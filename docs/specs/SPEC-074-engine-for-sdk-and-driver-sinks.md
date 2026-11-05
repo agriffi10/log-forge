@@ -4,7 +4,7 @@ id: SPEC-074
 title: "The Delivery Engine for the SDK and Driver Sinks, Including Id-Keyed Batch Results"
 description: "Puts the queue-service, database, broker and socket sinks on SPEC-072's engine through a per-event deliver, reads Id-keyed batch results in one shared function, and deletes their eleven retry loops, backoff constants and hand-built loss reports while every documented counter and losses() stays true."
 spec_status: Draft
-depends_on: [SPEC-069, SPEC-070, SPEC-071, SPEC-072, SPEC-073]
+depends_on: [SPEC-061, SPEC-066, SPEC-068, SPEC-069, SPEC-070, SPEC-071, SPEC-072, SPEC-073]
 arc: stability-redesign
 arc_order: 6
 ---
@@ -32,8 +32,8 @@ reader beside `adjudicate_positional`, with the positional rule's discipline: a 
 describes the chunk or it does not, and one it cannot read is counted, never retried.
 
 This spec builds on SPEC-061 (`NATSSink` liveness and a bounded close), SPEC-066 (every
-`max_retries` is an exact, floored `int`) and SPEC-068 (shutdown expiry), which land first in 1.1.0
-and are not in `depends_on` because they are not yet in this directory; `NATSSink` is converted
+`max_retries` is an exact, floored `int`) and SPEC-068 (shutdown expiry), which have landed, in 1.1.0,
+and are in `depends_on`; `NATSSink` is converted
 **as SPEC-061 leaves it**, and no SPEC-061 criterion is rewritten here. It builds on SPEC-073 (the
 HTTP family on the engine), earlier in this arc, and uses its run context unchanged (FR-001). It
 consumes SPEC-069's encode guard through a sibling of its helper (FR-002), SPEC-070's
@@ -979,3 +979,4 @@ other site still stating the old claim:
   the identical `MessageDeduplicationId` and `MessageGroupId`, as 1.x's loop did inside one `emit`;
   a criterion kills the per-round mutant, and FR-006's idempotency reasoning no longer rests on
   per-round ids.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

@@ -4,7 +4,7 @@ id: SPEC-079
 title: "Fork: One Walk From the Runtime's Roots, the Global Lock Roster, and sink_factory="
 description: "Repairs a forked child by re-creating the package's global locks from one explicit roster and reaching every sink through one bounded walk from the runtime's roots, deletes the module-wide walk and the separate inheritance marking, and adds sink_factory= so each process can build a sink of its own."
 spec_status: Draft
-depends_on: [SPEC-039, SPEC-042, SPEC-044, SPEC-053, SPEC-054, SPEC-072, SPEC-077, SPEC-078]
+depends_on: [SPEC-039, SPEC-042, SPEC-044, SPEC-053, SPEC-054, SPEC-068, SPEC-072, SPEC-077, SPEC-078, SPEC-080]
 arc: stability-redesign
 arc_order: 11
 ---
@@ -48,8 +48,7 @@ the two measured destructive closes that
 each, a child re-wrapped an inherited sink the parent never recorded and closed the parent's socket.
 Keeping the reach is the orchestrator's decision, taken on 2026-11-04.
 
-**This spec builds on SPEC-068, which lands first in 1.1.0 and is not in `depends_on` because it is
-not yet in this directory.** SPEC-068 resets `Worker._stopped` when a fork resumes a worker
+**This spec builds on SPEC-068, which has landed, in 1.1.0, and is in `depends_on`.** SPEC-068 resets `Worker._stopped` when a fork resumes a worker
 (`architecture.md` §12). This spec leaves `Worker._reinit_after_fork` as SPEC-068 leaves it.
 
 **Measured at `fda134a`, with the instrument named.**
@@ -1089,3 +1088,4 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   list of builtin types. The same helper, `_sink_arg.require_sink`, now refuses the wrappers' inner
   sinks. The `sink_factory` refusal is named `config._require_factory`, and the user-class case
   moves to §13.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

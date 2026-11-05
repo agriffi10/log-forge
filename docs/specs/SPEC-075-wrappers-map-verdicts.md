@@ -4,7 +4,7 @@ id: SPEC-075
 title: "Wrappers Map Verdicts; MultiSink Keeps Calling Each Child's emit"
 description: "The filtering, transforming and delegating wrappers offer deliver exactly when the sink they wrap does, map its verdict back to their own batch and count only their own decisions, while MultiSink offers none and keeps calling each child's emit — so a wrapped engine sink is retried and counted as it would be alone."
 spec_status: Draft
-depends_on: [SPEC-017, SPEC-058, SPEC-059, SPEC-072, SPEC-073, SPEC-074]
+depends_on: [SPEC-017, SPEC-058, SPEC-059, SPEC-066, SPEC-072, SPEC-073, SPEC-074, SPEC-080]
 arc: stability-redesign
 arc_order: 7
 ---
@@ -50,9 +50,8 @@ From SPEC-073 it uses the run context and its owner-addressed `count`. From SPEC
 socket transport's `deliver`, the refusal marker `RunContext.refuse`, and the rosters this spec's
 three classes stand outside.
 
-It also builds on SPEC-066, which lands first in 1.1.0 and makes `LogstashSink`'s `max_retries` an
-exact, floored `int` at construction. SPEC-066 is not in `depends_on` because it is not yet in the
-directory. This spec changes no constructor's signature.
+It also builds on SPEC-066, which has landed, in 1.1.0, and makes `LogstashSink`'s `max_retries` an
+exact, floored `int` at construction. SPEC-066 is in `depends_on`. This spec changes no constructor's signature.
 
 Figures re-measured at `fda134a`, each with its instrument:
 
@@ -583,3 +582,4 @@ tests/
 - 2026-11-05, the SPEC-080 follow-ups folded into the arc, at Andrew's direction: every `TypeError`
   this spec adds names its type through `_diag._STORED_NAME`, so SPEC-071 FR-005's guard holds. None
   is one of that guard's doors, since each names `self` or an attribute.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

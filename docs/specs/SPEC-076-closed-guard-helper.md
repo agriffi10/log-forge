@@ -4,7 +4,7 @@ id: SPEC-076
 title: "The Closed-Guard Helper"
 description: "Gives the shipped sinks that release a transport one private helper, in two modes, for the transport lock, the idempotent close and the refusal after close, and defines what a close does when it overlaps a call still inside the sink and what a closed sink's deliver answers."
 spec_status: Draft
-depends_on: [SPEC-028, SPEC-032, SPEC-069, SPEC-072, SPEC-074]
+depends_on: [SPEC-028, SPEC-032, SPEC-061, SPEC-069, SPEC-072, SPEC-074]
 arc: stability-redesign
 arc_order: 8
 ---
@@ -43,8 +43,7 @@ SPEC-072 assigns that to this spec, and SPEC-074 already gives the answer for it
 counter. This spec keeps that answer, moves it behind the guard's refused branch, and adds the
 guard's `CLOSING` state to what it covers. Second, what a close does when it overlaps a call that is still running, which is the plan's risk "an emit
 that times out is still running". This spec builds on SPEC-061 (`NATSSink`'s liveness and bounded
-close), which lands first in 1.1.0 and is not in `depends_on` because it is not yet in this
-directory. Its closing flag is the rule this spec generalises to every `SERIAL` sink, and nothing
+close), which has landed, in 1.1.0, and is in `depends_on`. Its closing flag is the rule this spec generalises to every `SERIAL` sink, and nothing
 SPEC-061 specifies is re-specified here.
 
 **Figures**, each re-measured at `fda134a` with its instrument named:
@@ -764,3 +763,4 @@ tests/
   - nits: the post-acquire refusal path is tested, an interrupted closer is defined, the grace
     claim is narrowed and the 0.5 s bound justified, Kafka's count is stated as an upper bound,
     and the AST check reads `run_context().refuse`.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

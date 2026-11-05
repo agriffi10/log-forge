@@ -4,7 +4,7 @@ id: SPEC-073
 title: "The HTTP Family on the Delivery Engine"
 description: "Puts HTTPSink and its eight shipped subclasses on SPEC-072's delivery engine: each offers deliver, one request per chunk per round, its emit runs the same engine inline, the three per-record readers return per-event outcomes through one shared unreadable-response method, every documented counter keeps its 1.x name and unit through a family-neutral run context, and a third-party subclass that overrides emit or _handle_response keeps its 1.x path."
 spec_status: Draft
-depends_on: [SPEC-018, SPEC-027, SPEC-038, SPEC-056, SPEC-058, SPEC-059, SPEC-062, SPEC-070, SPEC-072]
+depends_on: [SPEC-018, SPEC-027, SPEC-038, SPEC-056, SPEC-058, SPEC-059, SPEC-062, SPEC-066, SPEC-070, SPEC-072]
 arc: stability-redesign
 arc_order: 5
 ---
@@ -44,8 +44,7 @@ The counts that move are listed in FR-002, each with its reason. Every one of th
 release notes.
 
 It builds on SPEC-066 (every `max_retries` an exact, floored `int`; `HTTPSink.max_batch_count`'s
-validation), which lands first in 1.1.0 and is not in `depends_on` because it is not yet in this
-directory. It consumes SPEC-070's `HTTPSink._retryable_error`, its read-failed flag (`_UnreadBody`,
+validation), which has landed, in 1.1.0, and is in `depends_on`. It consumes SPEC-070's `HTTPSink._retryable_error`, its read-failed flag (`_UnreadBody`,
 `_read_failed`) and `_send`'s `count_unexpected` keyword. It does not touch #291's base-URL refusals,
 which landed.
 
@@ -928,3 +927,4 @@ tests/
   does.
 - Build-order re-read: FR-002's "no engine settled line" for a run with a registered announcement
   cites SPEC-072 FR-003, which now carries that refinement itself.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

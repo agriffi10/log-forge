@@ -4,7 +4,7 @@ id: SPEC-077
 title: "Runtime Holds Today's Lifecycle State, With No Behaviour Change, and the Model Test Drives It"
 description: "Moves the lifecycle bookkeeping that lives in module globals onto one Runtime object, adds a State read off today's flags, and extends the model test to drive every lifecycle call against a state table."
 spec_status: Draft
-depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062]
+depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-066, SPEC-068]
 arc: stability-redesign
 arc_order: 9
 ---
@@ -24,12 +24,11 @@ registry and makes the transitions checked, so that `State` becomes the authorit
 reworks the fork repair from `Runtime`'s roots. Neither is built here, and this spec is shaped so
 that each starts from a `Runtime` that already holds what it changes.
 
-Two specs land first, in 1.1.0, and this one builds on both: SPEC-066 (the `flush` and `shutdown`
+Two specs have landed, in 1.1.0, and this one builds on both: SPEC-066 (the `flush` and `shutdown`
 timeout verdicts, which put a door at the public calls and leave `_shutdown_worker`, `claim_stop`
 and `Worker.stop` alone) and SPEC-068 (shutdown expiry: `architecture.md` §12's double announce of
 an expired exit drain, a second `shutdown()` after an expired one, and a fork-resumed worker not
-resetting `Worker._stopped`). Neither is in `depends_on`, because neither is in this directory
-yet. This spec does not re-specify any of those fixes and writes nothing that depends on how they
+resetting `Worker._stopped`). Both are in `depends_on`. This spec does not re-specify any of those fixes and writes nothing that depends on how they
 come out, which is why `Worker._stopped` stays on `Worker` (FR-001).
 
 **What "today's state" is, measured at `fda134a`.** The plan this arc follows counted eleven lock
@@ -532,7 +531,7 @@ The last column is FR-003's child value: `walk` (replaced by `_fork._reinit_prim
 | `_owned`, `_marking_failed` | `_lifecycle.py:606`, `:598` | `_owned_lock`; `_marking_failed` none, written by the child's one thread | move to `Runtime` | reset: `_mark_inherited` |
 | `_swaps_running`, `_stops_running` | new | none: added under `_lock`, discarded atomically | `Runtime` | reset: `_clear_after_fork` |
 | `_Closing.event` | `_lifecycle.py:390` | the registry lock | stays, a per-close event owned by the entry | walk |
-| `Worker._stopped` | `worker.py:415` | `Worker._lock` | stays: the once-only stop gate **of one worker**, and there can be two (`_worker` and `_late_worker`), so a field on `Runtime` would need keying by worker; SPEC-068 is changing how it resets | inherited at `fda134a` |
+| `Worker._stopped` | `worker.py:415` | `Worker._lock` | stays: the once-only stop gate **of one worker**, and there can be two (`_worker` and `_late_worker`), so a field on `Runtime` would need keying by worker; SPEC-068 changed how it resets, in 1.1.0 | inherited at `fda134a` |
 | `Worker._exit_deadline`, `_in_flight` | `worker.py:416-417` | `_exit_deadline` under `Worker._lock` by `claim_stop`; `_in_flight` by the drain thread | stay: the drain's own bookkeeping (SPEC-062) | reset: `_rebuild_worker_after_fork` |
 | `Worker._drain_finished`, `_drain_settled` | `worker.py:413-414` | events | stay: the drain loop's own events, ordered against each other (`_run`'s docstring), read by `draining` and `flush` | walk, then reset: `_rebuild_worker_after_fork` |
 | `Worker._held`, `_taken_markers` | `worker.py:419`, `:418` | `Worker._lock` | stay: what the worker's own thread may still be inside, and the `flush()` callers it owes; both in `Worker._FORK_SKIP` | reset: `_rebuild_worker_after_fork` |
@@ -630,3 +629,4 @@ updated for the rename and for the three loose names that moved.
 - Build-order re-read: FR-001's lock-site literal and FR-005's file list are derived on the build's
   base commit, as SPEC-071's pins are, since SPEC-072 rewrites `Worker._emit` and adds
   `_retry_declined` before this spec builds.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

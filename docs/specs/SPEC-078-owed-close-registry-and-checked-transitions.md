@@ -4,7 +4,7 @@ id: SPEC-078
 title: "The Owed-Close Registry and Checked Lifecycle Transitions"
 description: "Puts every owed and in-flight sink close in one registry that spends the closer grace once per shutdown, and makes the stored lifecycle State the authority: every lifecycle call checks it under the runtime's lock and has a defined answer in every state."
 spec_status: Draft
-depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-077]
+depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-066, SPEC-068, SPEC-077]
 arc: stability-redesign
 arc_order: 10
 ---
@@ -47,8 +47,8 @@ retirement fence … making every later worker born retired would … lose event
 and making it terminal would reclassify those delivered events as `submitted_after_shutdown`, which
 the 1.2.0 additive rule forbids in a minor release.
 
-**This spec builds on three peer specs that land first, in 1.1.0, and are not in `depends_on`
-because none is in this directory yet.** SPEC-066 gives `flush(timeout=)` and `shutdown(timeout=)`
+**This spec builds on two peer specs that have landed, in 1.1.0, and are in `depends_on`.**
+SPEC-066 gives `flush(timeout=)` and `shutdown(timeout=)`
 a verdict for `inf`, `nan` and a non-number at the public call, so every transition here receives
 `None` or a finite number. SPEC-068 settles `architecture.md` §12's double announce on an expired
 exit drain, a second `shutdown()` after an expired one, and a fork-resumed worker not resetting
@@ -703,3 +703,4 @@ row for the registry. The release notes for 1.2.0 carry the two fixes.
 - Build-order re-read: SPEC-077 FR-001's lock-site test, which the lock merge and the deletion of
   `join_closers` turn red, is added to the Overview's list of SPEC-077 pins this spec changes and to
   FR-006's re-derived guards, with a criterion.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

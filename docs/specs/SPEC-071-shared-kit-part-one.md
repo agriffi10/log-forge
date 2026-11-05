@@ -4,7 +4,7 @@ id: SPEC-071
 title: "Shared Kit, Part One: import_extra, One Injected-Client Refusal and the Chunker Rule"
 description: "Moves the sinks' lazy extra imports, their injected-client refusal and SQS's chunk boundary into shared helpers, refuses the build options eight sinks silently ignore beside an injected client, routes configure()'s and the sinks' type doors on the real type, and pins first the rosters those moves can reach."
 spec_status: Draft
-depends_on: [SPEC-041, SPEC-043, SPEC-049, SPEC-059, SPEC-065]
+depends_on: [SPEC-041, SPEC-043, SPEC-049, SPEC-059, SPEC-061, SPEC-065, SPEC-066, SPEC-080]
 arc: stability-redesign
 arc_order: 3
 ---
@@ -57,9 +57,9 @@ retries. Tests that already exist and are **not edited**, plus characterisation 
 against the unmodified code, are what show that.
 
 This spec builds on SPEC-065 (in `depends_on`: its four payload ceilings are among FR-005's doors)
-and on SPEC-066 and SPEC-080, which have landed on `main` (`4fbfd60`) and are not in `depends_on`
-because they are not in this branch's `docs/specs/`. SPEC-066 added `exact_int`
-and `floor_count` to `sinks/_retry.py` and routed every `max_retries` floor through them. **That is
+and on SPEC-066 and SPEC-080, which landed on `main` (`4fbfd60`) in 1.1.0 and are in `depends_on`.
+SPEC-066 added `exact_int` and `floor_count` to `sinks/_retry.py` and routed every `max_retries`
+floor through them. **That is
 why the plan's "`max_retries` floor" row is absent here:** its validator already exists. This spec
 adds no function to `sinks/_retry.py`; FR-005 changes how its four type validators and
 `_exact_number` ask a value's type, and nothing else in it. SPEC-080 shipped `_diag._STORED_NAME`,
@@ -70,7 +70,7 @@ loop belong to SPEC-072.
 from**, and written out by name there; the figures below are anchored to `fda134a`, the tree this
 spec was drafted on, and say what the sibling specs are expected to add. SPEC-069 adds a soft `bson`
 import to `MongoDBSink` (a seventeenth site) and an encode step to `SQSSink._chunks`. SPEC-070 adds a
-roster of the twelve retry loops with a floor of twelve. SPEC-061 (NATS liveness, landing in 1.1.0)
+roster of the twelve retry loops with a floor of twelve. SPEC-061 (NATS liveness, landed in 1.1.0)
 moves `import nats` inside a `try` whose `except BaseException:` stops the sink's loop thread and
 re-raises, so that site still propagates.
 
@@ -144,7 +144,7 @@ re-raises, so that site still propagates.
     the exact line `from google.cloud import pubsub_v1  # type: ignore[import-not-found,
     unused-ignore]` and the `google.cloud.*` mypy override in `pyproject.toml`.
 
-**What was measured at `4fbfd60`, for FR-005** (current `main`; the branch rebases onto it).
+**What was measured at `4fbfd60`, for FR-005** (`main` when FR-005 was drafted, and in 1.1.0).
 
 - **Seven type doors.** An AST scan of `src/log_foundry/**/*.py` for a `raise TypeError(...)` whose
   message formats `type(x).__name__` for an `x` other than `self` or `cls` finds nine raises. Seven
@@ -229,8 +229,8 @@ re-raises, so that site still propagates.
 - **Which exceptions a sink retries** (SPEC-070) and **how it encodes an event** (SPEC-069). FR-004
   changes only the boundary arithmetic of `_chunks`, as it stands on the build's base commit.
 - **Peer branches.** SPEC-061 rewrites the `import nats` site and SPEC-066 moves the constructors'
-  floors above their builds; both have landed on `main`, and the build rebases onto them, keeping
-  both edits.
+  floors above their builds; both landed in 1.1.0, and the build starts from a base that carries
+  them, keeping both edits.
 - **The type-tested sites that are not FR-005's doors** (Overview, measured at `4fbfd60`):
   - `decorator._refuse_unusable`'s `isinstance(fn, (classmethod, staticmethod))`, which SPEC-080
     keeps on purpose, last and reached only by a callable, and which already names through
@@ -939,3 +939,4 @@ docs/release-notes/v1.2.0.md
   - The guard's corpus asserts silence on its four deliberate edges, and its mutation sweep plants
     at `require_callable`.
   - The API example names the instance's class, not its metaclass.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

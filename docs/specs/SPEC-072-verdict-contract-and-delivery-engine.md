@@ -4,7 +4,7 @@ id: SPEC-072
 title: "Verdict Contract and Delivery Engine"
 description: "Adds the optional per-event Verdict returned by deliver(batch), one delivery engine that resends only retryable events and writes a sink-owned counter object, and the worker, orphan and inline-emit paths that run it, proven against test sinks before any shipped sink adopts it."
 spec_status: Draft
-depends_on: [SPEC-027, SPEC-058, SPEC-059, SPEC-062, SPEC-070]
+depends_on: [SPEC-027, SPEC-058, SPEC-059, SPEC-061, SPEC-062, SPEC-066, SPEC-068, SPEC-070, SPEC-080]
 arc: stability-redesign
 arc_order: 4
 ---
@@ -36,9 +36,9 @@ and `emit` otherwise, and `emit` itself gains an inline adapter, so a third-part
 This is the central spec of the `stability-redesign` arc (release 1.2.0, additive: no count is
 reclassified, no `emit` contract changes). It builds on SPEC-066 (every sink's `max_retries` is an
 exact, floored `int`, so the engine reads it as one) and SPEC-068 (the worker's shutdown-expiry
-accounting), both of which land first in 1.1.0 and are not in `depends_on` because they are not yet
-in this directory. `Worker._in_flight`, which FR-005 sets around a run, is SPEC-062's, already in
-`depends_on`. It consumes SPEC-070's private
+accounting), both of which have landed, in 1.1.0, and are in `depends_on`. `Worker._in_flight`,
+which FR-005 sets around a run, is SPEC-062's, already in `depends_on`.
+It consumes SPEC-070's private
 exception predicate, `_retryable_error(self, err: Exception) -> bool`. The seam is inert until
 SPEC-073: at this spec's build **no shipped sink defines `deliver`**, so every shipped sink runs
 exactly the paths it runs today and the engine is proven against test sinks.
@@ -937,3 +937,4 @@ tests/
   because it names an element rather than a parameter.
 - 2026-11-05, the fold-in's review: the `Verdict` refusal routes its container and elements on their
   real type, and a criterion covers an element whose `__class__` claims `Outcome`.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

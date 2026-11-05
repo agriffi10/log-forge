@@ -4,7 +4,7 @@ id: SPEC-070
 title: "Retry Classification: What a Sink Retries, Per Exception, Per Entry and for an Unreadable 2xx"
 description: "Makes every retry loop in the sinks ask a declared predicate whether an exception is worth another attempt, classifies a rejected queue entry per service from the vendor's documented codes, counts a 2xx whose body could not be read in every sink that reads a body, and records the deliberate exceptions in one table."
 spec_status: Draft
-depends_on: []
+depends_on: [SPEC-061, SPEC-066, SPEC-068]
 arc: stability-redesign
 arc_order: 2
 ---
@@ -84,8 +84,8 @@ Every figure is anchored to `fda134a` (`origin/main`, the tree this spec was dra
   empty body and for one that failed to read.
 
 This spec builds on SPEC-061 (NATS liveness), SPEC-066 (the numeric doors, which route every
-`max_retries` floor through `floor_count`) and SPEC-068, which land first in 1.1.0 and are not in
-`depends_on` because they are not yet in the directory. SPEC-061 adds no retry loop to `NATSSink`
+`max_retries` floor through `floor_count`) and SPEC-068, which have landed, in 1.1.0, and are in
+`depends_on`. SPEC-061 adds no retry loop to `NATSSink`
 and raises `SinkDeliveryError` where it raised before, so NATS declares no predicate here. SPEC-066
 changes how `max_retries` is judged and nothing at the catch. SPEC-069, which lands first in the
 arc, moves encoding ahead of each bulk call; this spec is correct with or without it, because the
@@ -559,7 +559,7 @@ why, the decision that records it and a derivation or a named test that proves t
 
 | Rule | Departing classes | Departure | Recorded in | Derived by |
 |---|---|---|---|---|
-| A timeout that is already broken is refused, one that works is floored | `KafkaSink` (`flush_timeout`), `NATSSink` (`publish_timeout`) and `GooglePubSubSink` (`overflow_timeout`) floor it through `usable_timeout`; `PostgresSink` floors `connect_timeout` at 2 (`max(connect_timeout, _MIN_CONNECT_TIMEOUT)` at `fda134a`, `floor_count` once SPEC-066 lands); every other timeout is refused through `require_timeout` | floor, not refuse, for 1.x | *A bad argument is floored if it works and refused if it is already broken; a new one is refused* | per sink class, each `__init__` parameter whose name ends in `timeout`, classed by the call that judges it (below) |
+| A timeout that is already broken is refused, one that works is floored | `KafkaSink` (`flush_timeout`), `NATSSink` (`publish_timeout`) and `GooglePubSubSink` (`overflow_timeout`) floor it through `usable_timeout`; `PostgresSink` floors `connect_timeout` at 2 (`max(connect_timeout, _MIN_CONNECT_TIMEOUT)` at `fda134a`, `floor_count` since SPEC-066 landed in 1.1.0); every other timeout is refused through `require_timeout` | floor, not refuse, for 1.x | *A bad argument is floored if it works and refused if it is already broken; a new one is refused* | per sink class, each `__init__` parameter whose name ends in `timeout`, classed by the call that judges it (below) |
 | A status is retried if it is `429` or `5xx` | `OTLPSink` retries `429`, `502`, `503`, `504` | a `500` is abandoned on the first request | *A protocol's retry set is a private predicate hook, not a second loop* | the classes defining `_retryable_status`; the existing roster in `tests/test_sinks_otlp.py` |
 | A sink that released its transport refuses; a close mid-batch raises nothing by itself | `GooglePubSubSink` absorbs a close that lands mid-batch | the rest of the batch is counted unconfirmed, not raised | *A sink that released its transport refuses; one that released nothing keeps accepting* | `test_a_close_landing_mid_batch_counts_the_rest_unconfirmed_and_does_not_raise` in `tests/test_sinks_pubsub.py`, which the roster requires to exist |
 | A body that cannot carry the verdict is counted | `OTLPSink` reads an **empty** `2xx` body as success; the `_bulk` sinks and `HoneycombSink` count it | an OTLP success needs no `partialSuccess` | *A 2xx this sink cannot read is counted, and the `_bulk` reading is argued, never inherited* | `_handle_response` of each of the four readers on `b""` |
@@ -740,3 +740,4 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   was stated as indistinguishable and retried; it now fails at once on libpq's three refusal texts,
   on the orchestrator's measurement at `fda134a`, with the localisation limit stated and the
   transient `FATAL`s left retryable.
+- 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.

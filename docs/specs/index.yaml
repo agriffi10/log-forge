@@ -464,70 +464,70 @@ specs:
     title: "Retry Classification: What a Sink Retries, Per Exception, Per Entry and for an Unreadable 2xx"
     description: "Makes every retry loop in the sinks ask a declared predicate whether an exception is worth another attempt, classifies a rejected queue entry per service from the vendor's documented codes, counts a 2xx whose body could not be read in every sink that reads a body, and records the deliberate exceptions in one table."
     spec_status: "Draft"
-    depends_on: []
+    depends_on: ["SPEC-061", "SPEC-066", "SPEC-068"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-070-retry-classification.md"
   - id: "SPEC-071"
     title: "Shared Kit, Part One: import_extra, One Injected-Client Refusal and the Chunker Rule"
     description: "Moves the sinks' lazy extra imports, their injected-client refusal and SQS's chunk boundary into shared helpers, refuses the build options eight sinks silently ignore beside an injected client, routes configure()'s and the sinks' type doors on the real type, and pins first the rosters those moves can reach."
     spec_status: "Draft"
-    depends_on: ["SPEC-041", "SPEC-043", "SPEC-049", "SPEC-059", "SPEC-065"]
+    depends_on: ["SPEC-041", "SPEC-043", "SPEC-049", "SPEC-059", "SPEC-061", "SPEC-065", "SPEC-066", "SPEC-080"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-071-shared-kit-part-one.md"
   - id: "SPEC-072"
     title: "Verdict Contract and Delivery Engine"
     description: "Adds the optional per-event Verdict returned by deliver(batch), one delivery engine that resends only retryable events and writes a sink-owned counter object, and the worker, orphan and inline-emit paths that run it, proven against test sinks before any shipped sink adopts it."
     spec_status: "Draft"
-    depends_on: ["SPEC-027", "SPEC-058", "SPEC-059", "SPEC-062", "SPEC-070"]
+    depends_on: ["SPEC-027", "SPEC-058", "SPEC-059", "SPEC-061", "SPEC-062", "SPEC-066", "SPEC-068", "SPEC-070", "SPEC-080"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-072-verdict-contract-and-delivery-engine.md"
   - id: "SPEC-073"
     title: "The HTTP Family on the Delivery Engine"
     description: "Puts HTTPSink and its eight shipped subclasses on SPEC-072's delivery engine: each offers deliver, one request per chunk per round, its emit runs the same engine inline, the three per-record readers return per-event outcomes through one shared unreadable-response method, every documented counter keeps its 1.x name and unit through a family-neutral run context, and a third-party subclass that overrides emit or _handle_response keeps its 1.x path."
     spec_status: "Draft"
-    depends_on: ["SPEC-018", "SPEC-027", "SPEC-038", "SPEC-056", "SPEC-058", "SPEC-059", "SPEC-062", "SPEC-070", "SPEC-072"]
+    depends_on: ["SPEC-018", "SPEC-027", "SPEC-038", "SPEC-056", "SPEC-058", "SPEC-059", "SPEC-062", "SPEC-066", "SPEC-070", "SPEC-072"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-073-http-family-on-the-delivery-engine.md"
   - id: "SPEC-074"
     title: "The Delivery Engine for the SDK and Driver Sinks, Including Id-Keyed Batch Results"
     description: "Puts the queue-service, database, broker and socket sinks on SPEC-072's engine through a per-event deliver, reads Id-keyed batch results in one shared function, and deletes their eleven retry loops, backoff constants and hand-built loss reports while every documented counter and losses() stays true."
     spec_status: "Draft"
-    depends_on: ["SPEC-069", "SPEC-070", "SPEC-071", "SPEC-072", "SPEC-073"]
+    depends_on: ["SPEC-061", "SPEC-066", "SPEC-068", "SPEC-069", "SPEC-070", "SPEC-071", "SPEC-072", "SPEC-073"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-074-engine-for-sdk-and-driver-sinks.md"
   - id: "SPEC-075"
     title: "Wrappers Map Verdicts; MultiSink Keeps Calling Each Child's emit"
     description: "The filtering, transforming and delegating wrappers offer deliver exactly when the sink they wrap does, map its verdict back to their own batch and count only their own decisions, while MultiSink offers none and keeps calling each child's emit — so a wrapped engine sink is retried and counted as it would be alone."
     spec_status: "Draft"
-    depends_on: ["SPEC-017", "SPEC-058", "SPEC-059", "SPEC-072", "SPEC-073", "SPEC-074"]
+    depends_on: ["SPEC-017", "SPEC-058", "SPEC-059", "SPEC-066", "SPEC-072", "SPEC-073", "SPEC-074", "SPEC-080"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-075-wrappers-map-verdicts.md"
   - id: "SPEC-076"
     title: "The Closed-Guard Helper"
     description: "Gives the shipped sinks that release a transport one private helper, in two modes, for the transport lock, the idempotent close and the refusal after close, and defines what a close does when it overlaps a call still inside the sink and what a closed sink's deliver answers."
     spec_status: "Draft"
-    depends_on: ["SPEC-028", "SPEC-032", "SPEC-069", "SPEC-072", "SPEC-074"]
+    depends_on: ["SPEC-028", "SPEC-032", "SPEC-061", "SPEC-069", "SPEC-072", "SPEC-074"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-076-closed-guard-helper.md"
   - id: "SPEC-077"
     title: "Runtime Holds Today's Lifecycle State, With No Behaviour Change, and the Model Test Drives It"
     description: "Moves the lifecycle bookkeeping that lives in module globals onto one Runtime object, adds a State read off today's flags, and extends the model test to drive every lifecycle call against a state table."
     spec_status: "Draft"
-    depends_on: ["SPEC-045", "SPEC-046", "SPEC-050", "SPEC-054", "SPEC-062"]
+    depends_on: ["SPEC-045", "SPEC-046", "SPEC-050", "SPEC-054", "SPEC-062", "SPEC-066", "SPEC-068"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-077-runtime-holds-lifecycle-state.md"
   - id: "SPEC-078"
     title: "The Owed-Close Registry and Checked Lifecycle Transitions"
     description: "Puts every owed and in-flight sink close in one registry that spends the closer grace once per shutdown, and makes the stored lifecycle State the authority: every lifecycle call checks it under the runtime's lock and has a defined answer in every state."
     spec_status: "Draft"
-    depends_on: ["SPEC-045", "SPEC-046", "SPEC-050", "SPEC-054", "SPEC-062", "SPEC-077"]
+    depends_on: ["SPEC-045", "SPEC-046", "SPEC-050", "SPEC-054", "SPEC-062", "SPEC-066", "SPEC-068", "SPEC-077"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-078-owed-close-registry-and-checked-transitions.md"
   - id: "SPEC-079"
     title: "Fork: One Walk From the Runtime's Roots, the Global Lock Roster, and sink_factory="
     description: "Repairs a forked child by re-creating the package's global locks from one explicit roster and reaching every sink through one bounded walk from the runtime's roots, deletes the module-wide walk and the separate inheritance marking, and adds sink_factory= so each process can build a sink of its own."
     spec_status: "Draft"
-    depends_on: ["SPEC-039", "SPEC-042", "SPEC-044", "SPEC-053", "SPEC-054", "SPEC-072", "SPEC-077", "SPEC-078"]
+    depends_on: ["SPEC-039", "SPEC-042", "SPEC-044", "SPEC-053", "SPEC-054", "SPEC-068", "SPEC-072", "SPEC-077", "SPEC-078", "SPEC-080"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-079-fork-one-walk-roster-and-sink-factory.md"
   - id: "SPEC-080"

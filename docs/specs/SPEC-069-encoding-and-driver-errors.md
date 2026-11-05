@@ -113,8 +113,8 @@ This spec is a caller-visible behaviour change in a minor release, so it carries
 entry. Three changes are visible to a caller: a sink stops raising on an event it cannot encode,
 two refusals are repaired instead of losing the batch, and three sinks raise a new subclass. The
 only overlap with SPEC-061 is that SPEC-061 rewrites `NATSSink.emit`. This spec does not touch
-`NATSSink`, so SPEC-061 leaves nothing to rebase. SPEC-061 lands first, in 1.1.0, and is not in
-`depends_on` because it is not yet in the directory.
+`NATSSink`, so SPEC-061 leaves nothing to rebase. SPEC-061 has landed, in 1.1.0, and is not in
+`depends_on` because this spec does not build on it.
 
 ## Scope
 
@@ -732,3 +732,4 @@ tests/
   - FR-005 now serves no invariant.
   - The Postgres loss is now described as the whole batch (one commit across all chunks).
   - FR-005's octet-count criterion was dropped, because it already passes today.
+- 2026-11-05: rebased onto main after v1.1.0; SPEC-061 has landed and stays out of depends_on, since this spec does not build on it.
