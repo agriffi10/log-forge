@@ -604,8 +604,9 @@ by the row they break, and the shipped tree is reported clean.
 - [ ] `tests/test_sink_retry.py::test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side`
       still passes; its name says two where `grep -nE '(^|[^_])usable_timeout\(' src/log_foundry/sinks/*.py`,
       less its `def` line, finds four calls (`NATSSink`'s `publish_timeout` and `drain_timeout`,
-      `kafka._usable_timeout` and `GooglePubSubSink`'s `overflow_timeout`), and the build renames
-      it to say four.
+      `kafka._usable_timeout` and `GooglePubSubSink`'s `overflow_timeout`), four calls from three
+      classes, and the build renames it to
+      `test_the_four_shipped_usable_timeout_calls_stay_on_the_floor_side`.
 - [ ] No behaviour changes: the full suite's tests of the three plan-named departures pass unmodified.
 - [ ] Serves no invariant: it records and pins departures that FR-001 to FR-004's invariants already
       hold, and changes no behaviour a probe could observe.
@@ -744,3 +745,4 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   transient `FATAL`s left retryable.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: row 1 adds `NATSSink`'s `drain_timeout`, which SPEC-061 floors through `usable_timeout`, and drops it from the unjudged examples; the `usable_timeout` call count is re-measured as four on `93113e1b`.
+- 2026-11-05, execution-frame review: the renamed test says "four calls", from three classes, not four callers.

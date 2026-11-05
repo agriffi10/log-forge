@@ -396,8 +396,12 @@ Two destinations meet that bar.
     so `_int_text`'s output is unchanged. The other copies keep their inline expression:
     `_Coercer`'s two (`_bounded_int` and `integer`, inlined because they run once per integer) and
     `_otel._int_digits` (a leaf that imports nothing from the package). A test holds all three
-    sites equal to `int_placeholder` on positive and negative integers either side of each digit
-    boundary it crosses, so the text cannot drift.
+    sites equal to `int_placeholder`, so the text cannot drift. The sites agree on the text but
+    not on when they render it: their ceilings differ near 4300 digits and under
+    `sys.set_int_max_str_digits(0)`. So every input is a positive or negative integer past every
+    site's ceiling at the default limit and the default `max_value_bytes` (well beyond 4300
+    rendered digits, sign included), where each site renders the placeholder, and the test straddles no
+    threshold.
   - *Values left alone.* A NUL in a *value* is not touched, because BSON accepts it.
   - *Importing `bson`.* It is imported lazily on the first `emit` that reaches the check, never at
     construction, and read by name. A `bson` that is missing, or has no `encode`, disables the
@@ -739,3 +743,4 @@ tests/
   - FR-005's octet-count criterion was dropped, because it already passes today.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: SPEC-061 (its `NATSSink` criteria pin SPEC-061's sink) and SPEC-066 joined `depends_on`; `int_placeholder` is factored out of SPEC-066's `sanitize._int_text`, and its equality test covers `_Coercer`'s two inline copies and `_otel._int_digits`.
+- 2026-11-05, execution-frame review: the placeholder equality test's inputs are stated as past every site's ceiling at the default limit, since the sites' thresholds differ near 4300 digits and under `set_int_max_str_digits(0)`.

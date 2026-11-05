@@ -48,7 +48,8 @@ often as before.
 
 **What a caller sees change**, listed once here and in the release notes:
 
-- `.failed` counts each lost event once per batch, not once per worker attempt. The probe below
+- `.failed` counts each lost event once per batch, not once per worker attempt (`NATSSink`
+  excepted: it counts as its 1.x `emit` did, once per raised publish per call, FR-004). The probe below
   made 12 calls and counted `failed=15` for 5 events; on the engine it makes the same 12 calls and
   counts `failed=5`. Same term, a tighter upper bound; nothing moves between terms.
 - A chunk that keeps failing beside chunks that landed is retried within the whole worker-path
@@ -114,9 +115,9 @@ often as before.
 
 ### In Scope
 
-- How a converted sink counts and announces through SPEC-073's run context, and three private
-  additions to the engine: one commit under one lock, final rejections, and the refusal marker
-  (FR-001).
+- How a converted sink counts and announces through SPEC-073's run context, and four private
+  additions to the engine: one commit under one lock, final rejections, the refusal marker, and
+  sink-counted rounds (FR-001).
 - `_batch.py`'s keyed reader, and `SQSSink`, `SNSSink`, `KinesisSink` and `FirehoseSink` on the
   engine (FR-002).
 - `ClickHouseSink`, `MongoDBSink` (on the keyed reader) and `PostgresSink` on the engine (FR-003).
@@ -194,7 +195,7 @@ SQS batch, and refuses without counting. SPEC-073 adds the **run context** to `s
 `run_context()` gives a round its run's `round` number, `notes(owner)`, a per-run `dict` kept across
 rounds, and `count(owner, name, n, when=...)` and `announce(line, when=...)`, committed when the run
 ends as `ALWAYS`, `SETTLED` or `LAST` says; a run in which the sink announced anything is announced
-by the sink's lines alone. This spec uses it unchanged and adds three private things beside it.
+by the sink's lines alone. This spec uses it unchanged and adds four private things beside it.
 
 **How a converted sink counts.** `losses()` returns `self.log_foundry_counters.losses()`, so the
 twelve hand-built `SinkLosses` go and the two terms are SPEC-072's event totals, which for this
@@ -245,7 +246,7 @@ the run:
   uncounted loss.
 
 The shipped refusals are a closed or closing sink (`REJECTED`, the 1.x closed `SinkDeliveryError`),
-`NATSSink`'s forked child (`REJECTED`) and its disconnected client, latch and unanswered probe
+`NATSSink`'s forked child (`REJECTED`) and its disconnected client, both latches and unanswered probe
 (`RETRYABLE`, SPEC-061's `SinkDeliveryError`), and `SQSSink`'s batch whose every FIFO id callable
 raised (`REJECTED`, the caller's own first exception). That last is the arc's one rule for caller code
 that failed on every event of a batch, which SPEC-075's wrappers follow too: the events are
@@ -253,6 +254,15 @@ that failed on every event of a batch, which SPEC-075's wrappers follow too: the
 exception from the caller's code is not one the sink's predicate calls transient, SPEC-070), no sink
 counter moves, the catcher's `failed_batches` or `orphan_lost` counts it as any failed run, and the
 `emit` path re-raises the caller's own first exception by identity.
+
+**Sink-counted rounds (addition 4).** `RunContext.sink_counted(indices)` marks indices of the
+round's verdict, each `RETRYABLE`, whose loss for this round the sink has already registered
+through `count` and `announce`, `ALWAYS`, as its 1.x `emit` counted and wrote it. The engine commits
+nothing to `failed_events` for an event whose final outcome came from such a round, and writes no
+line for it; the sink's registrations and the catcher's term are its only counts. It is read when
+the round returns: an index that is not `RETRYABLE` in that round's verdict raises `ValueError`
+there, as for `final_rejections`. Only `NATSSink` calls it (FR-004), because its 1.x `failed` moves
+once per raised publish per `emit` call, which a count of each event once per run cannot reproduce.
 
 #### Acceptance Criteria:
 
@@ -280,6 +290,12 @@ counter moves, the catcher's `failed_batches` or `orphan_lost` counts it as any 
       on round one and `ACCEPTED` on round two delivers once with nothing counted; a refused round
       after a round that landed some events settles, counts the refused events `failed_events` once
       and writes one line.
+- [ ] A round returning all `RETRYABLE` for three events, marked `sink_counted({0, 1, 2})` and
+      registering `count(sink, "failed", 1, when=ALWAYS)` with one line, three rounds under
+      `Worker(max_retries=2)`: `.failed == 3`, three lines then the worker's abandon line,
+      `failed_batches == 1`; the same round followed by an `ACCEPTED` round leaves `.failed == 1`
+      and one line; marking an index whose outcome is `REJECTED` fails the run as an escaped
+      `ValueError` would.
 - [ ] A `deliver` raising `KeyboardInterrupt` propagates by identity and commits nothing.
 - [ ] Serves invariants 2, 7 and 11: each event lands in exactly one exact term or the documented
       upper bound, a refusal is counted by its catcher and never also by the sink, a sub-count and
@@ -561,11 +577,15 @@ the close alone.
   After the first publish, the round's outcome follows the one fact 1.x's `emit` acts on: whether
   anything in the round was published. An abandoned publish counts as published, as
   `_emit_on_loop` counts it.
-  - **Nothing published.** 1.x's `emit` raises and the worker resends the whole batch, so every
-    event of the round is `RETRYABLE`, announced `LAST`: each publish that raised, an ack wait that
-    expired in the driver included, with SPEC-061's publish line, and each event the deadline left
-    unattempted, with its `publish_timeout` line. An event `json.dumps` cannot encode is a publish
-    that raised, since it stays inside the publish path, off FR-002's step 1.
+  - **Nothing published.** 1.x's `emit` counts each publish that raised (`failed` +1 and SPEC-061's
+    `NATSSink publish, <Type>` line, as it happens), counts and writes nothing for an event the
+    deadline left unattempted, and raises, and the worker resends the whole batch. So every event
+    of the round is `RETRYABLE` and marked `sink_counted` (addition 4), and the round registers,
+    `ALWAYS`, exactly those 1.x counts and lines in 1.x's order: one per publish that raised, an ack
+    wait that expired in the driver included, and none for an unattempted event, whose loss, if the
+    run fails, is the catcher's alone (the worker's abandon or declined line, or `orphan_lost`). An
+    event `json.dumps` cannot encode is a publish that raised, since it stays inside the publish
+    path, off FR-002's step 1.
   - **Something published.** 1.x's `emit` returns, counting the rest in `failed`, and the worker
     resends nothing, so a publish that raised (an unencodable event included) and an event the
     deadline left unattempted are `REJECTED`, announced `ALWAYS` with the same two lines.
@@ -575,9 +595,9 @@ worker's `max_retries` further rounds on the drain thread and none on the orphan
 `emit` (the adapter uses the sink's own `max_retries`, or 0). So SPEC-061's `emit` against a stalled
 server still takes one `publish_timeout` and raises with `losses()` unchanged, and the worker still
 retries a refused batch, or one in which nothing was published, as its 1.x loop did: `w + 1`
-`deliver` calls for 1.x's `w + 1` `emit` calls, each carrying the whole batch, then
-`failed_batches` once with 1.x's `batch abandoned after {w + 1} emit attempts` line (SPEC-072
-FR-005).
+`deliver` calls for 1.x's `w + 1` `emit` calls, each carrying the whole batch and each counting
+what that `emit` counted, then `failed_batches` once with 1.x's `batch abandoned after {w + 1} emit
+attempts` line (SPEC-072 FR-005).
 
 **Why a batch with nothing published is still resent:** the 1.2.0 release is additive, so `emit`'s
 contract and every documented counter stay true for 1.x callers and no count is reclassified, and
@@ -608,14 +628,22 @@ written and is not rewritten).
 - [ ] NATS: one publish raising beside two unconfirmed is `.failed == 3` and `emit` returns; every
       publish raising, a JetStream ack-wait expiry among them, is `.failed == n` and `emit` raises;
       SPEC-061's blocked-publish case still returns with `.failed` equal to the batch size.
-- [ ] NATS, every publish raising through `Worker(max_retries=2)`: three `deliver` calls, each with
-      the whole batch, the same count of publish attempts 1.x's three `emit` calls make;
-      `failed_batches == 1` with the line `batch abandoned after 3 emit attempts`; and a batch whose
-      second round publishes is delivered with no third call.
-- [ ] NATS, one publish landing and the deadline leaving the other `n - 1` unattempted, through
-      `Worker(max_retries=2)`: one `deliver` call, `losses().failed == n - 1`, `failed_batches`
-      unmoved, `flush()` true, `health()` equal field for field to the same case on `93113e1b`, and
-      the only stderr line SPEC-061's `publish_timeout` line.
+- [ ] NATS differential matrix: `tests/test_sinks_nats_engine_matrix.py` runs each case below on the
+      engine, through `emit` and through `Worker(max_retries=2)`, and asserts per case and path
+      `losses().failed`, `failed_batches` as `health()` reports it, the number of `deliver` and
+      `emit` calls, the number of publishes the client saw, and the exact `log-foundry:` stderr
+      lines in order. The expected values are **recorded, not hand-written**: a recorder script
+      runs the same harness against 1.x at `93113e1b` (`emit` where the engine has `deliver`) and
+      writes a fixture committed beside the test, naming the commit and the command that
+      regenerates it; the test compares against that fixture. Cases, each on JetStream and core and
+      on an injected and an owned client wherever the case exists on that path: every publish
+      raising; every ack wait expiring; every event unencodable; a publish raising after the
+      deadline with the rest unattempted (`n = 5`, injected, `publish_timeout=0.2`: on `93113e1b`,
+      three `emit` calls, `failed == 3`, three `NATSSink publish, RuntimeError` lines then `lost 5
+      ... batch abandoned after 3 emit attempts`, and no `publish_timeout` line); a landed publish
+      beside a raise; a landed publish beside an unencodable event; a landed publish beside `n - 1`
+      unattempted; an abandoned publish; and `_refuse_while_stuck`. Planting one case's verdict as
+      the other branch's (`RETRYABLE` for `REJECTED`, or dropping `sink_counted`) reddens it.
 - [ ] NATS keeps SPEC-069's ledger: one unencodable event among several is `.failed == 1` and
       `losses().dropped == 0`, and `emit` returns; a batch of nothing but unencodable events raises
       `SinkDeliveryError` with `.failed` equal to the batch size. SPEC-069 FR-001's and FR-002's NATS
@@ -834,6 +862,9 @@ class RunContext:                          # SPEC-073's, plus:
     # the refusal marker: this round handed nothing to the transport. On a failed run the
     # round's final outcomes commit nothing and the adapter raises `error` by identity; on a
     # settled run they are counted failed_events with one line
+    def sink_counted(self, indices: Iterable[int]) -> None: ...
+    # RETRYABLE indices whose loss this round the sink registered ALWAYS itself, as 1.x's emit
+    # counted it; the engine commits no failed_events and no line for them (NATSSink only)
 
 # the commit: an owner whose _counter_lock is the sink's SinkCounters lock is committed with the
 # SinkCounters totals under one acquisition
@@ -886,7 +917,7 @@ class RabbitMQSink:                              # also SocketTransport, SyslogS
 
 ```
 src/log_foundry/sinks/
-├── _engine.py      # + RunContext.final_rejections, RunContext.refuse, the one-lock commit
+├── _engine.py      # + RunContext.final_rejections, RunContext.refuse, RunContext.sink_counted, the one-lock commit
 ├── _batch.py       # + adjudicate_keyed
 ├── _encode.py      # + encode_round, beside SPEC-069's encode_events
 ├── sqs.py sns.py kinesis.py firehose.py           # FR-002
@@ -937,7 +968,7 @@ other site still stating the old claim:
 
 ### Phase 1: The engine additions and the keyed reader
 
-- `RunContext.final_rejections`, `RunContext.refuse`, the `_counter_lock` property and the one-lock
+- `RunContext.final_rejections`, `RunContext.refuse`, `RunContext.sink_counted`, the `_counter_lock` property and the one-lock
   commit in `_engine.py`, on SPEC-073's run context, against test sinks; `adjudicate_keyed` in
   `_batch.py`.
 - `tests/test_engine_shipped_verdicts.py`, `tests/test_batch_keyed.py`.
@@ -1009,3 +1040,4 @@ other site still stating the old claim:
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: the NATS mapping gives a publish abandoned at the deadline (JetStream or an injected client) `UNKNOWN`, never resent, and names the abandoned-publish latch `_refuse_while_stuck` as a `RETRYABLE` refusal round, which keeps 1.x's worker retry of the refused batch.
 - 2026-11-05, the additive rule restored on SPEC-061's code: a NATS round in which nothing was published is `RETRYABLE` throughout, so the worker resends it `w + 1` times as 1.x does and `docs/invariants.md` 2's JetStream asymmetry stays true unrewritten; a publish that raised or an event left unattempted beside a publish that landed is `REJECTED`, counted in `failed` and never resent, as 1.x. The reason that argued for one attempt is replaced by the additive rule, and the Overview's release-notes line no longer names NATS.
+- 2026-11-05, execution-frame review: a NATS round with nothing published now registers 1.x's own counts and lines `ALWAYS` (one per raised publish, none for an unattempted event) and marks its `RETRYABLE` events `sink_counted`, a fourth run-context addition, so the engine adds no count; a differential matrix criterion holds every NATS case to values recorded by running 1.x at `93113e1b`, replacing the two hand-written NATS criteria.
