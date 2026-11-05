@@ -10,10 +10,10 @@ carried. **`CHANGELOG.md` at the repository root is the user-facing half of the 
 table maps a version to its SPECs, that file tells a caller what changed. Cutting a release owes
 both, and nothing gates either. Add a row when a release is cut — **except when a row is
 pre-written in the commit its tag will be cut from**, which is how a top row can arrive naming a
-tag that does not exist yet. Three rows here were written that way, for reasons of different
+tag that does not exist yet. Four rows here were written that way, for reasons of different
 strength: `v1.0.0`'s because something in the tagged tree links this table and would otherwise
-reach a copy missing its own row, `v1.0.1`'s and `v1.0.2`'s only because each release preparation
-was a single commit with no later one to add the row in.
+reach a copy missing its own row, `v1.0.1`'s, `v1.0.2`'s and `v1.1.0`'s only because each release
+preparation was a single commit with no later one to add the row in.
 
 **`v1.0.0`'s row was written in the commit its tag was cut from, and that was deliberate.**
 Everywhere else the rule is *add a row when a release is cut*, because the table's one job is
@@ -32,7 +32,9 @@ letting it borrow the argument above. Nothing in that tag's tree links this tabl
 copy — so nothing forced the row into the tag commit; the release was prepared in one commit and that commit is the
 one the tag is cut from, so there was no later commit to add it in. Convenience, not mechanism.
 **`v1.0.2`'s row is pre-written for the same weaker reason**: its notes link `CHANGELOG.md` and the
-three delivery docs tag-absolutely, but not this table.
+three delivery docs tag-absolutely, but not this table. **So is `v1.1.0`'s**: its notes link
+nothing outside themselves, since the lead's links are anchors within the file, and nothing else
+in its tree links this table at `blob/v1.1.0`.
 
 **Which makes any pre-written row a hostage to the tag actually being cut, so re-read it before
 you cut.** Three ways it goes wrong. **A spec completes first:** on `v1.0.0`'s row the exposure
@@ -40,7 +42,10 @@ was the `SPEC-024 – SPEC-055` closing number going stale, and a slipping tag i
 happens; a row claiming **no** SPECs, as `v1.0.1`'s does, is falsified the same way and less
 visibly, since nothing in the row itself looks like a number to re-check. `v1.0.2`'s row names
 `SPEC-057 – SPEC-059` and says `SPEC-056` ships nothing because it is a Draft, so that spec
-completing before the tag falsifies it. `docs/specs/index.yaml` (generated from each spec's
+completing before the tag falsifies it. `v1.1.0`'s names SPEC-056, SPEC-061 – SPEC-068 and
+SPEC-080 and five fixes by PR number, so a spec or a library fix landing before the tag falsifies
+it the same way. That is not hypothetical: `v1.0.2`'s row was written before #283 and #284 landed,
+was tagged naming two no-spec fixes where the tag carried four, and was corrected after the tag. `docs/specs/index.yaml` (generated from each spec's
 frontmatter; the old `INDEX.md`'s status table moved there, its arcs to `ARCS.md`) is where
 the range actually ends, so re-derive from it either way. **The tag is cut under a different
 number:** the row is wrong, and so is the notes file's name — correct both, and see the paragraph
@@ -58,7 +63,8 @@ the specific release it names, not as a template for the next one.
 
 | Version | Carried |
 |---|---|
-| `v1.0.2` | SPEC-057 – SPEC-059 — assembly bounded in work, one bad event costing only itself, and retry-safe drop counts in every sink; plus two library fixes with no spec, #255 (`LokiSink` epoch nanoseconds exact) and #276 (`ElasticsearchSink` and `OpenSearchSink` count a `2xx` `_bulk` body with no readable verdict instead of ignoring it or re-sending). SPEC-056 (OTLP) is a Draft and shipped nothing. No public name or signature changed. Notes: `docs/release-notes/v1.0.2.md` |
+| `v1.1.0` | SPEC-056, SPEC-061 – SPEC-068 and SPEC-080 — the OTLP sink, `NATSSink` liveness and a bounded close, the exit drain fitted to `shutdown()`'s budget, assembly keys and scalars, a bounded and total baggage header, `int`-only `configure()` ceilings and sink arguments with `flush()`/`shutdown()` timeouts judged at entry, a total `continue_trace`, shutdown-expiry bookkeeping, and `@trace` judging its arguments by their real type; plus five library fixes with no spec, #286 and #287 (`HoneycombSink` counts the events Honeycomb rejects, and refuses a dataset that is not one path segment), #291 (HTTP base URLs, `DatadogSink`'s `site` and `SentrySink`'s DSN path), #295 (an HTTP sink URL carrying a user or password) and #300 (an `@` outside an HTTP sink URL's host, and a `SentrySink` DSN on port `0`). One public import path added, `log_foundry.sinks.otlp.OTLPSink`; no existing public name or signature changed. Notes: `docs/release-notes/v1.1.0.md` |
+| `v1.0.2` | SPEC-057 – SPEC-059 — assembly bounded in work, one bad event costing only itself, and retry-safe drop counts in every sink; plus four library fixes with no spec, #255 (`LokiSink` epoch nanoseconds exact), #276 (`ElasticsearchSink` and `OpenSearchSink` count a `2xx` `_bulk` body with no readable verdict instead of ignoring it or re-sending), #283 (an HTTP sink decides by the status once a status line arrived, and never re-sends a `2xx` whose body it could not read) and #284 (the HTTP family refuses at construction a URL, method, header or credential `http.client` cannot send). SPEC-056 (OTLP) is a Draft and shipped nothing. No public name or signature changed. Notes: `docs/release-notes/v1.0.2.md` |
 | `v1.0.1` | No SPECs — no library code changed. It publishes the README work that landed after the `v1.0.0` tag: the page rewritten to read as a released `1.0.0` (#240, which carries the widened freeze wording), its links made absolute so they resolve on PyPI (#242), and a Changelog project URL. Notes: `docs/release-notes/v1.0.1.md` |
 | `v1.0.0` | SPEC-024 – SPEC-055 — the three pre-1.0 audit arcs, the API freeze, and the first release under semantic versioning. Notes: `docs/release-notes/v1.0.0.md` |
 | `v0.10.1` | SPEC-023 — the first release carrying an SBOM |
