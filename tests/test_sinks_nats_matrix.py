@@ -100,6 +100,8 @@ class MatrixFake(LiveFakeNATS):
       silent_after: How many PINGs the server answers before it falls silent; None answers all.
       block_at: The zero-based publish that blocks in the driver's force-flush, its bytes
         already queued as ``_send_command`` queues them, until :attr:`release` is set.
+      hold_at: The zero-based publish that parks before queueing anything until :attr:`release`
+        is set, so it is in flight at the deadline by construction while the buffer reads drained.
       starve: Whether a JetStream ack never arrives, so the driver's own ack timeout raises.
       first_pong_delay: Seconds before the first PING's PONG arrives, the rest as configured.
       cancelled_flushes: How many of this client's ``flush`` calls were cancelled.
@@ -111,8 +113,8 @@ class MatrixFake(LiveFakeNATS):
         *,
         silent_after: int | None = None,
         block_at: int | None = None,
+        hold_at: int | None = None,
         park: bool = False,
-        delay: float = 0.0,
         starve: bool = False,
         hold_close: bool = False,
         first_pong_delay: float = 0.0,
@@ -120,8 +122,8 @@ class MatrixFake(LiveFakeNATS):
         super().__init__()
         self.silent_after = silent_after
         self.block_at = block_at
+        self.hold_at = hold_at
         self.flusher_parked = park
-        self.publish_delay = delay
         self.starve = starve
         self.cancelled_flushes = 0
         self.first_pong_delay = first_pong_delay
@@ -148,8 +150,9 @@ class MatrixFake(LiveFakeNATS):
         index = self.calls.count("publish")
         self._record("publish")
         self.publish_entered.set()
-        if self.publish_delay:
-            await asyncio.sleep(self.publish_delay)
+        if index == self.hold_at:
+            self.release = asyncio.Event()
+            await self.release.wait()
         if index == self.block_at:
             self._add_pending(len(payload))
             self.release = asyncio.Event()
@@ -234,10 +237,13 @@ def _cells() -> dict[str, Cell]:
                 next_refused=stuck,
                 **base,
             )
+            # The second publish is held open before it queues a byte, so the deadline passes with
+            # it in flight and the buffer drained: an owned core confirmation then meets a spent
+            # deadline (AC-3), not mid-batch's undrained buffer.
             add(
                 f"{stem}-emit3-deadline-spent",
                 call="emit3",
-                fake={"delay": 0.3},
+                fake={"hold_at": 1},
                 failed=1 + second,
                 lines=((1, UNATTEMPTED), (second, abandoned)),
                 **base,
