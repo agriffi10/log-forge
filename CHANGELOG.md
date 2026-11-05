@@ -19,6 +19,21 @@ required whenever that version's notes link this file at `blob/<tag>/…`, since
 against the tagged tree. Nothing gates this file against the tags, so it goes stale by being
 forgotten rather than by failing.
 
+## 1.1.0 — 2026-11-05
+
+**An OTLP log sink, and fixes; nothing removed or renamed.** A feature release under the `1.x`
+freeze: `from log_foundry.sinks.otlp import OTLPSink` is the one new public import path, posting
+each batch as OTLP/HTTP JSON to a Collector or any backend that ingests OTLP, and the core still
+has no runtime dependency. `log_foundry.__all__` is unchanged and so is every shipped sink's
+constructor signature. The fixes, though, can break a caller that worked on `1.0.2`: several sink
+arguments, `configure()` ceilings and `flush()`/`shutdown()` timeouts that were accepted, some of
+them working and some misbehaving later, are now refused; some sink URLs and DSNs are refused or
+post elsewhere; some field keys, header values, stderr lines and counters read differently;
+`flush(math.inf)` now waits rather than returning at once; and `NATSSink` waits on its server
+before it publishes and raises `TimeoutError` from a `close()` against a stalled server. The notes open with the list of what can break you, the
+silent changes first and each item linked to its entry; read it before you bump a `>=1,<2` pin.
+[**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.1.0/docs/release-notes/v1.1.0.md).
+
 ## 1.0.2 — 2026-11-03
 
 **Behaviour corrections; no public name, signature or default changed.** A patch under the `1.x`
