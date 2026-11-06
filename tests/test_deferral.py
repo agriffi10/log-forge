@@ -244,7 +244,9 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("RabbitMQSink", "_active_channel"): frozenset({"_connection", "_channel"}),
     ("RabbitMQSink", "_reset"): frozenset({"_connection", "_channel"}),
     ("RabbitMQSink", "_persistent_properties"): frozenset({"_properties"}),
-    ("RotatingFileSink", "emit"): frozenset({"_size"}),
+    ("RotatingFileSink", "emit"): frozenset({"_size", "_failed"}),
+    ("FileSink", "emit"): frozenset({"_failed"}),
+    ("SQLiteSink", "emit"): frozenset({"_failed"}),
     ("RotatingFileSink", "_rotate_or_continue"): frozenset(
         {"_stream", "_size", "_next_rollover", "_rotation_failing"}
     ),
@@ -306,6 +308,9 @@ counts as it happens rather than through the ``Deferral``:
   both retry loops and left these as they were.
 - ``PostgresSink._reconnect_if_broken`` / ``_conn``, ``_reconnect_announced``: the held connection,
   reopened when broken, and its once-per-outage flag; state, not a count.
+- ``FileSink.emit``, ``RotatingFileSink.emit`` and ``SQLiteSink.emit`` / ``_failed``: a batch
+  whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
+  an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.
 - ``MongoDBSink._resolve_bson`` / ``_bson_encode``, ``_bson_resolved``: the driver's own encoder,
   found lazily on the first emit as the BSON detector (SPEC-069 FR-003); state, not a count.
 

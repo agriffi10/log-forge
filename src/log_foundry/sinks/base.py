@@ -17,6 +17,11 @@ class SinkDeliveryError(Exception):
     already have a natural exception to re-raise — a driver error, a ``MultiSink`` child's —
     re-raise that instead: the contract is that something propagates, not that it must be this
     type.
+
+    A sink may also raise a **subclass that is the driver's type as well** (SPEC-069 FR-004):
+    ``SQLiteSink`` and the file sinks raise their ``sqlite3.Error`` or ``OSError`` as an instance
+    of both, so ``isinstance(exc, SinkDeliveryError)`` and the driver's own ``except`` clause both
+    match. That subclass is built at run time and has no public name; ask with ``isinstance``.
     """
 
 

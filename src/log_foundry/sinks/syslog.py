@@ -114,7 +114,6 @@ class SyslogSink:
         self._app_name = app_name
         self._transport = transport
         self._hostname = socket.gethostname() or "-"
-        self._procid = str(os.getpid())
         self._socket = SocketTransport(
             host,
             port,
@@ -242,6 +241,12 @@ class SyslogSink:
     def _frame(self, event: dict[str, object]) -> bytes:
         """Builds one RFC 5424 message, octet-counted when the transport is TCP.
 
+        The PROCID is read here, per message, rather than once at construction (SPEC-069
+        FR-005): a child forked after the sink was built — a prefork server that configures once
+        in the master — sent every message stamped with its parent's process id. The read costs
+        a small fraction of the ``json.dumps`` beside it. The hostname is still read once, since
+        a fork does not change it.
+
         Args:
           event: The event to frame.
 
@@ -262,7 +267,8 @@ class SyslogSink:
         timestamp = event.get("timestamp")
         ts = timestamp if isinstance(timestamp, str) else "-"
         msg = json.dumps(event)
-        frame = f"<{pri}>1 {ts} {self._hostname} {self._app_name} {self._procid} - - {msg}"
+        procid = os.getpid()
+        frame = f"<{pri}>1 {ts} {self._hostname} {self._app_name} {procid} - - {msg}"
         data = frame.encode("utf-8")
         if self._transport == "tcp":
             return f"{len(data)} ".encode("ascii") + data

@@ -907,7 +907,9 @@ def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
     `_lifecycle._get_worker`), so the order is lifecycle -> config and must stay one-way:
     anything under `_config_lock` that reached back for the lifecycle lock, or blocked on I/O,
     would deadlock or stall every configure and every zero-config log behind it. Today only `replace()` and
-    `StdoutSink()` run there, and `StdoutSink.__init__` is a single attribute assignment.
+    `StdoutSink()` run there, and `StdoutSink.__init__` binds the stream and creates the
+    unencodable counter and the `threading.Lock` that guards it (SPEC-069) — three assignments,
+    nothing that blocks and nothing that reaches for another lock.
 
     Asserted as a whitelist rather than a search for the bad case: the set of things that would
     be unsafe is open, and the set that is currently safe is three.

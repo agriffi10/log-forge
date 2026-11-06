@@ -325,6 +325,7 @@ derivation — a renamed helper, a call it no longer resolves — would otherwis
 silently as a deletion.
 """
 
+
 def test_every_sink_encodes_through_the_helper() -> None:
     """FR-001's roster over the real package: nothing reaches ``json.dumps`` unguarded."""
     roster = _tree_roster()

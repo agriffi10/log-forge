@@ -11,6 +11,7 @@ from typing import TextIO
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
@@ -159,15 +160,17 @@ class FileSink:
         self._closed = False
         self._lock = threading.Lock()
         self._unencodable = 0
+        self._failed = 0
         self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses | None:
-        """Reports what this sink could not encode, once it has anything (SPEC-069 FR-001).
+        """Reports unencodable events and driver failures, once it has any (SPEC-069).
 
-        ``None`` until something is counted, the rule ``wrapped_losses`` applies, so a process
-        that only logs clean events still reads ``health().sink is None``. Read under the
-        counter lock, never the emit lock, so a poll does not wait behind a write (SPEC-028
-        FR-003).
+        ``dropped`` is the events :meth:`emit` could not encode (FR-001); ``failed`` the events of
+        a batch whose write or flush raised ``OSError`` (FR-004), an upper bound. ``None`` until
+        something is counted, the rule ``wrapped_losses`` applies, so a process that only logs
+        clean events still reads ``health().sink is None``. Read under the counter lock, never
+        the emit lock, so a poll does not wait behind a write (SPEC-028 FR-003).
 
         Args:
           None.
@@ -179,9 +182,9 @@ class FileSink:
           None.
         """
         with self._counter_lock:
-            if not self._unencodable:
+            if not (self._unencodable or self._failed):
                 return None
-            return SinkLosses(dropped=self._unencodable, failed=0)
+            return SinkLosses(dropped=self._unencodable, failed=self._failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Writes every event as one newline-terminated ``json.dumps`` line, then flushes.
@@ -198,6 +201,16 @@ class FileSink:
         of nothing encodable writes nothing and returns, once the closed check has passed
         (FR-002).
 
+        **A driver error is counted, announced and raised as both types** (SPEC-069 FR-004).
+        When a write or flush raises ``OSError`` — a full disk, a revoked permission — the batch
+        size is added to ``failed`` at once, under the counter lock and never the emit lock, one
+        line names the class, the exception's type and its ``errno``, and the error is raised as
+        an instance of both ``SinkDeliveryError`` and its own class
+        (``_driver_error.delivery_error``), so ``except OSError``, ``except PermissionError``
+        and ``except SinkDeliveryError`` all still catch it. A write that fails partway leaves
+        the earlier lines of the batch on disk, and the worker's retry writes them again: this
+        counts and types the failure, it does not make a partial write atomic.
+
         Args:
           batch: The events to write.
 
@@ -205,22 +218,35 @@ class FileSink:
           None.
 
         Raises:
-          OSError: If the write or flush fails (FR-001).
+          OSError: If the write or flush fails (FR-001), as an instance of
+            ``SinkDeliveryError`` too, with the original as its ``__cause__`` — or the original
+            itself, unchanged, if the dual-typed exception cannot be built.
+          SinkDeliveryError: If the sink is closed.
         """
         if not batch:
             return
         with Deferral(self) as pending:
             lines = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            with self._lock:
-                if self._closed:
-                    raise SinkDeliveryError(
-                        f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
-                    )
-                if not lines:
-                    return
-                for _, line in lines:
-                    self._stream.write(line)
-                self._stream.flush()
+            try:
+                with self._lock:
+                    if self._closed:
+                        raise SinkDeliveryError(
+                            f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
+                        )
+                    if not lines:
+                        return
+                    for _, line in lines:
+                        self._stream.write(line)
+                    self._stream.flush()
+            except OSError as err:
+                with self._counter_lock:
+                    self._failed += len(batch)
+                detail = f"{type(self).__name__}, {type(err).__name__} {_diag.errno_of(err)}"
+                _diag.lost("event", len(batch), detail.rstrip())
+                built = delivery_error(err)
+                if built is None:
+                    raise
+                raise built from err
 
     def _encode(self, event: dict[str, object]) -> str:
         """Encodes one event as its newline-terminated JSON line.
@@ -405,15 +431,17 @@ class RotatingFileSink:
         self._closed = False
         self._lock = threading.Lock()
         self._unencodable = 0
+        self._failed = 0
         self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses | None:
-        """Reports what this sink could not encode, once it has anything (SPEC-069 FR-001).
+        """Reports unencodable events and driver failures, once it has any (SPEC-069).
 
-        ``None`` until something is counted, the rule ``wrapped_losses`` applies, so a process
-        that only logs clean events still reads ``health().sink is None``. Read under the
-        counter lock, never the emit lock, so a poll does not wait behind a write (SPEC-028
-        FR-003).
+        ``dropped`` is the events :meth:`emit` could not encode (FR-001); ``failed`` the events of
+        a batch whose write or flush raised ``OSError`` (FR-004), an upper bound. ``None`` until
+        something is counted, the rule ``wrapped_losses`` applies, so a process that only logs
+        clean events still reads ``health().sink is None``. Read under the counter lock, never
+        the emit lock, so a poll does not wait behind a write (SPEC-028 FR-003).
 
         Args:
           None.
@@ -425,9 +453,9 @@ class RotatingFileSink:
           None.
         """
         with self._counter_lock:
-            if not self._unencodable:
+            if not (self._unencodable or self._failed):
                 return None
-            return SinkLosses(dropped=self._unencodable, failed=0)
+            return SinkLosses(dropped=self._unencodable, failed=self._failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Appends each event, rotating first whenever a size or time trigger fires (FR-002).
@@ -451,6 +479,16 @@ class RotatingFileSink:
         cannot be encoded costs only itself, counted and announced when this call returns, and a
         batch of nothing encodable writes nothing (FR-002).
 
+        **A driver error is counted, announced and raised as both types** (SPEC-069 FR-004).
+        When a write or flush raises ``OSError`` — a full disk, a revoked permission — the batch
+        size is added to ``failed`` at once, under the counter lock and never the emit lock, one
+        line names the class, the exception's type and its ``errno``, and the error is raised as
+        an instance of both ``SinkDeliveryError`` and its own class
+        (``_driver_error.delivery_error``), so ``except OSError``, ``except PermissionError``
+        and ``except SinkDeliveryError`` all still catch it. A write that fails partway leaves
+        the earlier lines of the batch on disk, and the worker's retry writes them again: this
+        counts and types the failure, it does not make a partial write atomic.
+
         Args:
           batch: The events to write.
 
@@ -458,28 +496,41 @@ class RotatingFileSink:
           None.
 
         Raises:
-          OSError: If a write or a flush fails. A failed *rotation* no longer raises; see
-            :meth:`_rotate_or_continue`.
+          OSError: If a write or a flush fails, or a rotation cannot reopen the file, as an
+            instance of ``SinkDeliveryError`` too, with the original as its ``__cause__`` — or
+            the original itself, unchanged, if the dual-typed exception cannot be built. A
+            failed *rotation* no longer raises; see :meth:`_rotate_or_continue`.
           SinkDeliveryError: If the sink is closed.
         """
         if not batch:
             return
         with Deferral(self) as pending:
             lines = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            with self._lock:
-                if self._closed:
-                    raise SinkDeliveryError(
-                        f"RotatingFileSink wrote none of {len(batch)} event(s): the sink is closed"
-                    )
-                if not lines:
-                    return
-                for _, (line, data) in lines:
-                    if self._should_rotate(data):
-                        self._stream.flush()
-                        self._rotate_or_continue()
-                    self._stream.write(line)
-                    self._size += data
-                self._stream.flush()
+            try:
+                with self._lock:
+                    if self._closed:
+                        raise SinkDeliveryError(
+                            f"RotatingFileSink wrote none of {len(batch)} event(s): the sink is "
+                            f"closed"
+                        )
+                    if not lines:
+                        return
+                    for _, (line, data) in lines:
+                        if self._should_rotate(data):
+                            self._stream.flush()
+                            self._rotate_or_continue()
+                        self._stream.write(line)
+                        self._size += data
+                    self._stream.flush()
+            except OSError as err:
+                with self._counter_lock:
+                    self._failed += len(batch)
+                detail = f"{type(self).__name__}, {type(err).__name__} {_diag.errno_of(err)}"
+                _diag.lost("event", len(batch), detail.rstrip())
+                built = delivery_error(err)
+                if built is None:
+                    raise
+                raise built from err
 
     def _encode(self, event: dict[str, object]) -> tuple[str, int]:
         """Encodes one event as its newline-terminated JSON line, with the bytes it will take.
