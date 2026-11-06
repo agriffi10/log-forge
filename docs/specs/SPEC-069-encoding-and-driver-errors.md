@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-069
 title: "Encoding and Driver Errors — One Bad Event Costs Only Itself in Every Sink"
 description: "Gives every record-building sink one encode step before its bulk call, so an event it cannot encode costs only itself and one its destination refuses is repaired and delivered, and counts, announces and types the driver errors the SQLite and file sinks let escape."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-026, SPEC-058, SPEC-059, SPEC-061, SPEC-066]
 arc: stability-redesign
 arc_order: 1
