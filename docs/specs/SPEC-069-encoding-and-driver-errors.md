@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-069
 title: "Encoding and Driver Errors — One Bad Event Costs Only Itself in Every Sink"
 description: "Gives every record-building sink one encode step before its bulk call, so an event it cannot encode costs only itself and one its destination refuses is repaired and delivered, and counts, announces and types the driver errors the SQLite and file sinks let escape."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-026, SPEC-058, SPEC-059, SPEC-061, SPEC-066]
 arc: stability-redesign
 arc_order: 1
@@ -619,9 +619,10 @@ a decision, and leaves a superseded marker at every other site that still states
     both types;
   - in the event-assembly area, that a destination's refusal is repaired at the sink and marked as
     assembly marks, with Andrew's 2026-11-04 choice.
-- **`docs/architecture.md`.** Two passages each get a superseded marker: the §2 passage ending "an
-  HTTP sink drops an event whose render still raises, alone", and the §12 note on a transform
-  output nested past the C stack, which says "every JSON sink's own `json.dumps`" crashes.
+- **`docs/architecture.md`.** Two passages each get a superseded marker: the §6 passage ending "an
+  HTTP sink drops an event whose render still raises, alone", and the §13 *Known constraints*
+  note on a transform output nested past the C stack, which says "every JSON sink's own
+  `json.dumps`" crashes.
 - **`README.md`.**
   - The `health()` section sentence "Most sinks drop only what can never fit" gains the unencodable
     event.
@@ -767,3 +768,7 @@ tests/
     the closed check.
   - Out of Scope gains the SQLite bind failures (an integer past 64 bits, a `dict`) that a
     direct `emit` can still use to cost a batch.
+- 2026-11-06, completion: the two `architecture.md` passages were cited as §2 and §12; they sit in
+  §6 and in §13's *Known constraints*, and the citation is corrected. The `StdoutSink.__init__`
+  docstring in `tests/test_public_surface.py` was rewritten in phase 2, so the completion found it
+  already true.
