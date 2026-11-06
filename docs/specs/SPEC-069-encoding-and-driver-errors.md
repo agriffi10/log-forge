@@ -101,7 +101,8 @@ destination.
 that has not changed keeps its counter**. Its source is the additive-release decision in this
 arc's brief (Andrew, 2026-11-04: "No count is reclassified in a minor release") and the plan's
 Change 2 item 6 ("Outcomes land in the counters they land in today"). `NATSSink` already isolates
-an unencodable event, counts it `failed` and never retries it (`_publish_all`, `nats.py:343-355`).
+an unencodable event, counts it `failed` and never retries it (`_publish_all`, `nats.py:1306-1320`
+at `ebf9d680`).
 `SentrySink` does the same per envelope (`_capture`). For them nothing about the outcome changes,
 so the counter stays, and `tests/test_sinks_nats.py` pins `SinkLosses(dropped=0, failed=1)` for it.
 The sinks this spec *does* move are different: their outcome changes. Today Postgres, both Redis
@@ -151,6 +152,10 @@ only overlap with SPEC-061 is that SPEC-061 rewrites `NATSSink.emit`. This spec 
   after earlier lines of the batch were written. Either way the earlier lines stay, and the
   worker's retry writes them again. This spec closes the *encode* route to that duplicate, not the
   I/O route. FR-004 counts and types a file driver error; it does not make a partial write atomic.
+- **SQLite column values that cannot be bound.** An integer past 64 bits raises the builtin
+  `OverflowError` and a `dict` raises `sqlite3.ProgrammingError` when `SQLiteSink` binds its
+  projected columns, and either still costs the batch. Only a direct `emit` can hand the sink one,
+  since assembly cannot produce them in those columns, and neither is measured or handled here.
 - **Oversize.** `dropped_oversized` and every size decision stay as they are. An event that is both
   unencodable and oversized counts once, as unencodable, because the encode step runs first.
 - **Refusals no one has measured.** Only the PostgreSQL and MongoDB refusals above are repaired, on
@@ -744,3 +749,21 @@ tests/
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: SPEC-061 (its `NATSSink` criteria pin SPEC-061's sink) and SPEC-066 joined `depends_on`; `int_placeholder` is factored out of SPEC-066's `sanitize._int_text`, and its equality test covers `_Coercer`'s two inline copies and `_otel._int_digits`.
 - 2026-11-05, execution-frame review: the placeholder equality test's inputs are stated as past every site's ceiling at the default limit, since the sites' thresholds differ near 4300 digits and under `set_int_max_str_digits(0)`.
+- 2026-11-06, plan review and build:
+  - The roster test classifies the HTTP family by class, not by function: a class is "on
+    `HTTPSink._items`" when its resolved `emit` is `HTTPSink.emit` **and** its resolved `_items` is
+    `HTTPSink._items`. FR-001's last criterion names `_render` and `_otel._dumps` as what the
+    family reaches, but `LokiSink._body` also calls `json.dumps` (on label dicts `_item_size` has
+    already encoded inside `_items`' guard), from `HTTPSink.emit` and outside `_items`, so a
+    function-level boundary at `_items` would refuse Loki. The cost of the class rule is that a
+    new `json.dumps` in an HTTP subclass's `_body` is not seen; the family is out of scope. A
+    subclass that overrides `_items` is held to the helper rule, and a corpus case pins it.
+  - The Overview's `nats.py:343-355` citation was stale: SPEC-061 rewrote the file, and
+    `_publish_all`'s per-event encode now sits at `nats.py:1306-1320` (at `ebf9d680`). The
+    behaviour is as stated.
+  - `SocketTransport.send_all` returned on an empty list before its closed check, so a closed
+    `SyslogSink` or socket-mode `LogstashSink` would have settled an all-unencodable batch and
+    committed its count, against FR-002's closed-sink criterion. The empty return now follows
+    the closed check.
+  - Out of Scope gains the SQLite bind failures (an integer past 64 bits, a `dict`) that a
+    direct `emit` can still use to cost a batch.
