@@ -241,6 +241,14 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
   coerces one that fails, for type only — the same `sanitize` rules, no configured ceiling, one
   fixed depth bound — and an HTTP sink drops an event whose render still raises, alone, rather
   than losing the batch.
+
+  > **Superseded in part by SPEC-069.** Not only an HTTP sink: every record-building sink now
+  > encodes the batch through one guarded step before its first bulk call, so an event any of
+  > them cannot encode is dropped alone, counted `dropped`, and a batch of nothing encodable
+  > settles. And "at the sinks" is no longer empty: `PostgresSink` and `MongoDBSink` repair a
+  > value their destination refuses, after assembly, marked `truncated`. The decisions live in
+  > `docs/decisions/sink-delivery/` (*An event a sink cannot encode costs only itself*) and
+  > `docs/decisions/event-assembly/` (*A destination's refusal is repaired at the sink*).
 - **The rule holds for what the library says about *itself*, not just for events.** A stderr
   diagnostic is also a place caller data was not asked to reach, and an exception's message
   routinely carries the value that provoked it — so an absorbed failure is reported by
@@ -1903,6 +1911,12 @@ and a third copy is a fork with no merge.
   the same output already crashes every JSON sink's own `json.dumps`, and assembly bounds
   library-built events at `max_depth`, so only a transform can produce one. It is a limit of
   invariant 1's reach: a process-killing signal is not an exception any guard catches. (SPEC-058)
+
+  > **Superseded in part by SPEC-069.** Every record-building sink's `json.dumps` now runs under
+  > the encode guard (`sinks/_encode.py`), so where such a nest raises `RecursionError` the sink
+  > drops that one event, counted, instead of losing the batch. The crash itself is unchanged: a
+  > `SIGBUS` on a small thread stack is still beyond any guard. The decision lives in
+  > `docs/decisions/sink-delivery/` (*An event a sink cannot encode costs only itself*).
 
 ---
 

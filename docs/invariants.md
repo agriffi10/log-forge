@@ -66,8 +66,10 @@ losses are counted but never retried, because a retry would duplicate — an una
 response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017)~~ — superseded
 by SPEC-058: five losses are counted but never retried by the sink — an unadjudicable batch
 response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or
-an SQS id callable's per-event failure when its siblings were delivered, and an unrenderable HTTP
-event (SPEC-058) — because a retry would re-deliver what landed beside them, or fail the same way.
+an SQS id callable's per-event failure when its siblings were delivered, and an event a sink
+cannot encode — first an unrenderable HTTP event (SPEC-058), and since SPEC-069 an event any
+record-building sink's encode step refuses — because a retry would re-deliver what landed beside
+them, or fail the same way.
 A sixth joins them with SPEC-061 FR-003: a core `NATSSink` batch whose confirming round trip went
 unanswered is counted in `failed` and announced once, never retried, because the bytes are in
 flight to a server that may yet process them (five of five did after a `docker unpause`) and a
@@ -91,15 +93,21 @@ orphan path or `MultiSink` — owns the batch. The sites are the drops `Transfor
 `FilteringSink`, `SQSSink._chunks` and `HTTPSink._items` decide and `MultiSink`'s absorbed count
 (SPEC-058), and the oversize drops of the record-building sinks and the socket transport, the
 hand-offs `KafkaSink` and `GooglePubSubSink` see refused, and `HTTPSink._drop_refused`'s `413`
-(SPEC-059). A counter some `losses()` reports as `dropped` is written only by that commit: the
+(SPEC-059), and the encode step every record-building sink runs before its first bulk call,
+`sinks/_encode.encode_events`, whose count lands in `_unencodable` (or `rejected` for `KafkaSink`
+and `GooglePubSubSink`, and on `SocketTransport` for `SyslogSink` and socket-mode `LogstashSink`)
+(SPEC-069). A counter some `losses()` reports as `dropped` is written only by that commit: the
 counters are derived from the tree and the rule checked over it (`tests/test_deferral.py`). The
 exception is a sink's own `failed` count, the upper bound above: it can land before a raise and
 again each time the worker retries that batch, the SQS sender fault included (`SQSSink._send`
-counts it before `emit` raises for a recoverable loss beside it). A third-party sink that counts
+counts it before `emit` raises for a recoverable loss beside it), and the batch size a
+`SQLiteSink`, `FileSink` or `RotatingFileSink` adds to `failed` when its driver raises, before it
+raises in turn (SPEC-069 FR-004). A third-party sink that counts
 a drop before raising is outside what the library can hold to this (`MultiSink.emit` names the
 cost).
-*Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`;
-`tests/test_invariants_model.py` is the identity itself.
+*Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
+`tests/test_encode.py` and `tests/test_sinks_encode.py` (the encode step over a roster derived from
+the tree, SPEC-069); `tests/test_invariants_model.py` is the identity itself.
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
@@ -196,36 +204,42 @@ released nothing keeps accepting (SPEC-032).
 
 *Observable:* with a destination that fails every call, `flush()` is falsy and a counter moved;
 with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice.
-*Recorded exceptions:* an `emit` may return normally having delivered nothing, because what it
-did not deliver was counted — an all-oversized or all-unrenderable HTTP batch, a wrapper batch of
-one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized event
-(SPEC-058). Nothing in such a batch is helped by a retry, which is the test this page's rule turns
-on. So a `_bulk` server answering every POST with a `2xx` the sink cannot adjudicate — a body it
-cannot read or that is not an object, or a truthy `errors` with a short `items` array — leaves
-`flush()` truthy and `failed_batches` at zero, with the loss in `health().sink`: the events may
-have landed, so a retry could duplicate them. A Honeycomb batch `200` the sink cannot adjudicate —
-a body it cannot read, not an array of objects, the wrong length, or an entry whose `status` is not
-an integer — leaves the same three signs. An HTTP `2xx` is a verdict however its body ends: a body
-cut short, stalled or reset after the status line settles its chunk — delivered for a sink that
-ignores the body or, like OTLP, reads an empty one as success, unadjudicated for the `_bulk` sinks
-and `HoneycombSink`, whose only verdict is in the body — and is never re-sent; before any status
-line, a protocol error is retried and counted like a connection error. An OTLP server answering
-every POST with a `2xx` whose `partialSuccess` is present but cannot be read, or with a `2xx` over
-the 4 MiB response bound, leaves the same three signs for the same reason (SPEC-056); only a `2xx`
-rejecting every record of every chunk raises there, because nothing landed — and the same holds for
-a Honeycomb `200` rejecting every event of every chunk. A core `NATSSink` batch whose confirming
-round trip went unanswered leaves them too (SPEC-061 FR-003): `emit` returns having counted the
-batch in `failed` and announced it once, because its bytes are in flight to a server that may yet
-process them, and the next call is refused by the probe or its latch, so a sustained stall is
-still reported as failed batches and only the one batch that straddles its onset is counted
-rather than raised.
+*Recorded exceptions:* an `emit` may return normally having delivered nothing, because what it did
+not deliver was counted — an all-oversized batch, a batch of nothing but events the sink cannot
+encode (an HTTP batch it cannot render, SPEC-058, and since SPEC-069 the same batch on every
+record-building sink, each event counted `dropped`; `NATSSink` and `SentrySink`, the declared
+exceptions, still count such an event `failed` and raise for a batch of nothing else), a wrapper
+batch of one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized
+or unencodable event (SPEC-058, SPEC-069). Nothing in such a batch is helped by a retry, which is
+the test this page's rule turns on. So a `_bulk` server answering every POST with a `2xx` the sink
+cannot adjudicate — a body it cannot read or that is not an object, or a truthy `errors` with a
+short `items` array — leaves `flush()` truthy and `failed_batches` at zero, with the loss in
+`health().sink`: the events may have landed, so a retry could duplicate them. A Honeycomb batch
+`200` the sink cannot adjudicate — a body it cannot read, not an array of objects, the wrong length,
+or an entry whose `status` is not an integer — leaves the same three signs. An HTTP `2xx` is a
+verdict however its body ends: a body cut short, stalled or reset after the status line settles its
+chunk — delivered for a sink that ignores the body or, like OTLP, reads an empty one as success,
+unadjudicated for the `_bulk` sinks and `HoneycombSink`, whose only verdict is in the body — and is
+never re-sent; before any status line, a protocol error is retried and counted like a connection
+error. An OTLP server answering every POST with a `2xx` whose `partialSuccess` is present but cannot
+be read, or with a `2xx` over the 4 MiB response bound, leaves the same three signs for the same
+reason (SPEC-056); only a `2xx` rejecting every record of every chunk raises there, because nothing
+landed — and the same holds for a Honeycomb `200` rejecting every event of every chunk. A core
+`NATSSink` batch whose confirming round trip went unanswered leaves them too (SPEC-061 FR-003):
+`emit` returns having counted the batch in `failed` and announced it once, because its bytes are in
+flight to a server that may yet process them, and the next call is refused by the probe or its
+latch, so a sustained stall is still reported as failed batches and only the one batch that
+straddles its onset is counted rather than raised.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
-`tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass), `tests/integration/`
-against real services (SPEC-041).
+`tests/test_sinks_encode.py` (an all-unencodable batch settles on every record-building sink,
+SPEC-069), `tests/test_driver_error.py` (a SQLite or file driver error raises with `failed` moved,
+SPEC-069), `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass),
+`tests/integration/` against real services (SPEC-041).
 
 ## 8. An event is safe by construction, once, at assembly
 
-`build_event` coerces and bounds every value, so a sink may `json.dumps` bare; the ceilings bound
+`build_event` coerces and bounds every value, so assembly's promise holds, and a sink encodes under
+a guard (SPEC-069: an event a sink still cannot encode costs only itself); the ceilings bound
 each *value*, and each coercion pass is bounded as a whole at 131,072 values visited and 16 MiB
 of text charged, which bounds the work and not the event's size at a destination; an
 unserializable value becomes a type name, never a `repr`; a number too large to render is
@@ -256,7 +270,14 @@ visits at most 131,072 values (`sanitize._MAX_NODES`) and charges at most 16 MiB
 one node and its members' nodes and bytes as a value would, and is written as the JSON text of its
 coerced form, so no member's `repr` is written inside it; a `bytes` or `bytearray` key is priced
 before it is rendered (SPEC-063).
-*Recorded exceptions:* the three config stamps `service`, `version` and `env` are copied from
+*Recorded exceptions:* a destination can refuse what assembly allows, and two sinks repair it
+after assembly, on a marked copy, never mutating the batch (SPEC-069 FR-003): `PostgresSink`
+replaces every U+0000 in a string value or key, the config stamps included, with U+FFFD, because
+JSONB and its text columns refuse it; `MongoDBSink` replaces an integer outside the signed 64-bit
+range with assembly's `<int: ~N digits>` placeholder (`sanitize.int_placeholder`) and a NUL in a
+key with U+FFFD, because `bson.encode` refuses them. Each repaired event carries `truncated`, as
+assembly marks the same substitutions; a repair is not a loss and is neither counted nor announced.
+The three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
 (invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). A boundary
 event takes two passes, `build_event`'s and `backfill_baggage`'s, so `span.start` and `span.end`
@@ -283,7 +304,9 @@ hostile value to the whole observable on both delivery paths, and `tests/test_as
 which holds both budgets exactly and the reads to the ceiling;
 `tests/test_assembly_keys_and_scalars.py`, which holds the container-key rule, the exact-type
 routes and the real-type routing (SPEC-063); a transform's output by
-`tests/test_transform_coercion.py` (SPEC-058).
+`tests/test_transform_coercion.py` (SPEC-058); the sink-side repairs by `tests/test_encode.py`,
+`tests/test_sinks_encode.py`, `tests/integration/test_postgres.py` and `test_mongo.py`
+(SPEC-069).
 
 ## 9. Context is scoped, and an adopted context confers nothing
 
