@@ -1689,7 +1689,10 @@ and a third copy is a fork with no merge.
     Inheriting from `Sink` or from a shipped sink is what brings it inside. The one consequence
     that would otherwise break an earlier guarantee is closed separately: the worker rebuild
     **re-offers** its fresh stop signal, so SPEC-027's interruptible backoff still holds for a
-    sink the walk cannot enter.
+    sink the walk cannot enter. The same boundary holds for a **shipped** sink held inside a
+    third-party wrapper the walk does not enter: since SPEC-069 `StdoutSink`, `FileSink`,
+    `RotatingFileSink` and `SQLiteSink` carry a `_counter_lock` as well, and inside such a
+    wrapper it is not repaired, exactly like the third-party sink's own lock.
   - **The converse costs a mixed-base class its foreign attributes.** Ownership is keyed on the
     whole MRO, because subclassing a shipped sink is a documented extension point and a
     defining-module test walked straight past a `_lock` that `FileSink.__init__` built — measured,

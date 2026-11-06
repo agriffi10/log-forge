@@ -1044,3 +1044,24 @@ def test_an_unencodable_oversized_document_counts_once(
     rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
     rig.sink.emit([{"log_id": "big", "pad": "x" * (17 * 1024 * 1024), "n": 2**64}])
     assert (rig.sink._unencodable, rig.sink.dropped_oversized) == (1, 0)
+
+
+def test_mongo_with_a_bson_whose_import_raises_inserts_everything(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``bson`` that raises on import disables the check; it does not fail every ``emit``."""
+
+    class BrokenBson:
+        def find_spec(self, name: str, path: object = None, target: object = None) -> None:
+            if name == "bson":
+                raise RuntimeError("bson is broken in this environment")
+
+    monkeypatch.delitem(sys.modules, "bson", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [BrokenBson(), *sys.meta_path])
+    rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    event = {"log_id": "n", "fields": {"n": 2**64}}
+    rig.sink.emit([event])
+    assert rig.handoffs() == [[event]]
+    assert rig.count() == 0
+    assert rig.sink._bson_resolved
+    assert rig.sink._bson_encode is None

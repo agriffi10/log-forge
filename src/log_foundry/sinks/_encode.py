@@ -20,9 +20,11 @@ NUL_ESCAPE = re.compile(r"(?<!\\)(?:\\\\)*\\u0000")
 
 A ``u0000`` counts only when the run of backslashes before it has odd length, so its last
 backslash is the escape's own: ``json.dumps`` writes a real NUL as ``\\u0000`` and the six
-characters ``\\u0000`` as ``\\\\u0000``, which JSONB accepts. A plain substring test would
-match both and repair an event PostgreSQL takes. Run over the JSON text ``PostgresSink`` already
-builds, so a clean event costs one search (SPEC-069 FR-003).
+characters ``\\u0000`` as ``\\\\u0000``, which JSONB accepts. It is a filter, not the decision:
+:func:`repair_nul` walks the event for a real U+0000 and returns ``None`` when it finds none, so
+correctness rests on the walk, and this search only keeps the walk off clean text and off the
+six-character lookalike. Run over the JSON text ``PostgresSink`` already builds, so a clean event
+costs one search (SPEC-069 FR-003).
 """
 
 _NUL = "\x00"

@@ -251,6 +251,7 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
         {"_stream", "_size", "_next_rollover", "_rotation_failing"}
     ),
     ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
+    ("RotatingFileSink", "_ensure_open"): frozenset({"_stream", "_size"}),
     ("PostgresSink", "_insert_batch"): frozenset({"failed"}),
     ("PostgresSink", "_reconnect_if_broken"): frozenset({"_conn", "_reconnect_announced"}),
     ("_RedisSink", "_send"): frozenset({"failed"}),
@@ -300,7 +301,7 @@ counts as it happens rather than through the ``Deferral``:
 - ``RabbitMQSink._active_channel``, ``_reset`` / ``_connection``, ``_channel``, and
   ``_persistent_properties`` / ``_properties``: the held connection, channel and message
   properties, opened, dropped and built lazily; state, not a count.
-- ``RotatingFileSink.emit``, ``_rotate_or_continue`` and ``_rotate`` / ``_size``, ``_stream``,
+- ``RotatingFileSink.emit``, ``_rotate_or_continue``, ``_rotate`` and ``_ensure_open`` / ``_size``, ``_stream``,
   ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
   next time trigger and the once-per-outage flag; state, not a count.
 - ``PostgresSink._insert_batch`` and ``_RedisSink._send`` / ``failed``: a batch abandoned past the

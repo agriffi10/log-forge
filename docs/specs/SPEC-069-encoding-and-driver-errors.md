@@ -385,8 +385,9 @@ Two destinations meet that bar.
   - *Accuracy.* Measured against PostgreSQL 17.11, the pattern agreed with the server on seven
     cases: a NUL in a value, in a key and nested; the six characters `\u0000`, which JSONB accepts
     as text; those six with an extra backslash before them; a real NUL after a backslash; and a
-    clean event. A plain substring test would also match the six characters, and so would repair
-    an event JSONB accepts.
+    clean event. A plain substring test would also match the six characters; the repair would still
+    leave them alone, because the walk finds no real U+0000 in them, so the pattern only keeps the
+    walk off them and off clean text.
 - **MongoDB, BSON.** The detector is the driver's own `bson.encode`, run on the event. It took
   about 0.98 µs per typical event, against 1.92 µs for `json.dumps` (CPython 3.13.1, `timeit`, at
   `fda134a`). When it refuses the event, the repair walks it:
@@ -772,3 +773,8 @@ tests/
   §6 and in §13's *Known constraints*, and the citation is corrected. The `StdoutSink.__init__`
   docstring in `tests/test_public_surface.py` was rewritten in phase 2, so the completion found it
   already true.
+- 2026-11-06, system-frame diff review: FR-003's sentence that a plain substring test "would
+  repair an event JSONB accepts" was false of the design as built. `repair_nul` walks for a real
+  U+0000 and returns `None` for the six-character lookalike, so the walk decides correctness and
+  the pattern only keeps the walk off clean text; the sentence, the `NUL_ESCAPE` docstring and
+  the event-assembly decision now say so.

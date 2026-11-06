@@ -10,7 +10,7 @@ from __future__ import annotations
 import pickle
 import sqlite3
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import pytest
 
@@ -282,23 +282,55 @@ def test_an_unencodable_event_beside_a_driver_error_is_in_failed(
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
 
 
-def test_losses_returns_while_an_emit_holds_the_emit_lock(tmp_path: Path) -> None:
-    """FR-004 AC9: the count never takes the emit lock, so a poll never waits behind a write."""
-    parked, release = threading.Event(), threading.Event()
+class _Parking:
+    """A stream and a connection double in one: its write or insert parks, then fails."""
 
-    class ParkingStream:
-        def write(self, data: str) -> int:
-            parked.set()
-            release.wait(10)
-            raise OSError(28, "No space left on device")
+    def __init__(self) -> None:
+        self.parked = threading.Event()
+        self.release = threading.Event()
 
-        def flush(self) -> None:
-            pass
+    def _park(self) -> None:
+        self.parked.set()
+        self.release.wait(10)
 
-        def close(self) -> None:
-            pass
+    def write(self, data: str) -> int:
+        self._park()
+        raise OSError(28, "No space left on device")
 
-    sink = _file_sink(FileSink, tmp_path, ParkingStream())
+    def executemany(self, sql: str, rows: object) -> None:
+        self._park()
+        raise sqlite3.OperationalError("database is locked")
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def flush(self) -> None:
+        pass
+
+    def commit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize("build", ["file", "rotating", "sqlite"])
+def test_losses_returns_while_an_emit_holds_the_emit_lock(build: str, tmp_path: Path) -> None:
+    """FR-004 AC9: the count never takes the emit lock, so a poll never waits behind a write.
+
+    The poll runs on its own thread with a bound, so a ``losses()`` that took the emit lock
+    shows as a poll that did not finish rather than as a hung suite.
+    """
+    double = _Parking()
+    if build == "sqlite":
+        sink: Any = SQLiteSink(str(tmp_path / "p.db"))
+        sink._conn.close()
+        sink._conn = double
+    else:
+        sink = _file_sink(FileSink if build == "file" else RotatingFileSink, tmp_path, double)
     failures: list[BaseException] = []
 
     def emitter() -> None:
@@ -307,17 +339,58 @@ def test_losses_returns_while_an_emit_holds_the_emit_lock(tmp_path: Path) -> Non
         except BaseException as err:
             failures.append(err)
 
+    polled: list[object] = []
     thread = threading.Thread(target=emitter)
     thread.start()
     try:
-        assert parked.wait(10)
+        assert double.parked.wait(10)
         assert sink._lock.locked()
-        assert sink.losses() is None, "read while the emit lock is held"
+        poll = threading.Thread(target=lambda: polled.append(sink.losses()), daemon=True)
+        poll.start()
+        poll.join(2.0)
+        assert polled == [None], "losses() must return while the emit lock is held"
     finally:
-        release.set()
+        double.release.set()
         thread.join(10)
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
     assert len(failures) == 1
+
+
+def test_a_failed_reopen_is_counted_and_the_sink_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A rotation whose reopen fails leaves a closed stream; the next emit reopens or counts.
+
+    Before, every later batch raised a plain ``ValueError`` on the closed stream — uncounted,
+    no line, not a ``SinkDeliveryError`` — for good, even once the cause had cleared.
+    """
+    import log_foundry.sinks.file as file_mod
+
+    sink = RotatingFileSink(str(tmp_path / "r.ndjson"), max_bytes=50, backup_count=1)
+    sink.emit([{"pad": "x" * 30}])
+
+    def refuse(*args: object, **kwargs: object) -> object:
+        raise PermissionError(13, "Permission denied", str(tmp_path / "r.ndjson"))
+
+    monkeypatch.setattr(file_mod, "open", refuse, raising=False)
+    with pytest.raises(PermissionError):
+        sink.emit([{"pad": "y" * 30}])
+    assert sink._stream.closed, "the rotation closed the stream and the reopen failed"
+    capsys.readouterr()
+
+    with pytest.raises(PermissionError) as caught:
+        sink.emit([{"n": 1}, {"n": 2}])
+    assert isinstance(caught.value, SinkDeliveryError)
+    losses = sink.losses()
+    assert losses is not None and losses.failed == 1 + 2
+    assert _lost_lines(capsys.readouterr().err) == [
+        "log-foundry: lost 2 event(s); RotatingFileSink, PermissionError errno=13"
+    ]
+
+    monkeypatch.undo()
+    sink.emit([{"n": 3}])
+    sink.close()
+    assert '{"n": 3}' in (tmp_path / "r.ndjson").read_text(encoding="utf-8")
 
 
 def test_multisink_counts_a_raising_sqlite_child_once_in_its_absorbed_term(

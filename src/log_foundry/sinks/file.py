@@ -515,6 +515,7 @@ class RotatingFileSink:
                         )
                     if not lines:
                         return
+                    self._ensure_open()
                     for _, (line, data) in lines:
                         if self._should_rotate(data):
                             self._stream.flush()
@@ -603,6 +604,33 @@ class RotatingFileSink:
             self._closed = True
             self._stream.flush()
             self._stream.close()
+
+    def _ensure_open(self) -> None:
+        """Reopens the active file when a failed rotation left the sink holding a closed stream.
+
+        ``_rotate`` closes the stream first and :meth:`_rotate_or_continue` reopens it when the
+        rotation fails, but that reopen can fail too — a read-only mount, ``EMFILE`` — and the
+        sink is left holding the stream ``_rotate`` closed. Every later write then raised a plain
+        ``ValueError: I/O operation on closed file``: uncounted, with no line, not a
+        ``SinkDeliveryError``, and permanent even after the cause cleared (SPEC-069 frame-2
+        review). Reopening here, under the emit lock and before the first write, turns a
+        failure into an ``OSError`` that :meth:`emit` counts, announces and raises as both types
+        (FR-004), and a success into a recovered sink. The size is re-read from the file, as the
+        absorbed-rotation path does. A stream double with no ``closed`` attribute reads as open.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the file still cannot be opened.
+        """
+        if not getattr(self._stream, "closed", False):
+            return
+        self._stream = open(self._path, "a", encoding=self._encoding)
+        self._size = os.path.getsize(self._path) if os.path.exists(self._path) else 0
 
     def _schedule_next(self) -> float | None:
         """Returns the monotonic-clock deadline for the next time-based rotation (SPEC-031).

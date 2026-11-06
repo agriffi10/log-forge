@@ -354,8 +354,11 @@ class MongoDBSink:
         by BSON. It is imported here rather than at construction, so a sink built over an
         injected client never forces an import, and read by name: a ``bson`` that is missing,
         or has no ``encode``, disables the check rather than raising — an injected client double
-        with no driver installed is not a BSON encoder either. Two threads resolving at once
-        both store the same answer.
+        with no driver installed is not a BSON encoder either. So does a ``bson`` whose import or
+        attribute read raises anything else — a broken install, a module that fails at import —
+        since that is not this sink's fault and must not fail every ``emit`` (invariant 1);
+        ``insert_many`` still reports whatever that driver does after it. Two threads resolving
+        at once both store the same answer.
 
         Args:
           None.
@@ -368,13 +371,15 @@ class MongoDBSink:
         """
         if self._bson_resolved:
             return
+        encode = None
         try:
             import bson  # type: ignore[import-not-found]
-        except ImportError:
-            encode = None
-        else:
+
             found = getattr(bson, "encode", None)
-            encode = found if callable(found) else None
+        except Exception:
+            found = None
+        if callable(found):
+            encode = found
         self._bson_encode = encode
         self._bson_resolved = True
 
