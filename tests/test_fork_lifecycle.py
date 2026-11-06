@@ -43,6 +43,7 @@ from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.stdout import StderrSink, StdoutSink
 from log_foundry.sinks.transform import TransformSink
 from log_foundry.worker import Worker
 
@@ -993,6 +994,57 @@ def test_the_same_child_blocks_when_the_wrappers_count_lock_is_put_back() -> Non
     )
     assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
     assert child.output == at_the_call, child.output
+
+
+@pytest.mark.parametrize("cls", [StdoutSink, StderrSink], ids=["stdout", "stderr"])
+def test_a_child_does_not_block_on_a_stream_sinks_inherited_counter_lock(cls: type) -> None:
+    """SPEC-069 FR-001. The counter lock the stream sinks gained is repaired in a forked child.
+
+    The child's batch carries one unencodable event beside a good one, so ``emit`` commits a
+    count and takes the lock — a clean batch takes no lock and would prove nothing — and
+    ``losses()`` takes it again.
+    """
+    sink = cls(stream=io.StringIO())
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    released, holder = _held_by_a_parent_thread(sink._counter_lock)
+
+    def emit_then_read() -> str:
+        sink.emit([{"ok": 1}, {"bad": b"x"}])
+        losses = sink.losses()
+        return f"dropped={losses.dropped if losses else None}"
+
+    try:
+        child = run_in_child(emit_then_read)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    assert child.output == "dropped=1", child.output
+
+
+def test_the_same_child_blocks_when_a_stream_sinks_counter_lock_is_put_back() -> None:
+    """The positive control for the test above: the inherited lock restored, the child hangs."""
+    sink = StdoutSink(stream=io.StringIO())
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    inherited = sink._counter_lock
+    released, holder = _held_by_a_parent_thread(inherited)
+    at_the_call = "at-the-call"
+
+    def unrepair_then_emit() -> str:
+        sink._counter_lock = inherited  # type: ignore[assignment]
+        report_from_child(at_the_call)
+        sink.emit([{"ok": 1}, {"bad": b"x"}])
+        return "returned"
+
+    try:
+        child = run_in_child(unrepair_then_emit, timeout=4)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.output.startswith(at_the_call), child.output
+    assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
 
 
 def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) -> None:

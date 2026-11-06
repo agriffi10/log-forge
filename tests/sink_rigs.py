@@ -102,7 +102,16 @@ def _no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     for mod in (
-        clickhouse, eventhubs, firehose, kinesis, mongodb, postgres, rabbitmq, redis, sns, sqs,
+        clickhouse,
+        eventhubs,
+        firehose,
+        kinesis,
+        mongodb,
+        postgres,
+        rabbitmq,
+        redis,
+        sns,
+        sqs,
         socket_mod,
     ):
         if hasattr(mod, "wait"):
@@ -226,7 +235,9 @@ class _Channel:
     def __init__(self, state: State) -> None:
         self._state = state
 
-    def basic_publish(self, *, exchange: str, routing_key: str, body: bytes, properties: Any) -> None:
+    def basic_publish(
+        self, *, exchange: str, routing_key: str, body: bytes, properties: Any
+    ) -> None:
         self._state.call(body)
 
     def close(self) -> None:
@@ -249,9 +260,7 @@ def rabbitmq(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
 
     _no_wait(mp)
     state = State()
-    sink = RabbitMQSink(
-        exchange="x", routing_key="k", connection=_Connection(state), max_retries=0
-    )
+    sink = RabbitMQSink(exchange="x", routing_key="k", connection=_Connection(state), max_retries=0)
     return Rig(sink, state, lambda body: [json.loads(body)], sink, "_unencodable")
 
 
@@ -610,7 +619,13 @@ RIGS: dict[str, Callable[[pytest.MonkeyPatch, Path], Rig]] = {
 """Every public record-building sink on the helper, by class name."""
 
 EIGHT = (
-    "StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "ClickHouseSink", "RabbitMQSink",
-    "KafkaSink", "AzureEventHubsSink",
+    "StdoutSink",
+    "StderrSink",
+    "FileSink",
+    "RotatingFileSink",
+    "ClickHouseSink",
+    "RabbitMQSink",
+    "KafkaSink",
+    "AzureEventHubsSink",
 )
 """The classes that handed earlier events over before an unencodable one raised (spec Overview)."""

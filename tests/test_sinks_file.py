@@ -274,13 +274,15 @@ def test_the_rotating_sink_reports_no_losses_for_what_retention_discards(tmp_pat
     """AC-3. A bounded ring counts nothing: retention working is not loss.
 
     `MemorySink(maxlen)` is the precedent — neither `dropped` (discarded *before* a delivery
-    attempt) nor `failed` describes an event that was written and flushed to disk.
+    attempt) nor `failed` describes an event that was written and flushed to disk. SPEC-069 gave
+    the class a `losses()` for unencodable events and driver errors; it still reads `None` after
+    retention has discarded generations, which keeps the point.
     """
     path = str(tmp_path / "app.ndjson")
     sink = RotatingFileSink(path, max_bytes=100, backup_count=0)
     sink.emit([{"pad": "z" * 60} for _ in range(10)])
     sink.close()
-    assert not hasattr(sink, "losses"), "no losses() accessor, deliberately"
+    assert sink.losses() is None, "retention is not loss: nothing is counted"
 
 
 def _all_events(directory: str) -> list[dict]:

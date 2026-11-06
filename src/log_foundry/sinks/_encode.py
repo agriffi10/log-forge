@@ -72,7 +72,5 @@ def encode_events[T](
         encoded.append((event, wire))
     if failures:
         pending.count(counter, failures)
-        pending.announce(
-            lambda: _diag.lost("event", failures, f"{sink}, encoding raised {kind}")
-        )
+        pending.announce(lambda: _diag.lost("event", failures, f"{sink}, encoding raised {kind}"))
     return encoded

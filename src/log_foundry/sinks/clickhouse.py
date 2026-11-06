@@ -8,6 +8,8 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
+from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -113,6 +115,7 @@ class ClickHouseSink:
         self.max_retries = floor_count(max_retries, 0, "max_retries", "ClickHouseSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
+        self._unencodable = 0
         self._closed = False
         self._lock = threading.Lock()
         self._counter_lock = threading.Lock()
@@ -126,7 +129,10 @@ class ClickHouseSink:
             self._ensure_schema()
 
     def losses(self) -> SinkLosses:
-        """Reports rows in a chunk abandoned past the retry bound (SPEC-026 FR-002).
+        """Reports unencodable events, and rows in a chunk abandoned past the retry bound.
+
+        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
+        rows of a chunk abandoned past the retry bound (SPEC-026 FR-002).
 
         Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
         never waits on an in-flight insert and its backoff.
@@ -141,10 +147,17 @@ class ClickHouseSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed)
+            return SinkLosses(dropped=self._unencodable, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts each chunk as one columnar call, retrying on failure (FR-002).
+
+        Every event is encoded into its row before the lock is taken and before the first insert
+        (SPEC-069 FR-001), so the rows are built once per call rather than once per chunk inside
+        the lock. One that cannot be encoded is dropped, counted and announced only when this
+        call returns, through the deferral helper; before, the chunks ahead of it were already
+        inserted when its row raised, and the worker's retry inserted them again. A batch of
+        nothing encodable inserts nothing and returns, once the closed check has passed (FR-002).
 
         Args:
           batch: The events to insert. An empty batch is a no-op.
@@ -164,20 +177,25 @@ class ClickHouseSink:
         if not batch:
             return
         chunks = inserted = 0
-        with self._lock:
-            if self._closed:
+        with Deferral(self) as pending:
+            encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
+            rows = [row for _, row in encoded]
+            with self._lock:
+                if self._closed:
+                    raise SinkDeliveryError(
+                        f"ClickHouseSink inserted none of {len(batch)} event(s): the sink is closed"
+                    )
+                if not rows:
+                    return
+                for chunk in chunk_list(rows, self._chunk_size):
+                    chunks += 1
+                    inserted += self._insert(chunk)
+            if not chunks:
                 raise SinkDeliveryError(
-                    f"ClickHouseSink inserted none of {len(batch)} event(s): the sink is closed"
+                    f"ClickHouseSink produced no chunk for {len(batch)} event(s); nothing was sent"
                 )
-            for chunk in chunk_list(batch, self._chunk_size):
-                chunks += 1
-                inserted += self._insert([self._row(event) for event in chunk])
-        if not chunks:
-            raise SinkDeliveryError(
-                f"ClickHouseSink produced no chunk for {len(batch)} event(s); nothing was sent"
-            )
-        if not inserted:
-            raise SinkDeliveryError(f"ClickHouseSink inserted none of {chunks} chunk(s)")
+            if not inserted:
+                raise SinkDeliveryError(f"ClickHouseSink inserted none of {chunks} chunk(s)")
 
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
@@ -211,9 +229,10 @@ class ClickHouseSink:
           The row values, in column order.
 
         Raises:
-          TypeError: If the event is not JSON-serializable. Neither source of events should
-            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
-            checks and coerces what its function returns (SPEC-058 FR-001).
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
         """
         return [*(event.get(col) for col in _COLUMNS), json.dumps(event)]
 

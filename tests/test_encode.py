@@ -209,8 +209,10 @@ def derive(
                 if callee is json.dumps:
                     hits.append((fn.__qualname__, guarded))
                 elif callee is encode_events:
-                    arg = node.args[1] if len(node.args) > 1 else next(
-                        (k.value for k in node.keywords if k.arg == "encode"), None
+                    arg = (
+                        node.args[1]
+                        if len(node.args) > 1
+                        else next((k.value for k in node.keywords if k.arg == "encode"), None)
                     )
                     target = _resolve(arg, fn, cls) if arg is not None else None
                     if inspect.isfunction(target):
@@ -280,13 +282,38 @@ def _tree_roster() -> Roster:
 
 ROSTER_FLOOR = frozenset(
     {
-        "StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "SQLiteSink", "ClickHouseSink",
-        "RabbitMQSink", "KafkaSink", "AzureEventHubsSink", "KinesisSink", "FirehoseSink",
-        "SNSSink", "SQSSink", "MongoDBSink", "SyslogSink", "LogstashSink", "PostgresSink",
-        "RedisStreamsSink", "RedisListSink", "GooglePubSubSink",
-        "HTTPSink", "DatadogSink", "ElasticsearchSink", "OpenSearchSink", "HoneycombSink",
-        "LokiSink", "NewRelicSink", "OTLPSink", "SplunkHECSink",
-        "NATSSink", "SentrySink", "TransformSink",
+        "StdoutSink",
+        "StderrSink",
+        "FileSink",
+        "RotatingFileSink",
+        "SQLiteSink",
+        "ClickHouseSink",
+        "RabbitMQSink",
+        "KafkaSink",
+        "AzureEventHubsSink",
+        "KinesisSink",
+        "FirehoseSink",
+        "SNSSink",
+        "SQSSink",
+        "MongoDBSink",
+        "SyslogSink",
+        "LogstashSink",
+        "PostgresSink",
+        "RedisStreamsSink",
+        "RedisListSink",
+        "GooglePubSubSink",
+        "HTTPSink",
+        "DatadogSink",
+        "ElasticsearchSink",
+        "OpenSearchSink",
+        "HoneycombSink",
+        "LokiSink",
+        "NewRelicSink",
+        "OTLPSink",
+        "SplunkHECSink",
+        "NATSSink",
+        "SentrySink",
+        "TransformSink",
     }
 )
 """The population the derivation must find; a floor, not the set.
@@ -299,10 +326,18 @@ silently as a deletion.
 
 NOT_YET_CONVERTED: frozenset[str] = frozenset(
     {
-        "StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "SQLiteSink", "ClickHouseSink",
-        "RabbitMQSink", "KafkaSink", "AzureEventHubsSink", "KinesisSink", "FirehoseSink",
-        "SNSSink", "SQSSink", "MongoDBSink", "SyslogSink", "LogstashSink", "PostgresSink",
-        "RedisStreamsSink", "RedisListSink", "GooglePubSubSink",
+        "SQLiteSink",
+        "KinesisSink",
+        "FirehoseSink",
+        "SNSSink",
+        "SQSSink",
+        "MongoDBSink",
+        "SyslogSink",
+        "LogstashSink",
+        "PostgresSink",
+        "RedisStreamsSink",
+        "RedisListSink",
+        "GooglePubSubSink",
     }
 )
 """The sinks the build has not converted yet, held exact so each conversion removes its entry."""
@@ -328,8 +363,15 @@ def test_the_roster_finds_its_floor() -> None:
     assert not lost, f"the derivation lost {sorted(lost)}"
     assert roster.of("exempt") == {"NATSSink", "SentrySink", "TransformSink"}
     assert roster.of("http") == {
-        "HTTPSink", "DatadogSink", "ElasticsearchSink", "OpenSearchSink", "HoneycombSink",
-        "LokiSink", "NewRelicSink", "OTLPSink", "SplunkHECSink",
+        "HTTPSink",
+        "DatadogSink",
+        "ElasticsearchSink",
+        "OpenSearchSink",
+        "HoneycombSink",
+        "LokiSink",
+        "NewRelicSink",
+        "OTLPSink",
+        "SplunkHECSink",
     }
 
 
@@ -367,19 +409,17 @@ class Ledger:
         return False
 """
 
+
 def _bare(cls: str, where: str) -> str:
     """The C1 finding text, with ``{m}`` left for the fixture module's name."""
-    return (
-        "{m}: " + f"{cls}.emit reaches json.dumps in {where} outside an encode function handed "
-        "to encode_events"
-    )
+    tail = f"{cls}.emit reaches json.dumps in {where} outside an encode function handed to"
+    return "{m}: " + tail + " encode_events"
 
 
 def _unresolved(cls: str, shown: str) -> str:
     """The C2 finding text, with ``{m}`` left for the fixture module's name."""
-    return "{m}: " + f"{cls}.emit hands encode_events an encode argument the roster cannot " + (
-        f"resolve: {shown}"
-    )
+    tail = f"{cls}.emit hands encode_events an encode argument the roster cannot resolve:"
+    return "{m}: " + tail + f" {shown}"
 
 
 _CASES: dict[str, tuple[str, list[str], dict[str, str]]] = {
@@ -488,8 +528,7 @@ class Sink:
         with Ledger() as pending:
             return encode_events(batch, lambda e: json.dumps(e), pending, sink="Sink")
 """,
-        [_unresolved("Sink", "lambda e: json.dumps(e)"),
-         _bare("Sink", "Sink.emit")],
+        [_unresolved("Sink", "lambda e: json.dumps(e)"), _bare("Sink", "Sink.emit")],
         {"Sink": "unconverted"},
     ),
     "local-encode": (
