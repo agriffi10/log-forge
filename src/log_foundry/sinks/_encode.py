@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag
 from log_foundry.sanitize import int_placeholder
@@ -150,7 +150,10 @@ def _marked(repaired: object) -> dict[str, object]:
     """Sets the ``truncated`` mark on a repaired event.
 
     Args:
-      repaired: The rebuilt top-level event, a ``dict`` because its input was one.
+      repaired: The rebuilt top-level event. :func:`_walk` rebuilds a ``dict`` as a ``dict``
+        and both callers hand it the event, so it is always one; the cast says so to the type
+        checker rather than testing it, since a test with a fallback would turn an impossible
+        shape into a silently emptied event.
 
     Returns:
       The same dict, marked.
@@ -158,7 +161,7 @@ def _marked(repaired: object) -> dict[str, object]:
     Raises:
       None.
     """
-    event = repaired if isinstance(repaired, dict) else {}
+    event = cast("dict[str, object]", repaired)
     event[_TRUNCATED] = True
     return event
 

@@ -139,6 +139,7 @@ class _Stream:
         return len(data)
 
     def flush(self) -> None:
+        self._state.log.append(("flush", None))
         if self._state.down:
             raise OSError(28, "No space left on device")
 

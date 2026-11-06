@@ -219,7 +219,9 @@ def test_a_batch_of_nothing_encodable_settles(
     assert rig.calls() == 0
     assert rig.count() == 3
     assert read_losses(rig.sink) == SinkLosses(dropped=3, failed=0)
-    assert len(_encode_lines(capsys.readouterr().err)) == 1
+    assert capsys.readouterr().err == (
+        f"log-foundry: lost 3 event(s); {name}, encoding raised TypeError\n"
+    )
 
 
 CLOSABLE = [

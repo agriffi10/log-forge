@@ -530,6 +530,15 @@ class Rogue(HTTPSink):
         [_bare("Rogue", "Rogue._items")],
         {"Rogue": "unconverted"},
     ),
+    "http-emit-overridden": (
+        """
+class Rogue2(HTTPSink):
+    def emit(self, batch):
+        return [json.dumps(event) for event in batch]
+""",
+        [_bare("Rogue2", "Rogue2.emit")],
+        {"Rogue2": "unconverted"},
+    ),
     "silent-converted": (
         """
 class Sink:
