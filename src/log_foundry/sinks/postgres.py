@@ -9,7 +9,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_nul
 from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -431,6 +431,17 @@ class PostgresSink:
     def _row(self, event: dict[str, object]) -> tuple[object, ...]:
         """Builds one row: the extracted columns, then the whole event as JSON.
 
+        **A U+0000 is repaired, not refused** (SPEC-069 FR-003). PostgreSQL refuses it in
+        ``jsonb`` and psycopg refuses it in a text column, and either used to fail the whole
+        transaction; assembly lets it through, and ``configure(service=...)`` stamps it on every
+        event. The JSON text this builds anyway is searched with
+        :data:`~log_foundry.sinks._encode.NUL_ESCAPE`, so a clean event costs one search, and
+        only on a match is the event rebuilt by
+        :func:`~log_foundry.sinks._encode.repair_nul` — every U+0000 in a string or key, at any
+        depth, becomes U+FFFD on a copy marked ``truncated`` — and encoded again. The columns
+        are read from the same copy. The six characters ``\\u0000`` written as text are left
+        alone, since JSONB accepts them.
+
         Args:
           event: The event to convert.
 
@@ -443,7 +454,13 @@ class PostgresSink:
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
         """
-        return (*(event.get(col) for col in _COLUMNS), json.dumps(event))
+        text = json.dumps(event)
+        source = event
+        if NUL_ESCAPE.search(text):
+            repaired = repair_nul(event)
+            if repaired is not None:
+                source, text = repaired, json.dumps(repaired)
+        return (*(source.get(col) for col in _COLUMNS), text)
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

@@ -496,7 +496,38 @@ class _Cursor:
         pass
 
     def executemany(self, sql: str, rows: list[tuple[object, ...]]) -> None:
-        self._state.call([tuple(r) for r in rows])
+        rows = [tuple(r) for r in rows]
+        if any(_postgres_refuses(row) for row in rows):
+            self._state.log.append(("refused", None))
+            raise _UntranslatableCharacter("unsupported Unicode escape sequence")
+        self._state.call(rows)
+
+
+class _UntranslatableCharacter(Exception):
+    """Stands in for psycopg's ``UntranslatableCharacter`` (SQLSTATE 22P05) and ``DataError``."""
+
+
+def _holds_nul(value: object) -> bool:
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, dict):
+        return any(_holds_nul(k) or _holds_nul(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_holds_nul(v) for v in value)
+    return False
+
+
+def _postgres_refuses(row: tuple[object, ...]) -> bool:
+    """What PostgreSQL refuses, modelled without reading the sink's own detector.
+
+    The JSONB parameter is parsed and walked for U+0000 in any string or key — a ``\\u0000``
+    escape parses to one, the six characters written as text do not — and every string column
+    is checked for U+0000, which psycopg refuses client-side.
+    """
+    *columns, document = row
+    if any(_holds_nul(column) for column in columns):
+        return True
+    return isinstance(document, str) and _holds_nul(json.loads(document))
 
 
 class _PGConnection:

@@ -252,6 +252,7 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("PostgresSink", "_insert_batch"): frozenset({"failed"}),
     ("PostgresSink", "_reconnect_if_broken"): frozenset({"_conn", "_reconnect_announced"}),
     ("_RedisSink", "_send"): frozenset({"failed"}),
+    ("MongoDBSink", "_resolve_bson"): frozenset({"_bson_encode", "_bson_resolved"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -305,6 +306,8 @@ counts as it happens rather than through the ``Deferral``:
   both retry loops and left these as they were.
 - ``PostgresSink._reconnect_if_broken`` / ``_conn``, ``_reconnect_announced``: the held connection,
   reopened when broken, and its once-per-outage flag; state, not a count.
+- ``MongoDBSink._resolve_bson`` / ``_bson_encode``, ``_bson_resolved``: the driver's own encoder,
+  found lazily on the first emit as the BSON detector (SPEC-069 FR-003); state, not a count.
 
 ``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
 ``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).

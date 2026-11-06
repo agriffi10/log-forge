@@ -230,6 +230,31 @@ def _int_digit_ceiling(max_value_bytes: int) -> int:
     return max_value_bytes if limit <= 0 else min(max_value_bytes, limit)
 
 
+def int_placeholder(value: int) -> str:
+    """Renders the ``<int: ~N digits>`` placeholder for an integer, never converting it.
+
+    The expression :func:`_int_text` uses for its placeholder, written once so a sink that must
+    replace an integer its destination refuses — ``MongoDBSink``, for one outside BSON's signed
+    64-bit range (SPEC-069 FR-003) — writes exactly the text assembly writes. ``N`` comes from
+    ``bit_length()`` through :data:`_INT_BIT_LENGTH`, so it is never the value's own digits and
+    a subclass cannot choose it, and it can overcount by one. The other copies keep the
+    expression inline — ``_Coercer``'s two, because they run once per integer, and
+    ``_otel._int_digits``, a leaf that imports nothing from the package — and a test holds all
+    of them equal to this one.
+
+    Args:
+      value: The integer to name, possibly a subclass instance.
+
+    Returns:
+      The placeholder naming the estimated digit count.
+
+    Raises:
+      None.
+    """
+    digits = _INT_BIT_LENGTH(value) * _LOG10_2_NUM // _LOG10_2_DEN + 1
+    return f"<int: ~{digits} digits>"
+
+
 def _int_text(value: int) -> str:
     """Returns an integer's digits for a refusal message, or ``<int: ~N digits>`` when too long.
 
@@ -267,7 +292,7 @@ def _int_text(value: int) -> str:
     limit = sys.get_int_max_str_digits()
     ceiling = default if limit <= 0 else min(limit, default)
     if rendered > ceiling:
-        return f"<int: ~{digits} digits>"
+        return int_placeholder(value)
     return int.__repr__(value)
 
 

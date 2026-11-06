@@ -15,6 +15,7 @@ the ``_stage`` their base ``emit`` calls, and the HTTP subclasses override ``_re
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
 import importlib.util
 import inspect
@@ -30,7 +31,7 @@ import pytest
 
 import log_foundry
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_bson, repair_nul
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -649,3 +650,114 @@ def test_an_unreadable_source_fails_closed() -> None:
         http_items=None,
     )
     assert roster.findings == ["Blind.emit: source unreadable; the roster is blind there"]
+
+
+# --- FR-003: the destination repairs ----------------------------------------------------------
+
+
+_DETECTOR_CASES = [
+    ("a NUL in a value", {"a": "x\x00y"}, True),
+    ("a NUL in a key", {"k\x00": 1}, True),
+    ("a NUL nested", {"l": [{"x": "\x00"}]}, True),
+    ("the six characters", {"a": "\\u0000"}, False),
+    ("a backslash before the six", {"a": "\\\\u0000"}, False),
+    ("a real NUL after a backslash", {"a": "\\\x00"}, True),
+    ("a clean event", {"a": "b"}, False),
+]
+"""The seven cases the spec measured against PostgreSQL 17, written out as literals."""
+
+
+@pytest.mark.parametrize(
+    ("label", "event", "refused"), _DETECTOR_CASES, ids=[c[0] for c in _DETECTOR_CASES]
+)
+def test_the_nul_detector_matches_what_postgres_refuses(
+    label: str, event: dict[str, object], refused: bool
+) -> None:
+    """FR-003: a real U+0000 matches, the six characters ``\\u0000`` as text do not."""
+    assert bool(NUL_ESCAPE.search(json.dumps(event))) is refused
+
+
+def test_the_detector_and_the_repair_agree_on_every_case() -> None:
+    for _, event, refused in _DETECTOR_CASES:
+        assert (repair_nul(event) is not None) is refused, event
+
+
+def test_repair_nul_replaces_every_nul_on_a_marked_copy() -> None:
+    event = {
+        "service": "s\x00x",
+        "fields": {"k\x00ey": "a\x00b", "deep": [{"z": "\x00"}, "\x00\x00", 7]},
+        "n": 1,
+    }
+    before = copy.deepcopy(event)
+    repaired = repair_nul(event)
+    assert event == before, "the batch is never mutated"
+    assert repaired == {
+        "service": "s�x",
+        "fields": {"k�ey": "a�b", "deep": [{"z": "�"}, "��", 7]},
+        "n": 1,
+        "truncated": True,
+    }
+
+
+def test_two_keys_repairing_to_one_text_keep_the_later_value() -> None:
+    assert repair_nul({"k\x00": 1, "k�": 2}) == {"k�": 2, "truncated": True}
+    assert repair_nul({"k�": 1, "k\x00": 2}) == {"k�": 2, "truncated": True}
+
+
+def test_repair_nul_leaves_a_clean_event_alone() -> None:
+    assert repair_nul({"a": "\x01", "b": "\\u0000", "c": [1, {"d": None}]}) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "replaced"),
+    [
+        (2**63, True),
+        (-(2**63) - 1, True),
+        (2**64, True),
+        (2**63 - 1, False),
+        (-(2**63), False),
+        (True, False),
+    ],
+    ids=["2**63", "-2**63-1", "2**64", "2**63-1", "-2**63", "True"],
+)
+def test_repair_bson_replaces_an_integer_outside_int64(value: int, replaced: bool) -> None:
+    from log_foundry.sanitize import int_placeholder
+
+    event = {"fields": {"n": value}}
+    repaired = repair_bson(event)
+    if replaced:
+        assert repaired == {"fields": {"n": int_placeholder(value)}, "truncated": True}
+    else:
+        assert repaired is None
+
+
+def test_repair_bson_fixes_a_nul_key_and_leaves_a_nul_value() -> None:
+    event = {"fields": {"k\x00": "v\x00"}}
+    assert repair_bson(event) == {"fields": {"k�": "v\x00"}, "truncated": True}
+    assert repair_bson({"fields": {"k": "v\x00"}}) is None
+    assert event == {"fields": {"k\x00": "v\x00"}}
+
+
+@pytest.mark.parametrize(
+    "number",
+    [10**5000, -(10**5000), 10**9000, -(10**9000)],
+    ids=["10**5000", "-10**5000", "10**9000", "-10**9000"],
+)
+def test_the_placeholder_sites_agree(number: int) -> None:
+    """FR-003: every inline copy of the placeholder writes ``int_placeholder``'s text.
+
+    The inputs are past every site's ceiling at the default limit and the default
+    ``max_value_bytes``, where each site renders the placeholder; the sites' thresholds differ
+    near 4300 digits and under ``set_int_max_str_digits(0)``, so no input straddles one.
+    """
+    from log_foundry._otel import _int_digits
+    from log_foundry.config import Config
+    from log_foundry.sanitize import _Coercer, _int_text, int_placeholder
+
+    assert sys.get_int_max_str_digits() == sys.int_info.default_max_str_digits
+    expected = int_placeholder(number)
+    assert expected.startswith("<int: ~") and expected.endswith(" digits>")
+    assert _int_text(number) == expected
+    assert _Coercer(Config())._bounded_int(number)[0] == expected
+    assert _Coercer(Config()).integer(number) == expected
+    assert _int_digits(number) == (expected, True)

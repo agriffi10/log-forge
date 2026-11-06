@@ -6,9 +6,13 @@ in ``tests/test_encode.py`` derives from the tree, so a sink cannot join the hel
 
 from __future__ import annotations
 
+import copy
+import json
 import os
 import socket
-from typing import TYPE_CHECKING
+import sys
+import types
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -763,3 +767,278 @@ def test_a_default_process_logging_clean_events_reports_no_sink_losses(
     assert log_foundry.flush()
     assert log_foundry.health().sink is None
     assert '"message": "inside"' in capsys.readouterr().out
+
+
+# --- FR-003: PostgreSQL's U+0000 is repaired, marked and delivered --------------------------
+
+_PG_COLUMNS = ("timestamp", "level", "trace_id", "span_id", "function", "service")
+
+
+def _pg_rows(rig: Any) -> list[tuple[object, ...]]:
+    return [row for payload in rig.handoffs() for row in payload]
+
+
+def _pg_documents(rig: Any) -> list[dict[str, Any]]:
+    return [json.loads(row[-1]) for row in _pg_rows(rig)]
+
+
+def test_postgres_repairs_a_nul_and_delivers_the_batch_in_one_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-003 AC1: three events, one transaction, one attempt; only the repaired one is marked."""
+    rig = RIGS["PostgresSink"](monkeypatch, tmp_path)
+    a, b = ok("a"), ok("b")
+    nul = {"log_id": "n", "fields": {"s": "x\x00y"}}
+    rig.sink.emit([a, nul, b])
+    assert [kind for kind, _ in rig.state.log] == ["handoff"], "one executemany, one attempt"
+    rows = _pg_rows(rig)
+    assert [rows[0][-1], rows[2][-1]] == [json.dumps(a), json.dumps(b)]
+    assert json.loads(rows[1][-1]) == {
+        "log_id": "n",
+        "fields": {"s": "x�y"},
+        "truncated": True,
+    }
+    assert (rig.count(), rig.sink.failed) == (0, 0)
+    assert capsys.readouterr().err == ""
+
+
+@pytest.mark.parametrize(
+    ("label", "event", "where"),
+    [
+        ("key", {"log_id": "n", "fields": {"k\x00": 1}}, None),
+        ("nested-list", {"log_id": "n", "fields": {"l": [1, ["a\x00"]]}}, None),
+        *[(col, {"log_id": "n", col: "v\x00"}, col) for col in _PG_COLUMNS],
+    ],
+    ids=lambda v: v if isinstance(v, str) else "",
+)
+def test_postgres_repairs_a_nul_wherever_it_sits(
+    label: str,
+    event: dict[str, object],
+    where: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FR-003 AC2: a key, a nested list and each of the six text columns."""
+    rig = RIGS["PostgresSink"](monkeypatch, tmp_path)
+    rig.sink.emit([event])
+    (row,) = _pg_rows(rig)
+    document = json.loads(row[-1])
+    assert document["truncated"] is True
+    assert "\x00" not in json.dumps(document, ensure_ascii=False)
+    if where is not None:
+        assert row[_PG_COLUMNS.index(where)] == "v�"
+        assert document[where] == "v�"
+
+
+@pytest.mark.parametrize(
+    "text", ["\\u0000", "\\\\u0000", "\x01"], ids=["six-chars", "backslash-six", "u0001"]
+)
+def test_postgres_leaves_lookalikes_unchanged(
+    text: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC4: no U+0000, no repair, no ``truncated`` key."""
+    rig = RIGS["PostgresSink"](monkeypatch, tmp_path)
+    event = {"log_id": "n", "fields": {"s": text}}
+    rig.sink.emit([event])
+    assert _pg_documents(rig) == [event]
+
+
+def test_postgres_repair_leaves_the_sibling_the_original(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC7: the repair never mutates the batch a ``MultiSink`` sibling also receives."""
+    from log_foundry.sinks.memory import MemorySink
+    from log_foundry.sinks.multi import MultiSink
+
+    rig = RIGS["PostgresSink"](monkeypatch, tmp_path)
+    memory = MemorySink()
+    batch = [ok("a"), {"log_id": "n", "service": "s\x00x"}]
+    before = copy.deepcopy(batch)
+    MultiSink(rig.sink, memory).emit(batch)
+    assert batch == before
+    assert memory.events[1]["service"] == "s\x00x"
+    assert _pg_documents(rig)[1]["service"] == "s�x"
+
+
+def test_a_nul_service_stamp_is_repaired_on_every_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC3: ``configure(service="s\\x00x")`` — every event of a traced call lands repaired."""
+    import log_foundry
+
+    rig = RIGS["PostgresSink"](monkeypatch, tmp_path)
+    log_foundry.configure(service="s\x00x", sink=rig.sink)
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("inside")
+
+    work()
+    assert log_foundry.flush()
+    rows = _pg_rows(rig)
+    assert len(rows) >= 2
+    for row in rows:
+        assert row[_PG_COLUMNS.index("service")] == "s�x"
+        document = json.loads(row[-1])
+        assert (document["service"], document["truncated"]) == ("s�x", True)
+    health = log_foundry.health()
+    assert health.failed_batches == 0
+    assert health.sink == SinkLosses(dropped=0, failed=0)
+
+
+def test_the_orphan_path_delivers_a_repaired_event(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC10: one U+0000 event outside a span is inserted repaired, nothing counted."""
+    import log_foundry
+
+    rig = RIGS["PostgresSink"](monkeypatch, tmp_path)
+    log_foundry.configure(service="t", sink=rig.sink)
+    log_foundry.info("outside", note="a\x00b")
+    (document,) = _pg_documents(rig)
+    assert document["fields"]["note"] == "a�b"
+    assert document["truncated"] is True
+    health = log_foundry.health()
+    assert health.orphan_lost == 0
+    assert health.sink == SinkLosses(dropped=0, failed=0)
+
+
+# --- FR-003: MongoDB's BSON refusals are repaired, marked and delivered ---------------------
+
+
+class InvalidDocument(Exception):
+    """Stands in for ``bson.errors.InvalidDocument``."""
+
+
+def _bson_like(value: object) -> None:
+    """What ``bson.encode`` refuses, as the spec measured it: 64-bit overflow and a NUL key."""
+    if isinstance(value, bool):
+        return
+    if isinstance(value, int) and not -(2**63) <= value <= 2**63 - 1:
+        raise OverflowError("MongoDB can only handle up to 8-byte ints")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str) and "\x00" in key:
+                raise InvalidDocument("key must not contain '\\x00'")
+            _bson_like(item)
+    if isinstance(value, list):
+        for item in value:
+            _bson_like(item)
+
+
+def _install_bson(monkeypatch: pytest.MonkeyPatch, encode: Any) -> None:
+    module = types.ModuleType("bson")
+    if encode is not None:
+        module.encode = encode  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "bson", module)
+
+
+def _measured_bson(document: object) -> bytes:
+    _bson_like(document)
+    return b""
+
+
+@pytest.mark.parametrize(
+    ("value", "replaced"),
+    [(2**63, True), (-(2**63) - 1, True), (2**64, True), (2**63 - 1, False), (-(2**63), False)],
+    ids=["2**63", "-2**63-1", "2**64", "2**63-1", "-2**63"],
+)
+def test_mongo_repairs_an_integer_bson_refuses(
+    value: int, replaced: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC5: out of int64 becomes ``int_placeholder``'s text, marked; in range is left."""
+    from log_foundry.sanitize import int_placeholder
+
+    _install_bson(monkeypatch, _measured_bson)
+    rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    event = {"log_id": "n", "fields": {"n": value}}
+    rig.sink.emit([event])
+    (document,) = rig.handoffs()[0]
+    if replaced:
+        assert document == {
+            "log_id": "n",
+            "fields": {"n": int_placeholder(value)},
+            "truncated": True,
+        }
+    else:
+        assert document == event
+    assert rig.count() == 0
+
+
+def test_mongo_repairs_a_nul_key_and_leaves_a_nul_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC6: a NUL key becomes U+FFFD, marked; a NUL value is untouched; collisions."""
+    _install_bson(monkeypatch, _measured_bson)
+    rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    rig.sink.emit(
+        [
+            {"log_id": "k", "fields": {"k\x00": 1}},
+            {"log_id": "v", "fields": {"k": "v\x00"}},
+            {"log_id": "c", "fields": {"k\x00": 1, "k�": 2}},
+        ]
+    )
+    assert rig.handoffs()[0] == [
+        {"log_id": "k", "fields": {"k�": 1}, "truncated": True},
+        {"log_id": "v", "fields": {"k": "v\x00"}},
+        {"log_id": "c", "fields": {"k�": 2}, "truncated": True},
+    ]
+
+
+def test_a_bson_that_refuses_everything_drops_each_event_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-003 AC8: refused before and after the repair, each event is unencodable, counted once."""
+
+    def refuse(document: object) -> bytes:
+        raise InvalidDocument("refused")
+
+    _install_bson(monkeypatch, refuse)
+    rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    rig.sink.emit([{"log_id": "a", "fields": {"n": 2**64}}, ok("b")])
+    assert rig.calls() == 0
+    assert rig.count() == 2
+    assert _encode_lines(capsys.readouterr().err) == [
+        "log-foundry: lost 2 event(s); MongoDBSink, encoding raised InvalidDocument"
+    ]
+
+
+@pytest.mark.parametrize("shape", ["missing", "no-encode"])
+def test_mongo_without_a_usable_bson_inserts_everything(
+    shape: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC8: no ``bson``, or one without ``encode``, disables the check; nothing is imported
+    at construction when a client is injected."""
+    reads: list[str] = []
+
+    class Spy(types.ModuleType):
+        def __getattr__(self, name: str) -> object:
+            reads.append(name)
+            raise AttributeError(name)
+
+    if shape == "missing":
+        monkeypatch.setitem(sys.modules, "bson", None)
+    else:
+        monkeypatch.setitem(sys.modules, "bson", Spy("bson"))
+    rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    assert reads == [], "construction over an injected client reads nothing from bson"
+    event = {"log_id": "n", "fields": {"n": 2**64, "k\x00": 1}}
+    rig.sink.emit([event])
+    assert rig.handoffs() == [[event]]
+    assert rig.count() == 0
+    if shape == "no-encode":
+        assert "encode" in reads, "resolved on the first emit"
+
+
+def test_an_unencodable_oversized_document_counts_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-003 AC9: BSON-refused after repair and over 16 MB is ``_unencodable``, not oversize."""
+
+    def refuse(document: object) -> bytes:
+        raise InvalidDocument("refused")
+
+    _install_bson(monkeypatch, refuse)
+    rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    rig.sink.emit([{"log_id": "big", "pad": "x" * (17 * 1024 * 1024), "n": 2**64}])
+    assert (rig.sink._unencodable, rig.sink.dropped_oversized) == (1, 0)

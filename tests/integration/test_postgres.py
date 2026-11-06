@@ -128,3 +128,32 @@ def test_a_borrowed_connection_is_left_to_its_owner(
     with pytest.raises(SinkDeliveryError):
         sink.emit([event(2)])
     assert sink._conn is borrowed
+
+
+def test_a_nul_is_repaired_and_the_whole_batch_lands(
+    services_are_up: dict[str, Endpoint], table: str
+) -> None:
+    """SPEC-069 FR-003: one U+0000 no longer rolls back the batch; three rows land, one repaired.
+
+    The real server is what refuses U+0000 in ``jsonb`` and psycopg what refuses it in a text
+    column, so this settles what the unit tests' double only models.
+    """
+    endpoint = services_are_up["postgres"]
+    sink = PostgresSink(table, dsn=dsn(endpoint), create_table=True, max_retries=0)
+    nul = {**event(2), "service": "s\x00x", "fields": {"k\x00": "a\x00b"}}
+    lookalike = {**event(3), "fields": {"text": "\\u0000"}}
+    sink.emit([event(1), nul, lookalike])
+    assert sink.losses().failed == 0
+    sink.close()
+
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT service, event FROM {table} ORDER BY id")
+        rows = cur.fetchall()
+
+    assert len(rows) == 3
+    assert rows[1][0] == "s�x"
+    assert rows[1][1]["fields"] == {"k�": "a�b"}
+    assert rows[1][1]["truncated"] is True
+    assert "truncated" not in rows[0][1]
+    assert rows[2][1]["fields"] == {"text": "\\u0000"}
+    assert "truncated" not in rows[2][1]
