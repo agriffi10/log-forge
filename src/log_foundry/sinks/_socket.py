@@ -131,6 +131,8 @@ class SocketTransport:
         ``max_datagram_bytes``, counted and announced only when ``emit`` returns — the calling
         sink's, whose ``Deferral`` :meth:`send_all` is handed (SPEC-059 FR-002) — so a batch the
         worker retries counts its oversized frame once, and one it abandons not at all.
+      _unencodable: Events the calling sink could not encode into a frame (SPEC-069 FR-001),
+        committed through the same ledger; private, and reported in ``losses().dropped``.
 
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``send_all`` puts the bytes on the
@@ -203,6 +205,7 @@ class SocketTransport:
         self._sock: socket.socket | None = None
         self.failed = 0
         self.dropped_oversized = 0
+        self._unencodable = 0
         self._counter_lock = threading.Lock()
         self.log_foundry_stop_signal: threading.Event | None = None
         self._lock = threading.Lock()
@@ -228,6 +231,12 @@ class SocketTransport:
         than counting at once. The commit runs after this call has released the send lock, so
         the datagram-limit line is never written under it.
 
+        **An empty call is refused by a closed transport too** (SPEC-069 FR-002). A sink whose
+        every event was unencodable hands over an empty list, and that batch settles only if the
+        transport is open: the closed check runs first, so such a call on a closed transport
+        raises and the ledger, its unencodable count included, is discarded, as for any other
+        closed sink. The empty return used to come before the check.
+
         Args:
           messages: The exact bytes to put on the wire, one call per message.
           pending: The calling sink's ``emit``'s deferral, owned by this transport, which holds
@@ -240,18 +249,19 @@ class SocketTransport:
           SinkDeliveryError: When none of the messages reached the socket, so the sinks built on
             this transport propagate a dead destination to the worker instead of reporting
             success (SPEC-026 FR-001). A partial send does not raise, because the worker's retry
-            would re-send the messages that already landed, and an empty call is a no-op rather
-            than a total failure. Also when the transport is already closed, before anything is
-            decided. Either raise leaves nothing in ``pending`` counted.
+            would re-send the messages that already landed, and an empty call on an open
+            transport is a no-op rather than a total failure. Also when the transport is already
+            closed, before anything is decided, an empty call included. Either raise leaves
+            nothing in ``pending`` counted.
         """
-        if not messages:
-            return
         with self._lock:
             if self._closed:
                 raise SinkDeliveryError(
                     f"SocketTransport delivered none of {len(messages)} message(s): "
                     f"the transport is closed"
                 )
+            if not messages:
+                return
             sendable = self._sendable(messages, pending)
             delivered = 0
             for message in sendable:
@@ -314,6 +324,9 @@ class SocketTransport:
     def losses(self) -> SinkLosses:
         """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
 
+        ``dropped`` is the oversized datagrams plus the events the calling sink could not encode
+        (SPEC-069 FR-001); ``dropped_oversized`` still means oversize only.
+
         Args:
           None.
 
@@ -324,7 +337,9 @@ class SocketTransport:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
+            )
 
     def close(self) -> None:
         """Closes the held socket, if any (FR-005, FR-012).

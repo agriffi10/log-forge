@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 
 from log_foundry import _lifecycle
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink, _valid_url
@@ -205,6 +206,12 @@ class LogstashSink:
         A raise discards it, and the worker's retry decides it afresh rather than counting it
         once per attempt. The HTTP branch delegates to ``HTTPSink.emit``, which enters its own.
 
+        In socket mode every event is framed through the encode helper before anything is
+        handed to the transport (SPEC-069 FR-001): one whose frame cannot be built is dropped,
+        counted on the transport and announced only when this call returns. A batch of nothing
+        encodable hands the transport an empty list, which settles on an open transport and is
+        refused by a closed one (FR-002). The HTTP mode is ``HTTPSink._items``' twin rule.
+
         Args:
           batch: The events to ship. An empty batch is a no-op.
 
@@ -220,9 +227,26 @@ class LogstashSink:
             self._http.emit(batch)
         else:
             assert self._socket is not None  # noqa: S101
-            frames = [(json.dumps(event) + "\n").encode("utf-8") for event in batch]
             with Deferral(self._socket) as pending:
-                self._socket.send_all(frames, pending)
+                frames = encode_events(batch, self._frame, pending, sink=type(self).__name__)
+                self._socket.send_all([frame for _, frame in frames], pending)
+
+    def _frame(self, event: dict[str, object]) -> bytes:
+        """Frames one event as a newline-terminated UTF-8 JSON line for the socket.
+
+        Args:
+          event: The event to frame.
+
+        Returns:
+          The exact bytes to put on the wire.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return (json.dumps(event) + "\n").encode("utf-8")
 
     def close(self) -> None:
         """Closes whichever backend is held (FR-005).

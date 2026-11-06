@@ -7,7 +7,9 @@ import sqlite3
 import threading
 
 from log_foundry.sinks._chunk import valid_identifier
-from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SQLiteSink"]
 
@@ -76,8 +78,31 @@ class SQLiteSink:
         )
         self._closed = False
         self._lock = threading.Lock()
+        self._unencodable = 0
+        self._counter_lock = threading.Lock()
         if create_table:
             self._ensure_schema()
+
+    def losses(self) -> SinkLosses | None:
+        """Reports what this sink could not encode, once it has anything (SPEC-069 FR-001).
+
+        ``None`` until something is counted, the rule ``wrapped_losses`` applies. Read under the
+        counter lock, never the emit lock, so a poll does not wait behind an insert (SPEC-028
+        FR-003).
+
+        Args:
+          None.
+
+        Returns:
+          ``None`` while nothing is counted, else the counters.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            if not self._unencodable:
+                return None
+            return SinkLosses(dropped=self._unencodable, failed=0)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts every event in one transaction (FR-003).
@@ -87,6 +112,11 @@ class SQLiteSink:
         (SPEC-028 FR-002). Row-building is deliberately *outside* it: those lines touch nothing
         shared, so serializing the ``json.dumps`` of a whole batch would lengthen the critical
         section for no gain.
+
+        Row-building runs through the encode helper (SPEC-069 FR-001), so an event whose row
+        cannot be built costs only itself, counted and announced when this call returns, rather
+        than the whole batch; a batch of nothing encodable runs no transaction and returns, once
+        the closed check has passed (FR-002).
 
         Args:
           batch: The events to insert.
@@ -105,17 +135,35 @@ class SQLiteSink:
         """
         if not batch:
             return
-        rows = [
-            (*(event.get(col) for col in _COLUMNS), json.dumps(event)) for event in batch
-        ]
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
-        with self._lock:
-            if self._closed:
-                raise SinkDeliveryError(
-                    f"SQLiteSink inserted none of {len(batch)} event(s): the sink is closed"
-                )
-            self._insert(rows, columns, placeholders)
+        with Deferral(self) as pending:
+            encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
+            with self._lock:
+                if self._closed:
+                    raise SinkDeliveryError(
+                        f"SQLiteSink inserted none of {len(batch)} event(s): the sink is closed"
+                    )
+                if not encoded:
+                    return
+                self._insert([row for _, row in encoded], columns, placeholders)
+
+    def _row(self, event: dict[str, object]) -> tuple[object, ...]:
+        """Builds one row: the projected columns, then the whole event as JSON.
+
+        Args:
+          event: The event to convert.
+
+        Returns:
+          The statement parameters, in column order.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return (*(event.get(col) for col in _COLUMNS), json.dumps(event))
 
     def _insert(
         self, rows: list[tuple[object, ...]], columns: str, placeholders: str

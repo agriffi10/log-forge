@@ -7,6 +7,8 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -68,12 +70,16 @@ class _RedisSink:
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
+        self._unencodable = 0
         self._counter_lock = threading.Lock()
         self._closed = False
         self._close_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
-        """Reports events abandoned past the retry bound (SPEC-026 FR-002).
+        """Reports unencodable events, and events abandoned past the retry bound.
+
+        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
+        events of a batch abandoned past the retry bound (SPEC-026 FR-002).
 
         Args:
           None.
@@ -85,7 +91,7 @@ class _RedisSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed)
+            return SinkLosses(dropped=self._unencodable, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Pipelines the whole batch into one round trip, retrying on error (FR-005).
@@ -96,6 +102,13 @@ class _RedisSink:
         caller's business, and is not permission to keep writing through a sink that has been
         released. Refusing moves no counter here — it is a failure reported to the worker, which
         records it in ``health().failed_batches``, not loss this sink absorbed.
+
+        Every event is encoded once, outside the retry loop and before the first pipeline
+        (SPEC-069 FR-001), so the loop stages the same payloads on every attempt. An event that
+        cannot be encoded is dropped, counted and announced only when this call returns; before,
+        the encode sat inside the loop, so one such event spent every attempt and cost the whole
+        batch, counted ``failed``. A batch of nothing encodable asks for no pipeline and returns
+        (FR-002). A spent bound still counts the whole batch in ``failed``, an upper bound.
 
         Args:
           batch: The events to buffer. An empty batch is a no-op.
@@ -116,11 +129,31 @@ class _RedisSink:
                 f"{type(self).__name__} delivered none of {len(batch)} event(s): "
                 "the sink is closed"
             )
+        with Deferral(self) as pending:
+            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            if not encoded:
+                return
+            self._send([payload for _, payload in encoded], len(batch))
+
+    def _send(self, payloads: list[str], batch_size: int) -> None:
+        """Pipelines the encoded payloads within the retry bound.
+
+        Args:
+          payloads: The encoded events, known non-empty.
+          batch_size: How many events the calling ``emit`` was handed, the ``failed`` count when
+            the bound is spent.
+
+        Returns:
+          None.
+
+        Raises:
+          SinkDeliveryError: When the retry bound is spent.
+        """
         for attempt in range(self.max_retries + 1):
             try:
                 pipe = self.client.pipeline()
-                for event in batch:
-                    self._stage(pipe, event)
+                for payload in payloads:
+                    self._stage(pipe, payload)
                 pipe.execute()
                 return
             except Exception as err:
@@ -128,14 +161,14 @@ class _RedisSink:
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
-                    self.failed += len(batch)
+                    self.failed += batch_size
                 _diag.lost(
                     "event",
-                    len(batch),
+                    batch_size,
                     f"{type(self).__name__}, {self.max_retries + 1} attempts, {type(err).__name__}",
                 )
                 raise SinkDeliveryError(
-                    f"{type(self).__name__} delivered none of {len(batch)} event(s)"
+                    f"{type(self).__name__} delivered none of {batch_size} event(s)"
                 ) from None
 
     def close(self) -> None:
@@ -162,12 +195,29 @@ class _RedisSink:
             if self._owns_client:
                 self.client.close()
 
-    def _stage(self, pipe: Any, event: dict[str, object]) -> None:
-        """Stages one event onto the pipeline, in whatever form the subclass writes.
+    def _encode(self, event: dict[str, object]) -> str:
+        """Encodes one event as the JSON text both Redis sinks write.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The JSON text.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event)
+
+    def _stage(self, pipe: Any, payload: str) -> None:
+        """Stages one encoded event onto the pipeline, in whatever form the subclass writes.
 
         Args:
           pipe: The open pipeline.
-          event: The event to stage.
+          payload: The event's JSON text, from :meth:`_encode`.
 
         Returns:
           None.
@@ -233,12 +283,12 @@ class RedisStreamsSink(_RedisSink):
         )
         super().__init__(client=client, url=url, max_retries=max_retries)
 
-    def _stage(self, pipe: Any, event: dict[str, object]) -> None:
+    def _stage(self, pipe: Any, payload: str) -> None:
         """Stages one ``XADD`` onto the pipeline.
 
         Args:
           pipe: The open pipeline.
-          event: The event to append.
+          payload: The event's JSON text, from :meth:`_encode`.
 
         Returns:
           None.
@@ -247,11 +297,9 @@ class RedisStreamsSink(_RedisSink):
           Exception: Whatever the client raises.
         """
         if self.maxlen is None:
-            pipe.xadd(self._stream, {"event": json.dumps(event)})
+            pipe.xadd(self._stream, {"event": payload})
         else:
-            pipe.xadd(
-                self._stream, {"event": json.dumps(event)}, maxlen=self.maxlen, approximate=True
-            )
+            pipe.xadd(self._stream, {"event": payload}, maxlen=self.maxlen, approximate=True)
 
 
 class RedisListSink(_RedisSink):
@@ -310,12 +358,12 @@ class RedisListSink(_RedisSink):
         )
         super().__init__(client=client, url=url, max_retries=max_retries)
 
-    def _stage(self, pipe: Any, event: dict[str, object]) -> None:
+    def _stage(self, pipe: Any, payload: str) -> None:
         """Stages one ``RPUSH`` onto the pipeline.
 
         Args:
           pipe: The open pipeline.
-          event: The event to push.
+          payload: The event's JSON text, from :meth:`_encode`.
 
         Returns:
           None.
@@ -323,6 +371,6 @@ class RedisListSink(_RedisSink):
         Raises:
           Exception: Whatever the client raises.
         """
-        pipe.rpush(self._key, json.dumps(event))
+        pipe.rpush(self._key, payload)
         if self.maxlen is not None:
             pipe.ltrim(self._key, -self.maxlen, -1)

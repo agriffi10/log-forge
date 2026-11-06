@@ -14,7 +14,7 @@ import pytest
 
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses, read_losses
 from sink_rigs import EIGHT, EVENTS, RIGS, ok, unencodable
-from test_encode import NOT_YET_CONVERTED, on_helper_public
+from test_encode import on_helper_public
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -99,7 +99,6 @@ def test_a_clean_batch_writes_the_same_bytes(
 
 # --- FR-001: one unencodable event costs only itself ----------------------------------------
 
-CONVERTED = sorted(set(RIGS) - NOT_YET_CONVERTED)
 _LINE = "encoding raised"
 
 
@@ -107,7 +106,7 @@ def _encode_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if _LINE in line]
 
 
-@pytest.mark.parametrize("name", CONVERTED)
+@pytest.mark.parametrize("name", ROSTER)
 def test_one_unencodable_event_costs_only_itself(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -123,7 +122,7 @@ def test_one_unencodable_event_costs_only_itself(
 
 
 @pytest.mark.parametrize("position", ["first", "middle", "last"])
-@pytest.mark.parametrize("name", [n for n in EIGHT if n in CONVERTED])
+@pytest.mark.parametrize("name", EIGHT)
 def test_nothing_is_handed_over_before_every_event_is_encoded(
     name: str, position: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -155,7 +154,7 @@ def test_nothing_is_handed_over_before_every_event_is_encoded(
     assert rig.count() == 1
 
 
-@pytest.mark.parametrize("name", CONVERTED)
+@pytest.mark.parametrize("name", ROSTER)
 def test_a_raising_call_counts_nothing_and_the_returning_one_counts_once(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -180,7 +179,7 @@ def test_a_raising_call_counts_nothing_and_the_returning_one_counts_once(
     assert rig.delivered() == ["a", "b"]
 
 
-@pytest.mark.parametrize("name", CONVERTED)
+@pytest.mark.parametrize("name", ROSTER)
 def test_a_baseexception_from_encode_propagates(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -206,7 +205,7 @@ def test_a_baseexception_from_encode_propagates(
 # --- FR-002: a batch with nothing encodable settles -----------------------------------------
 
 
-@pytest.mark.parametrize("name", CONVERTED)
+@pytest.mark.parametrize("name", ROSTER)
 def test_a_batch_of_nothing_encodable_settles(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -238,7 +237,7 @@ CLOSABLE = [
 """Every sink on the roster with a closed state; the two socket sinks hold theirs on the transport."""
 
 
-@pytest.mark.parametrize("name", [n for n in CLOSABLE if n in CONVERTED])
+@pytest.mark.parametrize("name", CLOSABLE)
 def test_a_closed_sink_still_raises_for_an_unencodable_batch(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -254,7 +253,7 @@ def test_a_closed_sink_still_raises_for_an_unencodable_batch(
 NEW_LOSSES = ["StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "SQLiteSink"]
 
 
-@pytest.mark.parametrize("name", [n for n in NEW_LOSSES if n in CONVERTED])
+@pytest.mark.parametrize("name", NEW_LOSSES)
 def test_a_new_losses_is_none_until_something_is_counted(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -265,3 +264,502 @@ def test_a_new_losses_is_none_until_something_is_counted(
     assert rig.sink.losses() is None
     rig.sink.emit([ok("c"), unencodable(), ok("d")])
     assert rig.sink.losses() == SinkLosses(dropped=1, failed=0)
+
+
+@pytest.mark.parametrize(
+    ("name", "method"),
+    [
+        ("PostgresSink", "_row"),
+        ("RedisStreamsSink", "_encode"),
+        ("RedisListSink", "_encode"),
+        ("ClickHouseSink", "_row"),
+    ],
+)
+def test_encode_runs_once_per_emit_not_per_attempt(
+    name: str, method: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-001 AC4: with three attempts, the encode function runs ``len(batch)`` times."""
+    rig = RIGS[name](monkeypatch, tmp_path)
+    rig.sink.max_retries = 2
+    rig.state.fail_next = 2
+    real = getattr(rig.sink, method)
+    calls: list[object] = []
+
+    def counted(event: dict[str, object]) -> object:
+        calls.append(event)
+        return real(event)
+
+    monkeypatch.setattr(rig.sink, method, counted)
+    batch = [ok("a"), ok("b"), ok("c")]
+    rig.sink.emit(batch)
+    assert [kind for kind, _ in rig.state.log].count("refused") == 2, "three attempts were made"
+    assert len(calls) == len(batch)
+    assert rig.delivered() == ["a", "b", "c"]
+
+
+@pytest.mark.parametrize("name", ["StdoutSink", "HTTPSink"])
+def test_the_line_names_class_and_type_only(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC5, over both twins: the helper's line and ``HTTPSink._items``' follow one rule.
+
+    A sentinel sits in the event and in the exception's message; neither may reach stderr, and
+    three failures write one line.
+    """
+    from log_foundry.sinks.http import HTTPSink
+    from test_sinks_http import FakeOpener
+
+    class Hostile:
+        def __repr__(self) -> str:
+            return "SENTINEL-in-the-message"
+
+    if name == "HTTPSink":
+        sink: object = HTTPSink("https://example.invalid/ingest", opener=FakeOpener())
+        verb = "rendering"
+    else:
+        sink = RIGS[name](monkeypatch, tmp_path).sink
+        verb = "encoding"
+    bad = [{"log_id": f"x{i}", "s": "SENTINEL-in-the-event", "h": Hostile()} for i in range(3)]
+    sink.emit([ok("a"), *bad])  # type: ignore[attr-defined]
+    err = capsys.readouterr().err
+    assert "SENTINEL" not in err
+    assert err.splitlines() == [f"log-foundry: lost 3 event(s); {name}, {verb} raised TypeError"]
+
+
+@pytest.mark.parametrize("name", ["SyslogSink", "LogstashSink"])
+def test_the_socket_sinks_count_on_the_transport(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-001 AC10: the count lives on the transport; ``dropped_oversized`` means oversize only."""
+    rig = RIGS[name](monkeypatch, tmp_path)
+    rig.sink.emit([ok("a"), unencodable()])
+    transport = rig.sink._socket
+    assert transport._unencodable == 1
+    assert transport.dropped_oversized == 0
+    assert rig.sink.losses() == SinkLosses(dropped=1, failed=0)
+
+
+def test_multisink_counts_an_unencodable_event_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-001 AC13: one term, once — the child settled, so ``MultiSink`` adds nothing."""
+    from log_foundry.sinks.memory import MemorySink
+    from log_foundry.sinks.multi import MultiSink
+
+    multi = MultiSink(RIGS["StdoutSink"](monkeypatch, tmp_path).sink, MemorySink())
+    multi.emit([ok("a"), unencodable(), ok("b")])
+    assert multi.losses() == SinkLosses(dropped=1, failed=0)
+
+
+def test_multisink_all_unencodable_is_one_term(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-002 AC5: a settled all-unencodable batch is in ``dropped`` alone, never also ``failed``."""
+    from log_foundry.sinks.memory import MemorySink
+    from log_foundry.sinks.multi import MultiSink
+
+    multi = MultiSink(RIGS["PostgresSink"](monkeypatch, tmp_path).sink, MemorySink())
+    multi.emit([unencodable("x"), unencodable("y")])
+    assert multi.losses() == SinkLosses(dropped=2, failed=0)
+
+
+@pytest.mark.parametrize("name", ["PostgresSink", "RedisStreamsSink", "RedisListSink"])
+def test_a_spent_bound_counts_the_whole_batch_in_failed(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``failed`` is the whole batch, the unencodable event included, as before SPEC-069."""
+    rig = RIGS[name](monkeypatch, tmp_path)
+    rig.state.down = True
+    with pytest.raises(SinkDeliveryError):
+        rig.sink.emit([ok("a"), unencodable()])
+    assert rig.sink.failed == 2
+    assert rig.count() == 0
+
+
+def test_a_failing_remainder_raises_and_counts_nothing_until_a_retry_returns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002 AC4: the unencodable count is decided by the call that finally returns."""
+    rig = RIGS["KafkaSink"](monkeypatch, tmp_path)
+    rig.state.down = True
+    with pytest.raises(SinkDeliveryError):
+        rig.sink.emit([ok("a"), unencodable(), ok("b")])
+    assert rig.count() == 0
+    assert _encode_lines(capsys.readouterr().err) == []
+    rig.state.down = False
+    rig.sink.emit([ok("a"), unencodable(), ok("b")])
+    assert rig.count() == 1
+
+
+# --- the declared exceptions -----------------------------------------------------------------
+
+
+def _nats() -> object:
+    from log_foundry.sinks.nats import NATSSink
+    from test_sinks_nats import SlowNATS
+
+    return NATSSink("logs", client=SlowNATS(per_event=0.0), jetstream=True, publish_timeout=30.0)
+
+
+def _sentry() -> object:
+    from log_foundry.sinks.sentry import SentrySink
+    from test_sinks_http import FakeOpener
+
+    return SentrySink(
+        dsn="https://pubkey@o123.ingest.sentry.io/456", backend="http", opener=FakeOpener()
+    )
+
+
+def _sentry_event(i: int, bad: bool) -> dict[str, object]:
+    return {"level": "ERROR", "message": f"m{i}", "fields": {"b": b"x"} if bad else {"n": i}}
+
+
+@pytest.mark.parametrize("build", [_nats, _sentry], ids=["nats", "sentry"])
+def test_the_declared_exceptions_still_count_failed(build) -> None:  # type: ignore[no-untyped-def]
+    """FR-001 AC12: one unencodable event among several is ``failed``, and ``dropped`` stays 0."""
+    sink = build()
+    try:
+        sink.emit([_sentry_event(0, False), _sentry_event(1, True), _sentry_event(2, False)])
+        assert read_losses(sink) == SinkLosses(dropped=0, failed=1)
+    finally:
+        sink.close()
+
+
+@pytest.mark.parametrize("build", [_nats, _sentry], ids=["nats", "sentry"])
+def test_the_declared_exceptions_still_raise(build) -> None:  # type: ignore[no-untyped-def]
+    """FR-002 AC7: a batch of nothing encodable raises as before, with ``failed`` counted."""
+    sink = build()
+    try:
+        with pytest.raises(SinkDeliveryError):
+            sink.emit([_sentry_event(0, True), _sentry_event(1, True)])
+        losses = read_losses(sink)
+        assert losses is not None and losses.dropped == 0 and losses.failed == 2
+    finally:
+        sink.close()
+
+
+# --- the worker and orphan paths -----------------------------------------------------------
+
+
+class AddsBytes:
+    """A third-party wrapper that makes every event unencodable after assembly, as FR-002 needs.
+
+    Assembly makes every event valid JSON (invariant 8), so the only routes to an unencodable
+    event are a wrapper like this one and a direct ``emit``. It delegates ``losses()`` so
+    ``health().sink`` reads the wrapped sink's counters.
+    """
+
+    def __init__(self, inner: object, *, only: str | None = None) -> None:
+        self.inner = inner
+        self.seen = 0
+        self._only = only
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        self.seen += len(batch)
+        self.inner.emit(  # type: ignore[attr-defined]
+            [
+                e if self._only and e.get("message") != self._only else {**e, "blob": b"x"}
+                for e in batch
+            ]
+        )
+
+    def losses(self) -> SinkLosses | None:
+        return read_losses(self.inner)
+
+    def close(self) -> None:
+        self.inner.close()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("name", ["PostgresSink", "KafkaSink", "GooglePubSubSink", "StdoutSink"])
+def test_the_worker_sees_a_settled_batch(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-002 AC2: a batch of nothing encodable settles on the worker path, counted once."""
+    import log_foundry
+
+    rig = RIGS[name](monkeypatch, tmp_path)
+    wrapper = AddsBytes(rig.sink)
+    log_foundry.configure(service="t", sink=wrapper)
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("one")
+        log_foundry.info("two")
+
+    work()
+    assert log_foundry.flush()
+    health = log_foundry.health()
+    assert wrapper.seen > 0
+    assert health.failed_batches == 0
+    assert health.sink == SinkLosses(dropped=wrapper.seen, failed=0)
+    assert rig.calls() == 0
+
+
+def test_the_worker_abandon_line_is_the_only_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC3: when the remainder fails every attempt, the unencodable event is never counted.
+
+    Every worker attempt raises, so every ledger is discarded; the worker's abandon line is the
+    batch's only count, and no encode line is ever written.
+    """
+    import log_foundry
+
+    rig = RIGS["KafkaSink"](monkeypatch, tmp_path)
+    rig.state.down = True
+    wrapper = AddsBytes(rig.sink, only="bad")
+    log_foundry.configure(service="t", sink=wrapper)
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("bad")
+
+    work()
+    log_foundry.flush()
+    health = log_foundry.health()
+    err = capsys.readouterr().err
+    assert health.failed_batches == 1
+    assert rig.count() == 0
+    assert _encode_lines(err) == []
+    assert "batch abandoned after" in err
+
+
+def test_the_orphan_path_settles_inside_the_sink(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-002 AC3: outside a span the one unencodable event is ``dropped``, never ``orphan_lost``."""
+    import log_foundry
+
+    rig = RIGS["StdoutSink"](monkeypatch, tmp_path)
+    log_foundry.configure(service="t", sink=AddsBytes(rig.sink))
+    log_foundry.info("outside any span")
+    health = log_foundry.health()
+    assert health.orphan_lost == 0
+    assert health.sink == SinkLosses(dropped=1, failed=0)
+    assert rig.calls() == 0
+
+
+BASE_PUBLIC: dict[str, frozenset[str]] = {
+    "AzureEventHubsSink": frozenset(
+        {
+            "close",
+            "dropped_oversized",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+            "producer",
+        }
+    ),
+    "ClickHouseSink": frozenset(
+        {"client", "close", "emit", "failed", "log_foundry_stop_signal", "losses", "max_retries"}
+    ),
+    "FileSink": frozenset({"close", "emit", "reacquire_after_fork"}),
+    "FirehoseSink": frozenset(
+        {
+            "MAX_RECORDS",
+            "MAX_RECORD_BYTES",
+            "MAX_REQUEST_BYTES",
+            "client",
+            "close",
+            "delivery_stream",
+            "dropped_oversized",
+            "dropped_unadjudicated",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+        }
+    ),
+    "GooglePubSubSink": frozenset(
+        {
+            "client",
+            "close",
+            "emit",
+            "failed",
+            "flush",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_pending",
+            "overflow_timeout",
+            "rejected",
+            "topic",
+        }
+    ),
+    "KafkaSink": frozenset(
+        {
+            "close",
+            "emit",
+            "failed",
+            "flush",
+            "flush_timeout",
+            "key_field",
+            "losses",
+            "producer",
+            "rejected",
+            "topic",
+        }
+    ),
+    "KinesisSink": frozenset(
+        {
+            "MAX_RECORDS",
+            "MAX_RECORD_BYTES",
+            "MAX_REQUEST_BYTES",
+            "client",
+            "close",
+            "dropped_oversized",
+            "dropped_unadjudicated",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+            "partition_key_field",
+            "stream_name",
+        }
+    ),
+    "LogstashSink": frozenset({"close", "emit", "failed", "log_foundry_stop_signal", "losses"}),
+    "MongoDBSink": frozenset(
+        {
+            "close",
+            "dropped_oversized",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+        }
+    ),
+    "PostgresSink": frozenset(
+        {
+            "close",
+            "connect_timeout",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+        }
+    ),
+    "RabbitMQSink": frozenset({"close", "emit", "failed", "log_foundry_stop_signal", "losses"}),
+    "RedisListSink": frozenset(
+        {
+            "client",
+            "close",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+            "maxlen",
+        }
+    ),
+    "RedisStreamsSink": frozenset(
+        {
+            "client",
+            "close",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+            "maxlen",
+        }
+    ),
+    "RotatingFileSink": frozenset({"close", "emit", "reacquire_after_fork"}),
+    "SNSSink": frozenset(
+        {
+            "MAX_BATCH",
+            "MAX_BYTES",
+            "client",
+            "close",
+            "dropped_oversized",
+            "emit",
+            "failed",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+            "topic_arn",
+        }
+    ),
+    "SQLiteSink": frozenset({"close", "emit"}),
+    "SQSSink": frozenset(
+        {
+            "MAX_BATCH",
+            "MAX_BYTES",
+            "client",
+            "close",
+            "dropped_oversized",
+            "emit",
+            "failed",
+            "fifo",
+            "log_foundry_stop_signal",
+            "losses",
+            "max_retries",
+            "message_deduplication_id",
+            "message_group_id",
+            "queue_url",
+        }
+    ),
+    "SocketTransport": frozenset(
+        {"close", "dropped_oversized", "failed", "log_foundry_stop_signal", "losses", "send_all"}
+    ),
+    "StderrSink": frozenset({"close", "emit"}),
+    "StdoutSink": frozenset({"close", "emit"}),
+    "SyslogSink": frozenset({"close", "emit", "failed", "log_foundry_stop_signal", "losses"}),
+}
+"""Each touched class's public names at ``ebf9d680`` (``origin/main`` before SPEC-069).
+
+Captured by building each rig against that tree and reading ``dir(type(sink))`` with
+``vars(sink)``, no leading underscore. A literal rather than a re-derivation, because the point is
+to compare against the tree this spec started from.
+"""
+
+GAINED_LOSSES = frozenset(
+    {"StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "SQLiteSink"}
+)
+
+
+def _public(obj: object) -> set[str]:
+    names = set(dir(type(obj))) | set(vars(obj))
+    return {n for n in names if not n.startswith("_")}
+
+
+def test_the_public_surface_grows_only_by_five_losses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-004 AC11 / invariant 10: five classes gain ``losses``, every other touched class nothing.
+
+    The counters, the encode functions, the helper and the driver-error class are private; a new
+    public name on any of these classes is frozen for 1.x, so one appearing here is a finding.
+    """
+    seen: dict[str, set[str]] = {}
+    for name, factory in RIGS.items():
+        rig = factory(monkeypatch, tmp_path)
+        seen[name] = _public(rig.sink)
+        if name == "SyslogSink":
+            seen["SocketTransport"] = _public(rig.sink._socket)
+    assert set(seen) == set(BASE_PUBLIC)
+    for name, names in seen.items():
+        expected = BASE_PUBLIC[name] | ({"losses"} if name in GAINED_LOSSES else set())
+        assert names == expected, (name, sorted(names ^ expected))
+
+
+def test_a_default_process_logging_clean_events_reports_no_sink_losses(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-001 AC8: the default ``StdoutSink`` gained ``losses()``, and it still reads ``None``."""
+    import log_foundry
+
+    log_foundry.info("outside a span")
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("inside")
+
+    work()
+    assert log_foundry.flush()
+    assert log_foundry.health().sink is None
+    assert '"message": "inside"' in capsys.readouterr().out

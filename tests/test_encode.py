@@ -324,37 +324,11 @@ derivation — a renamed helper, a call it no longer resolves — would otherwis
 silently as a deletion.
 """
 
-NOT_YET_CONVERTED: frozenset[str] = frozenset(
-    {
-        "SQLiteSink",
-        "KinesisSink",
-        "FirehoseSink",
-        "SNSSink",
-        "SQSSink",
-        "MongoDBSink",
-        "SyslogSink",
-        "LogstashSink",
-        "PostgresSink",
-        "RedisStreamsSink",
-        "RedisListSink",
-        "GooglePubSubSink",
-    }
-)
-"""The sinks the build has not converted yet, held exact so each conversion removes its entry."""
-
-
 def test_every_sink_encodes_through_the_helper() -> None:
     """FR-001's roster over the real package: nothing reaches ``json.dumps`` unguarded."""
     roster = _tree_roster()
-    unexpected = [
-        line
-        for line in roster.findings
-        if not any(f": {name}.emit reaches json.dumps" in line for name in NOT_YET_CONVERTED)
-    ]
-    assert unexpected == [], "\n".join(unexpected)
-    assert roster.of("unconverted") == NOT_YET_CONVERTED, (
-        "a converted sink must leave NOT_YET_CONVERTED in the same commit, and nothing may join it"
-    )
+    assert roster.findings == [], "\n".join(roster.findings)
+    assert roster.of("unconverted") == set()
 
 
 def test_the_roster_finds_its_floor() -> None:
@@ -376,9 +350,9 @@ def test_the_roster_finds_its_floor() -> None:
 
 
 def on_helper_public() -> set[str]:
-    """The roster's on-helper (or not yet converted) classes that their module exports."""
+    """The roster's on-helper classes that their module exports."""
     roster = _tree_roster()
-    names = roster.of("helper") | roster.of("unconverted")
+    names = roster.of("helper")
     exported: set[str] = set()
     for cls in _package_classes():
         module = sys.modules[cls.__module__]

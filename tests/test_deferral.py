@@ -202,6 +202,9 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/file.py": {"FileSink": ("emit",), "RotatingFileSink": ("emit",)},
     "sinks/clickhouse.py": {"ClickHouseSink": ("emit",)},
     "sinks/rabbitmq.py": {"RabbitMQSink": ("emit",)},
+    "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
+    "sinks/postgres.py": {"PostgresSink": ("emit",)},
+    "sinks/redis.py": {"_RedisSink": ("emit",)},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
@@ -246,6 +249,9 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
         {"_stream", "_size", "_next_rollover", "_rotation_failing"}
     ),
     ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
+    ("PostgresSink", "_insert_batch"): frozenset({"failed"}),
+    ("PostgresSink", "_reconnect_if_broken"): frozenset({"_conn", "_reconnect_announced"}),
+    ("_RedisSink", "_send"): frozenset({"failed"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -294,6 +300,11 @@ counts as it happens rather than through the ``Deferral``:
 - ``RotatingFileSink.emit``, ``_rotate_or_continue`` and ``_rotate`` / ``_size``, ``_stream``,
   ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
   next time trigger and the once-per-outage flag; state, not a count.
+- ``PostgresSink._insert_batch`` and ``_RedisSink._send`` / ``failed``: a batch abandoned past the
+  retry bound, counted before the raise; the same upper bound. SPEC-069 moved the encode out of
+  both retry loops and left these as they were.
+- ``PostgresSink._reconnect_if_broken`` / ``_conn``, ``_reconnect_announced``: the held connection,
+  reopened when broken, and its once-per-outage flag; state, not a count.
 
 ``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
 ``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).

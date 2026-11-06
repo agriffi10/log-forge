@@ -10,6 +10,7 @@ from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -85,6 +86,7 @@ class FirehoseSink:
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
+        self._unencodable = 0
         self.dropped_unadjudicated = 0
         self._counter_lock = threading.Lock()
 
@@ -105,9 +107,13 @@ class FirehoseSink:
         An oversize drop :meth:`_records` decides is counted and announced only when ``emit``
         returns, through the deferral helper whose ``with`` is the outermost block of the work
         (SPEC-059 FR-001). The drop is decided before any send, and this call can still raise
-        afterwards — the total-failure raise below, a ``json.dumps`` failure, a
-        ``BaseException`` from the client — and be retried whole; counting it at once counted
-        one oversized event once per attempt.
+        afterwards — the total-failure raise below, a ``BaseException`` from the client — and be
+        retried whole; counting it at once counted one oversized event once per attempt.
+
+        Every event is encoded before any record is sized or sent (SPEC-069 FR-001), through
+        :meth:`_encode` and the encode helper: one that cannot be encoded is dropped, counted and
+        announced only when ``emit`` returns, through the same ledger, and a batch of nothing
+        encodable sends nothing and returns (FR-002).
 
         Args:
           batch: The events to write.
@@ -124,7 +130,8 @@ class FirehoseSink:
         chunks = delivered = 0
         unknown = False
         with Deferral(self) as pending:
-            records = self._records(batch, pending)
+            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            records = self._records(encoded, pending)
             for chunk in chunk_items(
                 records,
                 max_count=self.MAX_RECORDS,
@@ -141,7 +148,10 @@ class FirehoseSink:
                 raise SinkDeliveryError(f"FirehoseSink delivered none of {chunks} chunk(s)")
 
     def losses(self) -> SinkLosses:
-        """Reports oversized drops, abandoned records and unadjudicable chunks (FR-002).
+        """Reports oversized and unencodable drops, abandoned records and unadjudicable chunks.
+
+        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001);
+        ``dropped_oversized`` still means oversize only.
 
         Args:
           None.
@@ -157,7 +167,7 @@ class FirehoseSink:
         """
         with self._counter_lock:
             return SinkLosses(
-                dropped=self.dropped_oversized,
+                dropped=self.dropped_oversized + self._unencodable,
                 failed=self.failed + self.dropped_unadjudicated,
             )
 
@@ -174,10 +184,30 @@ class FirehoseSink:
           None.
         """
 
+    def _encode(self, event: dict[str, object]) -> bytes:
+        """Encodes one event as its newline-terminated record data.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The UTF-8 JSON data with its trailing newline.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event).encode("utf-8") + b"\n"
+
     def _records(
-        self, batch: list[dict[str, object]], pending: Deferral
+        self, encoded: list[tuple[dict[str, object], bytes]], pending: Deferral
     ) -> list[dict[str, Any]]:
         """Builds the request entries, dropping any record too large to ever fit (FR-011).
+
+        It takes what :meth:`_encode` built (SPEC-069 FR-001), so sizing and the oversize drop
+        run over encoded forms and nothing here can fail on an event.
 
         Each record ends with a newline (SPEC-038 FR-005). Firehose concatenates record payloads
         verbatim into the delivery buffer and the *producer* must supply the separator, so
@@ -193,7 +223,7 @@ class FirehoseSink:
         today's shape, each line naming its own record rather than the last one met.
 
         Args:
-          batch: The events to convert.
+          encoded: Each encodable event with its newline-terminated data.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
             that ``emit`` is known not to raise.
 
@@ -205,8 +235,7 @@ class FirehoseSink:
         """
         records: list[dict[str, Any]] = []
         oversized: list[int] = []
-        for event in batch:
-            data = json.dumps(event).encode("utf-8") + b"\n"
+        for _, data in encoded:
             if len(data) > self.MAX_RECORD_BYTES:
                 oversized.append(len(data))
                 continue

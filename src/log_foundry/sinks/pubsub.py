@@ -9,6 +9,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, usable_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -173,7 +174,8 @@ class GooglePubSubSink:
           call (FR-004), so an outage is visible while it is happening rather than only at
           shutdown. It still lags the publish that caused it by however long the client takes to
           give up, which is a property of the client's asynchronous publish and not of this
-          accessor.
+          accessor. An event :meth:`emit` could not encode is counted in ``rejected`` beside the
+          refusals (SPEC-069 FR-001), as it was when the encode sat inside the publish guard.
 
         Raises:
           None.
@@ -225,6 +227,12 @@ class GooglePubSubSink:
         earlier would count before the call is known to return. The orphaned-future count above,
         and the reap's, stay immediate: they are ``failed``, an upper bound this does not defer.
 
+        Every event is encoded before the first publish (SPEC-069 FR-001), through the encode
+        helper into ``rejected``: one that cannot be encoded is counted and announced with **one
+        line per call**, where the encode inside the publish guard wrote one "refused" line per
+        event. A batch of nothing encodable publishes nothing, skips the reap and returns
+        (FR-002), and the total-failure raise compares the refusals with the encodable events.
+
         Args:
           batch: The events to publish.
 
@@ -243,11 +251,14 @@ class GooglePubSubSink:
             )
         with Deferral(self) as pending:
             refused: list[str] = []
-            for event in batch:
+            encoded = encode_events(
+                batch, self._encode, pending, sink=type(self).__name__, counter="rejected"
+            )
+            if not encoded:
+                return
+            for _, data in encoded:
                 try:
-                    future = self.client.publish(
-                        self.topic, data=json.dumps(event).encode("utf-8")
-                    )
+                    future = self.client.publish(self.topic, data=data)
                 except Exception as err:
                     refused.append(type(err).__name__)
                     continue
@@ -267,10 +278,27 @@ class GooglePubSubSink:
                 pending.count("rejected", len(refused))
                 pending.announce(lambda: self._announce_refused(refused))
             self._reap()
-            if len(refused) == len(batch):
+            if len(refused) == len(encoded):
                 raise SinkDeliveryError(
-                    f"GooglePubSubSink published none of {len(batch)} event(s)"
+                    f"GooglePubSubSink published none of {len(encoded)} event(s)"
                 )
+
+    def _encode(self, event: dict[str, object]) -> bytes:
+        """Encodes one event as the UTF-8 JSON data of its message.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The message data.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event).encode("utf-8")
 
     def _announce_refused(self, kinds: list[str]) -> None:
         """Writes one line per publish the client refused, naming its exception type (FR-008).

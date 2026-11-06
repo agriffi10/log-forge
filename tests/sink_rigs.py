@@ -49,9 +49,14 @@ class State:
 
     log: list[tuple[str, Any]] = field(default_factory=list)
     down: bool = False
+    fail_next: int = 0
 
     def call(self, payload: Any) -> None:
-        """Records one client call, raising when the rig is down."""
+        """Records one client call, raising when the rig is down or has failures queued."""
+        if self.fail_next > 0:
+            self.fail_next -= 1
+            self.log.append(("refused", None))
+            raise ConnectionError("rig refused this call")
         if self.down:
             self.log.append(("refused", None))
             raise ConnectionError("rig is down")

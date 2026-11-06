@@ -1704,11 +1704,21 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
 def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver."""
+    """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver.
+
+    The ``socket`` row is the transport, which is not a sink and has no ``emit``. Since SPEC-069
+    an empty ``send_all`` is how a syslog or socket-mode logstash batch of nothing but
+    unencodable events reaches it (FR-002), and that batch must raise on a closed transport as
+    any closed sink does, so a closed transport refuses an empty call too. The two sinks built on
+    it are their own rows here, and their ``emit([])`` returns before reaching the transport.
+    """
     sink, _ = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
     if name == "socket":
-        with Deferral(sink) as pending:
+        with (
+            pytest.raises(SinkDeliveryError, match="the transport is closed"),
+            Deferral(sink) as pending,
+        ):
             sink.send_all([], pending)
     else:
         sink.emit([])
