@@ -14,6 +14,7 @@ from typing import Any, NamedTuple, cast
 
 from log_foundry import _diag
 from log_foundry.sinks._args import require_callable
+from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
@@ -49,11 +50,15 @@ class _Prepared(NamedTuple):
       body: The serialized event.
       group_id: The resolved ``MessageGroupId``, or ``None``.
       dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
+      size: The costed bytes: the body's UTF-8 length plus, on a FIFO queue, both ids'. Carried
+        so :func:`~log_foundry.sinks._chunk.chunk_items` reads the cost rather than recomputing
+        it (SPEC-071 FR-004).
     """
 
     body: str
     group_id: str | None
     dedup_id: str | None
+    size: int
 
 
 def _bounded(raw: str, fallback: str) -> str:
@@ -340,6 +345,11 @@ class SQSSink:
     ) -> list[list[_Prepared]]:
         """Splits the batch into sends within both the entry-count and byte limits.
 
+        The boundaries are :func:`~log_foundry.sinks._chunk.chunk_items`' (SPEC-071 FR-004), the
+        rule this method used to carry inline: every per-event drop is decided first, so an event
+        that can never fit is filtered out before any boundary is drawn, and the chunks are
+        materialised as a list, so all of them are known before the first send.
+
         Each event is serialized once, and on a FIFO queue its ids are resolved once here too
         (SPEC-016 FR-005), because they travel in the same request. An entry whose costed size
         exceeds the limit can never fit a message, so it is dropped with a counted warning
@@ -373,9 +383,7 @@ class SQSSink:
           Exception: The first id callable's own exception, when every event's id callable
             failed and nothing reached a chunk or was dropped as oversized or unencodable.
         """
-        chunks: list[list[_Prepared]] = []
-        current: list[_Prepared] = []
-        current_bytes = 0
+        prepared: list[_Prepared] = []
         oversized: list[int] = []
         failures = 0
         first: Exception | None = None
@@ -395,16 +403,15 @@ class SQSSink:
             if size > self.MAX_BYTES:
                 oversized.append(size)
                 continue
-            if current and (
-                len(current) >= self.MAX_BATCH or current_bytes + size > self.MAX_BYTES
-            ):
-                chunks.append(current)
-                current = []
-                current_bytes = 0
-            current.append(_Prepared(body, group_id, dedup_id))
-            current_bytes += size
-        if current:
-            chunks.append(current)
+            prepared.append(_Prepared(body, group_id, dedup_id, size))
+        chunks = list(
+            chunk_items(
+                prepared,
+                max_count=self.MAX_BATCH,
+                max_bytes=self.MAX_BYTES,
+                size_of=lambda item: item.size,
+            )
+        )
         if first is not None:
             if not chunks and not oversized and not unencodable:
                 raise first
