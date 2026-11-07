@@ -273,13 +273,16 @@ def _calls_the_predicate_directly(handler: ast.ExceptHandler) -> bool:
     )
 
 
-def retry_loop_findings(root: Path) -> tuple[list[_Loop], list[str]]:
+def retry_loop_findings(
+    root: Path, floor: int = _LOOP_FLOOR
+) -> tuple[list[_Loop], list[str]]:
     """Every retry loop under ``root`` and every way one fails FR-001's rule.
 
     The rule: the loop sits in a class that defines ``_retryable_error`` in its own body, and
     every ``except`` of every ``try`` inside the loop names the exception and asks
     ``is_retryable(self._retryable_error, <that name>)``. A direct ``self._retryable_error(err)``
-    does not count — it bypasses the wrapper that makes the predicate total.
+    does not count — it bypasses the wrapper that makes the predicate total. Fewer loops than
+    ``floor`` is a finding too, so a scan that collapsed cannot pass by finding nothing to judge.
     """
     loops: list[_Loop] = []
     findings: list[str] = []
@@ -318,14 +321,18 @@ def retry_loop_findings(root: Path) -> tuple[list[_Loop], list[str]]:
 
     for path in sorted(root.glob("*.py")):
         visit(ast.parse(path.read_text(encoding="utf-8")), path, None)
+    if len(loops) < floor:
+        findings.append(
+            f"the scan found {len(loops)} retry loops, under its floor of {floor}: a refactor "
+            "hid one from it, or one was deleted without lowering the floor"
+        )
     return loops, findings
 
 
 def test_every_retry_loop_asks_its_sinks_predicate() -> None:
     """FR-001 AC-10, over the shipped tree."""
-    loops, findings = retry_loop_findings(_SINKS)
+    _, findings = retry_loop_findings(_SINKS)
     assert findings == []
-    assert len(loops) >= _LOOP_FLOOR, f"the loop scan found {len(loops)}: {loops}"
 
 
 _CORPUS_HEAD = '"""A fixture sink module."""\n\nfrom x import is_retryable\n\n'
@@ -388,20 +395,30 @@ _GOOD = "if attempt < self.max_retries and is_retryable(self._retryable_error, e
 )
 def test_the_loop_roster_names_the_class_and_the_reason(tmp_path, source, reason) -> None:
     (tmp_path / "fixture.py").write_text(_CORPUS_HEAD + source, encoding="utf-8")
-    loops, findings = retry_loop_findings(tmp_path)
+    loops, findings = retry_loop_findings(tmp_path, floor=1)
     assert len(loops) == 1
     assert len(findings) == 1, findings
     assert reason in findings[0], findings[0]
     assert findings[0].startswith("fixture.py:")
 
 
-def test_the_loop_roster_is_silent_on_the_rule_and_fails_eleven_on_the_floor(tmp_path) -> None:
-    body = "".join(_corpus_class(f"Good{i}", _GOOD) for i in range(11))
+@pytest.mark.parametrize(("count", "silent"), [(11, False), (12, True)])
+def test_the_loop_roster_fails_eleven_conforming_loops_on_its_floor(
+    tmp_path, count: int, silent: bool
+) -> None:
+    """Twelve conforming loops are silent; eleven fail on the floor alone, by the same path."""
+    body = "".join(_corpus_class(f"Good{i}", _GOOD) for i in range(count))
     (tmp_path / "fixture.py").write_text(_CORPUS_HEAD + body, encoding="utf-8")
     loops, findings = retry_loop_findings(tmp_path)
-    assert findings == []
-    assert len(loops) == 11
-    assert len(loops) < _LOOP_FLOOR, "a tree of eleven conforming loops is under the floor"
+    assert len(loops) == count
+    if silent:
+        assert findings == []
+    else:
+        expected = (
+            "the scan found 11 retry loops, under its floor of 12: a refactor hid one from it, "
+            "or one was deleted without lowering the floor"
+        )
+        assert findings == [expected]
 
 
 # --- FR-001: the twelve loops, swept ---------------------------------------------------------
@@ -997,12 +1014,35 @@ def test_every_driver_classes_call_is_literal_and_the_scan_finds_all_seven_drive
         assert not missing, f"{module}: no stand-in for {sorted(missing)}"
 
 
+def hierarchy_mismatches(module_name: str, real: Any) -> list[str]:
+    """Every pair of stand-in classes whose subclass relation the real driver does not share.
+
+    Both directions, for every ordered pair in the stand-in tree: a link the stand-in models and
+    the driver lacks, and a link the driver has that the stand-in leaves out, are each a
+    mismatch, because a predicate's exclusion is tested against the stand-in's model.
+    """
+    stand = standins.build(module_name)
+    names = list(standins.TREES[module_name])
+    mismatches: list[str] = []
+    for a in names:
+        for b in names:
+            modelled = issubclass(getattr(stand, a), getattr(stand, b))
+            actual = issubclass(getattr(real, a), getattr(real, b))
+            if modelled != actual:
+                mismatches.append(
+                    f"{module_name}: issubclass({a}, {b}) is {actual} in the driver, "
+                    f"{modelled} in the stand-in"
+                )
+    return mismatches
+
+
 def test_every_class_a_predicate_names_exists_in_the_installed_driver() -> None:
     """FR-002 AC-7: under ``LOG_FOUNDRY_EXTRAS=1`` (the integration workflow's extras leg).
 
     Every name a predicate resolves exists and is an exception class, so a rename cannot empty a
-    set unnoticed; and every class and parent link the stand-ins model holds in the real driver,
-    so an exclusion tested against a stand-in is an exclusion the driver shares.
+    set unnoticed; every class the stand-ins model exists in the real driver; and every subclass
+    relation between them agrees in both directions, so an exclusion tested against a stand-in is
+    an exclusion the driver shares.
     """
     import importlib
 
@@ -1014,11 +1054,24 @@ def test_every_class_a_predicate_names_exists_in_the_installed_driver() -> None:
         for name in found[module_name]:
             cls = getattr(real, name, None)
             assert isinstance(cls, type) and issubclass(cls, BaseException), (module_name, name)
-        for name, parents in tree.items():
-            cls = getattr(real, name, None)
-            assert isinstance(cls, type), (module_name, name)
-            for parent in parents:
-                assert issubclass(cls, getattr(real, parent)), (module_name, name, parent)
+        for name in tree:
+            assert isinstance(getattr(real, name, None), type), (module_name, name)
+        assert hierarchy_mismatches(module_name, real) == []
+
+
+def test_the_hierarchy_check_reports_a_link_either_side_lacks(monkeypatch) -> None:
+    """The two-way comparison above, against a hand-built "driver", both directions."""
+    real = standins.build(standins.REDIS)
+    tree = dict(standins.TREES[standins.REDIS])
+    monkeypatch.setitem(standins.TREES, standins.REDIS, tree)
+    assert hierarchy_mismatches(standins.REDIS, real) == []
+
+    tree["AuthorizationError"] = ("RedisError",)
+    mismatches = hierarchy_mismatches(standins.REDIS, real)
+    assert (
+        "redis.exceptions: issubclass(AuthorizationError, ConnectionError) is True in the "
+        "driver, False in the stand-in"
+    ) in mismatches
 
 
 # --- FR-003: the SenderFault roster ----------------------------------------------------------
@@ -1349,3 +1402,4 @@ def test_the_sqs_and_sns_sender_fault_batches_have_equal_ledgers_through_a_worke
         ledgers[kind] = (client.calls, delivered, health.failed_batches, sink.losses())
     assert ledgers["SQSSink"] == ledgers["SNSSink"]
     assert ledgers["SNSSink"][0] == 1, "a sender fault is sent once and the batch returns"
+    assert ledgers["SNSSink"][1] is True, "the worker's flush reports the batch delivered"

@@ -406,6 +406,13 @@ class PostgresSink:
         old object in place and the next attempt closes it again. It clears on a successful
         reconnect, so a later outage is announced again.
 
+        **A failed connect is announced as pending, never as absorbed** (SPEC-070 FR-002): it is
+        re-raised into the attempt, so "absorbed" would be false (invariant 11), and it is not a
+        loss yet either — the batch's own handler retries it or counts it, and that line carries
+        the count. :func:`~log_foundry._diag.pending` is the writer for exactly that: no ``lost``
+        prefix, the exception's type and never its message. The failed ``close()`` of the old
+        handle is still absorbed, and its line still says so.
+
         Args:
           None.
 
@@ -437,8 +444,9 @@ class PostgresSink:
             self._reconnect_announced = False
         except Exception as err:
             if not announced:
-                _diag.absorbed(
-                    "PostgresSink.reconnect", err, "the attempt fails with it and is counted"
+                _diag.pending(
+                    f"PostgresSink could not reconnect ({type(err).__name__}); this attempt "
+                    "fails with it, and the batch's own line says whether it is retried or lost"
                 )
             raise
 

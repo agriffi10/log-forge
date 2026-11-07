@@ -19,8 +19,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import pytest
-
 from log_foundry.sinks.http import HTTPSink
 from test_sinks_http import FakeOpener
 from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
@@ -220,8 +218,16 @@ def row_findings(
             findings.append(
                 f"{where}: derived {sorted(found)} where the table declares {sorted(row.declared)}"
             )
-        if not (decisions / row.recorded_in).exists():
+        decision = decisions / row.recorded_in
+        if not decision.exists():
             findings.append(f"{where}: its decision {row.recorded_in} does not exist")
+            continue
+        body = decision.read_text(encoding="utf-8")
+        findings.extend(
+            f"{where}: its decision {row.recorded_in} never names {cls}"
+            for cls in sorted(row.declared)
+            if cls not in body
+        )
     if len(derived[1]) < _ROW_ONE_FLOOR:
         findings.append(
             f"row 1 ({ROWS[0].rule}): the scan found {len(derived[1])} classes, under its floor "
@@ -256,17 +262,8 @@ def test_row_two_has_the_otlp_roster_beside_it() -> None:
     )
 
 
-@pytest.mark.xfail(
-    condition=not _TABLE.exists(),
-    reason="the table's decision file is written by the docs-only step that follows the build",
-    strict=True,
-)
 def test_the_table_decision_names_every_declared_class() -> None:
-    """FR-005 AC-1/AC-2: the decision file is the table, so it names every row's classes.
-
-    Expected to fail while the file is absent (a strict ``xfail``), and to run for real the
-    moment it lands, with no marker to remove.
-    """
+    """FR-005 AC-1/AC-2: the decision file is the table, so it names every row's classes."""
     body = _TABLE.read_text(encoding="utf-8")
     missing = sorted({cls for row in ROWS for cls in row.declared if cls not in body})
     assert missing == []
@@ -355,6 +352,14 @@ def test_a_deleted_proof_test_is_reported_by_row_three(tmp_path) -> None:
         encoding="utf-8",
     )
     assert "derived []" in _only(row_findings(sinks=sinks, tests=tests, decisions=decisions), 3)
+
+
+def test_a_decision_that_never_names_a_declared_class_is_reported_by_its_row(tmp_path) -> None:
+    sinks, tests, decisions = _copy_tree(tmp_path)
+    path = decisions / ROWS[1].recorded_in
+    path.write_text(path.read_text(encoding="utf-8").replace("OTLPSink", "the sink"), "utf-8")
+    finding = _only(row_findings(sinks=sinks, tests=tests, decisions=decisions), 2)
+    assert finding.endswith(f"its decision {ROWS[1].recorded_in} never names OTLPSink")
 
 
 def test_a_missing_decision_is_reported_by_its_row(tmp_path) -> None:

@@ -422,7 +422,7 @@ def test_a_failing_reconnect_is_announced_once_per_outage_not_per_attempt(
         sink.emit([{"a": 2}])
 
     lines = capsys.readouterr().err.splitlines()
-    assert sum("PostgresSink.reconnect" in line for line in lines) == 1, lines
+    assert sum("PostgresSink could not reconnect" in line for line in lines) == 1, lines
 
 
 def test_either_broken_signal_alone_triggers_the_reconnect(monkeypatch) -> None:
@@ -462,7 +462,7 @@ def test_a_later_outage_is_announced_again_after_a_successful_reconnect(
     state["down"] = True
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}])
-    assert capsys.readouterr().err.count("PostgresSink.reconnect") == 1
+    assert capsys.readouterr().err.count("PostgresSink could not reconnect") == 1
 
     # Recovery, then a second, distinct outage: it must be announced too.
     state["down"] = False
@@ -474,7 +474,7 @@ def test_a_later_outage_is_announced_again_after_a_successful_reconnect(
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 3}])
 
-    assert capsys.readouterr().err.count("PostgresSink.reconnect") == 1, (
+    assert capsys.readouterr().err.count("PostgresSink could not reconnect") == 1, (
         "a new outage after a recovery must be announced again"
     )
 
@@ -538,6 +538,7 @@ _TRANSIENT = [
     "connection failed: could not receive data from server: Connection refused",
     "connection failed: FATAL:  the database system is starting up",
     "connection failed: FATAL:  Passwort-Authentifizierung für Benutzer »postgres« fehlgeschlagen",
+    'connection failed: FATAL:  database "nope" is not currently accepting connections',
 ]
 
 
@@ -583,9 +584,16 @@ def test_a_refused_reconnect_is_one_connect_counted_once(monkeypatch, capsys, te
         assert fragment not in err, f"the message text reached stderr: {fragment}"
 
 
-@pytest.mark.parametrize("text", _TRANSIENT, ids=["refused-port", "starting-up", "german"])
+@pytest.mark.parametrize(
+    "text", _TRANSIENT, ids=["refused-port", "starting-up", "german", "database-prefix-only"]
+)
 def test_a_transient_or_unrecognised_reconnect_is_retried(monkeypatch, text) -> None:
-    """FR-002 AC-3: a refused port, a server starting up and a localised refusal keep the retry."""
+    """FR-002 AC-3: a refused port, a server starting up and a localised refusal keep the retry.
+
+    The last case carries a refusal's prefix, ``FATAL:  database "``, without its suffix: the
+    suffix is what makes the match a refusal, so a transient condition about a database is
+    still retried.
+    """
     sink, connects = _reconnecting(monkeypatch, text)
 
     with pytest.raises(SinkDeliveryError):
@@ -593,3 +601,20 @@ def test_a_transient_or_unrecognised_reconnect_is_retried(monkeypatch, text) -> 
 
     assert len(connects) == 4, "max_retries + 1 connects"
     assert sink.failed == 1
+
+
+def test_a_failed_reconnect_is_announced_as_pending_naming_the_type_only(monkeypatch, capsys) -> None:
+    """SPEC-070 FR-002, invariant 11: the connect failure is re-raised into the attempt, so its
+    line must not say "absorbed"; it is not a loss yet either, so it carries no ``lost`` prefix.
+    """
+    sink, _ = _reconnecting(monkeypatch, _REFUSED[0])
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+
+    lines = capsys.readouterr().err.splitlines()
+    assert (
+        "log-foundry: PostgresSink could not reconnect (OperationalError); this attempt fails "
+        "with it, and the batch's own line says whether it is retried or lost"
+    ) in lines
+    assert not any("absorbed" in line and "reconnect" in line for line in lines), lines

@@ -225,12 +225,21 @@ def test_only_the_entry_that_was_not_a_sender_fault_is_resent() -> None:
 
 def test_a_batch_of_nothing_but_sender_faults_returns() -> None:
     """FR-003 AC-3: every chunk rejected as the caller's fault returns, as ``SQSSink``'s does."""
+    from log_foundry.worker import Worker
+
     client = _FaultingSNS({str(i): True for i in range(10)})
     sink = SNSSink("arn", client=client, max_retries=3)
+    worker = Worker(sink, batch_size=12, max_retries=3)
+    try:
+        worker.submit([{"i": i} for i in range(12)])  # chunks of 10 and 2; Ids 0..9 rejected
+        flushed = worker.flush(timeout=30.0)
+        failed_batches = worker.health().failed_batches
+    finally:
+        worker.stop()
 
-    sink.emit([{"i": i} for i in range(12)])  # chunks of 10 and 2; every Id 0..9 rejected
-
-    assert len(client.calls) == 2
+    assert flushed, "the batch returned, so flush() reports it settled"
+    assert failed_batches == 0
+    assert len(client.calls) == 2, "sent once: the worker never re-sent it"
     assert sink.failed == 12
 
 
