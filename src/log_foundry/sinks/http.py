@@ -1249,28 +1249,33 @@ def merge_headers(
     given = dict(caller)
     if argument is not None:
         _refuse_credential_collision(base, given, owner, argument)
+        base.update(given)
     else:
         _respell_overridden(base, given)
-    base.update(given)
     return base
 
 
 def _respell_overridden(base: dict[str, str], given: dict[str, str]) -> None:
-    """Replaces, in place, each ``base`` key a caller's name folds to with the caller's header.
+    """Lays ``given`` over ``base``, a caller name folding to a default taking its place, in place.
 
     Before 1.2.0 the merge kept both spellings, ``{"X-Default": "1", "x-default": "2"}``, and
     ``urllib`` folded them, sending the caller's value where the default had stood. 1.2.0 refuses
     two names that fold together (:func:`_valid_headers`), which would have turned that working
     override into a refusal, so the merge now does the fold itself: the caller's spelling and
     value take the default's place, at its position, and the request on the wire is byte for byte
-    the one 1.x sent. Names are folded as the exact text they store. Only a key that was in
-    ``base`` is replaced, and each at most once, so two caller names that fold together are both
-    kept and still meet the duplicate refusal: a caller's own contradiction is reported, never
-    resolved here.
+    the one 1.x sent. Only a key that was in ``base`` is replaced, and each at most once, so two
+    caller names that fold together are both kept and still meet the duplicate refusal: a caller's
+    own contradiction is reported, never resolved here.
+
+    No caller code runs. The two maps are read by iteration, which calls no key's ``__hash__``
+    or ``__eq__``, every ``str`` name is folded and stored as the exact text it holds, and the
+    result is rebuilt from positions rather than looked up by key: popping a caller's key by its
+    own value raised a bare ``KeyError`` for a ``str`` subclass whose hash was not stable. A name
+    that is not a ``str`` is kept as given, for :func:`_valid_headers` to refuse.
 
     Args:
-      base: The sink's own headers, rewritten in place.
-      given: The caller's headers; a name that replaced a default is removed from it.
+      base: The sink's own headers, rewritten in place to the merged map.
+      given: The caller's headers, read with ``dict()``.
 
     Returns:
       None.
@@ -1278,23 +1283,41 @@ def _respell_overridden(base: dict[str, str], given: dict[str, str]) -> None:
     Raises:
       None.
     """
-    own = {
-        _wire_name(_diag._STR_STR(name)): name for name in base if issubclass(type(name), str)
+    defaults = [(_exact(name), value) for name, value in base.items()]
+    callers = [(_exact(name), value) for name, value in given.items()]
+    position = {
+        _wire_name(cast("str", name)): index
+        for index, (name, _value) in enumerate(defaults)
+        if issubclass(type(name), str)
     }
-    replaced: dict[str, str] = {}
-    for name in given:
-        if issubclass(type(name), str):
-            default = own.pop(_wire_name(_diag._STR_STR(name)), None)
-            if default is not None:
-                replaced[default] = name
-    if not replaced:
-        return
-    merged = [
-        (replaced[name], given.pop(replaced[name])) if name in replaced else (name, value)
-        for name, value in base.items()
-    ]
+    extra: list[tuple[object, str]] = []
+    for name, value in callers:
+        index = (
+            position.pop(_wire_name(cast("str", name)), None)
+            if issubclass(type(name), str)
+            else None
+        )
+        if index is None:
+            extra.append((name, value))
+        else:
+            defaults[index] = (name, value)
     base.clear()
-    base.update(merged)
+    base.update(cast("list[tuple[str, str]]", defaults + extra))
+
+
+def _exact(name: object) -> object:
+    """Returns a ``str`` name as the exact text it stores, and any other name as given.
+
+    Args:
+      name: A header name.
+
+    Returns:
+      The exact ``str``, or the name unchanged.
+
+    Raises:
+      None.
+    """
+    return _diag._STR_STR(cast("str", name)) if issubclass(type(name), str) else name
 
 
 def _refuse_credential_collision(

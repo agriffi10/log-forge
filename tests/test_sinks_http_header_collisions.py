@@ -197,7 +197,10 @@ def _header_routes(source: str, where: str) -> list[str]:
     literal, and ``extra_headers=`` in a class that takes no caller headers at all. Not seen, and
     reported: a ``merge_headers`` base that is not a literal; ``headers=`` built any other way; an
     ``extra_headers=`` in a class whose constructor takes ``headers`` or ``**kwargs``; an override
-    of ``_prepare``, ``_apply_auth`` or ``_send``; and a write to a mapping named ``headers``.
+    of ``_prepare``, ``_apply_auth`` or ``_send``; a subscript write to, or an ``.update`` or
+    ``.setdefault`` call on, a name or attribute holding ``headers`` (``self._headers``), wherever
+    it sits — after ``super().__init__``, under a condition, in any method; and a write of a
+    ``"headers"`` key, ``http_kwargs["headers"] = ...``.
     """
     tree = ast.parse(source)
     owner = _enclosing_classes(tree)
@@ -249,14 +252,33 @@ def _header_routes(source: str, where: str) -> list[str]:
             if isinstance(node, ast.AugAssign)
             else []
         )
-        findings.extend(
-            f"{where}:{node.lineno}: writes {target.value.id}[...]"
-            for target in targets
-            if isinstance(target, ast.Subscript)
-            and isinstance(target.value, ast.Name)
-            and "headers" in target.value.id
-        )
+        for target in targets:
+            if not isinstance(target, ast.Subscript):
+                continue
+            mapping = _headers_mapping(target.value)
+            key = target.slice
+            if mapping is not None:
+                findings.append(f"{where}:{node.lineno}: writes {mapping}[...]")
+            elif isinstance(key, ast.Constant) and key.value == "headers":
+                findings.append(f"{where}:{node.lineno}: writes [{key.value!r}]")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"update", "setdefault"}
+        ):
+            mapping = _headers_mapping(node.func.value)
+            if mapping is not None:
+                findings.append(f"{where}:{node.lineno}: calls {mapping}.{node.func.attr}")
     return findings
+
+
+def _headers_mapping(node: ast.expr) -> str | None:
+    """Names an expression read as a headers mapping (``self._headers``), or returns ``None``."""
+    if isinstance(node, ast.Name) and "headers" in node.id:
+        return node.id
+    if isinstance(node, ast.Attribute) and "headers" in node.attr:
+        return ast.unparse(node)
+    return None
 
 
 def test_no_shipped_sink_sets_a_header_by_a_route_the_rule_does_not_see() -> None:
@@ -328,6 +350,74 @@ class P(HTTPSink):
     ids=["computed-base", "literal-headers", "extra-with-caller", "prepare", "apply-auth"],
 )
 def test_the_roster_names_each_route_it_does_not_see(source: str, finding: str) -> None:
+    findings = _header_routes(source, "x.py")
+
+    assert any(item.endswith(finding) for item in findings), findings
+
+
+def _after_super(line: str) -> str:
+    """The platform fixture with ``line`` added after its ``super().__init__``."""
+    return _PLATFORM + f"        {line}\n"
+
+
+def _in_method(method: str, line: str) -> str:
+    """The platform fixture with a ``method`` override whose body is ``line``."""
+    return _PLATFORM + f"\n    def {method}(self, *args):\n        {line}\n"
+
+
+@pytest.mark.parametrize(
+    ("source", "finding"),
+    [
+        (
+            _after_super('self._headers["X-Key"] = "k"'),
+            "writes self._headers[...]",
+        ),
+        (
+            _after_super('self._headers["Content-Type"] = "text/plain"'),
+            "writes self._headers[...]",
+        ),
+        (
+            _after_super('if self.gzip:\n            self._headers["Content-Type"] = "x"'),
+            "writes self._headers[...]",
+        ),
+        (
+            _in_method("_sleep_backoff", 'self._headers["Content-Type"] = "x"'),
+            "writes self._headers[...]",
+        ),
+        (
+            _after_super('self._headers.update({"X-Key": "k"})'),
+            "calls self._headers.update",
+        ),
+        (
+            _after_super('self._headers.setdefault("X-Key", "k")'),
+            "calls self._headers.setdefault",
+        ),
+        (
+            _in_method("_render", 'self._http._headers.update(x="k")'),
+            "calls self._http._headers.update",
+        ),
+        (
+            _PLATFORM.replace(
+                "        super()",
+                '        http_kwargs["headers"] = {"X-Key": key}\n        super()',
+            ),
+            "writes ['headers']",
+        ),
+    ],
+    ids=[
+        "subscript-after-super",
+        "content-type-after-super",
+        "content-type-under-if",
+        "in-sleep-backoff",
+        "update",
+        "setdefault",
+        "wrapped-update",
+        "http-kwargs-headers",
+    ],
+)
+def test_the_roster_names_a_write_to_a_headers_attribute(source: str, finding: str) -> None:
+    """The third review's runtime-roster escapes, and the attribute routes the scan used to miss:
+    at ``457016f0`` it matched a subscript write only on a bare name."""
     findings = _header_routes(source, "x.py")
 
     assert any(item.endswith(finding) for item in findings), findings
@@ -630,3 +720,34 @@ def test_a_header_value_that_is_not_a_str_is_sent_as_before() -> None:
     HTTPSink(URL, headers={"X-Count": 5}, opener=opener).emit([{"i": 1}])  # type: ignore[dict-item]
 
     assert opener.calls[0]["headers"]["x-count"] == 5
+
+
+class _Unstable(str):
+    """A name whose hash changes on every call, and whose hash and equality count."""
+
+    calls = 0
+    seed = 0
+
+    def __hash__(self) -> int:
+        _Unstable.calls += 1
+        _Unstable.seed += 1
+        return _Unstable.seed
+
+    def __eq__(self, other: object) -> bool:
+        _Unstable.calls += 1
+        return str.__eq__(self, other)
+
+
+@pytest.mark.parametrize("spelled", ["x-default", "X-Other"], ids=["overrides", "adds"])
+def test_merge_headers_reads_an_unstable_hash_name_by_position(spelled: str) -> None:
+    """At ``8bfdaaa4``: ``given.pop`` looked the caller's key up by its own hash and raised a bare
+    ``KeyError``. The merge reads by iteration and stores the exact text, so no lookup can miss."""
+    given = {_Unstable(spelled): "2"}
+    _Unstable.calls = 0
+
+    merged = merge_headers({"X-Default": "1"}, {"headers": given})
+
+    assert _Unstable.calls == 0, "no caller __hash__ or __eq__ runs inside the merge"
+    assert all(type(name) is str for name in merged)
+    expected = {"x-default": "2"} if spelled == "x-default" else {"X-Default": "1", "X-Other": "2"}
+    assert merged == expected
