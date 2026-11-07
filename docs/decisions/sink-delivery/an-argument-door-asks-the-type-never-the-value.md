@@ -40,9 +40,13 @@ too.
 
 **Sites routed the same way that are not doors.** The HTTP sinks' `auth` (`http._valid_auth`,
 `http._authorization`) now tests `issubclass(type(auth), str)`, so a value that is not really a
-`str` takes the pair route, which already turned anything that cannot be unpacked into
-`ValueError("<owner> auth cannot be sent over HTTP (TypeError)")`, naming `auth`; a real `str` and
-a real pair are judged as before. `SQSSink`'s constant group id is told apart by real type and read
+`str` takes the pair route without its `__class__` or `__contains__` running. That route already
+turned a value that cannot be unpacked as a pair into `ValueError("<owner> auth cannot be sent
+over HTTP (TypeError)")`, naming `auth`, and it accepts anything that unpacks into two items,
+running its `__iter__`: a value claiming `str` that also defines `__iter__` is accepted and sent as
+Basic auth. A real `str` and a real pair are judged as before. A one-shot iterable `auth` passes
+construction and fails every `emit`, as it did before this spec; `architecture.md` §12 carries it
+as open. `SQSSink`'s constant group id is told apart by real type and read
 through `str.__str__`, at the constructor and per event, so a callable claiming `str` is still
 asked and a `str` subclass's own `strip` never runs.
 
@@ -60,7 +64,9 @@ refusal, so a rewritten earlier test or a second copy of an exempt one is still 
 sweep rewrites every door back to `isinstance` and `type(p).__name__` in memory and requires a
 report for each. **What it does not see**, each a deliberate edge its corpus asserts silence on: a
 type named by a helper (`raise TypeError(_type_name(value))`), a message held in a local and raised
-later, a `ValueError` door such as `auth`'s, and a `TypeError` naming no type.
+later, a `ValueError` door such as `auth`'s, a `TypeError` naming no type, and an argument rebound
+to a local before it is tested (`v = value; isinstance(v, int)`), since the guard follows a door's
+parameters by name.
 
 **Rejected.**
 
@@ -68,9 +74,9 @@ later, a `ValueError` door such as `auth`'s, and a `TypeError` naming no type.
   reader working on a sink or on `configure()` would not look in `trace-model`.
 - *Importing `decorator._stored_name`.* `decorator` imports `model`, which imports `config`, so
   `config` cannot import it; the doors use `_diag`, a leaf, directly.
-- *A `TypeError` door for `auth`.* The pair route already refuses a value that is not really a
-  `str` with a `ValueError` naming `auth`, and a new door would change the message an honest wrong
-  type gets today.
+- *A `TypeError` door for `auth`.* The pair route already refuses a value that cannot be unpacked
+  as a pair with a `ValueError` naming `auth`, and a new door would change the message an honest
+  wrong type gets today.
 - *A count of doors rather than a set.* A door removed and another added cancel in a count.
 - *Taking `usable_timeout`'s comparison.* It is floor-side by the bad-argument decision, and a
   non-number still raises the comparison's own `TypeError` there, now for a lying value too.

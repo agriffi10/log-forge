@@ -838,6 +838,21 @@ close it.
 
 ### Open
 
+- **An `auth` that unpacks only once is accepted at construction, and every `emit` then fails**
+  (SPEC-071 frame-2 review; invariant 13). The construction check builds the `Authorization` value
+  by unpacking `auth` as a pair, which consumes a one-shot iterable: `HTTPSink(url,
+  auth=iter(("u", "p")))` constructs, and every `emit` raises `not enough values to unpack`. The
+  same on `origin/main` before SPEC-071, so it predates the real-type routing. **Closed by**
+  copying the pair once, at construction, into the exact `tuple` both the check and `emit` read,
+  or refusing anything that is not a real `str` or `tuple`.
+- **`auth=` beside a caller's `Authorization` header is silently ignored** (SPEC-071 frame-2
+  review; invariant 13's "no argument is silently ignored because another was given"). `HTTPSink(url,
+  auth=("u", "p"), headers={"Authorization": "Bearer H"})` constructs and sends `Bearer H`.
+  `_valid_auth` and `_apply_auth` document this as deliberate: the caller's header wins, so
+  credentials it overrides are never sent and so are not checked. That reasoning is the code's,
+  not a settled exception, so invariant 13 does not record it. **Closed by** either refusing the
+  pair at construction, as an injected client's build options are refused, or recording the
+  precedence as an exception to invariant 13.
 - **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
   (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
   `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
@@ -1038,8 +1053,10 @@ close it.
   routes the same way, so a real `float` subclass whose `__class__` claims `int` is read as the
   float it holds where it used to raise `int.__index__`'s descriptor error. The spec also closed
   sites the entry did not list: the HTTP sinks' `auth`, which a value claiming `str` sent down the
-  token route into its own `__contains__` and now reaches the pair route's existing `ValueError`
-  naming `auth`, and seven callable constructor arguments that accepted a non-callable and then
+  token route into its own `__contains__`. It is now judged by its real type, so such a value takes
+  the `(user, password)` route without its `__class__` or `__contains__` running, and gets the
+  existing `ValueError` naming `auth` when it cannot be unpacked as a pair; one that unpacks into
+  two items is accepted and sent as Basic auth, its `__iter__` run. And seven callable constructor arguments that accepted a non-callable and then
   failed in `emit` or `close()`, now refused at construction through `_args.require_callable`.
   `tests/test_type_door_roster.py` holds the ten doors by name and reports any `isinstance` on a
   door's parameter outside `decorator._refuse_unusable`'s kept proxy test. The reasoning: *An

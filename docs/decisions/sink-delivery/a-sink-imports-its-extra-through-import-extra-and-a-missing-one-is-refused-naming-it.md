@@ -15,10 +15,11 @@ message is `The "<extra>" extra is not installed (<the interpreter's text>): pip
 "log-foundry[<extra>]"`, with the original as its `__cause__` and its `.name` and `.path`.
 
 **Only the module's own absence is converted.** A `ModuleNotFoundError` naming another module means
-the client is installed and its own dependency is missing, which installing the extra would not
-fix; one naming nothing, and an `ImportError` that is not a `ModuleNotFoundError` (a broken binary),
-say something else again. Each propagates as the same object, so the message never blames the extra
-for what it cannot cure.
+the client is installed and one of its own dependencies is missing (`botocore` under `boto3`, say),
+so a message saying the extra is not installed would be false, even where reinstalling the extra
+would repair it; one naming nothing, and an `ImportError` that is not a `ModuleNotFoundError` (a
+broken binary), say something else again. Each propagates as the same object, so the message
+claims the extra is absent only when its module is.
 
 **The type is private.** `MissingExtraError` lives in `sinks/_extras.py`, in no `__all__`, and is
 not re-exported. It is a `ModuleNotFoundError` and so an `ImportError`, so every `except` clause
@@ -53,14 +54,16 @@ patch. Every other injected-client sink imports nothing it did not import before
 library and the package outside `if TYPE_CHECKING:`; holds the derived `(file, function, module,
 extra)` sites to a set written out by name; requires every extra to be a key of
 `[project.optional-dependencies]`; requires both arguments to be string literals; and reports any
-call to `importlib.import_module` or `__import__` outside `sinks/_extras.py`. A mutation
+call to `importlib.import_module` or `__import__` outside `sinks/_extras.py`, an aliased
+`from importlib import import_module as X` included, leaving `importlib.util.find_spec`,
+`getattr(importlib, ...)` and `pkgutil.resolve_name` as deliberate edges it does not see. A mutation
 sweep rewrites each call back into the bare import in memory and requires a report for each.
 
 **Rejected.**
 
 - *A public `MissingExtraError`.* Freezes a name for 1.x that no caller needs to catch by name.
-- *Converting every `ModuleNotFoundError`.* It would tell a caller to install an extra they already
-  have when the client's own dependency is what is missing.
+- *Converting every `ModuleNotFoundError`.* It would tell a caller the extra is not installed when
+  it is, and the module missing is one of the client's own dependencies.
 - *Resolving `EventData` only per batch.* That is the defect: the sink constructed and then failed
   every `emit`.
 
