@@ -9,6 +9,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -72,10 +73,14 @@ class SNSSink:
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
+        self._unencodable = 0
         self._counter_lock = threading.Lock()
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and entries still failing past the retry bound (FR-002).
+
+        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001);
+        ``dropped_oversized`` still means oversize only.
 
         Args:
           None.
@@ -87,7 +92,9 @@ class SNSSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
+            )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Re-chunks to the publish limits and sends each chunk, retrying failures (FR-010).
@@ -95,9 +102,14 @@ class SNSSink:
         An oversize drop :meth:`_bodies` decides is counted and announced only when ``emit``
         returns, through the deferral helper whose ``with`` is the outermost block of the work
         (SPEC-059 FR-001). The drop is decided before any publish, and this call can still raise
-        afterwards — the total-failure raise below, a ``json.dumps`` failure, a malformed
-        ``Failed`` entry, a ``BaseException`` from the client — and be retried whole; counting it
-        at once counted one oversized event once per attempt.
+        afterwards — the total-failure raise below, a malformed ``Failed`` entry, a
+        ``BaseException`` from the client — and be retried whole; counting it at once counted one
+        oversized event once per attempt.
+
+        Every event is encoded before any message is sized or published (SPEC-069 FR-001),
+        through :meth:`_encode` and the encode helper: one that cannot be encoded is dropped,
+        counted and announced only when ``emit`` returns, through the same ledger, and a batch of
+        nothing encodable publishes nothing and returns (FR-002).
 
         Args:
           batch: The events to publish.
@@ -114,7 +126,8 @@ class SNSSink:
         """
         chunks = delivered = 0
         with Deferral(self) as pending:
-            bodies = self._bodies(batch, pending)
+            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            bodies = self._bodies(encoded, pending)
             for chunk in chunk_items(
                 bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=len
             ):
@@ -136,8 +149,30 @@ class SNSSink:
           None.
         """
 
-    def _bodies(self, batch: list[dict[str, object]], pending: Deferral) -> list[str]:
-        """Serializes each event, dropping any message too large to ever fit (FR-011).
+    def _encode(self, event: dict[str, object]) -> str:
+        """Encodes one event as its message body.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The JSON text.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event)
+
+    def _bodies(
+        self, encoded: list[tuple[dict[str, object], str]], pending: Deferral
+    ) -> list[str]:
+        """Keeps each encoded body, dropping any message too large to ever fit (FR-011).
+
+        It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
+        encoded forms and nothing here can fail on an event.
 
         A drop goes to ``pending`` rather than to the counter, so it is counted and announced
         only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
@@ -145,7 +180,7 @@ class SNSSink:
         so each drop registers its own count and its own line, one per event as before.
 
         Args:
-          batch: The events to serialize.
+          encoded: Each encodable event with its JSON body.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
             that ``emit`` is known not to raise.
 
@@ -156,8 +191,7 @@ class SNSSink:
           None.
         """
         bodies: list[str] = []
-        for event in batch:
-            body = json.dumps(event)
+        for _, body in encoded:
             if len(body.encode("utf-8")) > self.MAX_BYTES:
                 pending.count("dropped_oversized")
                 pending.announce(

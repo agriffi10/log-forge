@@ -8,6 +8,8 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
+from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_nul
 from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -114,6 +116,7 @@ class PostgresSink:
         self.max_retries = floor_count(max_retries, 0, "max_retries", "PostgresSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
+        self._unencodable = 0
         self._closed = False
         self._lock = threading.Lock()
         self._counter_lock = threading.Lock()
@@ -133,7 +136,10 @@ class PostgresSink:
             self._ensure_schema()
 
     def losses(self) -> SinkLosses:
-        """Reports events abandoned past the retry bound (SPEC-026 FR-002).
+        """Reports unencodable events, and events abandoned past the retry bound.
+
+        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
+        events of a batch abandoned past the retry bound (SPEC-026 FR-002).
 
         Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
         never waits on an in-flight insert and its backoff.
@@ -148,7 +154,7 @@ class PostgresSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed)
+            return SinkLosses(dropped=self._unencodable, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts the whole batch in one transaction, rolling back and retrying (FR-004).
@@ -157,6 +163,13 @@ class PostgresSink:
         serialized event as a statement parameter, and a psycopg error repr routinely reprints
         the failing statement and its parameters, so the old line reprinted the event, PII
         included, into a stream nobody was asked to secure (SPEC-029 FR-002, arch §6).
+
+        Every event's row is built once, before the lock is taken and outside the retry loop
+        (SPEC-069 FR-001), so the loop retries the same rows rather than re-encoding the batch on
+        every attempt. An event whose row cannot be built is dropped, counted and announced only
+        when this call returns; before, the encode sat inside the retry loop, so one such event
+        spent every attempt and cost the whole batch, counted ``failed``. A batch of nothing
+        encodable runs no transaction and returns, once the closed check has passed (FR-002).
 
         Args:
           batch: The events to insert. An empty batch is a no-op.
@@ -172,21 +185,30 @@ class PostgresSink:
         """
         if not batch:
             return
-        with self._lock:
-            if self._closed:
-                raise SinkDeliveryError(
-                    f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
-                )
-            self._insert_batch(batch)
+        with Deferral(self) as pending:
+            encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
+            with self._lock:
+                if self._closed:
+                    raise SinkDeliveryError(
+                        f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
+                    )
+                if not encoded:
+                    return
+                self._insert_batch([row for _, row in encoded], len(batch))
 
-    def _insert_batch(self, batch: list[dict[str, object]]) -> None:
+    def _insert_batch(self, rows: list[tuple[object, ...]], batch_size: int) -> None:
         """Runs the transaction sequence, with the emit lock already held.
 
         Split out so the lock's extent is one line in :meth:`emit` rather than an extra
         indentation level over the whole retry loop.
 
+        A spent bound counts the whole batch in ``failed``, unencodable events included, as
+        before SPEC-069: ``failed`` is an upper bound (invariant 2), and the unencodable count is
+        discarded with the raise and decided again by the call that finally returns.
+
         Args:
-          batch: The events to insert, known non-empty.
+          rows: The encoded rows to insert, known non-empty.
+          batch_size: How many events the calling ``emit`` was handed.
 
         Returns:
           None.
@@ -204,9 +226,9 @@ class PostgresSink:
                 self._reconnect_if_broken()
                 chunks = 0
                 with self._conn.cursor() as cur:
-                    for chunk in chunk_list(batch, self._chunk_size):
+                    for chunk in chunk_list(rows, self._chunk_size):
                         chunks += 1
-                        cur.executemany(self._insert_sql, [self._row(event) for event in chunk])
+                        cur.executemany(self._insert_sql, chunk)
                 if chunks:
                     self._conn.commit()
                     return
@@ -216,10 +238,10 @@ class PostgresSink:
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
-                    self.failed += len(batch)
+                    self.failed += batch_size
                 _diag.lost(
                     "event",
-                    len(batch),
+                    batch_size,
                     f"PostgresSink, {self.max_retries + 1} attempts, {type(err).__name__}"
                     + (
                         ", borrowed connection is broken and this sink may not reopen it"
@@ -228,10 +250,10 @@ class PostgresSink:
                     ),
                 )
                 raise SinkDeliveryError(
-                    f"PostgresSink inserted none of {len(batch)} event(s)"
+                    f"PostgresSink inserted none of {batch_size} event(s)"
                 ) from None
             raise SinkDeliveryError(
-                f"PostgresSink produced no chunk for {len(batch)} event(s); nothing was sent"
+                f"PostgresSink produced no chunk for {batch_size} event(s); nothing was sent"
             )
 
     def _connect(self) -> Any:
@@ -409,6 +431,17 @@ class PostgresSink:
     def _row(self, event: dict[str, object]) -> tuple[object, ...]:
         """Builds one row: the extracted columns, then the whole event as JSON.
 
+        **A U+0000 is repaired, not refused** (SPEC-069 FR-003). PostgreSQL refuses it in
+        ``jsonb`` and psycopg refuses it in a text column, and either used to fail the whole
+        transaction; assembly lets it through, and ``configure(service=...)`` stamps it on every
+        event. The JSON text this builds anyway is searched with
+        :data:`~log_foundry.sinks._encode.NUL_ESCAPE`, so a clean event costs one search, and
+        only on a match is the event rebuilt by
+        :func:`~log_foundry.sinks._encode.repair_nul` — every U+0000 in a string or key, at any
+        depth, becomes U+FFFD on a copy marked ``truncated`` — and encoded again. The columns
+        are read from the same copy. The six characters ``\\u0000`` written as text are left
+        alone, since JSONB accepts them.
+
         Args:
           event: The event to convert.
 
@@ -416,11 +449,18 @@ class PostgresSink:
           The statement parameters, in column order.
 
         Raises:
-          TypeError: If the event is not JSON-serializable. Neither source of events should
-            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
-            checks and coerces what its function returns (SPEC-058 FR-001).
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
         """
-        return (*(event.get(col) for col in _COLUMNS), json.dumps(event))
+        text = json.dumps(event)
+        source = event
+        if NUL_ESCAPE.search(text):
+            repaired = repair_nul(event)
+            if repaired is not None:
+                source, text = repaired, json.dumps(repaired)
+        return (*(source.get(col) for col in _COLUMNS), text)
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

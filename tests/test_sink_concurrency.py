@@ -1700,18 +1700,39 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
     assert driver_calls() == before, f"{name} reached its driver after close()"
 
 
-@pytest.mark.parametrize("name", sorted(POST_CLOSE_BUILDERS.values()))
+@pytest.mark.parametrize(
+    "name", sorted(name for name in POST_CLOSE_BUILDERS.values() if name != "socket")
+)
 def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver."""
+    """``emit([])`` never raises, closed or not — an empty batch has not failed to deliver.
+
+    Every sink in the post-close roster. The ``socket`` entry is the transport, which is not a
+    sink and has no ``emit``; its empty call has its own rule, in the test below.
+    """
     sink, _ = _build_closable(name, tmp_path, monkeypatch)
     sink.close()
-    if name == "socket":
-        with Deferral(sink) as pending:
-            sink.send_all([], pending)
-    else:
-        sink.emit([])
+    sink.emit([])
+
+
+def test_a_closed_transport_refuses_an_empty_send_all(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A closed ``SocketTransport`` refuses even an empty ``send_all`` (SPEC-069 FR-002).
+
+    An empty ``send_all`` is how a syslog or socket-mode logstash batch of nothing but
+    unencodable events reaches the transport, and that batch must raise on a closed transport as
+    any closed sink does, so the closed check runs before the empty return. The two sinks'
+    own ``emit([])`` still returns before reaching the transport, as the test above holds.
+    """
+    sink, _ = _build_closable("socket", tmp_path, monkeypatch)
+    sink.close()
+    with (
+        pytest.raises(SinkDeliveryError, match="the transport is closed"),
+        Deferral(sink) as pending,
+    ):
+        sink.send_all([], pending)
 
 
 def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(

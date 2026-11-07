@@ -8,6 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -189,7 +190,8 @@ class KafkaSink:
           off. A batch refused whole raised instead and is counted where the raise was caught —
           the worker's ``failed_batches`` once its retries are spent, ``orphan_lost`` outside a
           span, or a ``MultiSink``'s own ``failed`` when a sibling delivered — and a retry that
-          hands it off counts nothing.
+          hands it off counts nothing. An event :meth:`emit` could not encode is counted in the
+          same ``rejected`` (SPEC-069 FR-001): it never left the process either.
 
         Raises:
           None.
@@ -208,9 +210,16 @@ class KafkaSink:
         decided; the messages that were accepted are already on their way, so it is not retried.
         When every message was refused the call raises and counts nothing — whoever catches the
         raise owns the batch, so a batch refused on one attempt and accepted on the next records
-        no loss that never happened. A raise mid-loop (``json.dumps``, the key callable,
-        ``poll``) discards the refusals too. A delivery callback ``poll(0)`` serves counts
-        ``failed`` immediately, which stays an upper bound this does not defer.
+        no loss that never happened. A raise mid-loop (``poll``) discards the refusals too. A
+        delivery callback ``poll(0)`` serves counts ``failed`` immediately, which stays an upper
+        bound this does not defer.
+
+        Every event's body and key are encoded before the first produce (SPEC-069 FR-001). One
+        that cannot be encoded is dropped into ``rejected``, counted and announced only when this
+        call returns, with one line per call; before, the messages ahead of it were already
+        produced when its encode raised, and the worker's retry produced them again. A batch of
+        nothing encodable produces nothing and returns (FR-002), and the total-refusal raise
+        counts the encodable messages only.
 
         A closed sink refuses the batch before touching the producer (SPEC-032 FR-001). Refusing
         is not a loss this sink absorbed, so it moves no counter here: it is a failure reported
@@ -241,9 +250,12 @@ class KafkaSink:
         with Deferral(self) as pending:
             accepted = 0
             refused: list[str] = []
-            for event in batch:
-                body = json.dumps(event).encode("utf-8")
-                key = self._key(event)
+            messages = encode_events(
+                batch, self._encode, pending, sink=type(self).__name__, counter="rejected"
+            )
+            if not messages:
+                return
+            for _, (body, key) in messages:
                 try:
                     self.producer.produce(
                         self.topic, value=body, key=key, callback=self._on_delivery
@@ -256,8 +268,30 @@ class KafkaSink:
             if refused:
                 pending.count("rejected", len(refused))
                 pending.announce(lambda: self._announce_refused(refused))
-            if batch and not accepted:
-                raise SinkDeliveryError(f"KafkaSink produced none of {len(batch)} message(s)")
+            if not accepted:
+                raise SinkDeliveryError(f"KafkaSink produced none of {len(messages)} message(s)")
+
+    def _encode(self, event: dict[str, object]) -> tuple[bytes, bytes | None]:
+        """Encodes one event as its message body and partition key.
+
+        The key is encoded here with the body because ``_key``'s ``.encode("utf-8")`` can raise
+        too, and an event whose key cannot be encoded is as unencodable as one whose body cannot.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The UTF-8 JSON body and the encoded key, or ``None`` for no key.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+          UnicodeEncodeError: If the key field holds a lone surrogate, which assembly replaces;
+            the same drop.
+        """
+        return json.dumps(event).encode("utf-8"), self._key(event)
 
     def _announce_refused(self, kinds: list[str]) -> None:
         """Writes one line per message ``produce()`` refused, naming its exception type (FR-002).
@@ -394,7 +428,8 @@ class KafkaSink:
           The encoded key, or ``None`` when there is no key field or no value.
 
         Raises:
-          None.
+          UnicodeEncodeError: If the value's text holds a lone surrogate, which only a direct
+            ``emit`` can hand this sink; :meth:`_encode` drops that one event.
         """
         if not self.key_field:
             return None

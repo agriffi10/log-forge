@@ -31,7 +31,7 @@ import signal
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 import pytest
 
@@ -43,6 +43,7 @@ from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.stdout import StderrSink, StdoutSink
 from log_foundry.sinks.transform import TransformSink
 from log_foundry.worker import Worker
 
@@ -993,6 +994,186 @@ def test_the_same_child_blocks_when_the_wrappers_count_lock_is_put_back() -> Non
     )
     assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
     assert child.output == at_the_call, child.output
+
+
+@pytest.mark.parametrize("cls", [StdoutSink, StderrSink], ids=["stdout", "stderr"])
+def test_a_child_does_not_block_on_a_stream_sinks_inherited_counter_lock(cls: type) -> None:
+    """SPEC-069 FR-001. The counter lock the stream sinks gained is repaired in a forked child.
+
+    The child's batch carries one unencodable event beside a good one, so ``emit`` commits a
+    count and takes the lock — a clean batch takes no lock and would prove nothing — and
+    ``losses()`` takes it again.
+    """
+    sink = cls(stream=io.StringIO())
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    released, holder = _held_by_a_parent_thread(sink._counter_lock)
+
+    def emit_then_read() -> str:
+        sink.emit([{"ok": 1}, {"bad": b"x"}])
+        losses = sink.losses()
+        return f"dropped={losses.dropped if losses else None}"
+
+    try:
+        child = run_in_child(emit_then_read)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    assert child.output == "dropped=1", child.output
+
+
+def test_the_same_child_blocks_when_a_stream_sinks_counter_lock_is_put_back() -> None:
+    """The positive control for the test above: the inherited lock restored, the child hangs."""
+    sink = StdoutSink(stream=io.StringIO())
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    inherited = sink._counter_lock
+    released, holder = _held_by_a_parent_thread(inherited)
+    at_the_call = "at-the-call"
+
+    def unrepair_then_emit() -> str:
+        sink._counter_lock = inherited  # type: ignore[assignment]
+        report_from_child(at_the_call)
+        sink.emit([{"ok": 1}, {"bad": b"x"}])
+        return "returned"
+
+    try:
+        child = run_in_child(unrepair_then_emit, timeout=4)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.output.startswith(at_the_call), child.output
+    assert child.blocked, f"the un-repaired child did not block: {child.output!r}"
+
+
+class _RefusingSQLite:
+    """A connection double whose insert raises a driver error, so a forked child never touches
+    a real SQLite handle (an inherited one is not fork-safe on macOS)."""
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def executemany(self, sql: str, rows: object) -> None:
+        import sqlite3
+
+        raise sqlite3.OperationalError("no such table: log_events")
+
+    def commit(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+class _FullDisk:
+    """A stream whose every write raises ``OSError(28)``."""
+
+    def write(self, data: str) -> int:
+        raise OSError(28, "No space left on device")
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def _driver_failing_sink(build: str, tmp_path: pathlib.Path) -> Any:
+    """One of the three FR-004 sinks, built so its next ``emit`` hits a driver error."""
+    if build == "sqlite":
+        import sqlite3
+
+        from log_foundry.sinks.sqlite import SQLiteSink
+
+        real = sqlite3.connect(":memory:")
+        sink: Any = SQLiteSink(":memory:", connection=real, create_table=False)
+        real.close()
+        sink._conn = _RefusingSQLite()
+        return sink
+    cls = FileSink if build == "file" else RotatingFileSink
+    sink = cls(str(tmp_path / f"{build}.ndjson"))
+    sink._stream.close()
+    sink._stream = _FullDisk()
+    return sink
+
+
+@pytest.mark.parametrize("build", ["sqlite", "file", "rotating"])
+def test_a_child_does_not_block_on_a_driver_sinks_inherited_counter_lock(
+    build: str, tmp_path: pathlib.Path
+) -> None:
+    """SPEC-069 FR-004. The counter lock the driver-error count takes is repaired in a child.
+
+    The child's ``emit`` really hits a driver error, so it counts ``failed`` under the counter
+    lock before raising — the only route to that lock for a clean batch — and ``losses()``
+    takes it again.
+    """
+    sink = _driver_failing_sink(build, tmp_path)
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    released, holder = _held_by_a_parent_thread(sink._counter_lock)
+
+    import sqlite3
+
+    def emit_then_read() -> str:
+        try:
+            sink.emit([{"a": 1}, {"b": 2}])
+        except (OSError, sqlite3.Error) as err:
+            if not isinstance(err, SinkDeliveryError):
+                return f"raised a plain {type(err).__name__}"
+        else:
+            return "returned"
+        losses = sink.losses()
+        return f"failed={losses.failed if losses else None}"
+
+    try:
+        child = run_in_child(emit_then_read)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    assert child.output == "failed=2", child.output
+
+
+def test_a_forked_syslog_child_stamps_its_own_pid(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-069 FR-005. A child's message carries the child's PROCID; the parent's, the parent's.
+
+    The sink is built in the parent, before the fork — the prefork shape that stamped every
+    child message with the master's pid while the PROCID was read once at construction.
+    """
+    import log_foundry.sinks._socket as socket_mod
+    from log_foundry.sinks.syslog import SyslogSink
+
+    sent: list[bytes] = []
+
+    class Recording:
+        def sendto(self, data: bytes, addr: object) -> None:
+            sent.append(data)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(socket_mod, "_make_udp", lambda host: Recording())
+    sink = SyslogSink("loghost", 514, transport="udp")
+
+    def procid(frame: bytes) -> str:
+        return frame.decode("utf-8").split(" ")[4]
+
+    def emit_in_child() -> str:
+        sink.emit([{"level": "INFO", "message": "from the child"}])
+        return f"{procid(sent[-1])}:{os.getpid()}"
+
+    child = run_in_child(emit_in_child)
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    stamped, child_pid = child.output.split(":")
+    assert stamped == child_pid, "the child's message carries the child's own pid"
+    assert stamped != str(os.getpid())
+
+    sink.emit([{"level": "INFO", "message": "from the parent"}])
+    assert procid(sent[-1]) == str(os.getpid()), "and the parent's afterwards carries its own"
 
 
 def test_a_users_subclass_of_a_shipped_sink_is_repaired(tmp_path: pathlib.Path) -> None:

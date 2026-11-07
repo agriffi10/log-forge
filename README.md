@@ -1152,8 +1152,10 @@ from the configuration, so it reports on the orphan path too. Note the two `drop
 different things: the worker's is backpressure at *its* queue, the sink's is an event that never
 reached the wire. They are separate because the remedies do not overlap — and `sink.dropped` is
 itself several causes, which is why the diagnostic line matters. Most sinks drop only what can
-never fit; `KafkaSink` and `GooglePubSubSink` also count an event their client refused while the
-rest of its batch was handed off. A batch refused whole raises instead and is counted where the
+never fit, and an event they cannot encode at all (which only a third-party wrapper sink or a
+direct `emit` can hand them, since assembly makes every event valid JSON); `KafkaSink` and
+`GooglePubSubSink` also count an event their client refused while the rest of its batch was handed
+off. A batch refused whole raises instead and is counted where the
 raise is caught: in `failed_batches` once the worker's retries are spent, in `orphan_lost`
 outside a span, or in the fan-out's `sink.failed` under a `MultiSink` whose other children
 delivered, since a fan-out absorbs a partial failure rather than re-raising it. A
@@ -1163,8 +1165,12 @@ counted only when the sink's `emit` returns, so a batch the worker retries count
 and one it abandons is counted by the worker alone. And `TransformSink`,
 `FilteringSink`, a FIFO `SQSSink` and the HTTP sinks count an event that your own code — the
 transform, the predicate, an id callable — or the sink's render failed on, dropped alone so the
-rest of its batch is still delivered; each such batch writes one `log-foundry: lost N event(s)`
-line to stderr naming the sink and the exception type.
+rest of its batch is still delivered, and every other sink that builds a record per event does
+the same for an event it cannot encode (`NATSSink` and `SentrySink` count that one in `failed`
+instead). Each such batch writes one `log-foundry: lost N event(s)` line to stderr naming the sink
+and the exception type. A batch in which the sink could encode nothing is not a failed batch: it
+returns, counted in `sink.dropped`, because sending it again would fail the same way — so if you
+alert on `failed_batches` alone, add `sink.dropped`.
 
 `sink.failed` is an **upper bound** on loss, not a count of it. A sink that raises on total failure
 counts the attempt *and* hands the batch back to the worker, whose retry may then deliver it — so a
@@ -1428,6 +1434,16 @@ marked `truncated`, and nothing after it is written. Note that all four ceilings
 *value*, and the 131,072-value and 16 MiB budgets bound the work on your thread, not the event's
 size at a destination, so an event of many bounded values can still be large; see
 [Known constraints](https://github.com/agriffi10/log-forge/blob/main/docs/architecture.md#known-constraints).
+
+**Two destinations refuse values JSON allows, and their sinks repair them.** PostgreSQL cannot
+store U+0000 in `jsonb` or a text column, so `PostgresSink` replaces every U+0000 — in a value, a
+key, or the `service`, `version` and `env` stamps — with U+FFFD. MongoDB's BSON cannot hold an
+integer outside the signed 64-bit range or a NUL in a key name, so `MongoDBSink` replaces such an
+integer with the same `<int: ~N digits>` placeholder and the NUL in the key with U+FFFD (a NUL in a
+value is stored as it is). Each repair is made on a copy, so another sink beside it under a
+`MultiSink` sees your original value; the repaired event is delivered with `truncated: true`, as
+when assembly makes the same substitution, and nothing is counted as lost. The six characters
+`\u0000` written as text are not a NUL and are left alone.
 
 ## Development
 

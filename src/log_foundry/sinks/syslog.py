@@ -8,6 +8,7 @@ import socket
 from typing import TYPE_CHECKING
 
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 
 if TYPE_CHECKING:
@@ -113,7 +114,6 @@ class SyslogSink:
         self._app_name = app_name
         self._transport = transport
         self._hostname = socket.gethostname() or "-"
-        self._procid = str(os.getpid())
         self._socket = SocketTransport(
             host,
             port,
@@ -134,6 +134,12 @@ class SyslogSink:
         closed, or nothing sendable reaching the socket — discards it, and the worker's retry
         decides it afresh rather than counting it once per attempt.
 
+        Every event is framed through the encode helper before anything is handed to the
+        transport (SPEC-069 FR-001): one whose frame cannot be built is dropped, counted on the
+        transport and announced only when this call returns. A batch of nothing encodable hands
+        the transport an empty list, which settles on an open transport and is refused by a
+        closed one (FR-002).
+
         Args:
           batch: The events to ship. An empty batch is a no-op.
 
@@ -146,7 +152,8 @@ class SyslogSink:
         if not batch:
             return
         with Deferral(self._socket) as pending:
-            self._socket.send_all([self._frame(event) for event in batch], pending)
+            frames = encode_events(batch, self._frame, pending, sink=type(self).__name__)
+            self._socket.send_all([frame for _, frame in frames], pending)
 
     def close(self) -> None:
         """Closes the underlying socket (FR-006).
@@ -234,6 +241,12 @@ class SyslogSink:
     def _frame(self, event: dict[str, object]) -> bytes:
         """Builds one RFC 5424 message, octet-counted when the transport is TCP.
 
+        The PROCID is read here, per message, rather than once at construction (SPEC-069
+        FR-005): a child forked after the sink was built — a prefork server that configures once
+        in the master — sent every message stamped with its parent's process id. The read costs
+        a small fraction of the ``json.dumps`` beside it. The hostname is still read once, since
+        a fork does not change it.
+
         Args:
           event: The event to frame.
 
@@ -241,9 +254,10 @@ class SyslogSink:
           The exact bytes to put on the wire.
 
         Raises:
-          TypeError: If the event is not JSON-serializable. Neither source of events should
-            produce one: assembly coerces every value (``sanitize``), and a ``TransformSink``
-            checks and coerces what its function returns (SPEC-058 FR-001).
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
         """
         level = event.get("level")
         severity = _SEVERITY.get(level.upper(), _DEFAULT_SEVERITY) if isinstance(level, str) else (
@@ -253,7 +267,8 @@ class SyslogSink:
         timestamp = event.get("timestamp")
         ts = timestamp if isinstance(timestamp, str) else "-"
         msg = json.dumps(event)
-        frame = f"<{pri}>1 {ts} {self._hostname} {self._app_name} {self._procid} - - {msg}"
+        procid = os.getpid()
+        frame = f"<{pri}>1 {ts} {self._hostname} {self._app_name} {procid} - - {msg}"
         data = frame.encode("utf-8")
         if self._transport == "tcp":
             return f"{len(data)} ".encode("ascii") + data

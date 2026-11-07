@@ -247,3 +247,21 @@ def test_under_a_fan_out_the_id_failed_event_is_absorbed_once() -> None:
     assert sqs.losses().dropped == 0, "its emit raised, so it counted no id failure"
     assert sqs.failed == 3, "the premise: the three sendable entries were lost at the client"
     assert multi.losses() == SinkLosses(dropped=0, failed=sqs.failed + 4)
+
+
+def test_an_id_failure_beside_an_unencodable_event_returns(capsys) -> None:
+    """SPEC-069 FR-001: an unencodable event counts as something deliberately dropped.
+
+    Given one event whose id callable raises and one ``json.dumps`` cannot encode, and nothing
+    else, the all-failed re-raise does not fire: ``emit`` returns, the client is never called,
+    and both are in ``dropped`` — one in each of the two counters behind it.
+    """
+    sink = SQSSink(FIFO_URL, client=Refuses(), message_group_id=_fails_for(0))
+
+    sink.emit([_ev(0), _ev(1, blob=b"raw")])
+
+    assert sink.losses() == SinkLosses(dropped=2, failed=0)
+    assert (sink._id_failed, sink._unencodable) == (1, 1)
+    err = capsys.readouterr().err
+    assert _id_lines(err) == [ID_LINE]
+    assert "SQSSink, encoding raised TypeError" in err

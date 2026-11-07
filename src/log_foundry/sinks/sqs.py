@@ -14,6 +14,7 @@ from typing import Any, NamedTuple
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -160,6 +161,7 @@ class SQSSink:
         self.message_group_id = message_group_id
         self.message_deduplication_id = message_deduplication_id
         self.dropped_oversized = 0
+        self._unencodable = 0
         self.failed = 0
         self._id_failed = 0
         self._counter_lock = threading.Lock()
@@ -174,15 +176,17 @@ class SQSSink:
           The counters. Sender faults land in ``failed`` alongside the retry-exhausted entries:
           SQS rejected the request itself, so the entry is as lost as one that timed out, and
           SPEC-016 settled that it must not be re-sent byte-identical. An event dropped because
-          a FIFO id callable raised for it is in ``dropped`` beside the oversized ones, while
-          ``dropped_oversized`` keeps meaning oversize only (SPEC-058 FR-004).
+          a FIFO id callable raised for it is in ``dropped`` beside the oversized ones, and so is
+          one :meth:`emit` could not encode (SPEC-069 FR-001), while ``dropped_oversized`` keeps
+          meaning oversize only (SPEC-058 FR-004).
 
         Raises:
           None.
         """
         with self._counter_lock:
             return SinkLosses(
-                dropped=self.dropped_oversized + self._id_failed, failed=self.failed
+                dropped=self.dropped_oversized + self._id_failed + self._unencodable,
+                failed=self.failed,
             )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
@@ -193,6 +197,11 @@ class SQSSink:
         this call returns normally (SPEC-058 FR-004). They are decided before any send, and this
         call can still raise afterwards and be retried whole; counting them first counted one
         oversized event once per attempt.
+
+        Every event's body is encoded before any id is resolved or anything is sent (SPEC-069
+        FR-001), through :meth:`_encode` and the encode helper: one that cannot be encoded is
+        dropped, counted and announced only when this call returns, through the same ledger, and
+        a batch of nothing encodable sends nothing and returns (FR-002).
 
         Args:
           batch: The events to ship.
@@ -213,13 +222,14 @@ class SQSSink:
             but harmless, where silently dropping recoverable events would be the failure
             SPEC-026 exists to remove.
           Exception: The first id callable's own exception, unchanged, when every event's id
-            callable failed and nothing reached a chunk or was dropped as oversized (SPEC-058
-            FR-004). A raise of either kind leaves nothing from :meth:`_chunks` counted.
+            callable failed and nothing reached a chunk or was dropped as oversized or as
+            unencodable (SPEC-058 FR-004, SPEC-069 FR-001). A raise of either kind leaves nothing from :meth:`_chunks` counted.
         """
         chunks = delivered = 0
         recoverable_loss = False
         with Deferral(self) as pending:
-            for chunk in self._chunks(batch, pending):
+            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            for chunk in self._chunks(encoded, pending, unencodable=len(batch) - len(encoded)):
                 chunks += 1
                 accepted, retryable_lost = self._send(chunk)
                 delivered += accepted
@@ -292,8 +302,29 @@ class SQSSink:
 
         return new_log_id()
 
+    def _encode(self, event: dict[str, object]) -> str:
+        """Encodes one event as its message body.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The JSON text.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event)
+
     def _chunks(
-        self, batch: list[dict[str, object]], pending: Deferral
+        self,
+        encoded: list[tuple[dict[str, object], str]],
+        pending: Deferral,
+        *,
+        unencodable: int = 0,
     ) -> list[list[_Prepared]]:
         """Splits the batch into sends within both the entry-count and byte limits.
 
@@ -307,23 +338,28 @@ class SQSSink:
 
         **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
         under the wrappers' ledger rule: when every event failed and nothing reached a chunk or
-        was dropped as oversized, the first exception is re-raised unchanged and nothing is
-        counted; otherwise the failed events are set aside. Both drops — oversize and id failure
+        was dropped as oversized or as unencodable, the first exception is re-raised unchanged
+        and nothing is counted; otherwise the failed events are set aside. Both drops — oversize and id failure
         — go to ``pending`` rather than to the counters, so they are counted and announced only
         when the calling ``emit`` returns normally; the oversize lines keep their one-per-event
         shape, and the id failures are announced once per batch, naming the exception's type.
 
+        It takes the bodies :meth:`_encode` built (SPEC-069 FR-001). An event dropped there as
+        unencodable counts as something deliberately dropped, so a batch of one id failure and
+        one unencodable event returns, counting both, rather than re-raising.
+
         Args:
-          batch: The events to split.
+          encoded: Each encodable event with its JSON body.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
             that ``emit`` is known not to raise (SPEC-058 FR-004).
+          unencodable: How many events of the call the encode step already dropped.
 
         Returns:
           The chunks, each valid for one request.
 
         Raises:
           Exception: The first id callable's own exception, when every event's id callable
-            failed and nothing reached a chunk or was dropped as oversized.
+            failed and nothing reached a chunk or was dropped as oversized or unencodable.
         """
         chunks: list[list[_Prepared]] = []
         current: list[_Prepared] = []
@@ -331,8 +367,7 @@ class SQSSink:
         oversized: list[int] = []
         failures = 0
         first: Exception | None = None
-        for event in batch:
-            body = json.dumps(event)
+        for event, body in encoded:
             size = len(body.encode("utf-8"))
             group_id: str | None = None
             dedup_id: str | None = None
@@ -359,7 +394,7 @@ class SQSSink:
         if current:
             chunks.append(current)
         if first is not None:
-            if not chunks and not oversized:
+            if not chunks and not oversized and not unencodable:
                 raise first
             kind = type(first).__name__
             pending.count("_id_failed", failures)

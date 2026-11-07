@@ -198,10 +198,18 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/logstash.py": {"LogstashSink": ("emit",)},
     "sinks/kafka.py": {"KafkaSink": ("emit",)},
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
+    "sinks/stdout.py": {"StdoutSink": ("emit",)},
+    "sinks/file.py": {"FileSink": ("emit",), "RotatingFileSink": ("emit",)},
+    "sinks/clickhouse.py": {"ClickHouseSink": ("emit",)},
+    "sinks/rabbitmq.py": {"RabbitMQSink": ("emit",)},
+    "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
+    "sinks/postgres.py": {"PostgresSink": ("emit",)},
+    "sinks/redis.py": {"_RedisSink": ("emit",)},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
-SPEC-058 listed the first five modules and SPEC-059 the other ten. ``SocketTransport`` is the one
+SPEC-058 listed the first five modules, SPEC-059 the next ten, and SPEC-069 the rest, each of
+whose ``emit`` enters a ``Deferral`` for its encode step. ``SocketTransport`` is the one
 entry without an ``emit``: the ledger is entered by ``SyslogSink.emit`` and ``LogstashSink.emit``
 and handed to its ``send_all``, so the roster rule below, which starts from an ``emit``, cannot
 require it and it is named by hand.
@@ -231,6 +239,23 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
     ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
     ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
+    ("ClickHouseSink", "_insert"): frozenset({"failed"}),
+    ("RabbitMQSink", "_publish"): frozenset({"failed"}),
+    ("RabbitMQSink", "_active_channel"): frozenset({"_connection", "_channel"}),
+    ("RabbitMQSink", "_reset"): frozenset({"_connection", "_channel"}),
+    ("RabbitMQSink", "_persistent_properties"): frozenset({"_properties"}),
+    ("RotatingFileSink", "emit"): frozenset({"_size", "_failed"}),
+    ("FileSink", "emit"): frozenset({"_failed"}),
+    ("SQLiteSink", "emit"): frozenset({"_failed"}),
+    ("RotatingFileSink", "_rotate_or_continue"): frozenset(
+        {"_stream", "_size", "_next_rollover", "_rotation_failing"}
+    ),
+    ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
+    ("RotatingFileSink", "_ensure_open"): frozenset({"_stream", "_size"}),
+    ("PostgresSink", "_insert_batch"): frozenset({"failed"}),
+    ("PostgresSink", "_reconnect_if_broken"): frozenset({"_conn", "_reconnect_announced"}),
+    ("_RedisSink", "_send"): frozenset({"failed"}),
+    ("MongoDBSink", "_resolve_bson"): frozenset({"_bson_encode", "_bson_resolved"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -270,6 +295,25 @@ counts as it happens rather than through the ``Deferral``:
   expired; the same upper bound.
 - ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
   pending list, rebound as futures settle or are put back; state, not a count.
+- ``ClickHouseSink._insert`` and ``RabbitMQSink._publish`` / ``failed``: a chunk or a message
+  abandoned past the retry bound, counted as it happens; the same upper bound. SPEC-069 put both
+  sinks on the ledger for their encode step and left these as they were.
+- ``RabbitMQSink._active_channel``, ``_reset`` / ``_connection``, ``_channel``, and
+  ``_persistent_properties`` / ``_properties``: the held connection, channel and message
+  properties, opened, dropped and built lazily; state, not a count.
+- ``RotatingFileSink.emit``, ``_rotate_or_continue``, ``_rotate`` and ``_ensure_open`` / ``_size``, ``_stream``,
+  ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
+  next time trigger and the once-per-outage flag; state, not a count.
+- ``PostgresSink._insert_batch`` and ``_RedisSink._send`` / ``failed``: a batch abandoned past the
+  retry bound, counted before the raise; the same upper bound. SPEC-069 moved the encode out of
+  both retry loops and left these as they were.
+- ``PostgresSink._reconnect_if_broken`` / ``_conn``, ``_reconnect_announced``: the held connection,
+  reopened when broken, and its once-per-outage flag; state, not a count.
+- ``FileSink.emit``, ``RotatingFileSink.emit`` and ``SQLiteSink.emit`` / ``_failed``: a batch
+  whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
+  an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.
+- ``MongoDBSink._resolve_bson`` / ``_bson_encode``, ``_bson_resolved``: the driver's own encoder,
+  found lazily on the first emit as the BSON detector (SPEC-069 FR-003); state, not a count.
 
 ``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
 ``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).
@@ -1186,7 +1230,7 @@ def test_every_deferring_site_takes_the_one_helper() -> None:
 # --- SPEC-059 FR-005: a dropped counter is written only by a Deferral commit --------------
 
 DROPPED_FLOOR = frozenset(
-    {"dropped_oversized", "_unrenderable", "_id_failed", "rejected", "_dropped"}
+    {"dropped_oversized", "_unrenderable", "_id_failed", "rejected", "_dropped", "_unencodable"}
 )
 """Counters the derivation must find over the tree; a floor, not the set.
 

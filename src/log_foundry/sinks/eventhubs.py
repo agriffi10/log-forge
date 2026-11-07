@@ -8,6 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -75,12 +76,16 @@ class AzureEventHubsSink:
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
+        self._unencodable = 0
         self._counter_lock = threading.Lock()
         self._lock = threading.Lock()
         self._closed = False
 
     def losses(self) -> SinkLosses:
-        """Reports oversized drops and events in a batch abandoned past the bound (FR-002).
+        """Reports oversized and unencodable drops, and events abandoned past the bound (FR-002).
+
+        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001), which
+        ``dropped_oversized`` does not: that attribute still means oversize only.
 
         Args:
           None.
@@ -92,7 +97,9 @@ class AzureEventHubsSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
+            )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Packs events into batches within the size limit and sends each (FR-009).
@@ -111,6 +118,13 @@ class AzureEventHubsSink:
         (SPEC-028's two-lock decision). The failed-send count and line :meth:`_send` writes stay
         where they are, under the lock (SPEC-059 *Out of Scope*).
 
+        Every event is encoded inside the ledger but **before** the emit lock is taken, and
+        before the first ``create_batch`` (SPEC-069 FR-001). One that cannot be encoded is
+        dropped, counted and announced only when this call returns; before, an
+        ``EventDataBatch`` that filled ahead of it was already sent when its encode raised, and
+        the worker's retry sent it again. A batch of nothing encodable touches the producer not
+        at all and returns, once the closed check has passed (FR-002).
+
         Args:
           batch: The events to send. An empty batch is a no-op.
 
@@ -125,14 +139,35 @@ class AzureEventHubsSink:
         """
         if not batch:
             return
-        with Deferral(self) as pending, self._lock:
-            if self._closed:
-                raise SinkDeliveryError(
-                    f"AzureEventHubsSink sent none of {len(batch)} event(s): the sink is closed"
-                )
-            self._send_batch(batch, pending)
+        with Deferral(self) as pending:
+            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            with self._lock:
+                if self._closed:
+                    raise SinkDeliveryError(
+                        f"AzureEventHubsSink sent none of {len(batch)} event(s): the sink is closed"
+                    )
+                if not encoded:
+                    return
+                self._send_batch([body for _, body in encoded], pending)
 
-    def _send_batch(self, batch: list[dict[str, object]], pending: Deferral) -> None:
+    def _encode(self, event: dict[str, object]) -> bytes:
+        """Encodes one event as the UTF-8 JSON body of its ``EventData``.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The event's body.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event).encode("utf-8")
+
+    def _send_batch(self, bodies: list[bytes], pending: Deferral) -> None:
         """Packs and sends the batch, with the emit lock already held.
 
         Split out so the lock's extent is one line in :meth:`emit`. The driver requirement
@@ -149,7 +184,7 @@ class AzureEventHubsSink:
         before.
 
         Args:
-          batch: The events to send, known non-empty.
+          bodies: The encoded events to send, known non-empty.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
             that ``emit`` is known not to raise.
 
@@ -162,8 +197,8 @@ class AzureEventHubsSink:
         event_data_cls = _event_data_cls()
         current = self.producer.create_batch()
         attempted = delivered = 0
-        for event in batch:
-            data = event_data_cls(json.dumps(event).encode("utf-8"))
+        for body in bodies:
+            data = event_data_cls(body)
             if _try_add(current, data):
                 continue
             if len(current) > 0:

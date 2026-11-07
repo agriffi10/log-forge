@@ -7,6 +7,8 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -121,12 +123,16 @@ class RabbitMQSink:
         self._channel: Any = None
         self._properties: Any = None
         self.failed = 0
+        self._unencodable = 0
         self._counter_lock = threading.Lock()
         self._lock = threading.Lock()
         self._closed = False
 
     def losses(self) -> SinkLosses:
-        """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
+        """Reports unencodable events, and messages abandoned past the reconnect-retry bound.
+
+        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
+        messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
 
         Args:
           None.
@@ -138,7 +144,7 @@ class RabbitMQSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed)
+            return SinkLosses(dropped=self._unencodable, failed=self.failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Publishes one persistent message per event, reconnecting on error (FR-006).
@@ -151,6 +157,13 @@ class RabbitMQSink:
         *rebinds* both — ``_reset`` closes and nulls the channel another thread may be mid-publish
         on. It is structurally the same sink as ``SocketTransport``, one AMQP frame stream over
         one socket, so it takes the same lock.
+
+        Every event is encoded before the lock is taken and before the first publish (SPEC-069
+        FR-001). One that cannot be encoded is dropped, counted and announced only when this call
+        returns, through the deferral helper; before, the messages ahead of it were already on
+        the exchange when its encode raised, and the worker's retry published them again. A batch
+        of nothing encodable publishes nothing and returns, once the closed check has passed
+        (FR-002).
 
         Args:
           batch: The events to publish.
@@ -169,16 +182,38 @@ class RabbitMQSink:
         if not batch:
             return
         published = 0
-        with self._lock:
-            if self._closed:
-                raise SinkDeliveryError(
-                    f"RabbitMQSink published none of {len(batch)} message(s): the sink is closed"
-                )
-            for event in batch:
-                if self._publish(json.dumps(event).encode("utf-8")):
-                    published += 1
-        if batch and not published:
-            raise SinkDeliveryError(f"RabbitMQSink published none of {len(batch)} message(s)")
+        with Deferral(self) as pending:
+            bodies = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            with self._lock:
+                if self._closed:
+                    raise SinkDeliveryError(
+                        f"RabbitMQSink published none of {len(batch)} message(s): the sink is "
+                        f"closed"
+                    )
+                if not bodies:
+                    return
+                for _, body in bodies:
+                    if self._publish(body):
+                        published += 1
+            if not published:
+                raise SinkDeliveryError(f"RabbitMQSink published none of {len(bodies)} message(s)")
+
+    def _encode(self, event: dict[str, object]) -> bytes:
+        """Encodes one event as the UTF-8 JSON body of its message.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The message body.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event).encode("utf-8")
 
     def close(self) -> None:
         """Closes the channel and, when owned, the connection (FR-006).

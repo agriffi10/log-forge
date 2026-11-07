@@ -10,8 +10,11 @@ from typing import TextIO
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
+from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._driver_error import delivery_error
+from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive
-from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["FileSink", "RotatingFileSink"]
 
@@ -156,6 +159,32 @@ class FileSink:
         self._stream: TextIO = open(path, "a", encoding=encoding)
         self._closed = False
         self._lock = threading.Lock()
+        self._unencodable = 0
+        self._failed = 0
+        self._counter_lock = threading.Lock()
+
+    def losses(self) -> SinkLosses | None:
+        """Reports unencodable events and driver failures, once it has any (SPEC-069).
+
+        ``dropped`` is the events :meth:`emit` could not encode (FR-001); ``failed`` the events of
+        a batch whose write or flush raised ``OSError`` (FR-004), an upper bound. ``None`` until
+        something is counted, the rule ``wrapped_losses`` applies, so a process that only logs
+        clean events still reads ``health().sink is None``. Read under the counter lock, never
+        the emit lock, so a poll does not wait behind a write (SPEC-028 FR-003).
+
+        Args:
+          None.
+
+        Returns:
+          ``None`` while nothing is counted, else the counters.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            if not (self._unencodable or self._failed):
+                return None
+            return SinkLosses(dropped=self._unencodable, failed=self._failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Writes every event as one newline-terminated ``json.dumps`` line, then flushes.
@@ -165,6 +194,23 @@ class FileSink:
         still interleave two events' bytes; batch-wide locking also keeps a batch contiguous in
         the file, which is what makes the output readable.
 
+        Every event is encoded before the lock is taken and before the first write (SPEC-069
+        FR-001). One that cannot be encoded is dropped, counted and announced only when this call
+        returns, through the deferral helper; before, the lines ahead of it were already in the
+        stream's buffer when the encode raised, and the worker's retry wrote them again. A batch
+        of nothing encodable writes nothing and returns, once the closed check has passed
+        (FR-002).
+
+        **A driver error is counted, announced and raised as both types** (SPEC-069 FR-004).
+        When a write or flush raises ``OSError`` — a full disk, a revoked permission — the batch
+        size is added to ``failed`` at once, under the counter lock and never the emit lock, one
+        line names the class, the exception's type and its ``errno``, and the error is raised as
+        an instance of both ``SinkDeliveryError`` and its own class
+        (``_driver_error.delivery_error``), so ``except OSError``, ``except PermissionError``
+        and ``except SinkDeliveryError`` all still catch it. A write that fails partway leaves
+        the earlier lines of the batch on disk, and the worker's retry writes them again: this
+        counts and types the failure, it does not make a partial write atomic.
+
         Args:
           batch: The events to write.
 
@@ -172,18 +218,52 @@ class FileSink:
           None.
 
         Raises:
-          OSError: If the write or flush fails (FR-001).
+          OSError: If the write or flush fails (FR-001), as an instance of
+            ``SinkDeliveryError`` too, with the original as its ``__cause__`` — or the original
+            itself, unchanged, if the dual-typed exception cannot be built.
+          SinkDeliveryError: If the sink is closed.
         """
         if not batch:
             return
-        with self._lock:
-            if self._closed:
-                raise SinkDeliveryError(
-                    f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
-                )
-            for event in batch:
-                self._stream.write(json.dumps(event) + "\n")
-            self._stream.flush()
+        with Deferral(self) as pending:
+            lines = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            try:
+                with self._lock:
+                    if self._closed:
+                        raise SinkDeliveryError(
+                            f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
+                        )
+                    if not lines:
+                        return
+                    for _, line in lines:
+                        self._stream.write(line)
+                    self._stream.flush()
+            except OSError as err:
+                with self._counter_lock:
+                    self._failed += len(batch)
+                detail = f"{type(self).__name__}, {type(err).__name__} {_diag.errno_of(err)}"
+                _diag.lost("event", len(batch), detail.rstrip())
+                built = delivery_error(err)
+                if built is None:
+                    raise
+                raise built from err
+
+    def _encode(self, event: dict[str, object]) -> str:
+        """Encodes one event as its newline-terminated JSON line.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The line to write.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        return json.dumps(event) + "\n"
 
     def reacquire_after_fork(self) -> None:
         """Re-opens the file so this child holds its own descriptor (SPEC-039 FR-004, SPEC-042).
@@ -264,9 +344,10 @@ class RotatingFileSink:
     No counter is added for what retention discards, at any ``backup_count``. This sink is a
     bounded ring buffer, retention *is* the configuration, and discarding the oldest generation
     is that configuration working — the precedent being ``MemorySink(maxlen)``, which behaves as
-    a bounded ring, counts nothing and implements no ``losses()``. Neither ``dropped`` (defined
-    as discarded *before* attempting delivery) nor ``failed`` fits an event that was written and
-    flushed to disk.
+    a bounded ring and counts nothing. Neither ``dropped`` (defined as discarded *before*
+    attempting delivery) nor ``failed`` fits an event that was written and flushed to disk. The
+    ``losses()`` this class gained in SPEC-069 reports only an event it could not encode and a
+    driver error; retention moves neither counter.
 
     A rotation rebinds the active stream, so it is the sink where concurrent writers did real
     damage: a second thread mid-``emit`` could write to the handle rotation had just closed, or
@@ -349,6 +430,32 @@ class RotatingFileSink:
         self._rotation_failing = False
         self._closed = False
         self._lock = threading.Lock()
+        self._unencodable = 0
+        self._failed = 0
+        self._counter_lock = threading.Lock()
+
+    def losses(self) -> SinkLosses | None:
+        """Reports unencodable events and driver failures, once it has any (SPEC-069).
+
+        ``dropped`` is the events :meth:`emit` could not encode (FR-001); ``failed`` the events of
+        a batch whose write or flush raised ``OSError`` (FR-004), an upper bound. ``None`` until
+        something is counted, the rule ``wrapped_losses`` applies, so a process that only logs
+        clean events still reads ``health().sink is None``. Read under the counter lock, never
+        the emit lock, so a poll does not wait behind a write (SPEC-028 FR-003).
+
+        Args:
+          None.
+
+        Returns:
+          ``None`` while nothing is counted, else the counters.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            if not (self._unencodable or self._failed):
+                return None
+            return SinkLosses(dropped=self._unencodable, failed=self._failed)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Appends each event, rotating first whenever a size or time trigger fires (FR-002).
@@ -367,6 +474,21 @@ class RotatingFileSink:
         raises *here* is deliberately not absorbed: nothing was written, so it is the
         genuinely-total failure the worker's retry exists for.
 
+        Every event is encoded, and its size measured, before the lock is taken and before the
+        first write (SPEC-069 FR-001), exactly as :meth:`FileSink.emit` does: an event that
+        cannot be encoded costs only itself, counted and announced when this call returns, and a
+        batch of nothing encodable writes nothing (FR-002).
+
+        **A driver error is counted, announced and raised as both types** (SPEC-069 FR-004).
+        When a write or flush raises ``OSError`` — a full disk, a revoked permission — the batch
+        size is added to ``failed`` at once, under the counter lock and never the emit lock, one
+        line names the class, the exception's type and its ``errno``, and the error is raised as
+        an instance of both ``SinkDeliveryError`` and its own class
+        (``_driver_error.delivery_error``), so ``except OSError``, ``except PermissionError``
+        and ``except SinkDeliveryError`` all still catch it. A write that fails partway leaves
+        the earlier lines of the batch on disk, and the worker's retry writes them again: this
+        counts and types the failure, it does not make a partial write atomic.
+
         Args:
           batch: The events to write.
 
@@ -374,26 +496,63 @@ class RotatingFileSink:
           None.
 
         Raises:
-          OSError: If a write or a flush fails. A failed *rotation* no longer raises; see
-            :meth:`_rotate_or_continue`.
+          OSError: If a write or a flush fails, or a rotation cannot reopen the file, as an
+            instance of ``SinkDeliveryError`` too, with the original as its ``__cause__`` — or
+            the original itself, unchanged, if the dual-typed exception cannot be built. A
+            failed *rotation* no longer raises; see :meth:`_rotate_or_continue`.
           SinkDeliveryError: If the sink is closed.
         """
         if not batch:
             return
-        with self._lock:
-            if self._closed:
-                raise SinkDeliveryError(
-                    f"RotatingFileSink wrote none of {len(batch)} event(s): the sink is closed"
-                )
-            for event in batch:
-                line = json.dumps(event) + "\n"
-                data = len(line.encode(self._encoding))
-                if self._should_rotate(data):
+        with Deferral(self) as pending:
+            lines = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            try:
+                with self._lock:
+                    if self._closed:
+                        raise SinkDeliveryError(
+                            f"RotatingFileSink wrote none of {len(batch)} event(s): the sink is "
+                            f"closed"
+                        )
+                    if not lines:
+                        return
+                    self._ensure_open()
+                    for _, (line, data) in lines:
+                        if self._should_rotate(data):
+                            self._stream.flush()
+                            self._rotate_or_continue()
+                        self._stream.write(line)
+                        self._size += data
                     self._stream.flush()
-                    self._rotate_or_continue()
-                self._stream.write(line)
-                self._size += data
-            self._stream.flush()
+            except OSError as err:
+                with self._counter_lock:
+                    self._failed += len(batch)
+                detail = f"{type(self).__name__}, {type(err).__name__} {_diag.errno_of(err)}"
+                _diag.lost("event", len(batch), detail.rstrip())
+                built = delivery_error(err)
+                if built is None:
+                    raise
+                raise built from err
+
+    def _encode(self, event: dict[str, object]) -> tuple[str, int]:
+        """Encodes one event as its newline-terminated JSON line, with the bytes it will take.
+
+        The size is measured here, with the line, so the rotation check under the lock reads a
+        number rather than encoding again.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The line to write and its length in the file's encoding.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+        """
+        line = json.dumps(event) + "\n"
+        return line, len(line.encode(self._encoding))
 
     def reacquire_after_fork(self) -> None:
         """Re-opens the file so this child holds its own descriptor (SPEC-039 FR-004, SPEC-042).
@@ -446,6 +605,33 @@ class RotatingFileSink:
             self._stream.flush()
             self._stream.close()
 
+    def _ensure_open(self) -> None:
+        """Reopens the active file when a failed rotation left the sink holding a closed stream.
+
+        ``_rotate`` closes the stream first and :meth:`_rotate_or_continue` reopens it when the
+        rotation fails, but that reopen can fail too — a read-only mount, ``EMFILE`` — and the
+        sink is left holding the stream ``_rotate`` closed. Every later write then raised a plain
+        ``ValueError: I/O operation on closed file``: uncounted, with no line, not a
+        ``SinkDeliveryError``, and permanent even after the cause cleared (SPEC-069 frame-2
+        review). Reopening here, under the emit lock and before the first write, turns a
+        failure into an ``OSError`` that :meth:`emit` counts, announces and raises as both types
+        (FR-004), and a success into a recovered sink. The size is re-read from the file, as the
+        absorbed-rotation path does. A stream double with no ``closed`` attribute reads as open.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the file still cannot be opened.
+        """
+        if not getattr(self._stream, "closed", False):
+            return
+        self._stream = open(self._path, "a", encoding=self._encoding)
+        self._size = os.path.getsize(self._path) if os.path.exists(self._path) else 0
+
     def _schedule_next(self) -> float | None:
         """Returns the monotonic-clock deadline for the next time-based rotation (SPEC-031).
 
@@ -496,7 +682,7 @@ class RotatingFileSink:
         propagated out of ``emit`` — the worker then re-sent the whole batch and wrote them again.
         Measured: an 8-event batch failing after 3 were written put 11 lines on disk, 3 of them
         duplicates. A persistent failure was worse: the sink kept a **closed** stream and every
-        later batch raised a raw ``PermissionError``, which is not a ``SinkDeliveryError`` and has
+        later batch raised a raw ``PermissionError``, which is not a ``SinkDeliveryError`` and had
         no ``losses()`` behind it.
 
         Absorbing it costs nothing and duplicates nothing. The active file simply exceeds
@@ -536,7 +722,7 @@ class RotatingFileSink:
         Raises:
           OSError: If the *reopen* fails, per the paragraph above. A failed **rotation** is
             absorbed and announced through ``_diag``; the batch continues, nothing is dropped, no
-            counter moves, and this class still has no ``losses()``.
+            counter moves: a failed rotation is not a loss, so ``losses()`` does not report it.
         """
         try:
             self._rotate()

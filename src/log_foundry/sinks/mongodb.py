@@ -6,13 +6,17 @@ import json
 import math
 import re
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._encode import encode_events, repair_bson
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 __all__ = ["MongoDBSink"]
 
@@ -198,12 +202,18 @@ class MongoDBSink:
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
         self.dropped_oversized = 0
+        self._unencodable = 0
         self._closed = False
         self._counter_lock = threading.Lock()
         self._close_lock = threading.Lock()
+        self._bson_resolved = False
+        self._bson_encode: Callable[[Any], object] | None = None
 
     def losses(self) -> SinkLosses:
         """Reports oversized drops and documents the server rejected or never took (FR-002).
+
+        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001);
+        ``dropped_oversized`` still means oversize only.
 
         Both fields are read under one lock so the pair comes from the same instant rather than
         straddling a concurrent emit's increments (SPEC-028 FR-003).
@@ -218,7 +228,9 @@ class MongoDBSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.dropped_oversized, failed=self.failed)
+            return SinkLosses(
+                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
+            )
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts every event unordered, counting bulk failures and retrying errors (FR-003).
@@ -232,6 +244,12 @@ class MongoDBSink:
         from :meth:`_documents` to the last raise, so a connection error past the retry bound or
         a bulk write that stored nothing discards the drop, and a bulk write that stored some
         returns and commits it. The closed check sits before the ``with`` and decides nothing.
+
+        Every event is encoded before any document is sized or inserted (SPEC-069 FR-001),
+        through :meth:`_encode` and the encode helper: one that cannot be encoded is dropped,
+        counted and announced only when this call returns, through the same ledger, rather than
+        failing the whole ``insert_many`` client-side, retrying it and counting the batch
+        ``failed``. A batch of nothing encodable inserts nothing and returns (FR-002).
 
         Args:
           batch: The events to insert.
@@ -255,8 +273,10 @@ class MongoDBSink:
             raise SinkDeliveryError(
                 f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"
             )
+        self._resolve_bson()
         with Deferral(self) as pending:
-            documents = self._documents(batch, pending)
+            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
+            documents = self._documents(encoded, pending)
             if not documents:
                 return
             for attempt in range(self.max_retries + 1):
@@ -327,12 +347,94 @@ class MongoDBSink:
             if self._owns_client:
                 self._client.close()
 
-    def _documents(
-        self, batch: list[dict[str, object]], pending: Deferral
-    ) -> list[dict[str, object]]:
-        """Copies each event and drops any document too large to ever fit.
+    def _resolve_bson(self) -> None:
+        """Finds the driver's own ``bson.encode`` once, on the first ``emit`` that needs it.
+
+        It is the detector :meth:`_encode` runs (SPEC-069 FR-003): what BSON refuses is decided
+        by BSON. It is imported here rather than at construction, so a sink built over an
+        injected client never forces an import, and read by name: a ``bson`` that is missing,
+        or has no ``encode``, disables the check rather than raising — an injected client double
+        with no driver installed is not a BSON encoder either. So does a ``bson`` whose import or
+        attribute read raises anything else — a broken install, a module that fails at import —
+        since that is not this sink's fault and must not fail every ``emit`` (invariant 1);
+        ``insert_many`` still reports whatever that driver does after it. Two threads resolving
+        at once both store the same answer.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if self._bson_resolved:
+            return
+        encode = None
+        try:
+            import bson  # type: ignore[import-not-found]
+
+            found = getattr(bson, "encode", None)
+        except Exception:
+            found = None
+        if callable(found):
+            encode = found
+        self._bson_encode = encode
+        self._bson_resolved = True
+
+    def _encode(self, event: dict[str, object]) -> tuple[dict[str, object], int]:
+        """Encodes one event as the document to insert, with its JSON size.
 
         The copy is what keeps ``_id`` insertion by the driver from mutating the caller's dicts.
+        The size is the existing ``json.dumps`` measure the 16 MB drop reads, taken of what is
+        inserted.
+
+        **What BSON refuses is repaired, not refused** (SPEC-069 FR-003). ``bson.encode`` refuses
+        an integer outside the signed 64-bit range and a NUL in a key, both of which assembly
+        lets through, and either used to fail the whole ``insert_many`` client-side. When the
+        driver's own encoder (:meth:`_resolve_bson`) refuses the document,
+        :func:`~log_foundry.sinks._encode.repair_bson` rebuilds it — the integer becomes the
+        ``<int: ~N digits>`` placeholder, the NUL in a key U+FFFD, on a copy marked
+        ``truncated`` — and the encoder is asked again. A document it still refuses, or one
+        with nothing to repair, raises, and the encode helper drops that one event. With no
+        encoder there is no check.
+
+        Args:
+          event: The event to encode.
+
+        Returns:
+          The document and its size in bytes.
+
+        Raises:
+          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+            drop of this one event. Neither source of events produces one: assembly coerces every
+            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+            returns (SPEC-058 FR-001).
+          Exception: Whatever ``bson.encode`` raises for a document the repair cannot fix — the
+            same drop.
+        """
+        document = dict(event)
+        check = self._bson_encode
+        if check is not None:
+            try:
+                check(document)
+            except Exception:
+                repaired = repair_bson(event)
+                if repaired is None:
+                    raise
+                check(repaired)
+                document = repaired
+        return document, len(json.dumps(document).encode("utf-8"))
+
+    def _documents(
+        self, encoded: list[tuple[dict[str, object], tuple[dict[str, object], int]]],
+        pending: Deferral,
+    ) -> list[dict[str, object]]:
+        """Keeps each encoded document, dropping any too large to ever fit.
+
+        It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
+        encoded forms and nothing here can fail on an event.
 
         A drop goes to ``pending`` rather than to the counter, so it is counted and announced
         only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
@@ -340,7 +442,7 @@ class MongoDBSink:
         so each drop registers its own count and its own line, one per document as before.
 
         Args:
-          batch: The events to convert.
+          encoded: Each encodable event with its document and size.
           pending: The calling ``emit``'s deferral, which holds every drop decided here until
             that ``emit`` is known not to raise.
 
@@ -351,12 +453,12 @@ class MongoDBSink:
           None.
         """
         documents: list[dict[str, object]] = []
-        for event in batch:
-            if len(json.dumps(event).encode("utf-8")) > _MAX_DOC_BYTES:
+        for _, (document, size) in encoded:
+            if size > _MAX_DOC_BYTES:
                 pending.count("dropped_oversized")
                 pending.announce(
                     lambda: _diag.lost("document", 1, "MongoDBSink, exceeds the 16 MB limit")
                 )
                 continue
-            documents.append(dict(event))
+            documents.append(document)
         return documents
