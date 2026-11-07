@@ -11,6 +11,7 @@ from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -70,9 +71,7 @@ class SNSSink:
         """
         self.max_retries = floor_count(max_retries, 0, "max_retries", "SNSSink")
         if client is None:
-            import boto3  # type: ignore[import-not-found]
-
-            client = boto3.client("sns")
+            client = import_extra("boto3", "aws").client("sns")
         self.topic_arn = topic_arn
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None

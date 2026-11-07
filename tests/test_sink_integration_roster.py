@@ -6,9 +6,10 @@ is a **derived** roster rather than prose, because a hand-listed set is one this
 watched rot (SPEC-028's roster missed three sinks; SPEC-038's two rosters drifted twice).
 
 **The population is derived from two markers, and the second one is the correction.** The obvious
-derivation -- modules carrying a lazy third-party import (`# type: ignore[import-not-found]`) --
-is what an optional extra looks like, and it yields fourteen modules behind the eleven optional
-extras the spec's Overview counts (`aws` alone covers four of them). It
+derivation -- modules that import a third-party client lazily, which since SPEC-071 means a call
+to `sinks/_extras.import_extra` (before it, the text `# type: ignore[import-not-found]` on the
+import line) -- is what an optional extra looks like, and it yields fourteen modules behind the
+eleven optional extras the spec's Overview counts (`aws` alone covers four of them). It
 also **silently excludes `logstash`**, which is one of AC-1's named minimum four *and* the entire
 subject of FR-003, because that sink reaches Logstash over stdlib HTTP and imports no third-party
 client at all. The same hole hides `syslog`, `elasticsearch`, `loki` and the four SaaS sinks. So
@@ -48,6 +49,25 @@ _NETWORK_CORE_NAMES = {name for _, name in _NETWORK_CORES}
 """The same cores by bare name, for the module that *defines* one instead of importing it."""
 
 
+def _callee_name(func: ast.expr) -> str | None:
+    """Returns the name a call's callee is spelled with, bare or as an attribute.
+
+    Args:
+      func: The call's ``func`` node.
+
+    Returns:
+      ``f`` for ``f(...)`` and ``m.f(...)``, ``None`` for anything else.
+
+    Raises:
+      None.
+    """
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return None
+
+
 def _population() -> dict[str, set[str]]:
     """Returns the sink modules that reach a real destination, by how they were detected.
 
@@ -64,9 +84,9 @@ def _population() -> dict[str, set[str]]:
     for path in sorted(_SINKS.glob("*.py")):
         text = path.read_text(encoding="utf-8")
         tree = ast.parse(text)
-        if "import-not-found" in text or "import-untyped" in text:
-            marker.add(path.stem)
         for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _callee_name(node.func) == "import_extra":
+                marker.add(path.stem)
             if isinstance(node, ast.ImportFrom) and node.module:
                 for alias in node.names:
                     for suffix, name in _NETWORK_CORES:

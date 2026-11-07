@@ -10,6 +10,7 @@ from log_foundry import _diag
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -379,8 +380,7 @@ class RabbitMQSink:
           ImportError: If the ``amqp`` extra is not installed.
           Exception: Whatever ``pika`` raises when connecting.
         """
-        import pika  # type: ignore[import-not-found]
-
+        pika = import_extra("pika", "amqp")
         params = pika.URLParameters(self._url) if self._url else pika.ConnectionParameters()
         for name, value in self._bounds.items():
             setattr(params, name, value)
@@ -402,8 +402,7 @@ class RabbitMQSink:
         """
         if self._properties is None:
             try:
-                import pika
-
+                pika = import_extra("pika", "amqp")
                 self._properties = pika.BasicProperties(delivery_mode=_PERSISTENT)
             except ImportError:
                 self._properties = _PersistentProperties()

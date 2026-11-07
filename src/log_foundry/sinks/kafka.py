@@ -9,6 +9,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -155,9 +156,7 @@ class KafkaSink:
                 raise ValueError(
                     "KafkaSink requires bootstrap_servers when no producer is injected"
                 )
-            from confluent_kafka import Producer  # type: ignore[import-not-found]
-
-            producer = Producer(
+            producer = import_extra("confluent_kafka", "kafka").Producer(
                 {**(producer_config or {}), "bootstrap.servers": bootstrap_servers}
             )
         self.topic = topic

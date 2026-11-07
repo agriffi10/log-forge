@@ -1556,6 +1556,8 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             def close(self) -> None:
                 pass
 
+        # SPEC-071 FR-002: the sink resolves `EventData` at construction, extra or not.
+        monkeypatch.setattr(eventhubs, "_event_data_cls", lambda: lambda body: body)
         return eventhubs.AzureEventHubsSink(producer=Producer()), lambda: len(opened)
 
     if name == "file":

@@ -393,6 +393,8 @@ def _one_of_each_retrying_sink(monkeypatch) -> list[object]:
     from test_sinks_syslog import FakeSocket
 
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: FakeSocket())
+    # SPEC-071 FR-002: the sink resolves `EventData` at construction, extra or not.
+    monkeypatch.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body)
     return [
         HTTPSink("http://x", opener=FakeOpener()),
         SyslogSink("h", transport="udp"),

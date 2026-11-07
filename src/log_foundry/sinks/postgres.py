@@ -11,6 +11,7 @@ from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_nul
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -363,9 +364,9 @@ class PostgresSink:
           ImportError: If the ``postgres`` extra is not installed.
           Exception: Whatever the driver raises when connecting.
         """
-        import psycopg  # type: ignore[import-not-found]
-
-        return psycopg.connect(self._dsn, connect_timeout=self.connect_timeout)
+        return import_extra("psycopg", "postgres").connect(
+            self._dsn, connect_timeout=self.connect_timeout
+        )
 
     def _reconnect_if_broken(self) -> None:
         """Replaces an unusable **owned** connection before an insert attempt (FR-002).

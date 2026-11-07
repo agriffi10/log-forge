@@ -10,6 +10,7 @@ from log_foundry import _diag
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -65,8 +66,7 @@ class _RedisSink:
         self.max_retries = floor_count(max_retries, 0, "max_retries", type(self).__name__)
         self._owns_client = client is None
         if client is None:
-            import redis  # type: ignore[import-not-found]
-
+            redis = import_extra("redis", "redis")
             client = redis.Redis.from_url(url) if url else redis.Redis()
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None

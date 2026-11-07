@@ -10,6 +10,7 @@ from log_foundry import _diag
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -42,6 +43,13 @@ class AzureEventHubsSink:
     ) -> None:
         """Binds the sink to a producer, building one if none was injected.
 
+        **The extra is required with an injected producer too** (SPEC-071 FR-002). Every batch is
+        built from the extra's ``EventData`` class, so an injected producer without
+        ``azure-eventhub`` installed used to construct and then raise ``ModuleNotFoundError`` out
+        of every ``emit``. The class is resolved once here, after the argument checks and before
+        anything is built, so that configuration is refused where it is written; ``emit`` still
+        resolves it per batch through :func:`_event_data_cls`, the seam tests patch.
+
         Args:
           producer: An ``EventHubProducerClient``-shaped object, or ``None`` to build one.
           connection_str: The connection string, required when no producer is injected.
@@ -58,21 +66,18 @@ class AzureEventHubsSink:
         Raises:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
           ValueError: If no producer is injected and no connection string was given.
-          ImportError: If the ``azure-eventhubs`` extra is not installed.
+          ImportError: If the ``azure-eventhubs`` extra is not installed, whether or not a producer
+            was injected; its message names the extra (``MissingExtraError``).
         """
         self.max_retries = floor_count(max_retries, 0, "max_retries", "AzureEventHubsSink")
+        if producer is None and connection_str is None:
+            raise ValueError(
+                "AzureEventHubsSink requires connection_str when no producer is injected"
+            )
+        _event_data_cls()
         if producer is None:
-            if connection_str is None:
-                raise ValueError(
-                    "AzureEventHubsSink requires connection_str when no producer is injected"
-                )
-            from azure.eventhub import (  # type: ignore[import-not-found]
-                EventHubProducerClient,
-            )
-
-            producer = EventHubProducerClient.from_connection_string(
-                connection_str, eventhub_name=eventhub
-            )
+            client_cls = import_extra("azure.eventhub", "azure-eventhubs").EventHubProducerClient
+            producer = client_cls.from_connection_string(connection_str, eventhub_name=eventhub)
         self.producer = producer
         self.log_foundry_stop_signal: threading.Event | None = None
         self.failed = 0
@@ -344,6 +349,4 @@ def _event_data_cls() -> Any:
     Raises:
       ImportError: If the ``azure-eventhubs`` extra is not installed.
     """
-    from azure.eventhub import EventData
-
-    return EventData
+    return import_extra("azure.eventhub", "azure-eventhubs").EventData

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import exact_int, usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -419,10 +420,10 @@ class NATSSink:
         self._thread.start()
         try:
             if client is None:
-                import nats  # type: ignore[import-not-found]
-
                 client = self._submit(
-                    nats.connect(servers or "nats://localhost:4222", **supplied)
+                    import_extra("nats", "nats").connect(
+                        servers or "nats://localhost:4222", **supplied
+                    )
                 ).result()
         except BaseException:
             self._closed = True

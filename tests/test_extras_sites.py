@@ -27,6 +27,7 @@ serve invariant 2's neighbour rule that a missing optional speed-up costs nothin
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 import threading
 from dataclasses import dataclass
@@ -35,6 +36,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from log_foundry.sinks import eventhubs, nats, rabbitmq, sentry
+from log_foundry.sinks._extras import MissingExtraError
 from log_foundry.sinks.clickhouse import ClickHouseSink
 from log_foundry.sinks.eventhubs import AzureEventHubsSink
 from log_foundry.sinks.firehose import FirehoseSink
@@ -45,9 +47,12 @@ from log_foundry.sinks.nats import NATSSink
 from log_foundry.sinks.postgres import PostgresSink
 from log_foundry.sinks.pubsub import GooglePubSubSink
 from log_foundry.sinks.rabbitmq import RabbitMQSink
-from log_foundry.sinks.redis import RedisListSink
+from log_foundry.sinks.redis import RedisListSink, RedisStreamsSink
+from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.sns import SNSSink
+from log_foundry.sinks.sqlite import SQLiteSink
 from log_foundry.sinks.sqs import SQSSink
+from test_sinks_nats import FakeNATS
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -300,3 +305,80 @@ def test_rabbitmq_without_pika_uses_its_own_properties(monkeypatch: pytest.Monke
 def test_sentry_without_the_sdk_imports_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
     make_absent(monkeypatch, "sentry_sdk")
     assert sentry._import_sdk() is None
+
+
+# --- Phase 2: the sites through `import_extra` ----------------------------------------------------
+
+
+@pytest.mark.parametrize("site", BARE, ids=[site.where for site in BARE])
+def test_a_bare_site_names_its_extra_and_the_command(
+    monkeypatch: pytest.MonkeyPatch, site: Site
+) -> None:
+    make_absent(monkeypatch, site.module)
+    with pytest.raises(MissingExtraError) as info:
+        site.reach()
+    message = str(info.value)
+    assert f'The "{site.extra}" extra is not installed (' in message
+    assert f'pip install "log-foundry[{site.extra}]"' in message
+    assert "No module named" in message
+    assert info.value.name in self_and_parents(site.module)
+
+
+def test_an_injected_eventhubs_producer_refuses_a_missing_extra_at_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-002: it used to construct and then raise ``ModuleNotFoundError`` from every emit."""
+    make_absent(monkeypatch, "azure.eventhub")
+    with pytest.raises(MissingExtraError) as info:
+        AzureEventHubsSink(producer=object())
+    assert 'pip install "log-foundry[azure-eventhubs]"' in str(info.value)
+    monkeypatch.setattr(eventhubs, "_event_data_cls", lambda: object)
+    assert AzureEventHubsSink(producer=object()).producer is not None
+
+
+def test_eventhubs_with_neither_producer_nor_connection_string_keeps_its_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An argument error is reported ahead of an environment one."""
+    make_absent(monkeypatch, "azure.eventhub")
+    with pytest.raises(ValueError, match="requires connection_str when no producer is injected"):
+        AzureEventHubsSink()
+
+
+_EXTRA_MODULES = sorted({site.module for site in BARE} | {module for _, module, _ in SOFT})
+"""Every module an import site names, derived from the two tables."""
+
+
+def test_an_injected_client_imports_no_extra(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-002: with every extra absent, each injected-client sink still constructs.
+
+    The finder raises for any import of an extra, so a sink that reached for one would fail here;
+    the one exception is ``AzureEventHubsSink``'s ``EventData``, which is patched.
+    """
+    for module in _EXTRA_MODULES:
+        make_absent(monkeypatch, module)
+    monkeypatch.setattr(eventhubs, "_event_data_cls", lambda: object)
+    connection = sqlite3.connect(":memory:")
+    built = [
+        ClickHouseSink("t", client=object()),
+        AzureEventHubsSink(producer=object()),
+        FirehoseSink("s", client=object()),
+        KafkaSink("t", producer=object()),
+        KinesisSink("s", client=object()),
+        MongoDBSink(client={"d": {"c": object()}}, database="d", collection="c"),
+        PostgresSink("t", connection=object()),
+        GooglePubSubSink("t", client=object()),
+        RabbitMQSink(exchange="e", routing_key="r", connection=_Connection()),
+        RedisStreamsSink("s", client=object()),
+        RedisListSink("k", client=object()),
+        SentrySink(client=object()),
+        SNSSink("arn", client=object()),
+        SQLiteSink(":memory:", connection=connection),
+        SQSSink("https://q", client=object()),
+    ]
+    nats_sink = NATSSink("s", client=FakeNATS())
+    try:
+        assert len(built) + 1 == 16, "the sixteen injected-client classes"
+    finally:
+        nats_sink.close()
+        connection.close()

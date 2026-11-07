@@ -13,6 +13,7 @@ from log_foundry import _diag
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events, repair_bson
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -195,9 +196,9 @@ class MongoDBSink:
             )
         self._owns_client = client is None
         if client is None:
-            from pymongo import MongoClient  # type: ignore[import-not-found]
-
-            client = MongoClient(uri, **_client_bounds(uri, socket_timeout, server_selection_timeout))
+            client = import_extra("pymongo", "mongo").MongoClient(
+                uri, **_client_bounds(uri, socket_timeout, server_selection_timeout)
+            )
         self._client = client
         self._collection = client[database][collection]
         self.log_foundry_stop_signal: threading.Event | None = None
@@ -406,9 +407,7 @@ class MongoDBSink:
             return
         encode = None
         try:
-            import bson  # type: ignore[import-not-found]
-
-            found = getattr(bson, "encode", None)
+            found = getattr(import_extra("bson", "mongo"), "encode", None)
         except Exception:
             found = None
         if callable(found):

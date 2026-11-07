@@ -54,6 +54,12 @@ if TYPE_CHECKING:
 DSN = "https://pubkey@o123.ingest.sentry.io/456"
 
 
+@pytest.fixture(autouse=True)
+def _event_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-071 FR-002: `AzureEventHubsSink` resolves `EventData` at construction, extra or not."""
+    monkeypatch.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: object)
+
+
 class Lie(int):
     """An int subclass whose `<` and `>` return False: `max(Lie(-3), 0)` returns the Lie itself."""
 
@@ -365,6 +371,8 @@ def _pubsub(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
     calls, factory = _counting()
     cloud = types.SimpleNamespace(pubsub_v1=types.SimpleNamespace(PublisherClient=factory))
     monkeypatch.setitem(sys.modules, "google.cloud", cloud)
+    # SPEC-071 FR-002: the sink imports `google.cloud.pubsub_v1` whole, not off `google.cloud`.
+    monkeypatch.setitem(sys.modules, "google.cloud.pubsub_v1", cloud.pubsub_v1)
     return calls
 
 

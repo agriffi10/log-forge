@@ -11,6 +11,7 @@ from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -122,9 +123,7 @@ class ClickHouseSink:
         self._counter_lock = threading.Lock()
         self._owns_client = client is None
         if client is None:
-            import clickhouse_connect  # type: ignore[import-not-found]
-
-            client = clickhouse_connect.get_client(dsn=dsn, **bounds)
+            client = import_extra("clickhouse_connect", "clickhouse").get_client(dsn=dsn, **bounds)
         self.client = client
         if create_table:
             self._ensure_schema()
