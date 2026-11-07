@@ -52,7 +52,8 @@ patch. Every other injected-client sink imports nothing it did not import before
 `src/log_foundry/**/*.py`. It reports, by `file:line`, any import of a module outside the standard
 library and the package outside `if TYPE_CHECKING:`; holds the derived `(file, function, module,
 extra)` sites to a set written out by name; requires every extra to be a key of
-`[project.optional-dependencies]`; and requires both arguments to be string literals. A mutation
+`[project.optional-dependencies]`; requires both arguments to be string literals; and reports any
+call to `importlib.import_module` or `__import__` outside `sinks/_extras.py`. A mutation
 sweep rewrites each call back into the bare import in memory and requires a report for each.
 
 **Rejected.**
