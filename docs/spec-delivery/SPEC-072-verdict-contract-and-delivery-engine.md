@@ -77,3 +77,11 @@
   `log_foundry_stop_signal` with the static read, so a wrapper that keeps it behind a property —
   `FilteringSink` and `MultiSink` do — reads as having none, and its engine run would wait with
   `time.sleep`. SPEC-075 must say how a wrapper's signal reaches the engine.
+- **The at-fork handler as a whole still runs third-party hooks on hostile sink shapes** outside
+  the counters reach, which alone reads through `sinks.base._static_value`: the walk's own
+  ownership, container, traversal and namespace checks (`_fork._is_owned`, `_is_container`,
+  `_is_traversable`, `_fresh_primitive`, `_namespace_items`' `vars()`, `_slot_value`) and
+  `_lifecycle`'s `_may_be_a_sink` and `_mark_inherited` use ordinary lookups that can run a
+  hostile sink's code — `isinstance` (which reads `__class__`), `getattr`, `vars()`, and a type's
+  `__hash__` and `__eq__` in a set membership. SPEC-079's single-walk rewrite is where to close
+  that.

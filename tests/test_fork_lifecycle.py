@@ -3918,7 +3918,23 @@ class _SlottedEngineSink:
         pass
 
 
+class _CountersField:
+    """A "validated field" with ``__set__`` and no ``__get__``: reads go to the instance dict."""
+
+    def __set__(self, obj: object, value: object) -> None:
+        if type(value) is not SinkCounters:
+            raise TypeError("log_foundry_counters must be a SinkCounters")
+        obj.__dict__["log_foundry_counters"] = value
+
+
+class _ValidatedEngineSink(_StructuralEngineSink):
+    """A structural engine sink whose counters sit behind a set-only descriptor."""
+
+    log_foundry_counters = _CountersField()
+
+
 _ENGINE_SINKS = {
+    "set-only-descriptor": _ValidatedEngineSink,
     "structural": _StructuralEngineSink,
     "subclasses-sink": _SubclassedEngineSink,
     "slotted": _SlottedEngineSink,

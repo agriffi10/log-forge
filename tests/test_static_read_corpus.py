@@ -89,9 +89,22 @@ def _recording_getattr(self: object, name: str) -> Any:
 _INSTANCE_HOOKS = {"__getattribute__": _recording_getattribute, "__getattr__": _recording_getattr}
 
 
-def build(name: str, bases: tuple[type, ...] = (), namespace: dict[str, Any] | None = None) -> Any:
-    """A class built by :class:`Recording`, with the recording instance hooks unless overridden."""
-    return Recording(name, bases, {**_INSTANCE_HOOKS, **(namespace or {})})
+def build(
+    name: str,
+    bases: tuple[type, ...] = (),
+    namespace: dict[str, Any] | None = None,
+    *,
+    getattribute: bool = True,
+) -> Any:
+    """A class built by :class:`Recording`, with the recording instance hooks unless overridden.
+
+    The probe's sinks take ``getattribute=False``: a Python-level ``__getattribute__`` anywhere in
+    a sink's MRO refuses the offer by rule (it could hand the worker another ``emit``), so a
+    recording one on every sink would make every probe case the same case. They keep the
+    recording ``__getattr__`` and the recording metaclass.
+    """
+    hooks = dict(_INSTANCE_HOOKS) if getattribute else {"__getattr__": _recording_getattr}
+    return Recording(name, bases, {**hooks, **(namespace or {})})
 
 
 def _put(obj: object, name: str, value: object) -> object:
@@ -113,6 +126,23 @@ class DeleteOnly:
     def __get__(self, obj: object, cls: type | None = None) -> int:
         _note("DeleteOnly.__get__")
         return 7
+
+    def __delete__(self, obj: object) -> None:
+        pass
+
+
+class SetOnly:
+    """A "validated field": ``__set__`` without ``__get__``, so reads go past it to the instance."""
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    def __set__(self, obj: object, value: object) -> None:
+        object.__getattribute__(obj, "__dict__")[self.name] = value
+
+
+class DeleteNoGet:
+    """``__delete__`` without ``__get__``: not a data descriptor for reading either."""
 
     def __delete__(self, obj: object) -> None:
         pass
@@ -224,6 +254,9 @@ def _slotted(set_it: bool, base: tuple[type, ...] = ()) -> Any:
 _SLOT_BASE = build("SlotBase", (), {"__slots__": ("x",)})
 
 
+_SET_ONLY_BARE = build("SetOnlyBare", (), {"x": SetOnly()})
+"""One class for both builds of its case, so ``getattr``'s answer is the very descriptor read."""
+
 STATIC_CASES: dict[str, tuple[Callable[[], Any], object]] = {
     "class-attr": (lambda: build("A", (), {"x": 1})(), GETATTR),
     "instance-over-class": (lambda: _put(build("B", (), {"x": 1})(), "x", 2), GETATTR),
@@ -282,6 +315,18 @@ STATIC_CASES: dict[str, tuple[Callable[[], Any], object]] = {
         ),
     ),
     "missing": (lambda: build("Empty")(), GETATTR),
+    "set-only-descriptor-with-instance": (
+        lambda: _put(build("SetOnlyField", (), {"x": SetOnly()})(), "x", 42),
+        GETATTR,
+    ),
+    "set-only-descriptor-no-instance": (
+        lambda: _SET_ONLY_BARE(),
+        GETATTR,
+    ),
+    "delete-only-no-get-with-instance": (
+        lambda: _with_dict_entry(build("DeleteNoGetField", (), {"x": DeleteNoGet()})(), 43),
+        GETATTR,
+    ),
 }
 
 
@@ -339,8 +384,14 @@ def _close(self: object) -> None:
 _ENGINE = {"deliver": _deliver, "emit": _adapter, "close": _close}
 
 
+def _sink_class(
+    name: str, bases: tuple[type, ...] = (), namespace: dict[str, Any] | None = None
+) -> Any:
+    return build(name, bases, namespace, getattribute=False)
+
+
 def _engine(name: str, bases: tuple[type, ...] = (), extra: dict[str, Any] | None = None) -> Any:
-    return build(name, bases, {**_ENGINE, **(extra or {})})
+    return _sink_class(name, bases, {**_ENGINE, **(extra or {})})
 
 
 def _counted(obj: Any) -> Any:
@@ -354,12 +405,12 @@ def _proxy() -> Any:
         _note("proxy.__getattr__")
         return getattr(inner, name)
 
-    return build("Proxy", (), {"__getattr__": delegate, "close": _close})()
+    return _sink_class("Proxy", (), {"__getattr__": delegate, "close": _close})()
 
 
 def _emit_below() -> Any:
-    base = build("EmitBase", (), {"emit": _adapter, "close": _close})
-    return _counted(build("DeliverAbove", (base,), {"deliver": _deliver})())
+    base = _sink_class("EmitBase", (), {"emit": _adapter, "close": _close})
+    return _counted(_sink_class("DeliverAbove", (base,), {"deliver": _deliver})())
 
 
 def _instance_emit() -> Any:
@@ -375,6 +426,30 @@ def _many_sink() -> Any:
     for index in range(41):
         _put(sink, f"a{index}", index)
     return sink
+
+
+def _passing(self: object, name: str) -> Any:
+    _note("override.__getattribute__")
+    return object.__getattribute__(self, name)
+
+
+def _scrubbing(self: object, name: str) -> Any:
+    if name == "emit":
+        inner = object.__getattribute__(self, "emit")
+        return lambda batch: inner([{**event, "scrubbed": True} for event in batch])
+    return object.__getattribute__(self, name)
+
+
+def _supplies_emit(self: object, name: str) -> Any:
+    if name == "emit":
+        return types.MethodType(_adapter, self)
+    raise AttributeError(name)
+
+
+def _emit_bound_elsewhere() -> Any:
+    other = _counted(_engine("Other")())
+    sink = _counted(_engine("BoundElsewhere")())
+    return _put(sink, "emit", types.MethodType(_adapter, other))
 
 
 def _engine_slots() -> Any:
@@ -397,7 +472,24 @@ PROBE_CASES: dict[str, Callable[[], Any]] = {
     "exception-subclass": lambda: _counted(_engine("ExcSink", (Exception,))()),
     "metaclass-mro-property": lambda: _counted(_engine("MroSink")()),
     "getattribute-override": lambda: _counted(
-        _engine("GaSink", (), {"__getattribute__": lambda s, n: object.__getattribute__(s, n)})()
+        _engine("GaSink", (), {"__getattribute__": _passing})()
+    ),
+    "scrubbing-getattribute": lambda: _counted(
+        _engine("ScrubSink", (), {"__getattribute__": _scrubbing})()
+    ),
+    "no-emit": lambda: _counted(
+        _sink_class("NoEmit", (), {"deliver": _deliver, "close": _close})()
+    ),
+    "getattr-supplies-emit": lambda: _counted(
+        _sink_class(
+            "GetattrEmit",
+            (),
+            {"deliver": _deliver, "close": _close, "__getattr__": _supplies_emit},
+        )()
+    ),
+    "instance-emit-bound-to-another-sink": _emit_bound_elsewhere,
+    "set-only-counters-descriptor": lambda: _counted(
+        _engine("SetOnlyCounters", (), {"log_foundry_counters": SetOnly()})()
     ),
     "shadowed-dict-property": lambda: _counted(
         _engine("ShadowSink", (), {"__dict__": property(lambda s: {})})()
@@ -407,10 +499,10 @@ PROBE_CASES: dict[str, Callable[[], Any]] = {
     ),
     "instance-emit": _instance_emit,
     "class-emit-override": lambda: _counted(
-        build("Overrides", (_engine("EngineBase"),), {"emit": _adapter})()
+        _sink_class("Overrides", (_engine("EngineBase"),), {"emit": _adapter})()
     ),
     "class-emit-override-own-function": lambda: _counted(
-        build("Stamps", (_engine("EngineBase3"),), {"emit": _stamping})()
+        _sink_class("Stamps", (_engine("EngineBase3"),), {"emit": _stamping})()
     ),
     "emit-defined-below-deliver": _emit_below,
     "emit-property": lambda: _counted(
@@ -420,7 +512,7 @@ PROBE_CASES: dict[str, Callable[[], Any]] = {
         _engine("EmitStatic", (), {"emit": staticmethod(lambda batch: None)})()
     ),
     "deliver-none": lambda: _counted(
-        build("OptOut", (_engine("EngineBase2"),), {"deliver": None})()
+        _sink_class("OptOut", (_engine("EngineBase2"),), {"deliver": None})()
     ),
     "proxy-getattr": _proxy,
 }
@@ -445,6 +537,13 @@ PROBE_DIVERGENT: dict[str, tuple[bool, str]] = {
     "counters-property": (
         False,
         "the counters resolve only by running a property, which the probe never runs",
+    ),
+    "getattribute-override": (
+        False,
+        (
+            "a Python-level __getattribute__ may hand the worker another emit, and asking which "
+            "means running it, so the probe refuses even one that passes through"
+        ),
     ),
 }
 """Cases where the probe must not follow resolution, with its answer and why.

@@ -186,7 +186,9 @@ class Sink(Protocol):
     reads the sink's **type** statically: ``deliver`` must be a plain function defined on the
     class, no class earlier in the MRO than the one defining it may define ``emit``, and no
     ``emit`` may be set on the instance (so a subclass that overrides ``emit`` to stamp or scrub
-    keeps running its override, and so does ``sink.emit = scrub``), and the sink
+    keeps running its override, and so does ``sink.emit = scrub``); some class must define
+    ``emit``, and none may define ``__getattribute__`` as a plain function, which could hand the
+    worker another ``emit``; and the sink
     must also carry ``log_foundry_counters``, exactly a ``SinkCounters``, which the engine is
     the one writer of; ``losses()`` then returns ``log_foundry_counters.losses()``. A class
     attribute ``deliver = None`` declares an opt-out. When ``deliver`` is offered, the worker and
@@ -314,9 +316,11 @@ def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[obj
     The MRO and each namespace are read through the unbound ``type`` accessors, so no metaclass
     hook runs — no ``__mro__`` or ``__dict__`` property, and no metaclass ``__eq__`` or
     ``__hash__``, since nothing here hashes or compares a class. One residue is accepted rather
-    than closed: the name is looked up in each namespace's dict, so on a hash collision a key that
-    is a ``str`` subclass with its own ``__eq__`` — a key only a deliberately hostile class
-    builder can plant — runs that ``__eq__``. With ``skip_none`` a ``None`` found in a
+    than closed, and ordinary ``getattr`` shares it: the name is looked up in each namespace's
+    dict (and the instance dict, in :func:`_own_attribute`), so any key there whose hash collides
+    with the name has its ``__eq__`` run — a ``str`` subclass with its own ``__eq__``, or any
+    object whose ``__hash__`` returns ``hash(name)``, planted with ``setattr`` or
+    ``__dict__[key] = value``. With ``skip_none`` a ``None`` found in a
     namespace is passed over and the walk goes on, which is how SPEC-072's adapter reads a
     ``deliver = None`` opt-out: "do not offer", not "do not have".
 
@@ -435,13 +439,17 @@ def _static_value(obj: object, name: str) -> object:
     """Reads one attribute the way ordinary access finds it, running none of the object's code.
 
     The order is CPython's own for an instance: a **data descriptor** on the class (one whose
-    type defines ``__set__`` or ``__delete__``) wins, then the instance's own value, then any
-    other class attribute. The class side reads through ``type``'s unbound ``__mro__`` and
-    ``__dict__`` accessors and a ``__slots__`` member through its builtin ``__get__``; the
-    instance side is :func:`_own_attribute`'s. So no property, ``__getattr__``,
+    type defines ``__get__`` and also ``__set__`` or ``__delete__``) wins, then the instance's own
+    value, then any other class attribute. A value whose type defines ``__set__`` or
+    ``__delete__`` without ``__get__`` is not one for reading — CPython reads the instance dict
+    past it — so a "validated field" descriptor guarding ``log_foundry_counters`` on assignment
+    leaves the instance value visible. The class side reads through ``type``'s unbound
+    ``__mro__`` and ``__dict__`` accessors and a ``__slots__`` member through its builtin
+    ``__get__``; the instance side is :func:`_own_attribute`'s. So no property, ``__getattr__``,
     ``__getattribute__``, descriptor ``__get__`` or metaclass hook (``__mro__``, ``__name__``,
-    ``__eq__``, ``__hash__``) runs; the one residue, a hostile ``str``-subclass namespace key's
-    ``__eq__`` on a hash collision, is :func:`_class_member`'s. ``inspect.getattr_static`` was used
+    ``__eq__``, ``__hash__``) runs; the one residue, the ``__eq__`` of a dict key whose hash
+    collides with the name, is :func:`_class_member`'s, and ``getattr`` has it too.
+    ``inspect.getattr_static`` was used
     here first and is not this: its shadowed-``__dict__`` check is ``lru_cache``-wrapped, so it
     hashes the class and can compare it, which runs a metaclass's ``__hash__`` and ``__eq__``
     (SPEC-072's first diff review, measured on 3.12 and 3.13). A slot that is unset reads as
@@ -467,7 +475,9 @@ def _static_value(obj: object, name: str) -> object:
             kind = type(found[0])
             if kind is types.MemberDescriptorType:
                 return _MEMBER_GET(cast("types.MemberDescriptorType", found[0]), obj, cls)
-            if _class_member(kind, "__set__") or _class_member(kind, "__delete__"):
+            if _class_member(kind, "__get__") and (
+                _class_member(kind, "__set__") or _class_member(kind, "__delete__")
+            ):
                 return found[0]
     except Exception:
         return _ABSENT

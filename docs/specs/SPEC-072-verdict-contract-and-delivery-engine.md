@@ -202,16 +202,21 @@ for the reason `losses()` is not declared on it. `read_deliver(sink)` decides wh
   it to an inherited `deliver`, because an opt-out means "do not offer", not "do not have".
 - `deliver` is offered only when the `emit` ordinary lookup resolves on the sink — the one the
   worker would call — is a plain function defined on or below the class that defines `deliver`:
-  no class in `type(sink).__mro__` before that one defines `emit`, the `emit` found is a plain
-  function (a property or a `staticmethod` refuses), and **no `emit` is set on the instance
-  itself**. A subclass that overrides `emit` to scrub or stamp a batch and then calls
+  some class defines `emit` (one only a `__getattr__` supplies refuses, since the orphan fallback
+  would raise), no class in `type(sink).__mro__` before that one defines it, the `emit` found is
+  a plain function (a property or a `staticmethod` refuses), **no `emit` is set on the instance
+  itself**, and no class in the MRO defines `__getattribute__` as a plain function — one could
+  hand the worker a scrubbing `emit` and cannot be asked which without running it, so even a
+  pass-through one refuses. A subclass that overrides `emit` to scrub or stamp a batch and then calls
   `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
   adapter (FR-006) runs the engine below it. So does an `emit` assigned on the instance —
   `sink.emit = scrub`, or `mock.patch.object(sink, "emit")` in a test — read without a hook as
   the static read below reads the instance. `tests/test_static_read_corpus.py` derives each
   case's answer from Python's own resolution of `sink.emit` and holds the probe to it.
 - `log_foundry_counters` is read statically on the sink — CPython's lookup order (a class data
-  descriptor, then the instance `__dict__`, then a class attribute) walked through builtin
+  descriptor — one whose type defines `__get__` and also `__set__` or `__delete__`; a
+  set-only "validated field" is not one, so the instance value behind it is read — then the
+  instance `__dict__`, then a class attribute) walked through builtin
   accessors only, `type`'s unbound `__mro__` and `__dict__`, the class's own `__dict__` getset
   descriptor and a `__slots__` member's descriptor, so no property, `__getattr__`, descriptor
   `__get__` or metaclass hook (`__mro__`, `__name__`, `__eq__`, `__hash__`) runs — and must be
@@ -225,8 +230,10 @@ for the reason `losses()` is not declared on it. `read_deliver(sink)` decides wh
   **An instance value shadowing a non-data descriptor** (one with `__get__` but neither `__set__`
   nor `__delete__`) **behind such a shadowed `__dict__` is not seen**: the generic lookup would
   run the descriptor, so the class's descriptor is read instead. And the name is looked up in
-  plain dicts, so on a hash collision a namespace key that is a `str` subclass with its own
-  `__eq__` runs that `__eq__`; only a deliberately hostile class builder can plant one.
+  plain dicts — the class namespaces and the instance dict — so any key there whose hash
+  collides with the name has its `__eq__` run: a `str` subclass with its own `__eq__`, or any
+  object whose `__hash__` returns `hash(name)`, planted with `setattr` or `__dict__[key] = value`.
+  Ordinary `getattr` runs it too.
 
 `read_deliver` returns the bound `deliver` when the sink offers it and `None` otherwise. Like
 `read_losses` it never raises and writes nothing. It is public for the reason `read_losses` is: a
@@ -446,8 +453,8 @@ it. The reach is instead at **the value the walk would not push** — an attribu
 such as the `Worker`'s `sink`, or a member of a container it walks. There
 the walk reads the one attribute `log_foundry_counters` with the same static read FR-001's probe
 uses (no property, `__getattr__`, descriptor or metaclass hook runs in the at-fork handler;
-the one residue is FR-001's, a hostile `str`-subclass namespace key's `__eq__` on a hash
-collision), resolving a `__slots__` member through its builtin descriptor, and when the result
+the one residue is FR-001's, the `__eq__` of a namespace or instance-dict key whose hash
+collides with the name, which `getattr` runs too), resolving a `__slots__` member through its builtin descriptor, and when the result
 is exactly `SinkCounters` it pushes the counters, which are
 the package's own and so are walked, which replaces their lock. `SinkCounters` is found through
 `sys.modules` once per walk, never imported, since an import in a child not yet returned from
@@ -1095,3 +1102,10 @@ tests/
   shadowed-`__dict__` limit to an instance value over a non-data descriptor, and made the override
   rule follow the `emit` ordinary lookup resolves (a property or `staticmethod` `emit` now refuses
   the offer).
+- 2026-11-07, execution review: the offer also refuses a sink with no class-defined `emit` and
+  one whose MRO defines `__getattribute__` as a plain function (a scrubbing one bypassed its own
+  scrub); a set-only or delete-only descriptor without `__get__` no longer hides the instance
+  value behind it (a validated `log_foundry_counters` was refused and its adapter raised on every
+  batch); and the hash-collision residue is stated for any colliding key, in a class namespace or
+  the instance dict, not only a `str` subclass. Each is a case in
+  `tests/test_static_read_corpus.py`.
