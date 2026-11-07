@@ -178,6 +178,27 @@ class Sink(Protocol):
     because a swallowed flush failure is exactly the "sink the worker believes" this file exists
     to prevent.
 
+    A seventh is optional in the same way and changes how a batch is delivered rather than what
+    is reported: ``deliver(batch) -> Verdict`` (SPEC-072), which returns one ``Outcome`` per
+    event, by index, instead of raising for the whole batch. ``read_deliver`` is the probe, and it
+    reads the sink's **type** statically: ``deliver`` must be a plain function defined on the
+    class, no class earlier in the MRO than the one defining it may define ``emit`` (so a
+    subclass that overrides ``emit`` to stamp or scrub keeps running its override), and the sink
+    must also carry ``log_foundry_counters``, exactly a ``SinkCounters``, which the engine is
+    the one writer of; ``losses()`` then returns ``log_foundry_counters.losses()``. A class
+    attribute ``deliver = None`` declares an opt-out. When ``deliver`` is offered, the worker and
+    the orphan path call it through the delivery engine instead of calling ``emit``: the engine
+    resends only the events marked ``RETRYABLE``, within the 1.x total of attempts
+    (``max_retries`` + 1 times the worker's ``max_retries`` + 1, the sink's own ``max_retries``
+    read as an exact ``int``), waits the 1.x backoff on the stop signal, honours a verdict's
+    ``retry_after`` under the sink's ``max_retry_after`` (30 seconds when it declares none), and
+    counts what did not land into the counters at the end of the run. Two more optional
+    attributes refine it: ``log_foundry_idempotent = True`` (exactly ``True``) lets an
+    ``UNKNOWN`` outcome, an unreadable verdict or an exception escaping ``deliver`` be resent,
+    the last only when the sink's ``_retryable_error`` accepts it. Such a sink's ``emit`` should
+    be ``emit_via_deliver(self, batch)``, which runs the same engine inline and raises when the
+    run fails, so a wrapper calling ``inner.emit(batch)`` sees what a 1.x ``emit`` showed it.
+    **A ``deliver`` must not call its own ``emit``**, and must not mutate the list it is given.
     """
 
     @abstractmethod

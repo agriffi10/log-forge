@@ -1,0 +1,360 @@
+"""The verdict contract: what one ``deliver`` call reports per event (SPEC-072 FR-001)."""
+
+from __future__ import annotations
+
+import enum
+import inspect
+import threading
+import types
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final, Self, cast, final
+
+from log_foundry import _diag
+from log_foundry.sanitize import _int_text
+from log_foundry.sinks._retry import exact_int
+from log_foundry.sinks.base import SinkLosses
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+__all__ = ["Outcome", "SinkCounters", "Verdict", "read_deliver"]
+
+_ABSENT: Final = object()
+"""What :func:`_static_value` answers for an attribute that is missing or cannot be read."""
+
+_MRO = type.__dict__["__mro__"].__get__
+"""``type.__mro__``, unbound, so a metaclass ``__mro__`` property is never consulted."""
+
+_NAMESPACE = type.__dict__["__dict__"].__get__
+"""``type.__dict__``, unbound, so a class's own namespace is read without any hook running."""
+
+
+class Outcome(enum.Enum):
+    """What happened to one event of a batch handed to ``deliver``; closed for 1.x.
+
+    ``outcomes[i]`` of a :class:`Verdict` is the fate of ``batch[i]``. ``REJECTED`` and
+    ``DROPPED`` are the two forms of "rejected for good" and differ only in which
+    :class:`~log_foundry.SinkLosses` term the engine counts them in: ``failed`` for an event the
+    destination refused, ``dropped`` for one the sink refused to send because it could never be
+    accepted as built. ``UNKNOWN`` is an event that may have landed — a ``2xx`` whose body
+    cannot be read — and is resent only by a sink that declares itself idempotent. ``SKIPPED``
+    is a deliberate non-send that the engine counts nowhere and never resends, and it is not
+    ``ACCEPTED`` for the run-failed rule, so a batch of one declined event and a rejected rest
+    still fails.
+
+    **Closed for 1.x.** It is an input a sink writes, not a result a caller reads, so the rule
+    that results grow by new values (invariant 10) does not reach it, and a new member would
+    break a typed sink's exhaustive ``match`` at type-check time.
+
+    Attributes:
+      ACCEPTED: The destination took the event.
+      RETRYABLE: It did not land and a resend can succeed.
+      REJECTED: The destination refused it for good.
+      DROPPED: The sink refused to send it, because it could never be accepted as built.
+      UNKNOWN: It may have landed; resent only by an idempotent sink.
+      SKIPPED: Not sent, deliberately; no engine counter, never resent.
+    """
+
+    ACCEPTED = "accepted"
+    RETRYABLE = "retryable"
+    REJECTED = "rejected"
+    DROPPED = "dropped"
+    UNKNOWN = "unknown"
+    SKIPPED = "skipped"
+
+
+@dataclass(frozen=True, kw_only=True)
+class Verdict:
+    """One ``deliver`` call's report: a fate per event, and the server's retry-after hint.
+
+    Construction is keyword-only, as every public dataclass here is, and the class grows only by
+    appending fields. ``outcomes`` is typed ``tuple[Outcome, ...]``; at run time a ``list`` is
+    accepted too and stored as a ``tuple``, for an untyped caller, and any other container is
+    refused. The container and each element are routed on their **real** type —
+    ``issubclass(type(x), ...)``, never ``isinstance`` — and a refusal names the type through
+    the stored name (``_diag._STORED_NAME``), so a metaclass ``__name__`` property can neither
+    rename it nor run, and an element whose ``__class__`` claims ``Outcome`` is refused with its
+    ``__class__`` never read. A ``tuple`` or ``list`` subclass is copied through the base
+    class's own ``__iter__``, so a subclass's iteration hook never runs. The refusal names a
+    position or a type, never a value, since a value can carry an event's data.
+
+    ``retry_after`` is stored as given: the engine checks its type before it bounds it, and an
+    unusable hint is answered with the backoff rather than refused here, because a sink that
+    built a ``Verdict`` from a server header has already delivered or not by then.
+
+    Attributes:
+      outcomes: ``outcomes[i]`` is the fate of ``batch[i]`` in the list ``deliver`` was given.
+      retry_after: The server's hint in seconds, advisory only, or ``None``.
+    """
+
+    outcomes: tuple[Outcome, ...]
+    retry_after: float | None = None
+
+    def __post_init__(self) -> None:
+        """Refuses a container or element that is not an ``Outcome`` sequence, storing a tuple.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          TypeError: When ``outcomes`` is not a ``tuple`` or ``list``, naming its type, or when an
+            element is not an ``Outcome``, naming its position and its type.
+        """
+        given = self.outcomes
+        kind = type(given)
+        if issubclass(kind, tuple):
+            items = tuple(tuple.__iter__(given))
+        elif issubclass(kind, list):
+            items = tuple(list.__iter__(cast("list[Outcome]", given)))
+        else:
+            raise TypeError(
+                "Verdict outcomes must be a tuple of Outcome members, "
+                f"not {_diag._STR_STR(_diag._STORED_NAME(kind))}"
+            )
+        for index, item in enumerate(items):
+            if not issubclass(type(item), Outcome):
+                raise TypeError(
+                    f"Verdict outcomes[{index}] must be an Outcome, "
+                    f"not {_diag._STR_STR(_diag._STORED_NAME(type(item)))}"
+                )
+        object.__setattr__(self, "outcomes", items)
+
+    @classmethod
+    def uniform(cls, outcome: Outcome, count: int, *, retry_after: float | None = None) -> Self:
+        """Builds a verdict giving every one of ``count`` events the same outcome.
+
+        The outcome is validated before the count is used, by building a one-element verdict
+        first, so ``uniform("x", 0)`` is refused rather than yielding an empty verdict that
+        hides the mistake until a batch is non-empty.
+
+        Args:
+          outcome: The fate of every event.
+          count: How many events; an exact ``int`` (``True`` reads as ``1``).
+          retry_after: The server's hint in seconds, or ``None``.
+
+        Returns:
+          The verdict.
+
+        Raises:
+          TypeError: When ``count`` is not an ``int``, or ``outcome`` is not an ``Outcome``.
+          ValueError: When ``count`` is negative.
+        """
+        n = exact_int(count, "count", "Verdict.uniform")
+        if n < 0:
+            raise ValueError(f"Verdict.uniform count must not be negative, not {_int_text(n)}")
+        cls(outcomes=(outcome,))
+        return cls(outcomes=(outcome,) * n, retry_after=retry_after)
+
+
+@final
+class SinkCounters:
+    """The counter object a sink owns for the engine, exposed as ``log_foundry_counters``.
+
+    The engine is its one writer after construction: it commits each run's counts through one
+    ``Deferral`` at the end of the run, which reads ``_counter_lock`` at commit time, and a
+    sink's ``losses()`` returns :meth:`losses`. It lives on the sink, not the worker, so it is
+    the same object for every worker, every swap back to that sink and every process the sink
+    is forked into, and the fork repair reaches its lock on a third-party sink through the one
+    attribute name. The names are unique in the tree: ``tests/test_deferral.py`` derives the
+    counters some ``losses()`` reports as ``dropped`` by attribute name, and a plain ``dropped``
+    would meet ``NullSink.dropped``, which no ``losses()`` reports.
+
+    The engine accepts only this exact class (``type(v) is SinkCounters``), so a subclass whose
+    counters are properties can never make a commit misbehave; it is marked final for a type
+    checker to say so too.
+
+    Attributes:
+      dropped_events: Events the sink refused to send, counted only on a run that settled;
+        exact, each event once and in no other term.
+      failed_events: Events attempted and not confirmed; an upper bound, like every sink's
+        ``failed``.
+    """
+
+    def __init__(self) -> None:
+        """Starts both counters at zero with a fresh counter lock.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.dropped_events = 0
+        self.failed_events = 0
+        self._counter_lock = threading.Lock()
+
+    def losses(self) -> SinkLosses:
+        """Returns both counters as one snapshot, read under the counter lock.
+
+        Args:
+          None.
+
+        Returns:
+          The counters as a ``SinkLosses``.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            dropped = self.dropped_events
+            failed = self.failed_events
+        return SinkLosses(dropped=dropped, failed=failed)
+
+
+def _static_value(obj: object, name: str) -> object:
+    """Reads one attribute without running any of the object's own code, or :data:`_ABSENT`.
+
+    ``inspect.getattr_static`` finds an attribute the way ordinary access would — the instance
+    dict, then the class's MRO — without calling a property, a ``__getattr__`` or a
+    ``__getattribute__``. A ``__slots__`` attribute comes back as its member descriptor, which
+    is resolved through its own C-level ``__get__`` (an unset slot raises and reads as absent);
+    any other descriptor is returned as found, so a property reads as the property object and is
+    refused by whatever type test the caller applies.
+
+    Args:
+      obj: The object to read.
+      name: The attribute's name.
+
+    Returns:
+      The value, or :data:`_ABSENT` when it is missing or could not be read.
+
+    Raises:
+      None.
+    """
+    try:
+        found = inspect.getattr_static(obj, name, _ABSENT)
+        if type(found) is types.MemberDescriptorType:
+            found = found.__get__(obj, type(obj))
+    except Exception:
+        return _ABSENT
+    return found
+
+
+def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[object, int] | None:
+    """Finds ``name`` in a class's own MRO namespaces, returning the value and its MRO index.
+
+    The MRO and each namespace are read through the unbound ``type`` accessors, so no metaclass
+    hook runs. With ``skip_none`` a ``None`` found in a namespace is passed over and the walk
+    goes on, which is how the adapter reads a ``deliver = None`` opt-out: "do not offer", not
+    "do not have".
+
+    Args:
+      cls: The class to search.
+      name: The member's name.
+      skip_none: Whether a ``None`` value is passed over rather than returned.
+
+    Returns:
+      ``(value, index)`` for the first class in the MRO whose namespace holds ``name``, or
+      ``None``.
+
+    Raises:
+      Exception: Whatever an unusual class object raises while its MRO is read; callers guard.
+    """
+    for index, klass in enumerate(_MRO(cls)):
+        namespace = _NAMESPACE(klass)
+        if name in namespace:
+            value = namespace[name]
+            if value is None and skip_none:
+                continue
+            return value, index
+    return None
+
+
+def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> object | None:
+    """Returns the sink's class-defined ``deliver`` bound to it, or ``None``.
+
+    Args:
+      sink: The sink.
+      override_rule: Whether a class earlier in the MRO than the one defining ``deliver`` that
+        defines ``emit`` refuses the offer.
+      skip_none: Whether a ``deliver = None`` is passed over (the adapter) or refuses (the probe).
+
+    Returns:
+      The bound method, or ``None``.
+
+    Raises:
+      Exception: Whatever an unusual class object raises; callers guard.
+    """
+    cls = type(sink)
+    found = _class_member(cls, "deliver", skip_none=skip_none)
+    if found is None:
+        return None
+    function, index = found
+    if type(function) is not types.FunctionType:
+        return None
+    if override_rule:
+        for klass in _MRO(cls)[:index]:
+            if "emit" in _NAMESPACE(klass):
+                return None
+    return types.FunctionType.__get__(function, sink, cls)
+
+
+def _probe(
+    sink: object,
+) -> tuple[Callable[[list[dict[str, object]]], Verdict], SinkCounters] | None:
+    """Decides whether a sink offers ``deliver``, returning it bound with the sink's counters.
+
+    The one probe :func:`read_deliver` and the engine share, so the engine counts into the very
+    counters the offer was decided on rather than reading the attribute a second time. Every
+    step reads the sink's **type** or reads statically: ``deliver`` must be a plain function in
+    some class's namespace, no class earlier in the MRO than that one may define ``emit``, and
+    ``log_foundry_counters`` must be exactly a :class:`SinkCounters`.
+
+    Args:
+      sink: The sink to probe, of any type.
+
+    Returns:
+      ``(deliver, counters)``, or ``None`` when the sink does not offer ``deliver``.
+
+    Raises:
+      None.
+    """
+    try:
+        bound = _bound_deliver(sink, override_rule=True, skip_none=False)
+        if bound is None:
+            return None
+        counters = _static_value(sink, "log_foundry_counters")
+        if type(counters) is not SinkCounters:
+            return None
+    except Exception:
+        return None
+    return cast("Callable[[list[dict[str, object]]], Verdict]", bound), counters
+
+
+def read_deliver(sink: object) -> Callable[[list[dict[str, object]]], Verdict] | None:
+    """Returns a sink's bound ``deliver`` when it offers one, else ``None``; never raises.
+
+    The probe for the optional ``deliver`` member, the sibling of ``read_losses``. It reads the
+    sink's **type**, never the instance's dynamic attributes, so no third-party ``__getattr__``,
+    property or metaclass hook runs and nothing is written, stderr included:
+
+    - ``deliver`` is found in a class namespace along ``type(sink).__mro__`` and must be a plain
+      function. A proxy whose ``__getattr__`` delegates to an engine sink therefore offers
+      nothing, and its own ``emit`` runs. A class attribute ``deliver = None`` is a declared
+      opt-out, as is any ``deliver`` that is not a function (a ``staticmethod``, a property).
+    - ``deliver`` is offered only when no class before the defining one in the MRO defines
+      ``emit``, so a subclass that overrides ``emit`` to stamp or scrub and then calls
+      ``super().emit()`` keeps running its override.
+    - ``log_foundry_counters`` must be exactly a :class:`SinkCounters`, read statically, so a sink
+      that defines ``deliver`` with no counters keeps delivering through its ``emit``.
+
+    It is public for the reason ``read_losses`` is: a third-party wrapper that offers ``deliver``
+    itself asks it whether its inner sink offers one.
+
+    Args:
+      sink: The sink to probe, of any type.
+
+    Returns:
+      The bound ``deliver``, or ``None`` when the sink does not offer it.
+
+    Raises:
+      None.
+    """
+    probe = _probe(sink)
+    return None if probe is None else probe[0]

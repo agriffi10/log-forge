@@ -377,6 +377,8 @@ def test_the_public_surface_and_signatures_are_unchanged() -> None:
         "reset_context",
         "set_baggage",
     ]
+    # SPEC-072 FR-001 grew the surface by exactly four names (Outcome, SinkCounters, Verdict and
+    # read_deliver); this pin re-states the 30 it held plus those four, in sorted position.
     assert log_foundry.__all__ == [
         "DEFAULT_SHUTDOWN_TIMEOUT",
         "DEFAULT_SWAP_TIMEOUT",
@@ -384,9 +386,12 @@ def test_the_public_surface_and_signatures_are_unchanged() -> None:
         "ContinueResult",
         "FlushResult",
         "Health",
+        "Outcome",
         "Sink",
+        "SinkCounters",
         "SinkDeliveryError",
         "SinkLosses",
+        "Verdict",
         "__version__",
         "configure",
         "continue_trace",
@@ -402,6 +407,7 @@ def test_the_public_surface_and_signatures_are_unchanged() -> None:
         "get_config",
         "health",
         "info",
+        "read_deliver",
         "read_losses",
         "reset_context",
         "set_baggage",

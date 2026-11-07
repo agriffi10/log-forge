@@ -10,7 +10,17 @@ assertion is satisfied by the wrong defect. The runner reads them with `tokenize
 tokens only: a first version matched them by regex and picked up this very paragraph.
 """
 
-from log_foundry import Config, ContinueResult, FlushResult, Health, SinkLosses, configure, trace
+from log_foundry import (
+    Config,
+    ContinueResult,
+    FlushResult,
+    Health,
+    Outcome,
+    SinkLosses,
+    Verdict,
+    configure,
+    trace,
+)
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
 from log_foundry.sinks.logstash import LogstashSink
@@ -23,6 +33,7 @@ _b = SinkLosses(0, 0)                      # want: Too many positional arguments
 _c = FlushResult(True)                     # want: Too many positional arguments for "FlushResult"
 _d = ContinueResult(True)                  # want: Too many positional arguments for "ContinueResult"
 _e = Config("svc")                         # want: Too many positional arguments for "Config"
+_v = Verdict((Outcome.ACCEPTED,))          # want: Too many positional arguments for "Verdict"
 
 # ...and a misspelled keyword is the OTHER `call-arg`, which is why the codes are not enough.
 _f = Health(faled_batches=0)               # want: Unexpected keyword argument "faled_batches" for "Health"
