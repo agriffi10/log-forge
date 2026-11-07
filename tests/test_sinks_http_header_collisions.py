@@ -19,6 +19,9 @@ from __future__ import annotations
 import ast
 import inspect
 import pathlib
+import re
+import socket
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -421,26 +424,107 @@ def test_names_differing_by_a_character_that_does_not_fold_construct(headers) ->
     ("base", "caller", "merged"),
     [
         ({"X-Default": "1"}, {"X-Default": "2"}, {"X-Default": "2"}),
-        ({"X-Default": "1"}, {"x-default": "2"}, {"X-Default": "1", "x-default": "2"}),
+        ({"X-Default": "1"}, {"x-default": "2"}, {"x-default": "2"}),
+        ({"X-Default": "1"}, {"X-DEFAULT": "2"}, {"X-DEFAULT": "2"}),
         (
             {"Content-Type": "text/plain"},
             {"content-type": "application/json"},
-            {"Content-Type": "text/plain", "content-type": "application/json"},
+            {"content-type": "application/json"},
         ),
         ({"X-Default": "1"}, [("X-Extra", "3")], {"X-Default": "1", "X-Extra": "3"}),
     ],
-    ids=["exact", "lower", "content-type", "pairs"],
+    ids=["exact", "lower", "upper", "content-type", "pairs"],
 )
 def test_merge_headers_without_argument_lets_the_caller_win(base, caller, merged) -> None:
-    """At ``635c9edf``: the exact and lower rows raised ``... collides with a credential``.
+    """At ``635c9edf``: the exact, lower and upper rows raised ``... collides with a credential``.
 
     ``merge_headers`` is public, and a third-party sink built on it may hand it defaults a caller
-    is meant to override; the refusal is opt-in through ``argument=``.
+    is meant to override; the refusal is opt-in through ``argument=``. The exact row is what
+    ``39a3f08c`` returned. The lower and upper rows returned both spellings there, which
+    ``urllib`` folded to the caller's value; they return the caller's spelling alone now, so the
+    map meets no duplicate refusal and the wire is unchanged (the next test).
     """
     kwargs: dict[str, Any] = {"headers": caller, "gzip": True}
 
     assert merge_headers(dict(base), kwargs) == merged
     assert kwargs == {"gzip": True}, "headers is popped, the rest left to forward"
+
+
+def test_merge_headers_without_argument_replaces_a_default_at_its_position() -> None:
+    base = {"X-A": "a", "X-Default": "1", "X-B": "b"}
+
+    merged = merge_headers(base, {"headers": {"x-default": "2", "X-New": "n"}})
+
+    assert merged is base, "updated in place, as documented"
+    assert list(merged.items()) == [("X-A", "a"), ("x-default", "2"), ("X-B", "b"), ("X-New", "n")]
+
+
+def test_two_caller_names_folding_together_still_meet_the_duplicate_refusal() -> None:
+    """The merge replaces a default at most once, so a caller's own contradiction is reported."""
+
+    class ThirdParty(HTTPSink):
+        def __init__(self, **http_kwargs: Any) -> None:
+            super().__init__(URL, headers=merge_headers({"X-Default": "1"}, http_kwargs))
+
+    with pytest.raises(ValueError) as caught:
+        ThirdParty(headers={"x-default": "2", "X-DEFAULT": "3"})
+
+    assert str(caught.value) == (
+        "ThirdParty headers 'x-default' and 'X-DEFAULT' name the same header, which is sent "
+        "once; drop one"
+    )
+
+
+class _ThirdParty(HTTPSink):
+    """A sink outside the library handing ``merge_headers`` defaults for the caller to override."""
+
+    def __init__(self, url: str, **http_kwargs: Any) -> None:
+        headers = merge_headers({"X-Default": "1", "X-Keep": "k"}, http_kwargs)
+        super().__init__(url, headers=headers, **http_kwargs)
+
+
+def _raw_request(send: Callable[[str], None]) -> bytes:
+    """Serves one request on a raw socket and returns its head, port and Python version scrubbed."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    received: list[bytes] = []
+
+    def serve() -> None:
+        conn, _ = server.accept()
+        with conn:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(65536)
+            received.append(data.partition(b"\r\n\r\n")[0])
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        send(f"http://127.0.0.1:{port}/x")
+    finally:
+        thread.join(5)
+        server.close()
+    return re.sub(rb"Python-urllib/[0-9.]+", b"Python-urllib/V", received[0]).replace(
+        str(port).encode(), b"PORT"
+    )
+
+
+def test_a_third_party_override_in_another_case_sends_the_bytes_1x_sent() -> None:
+    """At ``2913ee5d``: refused as a duplicate. The head below was captured at ``39a3f08c`` on a raw
+    socket, with this sink and these headers; the current tree sends it byte for byte."""
+    head = _raw_request(
+        lambda url: _ThirdParty(url, headers={"x-default": "2", "X-New": "n"}).emit([{"i": 1}])
+    )
+
+    assert head == (
+        b"POST /x HTTP/1.1\r\nAccept-Encoding: identity\r\nContent-Length: 9\r\n"
+        b"Host: 127.0.0.1:PORT\r\nUser-Agent: Python-urllib/V\r\n"
+        b"Content-Type: application/x-ndjson\r\nX-Default: 2\r\nX-Keep: k\r\nX-New: n\r\n"
+        b"Connection: close"
+    )
 
 
 def test_merge_headers_with_argument_refuses_naming_owner_and_argument() -> None:

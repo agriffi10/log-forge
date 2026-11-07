@@ -794,11 +794,11 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
     "2"}`` sent only ``2`` and the first was silently ignored — two ``Authorization`` spellings
     likewise. The message names both names and neither value. A pair colliding only once the
     whitespace is stripped (``"X-Foo"``, ``"X-Foo "``) meets the whitespace refusal first, on
-    the second name. For the four shipped platform sinks, which pass ``argument=`` to
-    :func:`merge_headers`, a caller's spelling of the sink's own credential header never reaches
-    this check: that pair is refused there first, naming the argument the caller collided with. A
-    sink calling ``merge_headers`` without ``argument=`` gets this refusal for a caller name
-    that folds onto one of its own, since the merge keeps both spellings.
+    the second name. A sink's own header never reaches this check beside a caller's spelling of it
+    when the sink merged through :func:`merge_headers`: with ``argument=``, as the four shipped
+    platform sinks call it, that pair is refused there first, naming the argument the caller
+    collided with; without it, the caller's spelling replaces the default there. Two caller names
+    folding together are still both passed through, and meet this refusal.
 
     Every check reads the exact-``str`` copies :func:`_copied_headers` makes, and those copies
     are what is returned and stored, so none of a ``str`` subclass's methods runs after this.
@@ -1199,10 +1199,13 @@ def merge_headers(
     The caller's ``headers`` are read with ``dict()``, as :class:`HTTPSink` reads its own, so a
     ``MappingProxyType`` or a list of pairs is honoured — and then judged by every header and auth
     rule — rather than dropped: an ``isinstance(caller, dict)`` test here used to discard any other
-    mapping silently, ``Authorization`` beside ``auth=`` included. Without ``argument=``, that
-    is all it does: the caller's headers are laid over ``base`` and win, as before 1.2.0, because
-    this function is public (invariant 10) and a sink built on it may hand it defaults a caller is
-    meant to override.
+    mapping silently, ``Authorization`` beside ``auth=`` included. Without ``argument=``, the
+    caller's headers are laid over ``base`` and win, in any spelling, as on the wire before 1.2.0,
+    because this function is public (invariant 10) and a sink built on it may hand it defaults a
+    caller is meant to override: a caller name folding to a default replaces it, spelling and value,
+    at its position (:func:`_respell_overridden`), so the merged map holds one spelling and meets
+    no duplicate refusal. An exact-case override returns what it always did; a different-case one
+    returns one key where it used to return two, which ``urllib`` folded to the same request.
 
     **With** ``argument=``, **every key of** ``base`` **is the sink's own credential header**, and
     a caller header whose name folds to one of them (:func:`_wire_name`, the fold ``urllib`` sends
@@ -1246,8 +1249,52 @@ def merge_headers(
     given = dict(caller)
     if argument is not None:
         _refuse_credential_collision(base, given, owner, argument)
+    else:
+        _respell_overridden(base, given)
     base.update(given)
     return base
+
+
+def _respell_overridden(base: dict[str, str], given: dict[str, str]) -> None:
+    """Replaces, in place, each ``base`` key a caller's name folds to with the caller's header.
+
+    Before 1.2.0 the merge kept both spellings, ``{"X-Default": "1", "x-default": "2"}``, and
+    ``urllib`` folded them, sending the caller's value where the default had stood. 1.2.0 refuses
+    two names that fold together (:func:`_valid_headers`), which would have turned that working
+    override into a refusal, so the merge now does the fold itself: the caller's spelling and
+    value take the default's place, at its position, and the request on the wire is byte for byte
+    the one 1.x sent. Names are folded as the exact text they store. Only a key that was in
+    ``base`` is replaced, and each at most once, so two caller names that fold together are both
+    kept and still meet the duplicate refusal: a caller's own contradiction is reported, never
+    resolved here.
+
+    Args:
+      base: The sink's own headers, rewritten in place.
+      given: The caller's headers; a name that replaced a default is removed from it.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    own = {
+        _wire_name(_diag._STR_STR(name)): name for name in base if issubclass(type(name), str)
+    }
+    replaced: dict[str, str] = {}
+    for name in given:
+        if issubclass(type(name), str):
+            default = own.pop(_wire_name(_diag._STR_STR(name)), None)
+            if default is not None:
+                replaced[default] = name
+    if not replaced:
+        return
+    merged = [
+        (replaced[name], given.pop(replaced[name])) if name in replaced else (name, value)
+        for name, value in base.items()
+    ]
+    base.clear()
+    base.update(merged)
 
 
 def _refuse_credential_collision(
