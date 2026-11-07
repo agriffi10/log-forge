@@ -297,6 +297,9 @@ _BODY_FORMATS = ("ndjson", "json_array")
 
 _CRLF = ("\r", "\n")
 
+_GZIP_CODINGS = ("gzip", "x-gzip")
+"""The content-codings that name gzip: RFC 9110 §8.4.1.3 has ``x-gzip`` read as ``gzip``."""
+
 _MAX_PORT = 65535
 
 _AUTH_REMEDY = "auth=(user, password), auth=<token>, or an Authorization header in headers="
@@ -791,23 +794,30 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
     "2"}`` sent only ``2`` and the first was silently ignored — two ``Authorization`` spellings
     likewise. The message names both names and neither value. A pair colliding only once the
     whitespace is stripped (``"X-Foo"``, ``"X-Foo "``) meets the whitespace refusal first, on
-    the second name; a platform sink's own credential header never reaches this check beside a
-    caller's spelling of it, since :func:`merge_headers` refuses that pair first, naming the
-    argument the caller collided with.
+    the second name. For the four shipped platform sinks, which pass ``argument=`` to
+    :func:`merge_headers`, a caller's spelling of the sink's own credential header never reaches
+    this check: that pair is refused there first, naming the argument the caller collided with. A
+    sink calling ``merge_headers`` without ``argument=`` gets this refusal for a caller name
+    that folds onto one of its own, since the merge keeps both spellings.
+
+    Every check reads the exact-``str`` copies :func:`_copied_headers` makes, and those copies
+    are what is returned and stored, so none of a ``str`` subclass's methods runs after this.
 
     Args:
       headers: The caller's headers.
       owner: The class refusing them, for the message.
 
     Returns:
-      The headers unchanged.
+      The headers, every name and ``str`` value copied as the exact ``str`` it stores.
 
     Raises:
+      TypeError: If a header name is not a ``str`` (:func:`_copied_headers`).
       ValueError: If any name or value contains ``CR`` or ``LF``, ``http.client`` cannot send
         the header, a name contains whitespace anywhere, or two names fold to one.
     """
+    copied = _copied_headers(headers, owner)
     seen: dict[str, str] = {}
-    for name, value in headers.items():
+    for name, value in copied:
         for text, part in ((name, "name"), (str(value), "value")):
             if any(bad in text for bad in _CRLF):
                 raise ValueError(
@@ -818,13 +828,47 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
             raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
         if any(char.isspace() for char in name):
             raise ValueError(f"{owner} header name must not contain whitespace: {name!r}")
-        first = seen.setdefault(_wire_name(name), name)
-        if first is not name:
+        wire = _wire_name(name)
+        if wire in seen:
             raise ValueError(
-                f"{owner} headers {first!r} and {name!r} name the same header, which is sent "
-                "once; drop one"
+                f"{owner} headers {seen[wire]!r} and {name!r} name the same header, which is "
+                "sent once; drop one"
             )
-    return headers
+        seen[wire] = name
+    return dict(copied)
+
+
+def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, str]]:
+    """Copies every header name, and every ``str`` value, as the exact ``str`` it stores.
+
+    A ``str``-subclass name or value used to be stored as the caller's object, so its methods
+    ran at every check and on every ``emit``: a name whose ``capitalize`` folded to ``X-foo``
+    at construction and to ``Dd-api-key`` afterwards passed the credential rule and then sent
+    the caller's value as ``DD-API-KEY``, and a refusal printed whatever its ``__repr__`` said.
+    Every check now judges the copy :func:`_valid_headers` stores, so none of the caller's methods
+    runs after this. A name that is not a ``str`` is refused here, naming its real type, where it
+    used to raise a bare ``TypeError`` from the first check that read it; a value that is not a
+    ``str`` is kept as given, as ``http.client`` sends an ``int`` or ``bytes`` value itself. The
+    copies are a list rather than a ``dict``, so two subclass names with one text cannot collapse
+    into one silently: the duplicate check sees both.
+
+    Args:
+      headers: The caller's headers, read with ``dict()``.
+      owner: The class refusing them, for the message.
+
+    Returns:
+      The copied name and value of every header, in order.
+
+    Raises:
+      TypeError: If a header name is not a ``str``.
+    """
+    copied: list[tuple[str, str]] = []
+    for name, value in headers.items():
+        if not issubclass(type(name), str):
+            raise TypeError(f"{owner} header name must be a str, not {_type_name(name)}")
+        text = _diag._STR_STR(value) if issubclass(type(value), str) else value
+        copied.append((_diag._STR_STR(name), text))
+    return copied
 
 
 def _wire_name(name: str) -> str:
@@ -911,8 +955,9 @@ def _names_gzip(encoding: str) -> bool:
     """Says whether a ``Content-Encoding`` value names gzip, the coding ``gzip=True`` applies.
 
     A content-coding is case-insensitive (RFC 9110 §8.4.1), and a field value's surrounding space
-    and tab are optional whitespace, not part of it (§5.5), so ``GZIP`` and `` gzip `` name gzip.
-    A list of codings, ``gzip, br``, does not: it says the body is gzipped and then brotli'd.
+    and tab are optional whitespace, not part of it (§5.5), so ``GZIP`` and `` gzip `` name gzip,
+    and so does ``x-gzip``, which §8.4.1.3 has a recipient read as ``gzip``. A list of codings,
+    ``gzip, br``, does not: it says the body is gzipped and then brotli'd.
 
     Args:
       encoding: The caller's ``Content-Encoding`` value.
@@ -923,7 +968,7 @@ def _names_gzip(encoding: str) -> bool:
     Raises:
       None.
     """
-    return encoding.strip(" \t").lower() == "gzip"
+    return encoding.strip(" \t").lower() in _GZIP_CODINGS
 
 
 def _unsendable_header(name: str, value: str) -> str | None:
@@ -1147,39 +1192,44 @@ def merge_headers(
     http_kwargs: HTTPForwardKwargs,
     *,
     owner: str = "HTTPSink",
-    argument: str = "a credential",
+    argument: str | None = None,
 ) -> dict[str, str]:
-    """Merges a platform sink's own credential header with the caller's headers, or raises.
+    """Lays the caller's headers over a sink's own; with ``argument=``, refuses replacing them.
 
-    This is shared by the SaaS sinks that set a fixed auth header — Datadog, Splunk, New Relic,
-    Honeycomb — and **every key of** ``base`` **is that sink's own credential header**: a caller
-    header whose name folds to one of them (:func:`_wire_name`, the fold ``urllib`` sends and the
-    ``Authorization`` check uses) is refused (1.2.0). The caller's used to win, under any case,
-    since ``urllib`` keeps one value per folded name, the last written, so ``headers={"dd-api-key":
-    ...}`` sent instead of the required ``api_key`` and the argument was silently ignored
-    (invariant 13). The refusal names the caller's header, the argument it collides with and the
-    name the sink sends, never a value, and it runs here, before :class:`HTTPSink` judges any
-    header, so no later check can quote one first. A non-``str`` name is left to
-    :func:`_valid_headers`, and a ``str`` subclass is folded as the exact text it stores. The
-    caller's ``headers`` are read with ``dict()``, as :class:`HTTPSink` reads its own, so a
+    The caller's ``headers`` are read with ``dict()``, as :class:`HTTPSink` reads its own, so a
     ``MappingProxyType`` or a list of pairs is honoured — and then judged by every header and auth
     rule — rather than dropped: an ``isinstance(caller, dict)`` test here used to discard any other
-    mapping silently, ``Authorization`` beside ``auth=`` included. Everything else the caller passes
-    is laid over ``base`` unchanged, and the non-credential defaults :class:`HTTPSink` writes per
-    request — ``Content-Type``, ``Content-Encoding`` — sit beneath it, as SPEC-009 FR-002
-    records.
+    mapping silently, ``Authorization`` beside ``auth=`` included. Without ``argument=``, that
+    is all it does: the caller's headers are laid over ``base`` and win, as before 1.2.0, because
+    this function is public (invariant 10) and a sink built on it may hand it defaults a caller is
+    meant to override.
+
+    **With** ``argument=``, **every key of** ``base`` **is the sink's own credential header**, and
+    a caller header whose name folds to one of them (:func:`_wire_name`, the fold ``urllib`` sends
+    and the ``Authorization`` check uses) is refused (1.2.0). That is how Datadog, Splunk, New
+    Relic and Honeycomb call it. The caller's used to win, under any case, since ``urllib`` keeps
+    one value per folded name, the last written, so ``headers={"dd-api-key": ...}`` sent instead
+    of the required ``api_key`` and the argument was silently ignored (invariant 13). The refusal
+    names the caller's header, the argument it collides with and the name the sink sends, never a
+    value, and it runs here, before :class:`HTTPSink` judges any header, so no later check can
+    quote one first. Both sides are folded as the exact text they store (``_diag._STR_STR``), so a
+    ``str`` subclass's ``capitalize`` cannot answer one thing here and another on the wire; a
+    non-``str`` name is left to :func:`_valid_headers`, which refuses it. The non-credential
+    defaults :class:`HTTPSink` writes per request — ``Content-Type``, ``Content-Encoding`` — sit
+    beneath the caller's headers either way, as SPEC-009 FR-002 records.
 
     Args:
-      base: The sink's own credential headers, updated in place.
+      base: The sink's own headers, updated in place; with ``argument=``, its credential headers.
       http_kwargs: The caller's keyword arguments, mutated by popping ``headers`` out so the
         rest can be forwarded to :class:`HTTPSink` without a duplicate argument. Typed as the
         narrowest shape (SPEC-051 FR-005); every wider one is assignable to it, and ``pop`` is
         allowed because each key is ``total=False``. The pop is why a caller may still pass
         ``headers``, and — since it happens *here*, in another function — why ``mypy`` reports
         the caller's own forwarding call as a possible duplicate anyway.
-      owner: The class merging, for the message. Keyword-only and defaulted, so a caller of this
-        public function written before 1.2.0 still calls it.
-      argument: The constructor argument ``base`` carries, for the message.
+      owner: The class merging, for the refusal; read only with ``argument=``.
+      argument: The constructor argument ``base`` carries, which opts in to the refusal, or
+        ``None`` for the caller to win. Keyword-only and defaulted, so a caller of this public
+        function written before 1.2.0 calls it, and is answered, as it was.
 
     Returns:
       The merged headers.
@@ -1187,14 +1237,42 @@ def merge_headers(
     Raises:
       TypeError: If the caller's ``headers`` is not a mapping or an iterable of pairs, as
         ``dict()`` raises for :class:`HTTPSink`'s own.
-      ValueError: If an item of an iterable ``headers`` is not a pair, likewise, or a caller
-        header's name folds to a key of ``base``.
+      ValueError: If an item of an iterable ``headers`` is not a pair, likewise, or, with
+        ``argument=``, a caller header's name folds to a key of ``base``.
     """
     caller = http_kwargs.pop("headers", None)
     if caller is None:
         return base
     given = dict(caller)
-    own = {_wire_name(name): name for name in base}
+    if argument is not None:
+        _refuse_credential_collision(base, given, owner, argument)
+    base.update(given)
+    return base
+
+
+def _refuse_credential_collision(
+    base: dict[str, str], given: dict[str, str], owner: str, argument: str
+) -> None:
+    """Refuses a caller header whose name folds to one of a sink's own credential headers.
+
+    Args:
+      base: The sink's own credential headers.
+      given: The caller's headers.
+      owner: The class merging, for the message.
+      argument: The constructor argument ``base`` carries, for the message.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: If a caller header's name, as the exact text it stores, folds to a key of
+        ``base``.
+    """
+    own = {
+        _wire_name(_diag._STR_STR(name)): _diag._STR_STR(name)
+        for name in base
+        if issubclass(type(name), str)
+    }
     for name in given:
         if not issubclass(type(name), str):
             continue
@@ -1205,8 +1283,6 @@ def merge_headers(
                 f"{owner} header {written!r} collides with {argument}, which this sink sends as "
                 f"{sent}; drop the header"
             )
-    base.update(given)
-    return base
 
 
 class HTTPSink:

@@ -430,7 +430,9 @@ def test_no_extra_headers_in_src_carries_an_authorization_header() -> None:
 
     A subclass passing ``Authorization`` there would be silently replaced by the caller's
     credentials, or would send its own beside a caller who never gave any. Today the one site is
-    ``SentrySink``'s ``X-Sentry-Auth``; the floor keeps the scan from passing on nothing.
+    ``SentrySink``'s ``X-Sentry-Auth``; the floor keeps the scan from passing on nothing. It is
+    supplementary to the runtime roster (``tests/test_sinks_http_header_roster.py``), which sees
+    an aliased or ``getattr`` call this scan misses but only on the path one emit exercises.
     """
     sites: list[str] = []
     findings: list[str] = []

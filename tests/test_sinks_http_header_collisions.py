@@ -26,7 +26,7 @@ import pytest
 import log_foundry.sinks
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.honeycomb import HoneycombSink
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.http import HTTPSink, merge_headers
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.sentry import SentrySink
@@ -257,6 +257,15 @@ def _header_routes(source: str, where: str) -> list[str]:
 
 
 def test_no_shipped_sink_sets_a_header_by_a_route_the_rule_does_not_see() -> None:
+    """Supplementary to the runtime roster in ``tests/test_sinks_http_header_roster.py``.
+
+    That roster is the guard: it reads what each sink actually sends and tries to replace it, so
+    it sees routes this scan cannot name — ``self._headers[...]`` after ``super().__init__``,
+    ``.update``, a ``**{"headers": ...}`` splat, an ``http_kwargs["headers"]`` write, an
+    ``_attempt`` override, each measured missed here. It sees only what one emit of one event
+    exercises, though, and this scan reads code on every path, so the two are kept together;
+    neither covers the other.
+    """
     findings: list[str] = []
     scanned = 0
     for path in sorted(_SINKS.glob("*.py")):
@@ -403,3 +412,137 @@ def test_names_differing_by_a_character_that_does_not_fold_construct(headers) ->
     sent = opener.calls[0]["headers"]
     for name, value in headers.items():
         assert sent[name.lower()] == value
+
+
+# --- merge_headers without argument= keeps its pre-1.2.0 answer (invariant 10) -----------------
+
+
+@pytest.mark.parametrize(
+    ("base", "caller", "merged"),
+    [
+        ({"X-Default": "1"}, {"X-Default": "2"}, {"X-Default": "2"}),
+        ({"X-Default": "1"}, {"x-default": "2"}, {"X-Default": "1", "x-default": "2"}),
+        (
+            {"Content-Type": "text/plain"},
+            {"content-type": "application/json"},
+            {"Content-Type": "text/plain", "content-type": "application/json"},
+        ),
+        ({"X-Default": "1"}, [("X-Extra", "3")], {"X-Default": "1", "X-Extra": "3"}),
+    ],
+    ids=["exact", "lower", "content-type", "pairs"],
+)
+def test_merge_headers_without_argument_lets_the_caller_win(base, caller, merged) -> None:
+    """At ``635c9edf``: the exact and lower rows raised ``... collides with a credential``.
+
+    ``merge_headers`` is public, and a third-party sink built on it may hand it defaults a caller
+    is meant to override; the refusal is opt-in through ``argument=``.
+    """
+    kwargs: dict[str, Any] = {"headers": caller, "gzip": True}
+
+    assert merge_headers(dict(base), kwargs) == merged
+    assert kwargs == {"gzip": True}, "headers is popped, the rest left to forward"
+
+
+def test_merge_headers_with_argument_refuses_naming_owner_and_argument() -> None:
+    with pytest.raises(ValueError) as caught:
+        merge_headers(
+            {"X-Key": "own"}, {"headers": {"x-key": CALLER_VALUE}}, owner="P", argument="key"
+        )
+
+    assert str(caught.value) == (
+        "P header 'x-key' collides with key, which this sink sends as X-Key; drop the header"
+    )
+
+
+# --- a str subclass is judged and stored as the text it holds ----------------------------------
+
+
+class _Flip(str):
+    """A name whose ``capitalize`` folds harmlessly at first and to ``Dd-api-key`` afterwards."""
+
+    calls = 0
+
+    def capitalize(self) -> str:
+        _Flip.calls += 1
+        return "X-foo" if _Flip.calls <= 3 else "Dd-api-key"
+
+    def __repr__(self) -> str:
+        _Flip.calls += 1
+        return "'HIJACK'"
+
+
+def test_a_name_whose_fold_flips_after_construction_cannot_reach_the_credential() -> None:
+    """At ``635c9edf``: constructed and sent ``Dd-Api-Key: <caller's value>`` on the wire."""
+    _Flip.calls = 0
+    opener = FakeOpener()
+    sink = DatadogSink(OWN_VALUE, headers={_Flip("x-foo"): CALLER_VALUE}, opener=opener)
+    sink.emit([{"i": 1}])
+    sink.emit([{"i": 2}])
+
+    sent = opener.calls[-1]["headers"]
+    assert OWN_VALUE in sent["dd-api-key"]
+    assert sent["x-foo"] == CALLER_VALUE
+    assert _Flip.calls == 0, "none of the caller's methods runs, at construction or per emit"
+    assert all(type(name) is str for name in sink._headers)
+
+
+class _Shifty(str):
+    """A value or name whose methods count and lie."""
+
+    calls = 0
+
+    def __str__(self) -> str:
+        _Shifty.calls += 1
+        return "HIJACK"
+
+    def __repr__(self) -> str:
+        _Shifty.calls += 1
+        return "'HIJACK'"
+
+    def encode(self, *args: Any, **kwargs: Any) -> bytes:  # type: ignore[override]
+        _Shifty.calls += 1
+        return b"HIJACK"
+
+
+def test_a_str_subclass_value_is_sent_as_the_text_it_stores() -> None:
+    _Shifty.calls = 0
+    opener = FakeOpener()
+    sink = HTTPSink(URL, headers={"X-Env": _Shifty("prod")}, opener=opener)
+    sink.emit([{"i": 1}])
+
+    assert opener.calls[0]["headers"]["x-env"] == "prod"
+    assert type(opener.calls[0]["headers"]["x-env"]) is str
+    assert _Shifty.calls == 0
+
+
+def test_a_duplicate_message_prints_the_stored_text_not_a_lying_repr() -> None:
+    _Shifty.calls = 0
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, headers={"X-Foo": "1", _Shifty("x-foo"): "2"})
+
+    assert str(caught.value) == (
+        "HTTPSink headers 'X-Foo' and 'x-foo' name the same header, which is sent once; drop one"
+    )
+    assert _Shifty.calls == 0
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"), [(5, "int"), (b"X-Foo", "bytes"), (None, "NoneType")], ids=repr
+)
+@pytest.mark.parametrize("cls", sorted(_BUILDERS))
+def test_a_header_name_that_is_not_a_str_is_refused_naming_its_type(cls, name, kind) -> None:
+    """At ``635c9edf``: a bare ``TypeError`` from the first check that read the name."""
+    make, owner = _BUILDERS[cls]
+
+    with pytest.raises(TypeError) as caught:
+        make(headers={name: CALLER_VALUE})
+
+    assert str(caught.value) == f"{owner} header name must be a str, not {kind}"
+    assert caught.value.__context__ is None
+
+
+def test_a_header_value_that_is_not_a_str_is_sent_as_before() -> None:
+    opener = FakeOpener()
+    HTTPSink(URL, headers={"X-Count": 5}, opener=opener).emit([{"i": 1}])  # type: ignore[dict-item]
+
+    assert opener.calls[0]["headers"]["x-count"] == 5

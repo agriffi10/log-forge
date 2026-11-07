@@ -260,3 +260,18 @@ def test_every_class_forwarding_gzip_compresses_under_a_callers_gzip_header(cls:
 
     assert request["headers"]["content-encoding"] == "GZIP"
     assert gzip.decompress(request["body"])
+
+
+@pytest.mark.parametrize("value", ["x-gzip", "X-GZIP", " x-gzip\t"], ids=repr)
+def test_x_gzip_names_gzip_beside_gzip(value: str) -> None:
+    """RFC 9110 §8.4.1.3 has ``x-gzip`` read as ``gzip``. At ``635c9edf``: refused."""
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+
+    request = _sent(
+        HTTPSink(URL, headers={"content-encoding": value}, gzip=True, opener=opener), opener
+    )
+
+    assert gzip.decompress(request["body"]) == plain["body"]
+    assert request["headers"]["content-encoding"] == value
