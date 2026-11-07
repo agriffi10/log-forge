@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-070
 title: "Retry Classification: What a Sink Retries, Per Exception, Per Entry and for an Unreadable 2xx"
 description: "Makes every retry loop in the sinks ask a declared predicate whether an exception is worth another attempt, classifies a rejected queue entry per service from the vendor's documented codes, counts a 2xx whose body could not be read in every sink that reads a body, and records the deliberate exceptions in one table."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-061, SPEC-066, SPEC-068]
 arc: stability-redesign
 arc_order: 2
@@ -746,3 +746,22 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: row 1 adds `NATSSink`'s `drain_timeout`, which SPEC-061 floors through `usable_timeout`, and drops it from the unjudged examples; the `usable_timeout` call count is re-measured as four on `93113e1b`.
 - 2026-11-05, execution-frame review: the renamed test says "four calls", from three classes, not four callers.
+- 2026-11-07, build: the PostgreSQL reconnect now re-raises the connect failure into the loop, so
+  FR-002 AC-2 can hold. `_reconnect_if_broken` used to absorb it and leave the attempt to fail on
+  the dead handle's "the connection is closed", which no predicate could read as a refusal, and no
+  decision fenced the absorption. Its once-per-outage line gains `; the attempt fails with it and is
+  counted`.
+- 2026-11-07, build: invariant 7's recorded exceptions never named the SQS sender fault, so FR-003's
+  edit adds both the SQS and the SNS one there rather than one beside the other.
+- 2026-11-07, build: FR-004 AC-7's grep over `docs/` covers the live tier. The history tier —
+  delivery docs, past specs, past release notes — states what was true when it was written and is
+  left as written; its hits are reported, not rewritten.
+- 2026-11-07, build: FR-003 rule 3 is read as written for an explicit `None` failed count: it is not
+  an `int`, so it is unadjudicated, and only a count absent from the reply reads as delivered beside
+  no coded record.
+- 2026-11-07, build: the six loops that wrote a bare `N attempts` write `N attempt(s)` like the
+  rest, so FR-001 AC-2's `1 attempt` cannot pass on `1 attempts`; `HTTPSink` keeps its
+  `connection error, <Type>` line for any exception before a status line, FR-001's "the same
+  `_diag` line"; a Kinesis or Firehose unadjudicated line names the coded count and the failed
+  count. The decision cites the locked driver versions (botocore 1.43.119, clickhouse-connect 1.4.2
+  and its `driver/httpclient.py`, psycopg 3.3.6) rather than the ones FR-002's table was read at.
