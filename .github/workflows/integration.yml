@@ -4,10 +4,11 @@ name: Integration
 #
 # Eleven of this library's sinks talk to a third-party service through an optional extra, and
 # before this job not one of them was ever executed — not locally and not in CI, where the
-# no-extras environment is deliberately the contract (`CLAUDE.md`: `mypy --strict`'s
-# `type: ignore[import-not-found]` comments depend on it). That is right for the type gate and
-# wrong for correctness, so this is a SECOND job rather than a change to `ci.yml`: the gating
-# leg's environment is untouched (FR-001 AC-3).
+# no-extras environment is deliberately the contract, because the core is dependency-free and a
+# default install carries no extra. (`mypy --strict` no longer depends on it: every extra is
+# imported by name through `sinks/_extras.import_extra`, SPEC-071.) That is right for the gating
+# leg and wrong for correctness, so this is a SECOND job rather than a change to `ci.yml`: the
+# gating leg's environment is untouched (FR-001 AC-3).
 #
 # NOT A REQUIRED CHECK (FR-001 AC-2). Nine service containers, an image-pull path and a broker
 # that has to elect itself a controller are a flakiness budget, and a new job of that shape

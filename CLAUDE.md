@@ -103,11 +103,9 @@ poetry run pip-audit                           # advisories in the resolved envi
 poetry run cyclonedx-py environment "$(poetry env info --path)" -o sbom.cdx.json
 ```
 
-**After installing extras locally, recreate the venv before trusting `mypy`.** With the optional
-deps present the `type: ignore[import-not-found]` comments in `sinks/` become "unused" and
-`mypy --strict` fails. The `dev` group's `protobuf` puts `google/` in CI too, which is why
-`pubsub.py` adds `unused-ignore` and `pyproject.toml` ignores `google.cloud.*`; `azure/` leaves a
-dir behind on uninstall. `poetry env remove --all && poetry install --with dev` is the fix.
+**Installing extras locally no longer breaks `mypy`.** Every extra is imported by name through
+`sinks/_extras.import_extra`, so `mypy --strict` is clean with every extra installed
+(measured at `607f1f46`) and without; `tests/test_extras_roster.py` reports any other import of one.
 
 **Releasing:** `git tag -a vX.Y.Z && git push origin vX.Y.Z` → `release.yml` publishes to PyPI.
 Merges to `main` publish no `.devN` for now (`publish-dev` disabled in `release.yml`, which says
