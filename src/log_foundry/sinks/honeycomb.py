@@ -247,7 +247,9 @@ class HoneycombSink(HTTPSink):
             holds an ``@``, ``/``, ``?`` or ``#``; or if ``url`` carries a user or password, or a
             query or fragment, which the appended path would land inside
             (:func:`_valid_base_url`), or an ``@`` anywhere else, refused naming ``url`` once the
-            path is appended.
+            path is appended; or if a forwarded ``auth`` accompanies an ``Authorization`` header
+            in a forwarded ``headers``, in any case, refused by
+            :class:`~log_foundry.sinks.http.HTTPSink` naming this class.
         """
         _one_segment(dataset, type(self).__name__)
         _carried_in_a_path(dataset, type(self).__name__)

@@ -302,6 +302,12 @@ _MAX_PORT = 65535
 _AUTH_REMEDY = "auth=(user, password), auth=<token>, or an Authorization header in headers="
 """Where a caller's credentials go instead of a URL, for a sink taking none of its own."""
 
+_AUTH_BESIDE_HEADER = (
+    "auth and an Authorization header cannot both be given, since each sets the one "
+    "Authorization header a request carries; drop auth= or the header"
+)
+"""Why ``auth`` is refused beside an ``Authorization`` header, for a sink setting none itself."""
+
 _URLSPLIT_DROPS = {ord("\t"): None, ord("\r"): None, ord("\n"): None}
 """What ``urlsplit`` deletes from a URL before it parses; ``urllib`` keeps all three."""
 
@@ -784,10 +790,29 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
                 raise ValueError(
                     f"{owner} header {part} must not contain CR or LF: {name!r}"
                 )
-        failure = _unsendable_header(name.capitalize().title(), value)
+        failure = _unsendable_header(_wire_name(name), value)
         if failure:
             raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
     return headers
+
+
+def _wire_name(name: str) -> str:
+    """Returns the name ``urllib`` puts on the wire for a header the caller wrote as ``name``.
+
+    ``Request.add_header`` stores it ``capitalize``-d and ``do_open`` then sends it ``title``-d,
+    so ``authorization`` and ``AUTHORIZATION`` both go out as ``Authorization`` — HTTP header
+    names are case-insensitive, and ``urllib`` keeps one value per folded name, the last written.
+
+    Args:
+      name: The header name as the caller wrote it.
+
+    Returns:
+      The folded name.
+
+    Raises:
+      None.
+    """
+    return name.capitalize().title()
 
 
 def _unsendable_header(name: str, value: str) -> str | None:
@@ -816,49 +841,104 @@ def _unsendable_header(name: str, value: str) -> str | None:
 
 
 def _valid_auth(
-    auth: str | tuple[str, str] | None, owner: str, headers: dict[str, str]
+    auth: str | tuple[str, str] | None, owner: str, headers: dict[str, str], conflict: str
 ) -> str | tuple[str, str] | None:
-    """Returns credentials that cannot inject a header, or raises (SPEC-049 FR-001).
+    """Returns the credentials every ``emit`` sends, copied once, or raises (SPEC-049 FR-001).
+
+    **Beside an** ``Authorization`` **header,** ``auth`` **is refused** (1.2.0). Both set the one
+    ``Authorization`` header a request carries, so one of them was silently never sent — the
+    credentials when the header was spelled exactly ``Authorization``, the header under any other
+    case, since ``urllib`` folds the two names together and keeps the value written last. The header is matched by the name ``urllib`` sends,
+    :func:`_wire_name`, so no spelling escapes. This check runs **first**: it reads only whether
+    credentials were given and the header names, which :func:`_valid_headers` has already judged,
+    so it cannot echo or chain a credential, and a caller who must drop one of the two is told so
+    before being told anything about the value of one they may be about to drop. ``conflict`` is
+    the class's own wording, because a sink that writes ``Authorization`` itself — Splunk's token
+    — must not tell its caller they passed a header. Since nothing a sink holds can now override
+    the credentials, every one given is the one sent, and every one is checked below.
 
     Only the **bearer-token** form is checked for ``CR`` and ``LF``, and the asymmetry is
     deliberate rather than an oversight: a token is written into ``Authorization`` verbatim, so a
     ``CR`` in it is the same injection :func:`_valid_headers` refuses, in the argument with the
     highest consequence. The ``(user, password)`` form is base64-encoded before it reaches the
-    header and cannot carry one. Both forms are then built into the header by
-    :func:`_authorization`, the function ``emit`` uses, and put on a started head: a token
-    outside Latin-1, or a lone surrogate in either half of the pair, raised
-    ``UnicodeEncodeError`` out of every ``emit``, uncounted, and a value that is neither raised
-    ``TypeError``. The message names neither, and chains nothing that would. Credentials an
-    ``Authorization`` header overrides are never sent — :meth:`HTTPSink._apply_auth` defers to
-    that header, matched by the same exact-case test — so they are not checked here either.
+    header and cannot carry one. A value that is not a ``str`` — judged by its real type, never
+    by asking it — is unpacked **once**, here, into the real ``tuple`` this returns
+    (:func:`_copied_pair`): it was unpacked here and again on every ``emit``, so a one-shot
+    iterator constructed and then raised ``ValueError`` out of every ``emit``, uncounted. Both
+    forms are then built into the header by :func:`_authorization`, the function ``emit`` uses,
+    and put on a started head: a token outside Latin-1, or a lone surrogate in either half of the
+    pair, raised ``UnicodeEncodeError`` out of every ``emit``, uncounted, and a value that is
+    neither form raised ``TypeError`` or ``ValueError``. The message names neither, and chains
+    nothing that would.
 
     Args:
       auth: The bearer token, the user/password pair, or ``None``.
       owner: The class refusing it, for the message.
-      headers: The caller's headers, whose ``Authorization`` would override ``auth``.
+      headers: The caller's headers, already judged by :func:`_valid_headers`.
+      conflict: Why ``auth`` cannot accompany an ``Authorization`` header, in the class's words.
 
     Returns:
-      The credentials unchanged.
+      The token as given, the pair copied into a ``tuple``, or ``None``.
 
     Raises:
-      ValueError: If a bearer token contains ``CR`` or ``LF``, or ``http.client`` cannot send the
-        ``Authorization`` header either form builds.
+      ValueError: If ``auth`` is given beside an ``Authorization`` header in any case, a bearer
+        token contains ``CR`` or ``LF``, a value that is not a token does not unpack into exactly
+        two items, or ``http.client`` cannot send the ``Authorization`` header either form builds.
     """
-    if issubclass(type(auth), str) and any(bad in cast("str", auth) for bad in _CRLF):
-        raise ValueError(f"{owner} auth token must not contain CR or LF")
-    if auth is not None and "Authorization" not in headers:
-        failure = _unsendable_auth(auth)
-        if failure:
+    if auth is None:
+        return None
+    if any(_wire_name(name) == "Authorization" for name in headers):
+        raise ValueError(f"{owner} {conflict}")
+    stored: str | tuple[str, str]
+    if issubclass(type(auth), str):
+        stored = cast("str", auth)
+        if any(bad in stored for bad in _CRLF):
+            raise ValueError(f"{owner} auth token must not contain CR or LF")
+    else:
+        pair, failure = _copied_pair(auth)
+        if pair is None:
             raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
-    return auth
+        stored = pair
+    failure = _unsendable_auth(stored)
+    if failure:
+        raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
+    return stored
+
+
+def _copied_pair(auth: object) -> tuple[tuple[str, str] | None, str | None]:
+    """Unpacks a ``(user, password)`` pair once into a real ``tuple``, or names why it cannot be.
+
+    The unpack is the one ``_authorization`` used to perform on every ``emit``, so what it accepts
+    and refuses is unchanged — a non-iterable raises ``TypeError``, too few or too many items
+    ``ValueError``, and no more than three items are ever read — only now it happens once, and
+    ``emit`` reads the copy. The failure is returned as a type name, like
+    :func:`_unsendable_header`, so the refusal is raised outside the ``except`` and chains nothing
+    that carries the credential.
+
+    Args:
+      auth: The credentials as the caller passed them, already known not to be a ``str``.
+
+    Returns:
+      The copied pair and ``None``, or ``None`` and the type name of the exception unpacking
+      raised.
+
+    Raises:
+      None.
+    """
+    try:
+        user, password = cast("tuple[str, str]", auth)
+    except (ValueError, TypeError) as err:
+        return None, type(err).__name__
+    return (user, password), None
 
 
 def _unsendable_auth(auth: str | tuple[str, str]) -> str | None:
     """Names why the ``Authorization`` value these credentials build cannot be sent, or ``None``.
 
     Building the value is inside the check, since a lone surrogate in a pair fails the UTF-8
-    encode ahead of base64 and a value that is neither form fails to unpack; both are returned as
-    a type name, like :func:`_unsendable_header`, so nothing chained carries the credential.
+    encode ahead of base64; it is returned as a type name, like :func:`_unsendable_header`, so
+    nothing chained carries the credential. A pair reaches here already copied by
+    :func:`_copied_pair`, so the unpack in :func:`_authorization` cannot fail.
 
     Args:
       auth: The bearer token or the user/password pair.
@@ -880,10 +960,11 @@ def _authorization(auth: str | tuple[str, str]) -> str:
     """Builds the ``Authorization`` value for a bearer token or a ``(user, password)`` pair.
 
     One builder for :meth:`HTTPSink._apply_auth` and :func:`_valid_auth`, so the construction-time
-    check puts on the head exactly the value ``emit`` sends.
+    check puts on the head exactly the value ``emit`` sends — built from the same stored object,
+    the pair :func:`_copied_pair` made, rather than from whatever the caller passed.
 
     Args:
-      auth: The bearer token or the user/password pair.
+      auth: The bearer token or the copied user/password pair.
 
     Returns:
       The header value.
@@ -994,6 +1075,7 @@ class HTTPSink:
     MAX_BATCH_BYTES = DEFAULT_MAX_BATCH_BYTES
     MAX_EVENT_BYTES: int | None = None
     _CREDENTIALS = _AUTH_REMEDY
+    _AUTH_CONFLICT = _AUTH_BESIDE_HEADER
 
     def __init__(
         self,
@@ -1018,7 +1100,9 @@ class HTTPSink:
             already stripped it before sending, so :attr:`url` reads back what goes on the wire.
           method: The HTTP method.
           headers: Headers that override the sink's own defaults.
-          auth: A bearer token, or a ``(user, password)`` pair for basic auth.
+          auth: A bearer token, or a ``(user, password)`` pair for basic auth. A pair is any
+            value unpacking into exactly two items, a one-shot iterator included: it is copied
+            into a ``tuple`` once, here, and every request is built from the copy.
           body_format: ``"ndjson"`` or ``"json_array"``.
           timeout: Seconds allowed per request.
           gzip: Whether to compress the body.
@@ -1065,7 +1149,9 @@ class HTTPSink:
             else — write one that belongs in a path or query as ``%40`` — its scheme is not
             ``http`` or ``https``, it names no host or no usable port, or ``http.client`` cannot
             build a request line for it or for the method,
-            a header name or value or a bearer token contains CR or LF, the timeout cannot bound
+            a header name or value or a bearer token contains CR or LF, ``auth`` is given beside
+            an ``Authorization`` header in any case, ``auth`` cannot be sent or is not a token
+            and does not unpack into exactly two items, the timeout cannot bound
             anything, ``body_format`` is neither of the two this class renders, or
             ``max_batch_bytes`` is not positive — each refused here rather than raised out of every
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
@@ -1080,7 +1166,7 @@ class HTTPSink:
             )
         self.method = _valid_method(method, type(self).__name__)
         self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
-        self._auth = _valid_auth(auth, type(self).__name__, self._headers)
+        self._auth = _valid_auth(auth, type(self).__name__, self._headers, self._AUTH_CONFLICT)
         self.body_format = body_format
         self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
         self.gzip = gzip
@@ -1822,7 +1908,17 @@ class HTTPSink:
         return headers, data
 
     def _apply_auth(self, headers: dict[str, str]) -> None:
-        """Applies bearer-token or basic-auth credentials, if not already set.
+        """Applies bearer-token or basic-auth credentials, when the sink was given any.
+
+        Nothing the caller wrote is overwritten: construction refuses ``auth`` beside an
+        ``Authorization`` header in any case (:func:`_valid_auth`), so ``self._headers`` holds
+        none whenever there are credentials to apply. The guard that used to defer to an
+        ``Authorization`` already in the map is gone with the case it served. What it could
+        still have seen is a per-request ``extra_headers`` value, and that sits *beneath* the
+        caller's own (SPEC-048 FR-007) — ``auth`` is the caller's own — so the credentials are
+        written last and win, under any case, as ``urllib`` keeps the value written last for a
+        folded name. No shipped subclass passes one: ``SentrySink``, the only caller of
+        ``extra_headers``, passes ``X-Sentry-Auth`` and builds its sink without ``auth``.
 
         The URL's scheme is deliberately not checked: an ``http://`` endpoint sends these
         credentials in cleartext, and basic auth is base64 rather than encryption, but a
@@ -1839,9 +1935,8 @@ class HTTPSink:
         Raises:
           None.
         """
-        if self._auth is None or "Authorization" in headers:
-            return
-        headers["Authorization"] = _authorization(self._auth)
+        if self._auth is not None:
+            headers["Authorization"] = _authorization(self._auth)
 
     def _attempt(self, request: urllib.request.Request) -> tuple[int, bytes, float | None]:
         """Performs one request.

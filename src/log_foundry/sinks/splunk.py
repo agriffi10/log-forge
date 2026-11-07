@@ -38,6 +38,10 @@ class SplunkHECSink(HTTPSink):
     MAX_BATCH_COUNT = 1000
     MAX_BATCH_BYTES = 1_000_000
     _CREDENTIALS = "this sink's token argument"
+    _AUTH_CONFLICT = (
+        "auth cannot be given, since this sink sends its token as the Authorization header; "
+        "drop auth="
+    )
 
     def __init__(
         self,
@@ -68,7 +72,13 @@ class SplunkHECSink(HTTPSink):
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
           ValueError: For any argument :class:`~log_foundry.sinks.http.HTTPSink` refuses, under
             this class's name; a ``url`` carrying a user or password is told to pass the HEC
-            token as ``token``, which this sink sends itself.
+            token as ``token``, which this sink sends itself. A forwarded ``auth`` is always
+            refused: the token goes out as the ``Authorization`` header this sink writes into the
+            headers it hands :class:`~log_foundry.sinks.http.HTTPSink`, so ``auth`` used to be
+            dropped silently. It is refused by ``HTTPSink``'s own check, which sees that header
+            whenever ``auth`` is given, rather than by a second check here, so there is one rule
+            and one place it runs; :attr:`_AUTH_CONFLICT` only rewords it, since the shared
+            wording would tell the caller they had passed an ``Authorization`` header.
         """
         self._host = host
         self._source = source

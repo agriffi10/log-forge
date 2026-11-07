@@ -367,17 +367,6 @@ def test_credentials_that_are_neither_form_are_refused_naming_auth() -> None:
         HTTPSink("http://h/x", auth=123)  # type: ignore[arg-type]
 
 
-def test_credentials_an_authorization_header_overrides_are_not_checked() -> None:
-    """``_apply_auth`` never sends them, so they delivered; a lowercase twin is not an override."""
-    opener = FakeOpener()
-    sink = HTTPSink("http://h/x", headers={"Authorization": "x"}, auth="\u20ac", opener=opener)
-    sink.emit([{"i": 1}])
-    assert opener.calls[0]["headers"]["authorization"] == "x"
-
-    with pytest.raises(ValueError, match=r"^HTTPSink auth cannot be sent over HTTP "):
-        HTTPSink("http://h/x", headers={"authorization": "x"}, auth="\u20ac")
-
-
 @pytest.mark.parametrize("name", ["x-\u00df", "x-\ufb01"])
 def test_a_header_name_urllib_folds_to_ascii_constructs(name: str) -> None:
     """``capitalize`` then ``title``, urllib's two steps, turn these into ``X-Ss`` and ``X-Fi``."""
