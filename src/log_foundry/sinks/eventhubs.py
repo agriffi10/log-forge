@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
@@ -65,11 +66,19 @@ class AzureEventHubsSink:
 
         Raises:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
-          ValueError: If no producer is injected and no connection string was given.
+          ValueError: If no producer is injected and no connection string was given, or if
+            ``connection_str`` or ``eventhub`` is passed alongside ``producer=``, which is already
+            built and would never read either (SPEC-071 FR-003).
           ImportError: If the ``azure-eventhubs`` extra is not installed, whether or not a producer
             was injected; its message names the extra (``MissingExtraError``).
         """
         self.max_retries = floor_count(max_retries, 0, "max_retries", "AzureEventHubsSink")
+        refuse_with_injected(
+            "AzureEventHubsSink",
+            "producer",
+            producer,
+            {"connection_str": connection_str, "eventhub": eventhub},
+        )
         if producer is None and connection_str is None:
             raise ValueError(
                 "AzureEventHubsSink requires connection_str when no producer is injected"

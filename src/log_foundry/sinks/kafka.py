@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._extras import import_extra
@@ -140,18 +141,19 @@ class KafkaSink:
 
         Raises:
           ValueError: If no producer is injected and no broker list was given, or if
-            ``producer_config`` is passed alongside ``producer=`` — it can only be applied to a
-            producer this sink builds, and ignoring it would silently discard the caller's bound
-            (SPEC-043's rule).
+            ``producer_config`` or ``bootstrap_servers`` is passed alongside ``producer=`` —
+            either can only be applied to a producer this sink builds, and ignoring it would
+            silently discard what the caller configured (SPEC-043's rule;
+            ``bootstrap_servers`` since SPEC-071 FR-003).
           ImportError: If the ``kafka`` extra is not installed.
         """
-        if producer is not None:
-            if producer_config is not None:
-                raise ValueError(
-                    "KafkaSink cannot apply producer_config to an injected producer, which is "
-                    "already built; pass the settings where the producer is constructed"
-                )
-        else:
+        refuse_with_injected(
+            "KafkaSink",
+            "producer",
+            producer,
+            {"bootstrap_servers": bootstrap_servers, "producer_config": producer_config},
+        )
+        if producer is None:
             if bootstrap_servers is None:
                 raise ValueError(
                     "KafkaSink requires bootstrap_servers when no producer is injected"

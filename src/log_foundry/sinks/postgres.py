@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
@@ -114,7 +115,7 @@ class PostgresSink:
         create_table: bool = False,
         chunk_size: int = 1000,
         max_retries: int = 3,
-        connect_timeout: int = DEFAULT_CONNECT_TIMEOUT,
+        connect_timeout: int | None = None,
     ) -> None:
         """Connects to the database and prepares the insert statement.
 
@@ -131,16 +132,21 @@ class PostgresSink:
             (SPEC-021) — a negative value returned having attempted no insert at all, and
             reported success. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
             FR-001); a ``bool`` or ``int`` subclass is read as the ``int`` it holds.
-          connect_timeout: Seconds libpq may spend opening a connection. Defaults to
-            :data:`DEFAULT_CONNECT_TIMEOUT` (5) and is floored at libpq's own minimum of 2, since
+          connect_timeout: Seconds libpq may spend opening a connection. ``None``, the default,
+            means :data:`DEFAULT_CONNECT_TIMEOUT` (5): the ``None`` lets the sink tell a value the
+            caller gave from one left out (SPEC-071 FR-003), and the parameter is rebound to the
+            default before the floor so the floor still receives it positionally. It is floored
+            at libpq's own minimum of 2, since
             ``0`` means "wait forever" and would reinstate the unbounded connect this argument
             exists to remove. It is passed explicitly and therefore **overrides any
             ``connect_timeout`` in the DSN** — a DSN asking for 30 gets this value instead, so
             set it here rather than there. Applies to the connection opened at construction and
             to every reconnect. Anything but an ``int`` is refused with ``TypeError`` (SPEC-066
             FR-002) — libpq wants a decimal integer — and that holds with an injected
-            ``connection=`` too, which never reads it: the declared type is already violated,
-            and the rule against validating an unread value is about a value, not a type.
+            ``connection=`` too, judged first: the declared type is already violated, and the
+            rule against validating an unread value is about a value, not a type. A well-typed
+            value given beside ``connection=`` is then refused with ``ValueError``, since an
+            open connection never reads it (SPEC-071 FR-003).
 
         Returns:
           None.
@@ -148,8 +154,9 @@ class PostgresSink:
         Raises:
           TypeError: If ``max_retries`` or ``connect_timeout`` is not an ``int`` (SPEC-066),
             judged before any connection is opened.
-          ValueError: If the table name is not a plain SQL identifier, or the chunk size is not
-            positive.
+          ValueError: If the table name is not a plain SQL identifier, the chunk size is not
+            positive, or ``dsn`` or ``connect_timeout`` is passed alongside ``connection=``, which
+            is already open and would never read either (SPEC-071 FR-003).
           ImportError: If the ``postgres`` extra is not installed.
         """
         self._table = valid_identifier(table)
@@ -163,8 +170,16 @@ class PostgresSink:
         self._counter_lock = threading.Lock()
         self._owns_connection = connection is None
         self._dsn = dsn
+        given_timeout = connect_timeout
+        connect_timeout = DEFAULT_CONNECT_TIMEOUT if connect_timeout is None else connect_timeout
         self.connect_timeout = floor_count(
             connect_timeout, _MIN_CONNECT_TIMEOUT, "connect_timeout", "PostgresSink"
+        )
+        refuse_with_injected(
+            "PostgresSink",
+            "connection",
+            connection,
+            {"dsn": dsn, "connect_timeout": given_timeout},
         )
         if connection is None:
             connection = self._connect()

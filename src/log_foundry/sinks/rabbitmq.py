@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
@@ -92,9 +93,10 @@ class RabbitMQSink:
 
         Raises:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
-          ValueError: If a bound cannot bound anything, or if one is passed alongside
-            ``connection=``, which is already connected and cannot consume it — SPEC-043's rule
-            that an argument no backend can use is an error rather than a silent ignore.
+          ValueError: If a bound cannot bound anything, or if ``url`` or a bound is passed
+            alongside ``connection=``, which is already connected and cannot consume it —
+            SPEC-043's rule that an argument no backend can use is an error rather than a silent
+            ignore (``url`` since SPEC-071 FR-003).
           ImportError: If the ``amqp`` extra is not installed.
           Exception: Whatever ``pika`` raises when connecting.
         """
@@ -103,13 +105,17 @@ class RabbitMQSink:
             "socket_timeout": socket_timeout,
             "stack_timeout": stack_timeout,
         }
-        supplied = sorted(name for name, value in bounds.items() if value is not None)
-        if connection is not None and supplied:
-            raise ValueError(
-                f"RabbitMQSink cannot apply {', '.join(supplied)} to an injected connection, "
-                "which is already connected; pass them where the connection is built, or drop "
-                "connection="
-            )
+        refuse_with_injected(
+            "RabbitMQSink",
+            "connection",
+            connection,
+            {
+                "url": url,
+                "blocked_connection_timeout": blocked_connection_timeout,
+                "socket_timeout": socket_timeout,
+                "stack_timeout": stack_timeout,
+            },
+        )
         self._bounds = {
             name: require_timeout(value, name, "RabbitMQSink")
             for name, value in bounds.items()

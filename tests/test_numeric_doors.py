@@ -595,15 +595,18 @@ def test_postgres_connect_timeout_refuses_a_non_int(
     assert calls == [], "no connection is opened before the refusal"
 
 
-def test_postgres_connect_timeout_floors_to_two() -> None:
+def test_postgres_connect_timeout_floors_to_two(monkeypatch: pytest.MonkeyPatch) -> None:
     """FR-002 AC-6: libpq's minimum is kept; `True` was already the exact 2 (a pin)."""
+    _psycopg(monkeypatch)
     for value, expected in ((0, 2), (1, 2), (True, 2), (30, 30)):
-        stored = PostgresSink("t", connection=object(), connect_timeout=value).connect_timeout
+        stored = PostgresSink("t", dsn="postgresql://x", connect_timeout=value).connect_timeout
         assert stored == expected
         assert type(stored) is int
 
 
-def _other_floor(argument: str, value: Any, tmp_path: Any) -> Any:
+def _other_floor(
+    argument: str, value: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> Any:
     if argument in ("max_bytes", "backup_count"):
         sink = RotatingFileSink(str(tmp_path / f"{argument}.log"), **{argument: value})
         try:
@@ -614,7 +617,8 @@ def _other_floor(argument: str, value: Any, tmp_path: Any) -> Any:
         return HTTPSink("http://x", max_batch_count=value).max_batch_count
     if argument == "max_pending":
         return GooglePubSubSink("t", client=object(), max_pending=value).max_pending
-    return PostgresSink("t", connection=object(), connect_timeout=value).connect_timeout
+    _psycopg(monkeypatch)
+    return PostgresSink("t", dsn="postgresql://x", connect_timeout=value).connect_timeout
 
 
 _FLOORS = {"max_bytes": 0, "backup_count": 0, "max_batch_count": 1, "max_pending": 1}
@@ -639,10 +643,14 @@ _FLOORS = {"max_bytes": 0, "backup_count": 0, "max_batch_count": 1, "max_pending
 )
 @pytest.mark.parametrize("argument", [*_FLOORS, "connect_timeout"])
 def test_an_int_subclass_is_stored_exact_at_every_other_floor(
-    tmp_path: Any, argument: str, value: int, expected: dict[str, int]
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    argument: str,
+    value: int,
+    expected: dict[str, int],
 ) -> None:
     """FR-002 AC-7: the floor is taken on the number held, and that exact int is stored."""
-    stored = _other_floor(argument, value, tmp_path)
+    stored = _other_floor(argument, value, tmp_path, monkeypatch)
     assert stored == expected[argument]
     assert type(stored) is int, f"{argument} stored {type(stored).__name__}"
 
