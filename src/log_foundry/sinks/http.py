@@ -134,6 +134,38 @@ class _PayloadTooLarge(SinkDeliveryError):
         self.size = size
 
 
+class _UnreadBody(bytes):
+    """A ``2xx`` payload whose body could not be read: equal to ``b""``, and telling (FR-004).
+
+    :meth:`HTTPSink._attempt` returns one in place of ``b""`` when a body read failed after the
+    status line, so the flag travels in the value :meth:`HTTPSink._handle_response` already
+    receives and the hook's signature is unchanged (SPEC-070 FR-004). A keyword parameter was the
+    alternative and was rejected: an override with the two-argument signature, or a
+    ``*args, **kwargs`` wrapper forwarding to one, would raise ``TypeError`` out of ``emit``
+    exactly when a body fails to read, and the worker re-sends anything escaping ``emit``. An
+    override that does not ask :func:`_read_failed` sees ``b""``, as under ``1.x``; it has no
+    content, and ``json.loads``, ``len`` and slicing behave on it as on ``b""``.
+    """
+
+    __slots__ = ()
+
+
+def _read_failed(payload: bytes) -> bool:
+    """Reports whether a ``2xx`` payload stands for a body that could not be read (FR-004).
+
+    Args:
+      payload: What :meth:`HTTPSink._handle_response` was handed.
+
+    Returns:
+      True for :class:`_UnreadBody`; False for any other payload, ``b""`` included, so an empty
+      body and an unreadable one are told apart only where this is asked.
+
+    Raises:
+      None.
+    """
+    return isinstance(payload, _UnreadBody)
+
+
 DEFAULT_MAX_RETRY_AFTER = 30.0
 """Ceiling on a server-supplied ``Retry-After``, in seconds (SPEC-027 FR-001).
 
@@ -1501,14 +1533,17 @@ class HTTPSink:
         default ignores the body and reads a status in the success range as delivery; that is the
         whole answer only where the destination's ``2xx`` carries no per-record outcome.
 
-        The payload is ``b""`` both for an empty body and for one that could not be read after
-        the status line — cut short, stalled past ``timeout`` or reset (:meth:`_attempt`). An
-        override cannot tell the two apart, so the way it reads an empty ``2xx`` body is the way
-        it reads an unreadable one: the default settles both as delivered, and an override that
-        reads an empty body as success settles an unreadable one silently.
+        The payload equals ``b""`` both for an empty body and for one that could not be read
+        after the status line — cut short, stalled past ``timeout`` or reset (:meth:`_attempt`).
+        For the second it is an :class:`_UnreadBody`, which :func:`_read_failed` tells apart
+        (SPEC-070 FR-004), so an override whose verdict is in the body can count an unreadable
+        one even where it reads an empty one as success; the three shipped readers ask it. An
+        override that does not ask reads the two the same way, as under ``1.x``. The default
+        ignores the body and settles both as delivered: no body is its verdict.
 
         Args:
-          payload: The response body, or ``b""`` when it could not be read.
+          payload: The response body; an :class:`_UnreadBody`, equal to ``b""``, when it could
+            not be read.
           items: The chunk the response describes.
 
         Returns:
@@ -1692,8 +1727,8 @@ class HTTPSink:
 
         Returns:
           The response bytes, which subclasses that must inspect the response — such as
-          Elasticsearch's ``_bulk`` items — read. ``b""`` when a ``2xx`` body could not be read,
-          which the caller cannot tell from an empty one.
+          Elasticsearch's ``_bulk`` items — read. An :class:`_UnreadBody`, equal to ``b""``, when
+          a ``2xx`` body could not be read, which :func:`_read_failed` tells from an empty one.
 
         Raises:
           Exception: An exception :meth:`_retryable_error` rejects, unchanged, only when
@@ -1809,9 +1844,10 @@ class HTTPSink:
 
         **The status line is the dividing line.** Everything before it — the connection, the
         request, a status line or header block the server garbled — raises, and :meth:`_send`
-        retries it as a connection error. Once a status is in hand the server has answered, so a
-        body read that fails afterwards is not a fault to retry but a body nobody can read: the
-        payload is ``b""`` and the status, with its ``Retry-After``, decides as it always did. A
+        retries it, if :meth:`_retryable_error` accepts it, as a connection error. Once a status
+        is in hand the server has answered, so a body read that fails afterwards is not a fault to
+        retry but a body nobody can read: the payload is an :class:`_UnreadBody` and the status,
+        with its ``Retry-After``, decides as it always did. A
         ``2xx`` therefore settles its chunk however its body ends, because a ``2xx`` is not
         provable non-delivery and a re-send could duplicate what landed (SPEC-018's rule); and a
         ``503`` or a ``413`` whose body was cut short is still a ``503`` or a ``413``. Measured
@@ -1820,11 +1856,12 @@ class HTTPSink:
         or a reset mid-body was retried as a connection error, re-POSTing an accepted chunk once
         per retry and then counting it in ``failed``.
 
-        ``b""`` rather than ``None`` keeps :meth:`_handle_response`'s signature, which is a
-        documented extension hook, exactly as it was. The cost is that an override cannot tell an
-        empty body from an unreadable one, so each must read an empty ``2xx`` body the way it
-        wants an unreadable one read: the base settles both as delivered, and
-        ``ElasticsearchSink`` and ``HoneycombSink`` count both as unadjudicated.
+        An unreadable body is an :class:`_UnreadBody`, which equals ``b""``, rather than ``None``,
+        which keeps :meth:`_handle_response`'s signature, a documented extension hook, exactly as
+        it was. An override that does not ask :func:`_read_failed` cannot tell an empty body from
+        an unreadable one and reads both the same way; the three shipped readers ask it and count
+        an unreadable ``2xx`` body unadjudicated (SPEC-070 FR-004). An honestly empty body stays
+        plain ``b""``.
 
         The guard catches ``Exception``, not the read's documented errors, for the reason
         ``ElasticsearchSink._parse_bulk_response`` gives for its own: anything escaping here
@@ -1839,18 +1876,18 @@ class HTTPSink:
         asks for one byte past the bound so :meth:`_send` and :meth:`_handle_response` can tell
         "exactly the bound" from "over it", sits inside the same guard and checks
         ``response.length`` itself: fewer bytes than it asked for while the response still owes
-        some is a body nobody can read, and becomes ``b""`` exactly as a raise does. A truncated
-        chunked body raises from ``read(amt)`` too and takes the guard. A body with neither
-        length nor chunking is read to EOF, where truncation cannot be detected at all. With the
-        default ``None`` every other sink runs the bare ``read()`` under the guard, unchanged
-        (SPEC-056 FR-003).
+        some is a body nobody can read, and becomes an :class:`_UnreadBody` exactly as a raise
+        does. A truncated chunked body raises from ``read(amt)`` too and takes the guard. A body
+        with neither length nor chunking is read to EOF, where truncation cannot be detected at
+        all. With the default ``None`` every other sink runs the bare ``read()`` under the guard,
+        unchanged (SPEC-056 FR-003).
 
         Args:
           request: The prepared request.
 
         Returns:
-          The status, the response payload — ``b""`` when the body could not be read — and any
-          ``Retry-After`` delay.
+          The status, the response payload — an :class:`_UnreadBody` when the body could not be
+          read — and any ``Retry-After`` delay.
 
         Raises:
           urllib.error.URLError: On a connection-level failure, for the retry loop to handle.
@@ -1872,9 +1909,9 @@ class HTTPSink:
             else:
                 payload = response.read(limit + 1)
                 if len(payload) <= limit and (getattr(response, "length", None) or 0) > 0:
-                    payload = b""
+                    payload = _UnreadBody()
         except Exception:
-            payload = b""
+            payload = _UnreadBody()
         return int(status), payload, _parse_retry_after(getattr(response, "headers", None))
 
     def _sleep_backoff(self, attempt: int, retry_after: float | None) -> None:

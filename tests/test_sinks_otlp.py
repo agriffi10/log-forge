@@ -20,7 +20,7 @@ from log_foundry import _otel
 from log_foundry._otel import request_body
 from log_foundry.sinks import _retry
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.http import HTTPSink, _read_failed
 from log_foundry.sinks.otlp import DEFAULT_ENDPOINT, OTLPSink
 from log_foundry.sinks.transform import TransformSink
 from log_foundry.worker import Worker
@@ -853,13 +853,15 @@ def _truncating(mode: str) -> Iterator[_TruncatingServer]:
 
 
 @pytest.mark.parametrize("mode", ["content-length", "chunked"])
-def test_a_truncated_2xx_reaches_the_sink_as_empty_and_is_full_success(mode: str) -> None:
-    """The bounded read matches the unbounded one: a short body is ``b""``, never short bytes.
+def test_a_truncated_2xx_reaches_the_sink_unread_and_is_counted(mode: str) -> None:
+    """The bounded read matches the unbounded one: a short body is unread, never short bytes.
 
     The verdict on the wire is complete and rejects every record, so a bounded read that handed
     the short bytes on — ``read(amt)`` returns them silently on a ``Content-Length`` body,
     with ``response.length`` still owing — would parse it and raise; the ``response.length``
-    check turns it into ``b""``, which FR-004 reads as full success, uncounted (#283's rule).
+    check turns it into an ``_UnreadBody``, equal to ``b""``. It used to be read as full success,
+    uncounted (#283's rule); since SPEC-070 FR-004 the chunk is counted on
+    ``dropped_unadjudicated``, settled and never re-sent.
     """
     seen: list[bytes] = []
     with _truncating(mode) as server:
@@ -875,5 +877,6 @@ def test_a_truncated_2xx_reaches_the_sink_as_empty_and_is_full_success(mode: str
         posts = server.posts
     assert posts == 1
     assert seen == [b""]
-    assert (sink.rejected_records, sink.dropped_unadjudicated) == (0, 0)
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert _read_failed(seen[0]), "the flag travels in the payload"
+    assert (sink.rejected_records, sink.dropped_unadjudicated) == (0, 5)
+    assert sink.losses() == SinkLosses(dropped=0, failed=5)

@@ -8,7 +8,13 @@ from typing import Unpack
 from log_foundry import _diag
 from log_foundry.sinks._batch import usable_results
 from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPRetryKwargs, HTTPSink, _Item, _valid_base_url
+from log_foundry.sinks.http import (
+    HTTPRetryKwargs,
+    HTTPSink,
+    _Item,
+    _read_failed,
+    _valid_base_url,
+)
 
 __all__ = ["ElasticsearchSink", "OpenSearchSink"]
 
@@ -126,15 +132,15 @@ class ElasticsearchSink(HTTPSink):
         batch that indexed some of its chunks must not be re-sent whole (SPEC-026 FR-001).
 
         A ``2xx`` body that could not be read — cut short, stalled or reset after the status line
-        — arrives as ``b""`` (``HTTPSink._attempt``), and needs no branch of its own:
-        ``json.loads(b"")`` raises, so it takes the same unadjudicated route as any undecodable
-        body, counted on ``dropped_unadjudicated`` with the line saying the events may have
-        landed. That is also why reading an empty ``2xx`` as unadjudicated is the right reading
-        for ``_bulk``: this hook cannot tell an empty body from an unreadable one, and a reading
-        of empty as success would settle an unreadable body silently.
+        — arrives as an ``_UnreadBody`` (``HTTPSink._attempt``), and :meth:`_parse_bulk_response`
+        asks ``_read_failed`` first, counting it on ``dropped_unadjudicated`` with the line saying
+        the events may have landed (SPEC-070 FR-004). It used to rest on ``json.loads(b"")``
+        raising into the same route; the count is unchanged. An **empty** ``2xx`` body is counted
+        the same way, because ``_bulk``'s only verdict is in the body.
 
         Args:
-          payload: The response body, or ``b""`` when it could not be read.
+          payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
+            read.
           items: The chunk the response describes.
 
         Returns:
@@ -203,7 +209,8 @@ class ElasticsearchSink(HTTPSink):
         which is why ``docs/architecture.md`` §12 leaves that to be decided with the Astra profile.
 
         Args:
-          payload: The response body.
+          payload: The response body; an ``_UnreadBody`` when it could not be read, counted
+            unadjudicated before any parse (SPEC-070 FR-004).
           sent: How many events were in the request.
 
         Returns:
@@ -213,6 +220,9 @@ class ElasticsearchSink(HTTPSink):
         Raises:
           None.
         """
+        if _read_failed(payload):
+            self._abandon_unadjudicated(sent)
+            return False
         try:
             data = json.loads(payload)
         except Exception:

@@ -8,7 +8,13 @@ from typing import Unpack
 from log_foundry import __version__, _diag
 from log_foundry._otel import framing, log_record, request_body, resource_key
 from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _Item, _valid_url
+from log_foundry.sinks.http import (
+    HTTPPlatformKwargs,
+    HTTPSink,
+    _Item,
+    _read_failed,
+    _valid_url,
+)
 
 __all__ = ["OTLPSink"]
 
@@ -224,13 +230,22 @@ class OTLPSink(HTTPSink):
         then re-sends chunks that already landed. A body that is empty, not JSON, not an object
         or without a ``partialSuccess`` is full success — what a server must send on success, so
         a proxy's page or a protobuf body is not this sink's to adjudicate, unlike a ``_bulk``
-        response, whose only verdict is in the body. The body is parsed with ``parse_int=str``
+        response, whose only verdict is in the body.
+
+        **A body that could not be read is not one of those** (SPEC-070 FR-004). A ``2xx`` whose
+        body was cut short, stalled or reset after the status line arrives as an
+        ``_UnreadBody``, equal to ``b""``; it used to read as an empty body and so as full
+        success, settling silently a chunk whose verdict may have rejected every record. It is
+        asked about first, before the response bound, and counted on ``dropped_unadjudicated``
+        with the line written for an unreadable ``partialSuccess``, settled and never re-sent. An
+        honestly empty body is still success. The body is parsed with ``parse_int=str``
         so a bare over-long ``rejectedLogRecords`` takes the digit rule rather than reading as
         not-JSON and settling as success; ``except Exception`` because a ``RecursionError`` from a
         deeply nested body is not a ``ValueError``.
 
         Args:
-          payload: The response body, read under :meth:`_response_limit`.
+          payload: The response body, read under :meth:`_response_limit`; an ``_UnreadBody``
+            when it could not be read.
           items: The chunk the response describes.
 
         Returns:
@@ -242,6 +257,9 @@ class OTLPSink(HTTPSink):
           None.
         """
         sent = len(items)
+        if _read_failed(payload):
+            self._abandon_unadjudicated(sent)
+            return True
         limit = self._response_limit()
         if limit is not None and len(payload) > limit:
             self._abandon_unadjudicated(sent)

@@ -16,6 +16,7 @@ from log_foundry.sinks.http import (
     _holds_at,
     _holds_delimiter,
     _Item,
+    _read_failed,
     _started_request,
     _valid_base_url,
     _valid_url,
@@ -285,11 +286,12 @@ class HoneycombSink(HTTPSink):
 
         Honeycomb's only per-event verdict is the body, so a body that does not carry one is no
         verdict, and the chunk is counted on ``dropped_unadjudicated`` rather than read as
-        delivered. That includes ``b""``: an empty body and one that could not be read after the
-        status line both arrive as ``b""`` (``HTTPSink._attempt``), and reading it as success would
-        settle silently an all-rejected response whose body was cut short. It is the ``_bulk``
-        sinks' reading, argued here for this destination's own reason, and the opposite of
-        ``OTLPSink``'s, whose ``2xx`` needs no body to succeed.
+        delivered. That includes a body that could not be read after the status line, an
+        ``_UnreadBody`` (``HTTPSink._attempt``), which is asked about first (SPEC-070 FR-004) —
+        reading it as success would settle silently an all-rejected response whose body was cut
+        short — and an empty ``b""``, which carries no verdict either. It is the ``_bulk`` sinks'
+        reading, argued here for this destination's own reason. ``OTLPSink`` counts an
+        unreadable body too, but reads an empty one as success, since its ``2xx`` needs no body.
 
         The array is positional — Honeycomb names no event in it — so it must prove it describes
         the chunk before entry *i* is read as event *i*: the same length, and every entry an
@@ -304,7 +306,8 @@ class HoneycombSink(HTTPSink):
         here escapes ``emit``, and the worker re-sends a batch the server may have accepted.
 
         Args:
-          payload: The response body, or ``b""`` when it could not be read.
+          payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
+            read.
           items: The chunk the response describes.
 
         Returns:
@@ -316,6 +319,9 @@ class HoneycombSink(HTTPSink):
           None.
         """
         sent = len(items)
+        if _read_failed(payload):
+            self._abandon_unadjudicated(sent)
+            return True
         try:
             data = json.loads(payload)
         except Exception:
