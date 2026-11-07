@@ -479,4 +479,6 @@ the doors from the AST and fails naming one that asks the value rather than its 
 `tests/test_injected_client_roster.py`, which derives each constructor's build options and fails
 naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra refused at the
 constructor that needs it, and `tests/test_extras_roster.py`, which fails naming an extra imported
-other than through `import_extra` (SPEC-071).
+other than through `import_extra` (SPEC-071); `tests/test_sinks_http_auth.py` for `auth` refused
+beside an `Authorization` header in any case, and a one-shot `auth` copied once and sent on every
+request (the HTTP auth fix, no spec).

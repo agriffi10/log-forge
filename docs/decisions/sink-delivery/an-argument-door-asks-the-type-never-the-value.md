@@ -44,9 +44,9 @@ too.
 turned a value that cannot be unpacked as a pair into `ValueError("<owner> auth cannot be sent
 over HTTP (TypeError)")`, naming `auth`, and it accepts anything that unpacks into two items,
 running its `__iter__`: a value claiming `str` that also defines `__iter__` is accepted and sent as
-Basic auth. A real `str` and a real pair are judged as before. A one-shot iterable `auth` passes
-construction and fails every `emit`, as it did before this spec; `architecture.md` §12 carries it
-as open. `SQSSink`'s constant group id is told apart by real type and read
+Basic auth. A real `str` and a real pair are judged as before. A one-shot iterable `auth`, which
+this spec left passing construction and failing every `emit`, is now unpacked once at construction
+(*`auth` beside an `Authorization` header is refused, never resolved by precedence*). `SQSSink`'s constant group id is told apart by real type and read
 through `str.__str__`, at the constructor and per event, so a callable claiming `str` is still
 asked and a `str` subclass's own `strip` never runs.
 
@@ -90,6 +90,8 @@ named raises and the one multiset. (SPEC-071, invariants 13 and 6)
 
 ### 2026-11-07
 
+- **Updated (HTTP auth fix, no spec).** The one-shot `auth` this entry recorded as open is closed:
+  the pair is copied once at construction. The sentence saying so now points to that decision.
 - **Settled (SPEC-071 FR-005).** Closed the `architecture.md` §12 entry SPEC-080's frame-2 review
   recorded, at Andrew's direction, deferred from 1.1.0. Written as a sibling of SPEC-080's decision
   rather than a rewrite of it, since that one is about `@trace`.

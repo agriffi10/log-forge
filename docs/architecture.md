@@ -884,21 +884,19 @@ close it.
 
 ### Open
 
-- **An `auth` that unpacks only once is accepted at construction, and every `emit` then fails**
-  (SPEC-071 frame-2 review; invariant 13). The construction check builds the `Authorization` value
-  by unpacking `auth` as a pair, which consumes a one-shot iterable: `HTTPSink(url,
-  auth=iter(("u", "p")))` constructs, and every `emit` raises `not enough values to unpack`. The
-  same on `origin/main` before SPEC-071, so it predates the real-type routing. **Closed by**
-  copying the pair once, at construction, into the exact `tuple` both the check and `emit` read,
-  or refusing anything that is not a real `str` or `tuple`.
-- **`auth=` beside a caller's `Authorization` header is silently ignored** (SPEC-071 frame-2
-  review; invariant 13's "no argument is silently ignored because another was given"). `HTTPSink(url,
-  auth=("u", "p"), headers={"Authorization": "Bearer H"})` constructs and sends `Bearer H`.
-  `_valid_auth` and `_apply_auth` document this as deliberate: the caller's header wins, so
-  credentials it overrides are never sent and so are not checked. That reasoning is the code's,
-  not a settled exception, so invariant 13 does not record it. **Closed by** either refusing the
-  pair at construction, as an injected client's build options are refused, or recording the
-  precedence as an exception to invariant 13.
+- **A caller's `headers=` silently replaces a platform sink's own credential header** (HTTP auth
+  fix's build; invariant 13's "no argument is silently ignored because another was given").
+  `merge_headers` lays the caller's headers over the sink's own, and `urllib` sends one value per
+  folded name, the last written, so a caller header naming the sink's credential header in any
+  case is sent instead of the required argument: Splunk's `Authorization: Splunk <token>`,
+  Datadog's `DD-API-KEY`, New Relic's `Api-Key`, Honeycomb's `X-Honeycomb-Team`. Reproduced at
+  `7845f66f` with each name in its own, lower and upper case: every one constructs and sends only
+  the caller's value, and the `token` or `api_key` is never sent. `merge_headers` documents
+  "caller winning", but that is the code's reasoning, not an exception invariant 13 records. A side
+  effect: `SplunkHECSink`'s refusal of `auth=` says the sink sends its token as the `Authorization`
+  header even when the caller's own header has replaced that token. **Closed by** refusing a caller
+  header that names the sink's own credential header, in any case, or recording the precedence as
+  an exception to invariant 13.
 - **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
   (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
   `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
@@ -1087,6 +1085,21 @@ close it.
 
 ### Resolved
 
+- ~~**An `auth` that unpacks only once is accepted at construction, and every `emit` then
+  fails**~~ (SPEC-071 frame-2 review; invariant 13) → **closed by the HTTP auth fix (no spec)**.
+  A pair that is not a real `str` is unpacked once, at construction, into the real `tuple` the
+  check and every request read (`http._copied_pair`), so `HTTPSink(url, auth=iter(("u", "p")))`
+  sends Basic auth on every request. What the unpack refuses, and the type its refusal names, are
+  unchanged; a list pair is copied, so mutating it later changes nothing sent.
+- ~~**`auth=` beside a caller's `Authorization` header is silently ignored**~~ (SPEC-071 frame-2
+  review; invariant 13) → **closed by the HTTP auth fix (no spec)**, by refusal. Only the
+  exact-case spelling won; under any other case `auth` won and the header was dropped, since
+  `urllib` folds the names. `auth` beside an `Authorization` header in any case, matched by the
+  name `urllib` sends, is now a `ValueError` at construction from `HTTPSink` and every sink
+  forwarding `auth`, and `SplunkHECSink`, which sends its token as that header, refuses any `auth`.
+  `tests/test_sinks_http_auth.py` guards both entries across every shipped subclass. The
+  reasoning: *`auth` beside an `Authorization` header is refused, never resolved by precedence*,
+  in `docs/decisions/sink-delivery/`.
 - ~~**`configure()`'s stamps, its numeric ceilings, the `_retry` doors and `OTLPSink`'s endpoint
   test their arguments with `isinstance` and name them with `type(value).__name__`**~~ (SPEC-080
   frame-2 review; invariant 13, the "argument named" half) → **closed by SPEC-071 FR-005**. The
