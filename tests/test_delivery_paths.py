@@ -338,11 +338,8 @@ def test_the_workers_emit_loop_survives_a_huge_max_retries(
     ]
 
 
-@pytest.mark.parametrize("mutation", ["clear", "extend"])
-def test_a_deliver_that_mutates_its_argument_through_a_real_worker(
-    mutation: str, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """M1: no ``Exception`` escapes, every event keeps one counted fate, the line its count."""
+def _mutating(mutation: str, outcomes: tuple[Outcome, ...]) -> Any:
+    """A ``deliver`` step that clears or extends the list it was handed, then answers."""
 
     def mutate(handed: list[dict[str, object]]) -> Verdict:
         n = len(handed)
@@ -350,9 +347,17 @@ def test_a_deliver_that_mutates_its_argument_through_a_real_worker(
             handed.clear()
         else:
             handed.extend(events(7, "x"))
-        return Verdict.uniform(J, n)
+        return Verdict(outcomes=outcomes[:n])
 
-    sink = Scripted([mutate])
+    return mutate
+
+
+@pytest.mark.parametrize("mutation", ["clear", "extend"])
+def test_a_deliver_that_mutates_its_argument_through_a_real_worker(
+    mutation: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M1: a failed run's line counts the batch as it was before the run, not as left."""
+    sink = Scripted([_mutating(mutation, (J, J, J))])
     worker = _worker(sink, max_retries=0)
     flushed = _drained(worker, events(3))
     assert worker._thread.is_alive() and worker.stopped_reason is None
@@ -360,6 +365,35 @@ def test_a_deliver_that_mutates_its_argument_through_a_real_worker(
     assert _counts(sink) == (0, 3)
     assert _lost_lines(capsys.readouterr().err) == [
         (3, "event", "; batch abandoned after 1 emit attempts")
+    ]
+
+
+@pytest.mark.parametrize("mutation", ["clear", "extend"])
+def test_a_later_round_indexes_the_snapshot_through_a_real_worker(
+    mutation: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """M1: round two is built from the engine's copy, so no ``Exception`` reaches the worker.
+
+    Round one empties (or grows) the list it was handed and leaves event 0 retryable; were the
+    engine indexing that list, round two would raise ``IndexError`` on the drain thread.
+    """
+    sink = Scripted([_mutating(mutation, (R, J, A)), A])
+    worker = _worker(sink, max_retries=1)
+    batch = events(3)
+    flushed = _drained(worker, batch)
+    assert worker._thread.is_alive() and worker.stopped_reason is None
+    assert flushed and worker.failed_batches == 0
+    assert sink.calls == 2 and sink.rounds[1] == [batch[0]]
+    assert _counts(sink) == (0, 1)
+    assert _lost_lines(capsys.readouterr().err) == [
+        (
+            1,
+            "event",
+            (
+                "; rejected 1, unresolved 0, raised 0, unknown 0, dropped 0 after 2 "
+                "delivery round(s) to Scripted"
+            ),
+        )
     ]
 
 
