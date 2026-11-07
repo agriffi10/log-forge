@@ -46,9 +46,10 @@ over HTTP (TypeError)")`, naming `auth`, and it accepts anything that unpacks in
 running its `__iter__`: a value claiming `str` that also defines `__iter__` is accepted and sent as
 Basic auth. A real `str` and a real pair are judged as before. A one-shot iterable `auth`, which
 this spec left passing construction and failing every `emit`, is now unpacked once at construction
-(*`auth` beside an `Authorization` header is refused, never resolved by precedence*). `SQSSink`'s constant group id is told apart by real type and read
-through `str.__str__`, at the constructor and per event, so a callable claiming `str` is still
-asked and a `str` subclass's own `strip` never runs.
+(*`auth` beside an `Authorization` header is refused, never resolved by precedence*). `SQSSink`'s
+constant group id is told apart by real type and read through `str.__str__`, at the constructor and
+per event, so a callable claiming `str` is still asked and a `str` subclass's own `strip` never
+runs.
 
 **The guard.** `tests/test_type_door_roster.py` derives from the AST of `src/log_foundry/**/*.py`.
 A door is a function raising a `TypeError` that names, through the stored name, the type of one of

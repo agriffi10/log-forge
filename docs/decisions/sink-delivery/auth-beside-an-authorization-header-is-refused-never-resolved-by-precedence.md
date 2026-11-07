@@ -40,7 +40,11 @@ never sent, so the break lands only on a program that was already wrong.
 
 **Why the folded name.** Matching the exact string `Authorization` is what let the old precedence
 flip with case. HTTP header names are case-insensitive and `urllib` sends one value per folded
-name, so the check asks the question the wire answers; no spelling of the header escapes it.
+name, so the check asks the question the wire answers. No spelling escapes it, because a name
+reaching it has passed `_valid_headers`, which refuses a name holding whitespace anywhere — the
+spelling (`Authorization `) a lenient server might trim into `Authorization` — so every name that
+would put `Authorization` on the wire is one whose folded form equals it. A name that only
+contains the word, `X-Authorization`, is not a conflict.
 
 **Why the conflict is judged before the credential.** It reads only whether `auth` was given and
 the header names, which `_valid_headers` has already judged, so it cannot echo or chain a
@@ -52,8 +56,8 @@ construction check and again on every `emit`, so a one-shot iterator such as `it
 constructed and then raised `not enough values to unpack` out of every `emit`, uncounted.
 `http._copied_pair` now performs that same unpack once, into the real `tuple` the check and every
 request read, so what it refuses and the type name its refusal carries are unchanged, and it still
-reads no more than three items. A list pair is copied too, so mutating it later changes nothing
-sent.
+reads no more than three items. Any pair is read once: a list changed afterwards, or an object
+yielding new values each time it is iterated, is frozen at what it held at construction.
 
 **Not covered.** `merge_headers` lays a caller's `headers=` over a platform sink's own, so a caller
 header naming the sink's credential header (Splunk's `Authorization`, Datadog's `DD-API-KEY`, New
@@ -72,7 +76,9 @@ Relic's `Api-Key`, Honeycomb's `X-Honeycomb-Team`), in any case, replaces the re
 **The guard.** `tests/test_sinks_http_auth.py` sweeps every shipped `HTTPSink` subclass, found
 transitively and held to the render sweep's recipes, plus `HTTPSink` and `LogstashSink`, for the
 refusal in each case, Splunk's own wording, a token the check never reaches, `auth` sent beside a
-header that only contains the word, and a one-shot pair sent on every request.
+header that only contains the word, and a one-shot pair sent on every request; a whitespace
+spelling of `Authorization` is refused as a header name, before the conflict is reached.
+`tests/test_sinks_http_header_names.py` holds the whitespace refusal itself.
 
 ## History
 

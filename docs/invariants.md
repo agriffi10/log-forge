@@ -481,4 +481,5 @@ naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra r
 constructor that needs it, and `tests/test_extras_roster.py`, which fails naming an extra imported
 other than through `import_extra` (SPEC-071); `tests/test_sinks_http_auth.py` for `auth` refused
 beside an `Authorization` header in any case, and a one-shot `auth` copied once and sent on every
-request (the HTTP auth fix, no spec).
+request, and `tests/test_sinks_http_header_names.py` for a header name holding whitespace (the
+HTTP auth fix, no spec).
