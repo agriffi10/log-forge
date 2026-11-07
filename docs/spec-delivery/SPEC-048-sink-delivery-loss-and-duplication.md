@@ -31,6 +31,11 @@
 - **`gzip=True` no longer overwrites a caller's `Content-Encoding`** (FR-007), and when the
   caller's wins the body is not compressed.
 
+  > **Superseded in part by the HTTP auth fix (no spec), for 1.2.0.** The caller's header no
+  > longer wins beside `gzip=True`: one naming another coding is refused at construction, and one
+  > naming gzip is compressed under it. The decision: *A caller header that would silently
+  > replace another is refused*, in `docs/decisions/sink-delivery/`.
+
 **Deviation from the spec as written:** its FR-001 claimed `urlopen` follows all five 3xx
 statuses. It follows three — CPython refuses `307`/`308` on a POST already — so those two
 parameters are labelled regression pins, not evidence. The spec was corrected in place before the

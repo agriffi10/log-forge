@@ -353,6 +353,13 @@ added. The rotation failure is announced, not counted.
 
 ### FR-007: `gzip=True` does not overwrite a header the caller set
 
+> **Superseded in part by the HTTP auth fix (no spec), for 1.2.0.** `gzip=True` beside a caller
+> `Content-Encoding` that names another coding, `identity` included, is now refused at
+> construction rather than letting the header win over an uncompressed body, so the first
+> criterion below no longer holds; a value naming gzip is compressed under the caller's header, and
+> the header is found in any case. The decision: *A caller header that would silently replace
+> another is refused*, in `docs/decisions/sink-delivery/`.
+
 #### Description:
 
 `HTTPSink._prepare` merges the caller's headers and then applies `gzip`, so `gzip=True` overwrites

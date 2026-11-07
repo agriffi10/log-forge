@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A caller header that would silently replace another is refused"
-description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — every key of the base it hands `merge_headers`: Datadog's `DD-API-KEY`, New Relic's `Api-Key`, Honeycomb's `X-Honeycomb-Team`, Splunk's `Authorization` — is a `ValueError` at construction naming the argument it would replace, and two caller names folding to one are refused by `_valid_headers`; neither quotes a value. A non-credential default such as `Content-Type` stays the caller's to override. Do NOT let either side win silently, or hand-list the credential headers: two AST rosters derive them and fail naming a header set by a route they cannot see. (HTTP auth fix, no spec)"
+description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — every key of the base it hands `merge_headers` — is a `ValueError` at construction naming the argument it would replace; two caller names folding to one are refused by `_valid_headers`; `gzip=True` beside a caller `Content-Encoding` naming another coding is refused, and one naming gzip is compressed under it. None quotes a value. A non-credential default such as `Content-Type` stays the caller's to override. Do NOT let either side win silently, or hand-list the credential headers: two AST rosters derive them and fail naming a header set by a route they cannot see. (HTTP auth fix, no spec; reverses SPEC-048 FR-007)"
 ---
 
 **A caller header is refused at construction when it would silently replace another header,
@@ -32,12 +32,26 @@ resolved by precedence*: either winner drops an argument the caller wrote, and a
 was not sending what it was given breaks only a program that was already wrong. Andrew decided on
 2026-11-07 that 1.2.0 refuses both gaps.
 
-**What stays overridable.** Only a credential header is protected. `Content-Type` and the
-`Content-Encoding` `HTTPSink` writes per request sit beneath the caller's headers (SPEC-009
-FR-002), and a caller's `Content-Encoding` beside `gzip=True` suppresses the compression and is
-sent as written (SPEC-048 FR-007, now matched by folded name), except that a value naming gzip
-compresses the body under the caller's header. That `Content-Encoding` behaviour is recorded here
-as it stands, not settled by this decision.
+**`gzip=True` and a `Content-Encoding` header.** They are two arguments setting one header, so
+the same rule settles them. SPEC-048 FR-007 let the caller's header win and sent the body
+uncompressed, which silently ignored `gzip=True`; Andrew decided on 2026-11-07 to refuse the
+pairing instead. `_valid_encoding` runs after `_valid_headers` and finds the header by folded name
+(`_caller_encoding`), so `gzip=True` beside a `Content-Encoding` in any case whose value does not
+name gzip — `identity`, `br`, a list such as `gzip, br`, the empty string, a value that is not a
+`str` — raises `<Owner> gzip=True cannot apply beside header 'content-encoding', which names
+another encoding; drop gzip= or the header`, naming the caller's spelling and never the value.
+A value naming gzip, in any case and with surrounding spaces and tabs stripped (`_names_gzip`),
+is no contradiction: the body is compressed and sent under the caller's header. `gzip=False`
+beside any `Content-Encoding` sends the caller's header over an uncompressed body. The check
+reaches every class forwarding `gzip`, `LogstashSink`'s HTTP mode under `HTTPSink`'s name;
+`SentrySink` takes no `gzip`. `_prepare` keeps its per-request suppression for a non-gzip value,
+read through the same `_caller_encoding`, because `gzip` is a public attribute: set true after
+construction beside an `identity` header, the body is still sent uncompressed rather than
+compressed under a label that says otherwise.
+
+**What stays overridable.** Only a credential header is protected from the caller. `Content-Type`
+and the `Content-Encoding` `HTTPSink` writes per request sit beneath the caller's headers
+(SPEC-009 FR-002).
 
 **Derived, not listed.** The credential set is every key of the dict literal each sink hands
 `merge_headers`, so a new platform sink is covered by calling it.
@@ -57,6 +71,8 @@ that default protected too.
 
 - *The caller wins.* The old behaviour: the required `token` or `api_key` is silently never sent.
 - *The sink wins.* The caller's header is silently dropped instead.
+- *Keeping SPEC-048 FR-007's header-wins for `Content-Encoding`.* It silently ignores `gzip=True`,
+  the failure this decision refuses everywhere else.
 - *A hand-written list of credential headers.* It goes stale the day a sink is added; the derived
   set and the route roster cannot.
 
@@ -64,6 +80,10 @@ that default protected too.
 
 ### 2026-11-07
 
+- **Refined (HTTP auth fix, no spec).** `gzip=True` beside a caller `Content-Encoding` naming
+  another coding is refused at construction, Andrew's call, reversing SPEC-048 FR-007, which let
+  the header win and sent the body uncompressed. A value naming gzip is compressed under the
+  caller's header. Superseded markers stand in SPEC-048's spec and delivery doc.
 - **Settled (HTTP auth fix, no spec).** Closed the `architecture.md` §12 entry the fix's own build
   recorded, at Andrew's direction for 1.2.0. Written as its own decision rather than inside the
   `auth` one, since the rule is about any two headers that fold together, not only credentials.
