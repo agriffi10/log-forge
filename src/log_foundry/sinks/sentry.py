@@ -10,6 +10,7 @@ from typing import Any, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import (
     HTTPSink,
@@ -625,10 +626,9 @@ def _import_sdk() -> Any:
       None.
     """
     try:
-        import sentry_sdk  # type: ignore[import-not-found]
+        return import_extra("sentry_sdk", "sentry")
     except ImportError:
         return None
-    return sentry_sdk
 
 
 def _parse_dsn(dsn: str) -> tuple[str, str]:

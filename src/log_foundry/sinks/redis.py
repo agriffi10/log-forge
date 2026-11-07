@@ -7,9 +7,11 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -60,13 +62,15 @@ class _RedisSink:
 
         Raises:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
+          ValueError: If ``url`` is passed alongside ``client=``, which is already built and
+            would never read it (SPEC-071 FR-003).
           ImportError: If the ``redis`` extra is not installed.
         """
         self.max_retries = floor_count(max_retries, 0, "max_retries", type(self).__name__)
+        refuse_with_injected(type(self).__name__, "client", client, {"url": url})
         self._owns_client = client is None
         if client is None:
-            import redis  # type: ignore[import-not-found]
-
+            redis = import_extra("redis", "redis")
             client = redis.Redis.from_url(url) if url else redis.Redis()
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None

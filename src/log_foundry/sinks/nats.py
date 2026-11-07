@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
+from log_foundry.sinks._args import refuse_with_injected
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import exact_int, usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -360,8 +362,9 @@ class NATSSink:
           ValueError: If a connect-time argument is passed alongside ``client=``, which cannot
             consume it — SPEC-043's rule that an argument no backend can use is an error rather
             than a silent ignore. ``servers`` joins that set in SPEC-049 FR-004, closing the last
-            of the §12 items; it is checked separately from ``supplied`` rather than added to it,
-            because ``nats.connect(servers or …, **supplied)`` would then pass it twice.
+            of the §12 items. The refusal names all five in its own literal (SPEC-071 FR-003)
+            rather than reading ``options``, which stays the forwarded set, so
+            ``nats.connect(servers or …, **supplied)`` never receives ``servers`` twice.
             ``publish_timeout`` is deliberately outside the set: it is this sink's own bound and
             applies to any client. Also if ``max_reconnect_attempts`` is non-positive.
           TypeError: If ``max_reconnect_attempts`` is given and is not an ``int`` (SPEC-066),
@@ -388,14 +391,18 @@ class NATSSink:
             "drain_timeout": drain_timeout,
         }
         supplied = {name: value for name, value in options.items() if value is not None}
-        conflicting = sorted([*supplied, *(["servers"] if servers is not None else [])])
-        if client is not None and conflicting:
-            raise ValueError(
-                "NATSSink cannot apply "
-                + ", ".join(conflicting)
-                + " to an injected client, which is already connected; "
-                "pass them where the client is built, or drop client="
-            )
+        refuse_with_injected(
+            "NATSSink",
+            "client",
+            client,
+            {
+                "connect_timeout": connect_timeout,
+                "max_reconnect_attempts": max_reconnect_attempts,
+                "reconnect_time_wait": reconnect_time_wait,
+                "drain_timeout": drain_timeout,
+                "servers": servers,
+            },
+        )
         self._subject = subject
         self._jetstream = jetstream
         self.publish_timeout = usable_timeout(publish_timeout, DEFAULT_PUBLISH_TIMEOUT)
@@ -419,10 +426,10 @@ class NATSSink:
         self._thread.start()
         try:
             if client is None:
-                import nats  # type: ignore[import-not-found]
-
                 client = self._submit(
-                    nats.connect(servers or "nats://localhost:4222", **supplied)
+                    import_extra("nats", "nats").connect(
+                        servers or "nats://localhost:4222", **supplied
+                    )
                 ).result()
         except BaseException:
             self._closed = True

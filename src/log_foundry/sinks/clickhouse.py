@@ -7,10 +7,12 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -97,15 +99,17 @@ class ClickHouseSink:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), judged before any client is
             opened.
           ValueError: If the table name is not a plain SQL identifier, the chunk size is not
-            positive, ``send_receive_timeout`` cannot bound anything, or it is passed alongside
-            ``client=``, which is already built and cannot consume it (SPEC-043's rule).
+            positive, ``send_receive_timeout`` cannot bound anything, or ``dsn`` or
+            ``send_receive_timeout`` is passed alongside ``client=``, which is already built and
+            cannot consume either (SPEC-043's rule; ``dsn`` since SPEC-071 FR-003).
           ImportError: If the ``clickhouse`` extra is not installed.
         """
-        if client is not None and send_receive_timeout is not None:
-            raise ValueError(
-                "ClickHouseSink cannot apply send_receive_timeout to an injected client, which "
-                "is already built; pass it where the client is built, or drop client="
-            )
+        refuse_with_injected(
+            "ClickHouseSink",
+            "client",
+            client,
+            {"dsn": dsn, "send_receive_timeout": send_receive_timeout},
+        )
         bounds: dict[str, float] = {}
         if send_receive_timeout is not None:
             bounds["send_receive_timeout"] = require_timeout(
@@ -122,9 +126,7 @@ class ClickHouseSink:
         self._counter_lock = threading.Lock()
         self._owns_client = client is None
         if client is None:
-            import clickhouse_connect  # type: ignore[import-not-found]
-
-            client = clickhouse_connect.get_client(dsn=dsn, **bounds)
+            client = import_extra("clickhouse_connect", "clickhouse").get_client(dsn=dsn, **bounds)
         self.client = client
         if create_table:
             self._ensure_schema()

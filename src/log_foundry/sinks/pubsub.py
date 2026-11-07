@@ -10,6 +10,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, usable_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -149,9 +150,7 @@ class GooglePubSubSink:
             else DEFAULT_MAX_PENDING
         )
         if client is None:
-            from google.cloud import pubsub_v1  # type: ignore[import-not-found, unused-ignore]
-
-            client = pubsub_v1.PublisherClient()
+            client = import_extra("google.cloud.pubsub_v1", "gcp-pubsub").PublisherClient()
         self.topic = topic
         self.client = client
         self.overflow_timeout = usable_timeout(overflow_timeout, DEFAULT_OVERFLOW_TIMEOUT)

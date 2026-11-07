@@ -122,7 +122,8 @@ poetry install --with dev                             # or: pip install -e .
 ### Optional extras
 
 The core is dependency-free. Each sink built on a third-party client lives behind its own extra
-(the client is imported lazily, only when you construct that sink). All other sinks — stdout,
+(the client is imported lazily, only when you construct that sink, and a missing one is refused
+with a `ModuleNotFoundError` naming the extra to install). All other sinks — stdout,
 file, SQLite, the stdlib-`logging` bridge, and every HTTP/socket platform sink (Elasticsearch,
 Loki, Logstash, Syslog, Datadog, Splunk, New Relic, Honeycomb) — need **no** extra.
 
@@ -579,9 +580,13 @@ A few conventions hold across every sink below:
 - **Extras.** The core is dependency-free. A sink built on a third-party client sits behind the
   optional extra named in its table (blank = zero-dependency, stdlib only); the client is imported
   lazily, so `import log_foundry.sinks.<x>` never fails for a missing dependency — only *constructing*
-  the sink without an injected client does. See [Optional extras](#optional-extras).
+  the sink without an injected client does, and `AzureEventHubsSink` with one, since it builds every
+  event from the extra's own class. See [Optional extras](#optional-extras).
 - **Injection.** Sinks backed by an external resource accept an injected client/connection/stream
   (`client=`, `connection=`, `producer=`, `stream=`, `opener=`) for testing or bespoke configuration.
+  An option the sink would build its client from (`url=`, `dsn=`, `uri=`, a connect timeout), passed
+  beside an injected `client=`, `producer=` or `connection=`, is a `ValueError` at construction,
+  since nothing would read it; `SQLiteSink`'s required `database` is the one exception.
   The tables show the destination-defining arguments only; sinks that retry also take `max_retries`.
 - **Ownership.** A resource the sink opens itself is closed on `shutdown()`; an injected one is left
   open for you to manage.
@@ -955,7 +960,7 @@ Write-only inserts (querying is the downstream tool's job); each needs its own e
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
 | `MongoDBSink` | `log_foundry.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…", socket_timeout=None, server_selection_timeout=None)` — `pymongo`'s `socketTimeoutMS` default is `None`, so a read that never returns holds the drain thread; the sink applies `DEFAULT_SOCKET_TIMEOUT` (30 s) only when neither the keyword nor the URI query names one |
-| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False, connect_timeout=5)` — JSONB `event` column + extracted columns. Reconnects an **owned** connection the server has closed; a reconnect the server refuses — a wrong password, an unknown role or database, recognised from libpq's English message — fails at once rather than spending the retries; a `connection=` you inject is never reopened. `connect_timeout` is passed to libpq explicitly, so it **overrides** any `connect_timeout` in your DSN |
+| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False, connect_timeout=None)` — `None` means 5 s; JSONB `event` column + extracted columns. Reconnects an **owned** connection the server has closed; a reconnect the server refuses — a wrong password, an unknown role or database, recognised from libpq's English message — fails at once rather than spending the retries; a `connection=` you inject is never reopened. `connect_timeout` is passed to libpq explicitly, so it **overrides** any `connect_timeout` in your DSN |
 | `ClickHouseSink` | `log_foundry.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False, chunk_size=1000, send_receive_timeout=None)` — MergeTree, columnar insert; the driver's own 300 s `send_receive_timeout` is finite so it is left alone, and forwarded only when you set it |
 
 `PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set

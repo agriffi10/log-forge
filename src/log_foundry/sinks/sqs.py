@@ -10,12 +10,15 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from log_foundry import _diag
+from log_foundry.sinks._args import require_callable
+from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -47,11 +50,15 @@ class _Prepared(NamedTuple):
       body: The serialized event.
       group_id: The resolved ``MessageGroupId``, or ``None``.
       dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
+      size: The costed bytes: the body's UTF-8 length plus, on a FIFO queue, both ids'. Carried
+        so :func:`~log_foundry.sinks._chunk.chunk_items` reads the cost rather than recomputing
+        it (SPEC-071 FR-004).
     """
 
     body: str
     group_id: str | None
     dedup_id: str | None
+    size: int
 
 
 def _bounded(raw: str, fallback: str) -> str:
@@ -142,19 +149,26 @@ class SQSSink:
           None.
 
         Raises:
-          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), or if ``message_group_id``
+            is not a ``str``, a callable or ``None``, or ``message_deduplication_id`` is neither
+            callable nor ``None`` (SPEC-071 FR-005). Both are judged on a standard queue too,
+            which never reads either: the value is outside the declared type.
           ValueError: If a constant group id is blank.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
+        owner = type(self).__name__
+        require_callable(message_group_id, "message_group_id", owner, text=True)
+        require_callable(message_deduplication_id, "message_deduplication_id", owner)
         self.max_retries = floor_count(max_retries, 0, "max_retries", "SQSSink")
-        if isinstance(message_group_id, str) and not message_group_id.strip():
+        if (
+            issubclass(type(message_group_id), str)
+            and not _diag._STR_STR(cast("str", message_group_id)).strip()
+        ):
             raise ValueError(
                 "message_group_id must be a non-empty string; pass None to group by trace_id"
             )
         if client is None:
-            import boto3  # type: ignore[import-not-found]
-
-            client = boto3.client("sqs")
+            client = import_extra("boto3", "aws").client("sqs")
         self.queue_url = queue_url
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None
@@ -255,8 +269,11 @@ class SQSSink:
         """Resolves one event's ``MessageGroupId`` (SPEC-016 FR-002).
 
         A constant is used as given, a callable is asked, and otherwise the event's own
-        ``trace_id`` groups it. Every route is bounded, so a caller's callable returning an empty
-        string cannot put an empty parameter on the wire.
+        ``trace_id`` groups it. The constant is told apart by its real type and read through
+        ``str.__str__`` (SPEC-071 FR-005), so a callable whose ``__class__`` claims ``str`` is
+        still asked, and a ``str`` subclass's own ``strip`` never runs per event. Every route is
+        bounded, so a caller's callable returning an empty string cannot put an empty parameter on
+        the wire.
 
         Args:
           event: The event being sent.
@@ -269,10 +286,10 @@ class SQSSink:
             into a drop of this one event (SPEC-058 FR-004).
         """
         source = self.message_group_id
-        if isinstance(source, str):
-            raw = source
+        if issubclass(type(source), str):
+            raw = _diag._STR_STR(cast("str", source))
         elif source is not None:
-            raw = source(event)
+            raw = cast("Callable[[dict[str, object]], str]", source)(event)
         else:
             raw = str(event.get("trace_id", ""))
         return _bounded(raw, DEFAULT_GROUP_ID)
@@ -329,6 +346,11 @@ class SQSSink:
     ) -> list[list[_Prepared]]:
         """Splits the batch into sends within both the entry-count and byte limits.
 
+        The boundaries are :func:`~log_foundry.sinks._chunk.chunk_items`' (SPEC-071 FR-004), the
+        rule this method used to carry inline: every per-event drop is decided first, so an event
+        that can never fit is filtered out before any boundary is drawn, and the chunks are
+        materialised as a list, so all of them are known before the first send.
+
         Each event is serialized once, and on a FIFO queue its ids are resolved once here too
         (SPEC-016 FR-005), because they travel in the same request. An entry whose costed size
         exceeds the limit can never fit a message, so it is dropped with a counted warning
@@ -362,9 +384,7 @@ class SQSSink:
           Exception: The first id callable's own exception, when every event's id callable
             failed and nothing reached a chunk or was dropped as oversized or unencodable.
         """
-        chunks: list[list[_Prepared]] = []
-        current: list[_Prepared] = []
-        current_bytes = 0
+        prepared: list[_Prepared] = []
         oversized: list[int] = []
         failures = 0
         first: Exception | None = None
@@ -384,16 +404,15 @@ class SQSSink:
             if size > self.MAX_BYTES:
                 oversized.append(size)
                 continue
-            if current and (
-                len(current) >= self.MAX_BATCH or current_bytes + size > self.MAX_BYTES
-            ):
-                chunks.append(current)
-                current = []
-                current_bytes = 0
-            current.append(_Prepared(body, group_id, dedup_id))
-            current_bytes += size
-        if current:
-            chunks.append(current)
+            prepared.append(_Prepared(body, group_id, dedup_id, size))
+        chunks = list(
+            chunk_items(
+                prepared,
+                max_count=self.MAX_BATCH,
+                max_bytes=self.MAX_BYTES,
+                size_of=lambda item: item.size,
+            )
+        )
         if first is not None:
             if not chunks and not oversized and not unencodable:
                 raise first

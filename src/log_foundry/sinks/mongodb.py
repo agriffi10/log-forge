@@ -10,9 +10,11 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from log_foundry import _diag
+from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events, repair_bson
+from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -174,30 +176,28 @@ class MongoDBSink:
 
         Raises:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
-          ValueError: If either bound cannot bound anything, or if one is passed alongside
-            ``client=``, which is already connected and cannot consume it — SPEC-043's rule that
-            an argument no backend can use is an error rather than a silent ignore.
+          ValueError: If either bound cannot bound anything, or if ``uri`` or a bound is passed
+            alongside ``client=``, which is already connected and cannot consume it — SPEC-043's
+            rule that an argument no backend can use is an error rather than a silent ignore
+            (``uri`` since SPEC-071 FR-003).
           ImportError: If the ``mongo`` extra is not installed.
         """
         self.max_retries = floor_count(max_retries, 0, "max_retries", "MongoDBSink")
-        supplied = sorted(
-            name
-            for name, value in (
-                ("socket_timeout", socket_timeout),
-                ("server_selection_timeout", server_selection_timeout),
-            )
-            if value is not None
+        refuse_with_injected(
+            "MongoDBSink",
+            "client",
+            client,
+            {
+                "uri": uri,
+                "socket_timeout": socket_timeout,
+                "server_selection_timeout": server_selection_timeout,
+            },
         )
-        if client is not None and supplied:
-            raise ValueError(
-                f"MongoDBSink cannot apply {', '.join(supplied)} to an injected client, which is "
-                "already connected; pass them where the client is built, or drop client="
-            )
         self._owns_client = client is None
         if client is None:
-            from pymongo import MongoClient  # type: ignore[import-not-found]
-
-            client = MongoClient(uri, **_client_bounds(uri, socket_timeout, server_selection_timeout))
+            client = import_extra("pymongo", "mongo").MongoClient(
+                uri, **_client_bounds(uri, socket_timeout, server_selection_timeout)
+            )
         self._client = client
         self._collection = client[database][collection]
         self.log_foundry_stop_signal: threading.Event | None = None
@@ -406,9 +406,7 @@ class MongoDBSink:
             return
         encode = None
         try:
-            import bson  # type: ignore[import-not-found]
-
-            found = getattr(bson, "encode", None)
+            found = getattr(import_extra("bson", "mongo"), "encode", None)
         except Exception:
             found = None
         if callable(found):

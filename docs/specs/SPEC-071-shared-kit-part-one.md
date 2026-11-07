@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-071
 title: "Shared Kit, Part One: import_extra, One Injected-Client Refusal and the Chunker Rule"
 description: "Moves the sinks' lazy extra imports, their injected-client refusal and SQS's chunk boundary into shared helpers, refuses the build options eight sinks silently ignore beside an injected client, routes configure()'s and the sinks' type doors on the real type, and pins first the rosters those moves can reach."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-041, SPEC-043, SPEC-049, SPEC-059, SPEC-061, SPEC-065, SPEC-066, SPEC-080]
 arc: stability-redesign
 arc_order: 3
@@ -336,6 +336,12 @@ batch, which keeps the patch seam the tests use working.
 `tests/test_sink_retry.py:402` (`_one_of_each_retrying_sink`) and
 `tests/test_sink_concurrency.py:1554` build the sink with a fake producer and no patch, so both are
 edited to patch `_event_data_cls` first, and so is any other test the suite shows doing the same.
+On `2368ade3` that is also `tests/test_numeric_doors.py`, whose setup alone changes at four sites,
+no assertion or message: an autouse fixture patches `_event_data_cls` for its two Azure
+constructions; its Pub/Sub stub also registers `google.cloud.pubsub_v1`, since the module is now
+imported whole rather than read off `google.cloud`; and its two Postgres floor cases build through
+`dsn=` over the file's own `psycopg` stub, since FR-003 refuses `connect_timeout` beside
+`connection=`.
 
 **What the removed comments leave behind.** The `# type: ignore[import-not-found]` comments go,
 since `import_module` returns a module whose attributes are untyped. No import statement for
@@ -403,7 +409,8 @@ is `import of boto3 halted; None in sys.modules`.
 - [ ] `_population()["marker"]` still equals FR-001's pinned set, and the integration roster's
       floors, `VERIFIED` and `UNVERIFIED` are byte-identical.
 - [ ] The only existing tests edited are the integration roster's derivation, the deleted
-      `test_the_mypy_accommodation_is_in_place`, and the Azure constructions named above.
+      `test_the_mypy_accommodation_is_in_place`, the Azure constructions named above, and the
+      four setup sites of `tests/test_numeric_doors.py` named above.
 - [ ] `MissingExtraError` is in no `__all__`, and `tests/test_public_surface.py` and
       `tests/typed_consumer/` pass unedited.
 - [ ] Serves invariants 10, 11 and 13. No public name is added; the message names an extra and a
@@ -612,7 +619,8 @@ floor-side comparison `TypeError` (*Out of Scope*), now for a lying value too.
 name. An honest value's message is byte-identical, because for a type with no metaclass `__name__`
 property the stored name *is* `type(value).__name__`. So the existing message tests
 (`tests/test_config.py`, `tests/test_numeric_doors.py`, `tests/test_sink_retry.py`,
-`tests/test_sinks_otlp.py`, `tests/test_decorator_sync.py`) pass unedited, and so does
+`tests/test_sinks_otlp.py`, `tests/test_decorator_sync.py`) pass with their assertions unedited
+(`test_numeric_doors.py`'s four setup sites change under FR-002 and FR-003), and so does
 `tests/test_numeric_door_roster.py`, whose judges keep their names.
 
 **The twin paths (invariant 6).**
@@ -740,7 +748,7 @@ is outside the declared type, so no type-checked caller breaks.
       constructs `CallbackSink` or `TransformSink` pass unedited.
 - [ ] For honest values, `None`, an exact value, a `bool` and a real subclass are accepted and
       normalised as at `4fbfd60`, and a wrong type gets byte-identical text. The five message test
-      files and `tests/test_numeric_door_roster.py` pass unedited.
+      files pass with no assertion edited, and `tests/test_numeric_door_roster.py` passes unedited.
 - [ ] `tests/test_type_door_roster.py`'s corpus reports a door written with `isinstance`, one naming
       through `type(v).__name__`, one naming through `v.__class__.__name__`, and a door whose
       same-module helper tests `p` with `isinstance`.
@@ -940,3 +948,7 @@ docs/release-notes/v1.2.0.md
     at `require_callable`.
   - The API example names the instance's class, not its metaclass.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- **2026-11-07: answered the build plan's re-derivation on `2368ade3`.** `tests/test_numeric_doors.py`
+  cannot pass byte-identical under FR-002's constructor-time Azure resolution, the whole-module
+  Pub/Sub import and FR-003's `connect_timeout` refusal, so its four setup sites join the edit list;
+  no assertion or message in it changes.

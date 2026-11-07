@@ -13,10 +13,11 @@ import urllib.request
 from base64 import b64encode
 from collections.abc import Callable  # noqa: TC003
 from dataclasses import dataclass
-from typing import Any, NoReturn, TypedDict
+from typing import Any, NoReturn, TypedDict, cast
 from urllib.parse import unquote, unwrap, urlparse
 
 from log_foundry import _diag
+from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._classify import is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import (
@@ -843,7 +844,7 @@ def _valid_auth(
       ValueError: If a bearer token contains ``CR`` or ``LF``, or ``http.client`` cannot send the
         ``Authorization`` header either form builds.
     """
-    if isinstance(auth, str) and any(bad in auth for bad in _CRLF):
+    if issubclass(type(auth), str) and any(bad in cast("str", auth) for bad in _CRLF):
         raise ValueError(f"{owner} auth token must not contain CR or LF")
     if auth is not None and "Authorization" not in headers:
         failure = _unsendable_auth(auth)
@@ -890,9 +891,9 @@ def _authorization(auth: str | tuple[str, str]) -> str:
     Raises:
       UnicodeEncodeError: If the pair cannot be encoded as UTF-8 for base64.
     """
-    if isinstance(auth, str):
+    if issubclass(type(auth), str):
         return f"Bearer {auth}"
-    user, password = auth
+    user, password = cast("tuple[str, str]", auth)
     token = b64encode(f"{user}:{password}".encode()).decode("ascii")
     return f"Basic {token}"
 
@@ -1058,7 +1059,8 @@ class HTTPSink:
         Raises:
           TypeError: If ``max_retries`` or a supplied ``max_batch_count`` is not an ``int``, or
             ``max_retry_after`` is not an ``int`` or ``float`` (SPEC-066), the message carrying the
-            subclass's own name as the ``ValueError`` does.
+            subclass's own name as the ``ValueError`` does; or if ``opener`` is neither callable
+            nor ``None`` (SPEC-071 FR-005), judged first.
           ValueError: If the URL carries a user or password before its host or an ``@`` anywhere
             else — write one that belongs in a path or query as ``%40`` — its scheme is not
             ``http`` or ``https``, it names no host or no usable port, or ``http.client`` cannot
@@ -1069,6 +1071,7 @@ class HTTPSink:
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
             FR-004), and inherited by every subclass, whose own name the message carries.
         """
+        require_callable(opener, "opener", type(self).__name__)
         self.url = _valid_url(url, type(self).__name__, credentials=self._CREDENTIALS)
         if body_format not in _BODY_FORMATS:
             raise ValueError(

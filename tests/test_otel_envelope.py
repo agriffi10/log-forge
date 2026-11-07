@@ -514,19 +514,6 @@ def test_the_dependency_is_dev_only_and_the_library_never_imports_it() -> None:
     assert result.stdout.strip() == "[]", result.stdout
 
 
-def test_the_mypy_accommodation_is_in_place() -> None:
-    """AC-12's static half: the ignore codes on the one site and the override in pyproject."""
-    pubsub = (_ROOT / "src/log_foundry/sinks/pubsub.py").read_text(encoding="utf-8")
-    assert (
-        "from google.cloud import pubsub_v1  # type: ignore[import-not-found, unused-ignore]"
-        in pubsub
-    )
-    with (_ROOT / "pyproject.toml").open("rb") as handle:
-        overrides = tomllib.load(handle)["tool"]["mypy"]["overrides"]
-    assert {"module": "google.cloud.*", "ignore_missing_imports": True} in overrides
-    assert sum(1 for o in overrides if o["module"] == "google.cloud.*") == 1
-
-
 def test_the_envelope_parts_are_deep_copies_of_nothing() -> None:
     """``request_body`` never mutates its input pairs."""
     pairs = [(_KEY, "{}"), ((None, None, None), "{}")]

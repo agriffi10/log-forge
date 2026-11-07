@@ -118,8 +118,11 @@ class OTLPSink(HTTPSink):
             Every other refusal is inherited.
         """
         owner = type(self).__name__
-        if not isinstance(endpoint, str):
-            raise TypeError(f"{owner} endpoint must be a str, not {type(endpoint).__name__}")
+        if not issubclass(type(endpoint), str):
+            raise TypeError(
+                f"{owner} endpoint must be a str, "
+                f"not {_diag._STR_STR(_diag._STORED_NAME(type(endpoint)))}"
+            )
         _valid_url(endpoint, owner, name="endpoint")
         method = http_kwargs.get("method", "POST")
         if method != "POST":
