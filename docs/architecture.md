@@ -884,22 +884,6 @@ close it.
 
 ### Open
 
-- **A caller's `headers=` silently replaces a platform sink's own credential header** (HTTP auth
-  fix's build; invariant 13's "no argument is silently ignored because another was given").
-  `merge_headers` lays the caller's headers over the sink's own, and `urllib` sends one value per
-  folded name, the last written, so a caller header naming the sink's credential header in any
-  case is sent instead of the required argument: Splunk's `Authorization: Splunk <token>`,
-  Datadog's `DD-API-KEY`, New Relic's `Api-Key`, Honeycomb's `X-Honeycomb-Team`. Reproduced at
-  `7845f66f` with each name in its own, lower and upper case: every one constructs and sends only
-  the caller's value, and the `token` or `api_key` is never sent. `merge_headers` documents
-  "caller winning", but that is the code's reasoning, not an exception invariant 13 records. A side
-  effect: `SplunkHECSink`'s refusal of `auth=` says the sink sends its token as the `Authorization`
-  header even when the caller's own header has replaced that token. The same family: two caller
-  header names that fold to one wire name (`{"x-a": "1", "X-A": "2"}`, or `authorization` beside
-  `Authorization`) construct and send only the last value, silently; reproduced at `a8d87119`.
-  **Closed by** deciding which header wins for both together: refusing a caller header that names
-  the sink's own credential header, and two caller names that fold together, in any case, or
-  recording the precedence as an exception to invariant 13.
 - **An empty `auth` token or pair is accepted, and sends an empty credential** (HTTP auth fix's
   frame-2 review; invariant 13). `HTTPSink(url, auth="")` sends `Authorization: Bearer ` and
   `auth=("", "")` sends `Basic Og==` (reproduced at `a8d87119`), so against an endpoint that
@@ -1094,15 +1078,27 @@ close it.
 
 ### Resolved
 
+- ~~**A caller's `headers=` silently replaces a platform sink's own credential header**~~ (HTTP auth
+  fix's build; invariant 13) → **closed by the HTTP auth fix (no spec)**, by refusal. A caller
+  name folding to Splunk's `Authorization`, Datadog's `DD-API-KEY`, New Relic's `Api-Key` or
+  Honeycomb's `X-Honeycomb-Team`, in any case, used to be sent instead of the required `token` or
+  `api_key`; `merge_headers` now refuses it at construction, naming the argument it would replace
+  and no value, and the set is every key of the base each sink hands it, derived by an AST roster.
+  So `SplunkHECSink`'s `auth=` refusal, which says the sink sends its token as `Authorization`, is
+  true in every case. Its twin, two caller names folding to one wire name (`{"x-a": "1", "X-A":
+  "2"}`), used to send only the last and is refused by `_valid_headers`. Guard:
+  `tests/test_sinks_http_header_collisions.py`. The reasoning: *A caller header that would
+  silently replace another is refused*, in `docs/decisions/sink-delivery/`.
 - ~~**An `auth` that unpacks only once is accepted at construction, and every `emit` then
   fails**~~ (SPEC-071 frame-2 review; invariant 13) → **closed by the HTTP auth fix (no spec)**.
   Credentials are copied once, at construction, as exact `str` (`_diag._STR_STR`; a pair unpacked
   once by `http._copied_pair`), and the `Authorization` value is built and checked from the copy
   then, once; every request writes that stored value, so no caller code runs per request and
-  `HTTPSink(url, auth=iter(("u", "p")))` sends Basic auth on every one. The unpack's refusals keep
-  their messages. A pair outside `tuple[str, str]` used to construct and send whatever its unpack
-  gave (a set's hash order, a mapping's keys, a `bytes` half's `repr`); a `set`, `frozenset` or
-  mapping, or a half that is not a `str`, is now a `ValueError` naming only the real types.
+  `HTTPSink(url, auth=iter(("u", "p")))` sends Basic auth on every one. A pair outside
+  `tuple[str, str]` used to construct and send whatever its unpack gave (a set's hash order, a
+  mapping's keys, a `bytes` half's `repr`). A `set`, `frozenset` or mapping is now refused by real
+  type before it is unpacked, and a half that is not a `str` after, each a `ValueError` naming only
+  the real types; every other value the unpack refused keeps its message.
 - ~~**`auth=` beside a caller's `Authorization` header is silently ignored**~~ (SPEC-071 frame-2
   review; invariant 13) → **closed by the HTTP auth fix (no spec)**, by refusal. Only the
   exact-case spelling won; under any other case `auth` won and the header was dropped, since

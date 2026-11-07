@@ -41,18 +41,18 @@ too.
 **Sites routed the same way that are not doors.** The HTTP sinks' `auth` (`http._valid_auth`,
 `http._authorization`) now tests `issubclass(type(auth), str)`, so a value that is not really a
 `str` takes the pair route without its `__class__` or `__contains__` running. That route already
-turned a value that cannot be unpacked as a pair into `ValueError("<owner> auth cannot be sent
-over HTTP (TypeError)")`, naming `auth`. Since the HTTP auth fix, what it unpacks is judged by
-real type too: a `set`, `frozenset` or mapping, or a half that is not a `str`, is a `ValueError`
-naming the real types through the stored name, and each half is copied with `_diag._STR_STR`, so
-a value claiming `str` that also defines `__iter__` is sent as Basic auth only when it yields two
-real `str`, its `__iter__` run once, at construction. A token is copied the same way, so no
-`str`-subclass method runs on a request. A one-shot iterable `auth`, which this spec left passing
-construction and failing every `emit`, is now unpacked once at construction (*`auth` beside an
-`Authorization` header is refused, never resolved by precedence*). `SQSSink`'s
-constant group id is told apart by real type and read through `str.__str__`, at the constructor and
-per event, so a callable claiming `str` is still asked and a `str` subclass's own `strip` never
-runs.
+turned a value that cannot be unpacked as a pair into `ValueError("<owner> auth cannot be sent over
+HTTP (TypeError)")`, naming `auth`. Since the HTTP auth fix the pair is judged by real type too: a
+`set`, `frozenset` or mapping before it is unpacked, so none of its methods runs, and a half that is
+not a `str` after, each a `ValueError` naming the real types through the stored name; each half is
+copied with `_diag._STR_STR`, so a value claiming `str` that also defines `__iter__` is sent as
+Basic auth only when it yields two real `str`, its `__iter__` run once, at construction. A token is
+copied the same way, so no `str`-subclass method runs on a request. A one-shot iterable `auth`,
+which this spec left passing construction and failing every `emit`, is now unpacked once at
+construction (*`auth` beside an `Authorization` header is refused, never resolved by precedence*).
+`SQSSink`'s constant group id is told apart by real type and read through `str.__str__`, at the
+constructor and per event, so a callable claiming `str` is still asked and a `str` subclass's own
+`strip` never runs.
 
 **The guard.** `tests/test_type_door_roster.py` derives from the AST of `src/log_foundry/**/*.py`.
 A door is a function raising a `TypeError` that names, through the stored name, the type of one of
@@ -95,8 +95,8 @@ named raises and the one multiset. (SPEC-071, invariants 13 and 6)
 ### 2026-11-07
 
 - **Refined (HTTP auth fix, no spec).** `auth` is copied with `_diag._STR_STR`, the token whole and
-  each half of a pair, and what a pair unpacks into is refused by real type outside
-  `tuple[str, str]` — a `set`, `frozenset` or mapping, or a non-`str` half — with a `ValueError`,
+  each half of a pair, and a pair outside `tuple[str, str]` is refused by real type — a `set`,
+  `frozenset` or mapping before it is unpacked, a non-`str` half after — with a `ValueError`,
   as every `auth` refusal is, naming the types through the stored name. The one-shot `auth` this
   entry recorded as open is closed: the pair is copied once at construction. The sentences saying
   so now point to that decision.

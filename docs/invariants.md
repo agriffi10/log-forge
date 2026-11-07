@@ -483,5 +483,8 @@ other than through `import_extra` (SPEC-071); `tests/test_sinks_http_auth.py` fo
 beside an `Authorization` header in any case, a one-shot `auth` copied once and sent on every
 request, a pair that is not two `str` refused, and its scan failing naming any `extra_headers=` key
 in `src/` that folds to `Authorization`; `tests/test_sinks_http_header_names.py` for a header name
-holding whitespace, and `tests/test_sinks_http_header_merge.py` for a platform sink's non-`dict`
-`headers=` and a `Content-Encoding` in any case (the HTTP auth fix, no spec).
+holding whitespace, `tests/test_sinks_http_header_merge.py` for a non-mapping `headers=` refused
+and a platform sink's non-`dict` one sent, and a `Content-Encoding` found in any case, and
+`tests/test_sinks_http_header_collisions.py` for a caller header naming a platform sink's own
+credential header or two names folding to one, with its rosters deriving the credential headers
+and failing naming a header set by a route they cannot see (the HTTP auth fix, no spec).
