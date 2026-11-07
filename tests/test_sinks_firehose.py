@@ -292,8 +292,12 @@ def test_a_record_between_the_two_ceilings_is_dropped_rather_than_sent_to_be_rej
     assert none.calls == []
 
 
-class _Boom(Exception):
-    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError."""
+class _Boom(ConnectionError):
+    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError.
+
+    A ``ConnectionError`` since SPEC-070 FR-002, so it is a class the AWS predicate retries, as
+    an unreachable endpoint is: a bare ``Exception`` now fails at its first attempt.
+    """
 
 
 class _Raising:
