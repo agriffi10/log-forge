@@ -502,8 +502,10 @@ def _counters_reach(value: object, kind: type | None) -> Any | None:
     child. This reads the one attribute :data:`_COUNTERS_ATTRIBUTE` with
     ``sinks.base._static_value`` — no property, ``__getattr__``, ``__getattribute__``,
     descriptor ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``,
-    ``__hash__``) of the third-party object runs — resolving a ``__slots__`` member through its
-    builtin descriptor, and hands back the counters only when they are exactly ``SinkCounters``,
+    ``__hash__``) of the third-party object runs, the one residue being a hostile ``str``-subclass
+    namespace key's ``__eq__`` on a hash collision (see ``_class_member``) — resolving a
+    ``__slots__`` member through its builtin descriptor, and hands back the counters only when
+    they are exactly ``SinkCounters``,
     which is this package's own class and so is then walked as any owned holder is. Nothing else of
     the value's namespace is read, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
 

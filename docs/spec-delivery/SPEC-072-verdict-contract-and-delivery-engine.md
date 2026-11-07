@@ -64,3 +64,16 @@
 - `emit_via_deliver` is private (`sinks/_engine.py`), yet the public `Sink` docstring points
   third-party authors at it as their engine sink's `emit`; whether to make it public is raised as a
   follow-up for the `stability-redesign` arc.
+- **A registry of live `SinkCounters`** (SPEC-079). The fork reach finds counters one level from
+  a value the walk declines, so an engine sink inside a third-party wrapper, or a third-party
+  container-subclass sink, is not repaired, and a child whose parent held that lock at the fork
+  hangs on its first commit (invariant 12's recorded exception). A registry the walk reads instead
+  of searching would remove the boundary.
+- **Two drafts still prescribe `inspect.getattr_static`** where this build uses
+  `sinks.base._static_value`, which runs no metaclass `__eq__`/`__hash__`: SPEC-075 (about line
+  143, the wrapper's read of the inner sink's counters) and SPEC-079 (about lines 242-243, the
+  walk's counters read). Each should name the shared reader when it is next revised.
+- **A wrapper's stop signal is read statically.** `stop_signal_of` reads
+  `log_foundry_stop_signal` with the static read, so a wrapper that keeps it behind a property —
+  `FilteringSink` and `MultiSink` do — reads as having none, and its engine run would wait with
+  `time.sleep`. SPEC-075 must say how a wrapper's signal reaches the engine.

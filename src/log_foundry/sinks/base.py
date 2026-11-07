@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import types
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -310,8 +311,11 @@ def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[obj
     """Finds ``name`` in a class's own MRO namespaces, returning the value and its MRO index.
 
     The MRO and each namespace are read through the unbound ``type`` accessors, so no metaclass
-    hook runs — no ``__mro__`` or ``__dict__`` property, and no ``__eq__`` or ``__hash__``,
-    since nothing here hashes or compares a class. With ``skip_none`` a ``None`` found in a
+    hook runs — no ``__mro__`` or ``__dict__`` property, and no metaclass ``__eq__`` or
+    ``__hash__``, since nothing here hashes or compares a class. One residue is accepted rather
+    than closed: the name is looked up in each namespace's dict, so on a hash collision a key that
+    is a ``str`` subclass with its own ``__eq__`` — a key only a deliberately hostile class
+    builder can plant — runs that ``__eq__``. With ``skip_none`` a ``None`` found in a
     namespace is passed over and the walk goes on, which is how SPEC-072's adapter reads a
     ``deliver = None`` opt-out: "do not offer", not "do not have".
 
@@ -337,6 +341,36 @@ def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[obj
     return None
 
 
+def _instance_dict(obj: object) -> dict[str, object] | None:
+    """Returns an object's own ``__dict__`` through a builtin getset descriptor, or ``None``.
+
+    The descriptor is the first exact ``GetSetDescriptorType`` named ``__dict__`` along the MRO
+    that applies to the object, called through its builtin ``__get__``, so a ``__dict__``
+    property or any other hook never runs. One that does not apply — a getset borrowed from an
+    unrelated class — is passed over. ``None`` means the dict cannot be read this way: there is
+    none (a slotted or builtin object), or the class shadows ``__dict__`` where it defines it, so
+    no builtin descriptor exists for it. The caller treats that as "no instance attribute".
+
+    Args:
+      obj: The object.
+
+    Returns:
+      The instance dict, or ``None``.
+
+    Raises:
+      Exception: Whatever an unusual class object raises while its MRO is read; callers guard.
+    """
+    cls = type(obj)
+    for klass in _MRO(cls):
+        holder = _NAMESPACE(klass).get("__dict__")
+        if type(holder) is not types.GetSetDescriptorType:
+            continue
+        with contextlib.suppress(Exception):
+            own = _GETSET_GET(holder, obj, cls)
+            return cast("dict[str, object]", own) if issubclass(type(own), dict) else None
+    return None
+
+
 def _static_value(obj: object, name: str) -> object:
     """Reads one attribute the way ordinary access finds it, running none of the object's code.
 
@@ -346,15 +380,18 @@ def _static_value(obj: object, name: str) -> object:
     class namespaces through ``type``'s unbound ones, the instance dict through the class's own
     ``__dict__`` getset descriptor and its builtin ``__get__``, a ``__slots__`` member through its
     builtin ``__get__`` — so no property, ``__getattr__``, ``__getattribute__``, descriptor
-    ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``, ``__hash__``) runs.
+    ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``, ``__hash__``) runs; the
+    one residue, a hostile ``str``-subclass namespace key's ``__eq__`` on a hash collision, is
+    :func:`_class_member`'s.
     ``inspect.getattr_static`` was used here first and is not this: its shadowed-``__dict__``
     check is ``lru_cache``-wrapped, so it hashes the class and can compare it, which runs a
     metaclass's ``__hash__`` and ``__eq__`` (SPEC-072's first diff review, measured on 3.12 and
     3.13). A slot that is unset reads as absent; any other descriptor is returned as found, so a
-    property reads as the property object and is refused by the caller's type test. A class
-    whose ``__dict__`` is shadowed by something other than the builtin getset descriptor has its
-    instance dict read through the first builtin one further along the MRO, and not at all when
-    there is none.
+    property reads as the property object and is refused by the caller's type test. The instance
+    dict is :func:`_instance_dict`'s; when it cannot be read, or reading the name in it raises,
+    the class's own member is still returned, so a class-level attribute is found even on a class
+    that shadows ``__dict__``. **The limit:** an instance attribute behind a ``__dict__`` the
+    class shadows where it defines it is not seen.
 
     Args:
       obj: The object to read.
@@ -375,17 +412,16 @@ def _static_value(obj: object, name: str) -> object:
                 return _MEMBER_GET(cast("types.MemberDescriptorType", found[0]), obj, cls)
             if _class_member(kind, "__set__") or _class_member(kind, "__delete__"):
                 return found[0]
-        for klass in _MRO(cls):
-            holder = _NAMESPACE(klass).get("__dict__")
-            if type(holder) is types.GetSetDescriptorType:
-                own = _GETSET_GET(holder, obj, cls)
-                if issubclass(type(own), dict):
-                    value = dict.get(own, name, _ABSENT)
-                    if value is not _ABSENT:
-                        return value
-                break
     except Exception:
         return _ABSENT
+    try:
+        own = _instance_dict(obj)
+        if own is not None:
+            value = dict.get(own, name, _ABSENT)
+            if value is not _ABSENT:
+                return value
+    except Exception:
+        pass
     return _ABSENT if found is None else found[0]
 
 

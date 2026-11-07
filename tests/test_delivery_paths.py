@@ -748,3 +748,44 @@ def test_the_api_reports_an_orphan_loss_by_count_only(capsys: pytest.CaptureFixt
         err,
     ), err
     assert "CANARY" not in err
+
+
+# --- FR-001: an emit set on the instance wins, as ordinary lookup would (frame 2, M1) ------
+
+
+def test_an_instance_emit_override_runs_on_both_paths() -> None:
+    """A scrubbing ``sink.emit = scrub`` runs on the worker and orphan paths; no secret lands."""
+    sink = Scripted([A])
+    original = sink.emit
+    scrubbed: list[int] = []
+
+    def scrub(batch: list[dict[str, object]]) -> None:
+        scrubbed.append(len(batch))
+        original([{k: v for k, v in event.items() if k != "fields"} for event in batch])
+
+    sink.emit = scrub  # type: ignore[method-assign]
+
+    @log_foundry.trace
+    def work() -> None:
+        log_foundry.info("in", secret="CANARY-card")
+
+    log_foundry.configure(service="paths", sink=sink)
+    work()
+    assert log_foundry.flush(timeout=10.0)
+    log_foundry.info("orphan", secret="CANARY-card")
+    assert len(scrubbed) == 2, "the override ran once per path"
+    delivered = [event for round_ in sink.rounds for event in round_]
+    assert delivered, "the scrubbed events still reached deliver through the original emit"
+    assert not [e for e in delivered if "CANARY-card" in repr(e)]
+
+
+def test_a_patched_instance_emit_records_the_call() -> None:
+    """``mock.patch.object(sink, "emit")`` on an engine sink sees the worker's call."""
+    from unittest import mock
+
+    sink = Scripted([A])
+    worker = _worker(sink)
+    with mock.patch.object(sink, "emit") as patched:
+        assert _drained(worker, events(2))
+    assert patched.call_count == 1
+    assert sink.calls == 0, "deliver was not offered past the patched emit"

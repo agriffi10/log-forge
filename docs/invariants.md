@@ -430,10 +430,13 @@ held at fork time stays held in the child. The walk enters only this package's o
 of your own is repaired only if it subclasses `Sink` or a shipped sink — with one reach past that
 boundary (SPEC-072 FR-003): a value the walk would not enter, such as a structurally typed sink the
 worker holds, is read for the one attribute `log_foundry_counters`, statically, and an exact
-`SinkCounters` there has its lock replaced, so a child never hangs on an engine sink's counters.
-The reach is one level deep: an engine sink held inside a wrapper of your own, or a sink that is
-itself a container subclass of your own, is not reached, and nothing else of a foreign namespace
-is read.
+`SinkCounters` there has its lock replaced, so a child does not hang on a reached engine sink's
+counters. The reach is one level deep: an engine sink held inside a wrapper of your own, or a sink
+that is itself a container subclass of your own, is not reached, and nothing else of a foreign
+namespace is read. **An unreached shape whose counters' lock a parent thread held at the fork
+hangs the child's first run that commits into it:** an `info()` on the orphan path blocks the
+caller, and on the worker path the drain thread blocks, so `flush()` times out. A registry of live
+`SinkCounters` the walk reads, rather than finds, is SPEC-079's follow-up.
 *Guarded:* `tests/test_fork_lifecycle.py` (including an engine sink's counters, SPEC-072),
 `tests/test_sink_ownership.py`,
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`).

@@ -1071,3 +1071,56 @@ def test_a_shadowed_dict_is_read_through_the_builtin_descriptor_further_along() 
 
     assert _static_value(obj, "x") == 7
     assert ran == []
+
+
+@pytest.mark.parametrize("shape", ["property-dict", "foreign-getset"])
+def test_a_class_attribute_survives_an_unreadable_instance_dict(shape: str) -> None:
+    """Frame 2 m1: a class-level ``log_foundry_counters`` is found though the dict cannot be read.
+
+    ``property-dict`` shadows ``__dict__`` where the class defines it, so no builtin getset exists;
+    ``foreign-getset`` borrows an unrelated class's, whose ``__get__`` refuses this instance. An
+    instance attribute behind the property is the recorded limit: it is not seen.
+    """
+    from log_foundry.sinks.base import _ABSENT, _static_value
+    from log_foundry.sinks.verdict import read_deliver
+
+    ran: list[str] = []
+    shared = SinkCounters()
+    if shape == "property-dict":
+        dict_slot: object = property(lambda self: ran.append("p") or {})
+    else:
+        dict_slot = type("Unrelated", (), {}).__dict__["__dict__"]
+
+    def deliver(self: object, batch: list[dict[str, object]]) -> Verdict:
+        return Verdict.uniform(A, len(batch))
+
+    cls = type(
+        "Shadowed",
+        (),
+        {
+            "__dict__": dict_slot,
+            "log_foundry_counters": shared,
+            "deliver": deliver,
+            "emit": lambda self, batch: None,
+        },
+    )
+    obj = cls()
+    assert _static_value(obj, "log_foundry_counters") is shared
+    assert read_deliver(obj) is not None
+    if shape == "property-dict":
+        object.__setattr__(obj, "hidden", 1)
+        assert _static_value(obj, "hidden") is _ABSENT, "the limit FR-001 records"
+    assert ran == []
+
+
+def test_read_deliver_refuses_an_instance_with_its_own_emit() -> None:
+    """Frame 2 M1: an ``emit`` in the instance dict wins ordinary lookup, so nothing is offered."""
+    from log_foundry.sinks.verdict import read_deliver
+
+    sink = Scripted([A])
+    assert read_deliver(sink) is not None
+    sink.emit = lambda batch: None  # type: ignore[method-assign]
+    assert read_deliver(sink) is None
+    assert run_delivery(sink, events(1), worker_retries=0, stop=None) is None
+    del sink.emit
+    assert read_deliver(sink) is not None

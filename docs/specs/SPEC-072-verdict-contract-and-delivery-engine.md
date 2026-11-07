@@ -200,19 +200,28 @@ for the reason `losses()` is not declared on it. `read_deliver(sink)` decides wh
   `None`, which is not a function, so a subclass of an engine sink can set it to keep delivering
   through its own `emit`. The probe stops at that `None`; the adapter's lookup (FR-006) passes over
   it to an inherited `deliver`, because an opt-out means "do not offer", not "do not have".
-- `deliver` is offered only when no class in `type(sink).__mro__` before the one that defines
-  `deliver` defines `emit`. A subclass that overrides `emit` to scrub or stamp a batch and then calls
-  `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
-  adapter (FR-006) runs the engine below it.
+- `deliver` is offered only when no `emit` would win ordinary lookup over it: no class in
+  `type(sink).__mro__` before the one that defines `deliver` defines `emit`, and **no `emit` is set
+  on the instance itself**. A subclass that overrides `emit` to scrub or stamp a batch and then
+  calls `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
+  adapter (FR-006) runs the engine below it. So does an `emit` assigned on the instance —
+  `sink.emit = scrub`, or `mock.patch.object(sink, "emit")` in a test — read from the instance dict
+  through the same builtin getset path the static read below uses, so no hook runs.
 - `log_foundry_counters` is read statically on the sink — CPython's lookup order (a class data
   descriptor, then the instance `__dict__`, then a class attribute) walked through builtin
   accessors only, `type`'s unbound `__mro__` and `__dict__`, the class's own `__dict__` getset
   descriptor and a `__slots__` member's descriptor, so no property, `__getattr__`, descriptor
   `__get__` or metaclass hook (`__mro__`, `__name__`, `__eq__`, `__hash__`) runs — and must be
-  exactly a `SinkCounters`
-  (`type(v) is SinkCounters`; the class is `@final`) (FR-003). A sink that defines `deliver` with
-  no counters keeps delivering through `emit`, so nothing is lost and the engine never counts
-  somewhere dishonest.
+  exactly a `SinkCounters` (`type(v) is SinkCounters`; the class is `@final`) (FR-003). A sink
+  that defines `deliver` with no counters keeps delivering through `emit`, so nothing is lost and
+  the engine never counts somewhere dishonest. Two limits are recorded rather than closed. When
+  the instance dict cannot be read — the class shadows `__dict__` where it defines it, or a
+  borrowed getset refuses the instance — the class's own member is still used, so a class-level
+  `log_foundry_counters` or `deliver` is found, but **an instance attribute behind a shadowed
+  `__dict__` is not seen**: such a sink with instance counters reaches its adapter's `TypeError`
+  on every batch, a counted failure. And the name is looked up in plain dicts, so on a hash
+  collision a namespace key that is a `str` subclass with its own `__eq__` runs that `__eq__`; only
+  a deliberately hostile class builder can plant one.
 
 `read_deliver` returns the bound `deliver` when the sink offers it and `None` otherwise. Like
 `read_losses` it never raises and writes nothing. It is public for the reason `read_losses` is: a
@@ -431,8 +440,10 @@ and never becomes a holder: the `continue` the walk takes at a holder `_is_owned
 it. The reach is instead at **the value the walk would not push** — an attribute of an owned holder,
 such as the `Worker`'s `sink`, or a member of a container it walks. There
 the walk reads the one attribute `log_foundry_counters` with the same static read FR-001's probe
-uses (no third-party code, metaclass `__eq__` and `__hash__` included, runs in the at-fork
-handler), resolving a `__slots__` member through its builtin descriptor, and when the result is exactly `SinkCounters` it pushes the counters, which are
+uses (no property, `__getattr__`, descriptor or metaclass hook runs in the at-fork handler;
+the one residue is FR-001's, a hostile `str`-subclass namespace key's `__eq__` on a hash
+collision), resolving a `__slots__` member through its builtin descriptor, and when the result
+is exactly `SinkCounters` it pushes the counters, which are
 the package's own and so are walked, which replaces their lock. `SinkCounters` is found through
 `sys.modules` once per walk, never imported, since an import in a child not yet returned from
 `fork` can deadlock; a process that never loaded `sinks.verdict` holds none to repair. A value of a
@@ -440,7 +451,11 @@ scalar, function, module or class type is skipped before the static read. Nothin
 third-party namespace is read, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
 **The reach is one level deep:** an engine sink held *inside* a third-party wrapper, or a sink
 that is itself a third-party container subclass (pushed as a container, whose members are walked
-but whose attributes are not), is not reached.
+but whose attributes are not), is not reached. **What that costs:** if a parent thread held such a
+sink's counters' lock at the fork, the child's first run that commits into those counters hangs —
+an `info()` on the orphan path blocks the caller, and on the worker path the drain thread blocks,
+so `flush()` times out. The structural fix, a registry of live `SinkCounters` the walk reads
+instead of finding them, is SPEC-079's follow-up.
 
 **The engine counts once, at the end of a run, through one `Deferral`** (`sinks/_deferral.py`) built on
 the sink's counters, so the commit reads the lock at commit time as every deferring site does:
@@ -1063,3 +1078,8 @@ tests/
   (measured on 3.12 and 3.13); they read through builtin accessors only, in CPython's order, and a
   test holds a recording metaclass to no call. The fork reach's container branch, the only repair
   for an engine sink inside `MultiSink`, gained its own test and positive control.
+- 2026-11-07, second diff review: an `emit` set on the instance also wins the override rule
+  (`sink.emit = scrub` and `mock.patch.object(sink, "emit")` were bypassed on an engine sink); an
+  unreadable instance dict now keeps the class member instead of reading as absent, with the
+  instance-attribute limit recorded in FR-001; the `str`-subclass-key `__eq__` residue is stated
+  rather than claimed away; and FR-003's boundary says what an unreached shape costs a child.

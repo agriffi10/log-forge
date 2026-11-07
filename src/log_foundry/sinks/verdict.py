@@ -11,7 +11,14 @@ from typing import TYPE_CHECKING, Self, cast, final
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
 from log_foundry.sinks._retry import exact_int
-from log_foundry.sinks.base import _MRO, _NAMESPACE, SinkLosses, _class_member, _static_value
+from log_foundry.sinks.base import (
+    _MRO,
+    _NAMESPACE,
+    SinkLosses,
+    _class_member,
+    _instance_dict,
+    _static_value,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -202,8 +209,10 @@ def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> obj
 
     Args:
       sink: The sink.
-      override_rule: Whether a class earlier in the MRO than the one defining ``deliver`` that
-        defines ``emit`` refuses the offer.
+      override_rule: Whether an ``emit`` that would win ordinary lookup refuses the offer: one
+        in a class earlier in the MRO than the one defining ``deliver``, or one set on the
+        instance itself (``sink.emit = scrub``, ``mock.patch.object(sink, "emit")``), read from
+        the instance dict through :func:`~log_foundry.sinks.base._instance_dict` so no hook runs.
       skip_none: Whether a ``deliver = None`` is passed over (the adapter) or refuses (the probe).
 
     Returns:
@@ -223,6 +232,9 @@ def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> obj
         for klass in _MRO(cls)[:index]:
             if "emit" in _NAMESPACE(klass):
                 return None
+        own = _instance_dict(sink)
+        if own is not None and dict.__contains__(own, "emit"):
+            return None
     return types.FunctionType.__get__(function, sink, cls)
 
 
@@ -270,8 +282,9 @@ def read_deliver(sink: object) -> Callable[[list[dict[str, object]]], Verdict] |
       nothing, and its own ``emit`` runs. A class attribute ``deliver = None`` is a declared
       opt-out, as is any ``deliver`` that is not a function (a ``staticmethod``, a property).
     - ``deliver`` is offered only when no class before the defining one in the MRO defines
-      ``emit``, so a subclass that overrides ``emit`` to stamp or scrub and then calls
-      ``super().emit()`` keeps running its override.
+      ``emit``, and none is set on the instance itself, so a subclass that overrides ``emit`` to
+      stamp or scrub and then calls ``super().emit()`` keeps running its override, and so does an
+      ``emit`` assigned on the instance (``sink.emit = scrub``, ``mock.patch.object``).
     - ``log_foundry_counters`` must be exactly a :class:`SinkCounters`, read statically, so a sink
       that defines ``deliver`` with no counters keeps delivering through its ``emit``.
 
