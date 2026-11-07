@@ -838,17 +838,6 @@ close it.
 
 ### Open
 
-- **`configure()`'s stamps, its numeric ceilings, the `_retry` doors and `OTLPSink`'s endpoint
-  test their arguments with `isinstance` and name them with `type(value).__name__`** (SPEC-080
-  frame-2 review; invariant 13, the "argument named" half). The sites are `config._require_text`
-  and `_require_positive`, `sinks/_retry.py`'s validators (the `flush()`/`shutdown()` timeouts
-  and the sinks' `int` floors) and `sinks/otlp.py`'s endpoint check. Reproduced at `4f0c5741`:
-  `configure(service=x)` with `x`'s `__class__` property returning `str` raises `descriptor
-  '__str__' requires a 'str' object but received a '…'`, which does not name `service`; a raising
-  `__class__` raises its own exception; a metaclass `__name__` property returning `"str"` gives
-  `version must be a str, got str`. Every lying value is still stopped at the call, never per
-  emit, so only the message breaks the promise. **Closed by** routing each door through
-  `issubclass(type(v), T)` and the type's stored name, as SPEC-080 did for `@trace`.
 - **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
   (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
   `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
@@ -1037,6 +1026,24 @@ close it.
 
 ### Resolved
 
+- ~~**`configure()`'s stamps, its numeric ceilings, the `_retry` doors and `OTLPSink`'s endpoint
+  test their arguments with `isinstance` and name them with `type(value).__name__`**~~ (SPEC-080
+  frame-2 review; invariant 13, the "argument named" half) → **closed by SPEC-071 FR-005**. The
+  seven doors (`config._require_text` and `_require_positive`, `_retry.exact_seconds`,
+  `require_positive`, `exact_int` and `wait_budget`, and `OTLPSink`'s endpoint) now test
+  `issubclass(type(v), T)` and name the type through `_diag._STR_STR(_diag._STORED_NAME(type(v)))`,
+  so a value whose `__class__` property claims or raises, or whose metaclass `__name__` property
+  renames its type, gets the door's own `TypeError` naming the argument and the real class, and
+  none of its getters runs. An honest wrong type's message is byte-identical. `_retry._exact_number`
+  routes the same way, so a real `float` subclass whose `__class__` claims `int` is read as the
+  float it holds where it used to raise `int.__index__`'s descriptor error. The spec also closed
+  sites the entry did not list: the HTTP sinks' `auth`, which a value claiming `str` sent down the
+  token route into its own `__contains__` and now reaches the pair route's existing `ValueError`
+  naming `auth`, and seven callable constructor arguments that accepted a non-callable and then
+  failed in `emit` or `close()`, now refused at construction through `_args.require_callable`.
+  `tests/test_type_door_roster.py` holds the ten doors by name and reports any `isinstance` on a
+  door's parameter outside `decorator._refuse_unusable`'s kept proxy test. The reasoning: *An
+  argument door asks the type, never the value*, in `docs/decisions/sink-delivery/`.
 - ~~**Queued items are announced twice on an expired exit drain**~~ (SPEC-062 frame-2 review;
   invariant 2) → **closed by SPEC-068**. The `ShutdownTimeout` line called the queue lost, and the
   decline or abandon line announced the same items again once `_final_drain` took them; its count

@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-071
 title: "Shared Kit, Part One: import_extra, One Injected-Client Refusal and the Chunker Rule"
 description: "Moves the sinks' lazy extra imports, their injected-client refusal and SQS's chunk boundary into shared helpers, refuses the build options eight sinks silently ignore beside an injected client, routes configure()'s and the sinks' type doors on the real type, and pins first the rosters those moves can reach."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-041, SPEC-043, SPEC-049, SPEC-059, SPEC-061, SPEC-065, SPEC-066, SPEC-080]
 arc: stability-redesign
 arc_order: 3

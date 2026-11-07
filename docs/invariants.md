@@ -383,6 +383,10 @@ a NaN or non-number is refused at the call).
 
 *Observable:* no argument a constructor accepted later raises from `emit` or makes `emit` return
 having delivered nothing; no argument is silently ignored because another was given.
+*Recorded exceptions:* a required argument that a constructor documents as ignored beside an
+injected connection is accepted, because refusing it would break every such caller —
+`SQLiteSink.database`, the one such argument, pinned by name in
+`tests/test_injected_client_roster.py` (SPEC-071 FR-003).
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
 non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
@@ -394,4 +398,12 @@ also holds SPEC-065's spoofed-subclass pins for the three validators, and
 `tests/test_sinks_pubsub.py` — whose spec Overview was the
 measured list of what still constructs and should not; `tests/test_numeric_doors.py` for the
 `int` doors and the `flush()`/`shutdown()` `timeout`, and `tests/test_numeric_door_roster.py`,
-which derives the `int` doors from the AST and fails naming one left unjudged (SPEC-066).
+which derives the `int` doors from the AST and fails naming one left unjudged (SPEC-066);
+`tests/test_type_doors.py` for a value lying about its type at every argument door, the HTTP
+sinks' `auth` and the seven callable arguments, and `tests/test_type_door_roster.py`, which derives
+the doors from the AST and fails naming one that asks the value rather than its type;
+`tests/test_sinks_args.py` for the build options refused beside an injected client, and
+`tests/test_injected_client_roster.py`, which derives each constructor's build options and fails
+naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra refused at the
+constructor that needs it, and `tests/test_extras_roster.py`, which fails naming an extra imported
+other than through `import_extra` (SPEC-071).
