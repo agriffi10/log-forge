@@ -9,6 +9,7 @@ __all__ = [
     "Adjudication",
     "adjudicate_positional",
     "describe_count",
+    "results_rejected",
     "usable_results",
 ]
 
@@ -74,6 +75,7 @@ def adjudicate_positional[T](
     *,
     error_key: str = "ErrorCode",
     failed_count: object = _NOT_PASSED,
+    rejected: bool = False,
 ) -> Adjudication[T]:
     """Pairs a positional batch response against the records it should describe.
 
@@ -101,6 +103,11 @@ def adjudicate_positional[T](
         an ``int`` (``None`` included), and a length mismatch — is unadjudicated, because a
         resend of the coded records could duplicate what the count says was taken. Not passed,
         the rule is the one before SPEC-070, for a caller with no count to offer.
+      rejected: Whether the response carried a per-record array that :func:`usable_results`
+        refused — an entry that is not a mapping, say (see :func:`results_rejected`). Read only
+        with ``failed_count``: a present array nobody can read cannot show that nothing is coded,
+        so rule 1 cannot hold and the chunk is unadjudicated, whatever the count says. An array
+        that is absent is not rejected: a ``0`` count with no array is still delivered.
 
     Returns:
       The records to retry, or the count abandoned as unadjudicated when the arrays disagree.
@@ -109,6 +116,8 @@ def adjudicate_positional[T](
       None.
     """
     if failed_count is not _NOT_PASSED:
+        if rejected:
+            return Adjudication([], len(records))
         return _adjudicate_counted(records, results, error_key, failed_count)
     if len(results) != len(records):
         return Adjudication([], len(records))
@@ -172,3 +181,24 @@ def describe_count(failed_count: object) -> str:
     if type(failed_count) is int:
         return f"failed count {failed_count}"
     return f"a failed count of type {type(failed_count).__name__}"
+
+
+def results_rejected(raw: Any) -> bool:
+    """Reports whether a response carried a per-record array :func:`usable_results` refuses.
+
+    ``usable_results`` returns the array itself when it is usable, an empty one included, and a
+    fresh empty list otherwise, so identity tells the two apart without comparing a value the
+    client chose (SPEC-070 FR-003, hardened at diff review frame 2: a coded entry beside one
+    that is not a mapping used to vanish with the whole array, and a ``0`` or absent count then
+    read the chunk as delivered).
+
+    Args:
+      raw: The response's per-record field, ``None`` when it was absent.
+
+    Returns:
+      True when the field is present and unusable.
+
+    Raises:
+      None.
+    """
+    return raw is not None and usable_results(raw) is not raw

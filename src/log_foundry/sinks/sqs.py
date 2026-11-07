@@ -567,7 +567,7 @@ class SQSSink:
                 _diag.lost(
                     "message",
                     len(entries),
-                    f"SQSSink, still failing after {self.max_retries + 1} attempts; abandoned",
+                    f"SQSSink, still failing after {self.max_retries + 1} attempt(s); abandoned",
                 )
                 return accepted, True
         return accepted, False

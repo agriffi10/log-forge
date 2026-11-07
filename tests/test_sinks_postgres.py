@@ -614,7 +614,34 @@ def test_a_failed_reconnect_is_announced_as_pending_naming_the_type_only(monkeyp
 
     lines = capsys.readouterr().err.splitlines()
     assert (
-        "log-foundry: PostgresSink could not reconnect (OperationalError); this attempt fails "
-        "with it, and the batch's own line says whether it is retried or lost"
+        "log-foundry: PostgresSink could not reconnect (OperationalError); this attempt fails, "
+        "and a lost line follows only if the batch is given up"
     ) in lines
     assert not any("absorbed" in line and "reconnect" in line for line in lines), lines
+
+
+def test_a_reconnect_that_succeeds_on_retry_writes_only_the_pending_line(monkeypatch, capsys) -> None:
+    """Invariant 11: the pending line promises a ``lost`` line only if the batch is given up, so
+    a retry that succeeds writes the pending line and nothing that claims more."""
+    sink, connects = _reconnecting(monkeypatch, "connection failed: Connection refused")
+    refuse = sink._connect
+    replacement = FakeConnection()
+
+    def once_then_up() -> object:
+        if not connects:
+            return refuse()
+        connects.append(1)
+        return replacement
+
+    monkeypatch.setattr(sink, "_connect", once_then_up)
+
+    sink.emit([{"a": 1}])
+
+    assert len(connects) == 2
+    assert replacement.commits == 1, "delivered on the retry"
+    assert sink.failed == 0
+    expected = (
+        "log-foundry: PostgresSink could not reconnect (OperationalError); this attempt fails, "
+        "and a lost line follows only if the batch is given up"
+    )
+    assert capsys.readouterr().err.splitlines() == [expected]

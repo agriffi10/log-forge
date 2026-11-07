@@ -339,7 +339,7 @@ class SNSSink:
                 _diag.lost(
                     "message",
                     len(entries),
-                    f"SNSSink, still failing after {self.max_retries + 1} attempts; abandoned",
+                    f"SNSSink, still failing after {self.max_retries + 1} attempt(s); abandoned",
                 )
                 return accepted, True
         return accepted, False

@@ -11,6 +11,7 @@ from log_foundry.sinks._batch import (
     ABSENT,
     adjudicate_positional,
     describe_count,
+    results_rejected,
     usable_results,
 )
 from log_foundry.sinks._chunk import chunk_items
@@ -392,17 +393,26 @@ class FirehoseSink:
                 )
                 return sent - len(records)
             failed_count = response.get("FailedPutCount", ABSENT)
-            results = usable_results(response.get("RequestResponses"))
-            verdict = adjudicate_positional(records, results, failed_count=failed_count)
+            raw = response.get("RequestResponses")
+            results = usable_results(raw)
+            rejected = results_rejected(raw)
+            verdict = adjudicate_positional(
+                records, results, failed_count=failed_count, rejected=rejected
+            )
             if verdict.unadjudicated:
                 coded = sum(1 for result in results if result.get("ErrorCode"))
+                returned = (
+                    "an unreadable result array"
+                    if rejected
+                    else f"{len(results)} result(s) returned"
+                )
                 with self._counter_lock:
                     self.dropped_unadjudicated += verdict.unadjudicated
                 _diag.lost(
                     "record",
                     verdict.unadjudicated,
                     f"FirehoseSink could not adjudicate a put_record_batch response "
-                    f"({len(records)} record(s) sent, {len(results)} result(s) returned, "
+                    f"({len(records)} record(s) sent, {returned}, "
                     f"{coded} coded, "
                     f"{describe_count(failed_count)}); abandoned, not retried",
                 )
@@ -418,7 +428,8 @@ class FirehoseSink:
                 _diag.lost(
                     "record",
                     len(records),
-                    f"FirehoseSink, still failing after {self.max_retries + 1} attempts; abandoned",
+                    f"FirehoseSink, still failing after {self.max_retries + 1} attempt(s); "
+                    "abandoned",
                 )
                 return sent - len(records)
         return 0

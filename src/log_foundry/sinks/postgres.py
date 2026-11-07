@@ -410,8 +410,12 @@ class PostgresSink:
         re-raised into the attempt, so "absorbed" would be false (invariant 11), and it is not a
         loss yet either — the batch's own handler retries it or counts it, and that line carries
         the count. :func:`~log_foundry._diag.pending` is the writer for exactly that: no ``lost``
-        prefix, the exception's type and never its message. The failed ``close()`` of the old
-        handle is still absorbed, and its line still says so.
+        prefix, the exception's type and never its message. The line promises nothing it cannot
+        keep: a retry that succeeds writes no further line, so it says only that a ``lost`` line
+        follows if the batch is given up. The type is read as ``_diag.absorbed`` reads it, through
+        ``type``'s stored name (SPEC-063 FR-004), so a metaclass ``__name__`` cannot rename or
+        silence it. The failed ``close()`` of the old handle is still absorbed, and its line
+        still says so.
 
         Args:
           None.
@@ -444,9 +448,10 @@ class PostgresSink:
             self._reconnect_announced = False
         except Exception as err:
             if not announced:
+                kind = _diag._STR_STR(_diag._STORED_NAME(type(err)))
                 _diag.pending(
-                    f"PostgresSink could not reconnect ({type(err).__name__}); this attempt "
-                    "fails with it, and the batch's own line says whether it is retried or lost"
+                    f"PostgresSink could not reconnect ({kind}); this attempt fails, and a lost "
+                    "line follows only if the batch is given up"
                 )
             raise
 

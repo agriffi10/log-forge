@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from log_foundry.sinks._batch import ABSENT, adjudicate_positional, describe_count, usable_results
+from log_foundry.sinks._batch import (
+    ABSENT,
+    adjudicate_positional,
+    describe_count,
+    results_rejected,
+    usable_results,
+)
 
 
 def test_equal_lengths_select_the_flagged_records() -> None:
@@ -179,3 +185,20 @@ def test_empty_records_with_a_positive_count_leave_nothing_to_count() -> None:
 )
 def test_describe_count_names_a_type_never_a_value(count, text) -> None:
     assert describe_count(count) == text
+
+
+@pytest.mark.parametrize(
+    ("raw", "rejected"),
+    [(None, False), ([], False), ([{}], False), ([{}, None], True), ("x", True), ({}, True)],
+    ids=["absent", "empty", "usable", "not-a-mapping", "str", "dict"],
+)
+def test_results_rejected_means_present_and_unusable(raw, rejected) -> None:
+    assert results_rejected(raw) is rejected
+
+
+@pytest.mark.parametrize("count", [0, ABSENT, 2])
+def test_a_rejected_array_is_unadjudicated_in_counted_mode_only(count) -> None:
+    """A present array nobody can read cannot show that nothing is coded (rule 3, not rule 1)."""
+    assert adjudicate_positional([_A, _B], [], failed_count=count, rejected=True) == ([], 2)
+    assert adjudicate_positional([_A, _B], [], rejected=True) == ([], 2), "today's rule: mismatch"
+    assert adjudicate_positional([_A, _B], [], failed_count=0) == ([], 0), "no array: delivered"

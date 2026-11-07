@@ -11,6 +11,7 @@ from log_foundry.sinks._batch import (
     ABSENT,
     adjudicate_positional,
     describe_count,
+    results_rejected,
     usable_results,
 )
 from log_foundry.sinks._chunk import chunk_items
@@ -301,14 +302,14 @@ class KinesisSink:
 
         Kinesis ``PutRecords`` documents a record's ``ErrorCode`` as one of
         ``ProvisionedThroughputExceededException`` and ``InternalFailure``, each transient, so the
-        vendor's whole per-record list is retryable. A code the page does not list — or one that is not a
-        ``str`` — is retried too, bounded by ``max_retries``: the permanent kinds of failure on
-        this service are reported as whole-request errors (``InvalidArgumentException``, the KMS
-        errors), so the per-record channel carries what the service failed to do; the page's only
-        remedy for a failed record is to resend it; and the two mistakes are not symmetric — an
-        undocumented permanent code costs at most ``max_retries`` bounded, idle waits, while an
-        undocumented transient code read as permanent loses records the service would have
-        taken.
+        vendor's whole per-record list is retryable. A code the page does not list — or one that
+        is not a ``str`` — is retried too, bounded by ``max_retries``: the permanent kinds of
+        failure on this service are reported as whole-request errors (``InvalidArgumentException``,
+        the KMS errors), so the per-record channel carries what the service failed to do; the
+        page's only remedy for a failed record is to resend it; and the two mistakes are not
+        symmetric — an undocumented permanent code costs at most ``max_retries`` bounded, idle
+        waits, while an undocumented transient code read as permanent loses records the service
+        would have taken.
 
         It is asked only about a record the response marks failed, by a truthy ``ErrorCode``, and
         :meth:`_send` does not ask it: with every answer True the branch for False would be dead
@@ -391,17 +392,26 @@ class KinesisSink:
                 )
                 return sent - len(records)
             failed_count = response.get("FailedRecordCount", ABSENT)
-            results = usable_results(response.get("Records"))
-            verdict = adjudicate_positional(records, results, failed_count=failed_count)
+            raw = response.get("Records")
+            results = usable_results(raw)
+            rejected = results_rejected(raw)
+            verdict = adjudicate_positional(
+                records, results, failed_count=failed_count, rejected=rejected
+            )
             if verdict.unadjudicated:
                 coded = sum(1 for result in results if result.get("ErrorCode"))
+                returned = (
+                    "an unreadable result array"
+                    if rejected
+                    else f"{len(results)} result(s) returned"
+                )
                 with self._counter_lock:
                     self.dropped_unadjudicated += verdict.unadjudicated
                 _diag.lost(
                     "record",
                     verdict.unadjudicated,
                     f"KinesisSink could not adjudicate a put_records response ({len(records)} "
-                    f"record(s) sent, {len(results)} result(s) returned, {coded} coded, "
+                    f"record(s) sent, {returned}, {coded} coded, "
                     f"{describe_count(failed_count)}); abandoned, not retried",
                 )
                 return None
@@ -416,7 +426,8 @@ class KinesisSink:
                 _diag.lost(
                     "record",
                     len(records),
-                    f"KinesisSink, still failing after {self.max_retries + 1} attempts; abandoned",
+                    f"KinesisSink, still failing after {self.max_retries + 1} attempt(s); "
+                    "abandoned",
                 )
                 return sent - len(records)
         return 0

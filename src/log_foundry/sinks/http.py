@@ -1723,7 +1723,10 @@ class HTTPSink:
             abandoned here. ``SentrySink`` passes ``False``: it counts such an exception on its
             own ``.transport_errors``, a documented counter, so moving the count to this held
             sink's ``failed`` would reclassify it in a minor release. With ``False`` the
-            exception is re-raised unchanged after its one attempt, uncounted here.
+            exception is re-raised unchanged after its one attempt, uncounted here — unless it is
+            a ``SinkDeliveryError`` (``_PayloadTooLarge`` included), which every caller reads as
+            already counted and announced; that one is abandoned here, counted once in
+            ``failed``, so an opener raising it is never counted nowhere.
 
         Returns:
           The response bytes, which subclasses that must inspect the response — such as
@@ -1732,7 +1735,7 @@ class HTTPSink:
 
         Raises:
           Exception: An exception :meth:`_retryable_error` rejects, unchanged, only when
-            ``count_unexpected`` is False.
+            ``count_unexpected`` is False and it is not a ``SinkDeliveryError``.
           _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
             line, because the caller is about to re-send the same events in smaller requests and
             only what finally fails is a loss.
@@ -1758,7 +1761,8 @@ class HTTPSink:
                 if retryable and attempt < retries:
                     self._sleep_backoff(attempt, None)
                     continue
-                if not retryable and not count_unexpected:
+                counted_by_caller = not count_unexpected and not isinstance(err, SinkDeliveryError)
+                if not retryable and counted_by_caller:
                     raise
                 self._abandon(
                     f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip(),

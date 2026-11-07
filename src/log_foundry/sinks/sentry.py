@@ -581,6 +581,10 @@ class SentrySink:
         sink's own ``.transport_errors`` (SPEC-070 FR-001): ``_send`` re-raises it unchanged after
         its one attempt, uncounted, and :meth:`_capture` counts it as it always has. A transport
         error is retried and, past the bound, counted on the held sink's ``failed``, as before.
+        An opener that raises a ``SinkDeliveryError`` itself is the one exception to the
+        re-raise: :meth:`_capture` reads that type as already counted, so ``_send`` abandons it
+        through the held sink instead — one request, counted once on its ``failed``, one line —
+        rather than letting it pass uncounted by either sink.
 
         Args:
           event: The event to send.

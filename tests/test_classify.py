@@ -684,6 +684,35 @@ def test_sentry_keeps_an_unretried_exception_on_its_own_counter(monkeypatch, cap
     assert "log-foundry: lost 1 event(s); SentrySink, RuntimeError" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("raised", ["SinkDeliveryError", "_PayloadTooLarge"])
+def test_an_opener_raising_the_librarys_own_error_is_counted_once_by_the_held_sink(
+    raised: str, monkeypatch, capsys
+) -> None:
+    """Invariant 2: ``_capture`` reads a ``SinkDeliveryError`` as already counted, so ``_send``
+    must count it rather than re-raise it uncounted; before this, neither sink counted it."""
+    from log_foundry.sinks.http import _PayloadTooLarge
+
+    opener = _RaisingOpener()
+    opener.error = (
+        SinkDeliveryError("from the opener")
+        if raised == "SinkDeliveryError"
+        else _PayloadTooLarge("from the opener", 10)
+    )
+    sink = _sentry(opener, monkeypatch)
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"level": "ERROR"}])
+
+    assert opener.calls == 1, "not retried"
+    assert sink._http.failed == 1
+    assert sink.transport_errors == 0
+    assert sink.losses().failed == 1, "counted once, by one of the two"
+    lines = _lost(capsys.readouterr().err)
+    assert lines == [
+        f"log-foundry: lost 1 request(s); HTTPSink, 1 attempt(s), connection error, {raised}"
+    ]
+
+
 def test_sentry_still_retries_and_counts_a_transport_error(monkeypatch) -> None:
     opener = _RaisingOpener()
     opener.error = urllib.error.URLError("unreachable")
@@ -1191,12 +1220,22 @@ _NO_COUNT = object()
 """Stands for "the reply carries no failed count at all"."""
 
 
+_NOT_A_MAPPING = object()
+"""Stands for a result entry that is not a mapping at all, which ``usable_results`` refuses."""
+
+
+def _entry(code: object) -> object:
+    if code is _NOT_A_MAPPING:
+        return None
+    return {} if code is None else {"ErrorCode": code}
+
+
 def _reply(stream: _Stream, count: object, codes: list[object] | None) -> dict[str, Any]:
     reply: dict[str, Any] = {}
     if count is not _NO_COUNT:
         reply[stream.count_key] = count
     if codes is not None:
-        reply[stream.array_key] = [{} if c is None else {"ErrorCode": c} for c in codes]
+        reply[stream.array_key] = [_entry(c) for c in codes]
     return reply
 
 
@@ -1244,6 +1283,9 @@ def test_a_failed_count_its_entries_contradict_is_unadjudicated(
         (("1", [None, "InternalFailure"]), [2], 2),
         ((None, [None, None]), [2], 2),
         ((1, ["InternalFailure"]), [2], 2),
+        ((_NO_COUNT, ["InternalFailure", _NOT_A_MAPPING]), [2], 2),
+        ((0, ["InternalFailure", _NOT_A_MAPPING]), [2], 2),
+        ((0, [None, _NOT_A_MAPPING]), [2], 2),
     ],
     ids=[
         "zero",
@@ -1255,6 +1297,9 @@ def test_a_failed_count_its_entries_contradict_is_unadjudicated(
         "str",
         "explicit-none",
         "short-array",
+        "absent-beside-unusable",
+        "zero-beside-unusable",
+        "zero-unusable-uncoded",
     ],
 )
 def test_consistent_replies_read_as_before_and_odd_counts_are_unadjudicated(
@@ -1271,6 +1316,23 @@ def test_consistent_replies_read_as_before_and_odd_counts_are_unadjudicated(
     assert client.sent == sent
     assert sink.dropped_unadjudicated == unadjudicated
     assert sink.failed == 0
+
+
+@pytest.mark.parametrize("stream", _STREAMS, ids=lambda s: s.loop)
+def test_an_unusable_result_array_hides_nothing_and_is_named(
+    stream: _Stream, monkeypatch, capsys
+) -> None:
+    """Frame-2 hardening: a coded entry beside one that is not a mapping used to vanish with the
+    whole array, and an absent count then read the chunk as delivered, silently."""
+    reply = _reply(stream, _NO_COUNT, ["InternalFailure", _NOT_A_MAPPING])
+    sink, client = _stream_sink(stream, [reply], monkeypatch)
+
+    sink.emit(list(_TWO))
+
+    assert client.sent == [2]
+    assert sink.dropped_unadjudicated == 2
+    [line] = _lost(capsys.readouterr().err)
+    assert "2 record(s) sent, an unreadable result array, 0 coded, no failed count" in line
 
 
 @pytest.mark.parametrize("stream", _STREAMS, ids=lambda s: s.loop)
@@ -1403,3 +1465,23 @@ def test_the_sqs_and_sns_sender_fault_batches_have_equal_ledgers_through_a_worke
     assert ledgers["SQSSink"] == ledgers["SNSSink"]
     assert ledgers["SNSSink"][0] == 1, "a sender fault is sent once and the batch returns"
     assert ledgers["SNSSink"][1] is True, "the worker's flush reports the batch delivered"
+
+
+@pytest.mark.parametrize("kind", ["SQSSink", "SNSSink", "KinesisSink", "FirehoseSink"])
+def test_the_entry_exhaustion_line_counts_attempts_grammatically(kind: str, monkeypatch, capsys) -> None:
+    """D2 for the entry path: ``still failing after 1 attempt(s)`` at ``max_retries=0``."""
+    if kind in ("SQSSink", "SNSSink"):
+        sink = _queue_sink(kind, _Rejecting(False), monkeypatch)
+        sink.max_retries = 0
+    else:
+        stream = next(s for s in _STREAMS if s.loop == kind)
+        sink, _ = _stream_sink(stream, [_reply(stream, 2, ["InternalFailure"] * 2)], monkeypatch)
+        sink.max_retries = 0
+
+    try:
+        sink.emit(list(_TWO))
+    except SinkDeliveryError:
+        pass
+
+    [line] = _lost(capsys.readouterr().err)
+    assert line.endswith(f"{kind}, still failing after 1 attempt(s); abandoned"), line
