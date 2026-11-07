@@ -95,7 +95,7 @@ def test_bulk_write_error_counts_rejects_without_retry(capsys) -> None:
 
 
 def test_connection_error_retried_then_counted(capsys) -> None:
-    collection = FakeCollection(error=RuntimeError("no primary"), error_times=-1)
+    collection = FakeCollection(error=ConnectionError("no primary"), error_times=-1)
     sink = make_sink(collection, max_retries=2)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"a": 2}])  # nothing was inserted (SPEC-026 FR-001)

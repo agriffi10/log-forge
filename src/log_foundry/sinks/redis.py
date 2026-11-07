@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive, wait
@@ -157,7 +158,7 @@ class _RedisSink:
                 pipe.execute()
                 return
             except Exception as err:
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -165,11 +166,51 @@ class _RedisSink:
                 _diag.lost(
                     "event",
                     batch_size,
-                    f"{type(self).__name__}, {self.max_retries + 1} attempts, {type(err).__name__}",
+                    f"{type(self).__name__}, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
                 raise SinkDeliveryError(
                     f"{type(self).__name__} delivered none of {batch_size} event(s)"
                 ) from None
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed pipeline is worth another attempt (SPEC-070 FR-002).
+
+        redis-py's own default ``Retry`` retries ``ConnectionError``, ``TimeoutError`` and
+        ``socket.timeout`` (``redis/retry.py``), and ``redis/cluster.py`` retries
+        ``TryAgainError`` and ``ClusterDownError``; those are retried here. Three
+        ``ConnectionError`` subclasses are narrowed out — ``AuthenticationError``,
+        ``AuthorizationError`` and ``ExternalAuthProviderError``, the last skipped in a version
+        that lacks it — because a resend cannot fix a credential. ``ResponseError`` and its other
+        subclasses, and ``DataError``, fail at once.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        credential = driver_classes(
+            "redis.exceptions",
+            "AuthenticationError",
+            "AuthorizationError",
+            "ExternalAuthProviderError",
+        )
+        if isinstance(err, credential):
+            return False
+        retried = (
+            *TRANSIENT_BUILTINS,
+            *driver_classes(
+                "redis.exceptions",
+                "ConnectionError",
+                "TimeoutError",
+                "TryAgainError",
+                "ClusterDownError",
+            ),
+        )
+        return isinstance(err, retried)
 
     def close(self) -> None:
         """Closes the connection only if the sink owns it (FR-005).

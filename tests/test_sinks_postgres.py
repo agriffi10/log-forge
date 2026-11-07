@@ -31,11 +31,14 @@ class FakeCursor:
         if self._owner._fail_times != 0:
             if self._owner._fail_times > 0:
                 self._owner._fail_times -= 1
-            raise RuntimeError("insert failed")
+            raise self._owner.error
 
 
 class FakeConnection:
-    def __init__(self, fail_times: int = 0) -> None:
+    def __init__(self, fail_times: int = 0, error: Exception | None = None) -> None:
+        # A retried class by default, so the tests that need a retry get one (SPEC-070 FR-002):
+        # a bare RuntimeError fails at its first attempt now.
+        self.error: Exception = ConnectionError("insert failed") if error is None else error
         self.executed: list[tuple] = []
         self.executemany_calls: list[tuple] = []
         self.commits = 0
@@ -219,8 +222,9 @@ class RollbackRaisesConnection(FakeConnection):
     this double, so the FR closes without a running Postgres.
     """
 
-    def __init__(self) -> None:
-        super().__init__(fail_times=-1)
+    def __init__(self, error: Exception | None = None) -> None:
+        insert_error = RuntimeError("insert failed") if error is None else error
+        super().__init__(fail_times=-1, error=insert_error)
 
     def rollback(self) -> None:
         # A *distinct* type from the insert's RuntimeError, so the assertions below can tell
@@ -232,7 +236,7 @@ class RollbackRaisesConnection(FakeConnection):
 
 def test_a_rollback_that_raises_does_not_consume_the_remaining_attempts() -> None:
     """AC-1. Measured before the fix: attempts dropped from 4 to 1."""
-    conn = RollbackRaisesConnection()
+    conn = RollbackRaisesConnection(ConnectionError("insert failed"))
     sink = PostgresSink("logs", connection=conn, max_retries=3)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"i": 1}])
@@ -295,9 +299,11 @@ class BreakableConnection(FakeConnection):
         super().__init__(fail_times)
         self.broken = False
 
-    def kill(self) -> None:
+    def kill(self, error: Exception | None = None) -> None:
         self.broken = True
         self._fail_times = -1   # every later insert fails, as a dead handle's does
+        if error is not None:
+            self.error = error
 
 
 def _psycopg_stub(monkeypatch, connections):
@@ -402,7 +408,7 @@ def test_a_failing_reconnect_is_announced_once_per_outage_not_per_attempt(
 
     def connect(dsn, **kwargs):
         if getattr(connect, "opened", False):
-            raise RuntimeError("server is down")
+            raise ConnectionError("server is down")  # retried, so every attempt reconnects
         connect.opened = True
         return conn
 

@@ -24,7 +24,7 @@ class FakeClickHouse:
         if self._fail_times != 0:
             if self._fail_times > 0:
                 self._fail_times -= 1
-            raise RuntimeError("insert failed")
+            raise ConnectionError("insert failed")
 
     def command(self, sql: str) -> None:
         self.commands.append(sql)

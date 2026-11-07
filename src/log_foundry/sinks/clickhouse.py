@@ -8,6 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive, require_timeout, wait
@@ -253,7 +254,7 @@ class ClickHouseSink:
                 self.client.insert(self._table, data=rows, column_names=_COLUMN_NAMES)
                 return 1
             except Exception as err:
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -261,10 +262,38 @@ class ClickHouseSink:
                 _diag.lost(
                     "row",
                     len(rows),
-                    f"ClickHouseSink, {self.max_retries + 1} attempts, {type(err).__name__}",
+                    f"ClickHouseSink, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
                 return 0
         return 0
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed insert is worth another attempt (SPEC-070 FR-002).
+
+        ``OperationalError`` is clickhouse-connect's class for a failure "not necessarily under
+        the control of the programmer, e.g. an unexpected disconnect" (``driver/exceptions.py``),
+        and at the locked 1.4.2 ``driver/httpclient.py`` raises it for a transport error and for a
+        ``429``, ``503`` or ``504`` it has already retried itself. ``DatabaseError`` itself,
+        ``DataError``, ``ProgrammingError`` and ``InterfaceError`` fail at once: the same rows meet
+        the same refusal. The class is resolved per call, never imported.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        retried = (
+            *TRANSIENT_BUILTINS,
+            *driver_classes(
+                "clickhouse_connect.driver.exceptions",
+                "OperationalError",
+            ),
+        )
+        return isinstance(err, retried)
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target ``MergeTree`` table.

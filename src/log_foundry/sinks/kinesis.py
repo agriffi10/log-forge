@@ -9,6 +9,7 @@ from typing import Any
 from log_foundry import _diag
 from log_foundry.sinks._batch import adjudicate_positional, usable_results
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks._classify import aws_retryable, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
@@ -268,6 +269,25 @@ class KinesisSink:
                 f"{self.MAX_RECORD_BYTES}-byte per-record limit",
             )
 
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed call is worth another attempt (SPEC-070 FR-002).
+
+        botocore's transient and throttling failures, through the predicate the four AWS sinks
+        share (:func:`~log_foundry.sinks._classify.aws_retryable`); anything else — a
+        ``ParamValidationError``, an ``AccessDenied``, a ``TypeError`` from the caller's own code —
+        fails at once, counted and announced on its first attempt with no backoff wait.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        return aws_retryable(err)
+
     def _send(self, records: list[dict[str, Any]]) -> int | None:
         """Sends one chunk, retrying only the records the response flags as failed (FR-003).
 
@@ -312,7 +332,7 @@ class KinesisSink:
                     StreamName=self.stream_name, Records=records
                 )
             except Exception as err:
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -320,7 +340,7 @@ class KinesisSink:
                 _diag.lost(
                     "record",
                     len(records),
-                    f"KinesisSink, {self.max_retries + 1} attempt(s), {type(err).__name__}",
+                    f"KinesisSink, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
                 return sent - len(records)
             if not response.get("FailedRecordCount"):
