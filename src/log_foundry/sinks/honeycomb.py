@@ -249,14 +249,21 @@ class HoneycombSink(HTTPSink):
             (:func:`_valid_base_url`), or an ``@`` anywhere else, refused naming ``url`` once the
             path is appended; or if a forwarded ``auth`` accompanies an ``Authorization`` header
             in a forwarded ``headers``, in any case, refused by
-            :class:`~log_foundry.sinks.http.HTTPSink` naming this class.
+            :class:`~log_foundry.sinks.http.HTTPSink` naming this class; or if a forwarded
+            header's name folds to ``X-Honeycomb-Team``, which would replace ``api_key`` on the
+            wire (:func:`~log_foundry.sinks.http.merge_headers`).
         """
         _one_segment(dataset, type(self).__name__)
         _carried_in_a_path(dataset, type(self).__name__)
         _valid_base_url(
             url, type(self).__name__, f"/1/batch/{dataset}", credentials=self._CREDENTIALS
         )
-        headers = merge_headers({"X-Honeycomb-Team": api_key}, http_kwargs)
+        headers = merge_headers(
+            {"X-Honeycomb-Team": api_key},
+            http_kwargs,
+            owner=type(self).__name__,
+            argument="api_key",
+        )
         super().__init__(
             f"{url.rstrip('/')}/1/batch/{dataset}",
             headers=headers,

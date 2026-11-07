@@ -786,6 +786,15 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
     ``LF`` the injection — and this message is the reason only for the names that used to pass.
     A value holding spaces is untouched: ``Bearer abc`` is what values look like.
 
+    **Two names that fold to one are refused** (1.2.0), last of all for the second of them.
+    ``urllib`` keeps one value per folded name, the last written, so ``{"X-Foo": "1", "x-foo":
+    "2"}`` sent only ``2`` and the first was silently ignored — two ``Authorization`` spellings
+    likewise. The message names both names and neither value. A pair colliding only once the
+    whitespace is stripped (``"X-Foo"``, ``"X-Foo "``) meets the whitespace refusal first, on
+    the second name; a platform sink's own credential header never reaches this check beside a
+    caller's spelling of it, since :func:`merge_headers` refuses that pair first, naming the
+    argument the caller collided with.
+
     Args:
       headers: The caller's headers.
       owner: The class refusing them, for the message.
@@ -795,8 +804,9 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
 
     Raises:
       ValueError: If any name or value contains ``CR`` or ``LF``, ``http.client`` cannot send
-        the header, or a name contains whitespace anywhere.
+        the header, a name contains whitespace anywhere, or two names fold to one.
     """
+    seen: dict[str, str] = {}
     for name, value in headers.items():
         for text, part in ((name, "name"), (str(value), "value")):
             if any(bad in text for bad in _CRLF):
@@ -808,6 +818,12 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
             raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
         if any(char.isspace() for char in name):
             raise ValueError(f"{owner} header name must not contain whitespace: {name!r}")
+        first = seen.setdefault(_wire_name(name), name)
+        if first is not name:
+            raise ValueError(
+                f"{owner} headers {first!r} and {name!r} name the same header, which is sent "
+                "once; drop one"
+            )
     return headers
 
 
@@ -1044,23 +1060,43 @@ def _authorization(auth: str | tuple[str, str]) -> str:
     return f"Basic {token}"
 
 
-def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[str, str]:
-    """Merges a platform sink's own headers with any caller-supplied ones, caller winning.
+def merge_headers(
+    base: dict[str, str],
+    http_kwargs: HTTPForwardKwargs,
+    *,
+    owner: str = "HTTPSink",
+    argument: str = "a credential",
+) -> dict[str, str]:
+    """Merges a platform sink's own credential header with the caller's headers, or raises.
 
     This is shared by the SaaS sinks that set a fixed auth header — Datadog, Splunk, New Relic,
-    Honeycomb. The caller's ``headers`` are read with ``dict()``, as :class:`HTTPSink` reads
-    its own, so a ``MappingProxyType`` or a list of pairs is honoured — and then judged by every
-    header and auth rule — rather than dropped: an ``isinstance(caller, dict)`` test here used
-    to discard any other mapping silently, ``Authorization`` beside ``auth=`` included.
+    Honeycomb — and **every key of** ``base`` **is that sink's own credential header**: a caller
+    header whose name folds to one of them (:func:`_wire_name`, the fold ``urllib`` sends and the
+    ``Authorization`` check uses) is refused (1.2.0). The caller's used to win, under any case,
+    since ``urllib`` keeps one value per folded name, the last written, so ``headers={"dd-api-key":
+    ...}`` sent instead of the required ``api_key`` and the argument was silently ignored
+    (invariant 13). The refusal names the caller's header, the argument it collides with and the
+    name the sink sends, never a value, and it runs here, before :class:`HTTPSink` judges any
+    header, so no later check can quote one first. A non-``str`` name is left to
+    :func:`_valid_headers`, and a ``str`` subclass is folded as the exact text it stores. The
+    caller's ``headers`` are read with ``dict()``, as :class:`HTTPSink` reads its own, so a
+    ``MappingProxyType`` or a list of pairs is honoured — and then judged by every header and auth
+    rule — rather than dropped: an ``isinstance(caller, dict)`` test here used to discard any other
+    mapping silently, ``Authorization`` beside ``auth=`` included. Everything else the caller passes
+    is laid over ``base`` unchanged, and the non-credential defaults :class:`HTTPSink` writes per
+    request — ``Content-Type``, ``Content-Encoding`` — sit beneath it, as FR-002 records.
 
     Args:
-      base: The sink's own headers, updated in place.
+      base: The sink's own credential headers, updated in place.
       http_kwargs: The caller's keyword arguments, mutated by popping ``headers`` out so the
         rest can be forwarded to :class:`HTTPSink` without a duplicate argument. Typed as the
         narrowest shape (SPEC-051 FR-005); every wider one is assignable to it, and ``pop`` is
         allowed because each key is ``total=False``. The pop is why a caller may still pass
         ``headers``, and — since it happens *here*, in another function — why ``mypy`` reports
         the caller's own forwarding call as a possible duplicate anyway.
+      owner: The class merging, for the message. Keyword-only and defaulted, so a caller of this
+        public function written before 1.2.0 still calls it.
+      argument: The constructor argument ``base`` carries, for the message.
 
     Returns:
       The merged headers.
@@ -1068,11 +1104,25 @@ def merge_headers(base: dict[str, str], http_kwargs: HTTPForwardKwargs) -> dict[
     Raises:
       TypeError: If the caller's ``headers`` is not a mapping or an iterable of pairs, as
         ``dict()`` raises for :class:`HTTPSink`'s own.
-      ValueError: If an item of an iterable ``headers`` is not a pair, likewise.
+      ValueError: If an item of an iterable ``headers`` is not a pair, likewise, or a caller
+        header's name folds to a key of ``base``.
     """
     caller = http_kwargs.pop("headers", None)
-    if caller is not None:
-        base.update(dict(caller))
+    if caller is None:
+        return base
+    given = dict(caller)
+    own = {_wire_name(name): name for name in base}
+    for name in given:
+        if not issubclass(type(name), str):
+            continue
+        written = _diag._STR_STR(name)
+        sent = own.get(_wire_name(written))
+        if sent is not None:
+            raise ValueError(
+                f"{owner} header {written!r} collides with {argument}, which this sink sends as "
+                f"{sent}; drop the header"
+            )
+    base.update(given)
     return base
 
 
@@ -1226,11 +1276,11 @@ class HTTPSink:
             build a request line for it or for the method,
             a header name or value or a bearer token contains CR or LF, a header name contains
             whitespace anywhere (refused after ``http.client``'s own check, so a name that already
-            failed it keeps that message), ``auth`` is given beside
-            an ``Authorization`` header in any case, ``auth`` cannot be sent or is not a token
-            and does not unpack into exactly two items, the timeout cannot bound
-            anything, ``body_format`` is neither of the two this class renders, or
-            ``max_batch_bytes`` is not positive — each refused here rather than raised out of every
+            failed it keeps that message), two header names fold to one wire name, ``auth`` is
+            given beside an ``Authorization`` header in any case, ``auth`` cannot be sent or is
+            neither a ``str`` token nor a pair of two ``str``, the timeout cannot bound anything,
+            ``body_format`` is neither of the two this class renders, or ``max_batch_bytes`` is
+            not positive — each refused here rather than raised out of every
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
             FR-004), and inherited by every subclass, whose own name the message carries.
         """

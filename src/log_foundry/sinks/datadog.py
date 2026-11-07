@@ -101,7 +101,9 @@ class DatadogSink(HTTPSink):
             ``site``, the argument the caller wrote, rather than the ``url`` this class built from
             it (SPEC-049 FR-001). Also if a forwarded ``auth`` accompanies an ``Authorization``
             header in a forwarded ``headers``, in any case, refused by
-            :class:`~log_foundry.sinks.http.HTTPSink` naming this class.
+            :class:`~log_foundry.sinks.http.HTTPSink` naming this class. Also if a forwarded
+            header's name folds to ``DD-API-KEY``, which would replace ``api_key`` on the wire
+            (:func:`~log_foundry.sinks.http.merge_headers`).
         """
         _refuse_userinfo(
             f"https://http-intake.logs.{site}/api/v2/logs",
@@ -122,7 +124,12 @@ class DatadogSink(HTTPSink):
         )
         self._service = service
         self._ddtags = ddtags
-        headers = merge_headers({"DD-API-KEY": api_key}, http_kwargs)
+        headers = merge_headers(
+            {"DD-API-KEY": api_key},
+            http_kwargs,
+            owner=type(self).__name__,
+            argument="api_key",
+        )
         super().__init__(
             url,
             headers=headers,

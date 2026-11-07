@@ -51,6 +51,11 @@ SPLUNK = (
     "header; drop auth="
 )
 
+SPLUNK_COLLISION = (
+    "SplunkHECSink header {!r} collides with token, which this sink sends as Authorization; "
+    "drop the header"
+)
+
 HEC_VALUE = "SECRET-HEC-VALUE"
 """The token the Splunk sink is built with here, so its refusal can be shown not to echo it."""
 
@@ -432,10 +437,21 @@ def test_every_forwarder_refuses_auth_beside_an_authorization_header(name, heade
 
 @_AUTHS
 @pytest.mark.parametrize(
-    "headers", [None, {"X-Env": "prod"}, {"authorization": HEADER_VALUE}], ids=["alone", "x", "hdr"]
+    ("headers", "expected"),
+    [
+        (None, SPLUNK),
+        ({"X-Env": "prod"}, SPLUNK),
+        ({"authorization": HEADER_VALUE}, SPLUNK_COLLISION.format("authorization")),
+    ],
+    ids=["alone", "x", "hdr"],
 )
-def test_splunk_refuses_any_auth_saying_it_sends_its_token_there(headers, auth) -> None:
-    """At ``39a3f08c``: constructs and drops ``auth``, sending only ``Splunk <token>``."""
+def test_splunk_refuses_any_auth_saying_it_sends_its_token_there(headers, expected, auth) -> None:
+    """At ``39a3f08c``: constructs and drops ``auth``, sending only ``Splunk <token>``.
+
+    Beside a caller's own ``authorization`` the header collision is refused first, by
+    ``merge_headers``, so the ``auth=`` refusal's claim — the token is the ``Authorization``
+    sent — holds whenever it is the message.
+    """
     kw: dict[str, Any] = {"auth": auth}
     if headers is not None:
         kw["headers"] = headers
@@ -443,7 +459,7 @@ def test_splunk_refuses_any_auth_saying_it_sends_its_token_there(headers, auth) 
     with pytest.raises(ValueError) as caught:
         SplunkHECSink(URL, HEC_VALUE, **kw)
 
-    assert str(caught.value) == SPLUNK
+    assert str(caught.value) == expected
     assert "passed" not in str(caught.value) and "or the header" not in str(caught.value)
     _assert_names_no_value(caught.value)
     assert HEC_VALUE not in str(caught.value), "the sink's own token is never echoed"

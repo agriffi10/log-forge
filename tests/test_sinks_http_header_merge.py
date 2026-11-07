@@ -95,7 +95,10 @@ def test_a_non_dict_authorization_beside_auth_is_refused_as_httpsink_refuses_it(
 
     message = str(caught.value)
     if cls == "SplunkHECSink":
-        assert message.startswith("SplunkHECSink auth cannot be given, since this sink sends")
+        assert message == (
+            "SplunkHECSink header 'Authorization' collides with token, which this sink sends as "
+            "Authorization; drop the header"
+        )
     else:
         assert message == (
             f"{cls} auth and an Authorization header cannot both be given, since each sets the "
