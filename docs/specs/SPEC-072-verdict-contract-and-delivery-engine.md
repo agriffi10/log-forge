@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-072
 title: "Verdict Contract and Delivery Engine"
 description: "Adds the optional per-event Verdict returned by deliver(batch), one delivery engine that resends only retryable events and writes a sink-owned counter object, and the worker, orphan and inline-emit paths that run it, proven against test sinks before any shipped sink adopts it."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-027, SPEC-058, SPEC-059, SPEC-061, SPEC-062, SPEC-066, SPEC-068, SPEC-070, SPEC-080]
 arc: stability-redesign
 arc_order: 4
