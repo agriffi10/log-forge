@@ -12,11 +12,10 @@ from log_foundry import _diag
 from log_foundry.sanitize import _int_text
 from log_foundry.sinks._retry import exact_int
 from log_foundry.sinks.base import (
-    _MRO,
-    _NAMESPACE,
+    _ABSENT,
     SinkLosses,
     _class_member,
-    _instance_dict,
+    _own_attribute,
     _static_value,
 )
 
@@ -209,10 +208,12 @@ def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> obj
 
     Args:
       sink: The sink.
-      override_rule: Whether an ``emit`` that would win ordinary lookup refuses the offer: one
-        in a class earlier in the MRO than the one defining ``deliver``, or one set on the
-        instance itself (``sink.emit = scrub``, ``mock.patch.object(sink, "emit")``), read from
-        the instance dict through :func:`~log_foundry.sinks.base._instance_dict` so no hook runs.
+      override_rule: Whether the offer requires that ``sink.emit``, as ordinary lookup would
+        resolve it, is a plain function defined on or below the class defining ``deliver``. So
+        an ``emit`` in an earlier class, one that is not a plain function (a property, a
+        ``staticmethod``), and one set on the instance (``sink.emit = scrub``,
+        ``mock.patch.object(sink, "emit")``) each refuse it; the instance is read through
+        :func:`~log_foundry.sinks.base._own_attribute`, so no hook runs.
       skip_none: Whether a ``deliver = None`` is passed over (the adapter) or refuses (the probe).
 
     Returns:
@@ -229,11 +230,10 @@ def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> obj
     if type(function) is not types.FunctionType:
         return None
     if override_rule:
-        for klass in _MRO(cls)[:index]:
-            if "emit" in _NAMESPACE(klass):
-                return None
-        own = _instance_dict(sink)
-        if own is not None and dict.__contains__(own, "emit"):
+        emit = _class_member(cls, "emit")
+        if emit is not None and (type(emit[0]) is not types.FunctionType or emit[1] < index):
+            return None
+        if _own_attribute(sink, "emit", emit) is not _ABSENT:
             return None
     return types.FunctionType.__get__(function, sink, cls)
 
@@ -282,7 +282,8 @@ def read_deliver(sink: object) -> Callable[[list[dict[str, object]]], Verdict] |
       nothing, and its own ``emit`` runs. A class attribute ``deliver = None`` is a declared
       opt-out, as is any ``deliver`` that is not a function (a ``staticmethod``, a property).
     - ``deliver`` is offered only when no class before the defining one in the MRO defines
-      ``emit``, and none is set on the instance itself, so a subclass that overrides ``emit`` to
+      ``emit``, the ``emit`` found is a plain function (a property or a ``staticmethod``
+      refuses), and none is set on the instance itself, so a subclass that overrides ``emit`` to
       stamp or scrub and then calls ``super().emit()`` keeps running its override, and so does an
       ``emit`` assigned on the instance (``sink.emit = scrub``, ``mock.patch.object``).
     - ``log_foundry_counters`` must be exactly a :class:`SinkCounters`, read statically, so a sink

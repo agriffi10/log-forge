@@ -1079,7 +1079,8 @@ def test_a_class_attribute_survives_an_unreadable_instance_dict(shape: str) -> N
 
     ``property-dict`` shadows ``__dict__`` where the class defines it, so no builtin getset exists;
     ``foreign-getset`` borrows an unrelated class's, whose ``__get__`` refuses this instance. An
-    instance attribute behind the property is the recorded limit: it is not seen.
+    instance attribute behind either is read through CPython's generic lookup and is seen; the
+    one recorded limit is an instance value shadowing a non-data descriptor behind such a dict.
     """
     from log_foundry.sinks.base import _ABSENT, _static_value
     from log_foundry.sinks.verdict import read_deliver
@@ -1107,9 +1108,9 @@ def test_a_class_attribute_survives_an_unreadable_instance_dict(shape: str) -> N
     obj = cls()
     assert _static_value(obj, "log_foundry_counters") is shared
     assert read_deliver(obj) is not None
-    if shape == "property-dict":
-        object.__setattr__(obj, "hidden", 1)
-        assert _static_value(obj, "hidden") is _ABSENT, "the limit FR-001 records"
+    object.__setattr__(obj, "hidden", 1)
+    assert _static_value(obj, "hidden") == 1 == obj.hidden
+    assert _static_value(obj, "absent") is _ABSENT
     assert ran == []
 
 

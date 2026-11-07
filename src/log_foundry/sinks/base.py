@@ -184,8 +184,9 @@ class Sink(Protocol):
     is reported: ``deliver(batch) -> Verdict`` (SPEC-072), which returns one ``Outcome`` per
     event, by index, instead of raising for the whole batch. ``read_deliver`` is the probe, and it
     reads the sink's **type** statically: ``deliver`` must be a plain function defined on the
-    class, no class earlier in the MRO than the one defining it may define ``emit`` (so a
-    subclass that overrides ``emit`` to stamp or scrub keeps running its override), and the sink
+    class, no class earlier in the MRO than the one defining it may define ``emit``, and no
+    ``emit`` may be set on the instance (so a subclass that overrides ``emit`` to stamp or scrub
+    keeps running its override, and so does ``sink.emit = scrub``), and the sink
     must also carry ``log_foundry_counters``, exactly a ``SinkCounters``, which the engine is
     the one writer of; ``losses()`` then returns ``log_foundry_counters.losses()``. A class
     attribute ``deliver = None`` declares an opt-out. When ``deliver`` is offered, the worker and
@@ -371,27 +372,83 @@ def _instance_dict(obj: object) -> dict[str, object] | None:
     return None
 
 
+_GENERIC_GETATTR = object.__getattribute__
+"""CPython's generic attribute lookup, unbound: no ``__getattribute__`` or ``__getattr__`` runs.
+
+Called only where it cannot run a descriptor: when the class holds nothing for the name, or a
+plain value whose type defines no ``__get__``, or a plain function, whose ``__get__`` is C. It
+reads the real instance dict whatever the class does to ``__dict__`` — a property, a borrowed
+getset — which no Python-level accessor can.
+"""
+
+_METHOD_FUNC = types.MethodType.__dict__["__func__"].__get__
+"""A bound method's ``__func__``, read through its builtin member."""
+
+_METHOD_SELF = types.MethodType.__dict__["__self__"].__get__
+"""A bound method's ``__self__``, read through its builtin member."""
+
+
+def _own_attribute(obj: object, name: str, member: tuple[object, int] | None) -> object:
+    """Returns the value ``obj``'s own instance dict holds for ``name``, or :data:`_ABSENT`.
+
+    ``member`` is the class's (from :func:`_class_member`); the caller has already ruled out a
+    data descriptor. Three routes, chosen so that none runs a hook:
+
+    - nothing on the class, or a value whose type defines no ``__get__``: CPython's generic
+      lookup, which answers from the instance dict when it holds the name, else with the class
+      value (read here as "not the instance's own") or ``AttributeError``;
+    - a plain function: the generic lookup binds it in C when the instance does not shadow it, so
+      a bound method of that very function on this very object means "not the instance's own";
+    - any other non-data descriptor, whose ``__get__`` the generic lookup would call: the
+      instance dict read through :func:`_instance_dict`. **The one limit:** when the class
+      shadows ``__dict__`` where it defines it, an instance value shadowing such a descriptor is
+      not seen.
+
+    Args:
+      obj: The object.
+      name: The attribute's name, an exact ``str``.
+      member: ``_class_member(type(obj), name)``.
+
+    Returns:
+      The instance's own value, or :data:`_ABSENT`.
+
+    Raises:
+      Exception: Whatever an unusual object raises; callers guard.
+    """
+    held = None if member is None else member[0]
+    if member is None or _class_member(type(held), "__get__") is None:
+        try:
+            value = _GENERIC_GETATTR(obj, name)
+        except AttributeError:
+            return _ABSENT
+        return _ABSENT if member is not None and value is held else value
+    if type(held) is types.FunctionType:
+        value = _GENERIC_GETATTR(obj, name)
+        if type(value) is types.MethodType and _METHOD_FUNC(value) is held:
+            return _ABSENT if _METHOD_SELF(value) is obj else value
+        return value
+    own = _instance_dict(obj)
+    return _ABSENT if own is None else dict.get(own, name, _ABSENT)
+
+
 def _static_value(obj: object, name: str) -> object:
     """Reads one attribute the way ordinary access finds it, running none of the object's code.
 
     The order is CPython's own for an instance: a **data descriptor** on the class (one whose
-    type defines ``__set__`` or ``__delete__``) wins, then the instance's own ``__dict__``, then
-    any other class attribute. Every step reads through a builtin accessor — the MRO and the
-    class namespaces through ``type``'s unbound ones, the instance dict through the class's own
-    ``__dict__`` getset descriptor and its builtin ``__get__``, a ``__slots__`` member through its
-    builtin ``__get__`` — so no property, ``__getattr__``, ``__getattribute__``, descriptor
-    ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``, ``__hash__``) runs; the
-    one residue, a hostile ``str``-subclass namespace key's ``__eq__`` on a hash collision, is
-    :func:`_class_member`'s.
-    ``inspect.getattr_static`` was used here first and is not this: its shadowed-``__dict__``
-    check is ``lru_cache``-wrapped, so it hashes the class and can compare it, which runs a
-    metaclass's ``__hash__`` and ``__eq__`` (SPEC-072's first diff review, measured on 3.12 and
-    3.13). A slot that is unset reads as absent; any other descriptor is returned as found, so a
-    property reads as the property object and is refused by the caller's type test. The instance
-    dict is :func:`_instance_dict`'s; when it cannot be read, or reading the name in it raises,
-    the class's own member is still returned, so a class-level attribute is found even on a class
-    that shadows ``__dict__``. **The limit:** an instance attribute behind a ``__dict__`` the
-    class shadows where it defines it is not seen.
+    type defines ``__set__`` or ``__delete__``) wins, then the instance's own value, then any
+    other class attribute. The class side reads through ``type``'s unbound ``__mro__`` and
+    ``__dict__`` accessors and a ``__slots__`` member through its builtin ``__get__``; the
+    instance side is :func:`_own_attribute`'s. So no property, ``__getattr__``,
+    ``__getattribute__``, descriptor ``__get__`` or metaclass hook (``__mro__``, ``__name__``,
+    ``__eq__``, ``__hash__``) runs; the one residue, a hostile ``str``-subclass namespace key's
+    ``__eq__`` on a hash collision, is :func:`_class_member`'s. ``inspect.getattr_static`` was used
+    here first and is not this: its shadowed-``__dict__`` check is ``lru_cache``-wrapped, so it
+    hashes the class and can compare it, which runs a metaclass's ``__hash__`` and ``__eq__``
+    (SPEC-072's first diff review, measured on 3.12 and 3.13). A slot that is unset reads as
+    absent; any other descriptor is returned as found, so a property reads as the property object
+    and is refused by the caller's type test. Where the instance side raises, the class's own
+    member is still returned. ``tests/test_static_read_corpus.py`` holds this to ``getattr`` over
+    a corpus of class shapes, the divergences named case by case.
 
     Args:
       obj: The object to read.
@@ -415,13 +472,11 @@ def _static_value(obj: object, name: str) -> object:
     except Exception:
         return _ABSENT
     try:
-        own = _instance_dict(obj)
-        if own is not None:
-            value = dict.get(own, name, _ABSENT)
-            if value is not _ABSENT:
-                return value
+        own = _own_attribute(obj, name, found)
     except Exception:
-        pass
+        own = _ABSENT
+    if own is not _ABSENT:
+        return own
     return _ABSENT if found is None else found[0]
 
 

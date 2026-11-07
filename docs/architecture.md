@@ -468,8 +468,9 @@ sink, so each records its answer in its class docstring and a lint holds every s
 `Verdict`, `SinkCounters` and the probe `read_deliver` are public (`sinks/verdict.py`, re-exported
 from `log_foundry`); `deliver` is never declared on the `Sink` Protocol. The probe reads the sink's
 **type** and never runs a `__getattr__`, a property or a metaclass hook: `deliver` must be a plain
-function in a class namespace, no class earlier in the MRO may define `emit` (so an `emit`
-override that stamps or scrubs keeps running), and `log_foundry_counters` must be exactly a
+function in a class namespace, the `emit` ordinary lookup resolves must be a plain function on
+or below that class and not one set on the instance (so an `emit` override that stamps or scrubs
+keeps running, in a subclass or on the instance), and `log_foundry_counters` must be exactly a
 `SinkCounters`; a class attribute `deliver = None` opts out.
 
 One private engine, `sinks/_engine.py`, runs the rounds. The worker and the orphan path call

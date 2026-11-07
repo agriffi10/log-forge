@@ -200,13 +200,16 @@ for the reason `losses()` is not declared on it. `read_deliver(sink)` decides wh
   `None`, which is not a function, so a subclass of an engine sink can set it to keep delivering
   through its own `emit`. The probe stops at that `None`; the adapter's lookup (FR-006) passes over
   it to an inherited `deliver`, because an opt-out means "do not offer", not "do not have".
-- `deliver` is offered only when no `emit` would win ordinary lookup over it: no class in
-  `type(sink).__mro__` before the one that defines `deliver` defines `emit`, and **no `emit` is set
-  on the instance itself**. A subclass that overrides `emit` to scrub or stamp a batch and then
-  calls `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
+- `deliver` is offered only when the `emit` ordinary lookup resolves on the sink — the one the
+  worker would call — is a plain function defined on or below the class that defines `deliver`:
+  no class in `type(sink).__mro__` before that one defines `emit`, the `emit` found is a plain
+  function (a property or a `staticmethod` refuses), and **no `emit` is set on the instance
+  itself**. A subclass that overrides `emit` to scrub or stamp a batch and then calls
+  `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
   adapter (FR-006) runs the engine below it. So does an `emit` assigned on the instance —
-  `sink.emit = scrub`, or `mock.patch.object(sink, "emit")` in a test — read from the instance dict
-  through the same builtin getset path the static read below uses, so no hook runs.
+  `sink.emit = scrub`, or `mock.patch.object(sink, "emit")` in a test — read without a hook as
+  the static read below reads the instance. `tests/test_static_read_corpus.py` derives each
+  case's answer from Python's own resolution of `sink.emit` and holds the probe to it.
 - `log_foundry_counters` is read statically on the sink — CPython's lookup order (a class data
   descriptor, then the instance `__dict__`, then a class attribute) walked through builtin
   accessors only, `type`'s unbound `__mro__` and `__dict__`, the class's own `__dict__` getset
@@ -214,14 +217,16 @@ for the reason `losses()` is not declared on it. `read_deliver(sink)` decides wh
   `__get__` or metaclass hook (`__mro__`, `__name__`, `__eq__`, `__hash__`) runs — and must be
   exactly a `SinkCounters` (`type(v) is SinkCounters`; the class is `@final`) (FR-003). A sink
   that defines `deliver` with no counters keeps delivering through `emit`, so nothing is lost and
-  the engine never counts somewhere dishonest. Two limits are recorded rather than closed. When
-  the instance dict cannot be read — the class shadows `__dict__` where it defines it, or a
-  borrowed getset refuses the instance — the class's own member is still used, so a class-level
-  `log_foundry_counters` or `deliver` is found, but **an instance attribute behind a shadowed
-  `__dict__` is not seen**: such a sink with instance counters reaches its adapter's `TypeError`
-  on every batch, a counted failure. And the name is looked up in plain dicts, so on a hash
-  collision a namespace key that is a `str` subclass with its own `__eq__` runs that `__eq__`; only
-  a deliberately hostile class builder can plant one.
+  the engine never counts somewhere dishonest. The instance side is read through CPython's
+  generic lookup, `object.__getattribute__`, wherever that runs no descriptor — the class holds
+  nothing for the name, a value whose type has no `__get__`, or a plain function — so a class that
+  shadows `__dict__` with a property or a borrowed getset still has its instance attributes seen.
+  Two limits are recorded rather than closed, each a case in `tests/test_static_read_corpus.py`.
+  **An instance value shadowing a non-data descriptor** (one with `__get__` but neither `__set__`
+  nor `__delete__`) **behind such a shadowed `__dict__` is not seen**: the generic lookup would
+  run the descriptor, so the class's descriptor is read instead. And the name is looked up in
+  plain dicts, so on a hash collision a namespace key that is a `str` subclass with its own
+  `__eq__` runs that `__eq__`; only a deliberately hostile class builder can plant one.
 
 `read_deliver` returns the bound `deliver` when the sink offers it and `None` otherwise. Like
 `read_losses` it never raises and writes nothing. It is public for the reason `read_losses` is: a
@@ -1083,3 +1088,10 @@ tests/
   unreadable instance dict now keeps the class member instead of reading as absent, with the
   instance-attribute limit recorded in FR-001; the `str`-subclass-key `__eq__` residue is stated
   rather than claimed away; and FR-003's boundary says what an unreached shape costs a child.
+- 2026-11-07, the structural answer to three review frames' worth of one defect class: the
+  static read and the probe are now held to real attribute resolution by a differential corpus
+  (`tests/test_static_read_corpus.py`), its divergences written per case. Building it moved the
+  instance side onto CPython's generic lookup where that runs no descriptor, which narrowed the
+  shadowed-`__dict__` limit to an instance value over a non-data descriptor, and made the override
+  rule follow the `emit` ordinary lookup resolves (a property or `staticmethod` `emit` now refuses
+  the offer).
