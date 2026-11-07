@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from log_foundry import _lifecycle
+from log_foundry import _diag, _lifecycle
 from log_foundry.sanitize import _int_text
 
 if TYPE_CHECKING:
@@ -84,6 +84,11 @@ def _require_positive(name: str, value: object) -> int | None:
     hide the caller's mistake behind a ceiling they never chose, and under invariant 10 a float
     was already a ``mypy`` error for every type-checked caller.
 
+    **The test asks ``type``, never the value** (SPEC-071 FR-005): ``issubclass(type(value), T)``
+    reads the real type, so a value whose ``__class__`` property lies or raises is judged by what it
+    is and nothing of it runs, and the message names the type through its stored name
+    (``_diag._STORED_NAME``), which a metaclass ``__name__`` property cannot answer.
+
     An ``int`` instance — a ``bool``, an ``IntEnum`` member or any subclass — is of the declared
     type and works as the int it holds, so it is accepted; what is stored is
     ``int.__index__(value)``, which reads the integer from the int's own storage and ignores a
@@ -109,9 +114,11 @@ def _require_positive(name: str, value: object) -> int | None:
     """
     if value is None:
         return None
-    if not isinstance(value, int):
-        raise TypeError(f"{name} must be an int, got {type(value).__name__}")
-    exact = int.__index__(value)
+    if not issubclass(type(value), int):
+        raise TypeError(
+            f"{name} must be an int, got {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        )
+    exact = int.__index__(cast("int", value))
     if exact < 1:
         raise ValueError(f"{name} must be >= 1, got {_int_text(exact)}")
     return exact
@@ -128,6 +135,10 @@ def _require_text(name: str, value: object) -> str | None:
     would land in a ``str`` field. What is stored is ``str.__str__(value)``, an exact ``str``,
     so a ``StrEnum`` member is accepted and a ``str`` subclass instance never reaches an event.
 
+    The test is ``issubclass(type(value), str)``, the same real-type test
+    :func:`_require_positive` makes (SPEC-071 FR-005): a value whose ``__class__`` claims ``str``
+    used to reach ``str.__str__`` and raise its descriptor error, which named no setting.
+
     Args:
       name: The setting's name, used in the error message.
       value: The proposed stamp, or ``None`` to skip the check.
@@ -141,9 +152,11 @@ def _require_text(name: str, value: object) -> str | None:
     """
     if value is None:
         return None
-    if not isinstance(value, str):
-        raise TypeError(f"{name} must be a str, got {type(value).__name__}")
-    plain = str.__str__(value)
+    if not issubclass(type(value), str):
+        raise TypeError(
+            f"{name} must be a str, got {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        )
+    plain = str.__str__(cast("str", value))
     try:
         plain.encode("utf-8")
     except UnicodeEncodeError:

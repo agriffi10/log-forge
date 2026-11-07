@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import flush_sink, read_losses
 
@@ -64,8 +65,11 @@ class FilteringSink:
           None.
 
         Raises:
+          TypeError: If ``predicate`` is neither callable nor ``None``, refused here rather than
+            raised out of every ``emit`` (SPEC-071 FR-005).
           ValueError: If the minimum level is not one of the five standard names.
         """
+        require_callable(predicate, "predicate", type(self).__name__)
         self._inner = inner
         self._stop_signal: threading.Event | None = None
         self._predicate = predicate

@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 import threading
 import time
+from typing import cast
 
+from log_foundry import _diag
 from log_foundry.sanitize import _int_text
 
 __all__ = ["MAX_WAIT", "clamp_server_delay", "usable_timeout", "wait"]
@@ -101,6 +103,10 @@ def _exact_number(value: float) -> float:
     has already refused a non-number never sees this branch and one that has not keeps the
     comparison's own ``TypeError``, which :func:`usable_timeout` documents as unchanged.
 
+    The branch is chosen on the real type, ``issubclass(type(value), int)`` (SPEC-071 FR-005),
+    so a real ``float`` subclass whose ``__class__`` property claims ``int`` is read as the float
+    it holds instead of reaching ``int.__index__`` and its descriptor error.
+
     Args:
       value: The caller's number, possibly a subclass instance.
 
@@ -110,9 +116,9 @@ def _exact_number(value: float) -> float:
     Raises:
       None.
     """
-    if isinstance(value, int):
-        return int.__index__(value)
-    if isinstance(value, float):
+    if issubclass(type(value), int):
+        return int.__index__(cast("int", value))
+    if issubclass(type(value), float):
         return float.__float__(value)
     return value
 
@@ -217,8 +223,11 @@ def exact_seconds(value: float, name: str, owner: str) -> float:
       TypeError: When the value is not an ``int`` or ``float`` instance, in
         :func:`require_timeout`'s message shape.
     """
-    if not isinstance(value, int | float):
-        raise TypeError(f"{owner} {name} must be a number of seconds, not {type(value).__name__}")
+    if not issubclass(type(value), int | float):
+        raise TypeError(
+            f"{owner} {name} must be a number of seconds, "
+            f"not {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        )
     return _exact_number(value)
 
 
@@ -251,8 +260,11 @@ def require_positive(value: int, name: str, owner: str) -> int:
         comparison raising an unnamed one.
       ValueError: When the exact value is zero or negative.
     """
-    if not isinstance(value, int):
-        raise TypeError(f"{owner} {name} must be an integer, not {type(value).__name__}")
+    if not issubclass(type(value), int):
+        raise TypeError(
+            f"{owner} {name} must be an integer, "
+            f"not {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        )
     exact = int.__index__(value)
     if exact <= 0:
         raise ValueError(f"{owner} {name} must be a positive integer, not {_int_text(exact)}")
@@ -286,8 +298,11 @@ def exact_int(value: int, name: str, owner: str) -> int:
       TypeError: When the value is not an ``int`` instance — a ``float`` (``nan`` and ``inf``
         included), a ``str``, ``None``, or a number that only worked by duck typing.
     """
-    if not isinstance(value, int):
-        raise TypeError(f"{owner} {name} must be an integer, not {type(value).__name__}")
+    if not issubclass(type(value), int):
+        raise TypeError(
+            f"{owner} {name} must be an integer, "
+            f"not {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        )
     return int.__index__(value)
 
 
@@ -352,10 +367,10 @@ def wait_budget(value: float | None, name: str) -> float | None:
     """
     if value is None:
         return None
-    if not isinstance(value, int | float):
+    if not issubclass(type(value), int | float):
         raise TypeError(
             f"{name} must be an int or float number of seconds, or None, "
-            f"not {type(value).__name__}"
+            f"not {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
         )
     exact = _exact_number(value)
     if exact != exact:

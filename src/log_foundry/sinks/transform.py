@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.sanitize import _coerce_unbounded
+from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._deferral import Deferral, wrapped_losses
 from log_foundry.sinks.base import flush_sink, read_losses
 
@@ -151,8 +152,10 @@ class TransformSink:
           None.
 
         Raises:
-          None.
+          TypeError: If ``fn`` is not callable, refused here rather than raised out of every
+            ``emit`` (SPEC-071 FR-005).
         """
+        require_callable(fn, "fn", type(self).__name__, optional=False)
         self._inner = inner
         self._stop_signal: threading.Event | None = None
         self._fn = fn

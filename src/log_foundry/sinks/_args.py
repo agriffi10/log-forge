@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from log_foundry import _diag
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -46,3 +48,50 @@ def refuse_with_injected(
             f"{owner} cannot apply {', '.join(names)} to an injected {kind}; pass them where the "
             f"{kind} is built, or drop {kind}="
         )
+
+
+def require_callable(
+    value: object, name: str, owner: str, *, text: bool = False, optional: bool = True
+) -> None:
+    """Refuses, at the constructor, an argument the sink will call but that is not callable.
+
+    Seven constructor arguments are called later, per event or at ``close()``, and none was tested:
+    ``message_group_id=5`` constructed and then raised ``'int' object is not callable`` out of
+    every ``emit`` (SPEC-071 FR-005). The reach of a type refusal extends to every callable
+    argument a constructor stores, whether or not the selected branch reads it: the value is
+    outside the declared type, so no type-checked caller breaks (the bad-argument decision).
+
+    **It asks the type, never the value.** ``callable(value)`` reads the type's call slot, and the
+    ``str`` route is ``issubclass(type(value), str)``, so a value whose ``__class__`` claims to be a
+    ``str`` or a function is judged by what it is and nothing of it runs. The message names the
+    type through its stored name (``_diag._STORED_NAME``), which a metaclass ``__name__`` property
+    cannot answer.
+
+    Args:
+      value: The argument.
+      name: Its keyword, for the message.
+      owner: The constructing class's name, for the message.
+      text: Also accept a value whose real type is a ``str`` subclass (``message_group_id``).
+      optional: Accept ``None``; ``False`` for a required callable (``CallbackSink``'s ``fn``).
+
+    Returns:
+      None.
+
+    Raises:
+      TypeError: When the value is none of what is accepted, naming the owner, the argument and
+        the type: ``must be callable or None``, ``must be callable`` without ``optional``, or
+        ``must be a str, a callable or None`` with ``text``.
+    """
+    if optional and value is None:
+        return
+    if callable(value):
+        return
+    if text and issubclass(type(value), str):
+        return
+    if text:
+        wanted = "a str, a callable or None" if optional else "a str or a callable"
+    else:
+        wanted = "callable or None" if optional else "callable"
+    raise TypeError(
+        f"{owner} {name} must be {wanted}, not {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+    )

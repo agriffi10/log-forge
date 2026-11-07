@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 from log_foundry import _diag
+from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
@@ -143,12 +144,20 @@ class SQSSink:
           None.
 
         Raises:
-          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), or if ``message_group_id``
+            is not a ``str``, a callable or ``None``, or ``message_deduplication_id`` is neither
+            callable nor ``None`` (SPEC-071 FR-005). Both are judged on a standard queue too,
+            which never reads either: the value is outside the declared type.
           ValueError: If a constant group id is blank.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
+        require_callable(message_group_id, "message_group_id", "SQSSink", text=True)
+        require_callable(message_deduplication_id, "message_deduplication_id", "SQSSink")
         self.max_retries = floor_count(max_retries, 0, "max_retries", "SQSSink")
-        if isinstance(message_group_id, str) and not message_group_id.strip():
+        if (
+            issubclass(type(message_group_id), str)
+            and not _diag._STR_STR(cast("str", message_group_id)).strip()
+        ):
             raise ValueError(
                 "message_group_id must be a non-empty string; pass None to group by trace_id"
             )
@@ -254,8 +263,11 @@ class SQSSink:
         """Resolves one event's ``MessageGroupId`` (SPEC-016 FR-002).
 
         A constant is used as given, a callable is asked, and otherwise the event's own
-        ``trace_id`` groups it. Every route is bounded, so a caller's callable returning an empty
-        string cannot put an empty parameter on the wire.
+        ``trace_id`` groups it. The constant is told apart by its real type and read through
+        ``str.__str__`` (SPEC-071 FR-005), so a callable whose ``__class__`` claims ``str`` is
+        still asked, and a ``str`` subclass's own ``strip`` never runs per event. Every route is
+        bounded, so a caller's callable returning an empty string cannot put an empty parameter on
+        the wire.
 
         Args:
           event: The event being sent.
@@ -268,10 +280,10 @@ class SQSSink:
             into a drop of this one event (SPEC-058 FR-004).
         """
         source = self.message_group_id
-        if isinstance(source, str):
-            raw = source
+        if issubclass(type(source), str):
+            raw = _diag._STR_STR(cast("str", source))
         elif source is not None:
-            raw = source(event)
+            raw = cast("Callable[[dict[str, object]], str]", source)(event)
         else:
             raw = str(event.get("trace_id", ""))
         return _bounded(raw, DEFAULT_GROUP_ID)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from log_foundry.sinks._args import require_callable
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -45,8 +47,12 @@ class CallbackSink:
           None.
 
         Raises:
-          None.
+          TypeError: If ``fn`` is not callable, or ``on_close`` is neither callable nor ``None``,
+            refused here rather than raised out of every ``emit`` or out of ``close()``
+            (SPEC-071 FR-005).
         """
+        require_callable(fn, "fn", type(self).__name__, optional=False)
+        require_callable(on_close, "on_close", type(self).__name__)
         self._fn = fn
         self._on_close = on_close
 
