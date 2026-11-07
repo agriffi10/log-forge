@@ -236,32 +236,65 @@ def test_the_workers_predicate_declines_through_deliver() -> None:
     assert delivery is not None and delivery.declined and delivery.failed
 
 
+def _join_margin_compares(source: str) -> list[str]:
+    """The scope of every comparison that names ``_JOIN_MARGIN`` anywhere inside it.
+
+    Every ``Compare`` node in the module is read, at any depth and in any scope — a method, an
+    async function, a lambda, a class body or the module itself — and named by the qualified
+    path of the scopes enclosing it (``Worker._retry_declined``, ``f.<lambda>``, ``<module>``).
+    A use of the name outside a comparison — its assignment, an argument — is not one.
+    """
+    found: list[str] = []
+
+    def visit(node: ast.AST, scope: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            inner = scope
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                inner = (*scope, child.name)
+            elif isinstance(child, ast.Lambda):
+                inner = (*scope, "<lambda>")
+            if isinstance(child, ast.Compare) and any(
+                isinstance(n, ast.Name) and n.id == "_JOIN_MARGIN" for n in ast.walk(child)
+            ):
+                found.append(".".join(scope) or "<module>")
+            visit(child, inner)
+
+    visit(ast.parse(source), ())
+    return found
+
+
 def test_the_join_margin_comparison_is_written_once_in_retry_declined() -> None:
-    """FR-002 AC9: one ``... + _JOIN_MARGIN > ...`` across the worker and the engine."""
-    worker_tree = ast.parse(_WORKER.read_text(encoding="utf-8"))
+    """FR-002 AC9: exactly one comparison naming ``_JOIN_MARGIN``, in ``Worker._retry_declined``."""
+    worker_source = _WORKER.read_text(encoding="utf-8")
     assert any(
         isinstance(n, ast.AnnAssign | ast.Assign)
         and "_JOIN_MARGIN" in {t.id for t in ast.walk(n) if isinstance(t, ast.Name)}
-        for n in worker_tree.body
+        for n in ast.parse(worker_source).body
     ), "worker.py no longer defines _JOIN_MARGIN"
-    owners: list[str] = []
-    for path, tree in ((_WORKER, worker_tree), (_ENGINE, ast.parse(_ENGINE.read_text("utf-8")))):
-        owners.extend(
-            f"{path.name}:{scope.name}"
-            for scope in ast.walk(tree)
-            if isinstance(scope, ast.FunctionDef)
-            for node in ast.walk(scope)
-            if isinstance(node, ast.Compare)
-            and any(
-                isinstance(side, ast.BinOp)
-                and isinstance(side.op, ast.Add)
-                and any(isinstance(n, ast.Name) and n.id == "_JOIN_MARGIN" for n in ast.walk(side))
-                for side in (node.left, *node.comparators)
-            )
-        )
-    assert owners == ["worker.py:_retry_declined"], owners
-    cls = next(n for n in worker_tree.body if isinstance(n, ast.ClassDef) and n.name == "Worker")
-    assert any(isinstance(n, ast.FunctionDef) and n.name == "_retry_declined" for n in cls.body)
+    owners = [f"worker.py:{scope}" for scope in _join_margin_compares(worker_source)]
+    owners += [
+        f"_engine.py:{scope}"
+        for scope in _join_margin_compares(_ENGINE.read_text(encoding="utf-8"))
+    ]
+    assert owners == ["worker.py:Worker._retry_declined"], owners
+
+
+def test_the_join_margin_scan_reads_every_scope_and_only_comparisons() -> None:
+    """The scan's corpus: each scope a comparison can hide in is named, and other uses are not."""
+    source = (
+        "_JOIN_MARGIN = 0.1\n"
+        "keep = [_JOIN_MARGIN, min(_JOIN_MARGIN, 1)]\n"
+        "early = 1 > _JOIN_MARGIN\n"
+        "class W:\n"
+        "    def a(self, t):\n"
+        "        return t - _JOIN_MARGIN < 0\n"
+        "    async def b(self):\n"
+        "        return (lambda x: x + _JOIN_MARGIN >= 2)(1)\n"
+        "    def c(self):\n"
+        "        return f(_JOIN_MARGIN), _JOIN_MARGIN * 2\n"
+    )
+    assert _join_margin_compares(source) == ["<module>", "W.a", "W.b.<lambda>"]
+    assert _join_margin_compares("_JOIN_MARGIN = 0.1\nx = f(_JOIN_MARGIN)\n") == []
 
 
 def _emit_method() -> ast.FunctionDef:

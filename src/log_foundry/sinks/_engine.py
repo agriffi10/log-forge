@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import math
 import threading
 import time
@@ -13,17 +12,8 @@ from log_foundry import _diag
 from log_foundry.sinks import _retry
 from log_foundry.sinks._classify import ErrorPredicate, is_retryable
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks.base import SinkDeliveryError
-from log_foundry.sinks.verdict import (
-    _ABSENT,
-    Outcome,
-    SinkCounters,
-    Verdict,
-    _bound_deliver,
-    _class_member,
-    _probe,
-    _static_value,
-)
+from log_foundry.sinks.base import _ABSENT, SinkDeliveryError, _class_member, _static_value
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict, _bound_deliver, _probe
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -60,7 +50,7 @@ from attempt 1025; its loop now calls :func:`cycle_backoff` too.
 """
 
 _MAX_WAIT_INT: Final = int(_retry.MAX_WAIT)
-""":data:`_retry.MAX_WAIT` as an ``int``, so a huge ``int`` hint is compared without converting it."""
+""":data:`_retry.MAX_WAIT` as an ``int``, so a huge ``int`` hint is compared unconverted."""
 
 _RAISED: Final = object()
 """The fate of an event in a round whose ``deliver`` raised an ``Exception``."""
@@ -69,7 +59,7 @@ _UNREAD: Final = object()
 """The fate of an event in a round whose verdict could not be read."""
 
 _RESENDABLE_IF_IDEMPOTENT: Final = (Outcome.UNKNOWN, _UNREAD, _RAISED)
-"""Fates resent only by a sink that declares itself idempotent; ``_RAISED`` also asks its predicate."""
+"""Fates resent only by an idempotent sink; ``_RAISED`` also asks the sink's predicate."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -286,9 +276,9 @@ def _predicate_of(sink: object) -> ErrorPredicate | None:
             return None
         member = _class_member(type(sink), "_retryable_error")
         if member is not None and member[0] is found:
-            binder = inspect.getattr_static(type(found), "__get__", _ABSENT)
-            if binder is not _ABSENT:
-                found = binder(found, sink, type(sink))
+            binder = _class_member(type(found), "__get__")
+            if binder is not None:
+                found = cast("Callable[..., object]", binder[0])(found, sink, type(sink))
         if not callable(found):
             return None
     except Exception:

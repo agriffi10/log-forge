@@ -204,8 +204,12 @@ for the reason `losses()` is not declared on it. `read_deliver(sink)` decides wh
   `deliver` defines `emit`. A subclass that overrides `emit` to scrub or stamp a batch and then calls
   `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
   adapter (FR-006) runs the engine below it.
-- `log_foundry_counters` is read with `inspect.getattr_static` on the sink, a `__slots__` member
-  resolved through its own C-level descriptor, and must be exactly a `SinkCounters`
+- `log_foundry_counters` is read statically on the sink — CPython's lookup order (a class data
+  descriptor, then the instance `__dict__`, then a class attribute) walked through builtin
+  accessors only, `type`'s unbound `__mro__` and `__dict__`, the class's own `__dict__` getset
+  descriptor and a `__slots__` member's descriptor, so no property, `__getattr__`, descriptor
+  `__get__` or metaclass hook (`__mro__`, `__name__`, `__eq__`, `__hash__`) runs — and must be
+  exactly a `SinkCounters`
   (`type(v) is SinkCounters`; the class is `@final`) (FR-003). A sink that defines `deliver` with
   no counters keeps delivering through `emit`, so nothing is lost and the engine never counts
   somewhere dishonest.
@@ -426,9 +430,9 @@ and the sinks this spec ships the engine for are third-party ones, so such a sin
 and never becomes a holder: the `continue` the walk takes at a holder `_is_owned` refuses never sees
 it. The reach is instead at **the value the walk would not push** — an attribute of an owned holder,
 such as the `Worker`'s `sink`, or a member of a container it walks. There
-the walk reads the one attribute `log_foundry_counters` with `inspect.getattr_static` (no
-third-party code runs in the at-fork handler), resolving a `__slots__` member through its own
-C-level descriptor, and when the result is exactly `SinkCounters` it pushes the counters, which are
+the walk reads the one attribute `log_foundry_counters` with the same static read FR-001's probe
+uses (no third-party code, metaclass `__eq__` and `__hash__` included, runs in the at-fork
+handler), resolving a `__slots__` member through its builtin descriptor, and when the result is exactly `SinkCounters` it pushes the counters, which are
 the package's own and so are walked, which replaces their lock. `SinkCounters` is found through
 `sys.modules` once per walk, never imported, since an import in a child not yet returned from
 `fork` can deadlock; a process that never loaded `sinks.verdict` holds none to repair. A value of a
@@ -587,12 +591,12 @@ unadjudicable `2xx`: the events are counted `failed_events`, the run never fails
 `flush()` stays true, and the loss is in `health().sink` and on stderr.
 
 **Either is resent only by a sink that declares itself idempotent**, that is, a
-`log_foundry_idempotent` read with `inspect.getattr_static` that `is True` (a truthy non-`bool` is
+`log_foundry_idempotent` read statically (FR-001's read) that `is True` (a truthy non-`bool` is
 not a declaration). For an escaped exception the engine also asks SPEC-070's
 `sink._retryable_error`, found statically too and then **bound**, through
 `is_retryable(predicate, exc)`, never by a direct call, and resends only when it answers `True`, so a
-`TypeError` is never resent even by an idempotent sink. Found statically on an instance,
-`inspect.getattr_static` returns the class's unbound function, which `is_retryable` would call with
+`TypeError` is never resent even by an idempotent sink. Found statically on an instance, a
+method is the class's unbound function, which `is_retryable` would call with
 one argument short: it raises `TypeError` inside the wrapper, answers `False`, and every predicate
 would be refused silently. So a predicate found on the class is bound through
 its type's `__get__`, `type(found).__get__(found, sink, type(sink))`, which is SPEC-070's contract
@@ -1053,3 +1057,9 @@ tests/
   adapter's lookup passes over it to an inherited `deliver` (orchestrator's ruling); a stop event
   whose `wait` raises is announced once and the rest of the run sleeps; FR-006's door contributes
   both plant kinds to the door guard's sweep and takes no exemption.
+- 2026-11-07, first diff review: the static reads (`read_deliver`'s counters, the engine's members,
+  the fork reach) no longer use `inspect.getattr_static`, whose `lru_cache`d shadowed-`__dict__`
+  check hashed and compared the sink's class and so ran a metaclass's `__hash__` and `__eq__`
+  (measured on 3.12 and 3.13); they read through builtin accessors only, in CPython's order, and a
+  test holds a recording metaclass to no call. The fork reach's container branch, the only repair
+  for an engine sink inside `MultiSink`, gained its own test and positive control.

@@ -659,7 +659,8 @@ def test_the_engines_diagnostics_are_on_the_roster() -> None:
     """SPEC-072 FR-003 AC9: the engine's lines are ``_diag.<writer>`` calls the scan above sees.
 
     A ``from log_foundry._diag import lost`` would be a bare-name call this walker never matches,
-    so the repr check would pass the engine vacuously; holding its count here is what stops that.
+    so the repr check would pass the engine vacuously; pinning the exact count here stops that,
+    and a writer added or removed is a visible edit here.
     """
     engine = _SRC / "sinks" / "_engine.py"
     writers = sorted(
@@ -668,7 +669,9 @@ def test_the_engines_diagnostics_are_on_the_roster() -> None:
         if isinstance(call.func, ast.Attribute)
         and call.func.attr in {"lost", "absorbed", "pending"}
     )
-    assert writers.count("lost") >= 1 and writers.count("absorbed") >= 2, writers
+    assert writers == ["absorbed", "absorbed", "absorbed", "lost"], (
+        f"the engine writes three absorbed lines and one lost line, as _diag calls: {writers}"
+    )
 
 
 _STDERR_NAMES = {"stderr", "__stderr__"}

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import types
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, cast, runtime_checkable
 
 __all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "flush_sink", "read_losses"]
 
@@ -287,6 +288,105 @@ class Sink(Protocol):
           Exception: Whatever releasing the transport raises; the worker absorbs it.
         """
         ...
+
+
+_ABSENT: Final = object()
+"""What :func:`_static_value` answers for an attribute that is missing or cannot be read."""
+
+_MRO = type.__dict__["__mro__"].__get__
+"""``type.__mro__``, unbound, so a metaclass ``__mro__`` property is never consulted."""
+
+_NAMESPACE = type.__dict__["__dict__"].__get__
+"""``type.__dict__``, unbound, so a class's own namespace is read without any hook running."""
+
+_GETSET_GET = types.GetSetDescriptorType.__get__
+"""The builtin ``__get__`` of a getset descriptor: the instance ``__dict__`` slot, read in C."""
+
+_MEMBER_GET = types.MemberDescriptorType.__get__
+"""The builtin ``__get__`` of a ``__slots__`` member descriptor, read in C."""
+
+
+def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[object, int] | None:
+    """Finds ``name`` in a class's own MRO namespaces, returning the value and its MRO index.
+
+    The MRO and each namespace are read through the unbound ``type`` accessors, so no metaclass
+    hook runs — no ``__mro__`` or ``__dict__`` property, and no ``__eq__`` or ``__hash__``,
+    since nothing here hashes or compares a class. With ``skip_none`` a ``None`` found in a
+    namespace is passed over and the walk goes on, which is how SPEC-072's adapter reads a
+    ``deliver = None`` opt-out: "do not offer", not "do not have".
+
+    Args:
+      cls: The class to search.
+      name: The member's name, an exact ``str``.
+      skip_none: Whether a ``None`` value is passed over rather than returned.
+
+    Returns:
+      ``(value, index)`` for the first class in the MRO whose namespace holds ``name``, or
+      ``None``.
+
+    Raises:
+      Exception: Whatever an unusual class object raises while its MRO is read; callers guard.
+    """
+    for index, klass in enumerate(_MRO(cls)):
+        namespace = _NAMESPACE(klass)
+        if name in namespace:
+            value = namespace[name]
+            if value is None and skip_none:
+                continue
+            return value, index
+    return None
+
+
+def _static_value(obj: object, name: str) -> object:
+    """Reads one attribute the way ordinary access finds it, running none of the object's code.
+
+    The order is CPython's own for an instance: a **data descriptor** on the class (one whose
+    type defines ``__set__`` or ``__delete__``) wins, then the instance's own ``__dict__``, then
+    any other class attribute. Every step reads through a builtin accessor — the MRO and the
+    class namespaces through ``type``'s unbound ones, the instance dict through the class's own
+    ``__dict__`` getset descriptor and its builtin ``__get__``, a ``__slots__`` member through its
+    builtin ``__get__`` — so no property, ``__getattr__``, ``__getattribute__``, descriptor
+    ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``, ``__hash__``) runs.
+    ``inspect.getattr_static`` was used here first and is not this: its shadowed-``__dict__``
+    check is ``lru_cache``-wrapped, so it hashes the class and can compare it, which runs a
+    metaclass's ``__hash__`` and ``__eq__`` (SPEC-072's first diff review, measured on 3.12 and
+    3.13). A slot that is unset reads as absent; any other descriptor is returned as found, so a
+    property reads as the property object and is refused by the caller's type test. A class
+    whose ``__dict__`` is shadowed by something other than the builtin getset descriptor has its
+    instance dict read through the first builtin one further along the MRO, and not at all when
+    there is none.
+
+    Args:
+      obj: The object to read.
+      name: The attribute's name, an exact ``str``.
+
+    Returns:
+      The value, or :data:`_ABSENT` when it is missing or could not be read.
+
+    Raises:
+      None.
+    """
+    try:
+        cls = type(obj)
+        found = _class_member(cls, name)
+        if found is not None:
+            kind = type(found[0])
+            if kind is types.MemberDescriptorType:
+                return _MEMBER_GET(cast("types.MemberDescriptorType", found[0]), obj, cls)
+            if _class_member(kind, "__set__") or _class_member(kind, "__delete__"):
+                return found[0]
+        for klass in _MRO(cls):
+            holder = _NAMESPACE(klass).get("__dict__")
+            if type(holder) is types.GetSetDescriptorType:
+                own = _GETSET_GET(holder, obj, cls)
+                if issubclass(type(own), dict):
+                    value = dict.get(own, name, _ABSENT)
+                    if value is not _ABSENT:
+                        return value
+                break
+    except Exception:
+        return _ABSENT
+    return _ABSENT if found is None else found[0]
 
 
 def read_losses(sink: object) -> SinkLosses | None:

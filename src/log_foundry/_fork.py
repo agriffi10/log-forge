@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import collections
-import inspect
 import os
 import sys
 import threading
@@ -11,6 +10,7 @@ import types
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import _static_value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,7 +48,7 @@ _SCALAR_TYPES: tuple[type, ...] = (
 The counters reach is asked of every value the walk declines to push. For a buffering sink most
 of those are caller data — the strings and numbers inside the events a ``MemorySink`` holds — and
 in an idle process most are the package's own functions, classes and imported modules, so each
-would otherwise pay an ``inspect.getattr_static`` for an attribute that can never matter: none of
+would otherwise pay a static read for an attribute that can never matter: none of
 these types defines ``deliver``, so no engine run ever counts into counters one of them holds.
 Matched through :data:`_SKIPPED_TYPE_IDS`, by identity, never by ``in`` over a set of the types
 themselves, so a hostile metaclass ``__eq__`` or ``__hash__`` never runs here.
@@ -500,11 +500,12 @@ def _counters_reach(value: object, kind: type | None) -> Any | None:
     The walk enters only this package's own objects, and the sinks SPEC-072's engine counts for
     are typically third-party ones it never enters, so their counters' lock would stay dead in a
     child. This reads the one attribute :data:`_COUNTERS_ATTRIBUTE` with
-    ``inspect.getattr_static`` — no property, ``__getattr__`` or ``__getattribute__`` of the
-    third-party object runs — resolving a ``__slots__`` member through its own C-level
-    descriptor, and hands back the counters only when they are exactly ``SinkCounters``, which is
-    this package's own class and so is then walked as any owned holder is. Nothing else of the
-    value's namespace is read, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
+    ``sinks.base._static_value`` — no property, ``__getattr__``, ``__getattribute__``,
+    descriptor ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``,
+    ``__hash__``) of the third-party object runs — resolving a ``__slots__`` member through its
+    builtin descriptor, and hands back the counters only when they are exactly ``SinkCounters``,
+    which is this package's own class and so is then walked as any owned holder is. Nothing else of
+    the value's namespace is read, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
 
     Args:
       value: A value the walk would not push.
@@ -521,13 +522,29 @@ def _counters_reach(value: object, kind: type | None) -> Any | None:
     probed = type(value)
     if id(probed) in _SKIPPED_TYPE_IDS or issubclass(probed, type):
         return None
-    try:
-        found = inspect.getattr_static(value, _COUNTERS_ATTRIBUTE, None)
-        if type(found) is types.MemberDescriptorType:
-            found = found.__get__(value, probed)
-    except Exception:
-        return None
+    found = _static_value(value, _COUNTERS_ATTRIBUTE)
     return found if type(found) is kind else None
+
+
+def _container_push(child: object, kind: type | None) -> Any | None:
+    """Returns what the walk pushes for one member of a container it entered, or ``None``.
+
+    The member itself when the walk descends into it, else its counters through
+    :func:`_counters_reach`. This branch is the only repair for an engine sink held in a
+    container — ``MultiSink._sinks`` is a tuple — which is why it is a function of its own: a
+    test can take this branch away alone and watch that child hang.
+
+    Args:
+      child: A member of the container.
+      kind: ``SinkCounters``, from :func:`_counters_type`, or ``None``.
+
+    Returns:
+      The value to push, or ``None``.
+
+    Raises:
+      None.
+    """
+    return child if _is_traversable(child) else _counters_reach(child, kind)
 
 
 def _reinit_primitives() -> list[Any]:
@@ -550,7 +567,7 @@ def _reinit_primitives() -> list[Any]:
     exactly a ``SinkCounters``, so a third-party engine sink's counters' lock is replaced like an
     owned one. ``SinkCounters`` is looked up in ``sys.modules`` once per walk, not per value, and
     a scalar is skipped before the static read, so the reach adds one type test per value the
-    walk declines and an ``inspect.getattr_static`` per non-scalar one. Its boundary is the one
+    walk declines and one static read per non-scalar one. Its boundary is the one
     level it reads: an engine sink held *inside* a third-party wrapper, or a sink that is itself
     a third-party container subclass, is not reached.
 
@@ -586,7 +603,7 @@ def _reinit_primitives() -> list[Any]:
         seen.add(id(holder))
         if _is_container(holder):
             for child in _container_children(holder):
-                pushed = child if _is_traversable(child) else _counters_reach(child, counters_type)
+                pushed = _container_push(child, counters_type)
                 if pushed is not None:
                     stack.append(pushed)
         if not isinstance(holder, types.ModuleType | type):

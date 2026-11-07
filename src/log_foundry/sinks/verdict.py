@@ -3,30 +3,20 @@
 from __future__ import annotations
 
 import enum
-import inspect
 import threading
 import types
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Self, cast, final
+from typing import TYPE_CHECKING, Self, cast, final
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
 from log_foundry.sinks._retry import exact_int
-from log_foundry.sinks.base import SinkLosses
+from log_foundry.sinks.base import _MRO, _NAMESPACE, SinkLosses, _class_member, _static_value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 __all__ = ["Outcome", "SinkCounters", "Verdict", "read_deliver"]
-
-_ABSENT: Final = object()
-"""What :func:`_static_value` answers for an attribute that is missing or cannot be read."""
-
-_MRO = type.__dict__["__mro__"].__get__
-"""``type.__mro__``, unbound, so a metaclass ``__mro__`` property is never consulted."""
-
-_NAMESPACE = type.__dict__["__dict__"].__get__
-"""``type.__dict__``, unbound, so a class's own namespace is read without any hook running."""
 
 
 class Outcome(enum.Enum):
@@ -205,65 +195,6 @@ class SinkCounters:
             dropped = self.dropped_events
             failed = self.failed_events
         return SinkLosses(dropped=dropped, failed=failed)
-
-
-def _static_value(obj: object, name: str) -> object:
-    """Reads one attribute without running any of the object's own code, or :data:`_ABSENT`.
-
-    ``inspect.getattr_static`` finds an attribute the way ordinary access would — the instance
-    dict, then the class's MRO — without calling a property, a ``__getattr__`` or a
-    ``__getattribute__``. A ``__slots__`` attribute comes back as its member descriptor, which
-    is resolved through its own C-level ``__get__`` (an unset slot raises and reads as absent);
-    any other descriptor is returned as found, so a property reads as the property object and is
-    refused by whatever type test the caller applies.
-
-    Args:
-      obj: The object to read.
-      name: The attribute's name.
-
-    Returns:
-      The value, or :data:`_ABSENT` when it is missing or could not be read.
-
-    Raises:
-      None.
-    """
-    try:
-        found = inspect.getattr_static(obj, name, _ABSENT)
-        if type(found) is types.MemberDescriptorType:
-            found = found.__get__(obj, type(obj))
-    except Exception:
-        return _ABSENT
-    return found
-
-
-def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[object, int] | None:
-    """Finds ``name`` in a class's own MRO namespaces, returning the value and its MRO index.
-
-    The MRO and each namespace are read through the unbound ``type`` accessors, so no metaclass
-    hook runs. With ``skip_none`` a ``None`` found in a namespace is passed over and the walk
-    goes on, which is how the adapter reads a ``deliver = None`` opt-out: "do not offer", not
-    "do not have".
-
-    Args:
-      cls: The class to search.
-      name: The member's name.
-      skip_none: Whether a ``None`` value is passed over rather than returned.
-
-    Returns:
-      ``(value, index)`` for the first class in the MRO whose namespace holds ``name``, or
-      ``None``.
-
-    Raises:
-      Exception: Whatever an unusual class object raises while its MRO is read; callers guard.
-    """
-    for index, klass in enumerate(_MRO(cls)):
-        namespace = _NAMESPACE(klass)
-        if name in namespace:
-            value = namespace[name]
-            if value is None and skip_none:
-                continue
-            return value, index
-    return None
 
 
 def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> object | None:

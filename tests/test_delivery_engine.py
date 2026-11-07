@@ -389,15 +389,31 @@ def test_the_engine_holds_no_lock_while_the_sink_runs() -> None:
 
 
 def test_the_decline_predicate_is_asked_after_each_wait_with_the_longest_round() -> None:
-    """FR-002 item 5: never before round one; a True ends the run unresolved and declined."""
+    """FR-002 item 5: never before round one, always after the wait; True ends the run declined.
+
+    The deliver calls, the waits and the predicate append to one list, so the order is asserted
+    rather than only the count: a predicate asked before its wait is a different list.
+    """
+    order: list[str] = []
     asked: list[float] = []
 
+    class Ordered(WaitRecorder):
+        def wait(self, timeout: float | None = None) -> bool:
+            order.append("wait")
+            return super().wait(timeout)
+
     def decline(longest: float) -> bool:
+        order.append("decline")
         asked.append(longest)
         return len(asked) == 2
 
-    sink = Scripted([R], max_retries=5, seconds=0.02)
-    delivery = _deliver(sink, events(2), decline=decline)
+    def answer(batch: list[dict[str, object]]) -> Verdict:
+        order.append("deliver")
+        return Verdict.uniform(R, len(batch))
+
+    sink = Scripted([answer], max_retries=5, seconds=0.02)
+    delivery = _deliver(sink, events(2), decline=decline, stop=Ordered())
+    assert order == ["deliver", "wait", "decline", "deliver", "wait", "decline"]
     assert sink.calls == 2
     assert len(asked) == 2 and min(asked) >= 0.02
     assert delivery.declined and delivery.unresolved == 2 and delivery.failed
@@ -940,3 +956,118 @@ def test_a_stop_event_whose_wait_raises_costs_only_its_waits(
     assert time.monotonic() - started >= 0.3 - 0.05, "the backoff was slept, not skipped"
     err = capsys.readouterr().err
     assert err.count("absorbed a failure while waiting between delivery rounds") == 1
+
+
+# --- the static reads run none of a hostile class's code (first diff review, m-1) ----------
+
+
+def _recording_metaclass(calls: list[str]) -> type:
+    """A metaclass whose ``__eq__``, ``__hash__``, ``__mro__`` and ``__name__`` record each call."""
+
+    def eq(cls: type, other: object) -> bool:
+        calls.append("__eq__")
+        return cls is other
+
+    def hashed(cls: type) -> int:
+        calls.append("__hash__")
+        return id(cls)
+
+    def mro(cls: type) -> tuple[type, ...]:
+        calls.append("__mro__")
+        return type.__dict__["__mro__"].__get__(cls)  # type: ignore[no-any-return]
+
+    def name(cls: type) -> str:
+        calls.append("__name__")
+        return "Claimed"
+
+    return type(
+        "_RecordingMeta",
+        (type,),
+        {"__eq__": eq, "__hash__": hashed, "__mro__": property(mro), "__name__": property(name)},
+    )
+
+
+def _hostile_engine_sink(calls: list[str], script: list[Any]) -> Any:
+    """An idempotent engine sink built by :func:`_recording_metaclass`, with a predicate."""
+    namespace = {
+        "log_foundry_idempotent": True,
+        "_retryable_error": lambda self, err: True,
+        "max_retry_after": 0.5,
+    }
+    cls = _recording_metaclass(calls)("HostileSink", (Scripted,), namespace)
+    sink = cls(script, max_retries=3)
+    calls.clear()
+    return sink
+
+
+def test_no_static_read_runs_a_hostile_metaclass_hook(capsys: pytest.CaptureFixture[str]) -> None:
+    """``read_deliver``, the fork reach, ``run_delivery`` and the adapter read only builtins.
+
+    ``inspect.getattr_static`` hashed and compared the class through its ``lru_cache``d
+    shadowed-``__dict__`` check: measured ``['eq', 'hash']`` for ``read_deliver`` and four ``eq``
+    for ``run_delivery``. The script below takes every static read the engine makes — the probe,
+    the counters, ``max_retries``, ``max_retry_after``, the idempotence flag, the predicate and
+    its bind, the stop signal — and the commit's stored-name line.
+    """
+    from log_foundry import _fork
+    from log_foundry.sinks._engine import emit_via_deliver
+    from log_foundry.sinks.verdict import read_deliver
+
+    calls: list[str] = []
+    sink = _hostile_engine_sink(
+        calls, [ConnectionError("x"), Verdict(outcomes=(R, J), retry_after=0.1), [D], A]
+    )
+    sink.log_foundry_stop_signal = WaitRecorder()
+    assert read_deliver(sink) is not None
+    assert _fork._counters_reach(sink, SinkCounters) is sink.log_foundry_counters
+    delivery = _deliver(sink, events(2), worker_retries=1)
+    assert sink.calls == 3 and delivery.dropped == 1 and delivery.rejected == 1
+    sink.script = [J]
+    with pytest.raises(Exception, match=r"to HostileSink$"):
+        emit_via_deliver(sink, events(1))
+    assert "HostileSink" in capsys.readouterr().err
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "shape",
+    ["data-descriptor-first", "instance-dict-second", "class-attribute-last", "slot", "unset-slot"],
+)
+def test_the_static_read_keeps_cpythons_lookup_order(shape: str) -> None:
+    """A class data descriptor, then the instance dict, then a class attribute; slots resolved."""
+    from log_foundry.sinks.base import _ABSENT, _static_value
+
+    marker = SinkCounters()
+    if shape == "data-descriptor-first":
+        prop = property(lambda self: marker)
+        obj = type("D", (), {"x": prop})()
+        obj.__dict__["x"] = "shadowed"
+        assert _static_value(obj, "x") is prop
+    elif shape == "instance-dict-second":
+        obj = type("I", (), {"x": "class"})()
+        obj.x = marker  # type: ignore[attr-defined]
+        assert _static_value(obj, "x") is marker
+    elif shape == "class-attribute-last":
+        obj = type("C", (), {"x": marker})()
+        assert _static_value(obj, "x") is marker
+    else:
+        cls = type("S", (), {"__slots__": ("x",)})
+        obj = cls()
+        if shape == "slot":
+            obj.x = marker  # type: ignore[attr-defined]
+            assert _static_value(obj, "x") is marker
+        else:
+            assert _static_value(obj, "x") is _ABSENT
+
+
+def test_a_shadowed_dict_is_read_through_the_builtin_descriptor_further_along() -> None:
+    """A subclass's ``__dict__`` property never runs; the base's builtin getset reads the dict."""
+    ran: list[str] = []
+    base = type("Base", (), {})
+    shadow = type("Shadow", (base,), {"__dict__": property(lambda self: ran.append("p") or {})})
+    obj = shadow()
+    base.__dict__["__dict__"].__set__(obj, {"x": 7})
+    from log_foundry.sinks.base import _static_value
+
+    assert _static_value(obj, "x") == 7
+    assert ran == []

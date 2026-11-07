@@ -38,6 +38,7 @@ import pytest
 import log_foundry
 from conftest import install_worker
 from log_foundry import _fork, _lifecycle
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.http import HTTPSink
@@ -3956,6 +3957,60 @@ def test_a_child_repairs_an_engine_sinks_counters(shape: str) -> None:
     assert child.finished, f"the child {child.ending}, having written {child.output!r}"
     assert child.output == "failed=6 repaired=True", child.output
     assert parent_total == 5, "the parent's counters are its own"
+
+
+class _AdapterEngineSink(_StructuralEngineSink):
+    """A structural engine sink whose ``emit`` is the inline adapter, so a wrapper reaches it."""
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        return Verdict.uniform(Outcome.DROPPED, len(batch))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+
+def _forked_multisink_run() -> _Child:
+    """A ``MultiSink`` holding an adapter engine sink; its counters' lock held at the fork."""
+    inner = _AdapterEngineSink()
+    log_foundry.configure(service="fork", version="0", env="test", sink=MultiSink(inner))
+    parent_lock = id(inner.log_foundry_counters._counter_lock)
+    released, holder = _held_by_a_parent_thread(inner.log_foundry_counters._counter_lock)
+    at_the_call = "at-the-call;"
+
+    def run_then_read() -> str:
+        report_from_child(at_the_call)
+        log_foundry.info("child")
+        repaired = id(inner.log_foundry_counters._counter_lock) != parent_lock
+        return f"dropped={inner.log_foundry_counters.losses().dropped} repaired={repaired}"
+
+    try:
+        return run_in_child(run_then_read, timeout=5)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+
+def test_a_child_repairs_an_engine_sink_held_inside_a_multisink() -> None:
+    """SPEC-072 FR-003 AC6: the container branch is the only route to a ``MultiSink`` child.
+
+    ``MultiSink._sinks`` is a tuple, so the inner sink is a container member, never a namespace
+    value; the child's orphan reaches it through ``MultiSink.emit`` and the adapter's commit.
+    """
+    child = _forked_multisink_run()
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    assert child.output == "at-the-call;dropped=1 repaired=True", child.output
+
+
+def test_without_the_container_branch_the_multisink_child_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The positive control: only the container member's reach is taken away, and it hangs."""
+    monkeypatch.setattr(
+        _fork, "_container_push", lambda child, kind: child if _fork._is_traversable(child) else None
+    )
+    child = _forked_multisink_run()
+    assert child.output.startswith("at-the-call;"), f"never reached the call: {child.output!r}"
+    assert child.blocked, f"the unrepaired child did not block: it {child.ending}, {child.output!r}"
 
 
 def test_without_the_reach_the_same_child_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
