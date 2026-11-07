@@ -157,3 +157,35 @@ def test_a_nul_is_repaired_and_the_whole_batch_lands(
     assert "truncated" not in rows[0][1]
     assert rows[2][1]["fields"] == {"text": "\\u0000"}
     assert "truncated" not in rows[2][1]
+
+
+def test_a_permanent_refusal_is_one_attempt_against_a_real_server(
+    services_are_up: dict[str, Endpoint], table: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-070 FR-002 AC-6: a caller's ``VARCHAR(5)`` refuses ``warning``, and once is enough.
+
+    The insert raises ``StringDataRightTruncation`` (SQLSTATE ``22001``, a ``DataError``), which a
+    resend of the same rows meets again. Before SPEC-070 it was retried: ``2 attempts`` at
+    ``max_retries=1``. A one-event ``info`` batch through the same table lands, the positive
+    control that the schema, not the sink, is what refuses.
+    """
+    endpoint = services_are_up["postgres"]
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(
+            f"CREATE TABLE {table} (id BIGSERIAL PRIMARY KEY, timestamp TEXT, level VARCHAR(5), "
+            "trace_id TEXT, span_id TEXT, function TEXT, service TEXT, event JSONB NOT NULL)"
+        )
+        conn.commit()
+    sink = PostgresSink(table, dsn=dsn(endpoint), create_table=False, max_retries=1)
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{**event(1), "level": "info"}, {**event(2), "level": "warning"}])
+    assert sink.losses().failed == 2
+    err = capsys.readouterr().err
+    assert "lost 2 event(s); PostgresSink, 1 attempt(s), StringDataRightTruncation" in err
+
+    sink.emit([{**event(3), "level": "info"}])
+    sink.close()
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {table}")
+        assert cur.fetchone()[0] == 1

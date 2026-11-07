@@ -179,7 +179,8 @@ class PostgresSink:
         """Reports unencodable events, and events abandoned past the retry bound.
 
         ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        events of a batch abandoned past the retry bound (SPEC-026 FR-002).
+        events of a batch abandoned past the retry bound or, for a failure not worth retrying, at
+        its first attempt (SPEC-026 FR-002, SPEC-070).
 
         Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
         never waits on an in-flight insert and its backoff.
@@ -218,7 +219,8 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent. One transaction, rolled back on
+          SinkDeliveryError: When the retry bound is spent, or at once for a failure
+            :meth:`_retryable_error` does not retry (SPEC-070). One transaction, rolled back on
             failure, means such a batch inserted nothing, and the rollback is what makes the
             worker's retry safe here — there are no committed rows to duplicate (SPEC-026
             FR-001).
@@ -254,12 +256,13 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent, or when a non-empty batch produced no
-            chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049 FR-002, found by the
-            system-frame review): with the chunker yielding nothing this committed an empty
-            transaction and returned, having sent nothing, with every counter at zero. Raised
-            outside the retry loop, because a chunker that yields nothing will yield nothing four
-            times.
+          SinkDeliveryError: When the retry bound is spent, at once for a failure
+            :meth:`_retryable_error` does not retry (SPEC-070), or when a non-empty batch
+            produced no chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049
+            FR-002, found by the system-frame review): with the chunker yielding nothing this
+            committed an empty transaction and returned, having sent nothing, with every
+            counter at zero. Raised outside the retry loop, because a chunker that yields nothing
+            will yield nothing four times.
         """
         for attempt in range(self.max_retries + 1):
             try:

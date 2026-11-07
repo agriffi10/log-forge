@@ -261,9 +261,10 @@ class MongoDBSink:
         Raises:
           SinkDeliveryError: When the sink is already closed, since ``pymongo`` raises
             ``InvalidOperation`` on any use of a closed client and the library has its own word
-            for "none of this was delivered". Also when nothing was inserted (SPEC-026 FR-001) — a connection error
-            past the retry bound, or a bulk write every one of whose documents the server
-            rejected. A bulk write that stored some is partial and never raises. A batch of
+            for "none of this was delivered". Also when nothing was inserted (SPEC-026 FR-001)
+            — a connection error past the retry bound or one not worth retrying (SPEC-070), or a
+            bulk write every one of whose documents the server rejected. A bulk write that
+            stored some is partial and never raises. A batch of
             nothing but oversized documents does not raise either: they can never fit, so there
             is nothing to retry, and they are reported through :meth:`losses`. A raise leaves
             none of them counted.

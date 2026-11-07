@@ -133,7 +133,8 @@ class ClickHouseSink:
         """Reports unencodable events, and rows in a chunk abandoned past the retry bound.
 
         ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        rows of a chunk abandoned past the retry bound (SPEC-026 FR-002).
+        rows of a chunk abandoned past the retry bound or, for a failure not worth retrying, at
+        its first attempt (SPEC-026 FR-002, SPEC-070).
 
         Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
         never waits on an in-flight insert and its backoff.

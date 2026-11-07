@@ -80,7 +80,8 @@ class _RedisSink:
         """Reports unencodable events, and events abandoned past the retry bound.
 
         ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        events of a batch abandoned past the retry bound (SPEC-026 FR-002).
+        events of a batch abandoned past the retry bound or, for a failure not worth retrying, at
+        its first attempt (SPEC-026 FR-002, SPEC-070).
 
         Args:
           None.
@@ -118,7 +119,8 @@ class _RedisSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the sink is closed. Also when the retry bound is spent: the
+          SinkDeliveryError: When the sink is closed. Also when the retry bound is spent, or at
+            once for a failure ``_retryable_error`` does not retry (SPEC-070): the
             batch travels as one pipeline, so such a failure delivered nothing: it is counted and
             then raised, giving the worker its retry and ``health()`` the loss (SPEC-026 FR-001).
             There is no partial case to protect, because the pipeline is all or nothing.
@@ -148,7 +150,8 @@ class _RedisSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent.
+          SinkDeliveryError: When the retry bound is spent, or at once for a failure
+            :meth:`_retryable_error` does not retry (SPEC-070).
         """
         for attempt in range(self.max_retries + 1):
             try:
