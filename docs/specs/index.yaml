@@ -463,7 +463,7 @@ specs:
   - id: "SPEC-070"
     title: "Retry Classification: What a Sink Retries, Per Exception, Per Entry and for an Unreadable 2xx"
     description: "Makes every retry loop in the sinks ask a declared predicate whether an exception is worth another attempt, classifies a rejected queue entry per service from the vendor's documented codes, counts a 2xx whose body could not be read in every sink that reads a body, and records the deliberate exceptions in one table."
-    spec_status: "Draft"
+    spec_status: "In Progress"
     depends_on: ["SPEC-061", "SPEC-066", "SPEC-068"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-070-retry-classification.md"
