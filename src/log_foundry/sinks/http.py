@@ -846,6 +846,49 @@ def _wire_name(name: str) -> str:
     return name.capitalize().title()
 
 
+def _caller_encoding(headers: dict[str, str]) -> str | None:
+    """Returns the caller's ``Content-Encoding`` value, by the name ``urllib`` sends, or ``None``.
+
+    One reader for :meth:`HTTPSink._prepare` and any check at construction, so the two cannot
+    disagree about which header is the caller's. :func:`_valid_headers` has already refused two
+    names that fold together, so at most one matches. A value that is not a ``str`` is returned as
+    the empty string — it names no coding this module compresses for — and a ``str`` subclass as
+    the exact text it stores, so none of its methods runs.
+
+    Args:
+      headers: The caller's headers, already judged by :func:`_valid_headers`.
+
+    Returns:
+      The value, or ``None`` when the caller set no ``Content-Encoding``.
+
+    Raises:
+      None.
+    """
+    for name, value in headers.items():
+        if _wire_name(name) == "Content-Encoding":
+            return _diag._STR_STR(value) if issubclass(type(value), str) else ""
+    return None
+
+
+def _names_gzip(encoding: str) -> bool:
+    """Says whether a ``Content-Encoding`` value names gzip, the coding ``gzip=True`` applies.
+
+    A content-coding is case-insensitive (RFC 9110 §8.4.1), and a field value's surrounding space
+    and tab are optional whitespace, not part of it (§5.5), so ``GZIP`` and `` gzip `` name gzip.
+    A list of codings, ``gzip, br``, does not: it says the body is gzipped and then brotli'd.
+
+    Args:
+      encoding: The caller's ``Content-Encoding`` value.
+
+    Returns:
+      Whether it names gzip alone.
+
+    Raises:
+      None.
+    """
+    return encoding.strip(" \t").lower() == "gzip"
+
+
 def _unsendable_header(name: str, value: str) -> str | None:
     """Names why ``http.client`` cannot send one header, or returns ``None`` when it can.
 
@@ -952,24 +995,26 @@ _NOT_A_PAIR = (set, frozenset, Mapping)
 def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
     """Copies a ``(user, password)`` pair once into a ``tuple`` of two exact ``str``, or raises.
 
-    The unpack is the one ``_authorization`` used to perform on every ``emit``, so what it refuses
-    and the message it gets are unchanged — a non-iterable raises ``TypeError``, too few or too
-    many items ``ValueError``, and no more than three items are ever read. Its failure is caught
-    as a type name and the refusal raised outside the ``except``, so nothing chained carries the
-    credential.
+    A value outside the declared ``tuple[str, str]`` is refused rather than sent, breaking no
+    type-checked caller. A ``set`` or ``frozenset`` unpacks in hash order, so ``{"alice", "pw"}``
+    authenticated only when ``PYTHONHASHSEED`` happened to put the user first, and drew a
+    ``401`` on every request otherwise; a mapping unpacks into its keys. Those containers hold no
+    order, so they are judged by their real type **before** the unpack, and none of their
+    methods — an ``__iter__`` that raises with the caller's text, say — runs; a wrong-length one
+    gets this refusal rather than the unpack's.
 
-    A value that unpacks but is outside the declared ``tuple[str, str]`` is then refused rather
-    than sent, breaking no type-checked caller: each constructed and drew a ``401`` on every
-    request. A ``set`` or ``frozenset`` of two unpacks in hash order, so ``{"alice", "pw"}`` sent
-    either order depending on ``PYTHONHASHSEED``; a mapping unpacks into its keys; ``b"to"``
-    unpacks into two ``int``; and a ``bytes`` or ``None`` half was formatted as its ``repr``. The
-    container is judged after the unpack, so a container of the wrong length keeps the unpack's
-    message; nothing derived from its order is ever used. Both halves are judged by their real
-    types and copied with ``_diag._STR_STR``, which runs none of a subclass's methods. The message
-    names only the real type names, never a value. It is a ``ValueError`` although the fault is a
-    type, because every refusal of ``auth`` is one — ``auth=123`` has been
-    ``ValueError(... (TypeError))`` since SPEC-049 — and a caller catching the one exception
-    ``auth`` raises should not need a second.
+    The unpack is then the one ``_authorization`` used to perform on every ``emit``, so what it
+    refuses and the message it gets are unchanged for every other value — a non-iterable raises
+    ``TypeError``, too few or too many items ``ValueError``, and no more than three items are
+    ever read. Its failure is caught as a type name and the refusal raised outside the
+    ``except``, so nothing chained carries the credential. A value that unpacks into two items
+    that are not both ``str`` drew a ``401`` on every request: ``b"to"`` unpacks into two
+    ``int``, and a ``bytes`` or ``None`` half was formatted as its ``repr``. Both halves are
+    judged by their real types and copied with ``_diag._STR_STR``, which runs none of a
+    subclass's methods. The message names only the real type names, never a value. It is a
+    ``ValueError`` although the fault is a type, because every refusal of ``auth`` is one —
+    ``auth=123`` has been ``ValueError(... (TypeError))`` since SPEC-049 — and a caller catching
+    the one exception ``auth`` raises should not need a second.
 
     Args:
       auth: The credentials as the caller passed them, already known not to be a ``str``.
@@ -982,6 +1027,10 @@ def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
       ValueError: If the value does not unpack into exactly two items, is a ``set``,
         ``frozenset`` or mapping, or either item is not a ``str``.
     """
+    if issubclass(type(auth), _NOT_A_PAIR):
+        raise ValueError(  # noqa: TRY004
+            f"{owner} auth must be a str token or a pair of two str, not {_type_name(auth)}"
+        )
     failure: str | None = None
     try:
         user, password = cast("tuple[object, object]", auth)
@@ -989,10 +1038,6 @@ def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
         failure = type(err).__name__
     if failure is not None:
         raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
-    if issubclass(type(auth), _NOT_A_PAIR):
-        raise ValueError(  # noqa: TRY004
-            f"{owner} auth must be a str token or a pair of two str, not {_type_name(auth)}"
-        )
     if not (issubclass(type(user), str) and issubclass(type(password), str)):
         raise ValueError(  # noqa: TRY004
             f"{owner} auth must be a str token or a pair of two str, not a pair of "
@@ -1219,7 +1264,9 @@ class HTTPSink:
           url: The endpoint to POST to. Surrounding whitespace is stripped, as ``urllib``
             already stripped it before sending, so :attr:`url` reads back what goes on the wire.
           method: The HTTP method.
-          headers: Headers that override the sink's own defaults.
+          headers: Headers that override the sink's own defaults, read with ``dict()`` unless
+            ``None``, as :func:`merge_headers` reads a platform sink's, so the two agree: an
+            empty mapping is no headers, and ``0`` is refused rather than read as none.
           auth: A bearer token, or a ``(user, password)`` pair for basic auth. A token is a
             ``str``; a pair is any value — a ``tuple``, a ``list``, a one-shot iterator —
             unpacking into exactly two ``str``, other than a ``set``, ``frozenset`` or mapping,
@@ -1269,7 +1316,8 @@ class HTTPSink:
           TypeError: If ``max_retries`` or a supplied ``max_batch_count`` is not an ``int``, or
             ``max_retry_after`` is not an ``int`` or ``float`` (SPEC-066), the message carrying the
             subclass's own name as the ``ValueError`` does; or if ``opener`` is neither callable
-            nor ``None`` (SPEC-071 FR-005), judged first.
+            nor ``None`` (SPEC-071 FR-005), judged first; or, raised by ``dict()`` itself, if
+            ``headers`` is neither ``None``, a mapping nor an iterable of pairs.
           ValueError: If the URL carries a user or password before its host or an ``@`` anywhere
             else — write one that belongs in a path or query as ``%40`` — its scheme is not
             ``http`` or ``https``, it names no host or no usable port, or ``http.client`` cannot
@@ -1292,7 +1340,9 @@ class HTTPSink:
                 f"not {body_format!r}"
             )
         self.method = _valid_method(method, type(self).__name__)
-        self._headers = _valid_headers(dict(headers) if headers else {}, type(self).__name__)
+        self._headers = _valid_headers(
+            dict(headers) if headers is not None else {}, type(self).__name__
+        )
         self._auth, self._authorization_value = _valid_auth(
             auth, type(self).__name__, self._headers, self._AUTH_CONFLICT
         )
@@ -2013,10 +2063,19 @@ class HTTPSink:
         makes the destination decode garbage. The test is against ``self._headers`` rather than
         the merged map, so a per-request ``extra_headers`` value — which sits *beneath* the
         caller's own — does not switch compression off (SPEC-048 FR-007). The caller's header is
-        found by the name ``urllib`` sends (:func:`_wire_name`), not by exact case: a
+        found by the name ``urllib`` sends (:func:`_caller_encoding`), not by exact case: a
         ``content-encoding: identity`` used to miss the test, so the body was gzipped and a
         second ``Content-Encoding: gzip`` written after it, which ``urllib`` folded over the
-        caller's. The caller's own spelling is now the one sent, over an uncompressed body.
+        caller's. The caller's own spelling is the one sent, and it is the only one.
+
+        A caller's header that **names gzip** beside ``gzip=True`` is the exception to
+        "suppresses": the body is compressed and sent under the caller's header, since that is
+        what both said (:func:`_names_gzip`). It used to be sent uncompressed and labelled
+        ``gzip``, undecodable on every ``emit`` — in exact case since FR-002, and in any case
+        once the name was folded. Any other value beside ``gzip=True`` still suppresses the
+        compression and is sent as the caller wrote it; that pairing is one argument contradicting
+        another, and refusing it at construction would be a check on :func:`_caller_encoding` in
+        ``__init__``, beside the header checks.
 
         Args:
           body: The serialized batch.
@@ -2034,10 +2093,11 @@ class HTTPSink:
             headers.update(extra_headers)
         headers.update(self._headers)
         data = body
-        caller_encodes = any(_wire_name(name) == "Content-Encoding" for name in self._headers)
-        if self.gzip and not caller_encodes:
+        encoding = _caller_encoding(self._headers)
+        if self.gzip and (encoding is None or _names_gzip(encoding)):
             data = _gzip.compress(body)
-            headers["Content-Encoding"] = "gzip"
+            if encoding is None:
+                headers["Content-Encoding"] = "gzip"
         self._apply_auth(headers)
         return headers, data
 

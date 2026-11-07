@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import pathlib
 from collections import OrderedDict
+from collections.abc import Mapping
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -304,16 +305,52 @@ def test_a_pair_outside_two_str_is_refused_naming_only_types(auth, named: str) -
 
 
 @pytest.mark.parametrize(
-    "auth",
-    [b"tok", {"a", "b", "c"}, {"a": 1}],
+    ("auth", "message"),
+    [
+        (b"tok", "HTTPSink auth cannot be sent over HTTP (ValueError)"),
+        ({"a", "b", "c"}, _NOT_A_PAIR + "set"),
+        ({"a": 1}, _NOT_A_PAIR + "dict"),
+    ],
     ids=["bytes-of-three", "set-of-three", "dict-of-one"],
 )
-def test_a_container_of_the_wrong_length_keeps_the_unpack_refusal(auth) -> None:
-    """The container is judged after the unpack, so these read exactly as they did."""
+def test_a_value_of_the_wrong_length_is_refused_by_its_container_first(auth, message) -> None:
+    """A set or mapping is judged before the unpack; any other value keeps the unpack's refusal."""
     with pytest.raises(ValueError) as caught:
         HTTPSink(URL, auth=auth)
 
-    assert str(caught.value) == "HTTPSink auth cannot be sent over HTTP (ValueError)"
+    assert str(caught.value) == message
+
+
+class _HostileMapping(Mapping[str, str]):
+    """A mapping whose iteration raises carrying a secret, and counts that it ran."""
+
+    iterated: ClassVar[int] = 0
+
+    def __getitem__(self, key: str) -> str:
+        return "x"
+
+    def __len__(self) -> int:
+        return 2
+
+    def __iter__(self) -> Iterator[str]:
+        _HostileMapping.iterated += 1
+        raise RuntimeError("SECRET-PASSWORD in the caller's own text")
+
+
+def test_a_mapping_is_refused_without_its_iter_running() -> None:
+    """At ``1b201316``: the unpack ran first, so this ``RuntimeError`` escaped raw, secret and all.
+
+    The container is judged by its real type before anything iterates it.
+    """
+    _HostileMapping.iterated = 0
+
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=_HostileMapping())  # type: ignore[arg-type]
+
+    assert str(caught.value) == _NOT_A_PAIR + "_HostileMapping"
+    assert _HostileMapping.iterated == 0
+    _assert_names_no_value(caught.value)
+    _assert_chains_nothing(caught.value)
 
 
 @pytest.mark.parametrize("name", sorted(_FORWARDERS))
@@ -333,30 +370,58 @@ _SRC = pathlib.Path(log_foundry.__file__).parent
 
 
 def _extra_header_sites(source: str, where: str) -> tuple[list[str], list[str]]:
-    """Every ``extra_headers=`` keyword in ``source``: the sites, and the ones carrying credentials.
+    """Every per-request header map in ``source``: the sites, and the ones carrying credentials.
 
-    A site whose value is not a ``dict`` literal with ``str`` keys cannot be judged, and is a
-    finding too, so a refactor that computes the map is caught rather than waved through. A key is
-    folded as ``urllib`` folds it, ``capitalize`` then ``title``, written out here.
+    A map reaches a request by three spellings, each a site: an ``extra_headers=`` keyword, the
+    same key inside a ``**{...}`` splat, and the third positional argument of ``_prepare``. A
+    splat into ``_send`` or ``_prepare`` that is not a ``dict`` literal with ``str`` keys
+    cannot be read, and is a finding. A value that is the parameter ``extra_headers`` itself
+    is forwarding, judged where its value is written. Any other value that is not a ``dict``
+    literal with ``str`` keys cannot be judged, and is a finding too, so a refactor that computes
+    the map is caught rather than waved through. A key is folded as ``urllib`` folds it,
+    ``capitalize`` then ``title``, written out here.
     """
     sites: list[str] = []
     findings: list[str] = []
+    values: list[ast.expr] = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
             continue
+        method = node.func.attr if isinstance(node.func, ast.Attribute) else None
+        if method == "_prepare" and len(node.args) >= 3:
+            values.append(node.args[2])
         for keyword in node.keywords:
-            if keyword.arg != "extra_headers":
-                continue
-            site = f"{where}:{keyword.value.lineno}"
-            sites.append(site)
-            if not isinstance(keyword.value, ast.Dict):
-                findings.append(f"{site}: not a dict literal")
-                continue
-            for key in keyword.value.keys:
-                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
-                    findings.append(f"{site}: a key that is not a str literal")
-                elif key.value.capitalize().title() == "Authorization":
-                    findings.append(f"{site}: {key.value!r} is an Authorization header")
+            if keyword.arg == "extra_headers":
+                values.append(keyword.value)
+            elif keyword.arg is None and method in {"_send", "_prepare"}:
+                splat = keyword.value
+                readable = isinstance(splat, ast.Dict) and all(
+                    isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    for key in splat.keys
+                )
+                if not readable:
+                    sites.append(f"{where}:{splat.lineno}")
+                    findings.append(f"{where}:{splat.lineno}: a ** splat the scan cannot read")
+                    continue
+                assert isinstance(splat, ast.Dict)
+                values.extend(
+                    value
+                    for key, value in zip(splat.keys, splat.values, strict=True)
+                    if isinstance(key, ast.Constant) and key.value == "extra_headers"
+                )
+    for value in values:
+        site = f"{where}:{value.lineno}"
+        sites.append(site)
+        if isinstance(value, ast.Name) and value.id == "extra_headers":
+            continue
+        if not isinstance(value, ast.Dict):
+            findings.append(f"{site}: not a dict literal")
+            continue
+        for key in value.keys:
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                findings.append(f"{site}: a key that is not a str literal")
+            elif key.value.capitalize().title() == "Authorization":
+                findings.append(f"{site}: {key.value!r} is an Authorization header")
     return sites, findings
 
 
@@ -385,8 +450,26 @@ def test_no_extra_headers_in_src_carries_an_authorization_header() -> None:
         ('f(extra_headers={"AUTHORIZATION": t})', "'AUTHORIZATION' is an Authorization header"),
         ("f(extra_headers=build())", "not a dict literal"),
         ("f(extra_headers={name: t})", "a key that is not a str literal"),
+        (
+            's._send(b, **{"extra_headers": {"authorization": t}})',
+            "'authorization' is an Authorization header",
+        ),
+        ("s._send(b, **{key: {}})", "a ** splat the scan cannot read"),
+        ("s._send(b, content_type=c, **kw)", "a ** splat the scan cannot read"),
+        ('s._prepare(b, c, {"Authorization": t})', "'Authorization' is an Authorization header"),
+        ("s._prepare(b, c, build())", "not a dict literal"),
     ],
-    ids=["lower", "upper", "computed", "computed-key"],
+    ids=[
+        "lower",
+        "upper",
+        "computed",
+        "computed-key",
+        "splat",
+        "splat-key",
+        "splat-name",
+        "prepare-positional",
+        "prepare-computed",
+    ],
 )
 def test_the_scan_names_each_site_it_cannot_pass(source: str, finding: str) -> None:
     sites, findings = _extra_header_sites(source, "x.py")
@@ -395,8 +478,20 @@ def test_the_scan_names_each_site_it_cannot_pass(source: str, finding: str) -> N
     assert findings == [f"x.py:1: {finding}"]
 
 
-def test_the_scan_passes_a_per_request_header_that_is_not_authorization() -> None:
-    sites, findings = _extra_header_sites('f(extra_headers={"X-Sentry-Auth": a})', "x.py")
+@pytest.mark.parametrize(
+    "source",
+    [
+        'f(extra_headers={"X-Sentry-Auth": a})',
+        's._send(b, **{"extra_headers": {"X-Sentry-Auth": a}})',
+        "self._prepare(body, content_type, extra_headers)",
+        "f(extra_headers=extra_headers)",
+    ],
+    ids=["keyword", "splat", "forwarded-positional", "forwarded-keyword"],
+)
+def test_the_scan_passes_a_per_request_header_that_is_not_authorization(source: str) -> None:
+    """A literal naming another header passes, and so does forwarding the parameter itself: the
+    keys it can hold are judged where its value is written."""
+    sites, findings = _extra_header_sites(source, "x.py")
 
     assert sites == ["x.py:1"]
     assert findings == []

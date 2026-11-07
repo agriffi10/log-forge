@@ -138,3 +138,51 @@ def test_gzip_without_a_callers_content_encoding_still_compresses() -> None:
 
     assert request["headers"]["content-encoding"] == "gzip"
     assert gzip.decompress(request["body"]).startswith(b"{")
+
+
+@pytest.mark.parametrize("value", ["gzip", "GZIP", " gzip "], ids=repr)
+@pytest.mark.parametrize("name", ["Content-Encoding", "content-encoding", "CONTENT-ENCODING"])
+def test_a_callers_gzip_encoding_beside_gzip_is_compressed_under_the_callers_header(
+    name: str, value: str
+) -> None:
+    """At ``1b201316``: every spelling sent the body uncompressed and labelled gzip; at
+    ``39a3f08c`` the exact-case one did. Content-codings are case-insensitive (RFC 9110 §8.4.1).
+    """
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+
+    request = _sent(HTTPSink(URL, headers={name: value}, gzip=True, opener=opener), opener)
+
+    assert gzip.decompress(request["body"]) == plain["body"]
+    assert request["headers"]["content-encoding"] == value, "the caller's header, and only it"
+
+
+@pytest.mark.parametrize("value", ["identity", "br", "gzip, br"])
+def test_a_callers_other_encoding_beside_gzip_still_suppresses_compression(value: str) -> None:
+    """Behaviour kept as it was at ``39e365f5``, pending a decision on refusing the pairing."""
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+
+    request = _sent(
+        HTTPSink(URL, headers={"content-encoding": value}, gzip=True, opener=opener), opener
+    )
+
+    assert request["body"] == plain["body"]
+    assert request["headers"]["content-encoding"] == value
+
+
+@pytest.mark.parametrize("headers", [0, 1.5, object()], ids=["zero", "float", "object"])
+@pytest.mark.parametrize("cls", sorted(_MERGERS))
+def test_headers_that_are_no_mapping_are_refused_by_every_twin_alike(cls: str, headers) -> None:
+    """At ``1b201316``: ``HTTPSink(headers=0)`` read the falsy value as no headers and sent none,
+    while every platform sink raised from ``dict(0)``."""
+    with pytest.raises(TypeError, match="object is not iterable"):
+        _MERGERS[cls](headers=headers)
+
+
+@pytest.mark.parametrize("headers", [None, {}, [], ()], ids=["none", "dict", "list", "tuple"])
+@pytest.mark.parametrize("cls", sorted(_MERGERS))
+def test_empty_or_absent_headers_construct_on_every_twin(cls: str, headers) -> None:
+    assert _MERGERS[cls](headers=headers)
