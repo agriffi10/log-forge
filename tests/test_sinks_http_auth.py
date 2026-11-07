@@ -15,10 +15,15 @@ Every shipped subclass is swept through its own constructor, found transitively 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import ast
+import pathlib
+from collections import OrderedDict
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
+import log_foundry
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.splunk import SplunkHECSink
@@ -189,6 +194,207 @@ def test_a_token_is_stored_as_given() -> None:
     sink = HTTPSink(URL, auth=BEARER)
 
     assert sink._auth is BEARER
+
+
+class _Shifty(str):
+    """A ``str`` subclass whose every method answers differently from the text it stores."""
+
+    calls: ClassVar[list[str]] = []
+
+    def __format__(self, spec: str) -> str:
+        _Shifty.calls.append("__format__")
+        return "tok€"
+
+    def __str__(self) -> str:
+        _Shifty.calls.append("__str__")
+        return "HIJACK"
+
+    def __contains__(self, item: object) -> bool:
+        _Shifty.calls.append("__contains__")
+        return False
+
+    def encode(self, *args: Any, **kwargs: Any) -> bytes:  # type: ignore[override]
+        _Shifty.calls.append("encode")
+        return b"HIJACK"
+
+
+@pytest.mark.parametrize(
+    ("make", "sent"),
+    [
+        (lambda: _Shifty("x"), "Bearer x"),
+        (lambda: (_Shifty("u"), _Shifty("p")), BASIC_U_P),
+    ],
+    ids=["token", "pair"],
+)
+def test_a_str_subclass_is_copied_as_the_text_it_stores_and_never_asked(make, sent) -> None:
+    """At ``39a3f08c``: ``__format__`` ran at the check and on every request, free to change.
+
+    The probe's subclass answered ``tok`` at the check and ``tok€`` after, so the sink constructed
+    and then failed every ``emit``.
+    """
+    _Shifty.calls.clear()
+    opener = FakeOpener()
+    sink = HTTPSink(URL, auth=make(), opener=opener)
+
+    assert _sent_authorization(sink, opener) == sent
+    assert _sent_authorization(sink, opener) == sent
+    assert _Shifty.calls == []
+    stored = sink._auth if isinstance(sink._auth, tuple) else (sink._auth,)
+    assert all(type(part) is str for part in stored)
+
+
+def test_the_authorization_value_is_built_once_at_construction(monkeypatch) -> None:
+    """At ``39a3f08c``: ``_apply_auth`` rebuilt it from the stored credentials on every request."""
+    built: list[object] = []
+    sink = HTTPSink(URL, auth=("u", "p"), opener=(opener := FakeOpener()))
+    monkeypatch.setattr(
+        "log_foundry.sinks.http._authorization", lambda auth: built.append(auth) or "Basic X"
+    )
+
+    assert _sent_authorization(sink, opener) == BASIC_U_P
+    assert _sent_authorization(sink, opener) == BASIC_U_P
+    assert built == []
+
+
+_NOT_A_PAIR = "HTTPSink auth must be a str token or a pair of two str, not "
+
+
+@pytest.mark.parametrize(
+    ("auth", "named"),
+    [
+        ({"SECRET-USER", "SECRET-PASSWORD"}, "set"),
+        (frozenset({"SECRET-USER", "SECRET-PASSWORD"}), "frozenset"),
+        ({"SECRET-USER": "x", "SECRET-PASSWORD": "y"}, "dict"),
+        (MappingProxyType({"SECRET-USER": "x", "SECRET-PASSWORD": "y"}), "mappingproxy"),
+        (OrderedDict({"SECRET-USER": "x", "SECRET-PASSWORD": "y"}), "OrderedDict"),
+        (b"to", "a pair of (int, int)"),
+        ((b"SECRET-USER", b"SECRET-PASSWORD"), "a pair of (bytes, bytes)"),
+        (("SECRET-USER", None), "a pair of (str, NoneType)"),
+        ((None, "SECRET-PASSWORD"), "a pair of (NoneType, str)"),
+        (["SECRET-USER", 7], "a pair of (str, int)"),
+    ],
+    ids=[
+        "set",
+        "frozenset",
+        "dict",
+        "mappingproxy",
+        "ordereddict",
+        "bytes",
+        "bytes-pair",
+        "none-password",
+        "none-user",
+        "int-password",
+    ],
+)
+def test_a_pair_outside_two_str_is_refused_naming_only_types(auth, named: str) -> None:
+    """At ``39a3f08c``: each constructed and sent credentials nobody wrote — a set in hash order,
+    a mapping's keys, ``b"to"`` as ``116:111``, a ``bytes`` or ``None`` half as its ``repr``.
+    """
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=auth)
+
+    assert str(caught.value) == _NOT_A_PAIR + named
+    _assert_names_no_value(caught.value)
+    _assert_chains_nothing(caught.value)
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [b"tok", {"a", "b", "c"}, {"a": 1}],
+    ids=["bytes-of-three", "set-of-three", "dict-of-one"],
+)
+def test_a_container_of_the_wrong_length_keeps_the_unpack_refusal(auth) -> None:
+    """The container is judged after the unpack, so these read exactly as they did."""
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=auth)
+
+    assert str(caught.value) == "HTTPSink auth cannot be sent over HTTP (ValueError)"
+
+
+@pytest.mark.parametrize("name", sorted(_FORWARDERS))
+def test_every_forwarder_refuses_a_set_pair(name: str) -> None:
+    make, owner = _FORWARDERS[name]
+
+    with pytest.raises(ValueError) as caught:
+        make(auth={"SECRET-USER", "SECRET-PASSWORD"})
+
+    assert str(caught.value) == _NOT_A_PAIR.replace("HTTPSink", owner, 1) + "set"
+
+
+# --- per-request credentials ------------------------------------------------------------------
+
+
+_SRC = pathlib.Path(log_foundry.__file__).parent
+
+
+def _extra_header_sites(source: str, where: str) -> tuple[list[str], list[str]]:
+    """Every ``extra_headers=`` keyword in ``source``: the sites, and the ones carrying credentials.
+
+    A site whose value is not a ``dict`` literal with ``str`` keys cannot be judged, and is a
+    finding too, so a refactor that computes the map is caught rather than waved through. A key is
+    folded as ``urllib`` folds it, ``capitalize`` then ``title``, written out here.
+    """
+    sites: list[str] = []
+    findings: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "extra_headers":
+                continue
+            site = f"{where}:{keyword.value.lineno}"
+            sites.append(site)
+            if not isinstance(keyword.value, ast.Dict):
+                findings.append(f"{site}: not a dict literal")
+                continue
+            for key in keyword.value.keys:
+                if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                    findings.append(f"{site}: a key that is not a str literal")
+                elif key.value.capitalize().title() == "Authorization":
+                    findings.append(f"{site}: {key.value!r} is an Authorization header")
+    return sites, findings
+
+
+def test_no_extra_headers_in_src_carries_an_authorization_header() -> None:
+    """``extra_headers`` sits beneath the caller's own, and ``auth`` is written over it.
+
+    A subclass passing ``Authorization`` there would be silently replaced by the caller's
+    credentials, or would send its own beside a caller who never gave any. Today the one site is
+    ``SentrySink``'s ``X-Sentry-Auth``; the floor keeps the scan from passing on nothing.
+    """
+    sites: list[str] = []
+    findings: list[str] = []
+    for path in sorted(_SRC.rglob("*.py")):
+        found, bad = _extra_header_sites(path.read_text(), str(path.relative_to(_SRC)))
+        sites += found
+        findings += bad
+
+    assert any(site.startswith("sinks/sentry.py:") for site in sites), sites
+    assert findings == []
+
+
+@pytest.mark.parametrize(
+    ("source", "finding"),
+    [
+        ('f(extra_headers={"authorization": t})', "'authorization' is an Authorization header"),
+        ('f(extra_headers={"AUTHORIZATION": t})', "'AUTHORIZATION' is an Authorization header"),
+        ("f(extra_headers=build())", "not a dict literal"),
+        ("f(extra_headers={name: t})", "a key that is not a str literal"),
+    ],
+    ids=["lower", "upper", "computed", "computed-key"],
+)
+def test_the_scan_names_each_site_it_cannot_pass(source: str, finding: str) -> None:
+    sites, findings = _extra_header_sites(source, "x.py")
+
+    assert sites == ["x.py:1"]
+    assert findings == [f"x.py:1: {finding}"]
+
+
+def test_the_scan_passes_a_per_request_header_that_is_not_authorization() -> None:
+    sites, findings = _extra_header_sites('f(extra_headers={"X-Sentry-Auth": a})', "x.py")
+
+    assert sites == ["x.py:1"]
+    assert findings == []
 
 
 # --- auth beside an Authorization header ------------------------------------------------------

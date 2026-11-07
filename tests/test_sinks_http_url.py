@@ -328,26 +328,21 @@ def test_a_platform_key_reaches_the_header_check_through_the_subclass() -> None:
 
 
 @pytest.mark.parametrize(
-    "auth", ["\u20ac", ("u", "p\ud800"), ("\ud800", "p")], ids=["token", "password", "user"]
+    "value", ["Bearer \u20ac", "Basic \ud800"], ids=["token", "surrogate"]
 )
-def test_unsendable_credentials_never_reach_the_request_or_stderr(auth, capsys) -> None:
-    """A token reaches the request and is counted at its one attempt; a user or password fails
-    in ``_prepare``, before ``_send``'s guard, and still raises uncounted. Neither is echoed.
+def test_unsendable_credentials_never_reach_the_request_or_stderr(value, capsys) -> None:
+    """An unsendable ``Authorization`` value planted past construction is counted, never echoed.
 
     SPEC-070 FR-001 moved the token case: its ``ValueError`` used to escape ``emit`` raw with
-    ``failed == 0`` and nothing on stderr.
+    ``failed == 0`` and nothing on stderr. The value is now built once, at construction, and
+    ``emit`` writes it as is, so the plant is the built value; a pair's encode failure, which used
+    to raise uncounted out of ``_prepare`` on every ``emit``, can no longer happen there at all.
     """
     sink = HTTPSink("http://h/x", max_retries=1)
-    sink._auth = auth
+    sink._authorization_value = value
 
-    if isinstance(auth, str):
-        line = _counted_at_one_attempt(sink, capsys)
-        assert auth not in line, "the token is never written"
-        return
-    with pytest.raises(ValueError):
-        sink.emit([{"i": 1}])
-    assert sink.losses().failed == 0
-    assert capsys.readouterr().err == ""
+    line = _counted_at_one_attempt(sink, capsys)
+    assert value not in line, "the value is never written"
 
 
 @pytest.mark.parametrize(
