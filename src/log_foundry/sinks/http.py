@@ -773,6 +773,19 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
     which together turn ``x-ß`` into the ASCII ``X-Ss`` that delivered. The message names the
     header and never echoes its value, which is as likely to be a credential as not.
 
+    **A name holding whitespace anywhere is refused** (1.2.0), last. ``http.client`` refuses
+    whitespace only as a name's first character, and not even all of it there — its pattern's
+    ``\\s`` is the ASCII six, so a leading ``0x1C``–``0x1F`` passed — and sends any other verbatim,
+    ``Authorization : V`` included. RFC 9112 §5.1 has a server answer whitespace between a field
+    name and its colon with ``400``, so such a name was already broken against any conforming
+    server, and a lenient one may trim it into a header the caller never named. Every character
+    ``str.isspace`` is true for is refused, in any position; any other character outside the
+    token set is not, which is a separate decision. The check runs after the two above so a name
+    they already refused keeps its message unchanged — a leading space or tab is still
+    ``http.client``'s ``ValueError``, a non-ASCII space its ``UnicodeEncodeError``, a ``CR`` or
+    ``LF`` the injection — and this message is the reason only for the names that used to pass.
+    A value holding spaces is untouched: ``Bearer abc`` is what values look like.
+
     Args:
       headers: The caller's headers.
       owner: The class refusing them, for the message.
@@ -781,8 +794,8 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
       The headers unchanged.
 
     Raises:
-      ValueError: If any name or value contains ``CR`` or ``LF``, or ``http.client`` cannot send
-        the header.
+      ValueError: If any name or value contains ``CR`` or ``LF``, ``http.client`` cannot send
+        the header, or a name contains whitespace anywhere.
     """
     for name, value in headers.items():
         for text, part in ((name, "name"), (str(value), "value")):
@@ -793,6 +806,8 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
         failure = _unsendable_header(_wire_name(name), value)
         if failure:
             raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
+        if any(char.isspace() for char in name):
+            raise ValueError(f"{owner} header name must not contain whitespace: {name!r}")
     return headers
 
 
@@ -849,15 +864,12 @@ def _valid_auth(
     ``Authorization`` header a request carries, so one of them was silently never sent — the
     credentials when the header was spelled exactly ``Authorization``, the header under any other
     case, since ``urllib`` folds the two names together and keeps the value written last. The
-    header is matched by the name ``urllib`` sends, :func:`_wire_name`, with surrounding
-    whitespace stripped. ``http.client`` admits whitespace after a name's first character, so
-    ``Authorization`` followed by a tab reached the wire beside the credentials' own header, and
-    a lenient server may trim it to ``Authorization``. ``str.strip()`` with no argument removes
-    every whitespace character :func:`_valid_headers` lets trail a name — space, tab, ``VT``,
-    ``FF`` and the separators ``0x1C``–``0x1F``, measured over every code point — so no name
-    differing from ``Authorization`` only in case or surrounding whitespace escapes. A name that
-    merely contains the word, ``X-Authorization``, is not a conflict. This check runs **first**:
-    it reads only whether credentials were given and the header names, which
+    header is matched by the name ``urllib`` sends, :func:`_wire_name`, and no spelling escapes:
+    a name reaching here has passed :func:`_valid_headers`, which refuses one holding whitespace
+    anywhere — the spelling a lenient server might trim into ``Authorization`` — so every name
+    that would put ``Authorization`` on the wire is exactly a name whose folded form equals it. A
+    name that merely contains the word, ``X-Authorization``, is not a conflict. This check runs
+    **first**: it reads only whether credentials were given and the header names, which
     :func:`_valid_headers` has already judged, so it cannot echo or chain a credential, and a
     caller who must drop one of the two is told so before being told anything about the value of
     one they may be about to drop. ``conflict`` is
@@ -889,14 +901,13 @@ def _valid_auth(
       The token as given, the pair copied into a ``tuple``, or ``None``.
 
     Raises:
-      ValueError: If ``auth`` is given beside an ``Authorization`` header in any case or with
-        surrounding whitespace, a bearer token contains ``CR`` or ``LF``, a value that is not a
-        token does not unpack into exactly two items, or ``http.client`` cannot send the
-        ``Authorization`` header either form builds.
+      ValueError: If ``auth`` is given beside an ``Authorization`` header in any case, a bearer
+        token contains ``CR`` or ``LF``, a value that is not a token does not unpack into exactly
+        two items, or ``http.client`` cannot send the ``Authorization`` header either form builds.
     """
     if auth is None:
         return None
-    if any(_wire_name(name).strip() == "Authorization" for name in headers):
+    if any(_wire_name(name) == "Authorization" for name in headers):
         raise ValueError(f"{owner} {conflict}")
     stored: str | tuple[str, str]
     if issubclass(type(auth), str):
@@ -1160,7 +1171,9 @@ class HTTPSink:
             else — write one that belongs in a path or query as ``%40`` — its scheme is not
             ``http`` or ``https``, it names no host or no usable port, or ``http.client`` cannot
             build a request line for it or for the method,
-            a header name or value or a bearer token contains CR or LF, ``auth`` is given beside
+            a header name or value or a bearer token contains CR or LF, a header name contains
+            whitespace anywhere (refused after ``http.client``'s own check, so a name that already
+            failed it keeps that message), ``auth`` is given beside
             an ``Authorization`` header in any case, ``auth`` cannot be sent or is not a token
             and does not unpack into exactly two items, the timeout cannot bound
             anything, ``body_format`` is neither of the two this class renders, or

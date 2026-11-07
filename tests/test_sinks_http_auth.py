@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from log_foundry.sinks.http import HTTPSink, _valid_headers
+from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
@@ -50,10 +50,10 @@ HEC_VALUE = "SECRET-HEC-VALUE"
 """The token the Splunk sink is built with here, so its refusal can be shown not to echo it."""
 
 TRAILING_WHITESPACE = [" ", "\t", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x1f", " \t "]
-"""Every whitespace character ``_valid_headers`` lets trail a header name, plus a run of them.
+"""Every whitespace character ``http.client`` let trail a header name, plus a run of them.
 
-``http.client`` refuses whitespace only as a name's first character, so these reach the wire;
-``test_the_trailing_whitespace_roster_is_what_valid_headers_admits`` re-derives the set."""
+``_valid_headers`` refuses them all now; ``tests/test_sinks_http_header_names.py`` holds the
+general rule and the sweep that no whitespace character is admitted in any position."""
 
 
 @pytest.fixture(autouse=True)
@@ -244,51 +244,38 @@ def test_splunk_refuses_any_auth_saying_it_sends_its_token_there(headers, auth) 
     _assert_chains_nothing(caught.value)
 
 
-@_AUTHS
+@pytest.mark.parametrize(
+    "given", [{"auth": BEARER}, {"auth": PAIR}, {}], ids=["token", "pair", "no"]
+)
 @pytest.mark.parametrize("trailing", TRAILING_WHITESPACE, ids=repr)
 @pytest.mark.parametrize("header", ["Authorization", "authorization"])
-def test_auth_beside_an_authorization_header_with_trailing_whitespace_is_refused(
-    header, trailing, auth
+def test_an_authorization_name_with_trailing_whitespace_is_refused_as_a_header_name(
+    header, trailing, given
 ) -> None:
-    """At ``7845f66f``: constructs, and ``http.client`` sent both headers on one request."""
-    with pytest.raises(ValueError) as caught:
-        HTTPSink(URL, auth=auth, headers={header + trailing: HEADER_VALUE})
+    """At ``7845f66f``: constructs, and ``http.client`` sent the name verbatim beside ``auth``.
 
-    assert str(caught.value) == f"HTTPSink {BESIDE_HEADER}"
+    ``7226b9fe`` matched it as a conflict by stripping the name; the header refusal now runs
+    first, with or without ``auth``, so the strip is gone and these meet the header's reason.
+    """
+    name = header + trailing
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, headers={name: HEADER_VALUE}, **given)
+
+    assert str(caught.value) == f"HTTPSink header name must not contain whitespace: {name!r}"
     _assert_names_no_value(caught.value)
     _assert_chains_nothing(caught.value)
 
 
 @pytest.mark.parametrize("trailing", TRAILING_WHITESPACE, ids=repr)
-def test_a_header_only_containing_the_word_is_not_matched_with_trailing_whitespace(
+def test_a_name_only_containing_the_word_with_trailing_whitespace_is_refused_too(
     trailing,
 ) -> None:
-    opener = FakeOpener()
-    sink = HTTPSink(
-        URL, auth=("u", "p"), headers={"X-Authorization" + trailing: "v"}, opener=opener
-    )
+    """``X-Authorization`` is no conflict, but with whitespace after it it is no header name."""
+    name = "X-Authorization" + trailing
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=("u", "p"), headers={name: "v"})
 
-    assert _sent_authorization(sink, opener) == BASIC_U_P
-
-
-def test_the_trailing_whitespace_roster_is_what_valid_headers_admits() -> None:
-    """Re-derives the roster above, so a ``_valid_headers`` that admits more fails here.
-
-    Only whitespace by ``str.isspace`` is swept: the conflict check strips exactly that, and any
-    other character is a different name to a server, not a spelling of ``Authorization``.
-    """
-    admitted = set()
-    for code in range(0x110000):
-        char = chr(code)
-        if not char.isspace():
-            continue
-        try:
-            _valid_headers({"Authorization" + char: "v"}, "P")
-        except ValueError:
-            continue
-        admitted.add(char)
-
-    assert admitted == {item for item in TRAILING_WHITESPACE if len(item) == 1}
+    assert str(caught.value) == f"HTTPSink header name must not contain whitespace: {name!r}"
 
 
 def test_an_unsendable_token_beside_the_header_is_refused_by_the_conflict_in_either_case() -> None:
