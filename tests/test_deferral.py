@@ -278,7 +278,8 @@ counts as it happens rather than through the ``Deferral``:
 - ``KinesisSink._send`` and ``FirehoseSink._send`` / ``failed``, ``dropped_unadjudicated``:
   records failed past the bound, and records in a chunk whose response could not be paired to
   them, which ``losses()`` folds into ``failed``; an upper bound SPEC-059 does not recount.
-- ``SNSSink._send`` / ``failed``: entries failed past the bound; the same upper bound.
+- ``SNSSink._send`` / ``failed``: entries failed past the bound and, since SPEC-070, sender
+  faults, counted as they happen; the same upper bound.
 - ``MongoDBSink.emit`` / ``failed``: rejected documents and connection errors past the bound; the
   same upper bound.
 - ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper

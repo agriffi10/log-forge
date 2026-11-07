@@ -64,8 +64,13 @@ def test_the_module_is_a_leaf() -> None:
 
 
 def test_the_module_defines_the_arcs_names_and_exports_none() -> None:
-    for name in ("ErrorPredicate", "EntryPredicate", "TRANSIENT_BUILTINS", "driver_classes",
-                 "is_retryable"):
+    for name in (
+        "ErrorPredicate",
+        "EntryPredicate",
+        "TRANSIENT_BUILTINS",
+        "driver_classes",
+        "is_retryable",
+    ):
         assert hasattr(_classify, name), name
     assert (ConnectionError, TimeoutError) == TRANSIENT_BUILTINS
     assert not hasattr(_classify, "__all__")
@@ -115,9 +120,9 @@ def test_driver_classes_reads_only_what_is_loaded_and_imports_nothing(monkeypatc
     assert driver_classes("lf_no_such_driver", "ConnectionError") == ()
     assert driver_classes("lf_mapped_to_none", "ConnectionError") == ()
     assert driver_classes("lf_stand_in") == ()
-    assert driver_classes("lf_stand_in", "Missing", "ConnectionError", "NotAClass",
-                          "NotAnException", "TimeoutError") == (
-        module.ConnectionError, module.TimeoutError)
+    assert driver_classes(
+        "lf_stand_in", "Missing", "ConnectionError", "NotAClass", "NotAnException", "TimeoutError"
+    ) == (module.ConnectionError, module.TimeoutError)
 
     assert set(sys.modules) == before
 
@@ -195,8 +200,16 @@ def test_without_botocore_only_the_builtins_are_retried(monkeypatch) -> None:
 
 @pytest.mark.parametrize(
     ("value", "fault"),
-    [(None, False), (False, False), (0, False), ("", False),
-     (True, True), (1, True), ("true", True), ("false", True)],
+    [
+        (None, False),
+        (False, False),
+        (0, False),
+        ("", False),
+        (True, True),
+        (1, True),
+        ("true", True),
+        ("false", True),
+    ],
 )
 def test_sender_fault_is_the_truthiness_sqs_always_tested(value, fault) -> None:
     """FR-003: ``bool(entry.get("SenderFault"))``, so ``SQSSink`` is unchanged byte for byte."""
@@ -318,10 +331,10 @@ def test_every_retry_loop_asks_its_sinks_predicate() -> None:
 _CORPUS_HEAD = '"""A fixture sink module."""\n\nfrom x import is_retryable\n\n'
 
 
-def _corpus_class(name: str, handler_body: str, *, predicate: bool = True, as_name: str = " as err") -> str:
-    method = (
-        "    def _retryable_error(self, err):\n        return True\n\n" if predicate else ""
-    )
+def _corpus_class(
+    name: str, handler_body: str, *, predicate: bool = True, as_name: str = " as err"
+) -> str:
+    method = "    def _retryable_error(self, err):\n        return True\n\n" if predicate else ""
     return (
         f"class {name}:\n"
         f'    """Fixture."""\n\n'
@@ -723,15 +736,25 @@ def _pg(message: str = "", sqlstate: object = None) -> Callable[[Any], Exception
     return make
 
 
-_AWS_RETRIED = [_named("ConnectionError"), _named("HTTPClientError"), _client(503, "X"),
-                _client(400, "ThrottlingException")]
-_AWS_ONCE = [_named("ParamValidationError"), _named("NoCredentialsError"),
-             _client(400, "InvalidArgumentException"), _client(403, "AccessDenied"),
-             _client(400, "ResourceNotFoundException")]
+_AWS_RETRIED = [
+    _named("ConnectionError"),
+    _named("HTTPClientError"),
+    _client(503, "X"),
+    _client(400, "ThrottlingException"),
+]
+_AWS_ONCE = [
+    _named("ParamValidationError"),
+    _named("NoCredentialsError"),
+    _client(400, "InvalidArgumentException"),
+    _client(403, "AccessDenied"),
+    _client(400, "ResourceNotFoundException"),
+]
 
 _ROWS: list[tuple[str, str, list[Callable[[Any], Exception]], list[Callable[[Any], Exception]]]] = [
-    *[(name, standins.BOTOCORE, _AWS_RETRIED, _AWS_ONCE)
-      for name in ("SQSSink", "SNSSink", "KinesisSink", "FirehoseSink")],
+    *[
+        (name, standins.BOTOCORE, _AWS_RETRIED, _AWS_ONCE)
+        for name in ("SQSSink", "SNSSink", "KinesisSink", "FirehoseSink")
+    ],
     (
         "ClickHouseSink",
         standins.CLICKHOUSE,
@@ -741,55 +764,120 @@ _ROWS: list[tuple[str, str, list[Callable[[Any], Exception]], list[Callable[[Any
     (
         "MongoDBSink",
         standins.PYMONGO,
-        [_named(n) for n in ("ConnectionFailure", "AutoReconnect", "NetworkTimeout",
-                             "NotPrimaryError", "ServerSelectionTimeoutError",
-                             "WaitQueueTimeoutError")]
+        [
+            _named(n)
+            for n in (
+                "ConnectionFailure",
+                "AutoReconnect",
+                "NetworkTimeout",
+                "NotPrimaryError",
+                "ServerSelectionTimeoutError",
+                "WaitQueueTimeoutError",
+            )
+        ]
         + [_named("OperationFailure", labels=("RetryableWriteError",))],
-        [_named(n) for n in ("OperationFailure", "WriteError", "DuplicateKeyError",
-                             "WTimeoutError", "InvalidDocument", "DocumentTooLarge",
-                             "InvalidOperation", "ConfigurationError")],
+        [
+            _named(n)
+            for n in (
+                "OperationFailure",
+                "WriteError",
+                "DuplicateKeyError",
+                "WTimeoutError",
+                "InvalidDocument",
+                "DocumentTooLarge",
+                "InvalidOperation",
+                "ConfigurationError",
+            )
+        ],
     ),
     (
         "RedisListSink",
         standins.REDIS,
-        [_named(n) for n in ("ConnectionError", "TimeoutError", "TryAgainError",
-                             "ClusterDownError")],
-        [_named(n) for n in ("ResponseError", "DataError", "AuthenticationError",
-                             "AuthorizationError", "ExternalAuthProviderError")],
+        [
+            _named(n)
+            for n in ("ConnectionError", "TimeoutError", "TryAgainError", "ClusterDownError")
+        ],
+        [
+            _named(n)
+            for n in (
+                "ResponseError",
+                "DataError",
+                "AuthenticationError",
+                "AuthorizationError",
+                "ExternalAuthProviderError",
+            )
+        ],
     ),
     (
         "RabbitMQSink",
         standins.PIKA,
         [_named(n) for n in ("AMQPConnectionError", "StreamLostError", "ChannelWrongStateError")],
-        [_named(n) for n in ("AuthenticationError", "ProbableAuthenticationError",
-                             "ProbableAccessDeniedError", "IncompatibleProtocolError",
-                             "ConnectionClosedByClient", "ConnectionOpenAborted",
-                             "ChannelClosedByBroker", "ProtocolSyntaxError")],
+        [
+            _named(n)
+            for n in (
+                "AuthenticationError",
+                "ProbableAuthenticationError",
+                "ProbableAccessDeniedError",
+                "IncompatibleProtocolError",
+                "ConnectionClosedByClient",
+                "ConnectionOpenAborted",
+                "ChannelClosedByBroker",
+                "ProtocolSyntaxError",
+            )
+        ],
     ),
     (
         "AzureEventHubsSink",
         standins.AZURE,
         [_named(n) for n in ("ConnectionLostError", "ConnectError", "OperationTimeoutError")],
-        [_named(n) for n in ("AuthenticationError", "EventDataError", "EventDataSendError",
-                             "ClientClosedError", "EventHubError")],
+        [
+            _named(n)
+            for n in (
+                "AuthenticationError",
+                "EventDataError",
+                "EventDataSendError",
+                "ClientClosedError",
+                "EventHubError",
+            )
+        ],
     ),
     (
         "PostgresSink",
         standins.PSYCOPG,
-        [_pg("could not receive data from server"), _pg("", "40001"), _pg("", "08006"),
-         _pg("", "53300"), _pg("", "57P01"), _pg("", "55P03"), _pg("", "55006")],
-        [_pg("", "28P01"), _pg("", "54000"), _pg("", "55000"), _pg("", "42P01"), _pg("", 22001),
-         _pg("", ""), _pg("", "4"),
-         _pg('connection failed: FATAL:  password authentication failed for user "postgres"'),
-         _named("DataError"), _named("StringDataRightTruncation"), _named("IntegrityError"),
-         _named("ProgrammingError"), _named("InternalError"), _named("InterfaceError"),
-         _named("NotSupportedError")],
+        [
+            _pg("could not receive data from server"),
+            _pg("", "40001"),
+            _pg("", "08006"),
+            _pg("", "53300"),
+            _pg("", "57P01"),
+            _pg("", "55P03"),
+            _pg("", "55006"),
+        ],
+        [
+            _pg("", "28P01"),
+            _pg("", "54000"),
+            _pg("", "55000"),
+            _pg("", "42P01"),
+            _pg("", 22001),
+            _pg("", ""),
+            _pg("", "4"),
+            _pg('connection failed: FATAL:  password authentication failed for user "postgres"'),
+            _named("DataError"),
+            _named("StringDataRightTruncation"),
+            _named("IntegrityError"),
+            _named("ProgrammingError"),
+            _named("InternalError"),
+            _named("InterfaceError"),
+            _named("NotSupportedError"),
+        ],
     ),
 ]
 """FR-002's table, row by row: the sink, its driver module, what is retried and what is not."""
 
 _CASES = [
-    pytest.param(sink, key, make, retried, id=f"{sink}-{make.__name__}-{'retried' if retried else 'once'}")
+    pytest.param(
+        sink, key, make, retried, id=f"{sink}-{make.__name__}-{'retried' if retried else 'once'}"
+    )
     for sink, key, retried_list, once_list in _ROWS
     for retried, makes in ((True, retried_list), (False, once_list))
     for make in makes
@@ -849,9 +937,17 @@ def test_postgres_resolves_its_driver_per_call(monkeypatch, tmp_path) -> None:
     ("response", "calls"),
     [
         ({"Error": {"Code": "X"}, "ResponseMetadata": {"HTTPStatusCode": 503}}, 3),
-        ({"Error": {"Code": "ThrottlingException"}, "ResponseMetadata": {"HTTPStatusCode": 400}}, 3),
-        ({"Error": {"Code": "InvalidArgumentException"},
-          "ResponseMetadata": {"HTTPStatusCode": 400}}, 1),
+        (
+            {"Error": {"Code": "ThrottlingException"}, "ResponseMetadata": {"HTTPStatusCode": 400}},
+            3,
+        ),
+        (
+            {
+                "Error": {"Code": "InvalidArgumentException"},
+                "ResponseMetadata": {"HTTPStatusCode": 400},
+            },
+            1,
+        ),
         (None, 1),
         ({"ResponseMetadata": {"HTTPStatusCode": 400}}, 1),
         ({"Error": {"Code": ["ThrottlingException"]}}, 1),
@@ -945,8 +1041,10 @@ def sender_fault_findings(root: Path) -> tuple[set[str], list[str]]:
             if _reads_sender_fault(child) and not (
                 path.name == "_classify.py" and function == "sender_fault"
             ):
-                findings.append(f"{path.name}:{child.lineno} {owner or '<module>'}: reads "
-                                f"SenderFault itself rather than through sender_fault")
+                findings.append(
+                    f"{path.name}:{child.lineno} {owner or '<module>'}: reads "
+                    f"SenderFault itself rather than through sender_fault"
+                )
             visit(child, path, inner_owner, inner_function)
 
     for path in sorted(root.glob("*.py")):
@@ -1055,9 +1153,11 @@ _TWO = [{"log_id": "a", "level": "INFO"}, {"log_id": "b", "level": "INFO"}]
 @pytest.mark.parametrize("stream", _STREAMS, ids=lambda s: s.loop)
 @pytest.mark.parametrize(
     ("count", "codes"),
-    [(0, ["InternalFailure", "InternalFailure"]),
-     (_NO_COUNT, ["InternalFailure", "InternalFailure"]),
-     (2, [None, None])],
+    [
+        (0, ["InternalFailure", "InternalFailure"]),
+        (_NO_COUNT, ["InternalFailure", "InternalFailure"]),
+        (2, [None, None]),
+    ],
     ids=["zero-beside-coded", "absent-beside-coded", "two-beside-none"],
 )
 def test_a_failed_count_its_entries_contradict_is_unadjudicated(
@@ -1092,8 +1192,17 @@ def test_a_failed_count_its_entries_contradict_is_unadjudicated(
         ((None, [None, None]), [2], 2),
         ((1, ["InternalFailure"]), [2], 2),
     ],
-    ids=["zero", "absent", "zero-no-array", "absent-no-array", "one-coded", "bool",
-         "str", "explicit-none", "short-array"],
+    ids=[
+        "zero",
+        "absent",
+        "zero-no-array",
+        "absent-no-array",
+        "one-coded",
+        "bool",
+        "str",
+        "explicit-none",
+        "short-array",
+    ],
 )
 def test_consistent_replies_read_as_before_and_odd_counts_are_unadjudicated(
     stream: _Stream, first: tuple[object, Any], sent: list[int], unadjudicated: int, monkeypatch
@@ -1114,8 +1223,14 @@ def test_consistent_replies_read_as_before_and_odd_counts_are_unadjudicated(
 @pytest.mark.parametrize("stream", _STREAMS, ids=lambda s: s.loop)
 @pytest.mark.parametrize(
     "code",
-    ["ProvisionedThroughputExceededException", "ServiceUnavailableException", "InternalFailure",
-     "ValidationException", 5, ["x"]],
+    [
+        "ProvisionedThroughputExceededException",
+        "ServiceUnavailableException",
+        "InternalFailure",
+        "ValidationException",
+        5,
+        ["x"],
+    ],
     ids=["provisioned", "unavailable", "internal", "undocumented", "int", "list"],
 )
 def test_every_failed_record_is_retried_documented_or_not(
@@ -1234,4 +1349,3 @@ def test_the_sqs_and_sns_sender_fault_batches_have_equal_ledgers_through_a_worke
         ledgers[kind] = (client.calls, delivered, health.failed_batches, sink.losses())
     assert ledgers["SQSSink"] == ledgers["SNSSink"]
     assert ledgers["SNSSink"][0] == 1, "a sender fault is sent once and the batch returns"
-

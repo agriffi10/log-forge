@@ -1036,23 +1036,44 @@ def test_require_positive_refuses_a_non_positive_count(bad: int) -> None:
     assert repr(bad) in str(info.value), "the message names the value received"
 
 
-def test_the_two_shipped_usable_timeout_callers_stay_on_the_floor_side() -> None:
+def test_the_four_shipped_usable_timeout_calls_stay_on_the_floor_side() -> None:
     """SPEC-049 Out of Scope, pinned against a later well-meaning "consistency" change.
 
-    `KafkaSink(flush_timeout=-1)` and `NATSSink(publish_timeout=-1)` fall back to their module
+    `KafkaSink(flush_timeout=-1)`, `NATSSink(publish_timeout=-1)` and, since SPEC-061, its
+    `drain_timeout`, and `GooglePubSubSink(overflow_timeout=-1)` fall back to their module
     defaults and keep delivering. Under FR-001's rule — floor what works, refuse what is already
     broken — they are on the floor side, and moving them would be a breaking change at 1.0 for a
-    caller whose configuration works. This spec adds refusals; it does not convert these.
+    caller whose configuration works. This spec adds refusals; it does not convert these. Four
+    calls from three classes; SPEC-070 FR-005 renamed this from "two callers" and holds the
+    population in `tests/test_declared_exceptions.py` row 1.
 
     Asserted on the helpers; the constructor-level pins are SPEC-047's own, in
     `test_sinks_kafka.py` and `test_sinks_nats.py`, which construct each sink with 0, -1, inf and nan.
     """
+    import ast
+    import pathlib
+
     from log_foundry.sinks._retry import usable_timeout
     from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, _usable_timeout
-    from log_foundry.sinks.nats import DEFAULT_PUBLISH_TIMEOUT
+    from log_foundry.sinks.nats import DEFAULT_CLOSE_TIMEOUT, DEFAULT_PUBLISH_TIMEOUT
+    from log_foundry.sinks.pubsub import DEFAULT_OVERFLOW_TIMEOUT
 
     assert _usable_timeout(-1) == DEFAULT_FLUSH_TIMEOUT
     assert usable_timeout(-1, DEFAULT_PUBLISH_TIMEOUT) == DEFAULT_PUBLISH_TIMEOUT
+    assert usable_timeout(-1, DEFAULT_CLOSE_TIMEOUT) == DEFAULT_CLOSE_TIMEOUT
+    assert usable_timeout(-1, DEFAULT_OVERFLOW_TIMEOUT) == DEFAULT_OVERFLOW_TIMEOUT
+
+    sinks = pathlib.Path(__file__).resolve().parents[1] / "src" / "log_foundry" / "sinks"
+    calls = sorted(
+        path.name
+        for path in sinks.glob("*.py")
+        if path.name != "_retry.py"
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "usable_timeout"
+    )
+    assert calls == ["kafka.py", "nats.py", "nats.py", "pubsub.py"]
 
 
 @pytest.mark.parametrize("bad", [None, "5"])
