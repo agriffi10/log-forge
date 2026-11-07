@@ -37,7 +37,8 @@
   event*, records the contract.
 - `Worker._emit`'s 1.x loop calls `cycle_backoff`, whose bounded exponent ends the `OverflowError`
   a `Worker(max_retries>=1025)` raised on the drain thread (pinned by
-  `test_the_workers_emit_loop_survives_a_huge_max_retries`).
+  `test_the_workers_emit_loop_survives_a_huge_max_retries`). It has no release note: `Worker` is
+  not exported and `configure()` always builds it with `max_retries=3`, so the fix is internal.
 - `docs/invariants.md` entries 2, 3, 6, 7 and 12 and `architecture.md` §8 and §9 state the second
   form; invariant 7's recorded exception extends to `UNKNOWN` and an unreadable verdict.
 
@@ -55,3 +56,9 @@
 - Known weak mutant: the one in which a failed run counts its drops reddens the model test on 1 of
   16 seeds only; the engine unit case `[REJECTED, DROPPED]` in `tests/test_delivery_engine.py` is
   what kills it directly.
+
+## Follow-ups
+
+- `emit_via_deliver` is private (`sinks/_engine.py`), yet the public `Sink` docstring points
+  third-party authors at it as their engine sink's `emit`; whether to make it public is raised as a
+  follow-up for the `stability-redesign` arc.
