@@ -17,6 +17,7 @@ from typing import Any, NoReturn, TypedDict
 from urllib.parse import unquote, unwrap, urlparse
 
 from log_foundry import _diag
+from log_foundry.sinks._classify import is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._retry import (
     clamp_server_delay,
@@ -1084,11 +1085,12 @@ class HTTPSink:
         :meth:`_known_refused` discards without offering it — is counted and announced only when
         ``emit`` returns as well, through :meth:`_drop_refused` and the same ledger (SPEC-059
         FR-004). Once a drop has settled a chunk, this call raises only through a later chunk's
-        exception :meth:`_deliver` does not catch — one a caller-injected ``opener`` raises that
-        is none of ``URLError``, ``OSError`` and ``http.client.HTTPException``, one any subclass
-        hook raises, since :meth:`_body` and :meth:`_handle_response` run outside
-        :meth:`_send`'s guard, or a ``BaseException`` — and that raise now discards the drop
-        rather than leaving it counted once per attempt. The abandonment
+        exception :meth:`_deliver` does not catch — one any subclass hook raises, since
+        :meth:`_body` and :meth:`_handle_response` run outside :meth:`_send`'s guard, or a
+        ``BaseException`` — and that raise now discards the drop rather than leaving it counted
+        once per attempt. An exception a caller-injected ``opener`` raises is no longer such a
+        route: :meth:`_send` catches every ``Exception`` and counts one it does not retry as an
+        abandoned request (SPEC-070 FR-001). The abandonment
         counter stays immediate: ``failed`` is an upper bound neither spec recounts.
 
         Args:
@@ -1536,6 +1538,24 @@ class HTTPSink:
         """
         return status == 429 or 500 <= status < 600
 
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failure before any status line is worth another attempt (SPEC-070).
+
+        The three classes are the ones :meth:`_send`'s ``except`` named before it widened to
+        ``Exception``: a connection-level failure or a status line or header block that would not
+        parse. Anything else — what a caller-injected ``opener`` can raise — fails at once.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True for a ``URLError``, an ``OSError`` or an ``http.client.HTTPException``.
+
+        Raises:
+          None.
+        """
+        return isinstance(err, (urllib.error.URLError, OSError, http.client.HTTPException))
+
     def _response_limit(self) -> int | None:
         """The most response bytes :meth:`_attempt` reads, or ``None`` for the unbounded read.
 
@@ -1630,6 +1650,7 @@ class HTTPSink:
         content_type: str,
         extra_headers: dict[str, str] | None = None,
         splittable: bool = False,
+        count_unexpected: bool = True,
     ) -> bytes:
         """POSTs a body with bounded retry and returns the response bytes.
 
@@ -1638,15 +1659,20 @@ class HTTPSink:
         own. The one caller that must not propagate is ``SentrySink``, which sends one envelope
         per event and therefore catches it.
 
-        A failure **before** any status line is a connection error: an ``OSError``, a
-        ``URLError``, and an ``http.client.HTTPException`` such as ``BadStatusLine``, which is
-        neither and used to escape ``emit`` raw, handing the worker a batch to re-send whole,
-        chunks that had already landed included. All three are retried, then abandoned and
-        counted in ``failed``. A header block that fails to parse raises the same class *after* a
-        status line the library never sees, which may have been a ``2xx``; it is retried like a
-        read timeout awaiting the headers, on the expected-cost reasoning SPEC-048 records for
-        those. **After** a status line the status decides, whatever happened to the body
-        (:meth:`_attempt`).
+        A failure **before** any status line is a connection error when :meth:`_retryable_error`
+        accepts it: an ``OSError``, a ``URLError``, and an ``http.client.HTTPException`` such as
+        ``BadStatusLine``, which is neither and used to escape ``emit`` raw, handing the worker a
+        batch to re-send whole, chunks that had already landed included. Those three are retried,
+        then abandoned and counted in ``failed``. A header block that fails to parse raises the
+        same class *after* a status line the library never sees, which may have been a ``2xx``;
+        it is retried like a read timeout awaiting the headers, on the expected-cost reasoning
+        SPEC-048 records for those. **After** a status line the status decides, whatever happened
+        to the body (:meth:`_attempt`).
+
+        Any other exception — what a caller-injected ``opener`` can raise — also used to escape
+        ``emit`` raw and uncounted. It is now caught and abandoned at its first attempt with no
+        backoff wait (SPEC-070 FR-001), through the same ``_abandon`` line the exhausted
+        connection error writes, so its attempt count reads ``1``.
 
         Args:
           body: The serialized batch.
@@ -1658,6 +1684,11 @@ class HTTPSink:
             per event and has nothing left to split — keeps the counted, announced abandonment
             it has always had, because a ``413`` raised past it uncounted would be exactly the
             silent loss this file's counters exist to prevent.
+          count_unexpected: Whether an exception :meth:`_retryable_error` rejects is counted and
+            abandoned here. ``SentrySink`` passes ``False``: it counts such an exception on its
+            own ``.transport_errors``, a documented counter, so moving the count to this held
+            sink's ``failed`` would reclassify it in a minor release. With ``False`` the
+            exception is re-raised unchanged after its one attempt, uncounted here.
 
         Returns:
           The response bytes, which subclasses that must inspect the response — such as
@@ -1665,6 +1696,8 @@ class HTTPSink:
           which the caller cannot tell from an empty one.
 
         Raises:
+          Exception: An exception :meth:`_retryable_error` rejects, unchanged, only when
+            ``count_unexpected`` is False.
           _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
             line, because the caller is about to re-send the same events in smaller requests and
             only what finally fails is a loss.
@@ -1685,10 +1718,13 @@ class HTTPSink:
             )
             try:
                 status, payload, retry_after = self._attempt(request)
-            except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
-                if attempt < retries:
+            except Exception as err:
+                retryable = is_retryable(self._retryable_error, err)
+                if retryable and attempt < retries:
                     self._sleep_backoff(attempt, None)
                     continue
+                if not retryable and not count_unexpected:
+                    raise
                 self._abandon(
                     f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip(),
                     attempt + 1,

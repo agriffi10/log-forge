@@ -901,7 +901,11 @@ class _RaisingOpener:
 
 
 def test_sentry_absorbs_an_exception_http_sink_does_not_catch() -> None:
-    """``HTTPSink`` catches URLError, OSError and HTTPException; an opener's RuntimeError is none.
+    """``HTTPSink`` retries URLError, OSError and HTTPException; an opener's RuntimeError is none.
+
+    Since SPEC-070 FR-001 ``HTTPSink._send`` catches the ``RuntimeError`` too, but ``SentrySink``
+    asks it (``count_unexpected=False``) to re-raise one it does not retry, uncounted, so it is
+    still this sink's guard that counts it, on ``.transport_errors``.
 
     This used to raise ``IncompleteRead`` from the opener, which ``HTTPSink`` now catches as a
     pre-status protocol error, so it no longer reaches ``SentrySink``'s own guard.

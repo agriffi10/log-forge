@@ -45,6 +45,29 @@ def _assert_chains_nothing(exc: BaseException) -> None:
     assert exc.__context__ is None
 
 
+def _counted_at_one_attempt(sink: HTTPSink, capsys) -> str:
+    """Emits one event to a sink whose request cannot be encoded; the one line it wrote.
+
+    SPEC-070 FR-001: the ``ValueError`` ``http.client`` raises is not a transport error, so
+    ``_send`` no longer lets it escape ``emit`` raw and uncounted. It is abandoned at its first
+    attempt with no backoff wait, counted in ``failed`` and announced by type, and ``emit`` raises
+    ``SinkDeliveryError``. ``max_retries=1`` is what makes "one attempt" a claim rather than the
+    bound.
+    """
+    waits: list[int] = []
+    sink._sleep_backoff = lambda attempt, retry_after: waits.append(attempt)  # type: ignore[method-assign]
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": 1}])
+
+    assert sink.losses().failed == 1
+    assert waits == [], "a failure the predicate rejects takes no backoff"
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 1, lines
+    assert re.search(r"lost 1 request\(s\); HTTPSink, 1 attempt\(s\), connection error, \w+", lines[0])
+    return lines[0]
+
+
 def _assert_printable(exc: BaseException) -> None:
     """A lone surrogate in a message makes the message itself fail to encode where it is shown."""
     assert not any(0xD800 <= ord(char) <= 0xDFFF for char in str(exc)), str(exc).encode(
@@ -61,7 +84,7 @@ _UNCOUNTED = [
     "http://h:\u0668\u0660/x",
     "http://h:8\n/x",
 ]
-"""URLs whose request ``http.client`` cannot encode, so ``emit`` raised them uncounted.
+"""URLs whose request ``http.client`` cannot encode; ``emit`` used to raise them uncounted.
 
 The last three fail only in the ``Host`` header ``urllib`` writes itself, as the raw host in
 Latin-1: a CJK host ``http.client`` would have IDNA-encoded, a port in Arabic-Indic digits that
@@ -85,20 +108,19 @@ _UNSENDABLE = _UNCOUNTED + _COUNTED
 
 
 @pytest.mark.parametrize("url", _UNCOUNTED)
-def test_an_unencodable_url_raised_uncounted_out_of_every_emit(url: str, capsys) -> None:
-    """The premise, against the real default opener: no request, no count, no stderr line.
+def test_an_unencodable_url_is_counted_at_its_one_attempt(url: str, capsys) -> None:
+    """Against the real default opener: counted once, announced by type, raised as delivery.
 
     The sink is built on a good URL and pointed at the bad one afterwards, which is the only way
-    to reach ``emit`` with it now that construction refuses it.
+    to reach ``emit`` with it now that construction refuses it. Before SPEC-070 the request's
+    ``ValueError`` escaped ``emit`` raw with ``failed == 0`` and nothing on stderr.
     """
-    sink = HTTPSink("http://h/x", max_retries=0)
+    sink = HTTPSink("http://h/x", max_retries=1)
     sink.url = url
 
-    with pytest.raises(ValueError):
-        sink.emit([{"i": 1}])
+    line = _counted_at_one_attempt(sink, capsys)
 
-    assert sink.losses().failed == 0
-    assert capsys.readouterr().err == ""
+    assert url not in line
 
 
 @pytest.mark.parametrize("url", [*_COUNTED, "http://u:p@h/x"])
@@ -214,14 +236,12 @@ def test_an_unsendable_method_is_refused_at_construction(method: str) -> None:
         HTTPSink("http://h/x", method=method)
 
 
-def test_an_unsendable_method_raised_uncounted_out_of_every_emit() -> None:
-    sink = HTTPSink("http://h/x", max_retries=0)
+def test_an_unsendable_method_is_counted_at_its_one_attempt(capsys) -> None:
+    """SPEC-070 FR-001: the ``ValueError`` used to escape ``emit`` raw with ``failed == 0``."""
+    sink = HTTPSink("http://h/x", max_retries=1)
     sink.method = "POST\r\n"
 
-    with pytest.raises(ValueError, match="method can't contain control characters"):
-        sink.emit([{"i": 1}])
-
-    assert sink.losses().failed == 0
+    assert "ValueError" in _counted_at_one_attempt(sink, capsys)
 
 
 _SURROGATE = "\ud800"
@@ -270,15 +290,15 @@ def test_every_http_subclass_entry_builds_with_a_good_value(cls: type[HTTPSink])
     [{"X-A": "\u20ac"}, {"X:A": "secret-value"}, {"X-A": "\ud800"}],
     ids=["euro", "colon", "surrogate"],
 )
-def test_an_unsendable_header_raised_uncounted_out_of_every_emit(headers, capsys) -> None:
-    sink = HTTPSink("http://h/x", max_retries=0)
+def test_an_unsendable_header_is_counted_at_its_one_attempt(headers, capsys) -> None:
+    """SPEC-070 FR-001: the ``ValueError`` used to escape ``emit`` raw with ``failed == 0``."""
+    sink = HTTPSink("http://h/x", max_retries=1)
     sink._headers = headers
 
-    with pytest.raises(ValueError):
-        sink.emit([{"i": 1}])
+    line = _counted_at_one_attempt(sink, capsys)
 
-    assert sink.losses().failed == 0
-    assert capsys.readouterr().err == ""
+    [(name, value)] = headers.items()
+    assert value not in line, "the header's value is never written"
 
 
 @pytest.mark.parametrize(
@@ -310,13 +330,22 @@ def test_a_platform_key_reaches_the_header_check_through_the_subclass() -> None:
 @pytest.mark.parametrize(
     "auth", ["\u20ac", ("u", "p\ud800"), ("\ud800", "p")], ids=["token", "password", "user"]
 )
-def test_unsendable_credentials_raised_uncounted_out_of_every_emit(auth, capsys) -> None:
-    sink = HTTPSink("http://h/x", max_retries=0)
+def test_unsendable_credentials_never_reach_the_request_or_stderr(auth, capsys) -> None:
+    """A token reaches the request and is counted at its one attempt; a user or password fails
+    in ``_prepare``, before ``_send``'s guard, and still raises uncounted. Neither is echoed.
+
+    SPEC-070 FR-001 moved the token case: its ``ValueError`` used to escape ``emit`` raw with
+    ``failed == 0`` and nothing on stderr.
+    """
+    sink = HTTPSink("http://h/x", max_retries=1)
     sink._auth = auth
 
+    if isinstance(auth, str):
+        line = _counted_at_one_attempt(sink, capsys)
+        assert auth not in line, "the token is never written"
+        return
     with pytest.raises(ValueError):
         sink.emit([{"i": 1}])
-
     assert sink.losses().failed == 0
     assert capsys.readouterr().err == ""
 

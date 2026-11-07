@@ -424,9 +424,9 @@ class SentrySink:
         tried and was wrong twice over: the SDK branch is third-party code that can raise
         anything, and ``HTTPSink._send`` once caught only ``(URLError, OSError)``, so an
         ``IncompleteRead`` off ``response.read()`` came straight through. ``_send`` now catches
-        ``http.client.HTTPException`` before a status line and reads a body after one under its
-        own guard, but a caller-injected ``opener`` can still raise anything, so the guard here
-        stays ``Exception``.
+        every ``Exception`` before a status line, but :meth:`_post_envelope` asks it to re-raise
+        one its predicate rejects, so that it is counted here on ``.transport_errors`` as before
+        (SPEC-070 FR-001); the guard here therefore stays ``Exception``.
 
         Args:
           event: The event to send.
@@ -577,6 +577,11 @@ class SentrySink:
         The response body is never read here: Sentry's status is its whole answer, so a ``2xx``
         envelope whose body could not be read counts as sent, as any other ``2xx`` does.
 
+        ``count_unexpected=False`` keeps an exception the held sink's predicate rejects on this
+        sink's own ``.transport_errors`` (SPEC-070 FR-001): ``_send`` re-raises it unchanged after
+        its one attempt, uncounted, and :meth:`_capture` counts it as it always has. A transport
+        error is retried and, past the bound, counted on the held sink's ``failed``, as before.
+
         Args:
           event: The event to send.
 
@@ -585,6 +590,7 @@ class SentrySink:
 
         Raises:
           SinkDeliveryError: If the request was abandoned past the retry bound.
+          Exception: Whatever the opener raised that the held sink does not retry, unchanged.
         """
         assert self._http is not None  # noqa: S101
         header = {"event_id": uuid.uuid4().hex, "dsn": self._dsn}
@@ -598,6 +604,7 @@ class SentrySink:
             body,
             content_type="application/x-sentry-envelope",
             extra_headers={"X-Sentry-Auth": self._auth_header},
+            count_unexpected=False,
         )
 
 
