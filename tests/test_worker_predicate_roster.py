@@ -976,8 +976,13 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 43, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 44, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived count at SPEC-071 (FR-001), 43 -> 44.** The one added site is
+`_shutdown_worker`'s seventh, from SPEC-062 (`0aafcc18`), measured by diffing `_sites` per scope
+between `2b68b981` and `2368ade3`: a guard added, so the floor rises to meet it rather than
+leaving the later runtime specs in this arc a site of slack.
 
 **Re-derived at SPEC-054, not lowered to whatever passed.** `_lifecycle` went 46 -> 43 and the
 whole of the difference is accounted for below, measured by deriving the site list from both

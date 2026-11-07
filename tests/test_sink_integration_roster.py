@@ -240,3 +240,60 @@ def test_the_roster_has_not_collapsed() -> None:
     population = set().union(*_population().values())
     assert len(population) >= 23, f"population collapsed to {len(population)}"
     assert len(VERIFIED) >= 10, f"verified set collapsed to {len(VERIFIED)}"
+
+
+_PINNED_MARKER = frozenset(
+    {
+        "clickhouse",
+        "eventhubs",
+        "firehose",
+        "kafka",
+        "kinesis",
+        "mongodb",
+        "nats",
+        "postgres",
+        "pubsub",
+        "rabbitmq",
+        "redis",
+        "sentry",
+        "sns",
+        "sqs",
+    }
+)
+"""The lazy-import population by name, derived on `2368ade3` (SPEC-071 FR-001).
+
+Pinned before SPEC-071 moved every lazy import into `import_extra`, so the move that changes what
+`marker` reads cannot also shrink what it finds: the derivation is re-aimed, this set is not
+edited. A floor would have let the population fall from 24 to 11 and asked for the floor to be
+lowered.
+"""
+
+
+def _marker_findings(found: set[str]) -> list[str]:
+    """Names each module the marker population gained or lost against the pinned set.
+
+    Args:
+      found: The marker population to compare.
+
+    Returns:
+      One line per difference, sorted, empty when the sets are equal.
+
+    Raises:
+      None.
+    """
+    missing = [f"missing: {name}" for name in sorted(_PINNED_MARKER - found)]
+    unexpected = [f"unexpected: {name}" for name in sorted(found - _PINNED_MARKER)]
+    return [*missing, *unexpected]
+
+
+def test_the_lazy_import_population_is_pinned_by_name() -> None:
+    """SPEC-071 FR-001 AC-1: the marker set is compared exactly, serving invariant 7."""
+    assert _marker_findings(_population()["marker"]) == []
+
+
+def test_the_marker_pin_names_a_removed_module() -> None:
+    assert _marker_findings(set(_PINNED_MARKER - {"sqs"})) == ["missing: sqs"]
+
+
+def test_the_marker_pin_names_an_added_module() -> None:
+    assert _marker_findings(set(_PINNED_MARKER | {"extra"})) == ["unexpected: extra"]
