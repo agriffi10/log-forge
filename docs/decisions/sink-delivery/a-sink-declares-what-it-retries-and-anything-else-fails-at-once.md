@@ -68,7 +68,7 @@ retry, which costs only the old behaviour; a transient `FATAL` (`the database sy
 up`, `sorry, too many clients already`) is deliberately not matched; the message is read inside the
 predicate only and never printed (invariant 11). For the predicate to see it, `_reconnect_if_broken`
 now **re-raises** the connect failure after its once-per-outage line, which is therefore no longer
-an `absorbed` line but a `pending` one — `PostgresSink could not reconnect (<Type>); this attempt fails with it, and the batch's own line says whether it is retried or lost` — because the failure is neither absorbed
+an `absorbed` line but a `pending` one — `PostgresSink could not reconnect (<Type>); this attempt fails, and a lost line follows only if the batch is given up` — because the failure is neither absorbed
 nor yet a loss (invariant 11). It used to absorb it, and the attempt then failed on the dead
 handle's `the connection is closed`, which hid a refusal from any predicate.
 

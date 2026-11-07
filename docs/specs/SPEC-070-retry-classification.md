@@ -750,7 +750,7 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   FR-002 AC-2 can hold. `_reconnect_if_broken` used to absorb it and leave the attempt to fail on
   the dead handle's "the connection is closed", which no predicate could read as a refusal, and no
   decision fenced the absorption. Its once-per-outage line, which said `absorbed`, is now a
-  `_diag.pending` line, `PostgresSink could not reconnect (<Type>); this attempt fails with it, and the batch's own line says whether it is retried or lost`, since the failure is neither absorbed nor yet a
+  `_diag.pending` line, `PostgresSink could not reconnect (<Type>); this attempt fails, and a lost line follows only if the batch is given up`, since the failure is neither absorbed nor yet a
   loss (diff review frame 1).
 - 2026-11-07, build: invariant 7's recorded exceptions never named the SQS sender fault, so FR-003's
   edit adds both the SQS and the SNS one there rather than one beside the other.
@@ -766,3 +766,9 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
   `_diag` line"; a Kinesis or Firehose unadjudicated line names the coded count and the failed
   count. The decision cites the locked driver versions (botocore 1.43.119, clickhouse-connect 1.4.2
   and its `driver/httpclient.py`, psycopg 3.3.6) rather than the ones FR-002's table was read at.
+- 2026-11-07, diff review frame 2: FR-003 rule 1's "no usable result carries an `ErrorCode`" now
+  also requires a result array that is present to be usable. One that `usable_results` refuses — an
+  entry that is not a mapping — hid a coded entry beside it, and an absent or `0` count then read
+  the chunk as delivered, silently; it is unadjudicated (rule 3), and a `0` with no array at all is
+  still delivered. The PostgreSQL reconnect's pending line was reworded so it promises a `lost` line
+  only if the batch is given up, since a retry that succeeds writes none.
