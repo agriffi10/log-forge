@@ -1,6 +1,6 @@
 """SPEC-071 FR-002 — every import of an optional extra goes through `import_extra`, by AST.
 
-Four checks over `src/log_foundry/**/*.py`, derived rather than listed:
+Five checks over `src/log_foundry/**/*.py`, derived rather than listed:
 
 1. No import of a module outside the standard library and the package, outside
    `if TYPE_CHECKING:`, is left anywhere — reported as `file:line (qualname): imports module`.
@@ -8,6 +8,9 @@ Four checks over `src/log_foundry/**/*.py`, derived rather than listed:
    seventeen sites written out below from `2368ade3`, the commit SPEC-071 was built from.
 3. Every extra named is a key of `[project.optional-dependencies]`.
 4. Both arguments of every call are string literals, so checks 2 and 3 can read them.
+5. No call to `importlib.import_module`, `import_module` or `__import__` is made outside
+   `sinks/_extras.py`, which is `import_extra` itself — reported as `file:line (qualname)`. Check 1
+   sees only import statements, so a sink written with a dynamic import would otherwise escape it.
 
 The guard carries its own fixture corpus, including the shapes it must stay silent on, and a
 derived mutation sweep that rewrites each real call back into a bare import, in memory, and
@@ -30,6 +33,10 @@ _PACKAGE = _REPO / "src" / "log_foundry"
 another tree, and a guard scanning the wrong tree passes because it found nothing."""
 
 _IGNORED_TOP = frozenset(sys.stdlib_module_names) | {"__future__", "log_foundry"}
+
+_DYNAMIC = frozenset({"import_module", "__import__"})
+"""Callees that import a module by name: ``importlib.import_module``, a bare ``import_module``
+imported from ``importlib``, and ``__import__``, bare or as an attribute."""
 
 EXPECTED_SITES = frozenset(
     {
@@ -64,12 +71,14 @@ class Scan:
       sites: The ``(file, qualname, module, extra)`` tuple of each literal ``import_extra`` call.
       calls: ``(file, line, qualname, module, extra)`` for each literal call, for the sweep.
       nonliteral: ``file:line`` for each call whose arguments are not two string literals.
+      dynamic: ``file:line (qualname): …`` for each dynamic import outside ``sinks/_extras.py``.
     """
 
     imports: list[str] = field(default_factory=list)
     sites: set[tuple[str, str, str, str]] = field(default_factory=set)
     calls: list[tuple[str, int, str, str, str]] = field(default_factory=list)
     nonliteral: list[str] = field(default_factory=list)
+    dynamic: list[str] = field(default_factory=list)
 
 
 def _is_type_checking(test: ast.expr) -> bool:
@@ -138,6 +147,15 @@ def _scan_one(rel: str, source: str, scan: Scan) -> None:
             if isinstance(child, ast.Import | ast.ImportFrom) and not typing_only:
                 for module in _imported(child):
                     scan.imports.append(f"{rel}:{child.lineno} ({qualname}): imports {module}")
+            if (
+                isinstance(child, ast.Call)
+                and _callee(child.func) in _DYNAMIC
+                and rel != "sinks/_extras.py"
+            ):
+                scan.dynamic.append(
+                    f"{rel}:{child.lineno} ({qualname}): imports dynamically through "
+                    f"{ast.unparse(child.func)}"
+                )
             if isinstance(child, ast.Call) and _callee(child.func) == "import_extra":
                 _record_call(rel, child, ".".join(scope) or "<module>", scan)
             visit(child, child_scope, typing_only)
@@ -236,6 +254,7 @@ def findings(
     """
     scan = scan_sources(sources)
     out = list(scan.imports)
+    out += scan.dynamic
     out += [
         f"{where}: import_extra arguments are not two string literals" for where in scan.nonliteral
     ]
@@ -363,6 +382,34 @@ def test_it_is_silent_on_a_third_party_import_under_type_checking() -> None:
 def test_type_checking_covers_its_body_but_not_its_else() -> None:
     source = "if TYPE_CHECKING:\n    import boto3\nelse:\n    import pika\n"
     assert _one(source) == ["sinks/m.py:4 (<module>): imports pika"]
+
+
+def test_it_reports_a_dynamic_import_in_either_form() -> None:
+    source = (
+        "import importlib\n"
+        "from importlib import import_module\n"
+        "def f():\n"
+        "    a = importlib.import_module('boto3')\n"
+        "    b = import_module('pika')\n"
+        "    c = __import__('redis')\n"
+    )
+    assert _one(source) == [
+        "sinks/m.py:4 (f): imports dynamically through importlib.import_module",
+        "sinks/m.py:5 (f): imports dynamically through import_module",
+        "sinks/m.py:6 (f): imports dynamically through __import__",
+    ]
+
+
+def test_it_is_silent_on_the_dynamic_import_inside_import_extra() -> None:
+    source = (_PACKAGE / "sinks" / "_extras.py").read_text(encoding="utf-8")
+    assert "importlib.import_module(" in source, "the premise: _extras.py imports dynamically"
+    assert findings({"sinks/_extras.py": source}, frozenset(), frozenset()) == []
+    line = next(
+        n for n, text in enumerate(source.splitlines(), 1) if "importlib.import_module(" in text
+    )
+    assert findings({"sinks/other.py": source}, frozenset(), frozenset()) == [
+        f"sinks/other.py:{line} (import_extra): imports dynamically through importlib.import_module"
+    ], "the same source anywhere else is reported"
 
 
 def test_it_is_silent_on_a_call_to_import_extra() -> None:

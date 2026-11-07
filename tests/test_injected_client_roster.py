@@ -579,6 +579,20 @@ def test_it_follows_a_subscript_store_an_or_and_a_spread() -> None:
     ]
 
 
+def test_it_follows_an_option_read_back_from_a_self_attribute() -> None:
+    source = (
+        "class S:\n"
+        "    def __init__(self, client=None, url=None):\n"
+        "        self._u = url\n"
+        "        u = self._u\n"
+        "        if client is None:\n"
+        "            client = make(u)\n"
+    )
+    assert _one(source).unrefused == [
+        "m.py:S.url: a build option not refused beside an injected client"
+    ]
+
+
 def test_it_follows_a_comprehension_and_a_for_target() -> None:
     source = (
         "class S:\n"
@@ -706,6 +720,9 @@ def test_it_reports_a_malformed_refusal() -> None:
     assert refusal("'S', 'client', None, {'url': url}") == [
         "m.py:S: refuse_with_injected is not passed client"
     ]
+    assert refusal("'S', 'client', client, supplied={'url': url}") == [
+        "m.py:S: refuse_with_injected takes four positional arguments"
+    ]
 
 
 def test_it_reports_a_stray_refusal_message_outside_args() -> None:
@@ -735,6 +752,23 @@ def test_it_reports_an_extra_and_a_missing_class() -> None:
 # --- the mutation sweep -------------------------------------------------------------------------
 
 
+def _mapping(call: ast.Call) -> ast.Dict | None:
+    """Returns a ``refuse_with_injected`` call's literal mapping, or ``None`` for any other shape.
+
+    Args:
+      call: The call.
+
+    Returns:
+      The fourth positional argument when it is a dict literal and the call has exactly four.
+
+    Raises:
+      None.
+    """
+    if len(call.args) == 4 and not call.keywords and isinstance(call.args[3], ast.Dict):
+        return call.args[3]
+    return None
+
+
 class _DropKey(ast.NodeTransformer):
     """Drops one key from the ``n``-th ``refuse_with_injected`` mapping of a module."""
 
@@ -748,8 +782,8 @@ class _DropKey(ast.NodeTransformer):
         self.generic_visit(node)
         if isinstance(node.func, ast.Name) and node.func.id == "refuse_with_injected":
             self.seen += 1
-            mapping = node.args[3]
-            if self.seen == self.index and isinstance(mapping, ast.Dict):
+            mapping = _mapping(node)
+            if self.seen == self.index and mapping is not None:
                 kept = [
                     (k, v)
                     for k, v in zip(mapping.keys, mapping.values, strict=True)
@@ -761,9 +795,16 @@ class _DropKey(ast.NodeTransformer):
         return node
 
 
+def test_the_sweep_skips_a_keyword_form_refusal_rather_than_crashing() -> None:
+    call = ast.parse("refuse_with_injected('S', 'client', c, supplied={'url': u})").body[0]
+    assert isinstance(call, ast.Expr) and isinstance(call.value, ast.Call)
+    assert _mapping(call.value) is None
+
+
 def test_every_name_dropped_from_every_mapping_is_reported() -> None:
     tree = _tree()
     planted = 0
+    unsweepable: list[str] = []
     for file, source in tree.items():
         calls = [
             n
@@ -773,8 +814,10 @@ def test_every_name_dropped_from_every_mapping_is_reported() -> None:
             and n.func.id == "refuse_with_injected"
         ]
         for index, call in enumerate(calls):
-            mapping = call.args[3]
-            assert isinstance(mapping, ast.Dict)
+            mapping = _mapping(call)
+            if mapping is None:
+                unsweepable.append(f"{file}:{call.lineno}")
+                continue
             for key in mapping.keys:
                 assert isinstance(key, ast.Constant)
                 drop = _DropKey(index, str(key.value))
@@ -785,6 +828,7 @@ def test_every_name_dropped_from_every_mapping_is_reported() -> None:
                     f"{file}: dropping {key.value!r} from the refusal went unreported"
                 )
                 planted += 1
+    assert unsweepable == [], f"refusals the sweep cannot plant in: {unsweepable}"
     assert planted == 21, (
         "2 ClickHouse, 2 Azure, 2 Kafka, 3 Mongo, 5 NATS, 2 Postgres, 4 RabbitMQ, 1 Redis"
     )

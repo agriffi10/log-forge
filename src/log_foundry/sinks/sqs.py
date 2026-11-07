@@ -156,8 +156,9 @@ class SQSSink:
           ValueError: If a constant group id is blank.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
-        require_callable(message_group_id, "message_group_id", "SQSSink", text=True)
-        require_callable(message_deduplication_id, "message_deduplication_id", "SQSSink")
+        owner = type(self).__name__
+        require_callable(message_group_id, "message_group_id", owner, text=True)
+        require_callable(message_deduplication_id, "message_deduplication_id", owner)
         self.max_retries = floor_count(max_retries, 0, "max_retries", "SQSSink")
         if (
             issubclass(type(message_group_id), str)

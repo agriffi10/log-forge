@@ -360,6 +360,45 @@ def test_a_non_callable_is_refused_at_construction(
     assert boto3 == [], f"{case}: a client was built before the refusal"
 
 
+class _InstanceCall:
+    """An object carrying ``__call__`` as an instance attribute, which no call slot reads."""
+
+    def __init__(self) -> None:
+        self.__call__ = lambda *_args: True
+
+
+class _CountingGetattr:
+    """An object whose ``__getattr__`` counts every attribute it is asked for."""
+
+    asked: ClassVar[list[str]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        type(self).asked.append(name)
+        return lambda *_args: True
+
+
+def test_the_callable_test_reads_the_type_and_runs_nothing_of_the_value() -> None:
+    """``callable()`` reads the type's call slot: an instance ``__call__`` does not make one."""
+    with pytest.raises(TypeError, match=r"^S fn must be callable, not _InstanceCall$"):
+        require_callable(_InstanceCall(), "fn", "S", optional=False)
+    _CountingGetattr.asked = []
+    with pytest.raises(TypeError, match=r"^S fn must be callable, not _CountingGetattr$"):
+        require_callable(_CountingGetattr(), "fn", "S", optional=False)
+    assert _CountingGetattr.asked == []
+
+
+def test_a_subclass_of_sqs_is_named_in_its_callable_refusals(boto3: list[str]) -> None:
+    class MySQS(SQSSink):
+        pass
+
+    with pytest.raises(TypeError) as group:
+        MySQS("https://q.fifo", message_group_id=5)
+    assert str(group.value) == "MySQS message_group_id must be a str, a callable or None, not int"
+    with pytest.raises(TypeError) as dedup:
+        MySQS("https://q.fifo", message_deduplication_id="x")
+    assert str(dedup.value) == "MySQS message_deduplication_id must be callable or None, not str"
+
+
 @pytest.mark.parametrize("value", [lambda e: True, _Call(), None], ids=["lambda", "class", "None"])
 def test_a_callable_or_none_is_still_accepted_where_optional(boto3: list[str], value: Any) -> None:
     FilteringSink(MemorySink(), predicate=value)
