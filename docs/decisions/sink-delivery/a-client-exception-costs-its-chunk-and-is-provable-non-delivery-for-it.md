@@ -10,6 +10,7 @@ description: "guarded *inside* `_send`, since an outer guard reports a partial s
 
 ### 2026-11-07
 
+- **Applied to `deliver`** by SPEC-072 FR-004, fence unchanged: an exception escaping `deliver` is not a response, so the engine fails its round's events — counted in `failed_events`, toward a failed run that moves `failed_batches` or `orphan_lost` — and announces the exception's type, never its text. The retry half lives inside a sink's `deliver`, which catches its client's exception and returns `RETRYABLE`; the engine itself resends an escaped exception only for a sink declaring `log_foundry_idempotent = True` whose `_retryable_error`, bound and asked through `is_retryable`, accepts it. The inline adapter's raise for such a run invites the catcher's whole-batch retry, the expected-cost trade this entry records.
 - **Refined** by SPEC-070: the guard retries only a predicate-accepted exception and counts any other at its first attempt; `SNSSink._send` returns the recoverable term too.
 
 ### 2026-09-02

@@ -56,12 +56,19 @@ the README stops documenting a frozen path, so the promise survives but no reade
 a new sink **class** ships undocumented and is outside the freeze by omission rather than decision.
 That third one is class-level rather than module-level because the promise is: a module-level
 version missed both a sink shipped in a package's `__init__.py` and a new class added to an
-already-documented module. `sinks/base` is the one exempt module, and
-the exemption is derived from its own `__all__` rather than a listed set — a listed one stops
+already-documented module. ~~`sinks/base` is the one exempt module~~ — since SPEC-072, `sinks/base`
+and `sinks/verdict` are the two exempt modules, each because everything it exports is a top-level
+export, so the `__all__` clause of the freeze covers it without a README table row; `sinks/verdict`
+(`Outcome`, `Verdict`, `SinkCounters`, `read_deliver`) is a documented path the freeze covers. Each
+exemption is derived from the module's own `__all__` rather than a listed set — a listed one stops
 describing the module the moment a name is added, which is what a hand-written three-name version
 of it did while `base.__all__` already had five.
 
 ## History
+
+### 2026-11-07
+
+- **Refined** by SPEC-072: `sinks/verdict` joins `sinks/base` as a public sink module exempt from a README table row, on the same `__all__`-derived rule.
 
 ### 2026-09-08
 

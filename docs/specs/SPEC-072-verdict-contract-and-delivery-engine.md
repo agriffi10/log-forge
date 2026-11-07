@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-072
 title: "Verdict Contract and Delivery Engine"
 description: "Adds the optional per-event Verdict returned by deliver(batch), one delivery engine that resends only retryable events and writes a sink-owned counter object, and the worker, orphan and inline-emit paths that run it, proven against test sinks before any shipped sink adopts it."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-027, SPEC-058, SPEC-059, SPEC-061, SPEC-062, SPEC-066, SPEC-068, SPEC-070, SPEC-080]
 arc: stability-redesign
 arc_order: 4
@@ -51,10 +51,14 @@ its instrument:
   `kinesis`, `mongodb`, `postgres`, `rabbitmq`, `redis`, `sns`, `sqs`).
 - `max_retries`: ten sink modules assign `self.max_retries` (`grep -rl 'self.max_retries *='
   src/log_foundry/sinks`); the worker's own default is 3 (`Worker.__init__`).
-- `max_retry_after` exists in `sinks/http.py` alone (`grep -rl max_retry_after src/log_foundry`),
-  default `DEFAULT_MAX_RETRY_AFTER = 30.0`.
-- `losses()` is defined in 24 files (`grep -rl 'def losses' src/log_foundry`); Kafka, Pub/Sub and
-  `MultiSink` are three of them and never get `deliver`.
+- `max_retry_after` is declared and assigned in `sinks/http.py` alone (`git grep -n
+  'max_retry_after *=\|max_retry_after:' -- src/log_foundry` finds only that file at `d11e9e90`),
+  default `DEFAULT_MAX_RETRY_AFTER = 30.0`. `grep -rl max_retry_after src/log_foundry` lists one
+  file at `fda134a` and twelve at `d11e9e90`, the build's own `sinks/_engine.py` and `sinks/base.py`
+  among them; the other eleven name it without assigning it.
+- `losses()` is defined in 24 files at `fda134a` and 28 at `d11e9e90` (`grep -rl 'def losses'
+  src/log_foundry`; the 28th is this spec's `sinks/verdict.py`); Kafka, Pub/Sub and `MultiSink` are
+  three of them and never get `deliver`.
 - Call sites of `.emit(` that catch or delegate: the worker's `_emit`, the orphan call in `api.py`,
   `MultiSink`, and `FilteringSink`, `TransformSink` and `LogstashSink` delegating (`grep -rn
   '\.emit(' src/log_foundry`, comments and docstrings excluded).
@@ -62,7 +66,9 @@ its instrument:
 - `NullSink.dropped` is a `dropped` counter that no `losses()` reports (`grep -rn '\.dropped\b'
   src/log_foundry/sinks`), which constrains the counter names chosen in FR-003.
 - The fork repair does not enter a sink that is not a package type: `_fork._reinit_primitives`
-  skips the namespace of a holder `_is_owned` refuses (`continue` at `_fork.py:487`). Probed in this
+  pushes only what `_is_traversable` accepts (a package module, a package-owned object, a plain
+  container), so such a sink is never pushed and its namespace never read; the `continue` at
+  `_fork.py:487` refuses only a pushed container subclass that is not owned. Probed in this
   spec's review: a lock-holding stand-in for `SinkCounters` held by a structurally typed sink was
   not replaced in a child, and the same sink subclassing `log_foundry.Sink` was. FR-003 closes it.
 - `clamp_server_delay` does not filter a non-number: `clamp_server_delay("3", 30.0)` raises
@@ -174,25 +180,35 @@ names a type through `_diag._STR_STR(_diag._STORED_NAME(type(x)))`, never `type(
 metaclass `__name__` property cannot rename it and SPEC-071 FR-005's guard holds. It names an
 element or an attribute, not a parameter, so it is not one of that guard's doors. The container and
 each element are routed on their real type (`issubclass(type(x), …)`), never `isinstance`, so an
-element whose `__class__` claims `Outcome` is refused and its `__class__` is never read.
+element whose `__class__` claims `Outcome` is refused and its `__class__` is never read. A `tuple`
+or `list` subclass is copied through the base class's own `__iter__`, so a subclass's iteration hook
+never runs. `Verdict.uniform(outcome, count)` reads `count` as an exact `int` and refuses a
+negative one, then validates `outcome` by building a one-element verdict **before the count is
+used**, so `Verdict.uniform("x", 0)` raises `TypeError` rather than returning an empty verdict that
+hides the mistake until a batch is non-empty.
 
 **`deliver` is optional and probed, never declared on the `Sink` Protocol**, which stays structural
 for the reason `losses()` is not declared on it. `read_deliver(sink)` decides whether a sink
 **offers** `deliver`, and it reads the sink's **type**, never the instance's dynamic attributes:
 
-- `deliver` is found with `inspect.getattr_static` on `type(sink)` and must be a plain function. A
+- `deliver` is found in the class namespaces along `type(sink).__mro__`, each read through
+  `type`'s own unbound `__mro__` and `__dict__` accessors so no metaclass hook runs, and must be a
+  plain function (`type(f) is types.FunctionType`; a `staticmethod` or a property is not). A
   proxy whose `__getattr__` delegates to an inner sink therefore offers nothing, and its own `emit`
   runs, so a filtering or scrubbing proxy is never bypassed. No third-party `__getattr__` or property
   runs during the probe. A class attribute `deliver = None` is a declared opt-out: the lookup finds
   `None`, which is not a function, so a subclass of an engine sink can set it to keep delivering
-  through its own `emit`.
+  through its own `emit`. The probe stops at that `None`; the adapter's lookup (FR-006) passes over
+  it to an inherited `deliver`, because an opt-out means "do not offer", not "do not have".
 - `deliver` is offered only when no class in `type(sink).__mro__` before the one that defines
   `deliver` defines `emit`. A subclass that overrides `emit` to scrub or stamp a batch and then calls
   `super().emit()` keeps running its override: the worker calls its `emit`, and the inherited
   adapter (FR-006) runs the engine below it.
-- `log_foundry_counters` is read with `inspect.getattr_static` on the sink and must be a
-  `SinkCounters` (FR-003). A sink that defines `deliver` with no counters keeps delivering through
-  `emit`, so nothing is lost and the engine never counts somewhere dishonest.
+- `log_foundry_counters` is read with `inspect.getattr_static` on the sink, a `__slots__` member
+  resolved through its own C-level descriptor, and must be exactly a `SinkCounters`
+  (`type(v) is SinkCounters`; the class is `@final`) (FR-003). A sink that defines `deliver` with
+  no counters keeps delivering through `emit`, so nothing is lost and the engine never counts
+  somewhere dishonest.
 
 `read_deliver` returns the bound `deliver` when the sink offers it and `None` otherwise. Like
 `read_losses` it never raises and writes nothing. It is public for the reason `read_losses` is: a
@@ -232,8 +248,13 @@ dataclass does. `configure()`, `Config` and every existing signature are unchang
       inherits `Sink` and omits `emit` still cannot be instantiated. `Sink` gains no abstract member.
 - [ ] `log_foundry.__all__` is the 30 names it was plus exactly `Outcome`, `Verdict`, `SinkCounters`
       and `read_deliver`; `tests/test_public_surface.py` pins them and the import path
-      `from log_foundry.sinks.verdict import Outcome, Verdict, SinkCounters, read_deliver`, and every
-      existing pin passes unedited. `configure()` and `Config` gain no parameter or field.
+      `from log_foundry.sinks.verdict import Outcome, Verdict, SinkCounters, read_deliver`. The two
+      existing exact pins of `__all__`, in `tests/test_baggage_header.py` and
+      `tests/test_sinks_otlp.py`, are restated as the 30 names plus the four;
+      `tests/test_public_surface.py`'s keyword-only dataclass table gains `Verdict`, and its
+      frozen-path test exempts `sinks.verdict` from a README table row beside `sinks.base`, on the
+      same rule that everything the module exports is a top-level export. No other public-surface
+      pin is edited. `configure()` and `Config` gain no parameter or field.
 - [ ] `tests/typed_consumer/accepts.py` type-checks under `mypy --strict` with a sink whose
       `deliver` returns a `Verdict` built by keyword from a tuple, and `rejects.py` holds a
       positional `Verdict(...)` that `mypy` refuses.
@@ -248,13 +269,16 @@ dataclass does. `configure()`, `Config` and every existing signature are unchang
 The engine is `run_delivery` in `src/log_foundry/sinks/_engine.py`, private. A worker or the orphan
 path calls it with the sink, the batch, the worker's retry count (or `None` on the orphan path), a
 stop event and an optional decline
-predicate. It calls `read_deliver` once, inside, so a swap cannot change the sink between the probe
-and the run, and returns `None` when the sink does not offer `deliver` (the caller then uses `emit`).
-Otherwise it runs **rounds** through the private `_run`, which the adapter shares (FR-006):
+predicate. It runs `read_deliver`'s probe once, inside, so a swap cannot change the sink between the
+probe and the run and the run counts into the very counters the offer was decided on, and returns
+`None` when the sink does not offer `deliver` (the caller then uses `emit`). Otherwise it runs
+**rounds** through the private `_run`, which the adapter shares (FR-006):
 
-1. Round one calls `deliver` with the batch as given. Later rounds call it with a new list holding
-   only the events still to send, in their original order. Indices in each verdict are mapped back
-   to the original batch, and an event that has a final outcome is never offered again.
+1. `_run` copies the batch once at entry (a `list` or `list` subclass through `list.__iter__`, so no
+   subclass hook runs). Round one calls `deliver` with the batch as given. Later rounds call it with
+   a new list holding only the events still to send, in their original order, taken from the copy.
+   Indices in each verdict are mapped back to the copy, so a `deliver` that clears or extends the
+   list it was handed moves no index, and an event that has a final outcome is never offered again.
 2. After a round, events marked `RETRYABLE` remain to send (and unknown ones, under FR-004's rule).
    If none remain the run ends. If the budget of item 3 is spent, the run ends with those events
    unresolved.
@@ -265,7 +289,9 @@ Otherwise it runs **rounds** through the private `_run`, which the adapter share
    what a single layer would lose: an `HTTPSink` answered nine `503`s then a `200` is delivered today
    on the tenth request and would be lost at the fourth, and `HTTPSink(max_retries=0)` under the
    default worker gets 4 tries today and would get 1. So, with `s` the sink's `max_retries` when that
-   is an exact `int` (floored at zero) and `w` the worker's (floored at zero):
+   is an exact `int` (floored at zero) and `w` the worker's (floored at zero) — both read strictly,
+   `type(x) is int`, the sink's statically, so a `bool`, an `int` subclass, a `float`, a `str` or a
+   property reads as "declares none":
    - **worker path**, the sink declares `s`: `(s + 1) × (w + 1) − 1` further rounds, 15 at the
      defaults;
    - **worker path**, the sink declares none: `w`, as the worker's own loop gives today;
@@ -306,9 +332,20 @@ Otherwise it runs **rounds** through the private `_run`, which the adapter share
    honours the hint in full, as 1.x `HTTPSink(max_retry_after=float("inf"))` does, and a ceiling
    that is zero, negative or `NaN` falls back to the backoff, as `clamp_server_delay` already
    answers it. `clamp_server_delay` also turns a negative, zero, infinite or `NaN` hint into the
-   backoff. The exponent is bounded so that no `max_retries` raises `OverflowError`, and every wait
-   goes through `sinks._retry.wait(delay, stop)`, which waits on the stop event when it has one,
-   never `time.sleep`, and caps at `MAX_WAIT`.
+   backoff. An exact-`int` hint or ceiling is brought into `[-1, MAX_WAIT]` by integer comparison
+   before it is converted, because `clamp_server_delay` raises `OverflowError` on `10**400`: so a
+   hint of `10**400` waits the ceiling (30.0 by default, `MAX_WAIT` under an `inf` ceiling), a hint
+   of `-10**400` waits the backoff, and a `max_retry_after` of `10**400` is a ceiling of `MAX_WAIT`.
+   A `float`-subclass hint is not exactly a `float` and waits the backoff. The hint is read only
+   after `outcomes_of` (FR-004) has accepted the verdict, so a malformed verdict never supplies a
+   wait. The exponent is bounded (`_EXPONENT_CAP = 60`) so that no `max_retries` raises
+   `OverflowError`, and every wait goes through `sinks._retry.wait(delay, stop)`, which waits on the
+   stop event when it has one, sleeps when it has none, and caps at `MAX_WAIT`. The stop event is
+   the worker's `_stop` on the worker path, and on the orphan path and in the adapter the sink's
+   `log_foundry_stop_signal`, read statically and used when its type is `threading.Event` or a
+   subclass (a property reads as none). A stop event whose `wait` raises is announced once by
+   `_diag.absorbed` (`waiting between delivery rounds`) and the rest of that run sleeps its waits
+   instead, so no `Exception` escapes and no round runs without its wait.
 5. **SPEC-062's prediction runs before every further round**, after its wait has returned: the engine
    asks the caller's decline predicate with the longest round of this run, and a `True` ends the run
    with the remaining events unresolved and `declined` set. The first round is never declined, no
@@ -342,7 +379,10 @@ Otherwise it runs **rounds** through the private `_run`, which the adapter share
       `max_retry_after` (or `max_retry_after="30"`) a hint of `100` waits `30.0`, and with
       `max_retry_after=float("inf")` it waits `100`; `max_retry_after` of `0`, `-1` and `nan` waits
       the backoff; hints of `0`, `-1`, `inf`, `nan`, `"3"` and
-      `True` wait the backoff and none raises. A hint falling between two cycles replaces that
+      `True` wait the backoff and none raises. A hint of `10**400` waits `30.0`, and `86400.0`
+      (`MAX_WAIT`) under an `inf` ceiling; a hint of `-10**400` or of a `float` subclass waits the
+      backoff; a `max_retry_after` of `10**400` honours a hint of `100`; and the hint of a verdict
+      `outcomes_of` refuses is never read. A hint falling between two cycles replaces that
       cycle wait. `BACKOFF_BASE`, `CYCLE_BACKOFF_BASE` and `CYCLE_BACKOFF_CAP` are each assigned
       exactly once in `_engine.py`, and `worker.py` holds no backoff literal (an AST scan finds no
       `0.01` or `0.5` in a call to `wait` there).
@@ -350,9 +390,13 @@ Otherwise it runs **rounds** through the private `_run`, which the adapter share
       and under 0.05 s of CPU, measured through `tests/test_worker_exit_budget.py`'s helper.
 - [ ] `max_retries=2000` against a fast always-`RETRYABLE` sink with the stop event set returns after
       2001 calls without `OverflowError`.
-- [ ] Prediction, through `deliver`: an always-`RETRYABLE` sink whose call takes 0.5 s, run under the
+- [ ] Prediction, through `deliver`: an always-`RETRYABLE` sink that declares no `max_retries`, whose
+      call takes 0.5 s, run under the
       worker's predicate for `shutdown(timeout=1.2)`, is called exactly 2 times and the run reports
-      `declined`; `timeout=0.9` gives 1 call and `timeout=1.8` gives 3. A deadline of `None`
+      `declined`; `timeout=0.9` gives 1 call and `timeout=1.8` gives 3 (the run is `w + 1` cycles
+      of one attempt, with the worker's 0.01–0.04 s cycle waits between them; with `s >= 1` the
+      within-cycle 0.1 s wait puts the 1.2 s case exactly on the edge, `0.5 + 0.1 + 0.5 + 0.1 =
+      1.2`, so the cases are not stated for such a sink). A deadline of `None`
       declines nothing, and a batch whose first round is already past the deadline still makes it.
 - [ ] Inside a `deliver` call, `counters._counter_lock.acquire(blocking=False)` succeeds and is
       released: the engine holds no lock while the sink runs.
@@ -376,12 +420,23 @@ be unique in the tree: `tests/test_deferral.py` derives "a counter some `losses(
 The counter lives on the sink, not the worker, so it is the same object for every worker, every
 swap back to that sink and every process the sink is forked into.
 
-**The fork walk reaches it on every sink** (invariant 12). `_fork._reinit_primitives` enters only
-package-owned holders, and the sinks this spec ships the engine for are third-party ones. So at a
-holder `_is_owned` refuses, the walk now reads the one attribute `log_foundry_counters` with
-`inspect.getattr_static` (no third-party code runs in the at-fork handler) and, when it is a
-`SinkCounters`, walks it, which replaces its lock. Nothing else of the third-party namespace is
-entered, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
+**The fork walk reaches it on a sink the walk does not enter** (invariant 12).
+`_fork._reinit_primitives` pushes only package modules, package-owned objects and plain containers,
+and the sinks this spec ships the engine for are third-party ones, so such a sink is never pushed
+and never becomes a holder: the `continue` the walk takes at a holder `_is_owned` refuses never sees
+it. The reach is instead at **the value the walk would not push** — an attribute of an owned holder,
+such as the `Worker`'s `sink`, or a member of a container it walks. There
+the walk reads the one attribute `log_foundry_counters` with `inspect.getattr_static` (no
+third-party code runs in the at-fork handler), resolving a `__slots__` member through its own
+C-level descriptor, and when the result is exactly `SinkCounters` it pushes the counters, which are
+the package's own and so are walked, which replaces their lock. `SinkCounters` is found through
+`sys.modules` once per walk, never imported, since an import in a child not yet returned from
+`fork` can deadlock; a process that never loaded `sinks.verdict` holds none to repair. A value of a
+scalar, function, module or class type is skipped before the static read. Nothing else of the
+third-party namespace is read, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
+**The reach is one level deep:** an engine sink held *inside* a third-party wrapper, or a sink
+that is itself a third-party container subclass (pushed as a container, whose members are walked
+but whose attributes are not), is not reached.
 
 **The engine counts once, at the end of a run, through one `Deferral`** (`sinks/_deferral.py`) built on
 the sink's counters, so the commit reads the lock at commit time as every deferring site does:
@@ -448,8 +503,15 @@ number of rounds, never a value (invariant 11), unless the sink registered an an
 own for the run through the run context SPEC-073 adds: such a run is announced by the sink's lines
 alone, and the engine writes no settled line, so a loss is never announced twice. A failed run's
 loss is announced by its catcher: the
-worker's abandon or declined line, the orphan path's line, or the adapter's raise. A raising round is
-also announced by `_diag.absorbed`, which names the exception's type.
+worker's abandon or declined line, the orphan path's line, or the adapter's raise. The settled line
+reads `log-foundry: lost N event(s); rejected R, unresolved U, raised X, unknown K, dropped D after A
+delivery round(s) to <SinkType>`, the sink's type by its stored name. An exception escaping
+`deliver` is also announced by `_diag.absorbed`, which names the exception's type and never its
+text: `log-foundry: absorbed a failure while delivering a batch (<ExcType>); its round's events not
+confirmed by <SinkType>`. It is written **after the run's commit** (record first, announce second),
+**one line per run per distinct exception type**, not one per raising round, and it does not ride
+on the commit: a commit that itself fails is absorbed (`counting a delivery`) and the type line is
+still written.
 
 The three `losses()` sinks that never get `deliver` (Kafka, Pub/Sub, `MultiSink`) keep their own
 counters and `emit` path; invariant 2 holds for them exactly as it does today.
@@ -506,7 +568,8 @@ non-delivery for it* (an exception is not a response), and it keeps invariant 7'
 sink whose `deliver` raises on every call leaves `flush()` falsy and moves `failed_batches` or
 `orphan_lost`. The round's events are counted `failed_events` and count toward the run failing
 (FR-003); an earlier round's `ACCEPTED` events still make the run partial, which settles. The
-exception is announced by `_diag.absorbed` with `type(exc).__name__`, never its text. The engine
+exception is announced by `_diag.absorbed` naming its type by the stored name, never its text, once
+per run per distinct type after the commit (FR-003 gives the line). The engine
 catches `Exception` only, so a `KeyboardInterrupt` or `CancelledError` still reaches the caller
 (invariant 1). The decision's retry half — a client exception is retried — lives inside a sink's
 `deliver`, which catches its client's exception and returns `RETRYABLE` (SPEC-074 does this for the
@@ -515,7 +578,9 @@ SDK sinks); an exception that escapes `deliver` is the sink saying it could not 
 **A malformed verdict, or an `UNKNOWN` outcome, settles.** `deliver` returned, so I/O may have
 happened and the events may have landed. A verdict is malformed when it is not a `Verdict`, its
 `outcomes` is not a tuple of exact `Outcome` members, its length is not the number of events passed,
-or a field raises when read; `outcomes_of(verdict, n)` in `_engine.py`, factored out of `_run`, is
+or a field raises when read — both `outcomes` and `retry_after` are read inside its guard, so a
+`retry_after` that raises makes the verdict malformed too; `outcomes_of(verdict, n)` in
+`_engine.py`, factored out of `_run`, is
 that test's one definition, and SPEC-075's wrappers share it. This is the decision *After a status line the status decides; a 2xx
 whose body cannot be read is never re-sent* made general, and invariant 7's recorded exception for an
 unadjudicable `2xx`: the events are counted `failed_events`, the run never fails on their account,
@@ -529,13 +594,12 @@ not a declaration). For an escaped exception the engine also asks SPEC-070's
 `TypeError` is never resent even by an idempotent sink. Found statically on an instance,
 `inspect.getattr_static` returns the class's unbound function, which `is_retryable` would call with
 one argument short: it raises `TypeError` inside the wrapper, answers `False`, and every predicate
-would be refused silently. So a predicate found on the class is bound with
-`found.__get__(sink, type(sink))`, which is SPEC-070's contract (the engine receives the bound
-`sink._retryable_error`) and also unwraps a `staticmethod`; one found in the instance's own
-`__dict__` is used as found, as ordinary attribute access would. A sink without the predicate, every
-third-party sink among them, resends no exception, and a predicate that raises answers `False`
-through `is_retryable`; a sink without the predicate, every third-party sink among them, resends no
-exception, and a predicate that raises answers `False` through `is_retryable`. For
+would be refused silently. So a predicate found on the class is bound through
+its type's `__get__`, `type(found).__get__(found, sink, type(sink))`, which is SPEC-070's contract
+(the engine receives the bound `sink._retryable_error`) and also unwraps a `staticmethod`; one found
+in the instance's own `__dict__` is used as found, as ordinary attribute access would. A sink
+without the predicate — every third-party sink that does not inherit one from a shipped sink —
+resends no exception, and a predicate that raises answers `False` through `is_retryable`. For
 an `UNKNOWN` outcome or a malformed verdict there is no exception to ask, and idempotence alone
 decides. A resend is a further round: it is bounded by the retry budget and waits as FR-002 says.
 
@@ -584,17 +648,22 @@ batch, so a swap to an engine sink and back takes effect on the next batch.
 `Worker._retry_declined`; `_in_flight` is set before the run and reset in the same `finally`, so the
 expiry line counts the events inside a `deliver`: SPEC-062 FR-005's count, written since SPEC-068
 FR-001 as a `_diag.pending` line rather than a loss. A failed run increments
-`failed_batches` once and writes one line, through `_diag.lost("event", len(batch), ...)` exactly as
-1.x does: when the run declined, SPEC-062's `retry declined after {k} emit attempt(s); the next was
+`failed_batches` once and writes one loss line, through `_diag.lost("event", size, ...)` exactly as
+1.x does, with `size` the batch's length taken **before** the run, so a `deliver` that mutates the
+list it was handed cannot change the count: when the run declined, SPEC-062's `retry declined after {k} emit attempt(s); the next was
 predicted to end after the shutdown() deadline` with `k` the `deliver` calls made; otherwise 1.x's
 `batch abandoned after {cycles} emit attempts`, with `cycles` the cycles the run started, so a run
 exhausted at the defaults reads `log-foundry: lost N event(s); batch abandoned after 4 emit
-attempts`, the text `Worker._emit` writes at `fda134a` and six existing tests match. A settled run adds nothing: `flush()` stays true, as
-a partial outcome does today. The worker does **not** resend a whole batch around an engine run.
+attempts`, the text `Worker._emit` writes at `fda134a` and seven existing test files match, one line
+each (`git grep -l 'batch abandoned after 4 emit attempts' -- tests`, the same seven at `fda134a`
+and at this branch's base `39a3f08c`). A run in which `deliver` raised is also announced by the
+engine's absorbed line for the exception's type (FR-003), before the loss line. A settled run adds
+nothing to `failed_batches`: `flush()` stays true, as a partial outcome does today. The worker does **not** resend a whole batch around an engine run.
 
 **Orphan.** The call runs on the caller's thread, with the sink's `log_foundry_stop_signal` as the
 stop event and no decline predicate, so retries stay on the caller's thread (invariant 4). A failed
-run calls `_note_orphan_loss()` once and writes one `_diag.lost` line; the caller's exception
+run calls `_note_orphan_loss()` once and writes one `_diag.lost` line, `lost 1 event(s); orphan log
+not delivered after A delivery round(s)`; the caller's exception
 handling is untouched, and nothing raises into the application (invariant 1). A one-event batch
 fails exactly when its event ended `REJECTED`, unresolved or in a raising round, the cases in which a
 1.x `emit` raised, so `DROPPED`, `UNKNOWN` and an unreadable verdict leave `orphan_lost` at zero and
@@ -616,12 +685,16 @@ its own ground truth (it knows what it returned for every event), and a spy reco
       it; `failed_batches == 1`, the one stderr line is exactly
       `log-foundry: lost N event(s); batch abandoned after 4 emit attempts` with `N` the batch size,
       `flush()` is falsy, and `failed_events` equals the batch size. A sink whose `deliver` raises
-      `ConnectionRefusedError` every call gives the same `failed_batches`, falsy `flush()` and line.
+      `ConnectionRefusedError` every call gives the same `failed_batches` and falsy `flush()`, and
+      two lines: the engine's absorbed line naming `ConnectionRefusedError`, then `log-foundry: lost
+      N event(s); batch abandoned after 1 emit attempts` — not the 12-call run's line, because the
+      run started one cycle (FR-002 item 4's definition of a cycle) before the raise ended it.
 - [ ] Worker, partial: `[ACCEPTED, REJECTED]` leaves `failed_batches == 0`, `flush()` truthy,
       `failed_events == 1`, and one stderr line. A malformed verdict leaves `failed_batches == 0` and
       `flush()` truthy.
 - [ ] Worker, a `deliver` sink with no `max_retries` is retried up to the worker's `max_retries`.
-- [ ] Exit drain through `deliver`: SPEC-062's three D=0.5 s cases give 2, 1 and 3 calls for
+- [ ] Exit drain through `deliver`, for a sink that declares no `max_retries` (FR-002's prediction
+      criterion says why): SPEC-062's three D=0.5 s cases give 2, 1 and 3 calls for
       `shutdown(timeout)` of 1.2, 0.9 and 1.8, `close()` is called once, and a declined run adds one
       to `failed_batches` with SPEC-062's declined wording; a `deliver` blocked past
       `shutdown(timeout=0.2)` gives an expiry line counting its events.
@@ -653,16 +726,24 @@ its own ground truth (it knows what it returned for every event), and a spy reco
 method explicitly (SPEC-073 does, for a subclass that opts out of offering `deliver` while its own
 `emit` still runs the engine). Otherwise it finds `deliver` with the same static lookup
 `read_deliver` uses, **without** the `emit`-override rule (it is the `emit` the override reaches
-through `super()`). It always finds `log_foundry_counters` statically. It runs `_run` with the sink's own `max_retries`, the sink's `log_foundry_stop_signal` and no
+through `super()`), and where the probe stops at a class-namespace `deliver = None`, this lookup
+passes over it and goes on to an inherited `deliver`: the opt-out declines the offer, not the
+engine. A non-callable `deliver=` argument, or a class with no function `deliver` after the `None`,
+is "no usable `deliver`" below. It always finds `log_foundry_counters` statically, exactly a
+`SinkCounters`. It runs `_run` with the sink's own `max_retries`, the sink's `log_foundry_stop_signal` and no
 decline predicate, and then keeps the 1.x contract: it returns `None` when the run settles and raises
-`SinkDeliveryError` (a message of counts and the sink's type, no values) when it fails. `emit([])`
-returns without calling `deliver`. A sink that reaches the adapter with no usable `deliver` or no
+`SinkDeliveryError` (a message of counts and the sink's type, no values) when it fails. It copies
+the batch first, and `emit([])` returns before any member is checked and without calling
+`deliver`. A sink that reaches the adapter with no usable `deliver` or no
 `SinkCounters`, such as one that misspelt `log_foundry_counters`, raises `TypeError` naming its type
 and the missing member, from every non-empty `emit`, so the batch is a counted failure rather than
 events that vanish while `flush()` reports success. The type is named through
 `_diag._STR_STR(_diag._STORED_NAME(type(sink)))`, so SPEC-071 FR-005's guard holds. Because `sink`
 is a parameter, `emit_via_deliver` has that guard's door shape, so the build adds it to the guard's
-pinned door set in `tests/test_type_door_roster.py`. It tests `sink` with no `isinstance`.
+pinned door set in `tests/test_type_door_roster.py`. It tests `sink` with no `isinstance`, and it
+needs no exemption from that guard's mutation sweep: both kinds of plant land in it, the stored-name
+read in its two `TypeError`s and the `issubclass(type(batch), list)` it reaches through
+`_snapshot`.
 
 So a third-party wrapper that calls `inner.emit(batch)`, or a subclass that overrides `emit` and calls
 `super().emit(batch)`, sees what 1.x showed it: a normal return on a partial outcome, an unreadable
@@ -848,7 +929,7 @@ constants are module constants of `_engine.py`, unreachable from `configure()`.
 ```
 src/log_foundry/
 ├── __init__.py                 # + Outcome, Verdict, SinkCounters, read_deliver in __all__
-├── _fork.py                    # the walk reaches log_foundry_counters on a holder it does not own
+├── _fork.py                    # the walk reads log_foundry_counters on a value it would not push
 ├── api.py                      # orphan path: run_delivery first, emit when it returns None
 ├── worker.py                   # _emit: run_delivery first; _retry_declined shared with the emit loop
 └── sinks/
@@ -945,3 +1026,30 @@ tests/
   real type, and a criterion covers an element whose `__class__` claims `Outcome`.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: FR-003's never-retried table gains invariant 2's abandoned NATS publish (JetStream or an injected client) as `UNKNOWN`, never resent because `NATSSink` declares no idempotence; FR-005's expiry line is credited to SPEC-068 FR-001's `_diag.pending` line.
+- 2026-11-07, build findings, recorded at completion. FR-001 AC8: the two exact `__all__` pins
+  (`tests/test_baggage_header.py`, `tests/test_sinks_otlp.py`) had to be restated as the 30 names
+  plus the four, and `tests/test_public_surface.py`'s dataclass table and frozen-path exemption
+  grew, so "every existing pin passes unedited" was false. FR-002's prediction criterion and FR-005
+  AC5: the 2/1/3-call cases hold for a sink that declares no `max_retries`; with `s >= 1` the 1.2 s
+  case sits exactly on the edge. FR-002 item 4 and its hint criterion: a huge `int` hint or ceiling
+  is brought into range before `clamp_server_delay`, which raises `OverflowError` on `10**400`; a
+  `float`-subclass hint waits the backoff; the hint is read only after `outcomes_of` accepts the
+  verdict. FR-003: the fork reach is not at a holder `_is_owned` refuses — a third-party sink never
+  becomes a holder — but at the value the walk would not push, with `SinkCounters` found through
+  `sys.modules` once per walk and a `__slots__` member resolved; the Overview's probe bullet named
+  the same wrong mechanism and is corrected; the reach's one-level boundary is stated. FR-003 and
+  FR-004: the absorbed line is written after the commit, once per run per distinct exception type,
+  with its exact text. FR-004: a duplicated sentence deleted, and "every third-party sink" narrowed
+  to one that inherits no shipped predicate. FR-005 AC2: an always-raising `deliver` gives an
+  absorbed line and `batch abandoned after 1 emit attempts`, not the 12-call run's line
+  (orchestrator's ruling: the spec's own definition of a cycle). FR-005: seven existing test files
+  match the abandon line, not six, at `fda134a` and at `39a3f08c`. The Overview's `losses()` and
+  `max_retry_after` figures re-measured at `d11e9e90`. Rules the build made explicit, now stated in
+  their FRs: strict reads (`type(x) is int` for `max_retries`, `type(v) is SinkCounters`, a
+  `threading.Event` or subclass for the stop signal, `log_foundry_idempotent is True`); a raising
+  `retry_after` makes a verdict malformed; `Verdict.uniform` checks the outcome before using the
+  count; `list`/`tuple` subclasses copied through the base `__iter__`; the batch copied at entry and
+  the worker's line counting the pre-run length; the probe stops at `deliver = None` while the
+  adapter's lookup passes over it to an inherited `deliver` (orchestrator's ruling); a stop event
+  whose `wait` raises is announced once and the rest of the run sleeps; FR-006's door contributes
+  both plant kinds to the door guard's sweep and takes no exemption.

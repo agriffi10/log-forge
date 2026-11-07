@@ -79,6 +79,7 @@ protocol error is now `HTTPSink`'s counted abandonment rather than one of its `t
 
 ### 2026-11-07
 
+- **Applied to `deliver`** by SPEC-072 FR-004, fence unchanged: the engine makes this decision general. A verdict marking an event `UNKNOWN`, or a verdict the engine cannot read (`outcomes_of` refuses it: not a `Verdict`, outcomes not exact `Outcome` members, the wrong length, or a field that raises), means `deliver` returned and the events may have landed, so the run settles with them counted in `failed_events`, `flush()` stays true, and they are resent only by a sink declaring `log_foundry_idempotent = True` — which no shipped sink does.
 - **Refined** by SPEC-070 FR-004: an unreadable `2xx` body is an `_UnreadBody`, equal to `b""`, and
   `_read_failed` tells it from an empty one, so the residue shrinks to third-party overrides that do
   not ask; `OTLPSink` now counts an unreadable body. The keyword-parameter alternative is recorded
