@@ -30,10 +30,11 @@ def import_extra(module: str, extra: str) -> ModuleType:
 
     **Only the module being absent is converted.** The ``ModuleNotFoundError`` must name the module
     or one of its dotted parents (``google.cloud`` for ``google.cloud.pubsub_v1``). One naming
-    another module means the client is installed and its own dependency is missing, which the
-    extra would not fix; one naming nothing, an ``ImportError`` that is not a
-    ``ModuleNotFoundError`` (a broken binary), and anything else propagate unchanged, as the same
-    object.
+    another module means the client is installed and one of its own dependencies is missing
+    (``botocore`` under ``boto3``): reinstalling the extra may well fix that, but the extra is not
+    absent, and a message saying it is would send the reader after the wrong module. So that
+    exception, one naming nothing, an ``ImportError`` that is not a ``ModuleNotFoundError`` (a
+    broken binary), and anything else propagate unchanged, as the same object.
 
     A ``from X import Y`` site becomes an attribute read on what this returns, so a module present
     but lacking the name raises ``AttributeError`` where the import statement raised

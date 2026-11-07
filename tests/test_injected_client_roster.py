@@ -20,9 +20,14 @@ contributing no options at all.
 **Build options** are the parameters the build reads, directly or through what they flowed into:
 a local or a `self` attribute assigned from them (subscript stores, `or`/`if` expressions, calls,
 dict displays and `**` spreads, comprehensions and `for` targets included, and a container a
-method call such as `.append(x)` fills), and one level into a
-`self.<method>()` the build calls (`_connect`), reading the attributes the constructor stored.
-The analysis is flow-insensitive over the constructor, which over-reports rather than misses.
+method call such as `.append(x)` fills), and every `self.<method>()` the build reaches
+(`_connect`, and whatever `_connect` calls on `self`, followed transitively with a visited set),
+reading the attributes the constructor stored. The analysis is flow-insensitive over the
+constructor, which over-reports rather than misses.
+
+**Fails closed on `**kwargs` too.** An injected-client constructor taking `**<name>` is reported
+as `takes **<name>; its build options cannot be derived`: options arriving in a mapping have no
+parameter for the refusal to name, so the checks below could not see one ignored.
 
 **Five checks.**
 
@@ -316,6 +321,30 @@ def _taint(
     return local, attrs
 
 
+def _self_calls(node: ast.AST, methods: dict[str, ast.FunctionDef]) -> set[str]:
+    """Returns the names of the class's own methods a node calls on ``self``.
+
+    Args:
+      node: Any node.
+      methods: The class's methods, and its same-module bases', by name.
+
+    Returns:
+      Each ``self.<method>()`` callee that is one of ``methods``.
+
+    Raises:
+      None.
+    """
+    return {
+        n.func.attr
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and isinstance(n.func.value, ast.Name)
+        and n.func.value.id == "self"
+        and n.func.attr in methods
+    }
+
+
 def _is_super_init(call: ast.Call) -> bool:
     func = call.func
     return (
@@ -395,6 +424,10 @@ def _walk_init(file: str, cls: ast.ClassDef, methods: dict[str, ast.FunctionDef]
     if injected is None:
         return None
     init = _Init(file, cls.name, injected, defaults)
+    if func.args.kwarg is not None:
+        init.problems.append(
+            f"{file}:{cls.name}: takes **{func.args.kwarg.arg}; its build options cannot be derived"
+        )
     params = set(defaults)
     local, attrs = _taint(func, params)
     regions = _builds(func, injected)
@@ -405,16 +438,16 @@ def _walk_init(file: str, cls: ast.ClassDef, methods: dict[str, ast.FunctionDef]
             reads |= local.get(name, set())
         for attr in _self_attrs(region):
             reads |= attrs.get(attr, set())
-        for call in (n for n in ast.walk(region) if isinstance(n, ast.Call)):
-            target = call.func
-            if (
-                isinstance(target, ast.Attribute)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "self"
-                and target.attr in methods
-            ):
-                for attr in _self_attrs(methods[target.attr]):
-                    reads |= attrs.get(attr, set())
+        pending = _self_calls(region, methods)
+        visited: set[str] = set()
+        while pending:
+            name = pending.pop()
+            if name in visited:
+                continue
+            visited.add(name)
+            for attr in _self_attrs(methods[name]):
+                reads |= attrs.get(attr, set())
+            pending |= _self_calls(methods[name], methods)
     init.options = reads & params - {injected}
     for call in (n for n in ast.walk(func) if isinstance(n, ast.Call)):
         if isinstance(call.func, ast.Name) and call.func.id == "refuse_with_injected":
@@ -590,6 +623,36 @@ def test_it_follows_an_option_read_back_from_a_self_attribute() -> None:
     )
     assert _one(source).unrefused == [
         "m.py:S.url: a build option not refused beside an injected client"
+    ]
+
+
+def test_it_follows_an_option_read_two_methods_deep() -> None:
+    source = (
+        "class S:\n"
+        "    def __init__(self, connection=None, url=None):\n"
+        "        self._url = url\n"
+        "        self._conn = connection if connection is not None else self._connect()\n"
+        "    def _connect(self):\n"
+        "        return dial(self._params())\n"
+        "    def _params(self):\n"
+        "        return parse(self._url, self._again())\n"
+        "    def _again(self):\n"
+        "        return self._params()\n"
+    )
+    assert _one(source).unrefused == [
+        "m.py:S.url: a build option not refused beside an injected connection"
+    ]
+
+
+def test_it_reports_a_constructor_taking_keyword_options_it_cannot_derive() -> None:
+    source = (
+        "class S:\n"
+        "    def __init__(self, client=None, **client_options):\n"
+        "        if client is None:\n"
+        "            client = make(**client_options)\n"
+    )
+    assert _one(source).malformed == [
+        "m.py:S: takes **client_options; its build options cannot be derived"
     ]
 
 

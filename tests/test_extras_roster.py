@@ -12,6 +12,14 @@ Five checks over `src/log_foundry/**/*.py`, derived rather than listed:
    `sinks/_extras.py`, which is `import_extra` itself — reported as `file:line (qualname)`. Check 1
    sees only import statements, so a sink written with a dynamic import would otherwise escape it.
 
+A name bound by `from X import Y as Z` is resolved to `Y`, so an aliased `import_module` is still
+reported and an aliased `import_extra` is still a site for checks 2–4.
+
+**What it does not see**, each a deliberate edge its corpus asserts silence on: an import made
+through `importlib.util.find_spec` and `module_from_spec`, a callee fetched with
+`getattr(importlib, "import_module")`, and `pkgutil.resolve_name`. Each is a shape no sink has a
+reason to write; a site that needed one would be a design decision, not a slip.
+
 The guard carries its own fixture corpus, including the shapes it must stay silent on, and a
 derived mutation sweep that rewrites each real call back into a bare import, in memory, and
 requires check 1 to report it. A site added later is swept without an edit here.
@@ -132,6 +140,21 @@ def _scan_one(rel: str, source: str, scan: Scan) -> None:
       SyntaxError: If the source does not parse.
     """
 
+    tree = ast.parse(source)
+    aliases = {
+        alias.asname: alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if alias.asname
+    }
+
+    def callee(func: ast.expr) -> str | None:
+        name = _callee(func)
+        if isinstance(func, ast.Name) and name in aliases:
+            return aliases[name]
+        return name
+
     def visit(node: ast.AST, scope: tuple[str, ...], typing_only: bool) -> None:
         for child in ast.iter_child_nodes(node):
             child_scope = scope
@@ -149,14 +172,14 @@ def _scan_one(rel: str, source: str, scan: Scan) -> None:
                     scan.imports.append(f"{rel}:{child.lineno} ({qualname}): imports {module}")
             if (
                 isinstance(child, ast.Call)
-                and _callee(child.func) in _DYNAMIC
+                and callee(child.func) in _DYNAMIC
                 and rel != "sinks/_extras.py"
             ):
                 scan.dynamic.append(
                     f"{rel}:{child.lineno} ({qualname}): imports dynamically through "
                     f"{ast.unparse(child.func)}"
                 )
-            if isinstance(child, ast.Call) and _callee(child.func) == "import_extra":
+            if isinstance(child, ast.Call) and callee(child.func) == "import_extra":
                 _record_call(rel, child, ".".join(scope) or "<module>", scan)
             visit(child, child_scope, typing_only)
 
@@ -164,7 +187,7 @@ def _scan_one(rel: str, source: str, scan: Scan) -> None:
         holder = ast.Module(body=[stmt], type_ignores=[])
         visit(holder, scope, typing_only)
 
-    visit(ast.parse(source), (), False)
+    visit(tree, (), False)
 
 
 def _imported(node: ast.Import | ast.ImportFrom) -> list[str]:
@@ -239,7 +262,7 @@ def findings(
     extras: frozenset[str],
     expected: frozenset[tuple[str, str, str, str]],
 ) -> list[str]:
-    """Runs the four checks and names every violation.
+    """Runs the five checks and names every violation.
 
     Args:
       sources: Source text keyed by path relative to the package.
@@ -410,6 +433,36 @@ def test_it_is_silent_on_the_dynamic_import_inside_import_extra() -> None:
     assert findings({"sinks/other.py": source}, frozenset(), frozenset()) == [
         f"sinks/other.py:{line} (import_extra): imports dynamically through importlib.import_module"
     ], "the same source anywhere else is reported"
+
+
+def test_it_resolves_an_aliased_import_module_and_import_extra() -> None:
+    source = (
+        "from importlib import import_module as load\n"
+        "from log_foundry.sinks._extras import import_extra as ie\n"
+        "def f():\n"
+        "    load('pika')\n"
+        "    return ie('boto3', 'aws')\n"
+    )
+    site = ("sinks/m.py", "f", "boto3", "aws")
+    assert _one(source, frozenset({site})) == ["sinks/m.py:4 (f): imports dynamically through load"]
+    assert _one(source) == [
+        "sinks/m.py:4 (f): imports dynamically through load",
+        f"unexpected site {site}",
+    ]
+
+
+def test_it_is_silent_on_its_recorded_dynamic_import_edges() -> None:
+    source = (
+        "import importlib\n"
+        "import importlib.util\n"
+        "import pkgutil\n"
+        "def f():\n"
+        "    spec = importlib.util.find_spec('boto3')\n"
+        "    module = importlib.util.module_from_spec(spec)\n"
+        "    other = getattr(importlib, 'import_module')('pika')\n"
+        "    return pkgutil.resolve_name('redis:Redis'), module, other\n"
+    )
+    assert _one(source) == []
 
 
 def test_it_is_silent_on_a_call_to_import_extra() -> None:

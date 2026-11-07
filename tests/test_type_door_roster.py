@@ -14,14 +14,17 @@ A *door* is a function raising a `TypeError` that names the type of one of its p
    `isinstance` falls back to the value's `__class__`. The one exemption is
    `decorator._refuse_unusable`'s kept proxy test, SPEC-080's on purpose, and it is held as an
    exact multiset of its two expressions *after* the function's `not callable(fn)` refusal, so a
-   rewritten earlier test, or a second copy of an exempt one, is still reported.
+   rewritten earlier test, or a second copy of an exempt one, is still reported. A read of
+   `p.__class__` anywhere in a door's body (`if not value.__class__ is int:`) is reported too,
+   since it asks the value what it is by another spelling.
 3. The derived set of doors equals, exactly, the ten written out below from `2368ade3`: a door
    removed, renamed or inlined back reddens by name, and a new one is a visible edit.
 
 **What it does not see**, each a deliberate edge its corpus asserts silence on: a type named by a
 helper (`raise TypeError(_type_name(value))`), a message held in a local and raised later, a
-`ValueError` door (the HTTP sinks' `auth`, held by `tests/test_type_doors.py`), and a
-`TypeError` naming no type.
+`ValueError` door (the HTTP sinks' `auth`, held by `tests/test_type_doors.py`), a
+`TypeError` naming no type, and a parameter rebound to a local first (`v = value;
+isinstance(v, int)`), which check 2 does not follow.
 
 Its mutation sweep rewrites each door's `issubclass(type(p), T)` back to `isinstance(p, T)`, and
 each stored-name read back to `type(p).__name__`, in memory, and requires a report for every one;
@@ -287,6 +290,14 @@ def scan(sources: dict[str, str], expected: frozenset[str] = EXPECTED_DOORS) -> 
             if not _is_door(func):
                 continue
             doors.add(func.qual)
+            out += [
+                f"{rel}:{node.lineno} ({func.qual}): reads {node.value.id}.__class__ in a door"
+                for node in _own_nodes(func.node)
+                if isinstance(node, ast.Attribute)
+                and node.attr == "__class__"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in func.params
+            ]
             findings: list[tuple[int, str]] = []
             checked = [(func, set(func.params))]
             for call in (n for n in _own_nodes(func.node) if isinstance(n, ast.Call)):
@@ -431,6 +442,22 @@ def test_it_is_silent_on_an_owner_named_through_type_self() -> None:
 def test_it_is_silent_on_isinstance_in_a_function_that_raises_no_type_error() -> None:
     source = "def f(value):\n    if isinstance(value, int):\n        return 1\n    return 0\n"
     assert _one(source, frozenset()) == []
+
+
+def test_it_reports_a_dunder_class_read_anywhere_in_a_door() -> None:
+    source = _DOOR_OK.replace(
+        "    if not issubclass(type(value), int):\n",
+        "    if not value.__class__ is int:\n",
+    )
+    assert _one(source) == ["m.py:2 (m.door): reads value.__class__ in a door"]
+
+
+def test_it_is_silent_on_a_parameter_rebound_before_its_isinstance() -> None:
+    source = _DOOR_OK.replace(
+        "    if not issubclass(type(value), int):\n",
+        "    v = value\n    if not isinstance(v, int):\n",
+    )
+    assert _one(source) == []
 
 
 def test_it_is_silent_on_its_four_recorded_edges() -> None:
