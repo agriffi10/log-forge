@@ -45,6 +45,7 @@ from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from log_foundry.sinks.stdout import StderrSink, StdoutSink
 from log_foundry.sinks.transform import TransformSink
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 from log_foundry.worker import Worker
 
 # FR-004 AC-5's roster is the one `test_sink_concurrency` already derives -- every class in
@@ -3861,3 +3862,184 @@ def test_the_fork_collection_rule_can_actually_fail() -> None:
     }
     assert {name for name, src in accepted.items() if _unguarded_forks(src)} == set()
     assert {name for name, src in rejected.items() if not _unguarded_forks(src)} == set()
+
+
+# -- SPEC-072 FR-003: the walk reaches an engine sink's counters, and nothing else of it ------
+
+
+class _StructuralEngineSink:
+    """A third-party engine sink: no package type in its ancestry, counters it owns."""
+
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        return Verdict.uniform(Outcome.REJECTED, len(batch))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        raise AssertionError("an engine sink is delivered through deliver")
+
+    def close(self) -> None:
+        pass
+
+
+class _SubclassedEngineSink(Sink):
+    """The same engine sink, inheriting ``log_foundry.Sink`` as the README invites."""
+
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        return Verdict.uniform(Outcome.REJECTED, len(batch))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        raise AssertionError("an engine sink is delivered through deliver")
+
+    def close(self) -> None:
+        pass
+
+
+class _SlottedEngineSink:
+    """A third-party engine sink whose counters live in a ``__slots__`` member."""
+
+    __slots__ = ("log_foundry_counters",)
+
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        return Verdict.uniform(Outcome.REJECTED, len(batch))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        raise AssertionError("an engine sink is delivered through deliver")
+
+    def close(self) -> None:
+        pass
+
+
+_ENGINE_SINKS = {
+    "structural": _StructuralEngineSink,
+    "subclasses-sink": _SubclassedEngineSink,
+    "slotted": _SlottedEngineSink,
+}
+
+
+def _forked_engine_run(sink: Any) -> tuple[_Child, int]:
+    """Forks while a parent thread holds the sink's counters' lock; the child logs one orphan."""
+    counters = sink.log_foundry_counters
+    counters.failed_events = 5
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    parent_lock = id(counters._counter_lock)
+    released, holder = _held_by_a_parent_thread(counters._counter_lock)
+
+    def run_then_read() -> str:
+        log_foundry.info("child")
+        repaired = id(sink.log_foundry_counters._counter_lock) != parent_lock
+        return f"failed={sink.log_foundry_counters.losses().failed} repaired={repaired}"
+
+    try:
+        child = run_in_child(run_then_read, timeout=5)
+    finally:
+        released.set()
+        holder.join(5.0)
+    return child, counters.failed_events
+
+
+@pytest.mark.parametrize("shape", sorted(_ENGINE_SINKS))
+def test_a_child_repairs_an_engine_sinks_counters(shape: str) -> None:
+    """SPEC-072 FR-003 AC6: within 5 s, the counts add to the inherited ones, a fresh lock.
+
+    The structural sink is outside the walk's ownership boundary and the slotted one keeps its
+    counters off ``__dict__``; the reach reads the one attribute statically and walks it.
+    """
+    child, parent_total = _forked_engine_run(_ENGINE_SINKS[shape]())
+    assert child.finished, f"the child {child.ending}, having written {child.output!r}"
+    assert child.output == "failed=6 repaired=True", child.output
+    assert parent_total == 5, "the parent's counters are its own"
+
+
+def test_without_the_reach_the_same_child_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The positive control: with the reach answering nothing, the structural child hangs."""
+    monkeypatch.setattr(_fork, "_counters_reach", lambda value, kind: None)
+    child, _ = _forked_engine_run(_StructuralEngineSink())
+    assert child.blocked, f"the unrepaired child did not block: it {child.ending}, {child.output!r}"
+
+
+class _GuardedEngineSink(_StructuralEngineSink):
+    """An engine sink whose ``__getattr__`` raises and whose other attribute holds a lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.transport_lock = threading.Lock()
+        self.entered: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.__dict__["entered"].append(name)
+        raise RuntimeError(f"getattr-secret {name}")
+
+
+def test_the_counters_reach_enters_no_other_third_party_attribute() -> None:
+    """SPEC-072 FR-003 AC6: ``__getattr__`` never runs and another lock keeps its identity."""
+    sink = _GuardedEngineSink()
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    transport = id(sink.transport_lock)
+    counters_lock = id(sink.log_foundry_counters._counter_lock)
+    released, holder = _held_by_a_parent_thread(sink.transport_lock)
+
+    def read() -> str:
+        return (
+            f"transport-kept={id(sink.transport_lock) == transport} "
+            f"counters-repaired={id(sink.log_foundry_counters._counter_lock) != counters_lock} "
+            f"entered={sink.entered}"
+        )
+
+    try:
+        child = run_in_child(read)
+    finally:
+        released.set()
+        holder.join(5.0)
+    assert child.output == "transport-kept=True counters-repaired=True entered=[]", child.output
+
+
+def test_the_counters_type_is_read_without_an_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With ``sinks.verdict`` absent from ``sys.modules`` the reach answers nothing, importing nothing."""
+    monkeypatch.delitem(sys.modules, "log_foundry.sinks.verdict")
+    assert _fork._counters_type() is None
+    assert "log_foundry.sinks.verdict" not in sys.modules
+    monkeypatch.setitem(sys.modules, "log_foundry.sinks.verdict", None)
+    assert _fork._counters_type() is None
+    assert _fork._counters_reach(_StructuralEngineSink(), None) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "s",
+        3,
+        1.5,
+        True,
+        None,
+        b"b",
+        len,
+        _StructuralEngineSink,
+        sys,
+        type("P", (), {"log_foundry_counters": property(lambda self: SinkCounters())})(),
+        type("O", (), {"log_foundry_counters": object()})(),
+    ],
+    ids=[
+        "str",
+        "int",
+        "float",
+        "bool",
+        "none",
+        "bytes",
+        "builtin",
+        "class",
+        "module",
+        "property",
+        "other-type",
+    ],
+)
+def test_the_counters_reach_refuses_everything_but_exact_counters(value: object) -> None:
+    """Only an exact ``SinkCounters`` is handed back; a property is never called."""
+    assert _fork._counters_reach(value, SinkCounters) is None
