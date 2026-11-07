@@ -65,11 +65,16 @@ Figures, each with its instrument and the commit it was measured at:
   both `Worker(` and a family class, `SentrySink` or `LogstashSink`. The instrument is
   `grep -l 'Worker('` over `tests/*.py`, filtered by `grep -l` for the eleven class names. Which of
   them pin the removed whole-batch resend is FR-005's list.
-- **Probe D** (`tests/test_sinks_http_refused.py`). It makes 8 requests through
-  `Worker(max_retries=3)` at `fda134a`: four whole-batch attempts of a `413` and a `RuntimeError`.
-  SPEC-070 lands first and counts that `RuntimeError` as a rejection at its one attempt, but leaves
-  the worker's four attempts in place. So the 8 holds until this spec, and this spec is what makes
-  it 2.
+- **Probe D** (`tests/test_sinks_http_refused.py`). It made 8 requests through
+  `Worker(max_retries=3)` at `fda134a`: four whole-batch attempts of a `413` and an opener
+  `RuntimeError`. SPEC-070 changed that shape: `HTTPSink._send` now catches an opener's
+  `RuntimeError`, counts it in `failed` at its one attempt and lets nothing escape `emit`, so once
+  the `413` drop has settled chunk 1, `emit` returns, the worker sees success and the whole run is
+  2 requests with the drop counted once
+  (`test_an_opener_exception_after_a_drop_is_counted_and_the_drop_settles`). SPEC-070 rebuilt
+  Probe D's tests on an instance-level `_handle_response` that raises on chunk 2's `200`,
+  outside `_send`'s guard, so the raise still escapes `emit` and the probe still makes 8 requests
+  on SPEC-070's tree.
 
 ## Scope
 
@@ -928,3 +933,6 @@ tests/
 - Build-order re-read: FR-002's "no engine settled line" for a run with a registered announcement
   cites SPEC-072 FR-003, which now carries that refinement itself.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-07: SPEC-070 changed the Probe D premise. An opener `RuntimeError` after a drop is now 2
+  requests and `emit` returns, and Probe D was rebuilt on a raising `_handle_response`, which still
+  makes 8 requests; the Probe D paragraph under the measured figures is revised to say so.

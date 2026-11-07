@@ -14,7 +14,12 @@ holds `OTLPSink` as the only subclass defining the hook, and a sibling sweep hol
 to retrying a `500` and a `501`. **Rejected: a per-sink retry set on the worker.** `Worker._emit`
 re-sends a batch whenever `emit` raises, whatever the status, so a `400` is still offered
 `max_retries + 1` times by the pipeline above the sink; teaching the worker a per-sink "do not retry"
-is a change to every sink's contract, not to this one, and stays out of scope. **Kept on purpose: the
+is a change to every sink's contract, not to this one, and stays out of scope. **The exception hook
+is the same shape** (SPEC-070): every retry loop in the sinks, `HTTPSink._send`'s included, asks a
+private `_retryable_error(err)` beside this status hook, through `is_retryable` so a predicate that
+raises reads as "not retryable" (*A sink declares what it retries, and anything else fails at
+once*). `OTLPSink` overrides only the status hook; the roster of *The sinks keep four declared
+exceptions to their shared rules* holds it as the one class that does. **Kept on purpose: the
 `413` search.** OTLP's rule says nothing outside the set is retried; the base class halves the byte
 budget on a `413` and re-sends the same records in smaller requests (*A destination's limit is found
 by halving the budget*). It is kept because nothing landed — a `413` precedes ingestion — and because
@@ -22,6 +27,12 @@ OTLP's own server rule for an oversized request is to answer `413`, which is exa
 search exists to act on. (SPEC-056 FR-003)
 
 ## History
+
+### 2026-11-07
+
+- **Refined** by SPEC-070: `_retryable_error` joins `_retryable_status` as the exception half of the
+  same private-predicate shape, and the `_retryable_status` roster becomes row 2 of the declared
+  exceptions table.
 
 ### 2026-11-03
 

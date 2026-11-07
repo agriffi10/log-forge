@@ -65,7 +65,9 @@ bound (`health()` docstring); `queued` also counts a `flush()` marker stranded b
 losses are counted but never retried, because a retry would duplicate — an unadjudicable batch
 response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017)~~ — superseded
 by SPEC-058: five losses are counted but never retried by the sink — an unadjudicable batch
-response, an SQS sender fault, an oversized event (SPEC-018, SPEC-016, SPEC-017), a wrapper's or
+response (since SPEC-070, a Kinesis or Firehose failed count its coded records contradict among
+them), an SQS or SNS sender fault (SNS since SPEC-070), an oversized event (SPEC-018, SPEC-016,
+SPEC-017), a wrapper's or
 an SQS id callable's per-event failure when its siblings were delivered, and an event a sink
 cannot encode — first an unrenderable HTTP event (SPEC-058), and since SPEC-069 an event any
 record-building sink's encode step refuses — because a retry would re-deliver what landed beside
@@ -99,15 +101,18 @@ and `GooglePubSubSink`, and on `SocketTransport` for `SyslogSink` and socket-mod
 (SPEC-069). A counter some `losses()` reports as `dropped` is written only by that commit: the
 counters are derived from the tree and the rule checked over it (`tests/test_deferral.py`). The
 exception is a sink's own `failed` count, the upper bound above: it can land before a raise and
-again each time the worker retries that batch, the SQS sender fault included (`SQSSink._send`
-counts it before `emit` raises for a recoverable loss beside it), and the batch size a
+again each time the worker retries that batch, the SQS and SNS sender faults included
+(`SQSSink._send` and, since SPEC-070, `SNSSink._send` count one before `emit` raises for a
+recoverable loss beside it), a failure the sink's retry predicate does not accept, counted at its
+first attempt before `emit` raises when nothing landed (SPEC-070), and the batch size a
 `SQLiteSink`, `FileSink` or `RotatingFileSink` adds to `failed` when its driver raises, before it
 raises in turn (SPEC-069 FR-004). A third-party sink that counts
 a drop before raising is outside what the library can hold to this (`MultiSink.emit` names the
 cost).
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
 `tests/test_encode.py` and `tests/test_sinks_encode.py` (the encode step over a roster derived from
-the tree, SPEC-069); `tests/test_invariants_model.py` is the identity itself.
+the tree, SPEC-069), `tests/test_classify.py` (every retry loop counts once at the attempt that
+failed, the sender faults and the contradictory counts, SPEC-070); `tests/test_invariants_model.py` is the identity itself.
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
@@ -210,7 +215,8 @@ encode (an HTTP batch it cannot render, SPEC-058, and since SPEC-069 the same ba
 record-building sink, each event counted `dropped`; `NATSSink` and `SentrySink`, the declared
 exceptions, still count such an event `failed` and raise for a batch of nothing else), a wrapper
 batch of one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized
-or unencodable event (SPEC-058, SPEC-069). Nothing in such a batch is helped by a retry, which is
+or unencodable event (SPEC-058, SPEC-069), and an SQS or SNS batch rejected wholly as sender faults
+(SPEC-016 for SQS, SPEC-070 FR-003 for SNS). Nothing in such a batch is helped by a retry, which is
 the test this page's rule turns on. So a `_bulk` server answering every POST with a `2xx` the sink
 cannot adjudicate — a body it cannot read or that is not an object, or a truthy `errors` with a
 short `items` array — leaves `flush()` truthy and `failed_batches` at zero, with the loss in
@@ -218,11 +224,11 @@ short `items` array — leaves `flush()` truthy and `failed_batches` at zero, wi
 `200` the sink cannot adjudicate — a body it cannot read, not an array of objects, the wrong length,
 or an entry whose `status` is not an integer — leaves the same three signs. An HTTP `2xx` is a
 verdict however its body ends: a body cut short, stalled or reset after the status line settles its
-chunk — delivered for a sink that ignores the body or, like OTLP, reads an empty one as success,
-unadjudicated for the `_bulk` sinks and `HoneycombSink`, whose only verdict is in the body — and is
-never re-sent; before any status line, a protocol error is retried and counted like a connection
-error. An OTLP server answering every POST with a `2xx` whose `partialSuccess` is present but cannot
-be read, or with a `2xx` over the 4 MiB response bound, leaves the same three signs for the same
+chunk — delivered for a sink that ignores the body, unadjudicated for the `_bulk` sinks,
+`HoneycombSink` and `OTLPSink`, whose verdict is in the body (SPEC-070 FR-004) — and is never
+re-sent; before any status line, a protocol error is retried and counted like a connection error.
+An OTLP server answering every POST with a `2xx` whose `partialSuccess` is present but cannot be
+read, or whose body cannot be read, or with a `2xx` over the 4 MiB response bound, leaves the same three signs for the same
 reason (SPEC-056); only a `2xx` rejecting every record of every chunk raises there, because nothing
 landed — and the same holds for a Honeycomb `200` rejecting every event of every chunk. A core
 `NATSSink` batch whose confirming round trip went unanswered leaves them too (SPEC-061 FR-003):
@@ -232,7 +238,8 @@ latch, so a sustained stall is still reported as failed batches and only the one
 straddles its onset is counted rather than raised.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_encode.py` (an all-unencodable batch settles on every record-building sink,
-SPEC-069), `tests/test_driver_error.py` (a SQLite or file driver error raises with `failed` moved,
+SPEC-069), `tests/test_classify.py` and `tests/test_sinks_sns.py` (a batch lost only to sender
+faults returns, one with a recoverable loss beside it raises, SPEC-070), `tests/test_driver_error.py` (a SQLite or file driver error raises with `failed` moved,
 SPEC-069), `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass),
 `tests/integration/` against real services (SPEC-041).
 

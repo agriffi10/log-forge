@@ -15,8 +15,10 @@ adjudicates all of a chunk or none of it* from a misaligned array to a body with
 for the same reason: the per-item verdict lives in the body, so without one the server has not
 confirmed these events, and invariant 2 forbids losing them silently. A body that could not be read
 off the connection at all — cut short, stalled or reset after the status line — takes the same
-route: `HTTPSink._attempt` hands it over as `b""`, which `json.loads` refuses (*After a status line
-the status decides; a 2xx whose body cannot be read is never re-sent*).
+route: `HTTPSink._attempt` hands it over as an `_UnreadBody`, equal to `b""`, which the sink asks
+`_read_failed` about before it decodes anything (*After a status line the status decides; a 2xx
+whose body cannot be read is never re-sent*); before SPEC-070 it arrived as plain `b""` and took
+this route because `json.loads` refuses it.
 
 **Rejected: settling silently.** Before this decision an undecodable body returned with every counter
 at zero, and a too-deep one raised `RecursionError` out of `emit`, so the worker re-sent a batch the
@@ -33,11 +35,22 @@ unadjudicated would charge every success from an endpoint that omits it, which A
 OpenSearch-compatible `_bulk` appears to do by its source. It belongs with the Astra profile;
 `docs/architecture.md` §12 records the exposure.
 
-**OTLP reads the same shape differently, on purpose** — SPEC-056 FR-004 settles an unreadable 2xx
-OTLP body without a count, because a protobuf response is legal there. Do NOT copy either reading
+**OTLP reads the same shape differently, on purpose** — ~~SPEC-056 FR-004 settles an unreadable 2xx
+OTLP body without a count~~, because a protobuf response is legal there. Do NOT copy either reading
 into the other sink.
 
+> **Superseded in part by SPEC-070 FR-004:** a `2xx` OTLP body that could not be read off the
+> connection is now counted on `dropped_unadjudicated` like this sink's; what OTLP still settles
+> without a count is an empty, undecodable or non-object body. The decision lives in *A 2xx this
+> sink cannot read is counted, and the `_bulk` reading is argued, never inherited*, and the one
+> difference left is row 4 of *The sinks keep four declared exceptions to their shared rules*.
+
 ## History
+
+### 2026-11-07
+
+- **Marked.** SPEC-070 FR-004: the unreadable body arrives as an `_UnreadBody` the sink asks about
+  first, and OTLP now counts an unreadable body too; the OTLP paragraph carries a superseded marker.
 
 ### 2026-11-03
 
