@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "`auth` beside an `Authorization` header is refused, never resolved by precedence"
-description: "`auth=` beside an `Authorization` header in any case, matched by the name `urllib` sends (`http._wire_name`), is a `ValueError` at construction from `HTTPSink` and every sink forwarding `auth`, judged before the credential and naming no value; `SplunkHECSink`, which sends its token as that header, refuses any `auth=`. A pair that is not a real `str` is unpacked once, at construction, into the `tuple` every request is built from. Do NOT resolve the conflict by letting either side win, or match the header by exact case. A caller header replacing a platform sink's own credential header through `merge_headers` is not covered: `architecture.md` §12 carries it open. (HTTP auth fix, no spec)"
+description: "`auth=` beside an `Authorization` header in any case, matched by the name `urllib` sends (`http._wire_name`), is a `ValueError` at construction from `HTTPSink` and every sink forwarding `auth`, judged before the credential and naming no value; `SplunkHECSink`, which sends its token as that header, refuses any `auth=`. Credentials are copied once, at construction, as exact `str`, and every request sends the `Authorization` value built from the copy then. Do NOT resolve the conflict by letting either side win, or match the header by exact case. A caller header replacing a platform sink's own credential header through `merge_headers` is not covered: `architecture.md` §12 carries it open. (HTTP auth fix, no spec)"
 ---
 
 **Credentials and an `Authorization` header given together are refused at construction, because
@@ -25,10 +25,13 @@ its token as the Authorization header; drop auth=` rather than telling its calle
 header. It is one check in one place: Datadog, Elasticsearch, OpenSearch, Honeycomb, Loki, New
 Relic and OTLP forward `auth` and `headers` to the same constructor, and `LogstashSink`'s HTTP mode
 reports it under `HTTPSink`'s name, as it does every HTTP-mode refusal it does not make first.
-With nothing a sink holds able to override the credentials, `_apply_auth` writes them
+The four platform sinks that merge `headers=` over their own read it with `dict()`, as `HTTPSink`
+does, so an `Authorization` in a `MappingProxyType` or a list of pairs meets the check too; an
+`isinstance(caller, dict)` test used to drop such headers silently. With nothing a sink holds able
+to override the credentials, `_apply_auth` writes the value built at construction
 unconditionally; the only map that could still carry an `Authorization` is a per-request
-`extra_headers`, which sits beneath the caller's own (SPEC-048 FR-007), and no shipped sink passes
-one beside credentials.
+`extra_headers`, which sits beneath the caller's own (SPEC-048 FR-007), and no `extra_headers=` key
+in `src/` folds to `Authorization`.
 
 **Why refuse rather than pick a winner.** Either precedence leaves an argument the caller wrote
 silently never sent, which is the failure the invariant names, and neither side is the obvious
@@ -51,19 +54,25 @@ the header names, which `_valid_headers` has already judged, so it cannot echo o
 credential (invariant 11), and a caller who must drop one of the two is told so before being told
 anything about the value of one they may be about to drop.
 
-**The pair is copied once.** A value that is not a real `str` used to be unpacked by the
+**Credentials are built once.** A value that is not a real `str` used to be unpacked by the
 construction check and again on every `emit`, so a one-shot iterator such as `iter(("u", "p"))`
-constructed and then raised `not enough values to unpack` out of every `emit`, uncounted.
-`http._copied_pair` now performs that same unpack once, into the real `tuple` the check and every
-request read, so what it refuses and the type name its refusal carries are unchanged, and it still
-reads no more than three items. Any pair is read once: a list changed afterwards, or an object
-yielding new values each time it is iterated, is frozen at what it held at construction.
+constructed and then raised `not enough values to unpack` out of every `emit`, uncounted, and the
+`Authorization` value was rebuilt per request, so a `str` subclass's `__format__` ran on every one,
+free to return a value the check never saw. A token is now copied as the exact `str` it holds
+(`_diag._STR_STR`); `http._copied_pair` performs the old unpack once, keeping its refusals and
+reading no more than three items, then copies each half the same way. The `Authorization` value is
+built from the copy and checked once, at construction, and `_apply_auth` writes that stored value,
+so no caller code runs per request: a list changed afterwards, an object yielding new values each
+time it is iterated, or a `str` subclass answering differently later, is frozen at what it held. A
+pair outside `tuple[str, str]` is refused by real type (*An argument door asks the type, never the
+value*).
 
 **Not covered.** `merge_headers` lays a caller's `headers=` over a platform sink's own, so a caller
 header naming the sink's credential header (Splunk's `Authorization`, Datadog's `DD-API-KEY`, New
 Relic's `Api-Key`, Honeycomb's `X-Honeycomb-Team`), in any case, replaces the required `token` or
-`api_key` silently. That is the same class of gap, found during this fix's build and left open:
-`architecture.md` §12 carries it, with what would close it.
+`api_key` silently, and two caller header names folding to one send only the last. That is the
+same class of gap, found during this fix's build and left open: `architecture.md` §12 carries it,
+with what would close it.
 
 **Rejected:**
 
@@ -78,7 +87,10 @@ transitively and held to the render sweep's recipes, plus `HTTPSink` and `Logsta
 refusal in each case, Splunk's own wording, a token the check never reaches, `auth` sent beside a
 header that only contains the word, and a one-shot pair sent on every request; a whitespace
 spelling of `Authorization` is refused as a header name, before the conflict is reached.
-`tests/test_sinks_http_header_names.py` holds the whitespace refusal itself.
+It also scans every `extra_headers=` key in `src/` and fails naming one that folds to
+`Authorization` or is not a literal. `tests/test_sinks_http_header_names.py` holds the whitespace
+refusal itself, and `tests/test_sinks_http_header_merge.py` the platform sinks' non-`dict`
+`headers=`.
 
 ## History
 

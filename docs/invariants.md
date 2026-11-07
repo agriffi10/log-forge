@@ -480,6 +480,8 @@ the doors from the AST and fails naming one that asks the value rather than its 
 naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra refused at the
 constructor that needs it, and `tests/test_extras_roster.py`, which fails naming an extra imported
 other than through `import_extra` (SPEC-071); `tests/test_sinks_http_auth.py` for `auth` refused
-beside an `Authorization` header in any case, and a one-shot `auth` copied once and sent on every
-request, and `tests/test_sinks_http_header_names.py` for a header name holding whitespace (the
-HTTP auth fix, no spec).
+beside an `Authorization` header in any case, a one-shot `auth` copied once and sent on every
+request, a pair that is not two `str` refused, and its scan failing naming any `extra_headers=` key
+in `src/` that folds to `Authorization`; `tests/test_sinks_http_header_names.py` for a header name
+holding whitespace, and `tests/test_sinks_http_header_merge.py` for a platform sink's non-`dict`
+`headers=` and a `Content-Encoding` in any case (the HTTP auth fix, no spec).

@@ -894,9 +894,18 @@ close it.
   the caller's value, and the `token` or `api_key` is never sent. `merge_headers` documents
   "caller winning", but that is the code's reasoning, not an exception invariant 13 records. A side
   effect: `SplunkHECSink`'s refusal of `auth=` says the sink sends its token as the `Authorization`
-  header even when the caller's own header has replaced that token. **Closed by** refusing a caller
-  header that names the sink's own credential header, in any case, or recording the precedence as
-  an exception to invariant 13.
+  header even when the caller's own header has replaced that token. The same family: two caller
+  header names that fold to one wire name (`{"x-a": "1", "X-A": "2"}`, or `authorization` beside
+  `Authorization`) construct and send only the last value, silently; reproduced at `a8d87119`.
+  **Closed by** deciding which header wins for both together: refusing a caller header that names
+  the sink's own credential header, and two caller names that fold together, in any case, or
+  recording the precedence as an exception to invariant 13.
+- **An empty `auth` token or pair is accepted, and sends an empty credential** (HTTP auth fix's
+  frame-2 review; invariant 13). `HTTPSink(url, auth="")` sends `Authorization: Bearer ` and
+  `auth=("", "")` sends `Basic Og==` (reproduced at `a8d87119`), so against an endpoint that
+  requires credentials every request is refused, on every `emit`, for the life of the process.
+  **Closed by** refusing an empty token and an all-empty pair at construction, or recording either
+  as deliberate.
 - **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
   (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
   `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
@@ -1087,10 +1096,13 @@ close it.
 
 - ~~**An `auth` that unpacks only once is accepted at construction, and every `emit` then
   fails**~~ (SPEC-071 frame-2 review; invariant 13) → **closed by the HTTP auth fix (no spec)**.
-  A pair that is not a real `str` is unpacked once, at construction, into the real `tuple` the
-  check and every request read (`http._copied_pair`), so `HTTPSink(url, auth=iter(("u", "p")))`
-  sends Basic auth on every request. What the unpack refuses, and the type its refusal names, are
-  unchanged; a list pair is copied, so mutating it later changes nothing sent.
+  Credentials are copied once, at construction, as exact `str` (`_diag._STR_STR`; a pair unpacked
+  once by `http._copied_pair`), and the `Authorization` value is built and checked from the copy
+  then, once; every request writes that stored value, so no caller code runs per request and
+  `HTTPSink(url, auth=iter(("u", "p")))` sends Basic auth on every one. The unpack's refusals keep
+  their messages. A pair outside `tuple[str, str]` used to construct and send whatever its unpack
+  gave (a set's hash order, a mapping's keys, a `bytes` half's `repr`); a `set`, `frozenset` or
+  mapping, or a half that is not a `str`, is now a `ValueError` naming only the real types.
 - ~~**`auth=` beside a caller's `Authorization` header is silently ignored**~~ (SPEC-071 frame-2
   review; invariant 13) → **closed by the HTTP auth fix (no spec)**, by refusal. Only the
   exact-case spelling won; under any other case `auth` won and the header was dropped, since
@@ -1115,8 +1127,14 @@ close it.
   token route into its own `__contains__`. It is now judged by its real type, so such a value takes
   the `(user, password)` route without its `__class__` or `__contains__` running, and gets the
   existing `ValueError` naming `auth` when it cannot be unpacked as a pair; one that unpacks into
-  two items is accepted and sent as Basic auth, its `__iter__` run. And seven callable constructor arguments that accepted a non-callable and then
-  failed in `emit` or `close()`, now refused at construction through `_args.require_callable`.
+  two items is accepted and sent as Basic auth, its `__iter__` run. And seven callable constructor
+  arguments that accepted a non-callable and then failed in `emit` or `close()`, now refused at
+  construction through `_args.require_callable`.
+  > **Superseded in part by the HTTP auth fix (no spec).** A value that unpacks into two items is
+  > accepted only when both are real `str` and it is not a `set`, `frozenset` or mapping; anything
+  > else is refused naming its real types. Its `__iter__` runs once, at construction, and every
+  > request sends the value built then. The decision: *`auth` beside an `Authorization` header is
+  > refused, never resolved by precedence*, in `docs/decisions/sink-delivery/`.
   `tests/test_type_door_roster.py` holds the ten doors by name and reports any `isinstance` on a
   door's parameter outside `decorator._refuse_unusable`'s kept proxy test. The reasoning: *An
   argument door asks the type, never the value*, in `docs/decisions/sink-delivery/`.
