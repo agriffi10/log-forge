@@ -19,8 +19,9 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.http import HTTPSink, _valid_headers
 from log_foundry.sinks.logstash import LogstashSink
+from log_foundry.sinks.splunk import SplunkHECSink
 from test_sinks_http import FakeOpener
 from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
 
@@ -44,6 +45,15 @@ SPLUNK = (
     "SplunkHECSink auth cannot be given, since this sink sends its token as the Authorization "
     "header; drop auth="
 )
+
+HEC_VALUE = "SECRET-HEC-VALUE"
+"""The token the Splunk sink is built with here, so its refusal can be shown not to echo it."""
+
+TRAILING_WHITESPACE = [" ", "\t", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x1f", " \t "]
+"""Every whitespace character ``_valid_headers`` lets trail a header name, plus a run of them.
+
+``http.client`` refuses whitespace only as a name's first character, so these reach the wire;
+``test_the_trailing_whitespace_roster_is_what_valid_headers_admits`` re-derives the set."""
 
 
 @pytest.fixture(autouse=True)
@@ -220,19 +230,65 @@ def test_every_forwarder_refuses_auth_beside_an_authorization_header(name, heade
 )
 def test_splunk_refuses_any_auth_saying_it_sends_its_token_there(headers, auth) -> None:
     """At ``39a3f08c``: constructs and drops ``auth``, sending only ``Splunk <token>``."""
-    make = _RECIPES["SplunkHECSink"]
     kw: dict[str, Any] = {"auth": auth}
     if headers is not None:
         kw["headers"] = headers
 
     with pytest.raises(ValueError) as caught:
-        make(**kw)
+        SplunkHECSink(URL, HEC_VALUE, **kw)
 
     assert str(caught.value) == SPLUNK
     assert "passed" not in str(caught.value) and "or the header" not in str(caught.value)
     _assert_names_no_value(caught.value)
-    assert "tok" not in str(caught.value).replace("token", "")
+    assert HEC_VALUE not in str(caught.value), "the sink's own token is never echoed"
     _assert_chains_nothing(caught.value)
+
+
+@_AUTHS
+@pytest.mark.parametrize("trailing", TRAILING_WHITESPACE, ids=repr)
+@pytest.mark.parametrize("header", ["Authorization", "authorization"])
+def test_auth_beside_an_authorization_header_with_trailing_whitespace_is_refused(
+    header, trailing, auth
+) -> None:
+    """At ``7845f66f``: constructs, and ``http.client`` sent both headers on one request."""
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=auth, headers={header + trailing: HEADER_VALUE})
+
+    assert str(caught.value) == f"HTTPSink {BESIDE_HEADER}"
+    _assert_names_no_value(caught.value)
+    _assert_chains_nothing(caught.value)
+
+
+@pytest.mark.parametrize("trailing", TRAILING_WHITESPACE, ids=repr)
+def test_a_header_only_containing_the_word_is_not_matched_with_trailing_whitespace(
+    trailing,
+) -> None:
+    opener = FakeOpener()
+    sink = HTTPSink(
+        URL, auth=("u", "p"), headers={"X-Authorization" + trailing: "v"}, opener=opener
+    )
+
+    assert _sent_authorization(sink, opener) == BASIC_U_P
+
+
+def test_the_trailing_whitespace_roster_is_what_valid_headers_admits() -> None:
+    """Re-derives the roster above, so a ``_valid_headers`` that admits more fails here.
+
+    Only whitespace by ``str.isspace`` is swept: the conflict check strips exactly that, and any
+    other character is a different name to a server, not a spelling of ``Authorization``.
+    """
+    admitted = set()
+    for code in range(0x110000):
+        char = chr(code)
+        if not char.isspace():
+            continue
+        try:
+            _valid_headers({"Authorization" + char: "v"}, "P")
+        except ValueError:
+            continue
+        admitted.add(char)
+
+    assert admitted == {item for item in TRAILING_WHITESPACE if len(item) == 1}
 
 
 def test_an_unsendable_token_beside_the_header_is_refused_by_the_conflict_in_either_case() -> None:

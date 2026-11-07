@@ -848,11 +848,19 @@ def _valid_auth(
     **Beside an** ``Authorization`` **header,** ``auth`` **is refused** (1.2.0). Both set the one
     ``Authorization`` header a request carries, so one of them was silently never sent — the
     credentials when the header was spelled exactly ``Authorization``, the header under any other
-    case, since ``urllib`` folds the two names together and keeps the value written last. The header is matched by the name ``urllib`` sends,
-    :func:`_wire_name`, so no spelling escapes. This check runs **first**: it reads only whether
-    credentials were given and the header names, which :func:`_valid_headers` has already judged,
-    so it cannot echo or chain a credential, and a caller who must drop one of the two is told so
-    before being told anything about the value of one they may be about to drop. ``conflict`` is
+    case, since ``urllib`` folds the two names together and keeps the value written last. The
+    header is matched by the name ``urllib`` sends, :func:`_wire_name`, with surrounding
+    whitespace stripped. ``http.client`` admits whitespace after a name's first character, so
+    ``Authorization`` followed by a tab reached the wire beside the credentials' own header, and
+    a lenient server may trim it to ``Authorization``. ``str.strip()`` with no argument removes
+    every whitespace character :func:`_valid_headers` lets trail a name — space, tab, ``VT``,
+    ``FF`` and the separators ``0x1C``–``0x1F``, measured over every code point — so no name
+    differing from ``Authorization`` only in case or surrounding whitespace escapes. A name that
+    merely contains the word, ``X-Authorization``, is not a conflict. This check runs **first**:
+    it reads only whether credentials were given and the header names, which
+    :func:`_valid_headers` has already judged, so it cannot echo or chain a credential, and a
+    caller who must drop one of the two is told so before being told anything about the value of
+    one they may be about to drop. ``conflict`` is
     the class's own wording, because a sink that writes ``Authorization`` itself — Splunk's token
     — must not tell its caller they passed a header. Since nothing a sink holds can now override
     the credentials, every one given is the one sent, and every one is checked below.
@@ -881,13 +889,14 @@ def _valid_auth(
       The token as given, the pair copied into a ``tuple``, or ``None``.
 
     Raises:
-      ValueError: If ``auth`` is given beside an ``Authorization`` header in any case, a bearer
-        token contains ``CR`` or ``LF``, a value that is not a token does not unpack into exactly
-        two items, or ``http.client`` cannot send the ``Authorization`` header either form builds.
+      ValueError: If ``auth`` is given beside an ``Authorization`` header in any case or with
+        surrounding whitespace, a bearer token contains ``CR`` or ``LF``, a value that is not a
+        token does not unpack into exactly two items, or ``http.client`` cannot send the
+        ``Authorization`` header either form builds.
     """
     if auth is None:
         return None
-    if any(_wire_name(name) == "Authorization" for name in headers):
+    if any(_wire_name(name).strip() == "Authorization" for name in headers):
         raise ValueError(f"{owner} {conflict}")
     stored: str | tuple[str, str]
     if issubclass(type(auth), str):
@@ -1101,8 +1110,10 @@ class HTTPSink:
           method: The HTTP method.
           headers: Headers that override the sink's own defaults.
           auth: A bearer token, or a ``(user, password)`` pair for basic auth. A pair is any
-            value unpacking into exactly two items, a one-shot iterator included: it is copied
-            into a ``tuple`` once, here, and every request is built from the copy.
+            value unpacking into exactly two items, a one-shot iterator included, and any pair is
+            read **once**, here, into a ``tuple`` every request is built from: a list changed
+            afterwards, or an object yielding new values each time it is iterated, is frozen at
+            what it held at construction.
           body_format: ``"ndjson"`` or ``"json_array"``.
           timeout: Seconds allowed per request.
           gzip: Whether to compress the body.
