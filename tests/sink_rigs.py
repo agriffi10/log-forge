@@ -45,14 +45,22 @@ def ok(log_id: str) -> dict[str, object]:
 
 @dataclass
 class State:
-    """What the doubles share: the log, and whether every client call fails."""
+    """What the doubles share: the log, and whether every client call fails.
+
+    ``error``, when set, is raised by every client call in place of the rig's ``ConnectionError``
+    — the hook SPEC-070's tests use to put a chosen exception at each retry loop's catch.
+    """
 
     log: list[tuple[str, Any]] = field(default_factory=list)
     down: bool = False
     fail_next: int = 0
+    error: BaseException | None = None
 
     def call(self, payload: Any) -> None:
         """Records one client call, raising when the rig is down or has failures queued."""
+        if self.error is not None:
+            self.log.append(("refused", None))
+            raise self.error
         if self.fail_next > 0:
             self.fail_next -= 1
             self.log.append(("refused", None))
@@ -445,6 +453,9 @@ class _Socket:
         self._state = state
 
     def sendto(self, data: bytes, addr: tuple[str, int]) -> None:
+        if self._state.error is not None:
+            self._state.log.append(("refused", None))
+            raise self._state.error
         if self._state.down:
             self._state.log.append(("refused", None))
             raise OSError(111, "Connection refused")

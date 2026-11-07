@@ -161,3 +161,98 @@ def test_a_keyboard_interrupt_is_not_absorbed_by_the_chunk_guard() -> None:
     sink = SNSSink("arn:topic", client=_Interrupting(fail_on=set()), max_retries=0)
     with pytest.raises(KeyboardInterrupt):
         sink.emit([{"i": 1, "trace_id": "t"}])
+
+
+# --- SPEC-070 FR-003: a sender fault is the caller's, so it is sent once ----------------------
+
+
+class _FaultingSNS:
+    """Rejects the entries named in ``faults`` with ``SenderFault`` set as given there."""
+
+    def __init__(self, faults: dict[str, object], *, first_call_only: bool = False) -> None:
+        self.calls: list[list[str]] = []
+        self._faults = faults
+        self._first_call_only = first_call_only
+
+    def publish_batch(self, *, TopicArn: str, PublishBatchRequestEntries: list[dict]) -> dict:
+        self.calls.append([e["Id"] for e in PublishBatchRequestEntries])
+        live = not self._first_call_only or len(self.calls) == 1
+        failed = [
+            {"Id": e["Id"], "Code": "InvalidParameter", "SenderFault": self._faults[e["Id"]]}
+            for e in PublishBatchRequestEntries
+            if live and e["Id"] in self._faults
+        ]
+        ids = {f["Id"] for f in failed}
+        successful = [{"Id": e["Id"]} for e in PublishBatchRequestEntries if e["Id"] not in ids]
+        return {"Successful": successful, "Failed": failed}
+
+
+def test_a_sender_fault_is_sent_once_counted_and_named(monkeypatch, capsys) -> None:
+    """FR-003 AC-1: one call, ``failed`` up by the entry count, one ``not retried`` line."""
+    waits: list[float] = []
+    monkeypatch.setattr("log_foundry.sinks.sns.wait", lambda delay, stop=None: waits.append(delay))
+    client = _FaultingSNS({"0": True, "1": True})
+    sink = SNSSink("arn", client=client, max_retries=3)
+
+    sink.emit([{"a": 1}, {"a": 2}])
+
+    assert client.calls == [["0", "1"]]
+    assert sink.failed == 2
+    assert waits == []
+    lines = [line for line in capsys.readouterr().err.splitlines() if "lost" in line]
+    assert lines == [
+        (
+            "log-foundry: lost 2 message(s); SNSSink, rejected as invalid "
+            "(first code: InvalidParameter); not retried"
+        )
+    ]
+
+
+def test_only_the_entry_that_was_not_a_sender_fault_is_resent() -> None:
+    """FR-003 AC-1: of one sender fault and one ``SenderFault: False``, the second is resent."""
+    client = _FaultingSNS({"0": True, "1": False}, first_call_only=True)
+    sink = SNSSink("arn", client=client, max_retries=3)
+
+    sink.emit([{"a": 1}, {"a": 2}])
+
+    assert client.calls == [["0", "1"], ["1"]]
+    assert sink.failed == 1
+
+
+def test_a_batch_of_nothing_but_sender_faults_returns() -> None:
+    """FR-003 AC-3: every chunk rejected as the caller's fault returns, as ``SQSSink``'s does."""
+    client = _FaultingSNS({str(i): True for i in range(10)})
+    sink = SNSSink("arn", client=client, max_retries=3)
+
+    sink.emit([{"i": i} for i in range(12)])  # chunks of 10 and 2; every Id 0..9 rejected
+
+    assert len(client.calls) == 2
+    assert sink.failed == 12
+
+
+def test_a_sender_fault_chunk_does_not_mask_a_recoverable_one() -> None:
+    """FR-003 AC-3: the SQS twin's test (``test_sink_losses.py``), on SNS."""
+
+    class SplitFaultClient:
+        """The first request is all sender faults; every later one is a retryable error."""
+
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        def publish_batch(self, *, TopicArn: str, PublishBatchRequestEntries: list[dict]) -> dict:
+            self.calls.append([dict(e) for e in PublishBatchRequestEntries])
+            fault = len(self.calls) == 1
+            return {
+                "Successful": [],
+                "Failed": [
+                    {"Id": e["Id"], "SenderFault": fault, "Code": "X" if fault else "Internal"}
+                    for e in PublishBatchRequestEntries
+                ],
+            }
+
+    client = SplitFaultClient()
+    sink = SNSSink("arn", client=client, max_retries=0)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"i": i} for i in range(11)])  # 10 + 1 chunks
+    assert len(client.calls) == 2
+    assert sink.failed == 11

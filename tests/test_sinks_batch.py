@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from log_foundry.sinks._batch import adjudicate_positional, usable_results
+from log_foundry.sinks._batch import ABSENT, adjudicate_positional, describe_count, usable_results
 
 
 def test_equal_lengths_select_the_flagged_records() -> None:
@@ -117,3 +117,65 @@ def test_chunk_list_still_chunks_a_positive_size() -> None:
     from log_foundry.sinks._chunk import chunk_list
 
     assert list(chunk_list([1, 2, 3, 4, 5], 2)) == [[1, 2], [3, 4], [5]]
+
+
+# -- SPEC-070 FR-003: the failed count and the coded entries must agree ------------------------
+
+_A, _B = {"Data": b"a"}, {"Data": b"b"}
+_CODED = {"ErrorCode": "InternalFailure"}
+
+
+@pytest.mark.parametrize(
+    ("count", "results", "retry", "unadjudicated"),
+    [
+        (0, [{}, {}], [], 0),
+        (ABSENT, [{}, {}], [], 0),
+        (0, [], [], 0),
+        (ABSENT, [], [], 0),
+        (0, [{}], [], 0),
+        (1, [{}, _CODED], [_B], 0),
+        (2, [_CODED, _CODED], [_A, _B], 0),
+        (0, [_CODED, _CODED], [], 2),
+        (ABSENT, [_CODED, {}], [], 2),
+        (2, [{}, {}], [], 2),
+        (1, [_CODED, _CODED], [], 2),
+        (3, [_CODED, _CODED], [], 2),
+        (1, [_CODED], [], 2),
+        (True, [{}, _CODED], [], 2),
+        (False, [{}, {}], [], 2),
+        ("1", [{}, _CODED], [], 2),
+        (1.0, [{}, _CODED], [], 2),
+        (-1, [{}, {}], [], 2),
+        (None, [{}, {}], [], 2),
+    ],
+    ids=[
+        "zero", "absent", "zero-no-array", "absent-no-array", "zero-short-uncoded",
+        "one-of-two", "two-of-two", "zero-beside-coded", "absent-beside-coded",
+        "two-beside-none", "one-beside-two", "three-beside-two", "short-array", "bool-true",
+        "bool-false", "str", "float", "negative", "explicit-none",
+    ],
+)
+def test_a_passed_count_is_read_three_ways(count, results, retry, unadjudicated) -> None:
+    """Delivered only on ``0``/absent with nothing coded; retried only on agreement."""
+    verdict = adjudicate_positional([_A, _B], results, failed_count=count)
+    assert (verdict.retry, verdict.unadjudicated) == (retry, unadjudicated)
+
+
+def test_without_a_count_the_rule_before_spec_070_holds() -> None:
+    verdict = adjudicate_positional([_A, _B], [{}, _CODED])
+    assert (verdict.retry, verdict.unadjudicated) == ([_B], 0)
+    assert adjudicate_positional([_A, _B], [_CODED]).unadjudicated == 2
+
+
+def test_empty_records_with_a_positive_count_leave_nothing_to_count() -> None:
+    assert adjudicate_positional([], [], failed_count=2) == ([], 0)
+
+
+@pytest.mark.parametrize(
+    ("count", "text"),
+    [(ABSENT, "no failed count"), (0, "failed count 0"), (2, "failed count 2"),
+     ("1", "a failed count of type str"), (None, "a failed count of type NoneType"),
+     (True, "a failed count of type bool")],
+)
+def test_describe_count_names_a_type_never_a_value(count, text) -> None:
+    assert describe_count(count) == text

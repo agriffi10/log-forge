@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 
 from log_foundry import _diag
-from log_foundry.sinks._classify import aws_retryable, is_retryable
+from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
@@ -435,8 +435,8 @@ class SQSSink:
 
         botocore's transient and throttling failures, through the predicate the four AWS sinks
         share (:func:`~log_foundry.sinks._classify.aws_retryable`); anything else — a
-        ``ParamValidationError``, an ``AccessDenied``, a ``TypeError`` from the caller's own code —
-        fails at once, counted and announced on its first attempt with no backoff wait.
+        ``ParamValidationError``, an ``AccessDenied``, a ``TypeError`` from the caller's own
+        code — fails at once, counted and announced on its first attempt with no backoff wait.
 
         Args:
           err: The exception the attempt raised.
@@ -448,6 +448,24 @@ class SQSSink:
           None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
         """
         return aws_retryable(err)
+
+    def _retryable_entry(self, entry: Mapping[str, object]) -> bool:
+        """Reports whether a resend of one rejected entry may succeed (SPEC-070 FR-003).
+
+        A sender fault is the caller's: a byte-identical resend fails again, so it is counted and
+        never retried. Read through :func:`~log_foundry.sinks._classify.sender_fault`, which SQS
+        and SNS share, so the two services answer the same required field the same way.
+
+        Args:
+          entry: One item of the reply's ``Failed`` list.
+
+        Returns:
+          False for a sender fault, True otherwise.
+
+        Raises:
+          AttributeError: When the entry is not a mapping, as before.
+        """
+        return not sender_fault(entry)
 
     def _send(self, prepared: list[_Prepared]) -> tuple[int, bool]:
         """Sends one valid chunk, retrying only the failed entries within a bounded count.
@@ -526,7 +544,7 @@ class SQSSink:
             accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)
             if not failed:
                 return accepted, False
-            sender_faults = [item for item in failed if item.get("SenderFault")]
+            sender_faults = [item for item in failed if not self._retryable_entry(item)]
             if sender_faults:
                 with self._counter_lock:
                     self.failed += len(sender_faults)
@@ -537,7 +555,7 @@ class SQSSink:
                     f"{sender_faults[0].get('Code', 'unknown')}); not retried",
                 )
 
-            retryable_ids = {item["Id"] for item in failed if not item.get("SenderFault")}
+            retryable_ids = {item["Id"] for item in failed if self._retryable_entry(item)}
             if not retryable_ids:
                 return accepted, False
             entries = [entry for entry in entries if entry["Id"] in retryable_ids]

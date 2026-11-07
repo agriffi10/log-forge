@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_items
-from log_foundry.sinks._classify import aws_retryable, is_retryable
+from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = ["SNSSink"]
 
@@ -23,8 +26,9 @@ class SNSSink:
     """A :class:`~log_foundry.sinks.base.Sink` that publishes events to an SNS topic.
 
     This mirrors the SPEC-005 ``SQSSink`` partial-failure policy on SNS's ``publish_batch``:
-    the response's ``Failed`` list is retried within a bounded count, and entries still failing
-    are counted and logged. ``boto3`` is the optional ``aws`` extra, imported lazily.
+    the response's ``Failed`` list is retried within a bounded count, except a sender fault, which
+    is counted at once and never retried (SPEC-070 FR-003), and entries still failing are counted
+    and logged. ``boto3`` is the optional ``aws`` extra, imported lazily.
 
     The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per chunk, 0.7 s at the
     defaults. The waits are interruptible, so ``shutdown()`` cuts one short.
@@ -120,12 +124,16 @@ class SNSSink:
 
         Raises:
           SinkDeliveryError: When every chunk failed and at least one was sent (SPEC-026
-            FR-001). Events dropped before sending, being too large to ever fit, are not a send
-            failure and do not make a batch of nothing but oversized events raise — they can
-            never be retried into existence, and are reported through :meth:`losses`. A raise
-            leaves none of them counted.
+            FR-001), unless every entry that failed was a sender fault: a batch SNS rejected only
+            as the caller's fault returns with the entries counted, as ``SQSSink``'s does,
+            because a resend can only fail the same way (SPEC-070 FR-003). Events dropped
+            before sending, being too large to ever fit, are not a send failure and do not make a
+            batch of nothing but oversized events raise — they can never be retried into
+            existence, and are reported through :meth:`losses`. A raise leaves none of them
+            counted.
         """
         chunks = delivered = 0
+        recoverable_loss = False
         with Deferral(self) as pending:
             encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
             bodies = self._bodies(encoded, pending)
@@ -133,8 +141,10 @@ class SNSSink:
                 bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=len
             ):
                 chunks += 1
-                delivered += self._send(chunk)
-            if chunks and not delivered:
+                accepted, retryable_lost = self._send(chunk)
+                delivered += accepted
+                recoverable_loss = recoverable_loss or retryable_lost
+            if chunks and not delivered and recoverable_loss:
                 raise SinkDeliveryError(f"SNSSink published none of {chunks} chunk(s)")
 
     def close(self) -> None:
@@ -209,8 +219,8 @@ class SNSSink:
 
         botocore's transient and throttling failures, through the predicate the four AWS sinks
         share (:func:`~log_foundry.sinks._classify.aws_retryable`); anything else — a
-        ``ParamValidationError``, an ``AccessDenied``, a ``TypeError`` from the caller's own code —
-        fails at once, counted and announced on its first attempt with no backoff wait.
+        ``ParamValidationError``, an ``AccessDenied``, a ``TypeError`` from the caller's own
+        code — fails at once, counted and announced on its first attempt with no backoff wait.
 
         Args:
           err: The exception the attempt raised.
@@ -223,7 +233,25 @@ class SNSSink:
         """
         return aws_retryable(err)
 
-    def _send(self, bodies: list[str]) -> int:
+    def _retryable_entry(self, entry: Mapping[str, object]) -> bool:
+        """Reports whether a resend of one rejected entry may succeed (SPEC-070 FR-003).
+
+        A sender fault is the caller's: a byte-identical resend fails again, so it is counted and
+        never retried. Read through :func:`~log_foundry.sinks._classify.sender_fault`, which SQS
+        and SNS share, so the two services answer the same required field the same way.
+
+        Args:
+          entry: One item of the reply's ``Failed`` list.
+
+        Returns:
+          False for a sender fault, True otherwise.
+
+        Raises:
+          AttributeError: When the entry is not a mapping, as before.
+        """
+        return not sender_fault(entry)
+
+    def _send(self, bodies: list[str]) -> tuple[int, bool]:
         """Publishes one chunk, retrying only the failed entries within the bound (FR-010).
 
         The wait comes before the next attempt and never before abandoning (SPEC-027 FR-003):
@@ -245,19 +273,28 @@ class SNSSink:
         what the worker's retry exists for, while suppressing the raise would lose every event of
         every batch for a whole outage, silently.
 
+        **An entry SNS marks ``SenderFault`` is not retried** (SPEC-070 FR-003): SNS's
+        ``BatchResultErrorEntry`` carries the same required field as SQS's, and a byte-identical
+        resend of the caller's fault fails again. It is counted on ``failed`` when the reply
+        arrives, announced with the first error code and ``not retried``, and dropped from the
+        next round, exactly as ``SQSSink._send`` does; only :meth:`_retryable_entry`'s entries are
+        resent. It used to retry every entry named in ``Failed``. Acceptance is counted per round
+        by ``Id``, which is what keeps a dropped sender fault from reading as delivered.
+
         Args:
           bodies: One chunk's serialized events.
 
         Returns:
           How many entries SNS accepted, so :meth:`emit` can tell "nothing landed" from a partial
-          success. A chunk whose entries all failed contributes zero.
+          success, and whether anything was given up on that a resend could plausibly recover. A
+          chunk rejected wholly as sender faults reports False there.
 
         Raises:
           None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
             or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
-        sent = len(bodies)
         entries = [{"Id": str(i), "Message": body} for i, body in enumerate(bodies)]
+        accepted = 0
         for attempt in range(self.max_retries + 1):
             try:
                 response = self.client.publish_batch(
@@ -274,12 +311,26 @@ class SNSSink:
                     len(entries),
                     f"SNSSink, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
-                return sent - len(entries)
+                return accepted, True
             failed = response.get("Failed", [])
-            if not failed:
-                return sent
             failed_ids = {entry["Id"] for entry in failed}
-            entries = [entry for entry in entries if entry["Id"] in failed_ids]
+            accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)
+            if not failed:
+                return accepted, False
+            sender_faults = [item for item in failed if not self._retryable_entry(item)]
+            if sender_faults:
+                with self._counter_lock:
+                    self.failed += len(sender_faults)
+                _diag.lost(
+                    "message",
+                    len(sender_faults),
+                    f"SNSSink, rejected as invalid (first code: "
+                    f"{sender_faults[0].get('Code', 'unknown')}); not retried",
+                )
+            retryable_ids = {item["Id"] for item in failed if self._retryable_entry(item)}
+            if not retryable_ids:
+                return accepted, False
+            entries = [entry for entry in entries if entry["Id"] in retryable_ids]
             if attempt < self.max_retries:
                 wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
             if attempt >= self.max_retries:
@@ -290,5 +341,5 @@ class SNSSink:
                     len(entries),
                     f"SNSSink, still failing after {self.max_retries + 1} attempts; abandoned",
                 )
-                return sent - len(entries)
-        return 0
+                return accepted, True
+        return accepted, False

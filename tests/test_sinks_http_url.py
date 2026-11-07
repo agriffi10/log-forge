@@ -297,7 +297,7 @@ def test_an_unsendable_header_is_counted_at_its_one_attempt(headers, capsys) -> 
 
     line = _counted_at_one_attempt(sink, capsys)
 
-    [(name, value)] = headers.items()
+    [(_name, value)] = headers.items()
     assert value not in line, "the header's value is never written"
 
 

@@ -525,3 +525,71 @@ def test_a_batch_that_produces_no_chunk_raises_rather_than_committing_nothing(mo
         sink.emit([{"i": 1}, {"i": 2}])
     assert conn.executemany_calls == [], "nothing was sent"
     assert conn.commits == 0, "and no empty transaction was committed"
+
+
+# --- SPEC-070 FR-002: a connect-time refusal fails at once; a transient connect is retried -----
+
+_REFUSED = [
+    'connection failed: FATAL:  password authentication failed for user "postgres"',
+    'connection failed: FATAL:  role "nobody" does not exist',
+    'connection failed: FATAL:  database "nope" does not exist',
+]
+_TRANSIENT = [
+    "connection failed: could not receive data from server: Connection refused",
+    "connection failed: FATAL:  the database system is starting up",
+    "connection failed: FATAL:  Passwort-Authentifizierung für Benutzer »postgres« fehlgeschlagen",
+]
+
+
+def _reconnecting(monkeypatch, text: str) -> tuple[PostgresSink, list[int]]:
+    """An owned sink whose held connection is dead and whose reconnect raises ``text``.
+
+    The dead handle raises what psycopg's does — ``OperationalError("the connection is
+    closed")`` with no SQLSTATE, which the predicate retries — so if the connect's own failure
+    did not reach the loop's handler, the refusal would be retried and the connect count below
+    would say so.
+    """
+    import driver_standins as standins
+
+    module = standins.install(monkeypatch, standins.PSYCOPG)
+    first = BreakableConnection()
+    _psycopg_stub(monkeypatch, [first])
+    sink = PostgresSink("logs", dsn="postgresql://x", max_retries=3)
+    first.kill(module.OperationalError("the connection is closed"))
+    connects: list[int] = []
+
+    def refuse() -> object:
+        connects.append(1)
+        raise module.OperationalError(text)
+
+    monkeypatch.setattr(sink, "_connect", refuse)
+    return sink, connects
+
+
+@pytest.mark.parametrize("text", _REFUSED, ids=["password", "role", "database"])
+def test_a_refused_reconnect_is_one_connect_counted_once(monkeypatch, capsys, text) -> None:
+    """FR-002 AC-2: one connect, ``failed`` once, one line naming the type and never the text."""
+    sink, connects = _reconnecting(monkeypatch, text)
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+
+    assert len(connects) == 1
+    assert sink.failed == 1
+    err = capsys.readouterr().err
+    [line] = [line for line in err.splitlines() if "lost 1 event(s)" in line]
+    assert "PostgresSink, 1 attempt(s), OperationalError" in line
+    for fragment in ("password", "nobody", "nope", "postgres\"", "FATAL"):
+        assert fragment not in err, f"the message text reached stderr: {fragment}"
+
+
+@pytest.mark.parametrize("text", _TRANSIENT, ids=["refused-port", "starting-up", "german"])
+def test_a_transient_or_unrecognised_reconnect_is_retried(monkeypatch, text) -> None:
+    """FR-002 AC-3: a refused port, a server starting up and a localised refusal keep the retry."""
+    sink, connects = _reconnecting(monkeypatch, text)
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
+
+    assert len(connects) == 4, "max_retries + 1 connects"
+    assert sink.failed == 1
