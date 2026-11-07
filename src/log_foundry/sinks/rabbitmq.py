@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
@@ -264,7 +265,7 @@ class RabbitMQSink:
                 return True
             except Exception as err:
                 self._reset()
-                if attempt < self._max_retries:
+                if attempt < self._max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -272,10 +273,53 @@ class RabbitMQSink:
                 _diag.lost(
                     "message",
                     1,
-                    f"RabbitMQSink, {self._max_retries + 1} attempts, {type(err).__name__}",
+                    f"RabbitMQSink, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
                 return False
         return False
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed publish is worth another attempt (SPEC-070 FR-002).
+
+        ``AMQPConnectionError`` is retried, except the six subclasses a reconnect cannot fix —
+        ``AuthenticationError``, ``ProbableAuthenticationError``, ``ProbableAccessDeniedError``,
+        ``IncompatibleProtocolError``, ``ConnectionClosedByClient`` and
+        ``ConnectionOpenAborted`` — and so is ``ChannelWrongStateError``, what a publish on the
+        channel a dropped connection left behind raises; :meth:`_reset` has already dropped it, so
+        the next attempt reconnects (``pika/exceptions.py``). ``ChannelClosedByBroker`` and
+        ``ProtocolSyntaxError`` fail at once. ``NackError`` and ``UnroutableError`` are not
+        classified: this sink enables neither ``confirm_delivery`` nor ``mandatory``, so pika
+        cannot raise them here.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        excluded = driver_classes(
+            "pika.exceptions",
+            "AuthenticationError",
+            "ProbableAuthenticationError",
+            "ProbableAccessDeniedError",
+            "IncompatibleProtocolError",
+            "ConnectionClosedByClient",
+            "ConnectionOpenAborted",
+        )
+        if isinstance(err, excluded):
+            return False
+        retried = (
+            *TRANSIENT_BUILTINS,
+            *driver_classes(
+                "pika.exceptions",
+                "AMQPConnectionError",
+                "ChannelWrongStateError",
+            ),
+        )
+        return isinstance(err, retried)
 
     def _active_channel(self) -> Any:
         """Returns the open channel, reconnecting and reopening as needed.

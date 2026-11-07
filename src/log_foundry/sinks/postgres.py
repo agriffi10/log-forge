@@ -8,6 +8,7 @@ from typing import Any
 
 from log_foundry import _diag
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_nul
 from log_foundry.sinks._retry import floor_count, require_positive, wait
@@ -34,6 +35,45 @@ own degenerate values (SPEC-038 FR-006).
 _MIN_CONNECT_TIMEOUT = 2
 
 _COLUMNS = ("timestamp", "level", "trace_id", "span_id", "function", "service")
+
+_RETRYABLE_CLASSES = frozenset({"08", "40", "53", "57"})
+"""SQLSTATE classes retried: connection exception, transaction rollback, insufficient resources
+and operator intervention (PostgreSQL's *Appendix A*; SPEC-070 FR-002)."""
+
+_RETRYABLE_STATES = frozenset({"55P03", "55006"})
+"""The two class-``55`` states retried: ``LockNotAvailable`` and ``ObjectInUse``."""
+
+_REFUSALS: tuple[tuple[str, str], ...] = (
+    ("FATAL:  password authentication failed", ""),
+    ('FATAL:  role "', '" does not exist'),
+    ('FATAL:  database "', '" does not exist'),
+)
+"""libpq's connect-time refusals, as a prefix and a suffix found after it (SPEC-070 FR-002).
+
+A wrong password, an unknown user and an unknown database each reach the sink as a plain
+``OperationalError`` with no SQLSTATE, and only this text tells them from a refused port: the
+server answered and refused, and a resend asks the same question of the same configuration.
+"""
+
+
+def _refused(message: str) -> bool:
+    """Reports whether a connect failure's message is one of libpq's refusals.
+
+    Args:
+      message: The exception's text, read inside the predicate and never printed.
+
+    Returns:
+      True when the message carries a :data:`_REFUSALS` prefix and, where the entry names one,
+      its suffix somewhere after it.
+
+    Raises:
+      None.
+    """
+    for prefix, suffix in _REFUSALS:
+        start = message.find(prefix)
+        if start >= 0 and message.find(suffix, start + len(prefix)) >= 0:
+            return True
+    return False
 
 
 class PostgresSink:
@@ -139,7 +179,8 @@ class PostgresSink:
         """Reports unencodable events, and events abandoned past the retry bound.
 
         ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        events of a batch abandoned past the retry bound (SPEC-026 FR-002).
+        events of a batch abandoned past the retry bound or, for a failure not worth retrying, at
+        its first attempt (SPEC-026 FR-002, SPEC-070).
 
         Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
         never waits on an in-flight insert and its backoff.
@@ -178,7 +219,8 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent. One transaction, rolled back on
+          SinkDeliveryError: When the retry bound is spent, or at once for a failure
+            :meth:`_retryable_error` does not retry (SPEC-070). One transaction, rolled back on
             failure, means such a batch inserted nothing, and the rollback is what makes the
             worker's retry safe here — there are no committed rows to duplicate (SPEC-026
             FR-001).
@@ -214,12 +256,13 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent, or when a non-empty batch produced no
-            chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049 FR-002, found by the
-            system-frame review): with the chunker yielding nothing this committed an empty
-            transaction and returned, having sent nothing, with every counter at zero. Raised
-            outside the retry loop, because a chunker that yields nothing will yield nothing four
-            times.
+          SinkDeliveryError: When the retry bound is spent, at once for a failure
+            :meth:`_retryable_error` does not retry (SPEC-070), or when a non-empty batch
+            produced no chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049
+            FR-002, found by the system-frame review): with the chunker yielding nothing this
+            committed an empty transaction and returned, having sent nothing, with every
+            counter at zero. Raised outside the retry loop, because a chunker that yields nothing
+            will yield nothing four times.
         """
         for attempt in range(self.max_retries + 1):
             try:
@@ -234,7 +277,7 @@ class PostgresSink:
                     return
             except Exception as err:
                 self._rollback()
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -242,7 +285,7 @@ class PostgresSink:
                 _diag.lost(
                     "event",
                     batch_size,
-                    f"PostgresSink, {self.max_retries + 1} attempts, {type(err).__name__}"
+                    f"PostgresSink, {attempt + 1} attempt(s), {type(err).__name__}"
                     + (
                         ", borrowed connection is broken and this sink may not reopen it"
                         if not self._owns_connection and self._is_broken()
@@ -255,6 +298,51 @@ class PostgresSink:
             raise SinkDeliveryError(
                 f"PostgresSink produced no chunk for {batch_size} event(s); nothing was sent"
             )
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed attempt is worth another (SPEC-070 FR-002).
+
+        psycopg files every server condition this could meet under ``OperationalError``, so the
+        class alone does not separate a transient failure from a permanent one; the SQLSTATE
+        does. Retried: an ``OperationalError`` whose SQLSTATE class is ``08`` (connection
+        exception), ``40`` (transaction rollback), ``53`` (insufficient resources) or ``57``
+        (operator intervention), ``55P03`` ``LockNotAvailable`` and ``55006`` ``ObjectInUse`` —
+        the classes PostgreSQL's *Appendix A* defines as connection, rollback, resource and
+        operator conditions — and one with no SQLSTATE at all, psycopg's own client-side failures
+        (a failed connect, a timeout, "the connection is closed").
+
+        **A connect-time refusal is the exception, recognised by its text** because nothing
+        structured carries it: psycopg raises every failed connect as a plain ``OperationalError``
+        with no SQLSTATE, and only libpq's message says the server answered and refused — see
+        :data:`_REFUSALS`. The text follows the server's ``lc_messages``, so a server reporting in
+        another language is not matched and keeps the retry; a transient ``FATAL`` ("the database
+        system is starting up", "sorry, too many clients already") is deliberately not matched.
+        The message is read here only; no line prints it.
+
+        Every other ``OperationalError`` — class ``28``, ``54``, the rest of ``55`` and the others
+        psycopg puts there — and ``DataError`` (``StringDataRightTruncation`` among them),
+        ``IntegrityError``, ``ProgrammingError``, ``InternalError``, ``InterfaceError`` and
+        ``NotSupportedError`` fail at once: the same rows meet the same refusal.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        if isinstance(err, TRANSIENT_BUILTINS):
+            return True
+        if not isinstance(err, driver_classes("psycopg.errors", "OperationalError")):
+            return False
+        state = getattr(err, "sqlstate", None)
+        if state is None:
+            return not _refused(str(err))
+        if not isinstance(state, str):
+            return False
+        return state[:2] in _RETRYABLE_CLASSES or state in _RETRYABLE_STATES
 
     def _connect(self) -> Any:
         """Opens a connection to the configured DSN, bounded by :attr:`connect_timeout`.
@@ -318,6 +406,17 @@ class PostgresSink:
         old object in place and the next attempt closes it again. It clears on a successful
         reconnect, so a later outage is announced again.
 
+        **A failed connect is announced as pending, never as absorbed** (SPEC-070 FR-002): it is
+        re-raised into the attempt, so "absorbed" would be false (invariant 11), and it is not a
+        loss yet either — the batch's own handler retries it or counts it, and that line carries
+        the count. :func:`~log_foundry._diag.pending` is the writer for exactly that: no ``lost``
+        prefix, the exception's type and never its message. The line promises nothing it cannot
+        keep: a retry that succeeds writes no further line, so it says only that a ``lost`` line
+        follows if the batch is given up. The type is read as ``_diag.absorbed`` reads it, through
+        ``type``'s stored name (SPEC-063 FR-004), so a metaclass ``__name__`` cannot rename or
+        silence it. The failed ``close()`` of the old handle is still absorbed, and its line
+        still says so.
+
         Args:
           None.
 
@@ -325,10 +424,16 @@ class PostgresSink:
           None.
 
         Raises:
-          None. A failed reconnect is absorbed and left to the next attempt, which is what keeps
-            this inside the existing retry budget rather than adding a loop of its own (AC-3):
-            the batch's bound is unchanged, and a connect that cannot succeed simply spends an
-            attempt visibly, through the counters.
+          Exception: Whatever the connect raised, after the once-per-outage line. It ends this
+            attempt inside :meth:`_insert_batch`'s ``try``, so the batch's own handler sees the
+            connect's failure rather than whatever the dead handle raises next (SPEC-070
+            FR-002): :meth:`_retryable_error` then reads a refused password, role or database as
+            final, and anything else as worth the next attempt. That keeps this inside the
+            existing retry budget rather than adding a loop of its own (AC-3): the batch's bound
+            is unchanged, and a connect that cannot succeed spends an attempt visibly, through
+            the counters. Before SPEC-070 the failure was absorbed here and the attempt went on
+            to fail on the dead handle, whose "the connection is closed" hid a refusal from the
+            predicate. A failed ``close()`` of the old handle is still absorbed.
         """
         if not self._owns_connection or not self._is_broken():
             return
@@ -343,7 +448,12 @@ class PostgresSink:
             self._reconnect_announced = False
         except Exception as err:
             if not announced:
-                _diag.absorbed("PostgresSink.reconnect", err)
+                kind = _diag._STR_STR(_diag._STORED_NAME(type(err)))
+                _diag.pending(
+                    f"PostgresSink could not reconnect ({kind}); this attempt fails, and a lost "
+                    "line follows only if the batch is given up"
+                )
+            raise
 
     def _is_broken(self) -> bool:
         """Reports whether the held connection can no longer be used.

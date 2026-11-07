@@ -189,8 +189,12 @@ def test_close_is_noop() -> None:
     assert sink.close() is None
 
 
-class _Boom(Exception):
-    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError."""
+class _Boom(ConnectionError):
+    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError.
+
+    A ``ConnectionError`` since SPEC-070 FR-002, so it is a class the AWS predicate retries, as
+    an unreachable endpoint is: a bare ``Exception`` now fails at its first attempt.
+    """
 
 
 class _Raising:

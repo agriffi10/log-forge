@@ -43,7 +43,7 @@ class FakeProducer:
 
     def send_batch(self, batch: FakeBatch) -> None:
         if self._fail:
-            raise RuntimeError("send failed")
+            raise ConnectionError("send failed")
         self.sent.append(list(batch.items))
 
     def close(self) -> None:

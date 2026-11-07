@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
+from log_foundry.sinks._classify import is_retryable
 from log_foundry.sinks._retry import (
     exact_int,
     floor_count,
@@ -371,11 +372,11 @@ class SocketTransport:
         refused" from "host unknown", and the code is an integer from the OS rather than caller
         data.
 
-        An errno in ``_PERMANENT_ERRNOS`` skips the remaining attempts (FR-007 AC-3): a re-send
-        of identical bytes to the same destination can only earn the same answer, so retrying
-        buys nothing and costs the drain thread its backoff. :meth:`_sendable` normally catches
-        the oversized case first; this is the backstop for a path MTU smaller than the datagram
-        limit, which no local check can know.
+        Only what :meth:`_retryable_error` accepts is attempted again (SPEC-070 FR-001): an
+        ``OSError`` whose errno is outside ``_PERMANENT_ERRNOS``. Anything else the send raises —
+        a ``ValueError`` from a socket object closed under it, say — used to escape ``emit`` raw
+        and uncounted; it is now caught, counted and abandoned at its first attempt, with no
+        backoff wait. The held socket is reset first either way, as before.
 
         The line carries the attempts actually made, ``attempt + 1``, as ``HTTPSink._request``
         already did (SPEC-049 FR-006): it used to write ``max_retries + 1`` unconditionally, so a
@@ -398,9 +399,9 @@ class SocketTransport:
                 else:
                     self._socket().sendall(message)
                 return True
-            except OSError as err:
+            except Exception as err:
                 self._reset()
-                if attempt < self._max_retries and err.errno not in _PERMANENT_ERRNOS:
+                if attempt < self._max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -413,6 +414,26 @@ class SocketTransport:
                 )
                 return False
         return False
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether another send after this exception may succeed (SPEC-070 FR-001).
+
+        An errno in ``_PERMANENT_ERRNOS`` is not retried (FR-007 AC-3): a re-send of identical
+        bytes to the same destination can only earn the same answer, so retrying buys nothing and
+        costs the drain thread its backoff. :meth:`_sendable` normally catches the oversized case
+        first; this is the backstop for a path MTU smaller than the datagram limit, which no local
+        check can know. The set used to be checked inline in :meth:`_send_one`'s loop.
+
+        Args:
+          err: The exception the send raised.
+
+        Returns:
+          True for an ``OSError`` whose errno is not permanent, False for anything else.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        return isinstance(err, OSError) and err.errno not in _PERMANENT_ERRNOS
 
     def _socket(self) -> socket.socket:
         """Returns the held socket, opening one if none is held.

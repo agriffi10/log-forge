@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, require_positive, wait
@@ -79,7 +80,8 @@ class _RedisSink:
         """Reports unencodable events, and events abandoned past the retry bound.
 
         ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        events of a batch abandoned past the retry bound (SPEC-026 FR-002).
+        events of a batch abandoned past the retry bound or, for a failure not worth retrying, at
+        its first attempt (SPEC-026 FR-002, SPEC-070).
 
         Args:
           None.
@@ -117,7 +119,8 @@ class _RedisSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the sink is closed. Also when the retry bound is spent: the
+          SinkDeliveryError: When the sink is closed. Also when the retry bound is spent, or at
+            once for a failure ``_retryable_error`` does not retry (SPEC-070): the
             batch travels as one pipeline, so such a failure delivered nothing: it is counted and
             then raised, giving the worker its retry and ``health()`` the loss (SPEC-026 FR-001).
             There is no partial case to protect, because the pipeline is all or nothing.
@@ -147,7 +150,8 @@ class _RedisSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent.
+          SinkDeliveryError: When the retry bound is spent, or at once for a failure
+            :meth:`_retryable_error` does not retry (SPEC-070).
         """
         for attempt in range(self.max_retries + 1):
             try:
@@ -157,7 +161,7 @@ class _RedisSink:
                 pipe.execute()
                 return
             except Exception as err:
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -165,11 +169,51 @@ class _RedisSink:
                 _diag.lost(
                     "event",
                     batch_size,
-                    f"{type(self).__name__}, {self.max_retries + 1} attempts, {type(err).__name__}",
+                    f"{type(self).__name__}, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
                 raise SinkDeliveryError(
                     f"{type(self).__name__} delivered none of {batch_size} event(s)"
                 ) from None
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed pipeline is worth another attempt (SPEC-070 FR-002).
+
+        redis-py's own default ``Retry`` retries ``ConnectionError``, ``TimeoutError`` and
+        ``socket.timeout`` (``redis/retry.py``), and ``redis/cluster.py`` retries
+        ``TryAgainError`` and ``ClusterDownError``; those are retried here. Three
+        ``ConnectionError`` subclasses are narrowed out — ``AuthenticationError``,
+        ``AuthorizationError`` and ``ExternalAuthProviderError``, the last skipped in a version
+        that lacks it — because a resend cannot fix a credential. ``ResponseError`` and its other
+        subclasses, and ``DataError``, fail at once.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        credential = driver_classes(
+            "redis.exceptions",
+            "AuthenticationError",
+            "AuthorizationError",
+            "ExternalAuthProviderError",
+        )
+        if isinstance(err, credential):
+            return False
+        retried = (
+            *TRANSIENT_BUILTINS,
+            *driver_classes(
+                "redis.exceptions",
+                "ConnectionError",
+                "TimeoutError",
+                "TryAgainError",
+                "ClusterDownError",
+            ),
+        )
+        return isinstance(err, retried)
 
     def close(self) -> None:
         """Closes the connection only if the sink owns it (FR-005).

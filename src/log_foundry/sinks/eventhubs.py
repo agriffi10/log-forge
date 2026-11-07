@@ -7,6 +7,7 @@ import threading
 from typing import Any
 
 from log_foundry import _diag
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
@@ -241,6 +242,37 @@ class AzureEventHubsSink:
             self._closed = True
             self.producer.close()
 
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed send is worth another attempt (SPEC-070 FR-002).
+
+        ``ConnectionLostError`` ("in most cases the client will automatically retry"),
+        ``ConnectError`` and ``OperationTimeoutError`` (``azure/eventhub/exceptions.py``) are
+        retried; ``AuthenticationError``, a ``ConnectError`` subclass, is not, because a resend
+        cannot fix a credential. ``EventDataError``, ``EventDataSendError`` (an AMQP rejection of
+        the message), ``ClientClosedError`` and a bare ``EventHubError`` fail at once.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        if isinstance(err, driver_classes("azure.eventhub.exceptions", "AuthenticationError")):
+            return False
+        retried = (
+            *TRANSIENT_BUILTINS,
+            *driver_classes(
+                "azure.eventhub.exceptions",
+                "ConnectionLostError",
+                "ConnectError",
+                "OperationTimeoutError",
+            ),
+        )
+        return isinstance(err, retried)
+
     def _send(self, event_batch: Any) -> int:
         """Sends one ``EventDataBatch``, retrying failures (FR-009, FR-011).
 
@@ -263,7 +295,7 @@ class AzureEventHubsSink:
                 self.producer.send_batch(event_batch)
                 return 1
             except Exception as err:
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -271,7 +303,7 @@ class AzureEventHubsSink:
                 _diag.lost(
                     "event",
                     len(event_batch),
-                    f"AzureEventHubsSink, one batch, {self.max_retries + 1} attempts, "
+                    f"AzureEventHubsSink, one batch, {attempt + 1} attempt(s), "
                     f"{type(err).__name__}",
                 )
                 return 0

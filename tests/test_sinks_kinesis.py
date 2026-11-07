@@ -255,8 +255,12 @@ def test_firehose_has_no_partition_key_to_charge() -> None:
     assert set(client.calls[0][0]) == {"Data"}, "a Firehose record carries no PartitionKey"
 
 
-class _Boom(Exception):
-    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError."""
+class _Boom(ConnectionError):
+    """A client fault shaped like `botocore`'s ClientError / EndpointConnectionError.
+
+    A ``ConnectionError`` since SPEC-070 FR-002, so it is a class the AWS predicate retries, as
+    an unreachable endpoint is: a bare ``Exception`` now fails at its first attempt.
+    """
 
 
 class _Raising:

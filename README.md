@@ -614,8 +614,11 @@ A few conventions hold across every sink below:
   `health().failed_batches` records the loss — there is nothing downstream to duplicate. Three
   cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
   event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
-  landed), and an SQS sender fault (a byte-identical re-send can only fail again). Either way the
-  exception never reaches your code — inside a span the worker catches it, and on the orphan path
+  landed), and an SQS or SNS sender fault (a byte-identical re-send can only fail again). Within a
+  sink, only a failure its driver documents as transient — a dropped connection, a timeout, a
+  throttle — is retried; anything else, a `TypeError` from your own client or a value the server
+  refuses, is counted and announced at its first attempt, and the batch still raises if nothing
+  landed. Either way the exception never reaches your code — inside a span the worker catches it, and on the orphan path
   (`log_foundry.info(...)` outside any span, which emits synchronously) the emitter does.
 
 #### Built-in, zero-dependency
@@ -765,7 +768,8 @@ a builtin. `code.function.name` carries the name the span recorded — the funct
 A `2xx` carrying `partialSuccess` is counted on `.rejected_records` and never retried, because a
 retry would re-send what landed; a `2xx` whose verdict cannot be read — a count that is not a
 usable integer, a body over the 4 MiB bound — is counted on `.dropped_unadjudicated`, also never
-retried. Both feed `health().sink.failed`. A chunk whose every record was rejected raises, so the
+retried, and so is a `2xx` whose body could not be read at all (cut short, stalled or reset after
+the status line); a `2xx` with an empty body is success. Both feed `health().sink.failed`. A chunk whose every record was rejected raises, so the
 worker's retry and `failed_batches` show a permanent rejection. A `413` still halves the byte
 budget and re-sends in smaller requests, since nothing landed.
 
@@ -840,9 +844,10 @@ lf.configure(service="payments",
 
 Consuming from the buffer and indexing into ELK is a separate component, outside this library.
 
-`SQSSink` does not retry a message SQS rejects as a **sender fault** — the retry would re-send it
-byte-identical, so it can only fail the same way. Those are counted on `.failed` immediately and
-the SQS error code is named on stderr. Throttles and internal errors are still retried up to
+`SQSSink` and `SNSSink` do not retry a message the service rejects as a **sender fault** — the
+retry would re-send it byte-identical, so it can only fail the same way. Those are counted on
+`.failed` immediately and the service's error code is named on stderr; a batch lost only to sender
+faults returns rather than raising. Throttles and internal errors are still retried up to
 `max_retries`.
 
 ##### FIFO queues
@@ -950,7 +955,7 @@ Write-only inserts (querying is the downstream tool's job); each needs its own e
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
 | `MongoDBSink` | `log_foundry.sinks.mongodb` | `mongo` | `MongoDBSink(*, uri="…", database="…", collection="…", socket_timeout=None, server_selection_timeout=None)` — `pymongo`'s `socketTimeoutMS` default is `None`, so a read that never returns holds the drain thread; the sink applies `DEFAULT_SOCKET_TIMEOUT` (30 s) only when neither the keyword nor the URI query names one |
-| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False, connect_timeout=5)` — JSONB `event` column + extracted columns. Reconnects an **owned** connection the server has closed; a `connection=` you inject is never reopened. `connect_timeout` is passed to libpq explicitly, so it **overrides** any `connect_timeout` in your DSN |
+| `PostgresSink` | `log_foundry.sinks.postgres` | `postgres` | `PostgresSink(table, *, dsn="…", create_table=False, connect_timeout=5)` — JSONB `event` column + extracted columns. Reconnects an **owned** connection the server has closed; a reconnect the server refuses — a wrong password, an unknown role or database, recognised from libpq's English message — fails at once rather than spending the retries; a `connection=` you inject is never reopened. `connect_timeout` is passed to libpq explicitly, so it **overrides** any `connect_timeout` in your DSN |
 | `ClickHouseSink` | `log_foundry.sinks.clickhouse` | `clickhouse` | `ClickHouseSink(table, *, dsn="…", create_table=False, chunk_size=1000, send_receive_timeout=None)` — MergeTree, columnar insert; the driver's own 300 s `send_receive_timeout` is finite so it is left alone, and forwarded only when you set it |
 
 `PostgresSink` / `ClickHouseSink` default `create_table=False` (you own the schema and indexes); set

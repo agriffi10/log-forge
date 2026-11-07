@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from log_foundry import _diag
+from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events, repair_bson
 from log_foundry.sinks._retry import floor_count, require_timeout, wait
@@ -260,9 +261,10 @@ class MongoDBSink:
         Raises:
           SinkDeliveryError: When the sink is already closed, since ``pymongo`` raises
             ``InvalidOperation`` on any use of a closed client and the library has its own word
-            for "none of this was delivered". Also when nothing was inserted (SPEC-026 FR-001) — a connection error
-            past the retry bound, or a bulk write every one of whose documents the server
-            rejected. A bulk write that stored some is partial and never raises. A batch of
+            for "none of this was delivered". Also when nothing was inserted (SPEC-026 FR-001)
+            — a connection error past the retry bound or one not worth retrying (SPEC-070), or a
+            bulk write every one of whose documents the server rejected. A bulk write that
+            stored some is partial and never raises. A batch of
             nothing but oversized documents does not raise either: they can never fit, so there
             is nothing to retry, and they are reported through :meth:`losses`. A raise leaves
             none of them counted.
@@ -301,7 +303,7 @@ class MongoDBSink:
                                 f"MongoDBSink inserted none of {len(documents)} document(s)"
                             ) from None
                         return
-                    if attempt < self.max_retries:
+                    if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                         wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                         continue
                     with self._counter_lock:
@@ -309,11 +311,42 @@ class MongoDBSink:
                     _diag.lost(
                         "document",
                         len(documents),
-                        f"MongoDBSink, {self.max_retries + 1} attempts, {type(err).__name__}",
+                        f"MongoDBSink, {attempt + 1} attempt(s), {type(err).__name__}",
                     )
                     raise SinkDeliveryError(
                         f"MongoDBSink inserted none of {len(documents)} document(s)"
                     ) from None
+
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed insert is worth another attempt (SPEC-070 FR-002).
+
+        ``ConnectionFailure`` and so ``AutoReconnect`` ("the operation ... has not necessarily
+        succeeded"), ``NetworkTimeout``, ``NotPrimaryError``, ``ServerSelectionTimeoutError`` and
+        ``WaitQueueTimeoutError`` are retried, and so is any ``PyMongoError`` the driver or the
+        server labelled ``RetryableWriteError`` (``pymongo/errors.py``,
+        ``mongo_client_shared.py``). ``OperationFailure``, ``WriteError``, ``DuplicateKeyError``,
+        ``WTimeoutError`` (the write was applied), ``InvalidDocument``, ``DocumentTooLarge``,
+        ``InvalidOperation`` — what a client closed under the insert raises — and
+        ``ConfigurationError`` fail at once. :meth:`emit` reads a ``BulkWriteError``'s
+        ``writeErrors`` ahead of this, so one that names failed documents is still counted from
+        its ``details``.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        retried = (*TRANSIENT_BUILTINS, *driver_classes("pymongo.errors", "ConnectionFailure"))
+        if isinstance(err, retried):
+            return True
+        if not isinstance(err, driver_classes("pymongo.errors", "PyMongoError")):
+            return False
+        has_label = getattr(err, "has_error_label", None)
+        return callable(has_label) and bool(has_label("RetryableWriteError"))
 
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).

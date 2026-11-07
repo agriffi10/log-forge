@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "After a status line the status decides; a 2xx whose body cannot be read is never re-sent"
-description: "before a status line, `URLError`, `OSError` and `http.client.HTTPException` are retried, then counted in `failed`; after one, a body read that fails is `b\"\"` and the status decides as it always did — a `2xx` settles its chunk (`_bulk` counts it unadjudicated), a `503` retries, a `413` splits, a `400` is abandoned. `_handle_response` keeps `bytes`, so it cannot tell an empty body from an unreadable one."
+description: "before a status line, `URLError`, `OSError` and `http.client.HTTPException` are retried, then counted in `failed`; after one, a body read that fails is an `_UnreadBody`, equal to `b\"\"`, and the status decides as it always did — a `2xx` settles its chunk (the body readers count it unadjudicated), a `503` retries, a `413` splits, a `400` is abandoned. `_handle_response` keeps `bytes`; `_read_failed` tells an unreadable body from an empty one."
 ---
 
 **After a status line the status decides; a 2xx whose body cannot be read is never re-sent** —
@@ -18,11 +18,13 @@ the only thing SPEC-018 lets a sink re-send, and invariant 2 forbids the chunk t
 
 **The status line is the dividing line.** Before it, nothing the server said can be relied on, so a
 connection error, a refused or garbled status line and an unparseable header block are retried and
-then abandoned with the existing `connection error, <Type>` line, counted in `failed`. After it, the
-body is read under its own guard catching `Exception` (never `BaseException`), for the reason
-`ElasticsearchSink`'s JSON guard gives: anything escaping escapes `emit`, and the worker re-sends a
-batch the destination may have accepted. A failed read yields `b""`, and the status and its
-`Retry-After` decide exactly as they would have with a body. So the change reaches non-`2xx` statuses
+then abandoned with the existing `connection error, <Type>` line, counted in `failed`; any other
+exception there fails at its first attempt through the same line (*A sink declares what it retries,
+and anything else fails at once*, SPEC-070). After it, the body is read under its own guard
+catching `Exception` (never `BaseException`), for the reason `ElasticsearchSink`'s JSON guard
+gives: anything escaping escapes `emit`, and the worker re-sends a batch the destination may have
+accepted. A failed read yields an `_UnreadBody`, a private `bytes` subclass equal to `b""`, and the
+status and its `Retry-After` decide exactly as they would have with a body. So the change reaches non-`2xx` statuses
 too: a `503` whose body is cut short is retried and reported as `HTTP 503`, a `413` still drives the
 budget search, and a `400` is abandoned once, where each used to raise out of `emit` on a short body
 and be retried as a connection error on a stall or reset.
@@ -33,17 +35,16 @@ surface test calls the three unrestricted — so its signature is held under `1.
 and this decision keeps it `bytes`. The premise this corrects was that the hook was private and its
 type could be widened freely.
 
-**The residue: an override cannot tell an empty `2xx` body from an unreadable one.** It is handed
-`b""` for both, so the way a subclass reads an empty body is the way it reads an unreadable one. A
-subclass that reads an empty body as success settles an unreadable one silently. That is what the base
-class does, since it ignores the body, and it is correct for OTLP's reading of an empty body as
-success, since the status there is the verdict. It is not a claim that every body-ignoring subclass
-is right to ignore the body: `HoneycombSink`'s `2xx` carries a per-event array, and it reads it
-and counts `b""` unadjudicated (*A Honeycomb batch response is a per-event verdict, read all of a
-chunk or none of it*). It is also why `ElasticsearchSink` reading an empty `2xx`
-as unadjudicated is the right reading for `_bulk`: `json.loads(b"")` raises, so an unreadable body
-takes *A 2xx _bulk response with no readable verdict is counted, never retried* with no branch of its
-own.
+**An override can tell an empty `2xx` body from an unreadable one, by asking** (SPEC-070 FR-004).
+The unreadable one is an `_UnreadBody`, and `_read_failed(payload)` answers whether a payload is
+one; an honestly empty body stays plain `b""`. The flag travels in the value the hook already
+receives, so `_handle_response`'s signature is unchanged. The three shipped readers ask it first and
+count an unreadable `2xx` body unadjudicated: `ElasticsearchSink` (and `OpenSearchSink`) and
+`HoneycombSink`, whose reading no longer rests on `json.loads(b"")` raising, and `OTLPSink`, which
+reads an **empty** body as success, since an OTLP success needs no body, and until SPEC-070 settled
+an unreadable one silently the same way. **The residue** is a third-party override that does not ask:
+it sees `b""` for both, as under `1.x`, and reads them alike. The base class ignores the body and
+settles both as delivered, because no body is its verdict.
 
 **`read()` with no size, on purpose.** CPython's `read()` raises `IncompleteRead` on a short
 `Content-Length` body and on a truncated chunked one, but `read(amt)` returns a short
@@ -62,8 +63,12 @@ again, once per retry. **Rejected: `bytes | None`.** Passing `None` for an unrea
 third-party override at type-check time, and at runtime an override whose JSON guard catches only
 `ValueError` lets `json.loads(None)`'s `TypeError` escape `emit`, so the batch is re-sent — the
 defect again, moved into the caller's code. **Rejected: a separate `_handle_unreadable` hook.** It
-would be one more extension surface held under `1.x` that cannot be removed, and nothing needs to
-treat an unreadable body differently from an empty one today. **Rejected: `read(amt)`.** It hides a
+would be one more extension surface held under `1.x` that cannot be removed; the flag in the payload
+gives the readers that need the difference what they need without one. **Rejected: a keyword
+parameter `read_failed: bool = False` on `_handle_response`** (SPEC-070). A third-party override
+with the two-argument signature, or a `*args, **kwargs` wrapper forwarding to one, would raise
+`TypeError` out of `emit` exactly when a body fails to read, and the worker re-sends anything
+escaping `emit` — the defect this decision exists to prevent. **Rejected: `read(amt)`.** It hides a
 short body (above).
 
 **Do NOT build** a retry on a failed body read after a `2xx`, or a body read outside the guard.
@@ -71,6 +76,14 @@ short body (above).
 protocol error is now `HTTPSink`'s counted abandonment rather than one of its `transport_errors`.
 
 ## History
+
+### 2026-11-07
+
+- **Refined** by SPEC-070 FR-004: an unreadable `2xx` body is an `_UnreadBody`, equal to `b""`, and
+  `_read_failed` tells it from an empty one, so the residue shrinks to third-party overrides that do
+  not ask; `OTLPSink` now counts an unreadable body. The keyword-parameter alternative is recorded
+  as rejected. Before a status line, an exception outside the three classes is now counted at its
+  first attempt rather than escaping `emit`. *Never re-send* is unchanged.
 
 ### 2026-11-03
 

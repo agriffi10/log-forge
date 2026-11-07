@@ -21,7 +21,7 @@ class FakeChannel:
 
     def basic_publish(self, *, exchange, routing_key, body, properties) -> None:
         if self._fail:
-            raise RuntimeError("channel closed")
+            raise ConnectionError("channel closed")
         self.published.append((exchange, routing_key, body, properties))
 
     def close(self) -> None:

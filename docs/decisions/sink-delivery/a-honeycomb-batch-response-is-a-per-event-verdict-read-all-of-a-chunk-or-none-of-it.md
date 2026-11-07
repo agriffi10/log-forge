@@ -40,18 +40,23 @@ raise, so each worker attempt adds the chunk's size again, an upper bound like `
 
 **A body that is no verdict is counted, never read as success.** That includes `b""`: since *After a
 status line the status decides; a 2xx whose body cannot be read is never re-sent* (#283), an empty
-body and one that could not be read after the status line both reach the hook as `b""`, and
+body and one that could not be read after the status line both reach the hook equal to `b""` (since
+SPEC-070 the second as an `_UnreadBody`, which the hook asks `_read_failed` about first), and
 Honeycomb's only per-event verdict is in the body, so reading `b""` as delivery would settle
 silently an all-rejected response whose tail was cut off. This is the `_bulk` sinks' reading,
 reached here on this destination's own argument rather than copied, as *A 2xx this sink cannot read
-is counted, and the `_bulk` reading is argued, never inherited* asks; `OTLPSink` reads `b""` the
-other way because an OTLP success needs no body. The whole chunk goes to `dropped_unadjudicated`
-with a may-have-landed line, `losses().failed` sums it with `rejected_events` and the abandoned
+is counted, and the `_bulk` reading is argued, never inherited* asks; ~~`OTLPSink` reads `b""` the
+other way because an OTLP success needs no body~~. The whole chunk goes to
+`dropped_unadjudicated` with a may-have-landed line, `losses().failed` sums it with `rejected_events` and the abandoned
 requests, and the chunk is settled. **The known cost**: a proxy that speaks Honeycomb's batch
 protocol but answers with something other than an array — none is known to; Refinery answers with
 the array, and `libhoney-go` itself fails a whole batch whose `200` body does not decode — would
 have every chunk charged as an upper bound, one stderr line per chunk, since `_diag.lost` is not
 throttled. That is loud, not silent, which is the side invariant 2 lets it err on.
+
+> **Superseded in part by SPEC-070 FR-004:** `OTLPSink` now counts an unreadable `2xx` body as this
+> sink does, and reads only an **empty** one as success, because an OTLP success needs no body — row
+> 4 of *The sinks keep four declared exceptions to their shared rules*.
 
 **Rejected: reading an empty or unreadable `2xx` as success.** It settles silently the very response
 the gap was about. **Rejected: reading the overlapping prefix of a misaligned array.** A length
@@ -65,6 +70,11 @@ the caller logged, and invariant 11 names a type and never a value. **Not done: 
 response, and a bound would also change how an oversized non-`2xx` is retried.
 
 ## History
+
+### 2026-11-07
+
+- **Marked.** SPEC-070 FR-004: the unreadable body arrives as an `_UnreadBody`, and `OTLPSink`'s
+  contrasting reading now covers only an empty body; the sentence carries a superseded marker.
 
 ### 2026-11-03
 

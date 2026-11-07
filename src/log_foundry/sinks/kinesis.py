@@ -4,15 +4,25 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
-from log_foundry.sinks._batch import adjudicate_positional, usable_results
+from log_foundry.sinks._batch import (
+    ABSENT,
+    adjudicate_positional,
+    describe_count,
+    results_rejected,
+    usable_results,
+)
 from log_foundry.sinks._chunk import chunk_items
+from log_foundry.sinks._classify import aws_retryable, is_retryable
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._retry import floor_count, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 __all__ = ["KinesisSink"]
 
@@ -268,6 +278,54 @@ class KinesisSink:
                 f"{self.MAX_RECORD_BYTES}-byte per-record limit",
             )
 
+    def _retryable_error(self, err: Exception) -> bool:
+        """Reports whether a failed call is worth another attempt (SPEC-070 FR-002).
+
+        botocore's transient and throttling failures, through the predicate the four AWS sinks
+        share (:func:`~log_foundry.sinks._classify.aws_retryable`); anything else — a
+        ``ParamValidationError``, an ``AccessDenied``, a ``TypeError`` from the caller's own
+        code — fails at once, counted and announced on its first attempt with no backoff wait.
+
+        Args:
+          err: The exception the attempt raised.
+
+        Returns:
+          True when another attempt may succeed.
+
+        Raises:
+          None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
+        """
+        return aws_retryable(err)
+
+    def _retryable_entry(self, entry: Mapping[str, object]) -> bool:
+        """Reports whether a resend of one failed record may succeed: always (SPEC-070 FR-003).
+
+        Kinesis ``PutRecords`` documents a record's ``ErrorCode`` as one of
+        ``ProvisionedThroughputExceededException`` and ``InternalFailure``, each transient, so the
+        vendor's whole per-record list is retryable. A code the page does not list — or one that
+        is not a ``str`` — is retried too, bounded by ``max_retries``: the permanent kinds of
+        failure on this service are reported as whole-request errors (``InvalidArgumentException``,
+        the KMS errors), so the per-record channel carries what the service failed to do; the
+        page's only remedy for a failed record is to resend it; and the two mistakes are not
+        symmetric — an undocumented permanent code costs at most ``max_retries`` bounded, idle
+        waits, while an undocumented transient code read as permanent loses records the service
+        would have taken.
+
+        It is asked only about a record the response marks failed, by a truthy ``ErrorCode``, and
+        :meth:`_send` does not ask it: with every answer True the branch for False would be dead
+        code. It is declared for SPEC-072's engine, which takes it as an argument.
+
+        Args:
+          entry: The failed record's result entry.
+
+        Returns:
+          True.
+
+        Raises:
+          None.
+        """
+        return True
+
     def _send(self, records: list[dict[str, Any]]) -> int | None:
         """Sends one chunk, retrying only the records the response flags as failed (FR-003).
 
@@ -291,6 +349,16 @@ class KinesisSink:
         what the worker's retry exists for, while suppressing the raise would lose every event of
         every batch for a whole outage, silently.
 
+        **The failed count and the coded records must agree** (SPEC-070 FR-003). This used to
+        read the count first and return the chunk as sent when it was ``0`` or missing, so a
+        reply saying ``0`` beside coded records, or no count beside them, counted nothing; and a
+        positive count beside no coded record retried nothing and counted the chunk as sent. The
+        reply now goes whole to ``adjudicate_positional`` with its count: only a ``0`` or absent
+        count with no coded record is delivered, only a positive count matched by exactly that
+        many coded records is retried, and every other combination is unadjudicated — counted on
+        ``dropped_unadjudicated``, announced once with the count named, never resent — because
+        the reply's two halves disagree about which records landed.
+
         Args:
           records: One chunk's request entries.
 
@@ -312,7 +380,7 @@ class KinesisSink:
                     StreamName=self.stream_name, Records=records
                 )
             except Exception as err:
-                if attempt < self.max_retries:
+                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
                     wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
                     continue
                 with self._counter_lock:
@@ -320,21 +388,31 @@ class KinesisSink:
                 _diag.lost(
                     "record",
                     len(records),
-                    f"KinesisSink, {self.max_retries + 1} attempt(s), {type(err).__name__}",
+                    f"KinesisSink, {attempt + 1} attempt(s), {type(err).__name__}",
                 )
                 return sent - len(records)
-            if not response.get("FailedRecordCount"):
-                return sent
-            results = usable_results(response.get("Records"))
-            verdict = adjudicate_positional(records, results)
+            failed_count = response.get("FailedRecordCount", ABSENT)
+            raw = response.get("Records")
+            results = usable_results(raw)
+            rejected = results_rejected(raw)
+            verdict = adjudicate_positional(
+                records, results, failed_count=failed_count, rejected=rejected
+            )
             if verdict.unadjudicated:
+                coded = sum(1 for result in results if result.get("ErrorCode"))
+                returned = (
+                    "an unreadable result array"
+                    if rejected
+                    else f"{len(results)} result(s) returned"
+                )
                 with self._counter_lock:
                     self.dropped_unadjudicated += verdict.unadjudicated
                 _diag.lost(
                     "record",
                     verdict.unadjudicated,
                     f"KinesisSink could not adjudicate a put_records response ({len(records)} "
-                    f"record(s) sent, {len(results)} result(s) returned); abandoned, not retried",
+                    f"record(s) sent, {returned}, {coded} coded, "
+                    f"{describe_count(failed_count)}); abandoned, not retried",
                 )
                 return None
             records = verdict.retry
@@ -348,7 +426,8 @@ class KinesisSink:
                 _diag.lost(
                     "record",
                     len(records),
-                    f"KinesisSink, still failing after {self.max_retries + 1} attempts; abandoned",
+                    f"KinesisSink, still failing after {self.max_retries + 1} attempt(s); "
+                    "abandoned",
                 )
                 return sent - len(records)
         return 0

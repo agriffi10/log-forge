@@ -6,15 +6,16 @@ later chunk's exception ``_deliver`` does not catch, and the worker's retry then
 once per attempt. ``_drop_refused`` now takes ``emit``'s ledger, so that raise discards it.
 
 Probe D: ``max_batch_count=1, max_retries=0``, an opener answering ``413`` to the 2,000-byte
-event's lone request (sent first) and, for the ordinary event's request, raising a
-``RuntimeError`` — what a caller-injected opener can raise, and none of the ``URLError``,
-``OSError`` and ``http.client.HTTPException`` that ``_send`` catches. Down repeats that on every
-attempt; once serves the second.
+event's lone request (sent first) and ``200`` to the ordinary event's, whose
+``_handle_response`` — set on the instance — raises a ``RuntimeError``. A subclass hook runs
+outside ``_send``'s guard, so that raise escapes ``emit``, which is the route SPEC-059 FR-004
+holds the drop to. Down repeats that on every attempt; once serves the second.
 
-Probe D used to be a ``200`` whose ``read()`` raised ``IncompleteRead``. That no longer raises:
-after a status line a failed body read is ``b""`` and the ``2xx`` settles its chunk, so it could
-no longer stand for "an exception after a drop" (``docs/decisions/sink-delivery/``, *After a status
-line the status decides*).
+Probe D used to be a ``200`` whose ``read()`` raised ``IncompleteRead``, and then an opener
+raising ``RuntimeError``. Neither raises any more: after a status line a failed body read settles
+the ``2xx`` (*After a status line the status decides*), and since SPEC-070 FR-001 ``_send``
+catches every ``Exception`` and counts one it does not retry as an abandoned request, so an
+opener's exception settles nothing and escapes nothing (pinned below, as the new truth).
 """
 
 from __future__ import annotations
@@ -37,8 +38,8 @@ _MARKER = "refused at the smallest request this sink can build"
 
 
 def _attempt() -> list[FakeResponse | Exception]:
-    """One Probe D attempt: ``413`` for the oversized event, then an opener that raises."""
-    return [FakeResponse(413, b""), RuntimeError("injected opener")]
+    """One Probe D attempt: ``413`` for the oversized event, then ``200`` for the other."""
+    return [FakeResponse(413, b""), FakeResponse(200, b"")]
 
 
 def _down() -> list[FakeResponse | Exception]:
@@ -46,7 +47,27 @@ def _down() -> list[FakeResponse | Exception]:
 
 
 def _once() -> list[FakeResponse | Exception]:
-    return [*_attempt(), FakeResponse(413, b""), FakeResponse(200, b"")]
+    return _attempt() * 2
+
+
+def _arm(sink: HTTPSink, raises: int) -> HTTPSink:
+    """Makes the sink's ``_handle_response`` raise ``RuntimeError`` on its first ``raises`` calls.
+
+    Set on the instance, so it shadows any subclass override; past ``raises`` it delegates to
+    the class's own method. It runs in ``_deliver``, outside ``_send``'s guard, so its raise
+    escapes ``emit`` the way a subclass hook's does.
+    """
+    original = sink._handle_response
+    calls = [0]
+
+    def hook(payload: bytes, items: list[Any]) -> bool:
+        calls[0] += 1
+        if calls[0] <= raises:
+            raise RuntimeError("injected hook")
+        return original(payload, items)
+
+    sink._handle_response = hook  # type: ignore[method-assign]
+    return sink
 
 
 def _event(**fields: object) -> dict[str, object]:
@@ -64,8 +85,8 @@ def _probe_d() -> list[dict[str, object]]:
     return [_event(big="x" * 2_000), _event(i=1)]
 
 
-def _http(opener: FakeOpener) -> HTTPSink:
-    return HTTPSink("http://h", max_batch_count=1, max_retries=0, opener=opener)
+def _http(opener: FakeOpener, raises: int = 4) -> HTTPSink:
+    return _arm(HTTPSink("http://h", max_batch_count=1, max_retries=0, opener=opener), raises)
 
 
 def _drop_lines(err: str) -> list[str]:
@@ -87,13 +108,13 @@ def _through_the_worker(sink: Any, batch: list[dict[str, object]]) -> tuple[bool
 def test_probe_d_down_counts_no_413_drop(capsys) -> None:
     """Four attempts each refused the event and then raised; none returned, so none counts."""
     opener = FakeOpener(_down())
-    sink = _http(opener)
+    sink = _http(opener, raises=4)
 
     delivered, failed_batches = _through_the_worker(sink, _probe_d())
 
     err = capsys.readouterr().err
     assert not delivered and failed_batches == 1
-    assert len(opener.calls) == 8, "the premise: the 413 and the raising opener on every attempt"
+    assert len(opener.calls) == 8, "the premise: the 413 and the raising hook on every attempt"
     assert sink.dropped_oversized == 0
     assert sink.losses().dropped == 0
     assert _drop_lines(err) == [], "no 413 line from an emit that raised"
@@ -105,7 +126,7 @@ def test_probe_d_down_counts_no_413_drop(capsys) -> None:
 def test_probe_d_once_counts_the_413_drop_once(capsys) -> None:
     """Attempt 1 raised and counted nothing; attempt 2 returned and counted the drop once."""
     opener = FakeOpener(_once())
-    sink = _http(opener)
+    sink = _http(opener, raises=1)
 
     delivered, failed_batches = _through_the_worker(sink, _probe_d())
 
@@ -126,7 +147,7 @@ def test_the_never_offered_route_defers_too(mode: str, capsys) -> None:
     ``_drop_refused`` are held to the same ledger.
     """
     opener = FakeOpener(_down() if mode == "down" else _once())
-    sink = _http(opener)
+    sink = _http(opener, raises=4 if mode == "down" else 1)
     batch = [_event(big="x" * 2_000, n=0), _event(big="x" * 2_000, n=1), _event(i=1)]
 
     delivered, _ = _through_the_worker(sink, batch)
@@ -166,13 +187,13 @@ def test_every_http_subclass_counts_no_413_drop_when_down(cls: type[HTTPSink]) -
     """
     assert cls.__name__ in _RECIPES, f"{cls.__name__} has no recipe; add one to _RECIPES"
     opener = FakeOpener(_down())
-    sink = _RECIPES[cls.__name__](opener=opener, max_batch_count=1, max_retries=0)
+    sink = _arm(_RECIPES[cls.__name__](opener=opener, max_batch_count=1, max_retries=0), 4)
     assert type(sink) is cls
 
     delivered, failed_batches = _through_the_worker(sink, _probe_d())
 
     assert not delivered and failed_batches == 1
-    assert len(opener.calls) == 8, "the premise: the 413 and the raising opener on every attempt"
+    assert len(opener.calls) == 8, "the premise: the 413 and the raising hook on every attempt"
     assert sink.losses().dropped == 0
 
 
@@ -192,7 +213,7 @@ def test_an_orphan_413_settles_inside_the_sink() -> None:
 
 def test_a_fanout_absorbs_the_probe_d_batch() -> None:
     """The child raised after its drop, its sibling delivered: the fan-out owns both events."""
-    child = _http(FakeOpener(_attempt()))
+    child = _http(FakeOpener(_attempt()), raises=1)
     multi = MultiSink(child, MemorySink())
 
     multi.emit(_probe_d())
@@ -200,3 +221,23 @@ def test_a_fanout_absorbs_the_probe_d_batch() -> None:
     own = child.losses()
     assert own.dropped == 0, "the child's raise discarded its 413 drop"
     assert multi.losses() == SinkLosses(dropped=0, failed=own.failed + 2)
+
+
+def test_an_opener_exception_after_a_drop_is_counted_and_the_drop_settles(capsys) -> None:
+    """SPEC-070 FR-001: the opener's ``RuntimeError`` no longer escapes ``emit``.
+
+    It is abandoned at its one attempt and counted in ``failed``. The ``413`` drop settled chunk
+    1, so ``emit`` delivered something and returns (invariant 7): the worker sees success, makes
+    no second attempt, and the drop is counted once. This was Probe D's own shape before SPEC-070.
+    """
+    opener = FakeOpener([FakeResponse(413, b""), RuntimeError("injected opener")])
+    sink = HTTPSink("http://h", max_batch_count=1, max_retries=2, opener=opener)
+
+    delivered, failed_batches = _through_the_worker(sink, _probe_d())
+
+    err = capsys.readouterr().err
+    assert delivered and failed_batches == 0
+    assert len(opener.calls) == 2, "one request per chunk; the RuntimeError is not retried"
+    assert sink.losses() == SinkLosses(dropped=1, failed=1)
+    assert _drop_lines(err) == [f"log-foundry: lost 1 event(s); HTTPSink, {_MARKER}"]
+    assert "lost 1 request(s); HTTPSink, 1 attempt(s), connection error, RuntimeError" in err

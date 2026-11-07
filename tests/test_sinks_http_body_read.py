@@ -18,6 +18,7 @@ with an injected opener, since that is where the per-class reading of the body l
 from __future__ import annotations
 
 import http.client
+import json
 import socket
 import socketserver
 import struct
@@ -31,7 +32,7 @@ import log_foundry
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.elasticsearch import ElasticsearchSink, OpenSearchSink
 from log_foundry.sinks.honeycomb import HoneycombSink
-from log_foundry.sinks.http import HTTPSink, _no_redirect_opener
+from log_foundry.sinks.http import HTTPSink, _no_redirect_opener, _read_failed, _UnreadBody
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.otlp import OTLPSink
 from test_sinks_http import FakeOpener, FakeResponse
@@ -86,6 +87,8 @@ class _RawServer(socketserver.ThreadingTCPServer):
     - ``manyheaders``: a ``200`` status line followed by 101 headers, one past ``http.client``'s
       limit.
     - ``longheader``: a ``200`` status line followed by one header line over 65,536 bytes.
+    - ``chunked:<status>``: that status, chunked, one ``{}`` chunk, then a close with no
+      terminating chunk.
     """
 
     allow_reuse_address = True
@@ -150,6 +153,9 @@ class _RawHandler(socketserver.BaseRequestHandler):
                 self.server.errors.append("the client never reported a status before the RST")
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             sock.close()
+        elif mode.startswith("chunked:"):
+            head = f"HTTP/1.1 {mode.split(':')[1]} X\r\nTransfer-Encoding: chunked\r\n"
+            sock.sendall(head.encode() + b"Connection: close\r\n\r\n2\r\n{}\r\n")
         elif mode == "badstatus":
             sock.sendall(b"garbage\r\n\r\n")
         elif mode == "manyheaders":
@@ -443,15 +449,24 @@ _READ_ERRORS = [
 _BODY_READERS = {ElasticsearchSink, OpenSearchSink, HoneycombSink, OTLPSink}
 """The shipped subclasses whose ``_handle_response`` reads the body.
 
-A new body reader must be added here, and must decide what ``b""`` means for it: an override
-cannot tell an empty ``2xx`` body from one that could not be read. The decision is recorded in
-``_COUNTS_UNREADABLE``: the ``_bulk`` sinks and ``HoneycombSink`` count it, since their only
-verdict is in the body; ``OTLPSink`` reads it as full success, since an OTLP success needs no ``partialSuccess`` at all
-(SPEC-056 FR-004).
+A new body reader must be added here, and must decide what an unreadable body means for it.
+Since SPEC-070 FR-004 the payload of a ``2xx`` whose body could not be read is an ``_UnreadBody``,
+equal to ``b""``, which ``_read_failed`` tells from an empty body; every shipped reader asks it
+and counts the chunk unadjudicated, so ``_COUNTS_UNREADABLE`` equals this set. How a reader takes
+an **empty** body is a separate question, recorded in ``tests/test_declared_exceptions.py``:
+``OTLPSink`` reads it as success, since an OTLP success needs no ``partialSuccess``.
 """
 
-_COUNTS_UNREADABLE = {ElasticsearchSink, OpenSearchSink, HoneycombSink}
-"""The body readers for which ``b""`` is an unadjudicated chunk rather than a delivered one."""
+_COUNTS_UNREADABLE = {ElasticsearchSink, OpenSearchSink, HoneycombSink, OTLPSink}
+"""The body readers for which an unreadable ``2xx`` body is an unadjudicated chunk.
+
+``OTLPSink`` joined it with SPEC-070 FR-004; before, it read an unreadable body as full success.
+"""
+
+
+def test_every_body_reader_counts_an_unreadable_body() -> None:
+    """FR-004 AC-1: no shipped reader settles an unreadable ``2xx`` body as delivered."""
+    assert _COUNTS_UNREADABLE == _BODY_READERS
 
 
 def test_the_body_readers_are_exactly_the_listed_set() -> None:
@@ -521,3 +536,115 @@ def test_retry_after_survives_a_failed_body_read(monkeypatch: pytest.MonkeyPatch
 
     assert delays == [2.0]
     assert len(opener.calls) == 2
+
+
+# --- SPEC-070 FR-004: every reader counts an unreadable body, and the flag rides the payload ---
+
+
+_READERS_AT = {
+    "ElasticsearchSink": lambda url, **kw: ElasticsearchSink(url, index="i", **kw),
+    "OpenSearchSink": lambda url, **kw: OpenSearchSink(url, index="i", **kw),
+    "HoneycombSink": lambda url, **kw: HoneycombSink("key", "dataset", url=url, **kw),
+    "OTLPSink": lambda url, **kw: OTLPSink(f"{url}/v1/logs", **kw),
+}
+"""Each body reader, built against a loopback URL; held equal to ``_BODY_READERS`` below."""
+
+
+def test_the_socket_recipes_cover_every_body_reader() -> None:
+    assert set(_READERS_AT) == {cls.__name__ for cls in _BODY_READERS}
+
+
+@pytest.mark.parametrize("mode", ["short:200", "chunked:200"])
+@pytest.mark.parametrize("name", sorted(_READERS_AT))
+def test_a_truncated_2xx_is_counted_by_every_reader(
+    name: str, mode: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-004 AC-1 through a real socket: a short ``Content-Length`` body and a cut chunked one.
+
+    ``OTLPSink`` reads under its response bound, so it meets the ``response.length`` path as well
+    as the raise; the other three read bare. One POST per chunk, the whole chunk counted, one
+    line per chunk, nothing re-sent.
+    """
+    with _serving([mode]) as server:
+        sink = _READERS_AT[name](server.url, max_batch_count=2, max_retries=2, timeout=_TIMEOUT)
+        sink.emit(_batch(4))
+
+    assert len(server.posts) == 2, "one POST per chunk, none re-sent"
+    assert sink.dropped_unadjudicated == 4
+    assert sink.losses() == SinkLosses(dropped=0, failed=4)
+    assert len(_lost_lines(capsys.readouterr().err)) == 2
+
+
+@pytest.mark.parametrize(
+    "cls", sorted(_BODY_READERS, key=lambda c: c.__name__), ids=lambda c: c.__name__
+)
+def test_an_empty_2xx_is_success_only_for_otlp(
+    cls: type[HTTPSink], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-004 AC-2: an **empty** body is untouched — OTLP's success, the other three's count."""
+    opener = FakeOpener([FakeResponse(200, b"")])
+    sink = _RECIPES[cls.__name__](opener=opener, max_batch_count=2, max_retries=2)
+
+    sink.emit(_batch(4))
+
+    assert len(opener.calls) == 2
+    err = capsys.readouterr().err
+    if cls is OTLPSink:
+        assert sink.losses() == SinkLosses(dropped=0, failed=0)
+        assert _lost_lines(err) == []
+    else:
+        assert sink.losses() == SinkLosses(dropped=0, failed=4)
+        assert len(_lost_lines(err)) == 2
+
+
+class _TwoArgumentReader(HTTPSink):
+    """A third-party override written against ``1.x``: two arguments, no flag asked."""
+
+    seen: list[bytes]
+
+    def _handle_response(self, payload, items):  # type: ignore[no-untyped-def]
+        self.seen.append(payload)
+        return True
+
+
+class _ForwardingReader(_TwoArgumentReader):
+    """A ``*args, **kwargs`` wrapper that forwards to the two-argument override."""
+
+    def _handle_response(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return super()._handle_response(*args, **kwargs)
+
+
+@pytest.mark.parametrize("exc", _READ_ERRORS, ids=lambda e: type(e).__name__)
+@pytest.mark.parametrize("cls", [_TwoArgumentReader, _ForwardingReader], ids=lambda c: c.__name__)
+def test_an_unchanged_override_sees_empty_bytes_and_settles(
+    cls: type[_TwoArgumentReader], exc: Exception
+) -> None:
+    """FR-004 AC-3: the hook's signature did not change, so a ``1.x`` override is not broken.
+
+    A keyword parameter would have raised ``TypeError`` out of ``emit`` here, exactly when a
+    body failed to read, and the worker re-sends anything escaping ``emit``.
+    """
+    opener = FakeOpener([_UnreadableResponse(200, exc)])
+    sink = cls("http://h", opener=opener, max_batch_count=2, max_retries=2)
+    sink.seen = []
+
+    sink.emit(_batch(4))
+
+    assert len(opener.calls) == 2
+    assert sink.seen == [b"", b""]
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "delivered, as under 1.x"
+
+
+def test_the_unread_body_behaves_as_empty_bytes_and_is_told_apart_only_when_asked() -> None:
+    """FR-004 AC-4."""
+    unread = _UnreadBody()
+    assert unread == b""
+    assert len(unread) == 0
+    assert unread[:1] == b""
+    for payload in (b"", unread):
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(payload)
+    assert _read_failed(unread)
+    assert not _read_failed(b"")
+    assert not _read_failed(bytearray())
+    assert not _read_failed(b"{}")

@@ -424,7 +424,8 @@ raising and wrong-shaped alike as "reports nothing".
 ~~Three~~ cases where nothing landed and the sink still must not raise, each settled by an earlier
 spec: an **unadjudicable** batch response (SPEC-018 — the sink cannot prove nothing landed, so a
 retry risks duplicating), an **SQS sender fault** (SPEC-016 FR-006 — provably rejected, and a
-byte-identical re-send can only fail the same way), and an **oversized** event (it can never fit,
+byte-identical re-send can only fail the same way; an **SNS sender fault** too since SPEC-070,
+below), and an **oversized** event (it can never fit,
 so there is nothing to retry). All three are reported through `losses()` instead. — Superseded
 in part by SPEC-058, which settles three more cases the same way, counted rather than raised: an
 **unrenderable** event in the HTTP family, alone or beside oversized ones (the sink's own render
@@ -439,8 +440,15 @@ record-building sinks and the socket transport, the hand-offs `KafkaSink` and `G
 see refused, and `HTTPSink._drop_refused`'s `413`. So a `dropped` count is made only by an `emit`
 that returned, and a check in `tests/test_deferral.py` holds every counter some `losses()`
 reports as `dropped` to being written by that commit alone. What can still land before a raise
-and again on the worker's retry is a sink's own `failed` count, an upper bound, the SQS sender
-fault included — `SQSSink._send` counts it before `emit` raises for a recoverable loss beside it.
+and again on the worker's retry is a sink's own `failed` count, an upper bound, the SQS and SNS
+sender faults included — `SQSSink._send` and, since SPEC-070, `SNSSink._send` count one before
+`emit` raises for a recoverable loss beside it.
+
+SPEC-070 widens the first two of the original three cases. An **SNS sender fault** joins the SQS
+one — the same required `SenderFault` field, read through the same `sinks/_classify.sender_fault`,
+counted and never retried, a batch lost only to sender faults returning — and a Kinesis or Firehose
+reply whose failed count its coded records contradict is an unadjudicable response (*A sink that
+delivered nothing raises; one that delivered something reports*).
 
 **The same rule reaches the sink's own lifecycle** (SPEC-032): a sink whose `close()` released or
 invalidated a transport must **raise** on a later non-empty `emit` rather than absorb it — a
@@ -986,12 +994,15 @@ close it.
   so SPEC-066 changed only `max_reconnect_attempts` there. **Closed by** judging each by the
   sink-delivery rule — refused if no value of that kind has a working configuration to protect,
   floored through `usable_timeout` if one does.
-- **A `float` timeout too large for a socket constructs and raises out of every `emit`** (SPEC-066
+- **A `float` timeout too large for a socket constructs and fails every `emit`** (SPEC-066
   second diff review, found while closing the int doors; invariant 13). `_retry.require_timeout`
   accepts any positive finite number, and `socket.settimeout` raises `OverflowError` above about
-  `9.2e9` seconds (the platform's `PyTime_t`), so `HTTPSink(timeout=1e10)` constructs and its
-  `emit` raises that `OverflowError` uncounted — not an `OSError`, so the retry guard never sees
-  it. It is a `float` door of SPEC-049's, not an `int` door, so SPEC-066 did not change it.
+  `9.2e9` seconds (the platform's `PyTime_t`), so `HTTPSink(timeout=1e10)` constructs and no
+  `emit` can deliver. ~~Its `emit` raises that `OverflowError` uncounted — not an `OSError`, so the
+  retry guard never sees it.~~ Since SPEC-070 FR-001 `HTTPSink._send` catches it, counts the
+  request in `failed` at its one attempt with a `connection error, OverflowError` line and raises
+  `SinkDeliveryError`, every `emit` (*A sink declares what it retries, and anything else fails at
+  once*); the value still never delivers, so the item stays open. It is a `float` door of SPEC-049's, not an `int` door, so SPEC-066 did not change it.
   **Closed by** an upper bound in `require_timeout` at what the socket accepts, refused rather
   than floored if no value above it delivers — once the bound and its message are settled.
 - **The after-shutdown submission line announces a loss the final drain can still deliver**
