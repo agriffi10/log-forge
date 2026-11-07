@@ -1082,13 +1082,16 @@ close it.
   fix's build; invariant 13) → **closed by the HTTP auth fix (no spec)**, by refusal. A caller
   name folding to Splunk's `Authorization`, Datadog's `DD-API-KEY`, New Relic's `Api-Key` or
   Honeycomb's `X-Honeycomb-Team`, in any case, used to be sent instead of the required `token` or
-  `api_key`; `merge_headers` now refuses it at construction, naming the argument it would replace
-  and no value, and the set is every key of the base each sink hands it, derived by an AST roster.
-  So `SplunkHECSink`'s `auth=` refusal, which says the sink sends its token as `Authorization`, is
-  true in every case. Its twin, two caller names folding to one wire name (`{"x-a": "1", "X-A":
-  "2"}`), used to send only the last and is refused by `_valid_headers`. Guard:
-  `tests/test_sinks_http_header_collisions.py`. The reasoning: *A caller header that would
-  silently replace another is refused*, in `docs/decisions/sink-delivery/`.
+  `api_key`; `merge_headers`, called by each with `argument=`, now refuses it at construction,
+  naming the argument it would replace and no value, the set being every key of the base each sink
+  hands it. Without `argument=` it lets the caller win as in 1.x, so a third-party sink's override
+  of its own default still sends what it sent. So `SplunkHECSink`'s `auth=` refusal, which says the
+  sink sends its token as `Authorization`, is true in every case. Its twin, two caller names
+  folding to one wire name (`{"x-a": "1", "X-A": "2"}`), used to send only the last and is refused
+  by `_valid_headers`. Guard: `tests/test_sinks_http_header_roster.py`, a run-time roster that
+  replays every header each HTTP sink sends as a caller header and requires a refusal, with
+  `tests/test_sinks_http_header_collisions.py`'s AST scans supplementary. The reasoning: *A caller
+  header that would silently replace another is refused*, in `docs/decisions/sink-delivery/`.
 - ~~**An `auth` that unpacks only once is accepted at construction, and every `emit` then
   fails**~~ (SPEC-071 frame-2 review; invariant 13) → **closed by the HTTP auth fix (no spec)**.
   Credentials are copied once, at construction, as exact `str` (`_diag._STR_STR`; a pair unpacked
