@@ -749,8 +749,9 @@ docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-f
 - 2026-11-07, build: the PostgreSQL reconnect now re-raises the connect failure into the loop, so
   FR-002 AC-2 can hold. `_reconnect_if_broken` used to absorb it and leave the attempt to fail on
   the dead handle's "the connection is closed", which no predicate could read as a refusal, and no
-  decision fenced the absorption. Its once-per-outage line gains `; the attempt fails with it and is
-  counted`.
+  decision fenced the absorption. Its once-per-outage line, which said `absorbed`, is now a
+  `_diag.pending` line, `PostgresSink could not reconnect (<Type>); this attempt fails with it, and the batch's own line says whether it is retried or lost`, since the failure is neither absorbed nor yet a
+  loss (diff review frame 1).
 - 2026-11-07, build: invariant 7's recorded exceptions never named the SQS sender fault, so FR-003's
   edit adds both the SQS and the SNS one there rather than one beside the other.
 - 2026-11-07, build: FR-004 AC-7's grep over `docs/` covers the live tier. The history tier —
