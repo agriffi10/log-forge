@@ -50,6 +50,8 @@
   `MemorySink` holding 100k four-field events, `bd8006b4` against `d11e9e90`: the builder measured
   idle 0.92 ms against 1.55 ms and loaded 447 ms against 483 ms on Python 3.12.12; a re-run on
   3.13.1 gave idle 0.83 against 1.45 ms and loaded about 385 against 419 ms. Noisy run to run.
+  At `06c323b8`, whose static read replaced `inspect.getattr_static` (first diff review), the
+  same measure on 3.12.12 gave idle 1.3 ms and loaded 470 to 477 ms.
 - The model test's `deliver` form adds about 7 s serial across its 16 seeds (the builder's 7.0 s;
   7.3 s summed from `--durations` in a 3.13.1 re-run at `d11e9e90`). The whole file took 1.9 s at
   `-n 12` in the builder's run and 2.7 s to 2.9 s in the re-run.
