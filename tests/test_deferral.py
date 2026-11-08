@@ -187,7 +187,9 @@ MODULE_LEVEL = "<module>"
 
 SPEC-072's engine commits a whole delivery run in one module function, ``_engine._run``, rather
 than in an ``emit``: it is shared by the worker, the orphan path and the inline adapter, so no one
-class owns it. A function listed here is held to what a listed ``emit`` is, with one difference
+class owns it. SPEC-073's run context adds ``_engine._commit``, which commits the counts a sink
+registered on the run's context, one ``Deferral`` per owner, for ``_run`` and for a round run
+outside any run. A function listed here is held to what a listed ``emit`` is, with one difference
 that follows from having no ``self``: it may make **no** attribute store through any root, its
 same-module callees included, since a second ledger there would be a store through the counters
 object the ``Deferral`` already commits into.
@@ -216,7 +218,7 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
     "sinks/postgres.py": {"PostgresSink": ("emit",)},
     "sinks/redis.py": {"_RedisSink": ("emit",)},
-    "sinks/_engine.py": {MODULE_LEVEL: ("_run",)},
+    "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
@@ -2428,3 +2430,134 @@ def test_the_dropped_counter_check_reports_what_it_claims_to(case: str) -> None:
     """Each derivation and store form's finding text, and the shapes that must stay silent."""
     source, expected = _DROPPED_CORPUS[case]
     assert dropped_store_findings("m.py", source, dropped_counters(source)) == expected
+
+
+# --- SPEC-073 FR-005: a dropped counter counted through a run context commits only if settled ----
+
+
+def run_context_count_findings(where: str, source: str, counters: set[str]) -> list[str]:
+    """Every run-context ``count`` that could count a ``dropped`` counter in a run that failed.
+
+    A sink on the delivery engine counts through ``RunContext.count(owner, name, n, when=...)``
+    rather than storing, so :func:`dropped_store_findings` sees no store, and a ``when`` other than
+    ``When.SETTLED`` would count a drop that a failed run's catcher already counts. The call is
+    recognised by **shape**: an attribute call named ``count`` with three or more positional
+    arguments, the second the counter's name. ``Deferral.count`` and the context's ``drops`` view
+    take the counter first and at most two positionals, so they are not this shape and stay
+    silent: both are committed only by a settled run or a returning ``emit``.
+
+    In that shape a ``when=When.SETTLED`` keyword is silent whatever the name. Otherwise a name
+    that is not a string literal is a finding, because the gate cannot tell which counter it is
+    (it fails closed), and a literal naming one of ``counters`` is a finding too.
+
+    Args:
+      where: The module's path, for the message.
+      source: The module's text.
+      counters: The counters some ``losses()`` reports as ``dropped``.
+
+    Returns:
+      One line per finding, in source order.
+    """
+    findings: list[tuple[int, str]] = []
+    for node in ast.walk(ast.parse(source)):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "count"
+            and len(node.args) >= 3
+        ):
+            continue
+        when = next((k.value for k in node.keywords if k.arg == "when"), None)
+        if isinstance(when, ast.Attribute) and when.attr == "SETTLED":
+            continue
+        shown = ast.unparse(when) if when is not None else "no when"
+        name = node.args[1]
+        if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            findings.append(
+                (
+                    node.lineno,
+                    (
+                        f"{where}:{node.lineno}: a run-context count names its counter by "
+                        f"{ast.unparse(name)}, which the gate cannot read, with {shown}; name it "
+                        f"by a literal or pass when=When.SETTLED"
+                    ),
+                )
+            )
+        elif name.value in counters:
+            findings.append(
+                (
+                    node.lineno,
+                    (
+                        f"{where}:{node.lineno}: the dropped counter {name.value} is counted "
+                        f"through a run context with {shown}; a dropped count commits only when "
+                        f"the run settles"
+                    ),
+                )
+            )
+    return [text for _, text in sorted(findings)]
+
+
+def test_every_run_context_count_of_a_dropped_counter_is_settled() -> None:
+    """FR-005: over the real package, a run-context ``count`` of a dropped counter is ``SETTLED``.
+
+    The derivation of the dropped counters is :func:`_tree_counters`'s, so this holds the same
+    population :func:`test_every_dropped_counter_is_written_only_by_a_deferral_commit` holds.
+    """
+    sources = _tree_sources()
+    counters = _tree_counters(sources)
+    assert counters >= DROPPED_FLOOR
+    findings: list[str] = []
+    for where, source in sources.items():
+        findings.extend(run_context_count_findings(where, source, counters))
+    assert findings == [], "\n".join(findings)
+
+
+_RUN_CONTEXT_CORPUS: dict[str, tuple[str, list[str]]] = {
+    "settled-literal": ('ctx.count(self, "dropped_oversized", 1, when=When.SETTLED)\n', []),
+    "settled-non-literal": ("ctx.count(self, name, 1, when=When.SETTLED)\n", []),
+    "not-a-dropped-counter": ('ctx.count(self, "failed", 1, when=When.ALWAYS)\n', []),
+    "a-deferral-count-without-when": ('pending.count("dropped_oversized", 2)\n', []),
+    "always-literal": (
+        'ctx.count(self, "dropped_oversized", 1, when=When.ALWAYS)\n',
+        [
+            (
+                "m.py:1: the dropped counter dropped_oversized is counted through a run context with "
+                "When.ALWAYS; a dropped count commits only when the run settles"
+            )
+        ],
+    ),
+    "last-literal": (
+        'x = 1\nctx.count(self, "dropped_oversized", n, when=When.LAST)\n',
+        [
+            (
+                "m.py:2: the dropped counter dropped_oversized is counted through a run context with "
+                "When.LAST; a dropped count commits only when the run settles"
+            )
+        ],
+    ),
+    "no-when": (
+        'ctx.count(self, "dropped_oversized", 1)\n',
+        [
+            (
+                "m.py:1: the dropped counter dropped_oversized is counted through a run context with "
+                "no when; a dropped count commits only when the run settles"
+            )
+        ],
+    ),
+    "non-literal-fails-closed": (
+        "ctx.count(self, name, 1, when=When.ALWAYS)\n",
+        [
+            (
+                "m.py:1: a run-context count names its counter by name, which the gate cannot read, "
+                "with When.ALWAYS; name it by a literal or pass when=When.SETTLED"
+            )
+        ],
+    ),
+}
+"""Each shape's finding, and the shapes that must stay silent, for the counter ``dropped_oversized``."""
+
+
+@pytest.mark.parametrize("case", sorted(_RUN_CONTEXT_CORPUS))
+def test_the_run_context_count_check_reports_what_it_claims_to(case: str) -> None:
+    source, expected = _RUN_CONTEXT_CORPUS[case]
+    assert run_context_count_findings("m.py", source, {"dropped_oversized"}) == expected
