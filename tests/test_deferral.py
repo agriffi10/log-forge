@@ -200,7 +200,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
     "sinks/sqs.py": {"SQSSink": ("emit", "_chunks")},
-    "sinks/http.py": {"HTTPSink": ("emit", "_items")},
     "sinks/kinesis.py": {"KinesisSink": ("emit", "_records")},
     "sinks/firehose.py": {"FirehoseSink": ("emit", "_records")},
     "sinks/sns.py": {"SNSSink": ("emit", "_bodies")},
@@ -223,7 +222,10 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
 """The functions in each site that decide a per-event drop, by module, class and name.
 
 SPEC-058 listed the first five modules, SPEC-059 the next ten, and SPEC-069 the rest, each of
-whose ``emit`` enters a ``Deferral`` for its encode step. ``SocketTransport`` is the one
+whose ``emit`` enters a ``Deferral`` for its encode step. SPEC-073 took ``sinks/http.py`` off the
+list: ``HTTPSink`` counts through the delivery engine's run context, whose one commit is
+``_engine._commit``, listed below, and whose ``SETTLED`` rule for a dropped counter
+:func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it. ``SocketTransport`` is the one
 entry without an ``emit``: the ledger is entered by ``SyslogSink.emit`` and ``LogstashSink.emit``
 and handed to its ``send_all``, so the roster rule below, which starts from an ``emit``, cannot
 require it and it is named by hand.
@@ -237,8 +239,6 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("HTTPSink", "_abandon"): frozenset({"failed"}),
-    ("HTTPSink", "_abandon_unreduced"): frozenset({"failed"}),
     ("SQSSink", "_send"): frozenset({"failed"}),
     ("KinesisSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
     ("FirehoseSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
@@ -282,11 +282,6 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``HTTPSink._abandon`` / ``failed``: a request abandoned past the retry bound, counted before
-  the raise by design; ``failed`` is an upper bound neither SPEC-058 nor SPEC-059 recounts (each
-  spec's *Out of Scope*).
-- ``HTTPSink._abandon_unreduced`` / ``failed``: a chunk the reduction budget could not shrink;
-  the same upper bound, the same *Out of Scope* clause.
 - ``SQSSink._send`` / ``failed``: entries failed past the bound and sender faults, counted as they
   happen, before ``emit`` can raise; the same upper bound, the same *Out of Scope* clause.
 - ``KinesisSink._send`` and ``FirehoseSink._send`` / ``failed``, ``dropped_unadjudicated``:

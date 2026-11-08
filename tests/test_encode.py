@@ -181,8 +181,10 @@ def derive(
     ``module.attr`` through the calling function's globals. A call whose callee resolves to
     ``json.dumps`` — however it was imported — is a hit. A call to ``encode_events`` has its
     ``encode`` argument resolved the same way and walked as *guarded*; every other reach is
-    *unguarded*. It does not follow a callable passed uncalled (other than the helper's encode
-    argument), a property, or a call through another object.
+    *unguarded*. A callable passed as a ``deliver=`` keyword is followed as a call too, since
+    ``emit_via_deliver(self, batch, deliver=self._round)`` is how an engine sink's ``emit`` reaches
+    its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. It does not follow any other
+    callable passed uncalled, a property, or a call through another object.
     """
     roster = Roster()
     for cls in classes:
@@ -226,6 +228,12 @@ def derive(
                         )
                 elif inspect.isfunction(callee) and (callee.__module__ or "").startswith(owned):
                     stack.append((callee, guarded))
+                for keyword in node.keywords:
+                    if keyword.arg != "deliver":
+                        continue
+                    handed = _resolve(keyword.value, fn, cls)
+                    if inspect.isfunction(handed) and (handed.__module__ or "").startswith(owned):
+                        stack.append((handed, guarded))
         if not hits:
             continue
         name = cls.__qualname__
@@ -586,6 +594,18 @@ class Fine(HTTPSink):
 """,
         [],
         {"Fine": "http"},
+    ),
+    "engine-round-unguarded": (
+        """
+class EngineSink:
+    def emit(self, batch):
+        emit_via_deliver(self, batch, deliver=self._round)
+
+    def _round(self, batch):
+        return [json.dumps(event) for event in batch]
+""",
+        [_bare("EngineSink", "EngineSink._round")],
+        {"EngineSink": "unconverted"},
     ),
     "silent-exempt": (
         """

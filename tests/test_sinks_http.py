@@ -72,9 +72,9 @@ class FakeOpener:
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps so retry tests run instantly."""
-    # ``wait`` is bound into each sink at import, and its Event branch never reaches
-    # ``time.sleep`` — patching either centrally would leave this fixture inert.
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    # The HTTP family waits only through the delivery engine, which calls ``_retry.wait``
+    # through the module (SPEC-073), so patching it there reaches every round's wait.
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 # --- FR-001: core POST ------------------------------------------------------------------
@@ -260,7 +260,7 @@ def test_a_failing_chunk_does_not_abandon_the_chunks_that_succeeded() -> None:
 def test_every_chunk_failing_is_the_total_failure_the_worker_retries() -> None:
     opener = FakeOpener([FakeResponse(500, b"")])
     sink = HTTPSink("http://x", max_batch_count=1, max_retries=0, opener=opener)
-    with pytest.raises(SinkDeliveryError, match="delivered none of 3 chunk"):
+    with pytest.raises(SinkDeliveryError, match="delivered none of 3 event"):
         sink.emit([{"a": 1}, {"a": 2}, {"a": 3}])
     assert sink.failed == 3
 

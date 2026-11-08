@@ -21,7 +21,7 @@ _SERVER_TEXT = "Event has too many columns."
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize backoff waits, as ``test_sinks_http`` does for its own module."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _verdict(*statuses: object) -> FakeResponse:

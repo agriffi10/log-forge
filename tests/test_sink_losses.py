@@ -26,12 +26,13 @@ from log_foundry.worker import Health, Worker
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
     for module in (
-        "_socket", "clickhouse", "eventhubs", "firehose", "http", "kinesis", "mongodb",
+        "_socket", "clickhouse", "eventhubs", "firehose", "kinesis", "mongodb",
         "postgres", "rabbitmq", "redis", "sns", "sqs",
     ):
         monkeypatch.setattr(
             f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None
         )
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 class QuietSink:

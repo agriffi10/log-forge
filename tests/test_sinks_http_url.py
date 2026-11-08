@@ -13,6 +13,7 @@ import ast
 import http.client
 import pathlib
 import re
+import threading
 import urllib.parse
 import urllib.request
 
@@ -45,6 +46,22 @@ def _assert_chains_nothing(exc: BaseException) -> None:
     assert exc.__context__ is None
 
 
+class _RecordingStop(threading.Event):
+    """A stop signal recording every wait the delivery engine takes on it, returning at once.
+
+    Since SPEC-073 the engine waits between rounds on the sink's ``log_foundry_stop_signal``, so
+    this records the backoff the deleted ``_sleep_backoff`` used to be patched for.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waits: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.waits.append(timeout)
+        return False
+
+
 def _counted_at_one_attempt(sink: HTTPSink, capsys) -> str:
     """Emits one event to a sink whose request cannot be encoded; the one line it wrote.
 
@@ -54,14 +71,14 @@ def _counted_at_one_attempt(sink: HTTPSink, capsys) -> str:
     ``SinkDeliveryError``. ``max_retries=1`` is what makes "one attempt" a claim rather than the
     bound.
     """
-    waits: list[int] = []
-    sink._sleep_backoff = lambda attempt, retry_after: waits.append(attempt)  # type: ignore[method-assign]
+    stop = _RecordingStop()
+    sink.log_foundry_stop_signal = stop
 
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"i": 1}])
 
     assert sink.losses().failed == 1
-    assert waits == [], "a failure the predicate rejects takes no backoff"
+    assert stop.waits == [], "a failure the predicate rejects takes no backoff"
     lines = capsys.readouterr().err.splitlines()
     assert len(lines) == 1, lines
     assert re.search(r"lost 1 request\(s\); HTTPSink, 1 attempt\(s\), connection error, \w+", lines[0])
@@ -131,7 +148,8 @@ def test_an_invalid_url_failed_every_request_without_a_socket(url: str, capsys) 
     now refuses it as userinfo, before this refusal is reached, so it is not in ``_COUNTED``.
     """
     sink = HTTPSink("http://h/x", max_retries=1)
-    sink._sleep_backoff = lambda attempt, retry_after: None
+    sink.log_foundry_stop_signal = threading.Event()
+    sink.log_foundry_stop_signal.set()
 
     sink.url = url
     with pytest.raises(SinkDeliveryError):

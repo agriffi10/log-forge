@@ -685,11 +685,14 @@ class FloatLie(float):
 
 
 def _retry_after_waits(monkeypatch: pytest.MonkeyPatch, ceiling: Any) -> tuple[int, list[Any]]:
-    """Emits one event through a 429-then-200 opener; returns the request count and the waits."""
-    import log_foundry.sinks.http as http_module
+    """Emits one event through a 429-then-200 opener; returns the request count and the waits.
+
+    The waits are the delivery engine's (SPEC-073), which calls ``_retry.wait`` through the module.
+    """
+    from log_foundry.sinks import _retry
 
     waits: list[Any] = []
-    monkeypatch.setattr(http_module, "wait", lambda delay, stop=None: waits.append(delay))
+    monkeypatch.setattr(_retry, "wait", lambda delay, stop=None: waits.append(delay))
     opener = _RetryAfterOpener()
     sink = HTTPSink("http://x", opener=opener, max_retries=1, max_retry_after=ceiling)
     sink.emit([{"a": 1}])
@@ -771,14 +774,14 @@ def test_a_float_subclass_max_retry_after_is_judged_by_the_number_it_holds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """FR-002: a lying `-1.0` passed both `min()` calls and paused a day on `Retry-After: 1`."""
-    import log_foundry.sinks.http as http_module
+    from log_foundry.sinks import _engine
 
     stored = HTTPSink("http://x", opener=_Opener(), max_retry_after=FloatLie(-1.0)).max_retry_after
     assert stored == -1.0
     assert type(stored) is float
     requests, waits = _retry_after_waits(monkeypatch, FloatLie(-1.0))
     assert requests == 2
-    assert waits == [http_module._BACKOFF_BASE], "an unusable ceiling falls back to backoff"
+    assert waits == [_engine.BACKOFF_BASE], "an unusable ceiling falls back to backoff"
     assert type(waits[0]) is float
 
 
@@ -800,11 +803,11 @@ def test_a_numeric_max_retry_after_is_still_judged_floor_side(
     monkeypatch: pytest.MonkeyPatch, ceiling: Any, expected: Any
 ) -> None:
     """FR-002: a control — a number constructs and `clamp_server_delay` answers it, as before."""
-    import log_foundry.sinks.http as http_module
+    from log_foundry.sinks import _engine
 
     requests, waits = _retry_after_waits(monkeypatch, ceiling)
     assert requests == 2, "the 429 is retried and the batch delivered"
-    assert waits == [http_module._BACKOFF_BASE if expected == "backoff" else expected]
+    assert waits == [_engine.BACKOFF_BASE if expected == "backoff" else expected]
 
 
 @pytest.mark.parametrize(

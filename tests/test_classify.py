@@ -1,13 +1,16 @@
-"""SPEC-070 — what a sink retries: the predicates, the twelve loops, the vendor sets and the rosters.
+"""SPEC-070 — what a sink retries: the predicates, the retry loops, the vendor sets and the rosters.
 
 Every retry loop under ``sinks/`` used to answer "is this failure worth another attempt?" its own
 way: ten retried any exception, two let anything but a transport error escape ``emit`` raw. Each
 loop now asks its class's ``_retryable_error`` through ``is_retryable``, and what the predicate
 does not name fails at its first attempt, counted and announced exactly as exhaustion is.
 
-The loop sweep builds eleven of the twelve loops from ``tests/sink_rigs.py`` (``SyslogSink`` for
-``SocketTransport``, ``RedisListSink`` for ``_RedisSink``) and ``HTTPSink`` from a raising opener,
-and is held to the population the loop roster derives, so a thirteenth loop needs an entry here.
+The loop sweep builds the eleven loops from ``tests/sink_rigs.py`` (``SyslogSink`` for
+``SocketTransport``, ``RedisListSink`` for ``_RedisSink``), and is held to the population the
+loop roster derives, so a twelfth loop needs an entry here. ``HTTPSink``'s loop was the twelfth
+until SPEC-073 moved its retries onto the delivery engine; its four sweep cases are re-expressed
+against ``HTTPSink.emit`` in ``tests/test_http_rounds.py``, and the check below holds ``http.py``
+to reaching ``_attempt`` only through the engine.
 """
 
 from __future__ import annotations
@@ -219,8 +222,8 @@ def test_sender_fault_is_the_truthiness_sqs_always_tested(value, fault) -> None:
 
 # --- FR-001: the loop roster -----------------------------------------------------------------
 
-_LOOP_FLOOR = 12
-"""The twelve retry loops measured when SPEC-070 was drafted and re-measured when it was built.
+_LOOP_FLOOR = 11
+"""The retry loops: twelve when SPEC-070 was built, eleven since SPEC-073 deleted ``HTTPSink._send``'s.
 
 Exactly the count rather than below it: a refactor that hides a loop from the scan — a ``while``,
 a bound named otherwise — must fail here rather than shrink the population silently. Raise it
@@ -402,11 +405,11 @@ def test_the_loop_roster_names_the_class_and_the_reason(tmp_path, source, reason
     assert findings[0].startswith("fixture.py:")
 
 
-@pytest.mark.parametrize(("count", "silent"), [(11, False), (12, True)])
-def test_the_loop_roster_fails_eleven_conforming_loops_on_its_floor(
+@pytest.mark.parametrize(("count", "silent"), [(10, False), (11, True)])
+def test_the_loop_roster_fails_ten_conforming_loops_on_its_floor(
     tmp_path, count: int, silent: bool
 ) -> None:
-    """Twelve conforming loops are silent; eleven fail on the floor alone, by the same path."""
+    """Eleven conforming loops are silent; ten fail on the floor alone, by the same path."""
     body = "".join(_corpus_class(f"Good{i}", _GOOD) for i in range(count))
     (tmp_path / "fixture.py").write_text(_CORPUS_HEAD + body, encoding="utf-8")
     loops, findings = retry_loop_findings(tmp_path)
@@ -415,13 +418,177 @@ def test_the_loop_roster_fails_eleven_conforming_loops_on_its_floor(
         assert findings == []
     else:
         expected = (
-            "the scan found 11 retry loops, under its floor of 12: a refactor hid one from it, "
+            "the scan found 10 retry loops, under its floor of 11: a refactor hid one from it, "
             "or one was deleted without lowering the floor"
         )
         assert findings == [expected]
 
 
-# --- FR-001: the twelve loops, swept ---------------------------------------------------------
+# --- SPEC-073 FR-005: the HTTP family reaches the wire only through the engine ---------------
+
+
+def _is_self_call(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == name
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    )
+
+
+def _is_engine_call(node: ast.AST, name: str) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == name
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "_engine"
+    )
+
+
+def _names_self_round(node: ast.AST | None) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_round"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def http_engine_findings(source: str) -> list[str]:
+    """Every way ``http.py`` could reach ``_attempt`` other than through the delivery engine.
+
+    The rule (SPEC-073 FR-005): ``self._attempt(...)`` is called only in ``HTTPSink._exchange``,
+    the one classification; ``self._exchange(...)`` only in ``_round`` and in a function nested
+    in ``_send``; that nested function is the round ``_send`` hands ``_engine._run``; ``emit`` is
+    ``_engine.emit_via_deliver(..., deliver=self._round)``; ``deliver`` is
+    ``_engine.one_round(self._round, ...)``; and ``_exchange``'s handler asks
+    ``is_retryable(self._retryable_error, err)``. No retry loop can then sit around a request in
+    ``http.py``: every resend is the engine's.
+
+    Args:
+      source: The text of ``http.py``.
+
+    Returns:
+      One line per breach.
+    """
+    tree = ast.parse(source)
+    cls = next(
+        (n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "HTTPSink"), None
+    )
+    if cls is None:
+        return ["HTTPSink not found; the check is blind"]
+    methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
+    findings = [
+        f"HTTPSink.{name} not found; the check is stale"
+        for name in ("_exchange", "_round", "_send", "emit", "deliver")
+        if name not in methods
+    ]
+    if findings:
+        return findings
+    findings.extend(
+        f"{node.name} makes a request outside HTTPSink"
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and any(
+            _is_self_call(c, "_attempt") or _is_self_call(c, "_exchange") for c in ast.walk(node)
+        )
+    )
+    findings.extend(
+        f"HTTPSink.{name} calls _attempt outside _exchange"
+        for name, fn in methods.items()
+        if name != "_exchange" and any(_is_self_call(c, "_attempt") for c in ast.walk(fn))
+    )
+    nested = [n for n in ast.walk(methods["_send"]) if isinstance(n, ast.FunctionDef)]
+    nested = [n for n in nested if n is not methods["_send"]]
+    nested_ids = {id(c) for fn in nested for c in ast.walk(fn)}
+    for name, fn in methods.items():
+        for call in ast.walk(fn):
+            if not _is_self_call(call, "_exchange") or name == "_round":
+                continue
+            if name == "_send" and id(call) in nested_ids:
+                continue
+            findings.append(f"HTTPSink.{name} calls _exchange outside a round")
+    runs = [c for c in ast.walk(methods["_send"]) if _is_engine_call(c, "_run")]
+    handed = {
+        call.args[1].id
+        for call in runs
+        if isinstance(call, ast.Call) and len(call.args) > 1 and isinstance(call.args[1], ast.Name)
+    }
+    if not any(fn.name in handed for fn in nested):
+        findings.append("HTTPSink._send does not hand its round to _engine._run")
+    emits = [c for c in ast.walk(methods["emit"]) if _is_engine_call(c, "emit_via_deliver")]
+    if not any(
+        isinstance(c, ast.Call)
+        and any(k.arg == "deliver" and _names_self_round(k.value) for k in c.keywords)
+        for c in emits
+    ):
+        findings.append("HTTPSink.emit is not _engine.emit_via_deliver(..., deliver=self._round)")
+    rounds = [c for c in ast.walk(methods["deliver"]) if _is_engine_call(c, "one_round")]
+    if not any(isinstance(c, ast.Call) and c.args and _names_self_round(c.args[0]) for c in rounds):
+        findings.append("HTTPSink.deliver is not _engine.one_round(self._round, ...)")
+    handlers = [
+        h for t in ast.walk(methods["_exchange"]) if isinstance(t, ast.Try) for h in t.handlers
+    ]
+    if not handlers or not all(h.name and _asks_the_predicate(h) for h in handlers):
+        findings.append(
+            "HTTPSink._exchange's handler does not ask is_retryable(self._retryable_error, err)"
+        )
+    return findings
+
+
+_HTTP_SOURCE = (_SINKS / "http.py").read_text(encoding="utf-8")
+
+
+def test_the_http_family_reaches_attempt_only_through_the_engine() -> None:
+    assert http_engine_findings(_HTTP_SOURCE) == []
+
+
+def _mutated(old: str, new: str) -> str:
+    assert _HTTP_SOURCE.count(old) == 1, old
+    return _HTTP_SOURCE.replace(old, new)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "finding"),
+    [
+        (
+            "        headers, data = self._prepare(body, content_type, extra_headers)\n",
+            (
+                "        headers, data = self._prepare(body, content_type, extra_headers)\n"
+                "        self._attempt(urllib.request.Request(self.url))\n"
+            ),
+            "HTTPSink._send calls _attempt outside _exchange",
+        ),
+        (
+            "        return _engine.one_round(self._round, batch)\n",
+            (
+                "        self._exchange(batch, splittable=True, count_unexpected=True)\n"
+                "        return _engine.one_round(self._round, batch)\n"
+            ),
+            "HTTPSink.deliver calls _exchange outside a round",
+        ),
+        (
+            "        _engine.emit_via_deliver(self, batch, deliver=self._round)\n",
+            "        self._round(batch)\n",
+            "HTTPSink.emit is not _engine.emit_via_deliver(..., deliver=self._round)",
+        ),
+        (
+            "            if is_retryable(self._retryable_error, err):\n",
+            "            if self._retryable_error(err):\n",
+            "HTTPSink._exchange's handler does not ask is_retryable(self._retryable_error, err)",
+        ),
+    ],
+    ids=["attempt-in-send", "exchange-in-deliver", "emit-off-the-engine", "predicate-bypassed"],
+)
+def test_the_engine_only_check_names_each_route_around_the_engine(
+    old: str, new: str, finding: str
+) -> None:
+    assert http_engine_findings(_mutated(old, new)) == [finding]
+
+
+# --- FR-001: the eleven loops, swept ---------------------------------------------------------
 
 
 class _RaisingOpener:
@@ -467,21 +634,8 @@ def _rig(name: str) -> Callable[[pytest.MonkeyPatch, Path, int], _Built]:
     return build
 
 
-def _http(mp: pytest.MonkeyPatch, tmp: Path, retries: int) -> _Built:
-    opener = _RaisingOpener()
-    sink = HTTPSink("http://h", opener=opener, max_retries=retries)
-    waits: list[float] = []
-    sink._sleep_backoff = lambda attempt, retry_after: waits.append(attempt)  # type: ignore[method-assign]
-
-    def set_error(error: BaseException) -> None:
-        opener.error = error
-
-    return _Built(sink, sink, lambda: opener.calls, set_error, waits)
-
-
 _LOOPS: dict[str, Callable[[pytest.MonkeyPatch, Path, int], _Built]] = {
     "SocketTransport": _rig("SyslogSink"),
-    "HTTPSink": _http,
     "ClickHouseSink": _rig("ClickHouseSink"),
     "AzureEventHubsSink": _rig("AzureEventHubsSink"),
     "FirehoseSink": _rig("FirehoseSink"),
@@ -665,7 +819,7 @@ def _sentry(opener: _RaisingOpener, monkeypatch) -> Any:
 
     sink = SentrySink("http://k@sentry.local/1", backend="http", max_retries=3, opener=opener)
     assert sink._http is not None
-    monkeypatch.setattr(sink._http, "_sleep_backoff", lambda attempt, retry_after: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
     return sink
 
 

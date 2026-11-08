@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 STAMP = "2026-10-05T12:34:56.789Z"
+_real_wait = _retry.wait
+"""The real shared wait, kept before any fixture replaces the module's attribute."""
 MIB = 1024 * 1024
 LIMIT = 4 * MIB
 
@@ -40,7 +42,7 @@ LIMIT = 4 * MIB
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize the HTTP backoff so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _event(i: int = 0, **over: object) -> dict[str, object]:
@@ -210,14 +212,20 @@ def test_every_other_status_is_abandoned_on_the_first_request(
 def test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-7 (invariant 3). The backoff goes through ``_retry.wait`` with the sink's signal."""
+    """AC-7 (invariant 3). The backoff goes through ``_retry.wait`` with the sink's signal.
+
+    Since SPEC-073 the wait is the delivery engine's, which calls ``_retry.wait`` through the
+    module; the spy keeps the real function to call, since the autouse fixture has already
+    replaced the module's attribute.
+    """
     seen: list[tuple[float, threading.Event | None]] = []
+    real = _real_wait
 
     def spy(delay: float, stop: threading.Event | None = None) -> None:
         seen.append((delay, stop))
-        _retry.wait(delay, stop)
+        real(delay, stop)
 
-    monkeypatch.setattr("log_foundry.sinks.http.wait", spy)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", spy)
     sink, opener = _sink(FakeResponse(503, b""), max_retries=2)
     sink.log_foundry_stop_signal = threading.Event()
     sink.log_foundry_stop_signal.set()

@@ -50,7 +50,7 @@ _SINKS = pathlib.Path(log_foundry.sinks.__file__).parent
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize the HTTP backoff so a failing case cannot stall the suite."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _enclosing_classes(tree: ast.Module) -> dict[ast.AST, str]:
@@ -381,7 +381,7 @@ def _in_method(method: str, line: str) -> str:
             "writes self._headers[...]",
         ),
         (
-            _in_method("_sleep_backoff", 'self._headers["Content-Type"] = "x"'),
+            _in_method("_round", 'self._headers["Content-Type"] = "x"'),
             "writes self._headers[...]",
         ),
         (
@@ -408,7 +408,7 @@ def _in_method(method: str, line: str) -> str:
         "subscript-after-super",
         "content-type-after-super",
         "content-type-under-if",
-        "in-sleep-backoff",
+        "in-round",
         "update",
         "setdefault",
         "wrapped-update",

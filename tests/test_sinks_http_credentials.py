@@ -47,7 +47,7 @@ _CREDENTIAL_NAME = re.compile(r"(^|_)(key|token|secret|password|credentials?)$")
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize the HTTP backoff so a failing case cannot stall the suite."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 _CREDENTIALS: dict[tuple[str, str], tuple[Callable[..., Any], str, Callable[[str], str]]] = {

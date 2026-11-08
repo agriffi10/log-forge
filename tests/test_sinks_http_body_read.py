@@ -50,7 +50,7 @@ _TIMEOUT = 5.0
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize backoff waits, as ``test_sinks_http`` does for its own module."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _event(i: int) -> dict[str, object]:
@@ -522,7 +522,7 @@ def test_retry_after_survives_a_failed_body_read(monkeypatch: pytest.MonkeyPatch
     """The headers are read off the response even when its body is not."""
     delays: list[float] = []
     monkeypatch.setattr(
-        "log_foundry.sinks.http.wait", lambda delay, _stop=None: delays.append(delay)
+        "log_foundry.sinks._retry.wait", lambda delay, _stop=None: delays.append(delay)
     )
     opener = FakeOpener(
         [

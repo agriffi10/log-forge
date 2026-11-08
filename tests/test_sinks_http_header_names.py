@@ -48,7 +48,7 @@ ASCII separators were not refused in any, since its pattern's ``\\s`` does not i
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize the HTTP backoff so a failing case cannot stall the suite."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _logstash(**kw: Any) -> LogstashSink:

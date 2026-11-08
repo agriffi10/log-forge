@@ -110,7 +110,7 @@ def test_one_chunk_rejecting_every_item_does_not_fail_a_batch_that_indexed_other
 def test_every_chunk_rejecting_every_item_is_a_total_failure() -> None:
     opener = FakeOpener([FakeResponse(200, _all_failed(2))])
     sink = ElasticsearchSink("http://es:9200", index="logs", max_batch_count=2, opener=opener)
-    with pytest.raises(SinkDeliveryError, match="delivered none of 2 chunk"):
+    with pytest.raises(SinkDeliveryError, match="delivered none of 4 event"):
         sink.emit([{"n": i} for i in range(4)])
     assert sink.item_errors == 4
 
