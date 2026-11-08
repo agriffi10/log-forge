@@ -51,14 +51,23 @@ class NewRelicSink(HTTPSink):
           TypeError: If a forwarded ``max_retries`` or ``max_batch_count`` is not an ``int``, or
             a forwarded ``max_retry_after`` is not an ``int`` or ``float``, refused by
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
-          ValueError: If the region is not one this API serves.
+          ValueError: If the region is not one this API serves, or a forwarded ``auth``
+            accompanies an ``Authorization`` header in a forwarded ``headers``, in any case,
+            refused by :class:`~log_foundry.sinks.http.HTTPSink` naming this class, or a
+            forwarded header's name folds to ``Api-Key``, which would replace ``api_key`` on
+            the wire (:func:`~log_foundry.sinks.http.merge_headers`).
         """
         region = region.upper()
         if region not in _HOSTS:
             raise ValueError(
                 f"{type(self).__name__} region must be one of {sorted(_HOSTS)}, not {region!r}"
             )
-        headers = merge_headers({"Api-Key": api_key}, http_kwargs)
+        headers = merge_headers(
+            {"Api-Key": api_key},
+            http_kwargs,
+            owner=type(self).__name__,
+            argument="api_key",
+        )
         super().__init__(
             f"https://{_HOSTS[region]}/log/v1",
             headers=headers,

@@ -750,14 +750,17 @@ def test_an_injected_opener_is_used_exactly_as_given() -> None:
 def test_gzip_does_not_overwrite_a_content_encoding_the_caller_set() -> None:
     """SPEC-048 FR-007. `Content-Encoding` was the one caller header `gzip=True` overrode.
 
-    And when the caller's value wins the body must not be compressed, or the header and the bytes
-    disagree and the destination decodes garbage -- so the assertion is on the *body*, parsed,
-    not on its length.
+    FR-007 let the caller's `identity` win and sent the body uncompressed, which silently ignored
+    `gzip=True`; 1.2.0 refuses that pairing at construction instead, so the header is still never
+    overwritten and the header and the bytes still never disagree. Without a caller header the
+    sink's own `gzip` is sent over a body `gzip.decompress` reads -- the assertion is on the
+    *body*, parsed, not on its length.
     """
+    with pytest.raises(ValueError, match=r"^HTTPSink gzip=True cannot apply beside header "):
+        HTTPSink("http://x", gzip=True, headers={"Content-Encoding": "identity"})
+
     plain = FakeOpener([FakeResponse(200)])
-    HTTPSink(
-        "http://x", gzip=True, headers={"Content-Encoding": "identity"}, opener=plain
-    ).emit([{"a": 1}])
+    HTTPSink("http://x", headers={"Content-Encoding": "identity"}, opener=plain).emit([{"a": 1}])
     call = plain.calls[0]
     assert call["headers"]["content-encoding"] == "identity"
     assert json.loads(call["body"].decode().strip()) == {"a": 1}, "and the body is not gzipped"

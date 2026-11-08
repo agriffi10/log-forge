@@ -38,6 +38,10 @@ class SplunkHECSink(HTTPSink):
     MAX_BATCH_COUNT = 1000
     MAX_BATCH_BYTES = 1_000_000
     _CREDENTIALS = "this sink's token argument"
+    _AUTH_CONFLICT = (
+        "auth cannot be given, since this sink sends its token as the Authorization header; "
+        "drop auth="
+    )
 
     def __init__(
         self,
@@ -68,11 +72,26 @@ class SplunkHECSink(HTTPSink):
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class (SPEC-066).
           ValueError: For any argument :class:`~log_foundry.sinks.http.HTTPSink` refuses, under
             this class's name; a ``url`` carrying a user or password is told to pass the HEC
-            token as ``token``, which this sink sends itself.
+            token as ``token``, which this sink sends itself. A forwarded ``auth`` is always
+            refused: the token goes out as the ``Authorization`` header this sink writes into the
+            headers it hands :class:`~log_foundry.sinks.http.HTTPSink`, so ``auth`` used to be
+            dropped silently. It is refused by ``HTTPSink``'s own check, which sees that header
+            whenever ``auth`` is given, rather than by a second check here, so there is one rule
+            and one place it runs; :attr:`_AUTH_CONFLICT` only rewords it, since the shared
+            wording would tell the caller they had passed an ``Authorization`` header. A
+            forwarded header whose name folds to ``Authorization`` is refused before that, by
+            :func:`~log_foundry.sinks.http.merge_headers`, naming ``token``: it would have
+            replaced the token on the wire. So the token is always the ``Authorization`` sent,
+            and the ``auth=`` refusal's wording holds in every case.
         """
         self._host = host
         self._source = source
-        headers = merge_headers({"Authorization": f"Splunk {token}"}, http_kwargs)
+        headers = merge_headers(
+            {"Authorization": f"Splunk {token}"},
+            http_kwargs,
+            owner=type(self).__name__,
+            argument="token",
+        )
         super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[misc]
 
     def _render(self, event: dict[str, object]) -> str:

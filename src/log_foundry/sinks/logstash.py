@@ -144,7 +144,9 @@ class LogstashSink:
             other is told rather than left to wonder. ``body_format`` is outside the second set: it
             is a documented no-effect switch in socket mode, validated there on purpose. A
             ``url`` the wrapped :class:`HTTPSink` would refuse is refused here first, so the
-            message names this class rather than the one it wraps.
+            message names this class rather than the one it wraps. Every other HTTP-mode refusal
+            is the wrapped sink's, under its name — a forwarded ``auth`` beside an
+            ``Authorization`` header in a forwarded ``headers``, in any case, among them.
         """
         if body_format not in _BODY_FORMATS:
             raise ValueError(

@@ -87,7 +87,9 @@ class ElasticsearchSink(HTTPSink):
             password, or a query or fragment, which the appended ``/_bulk`` would land inside
             (:func:`~log_foundry.sinks.http._valid_base_url`) — a ``_bulk`` parameter such as
             ``?pipeline=`` never reached ``_bulk``, so it was never applied — or holds an ``@``
-            anywhere else, refused naming ``url`` once ``/_bulk`` is appended.
+            anywhere else, refused naming ``url`` once ``/_bulk`` is appended; or if ``auth``
+            accompanies an ``Authorization`` header in a forwarded ``headers``, in any case,
+            refused by :class:`~log_foundry.sinks.http.HTTPSink` naming this class.
         """
         _valid_base_url(url, type(self).__name__, "/_bulk", credentials=self._CREDENTIALS)
         if not index or any(char.isspace() for char in index):

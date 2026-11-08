@@ -115,7 +115,8 @@ class OTLPSink(HTTPSink):
             anywhere else, has no ``http``/``https`` scheme or names no host, or if ``method`` is
             anything but ``"POST"`` — OTLP/HTTP is POST only, and accepting another would send
             every batch to a server that refuses it for the life of the process (invariant 13).
-            Every other refusal is inherited.
+            Every other refusal is inherited, a forwarded ``auth`` beside an ``Authorization``
+            header in a forwarded ``headers`` among them.
         """
         owner = type(self).__name__
         if not issubclass(type(endpoint), str):
