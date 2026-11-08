@@ -23,6 +23,13 @@
   carries is `DROPPED` only when that many were dropped and counted, else `REJECTED`; only a
   raising reader gets the `raised <Type>` line. `_abandon_unreduced` keeps its 1.x signature
   (`181745b5`).
+- The frame-2 diff review (`3ab93aa3`): `_send` caught only its `Request` build, so a raising
+  `_retryable_status` escaped into the engine and `_send` raised `SinkDeliveryError("<class> made
+  no attempt")`, which `SentrySink` reads as already counted, though nothing was; it now re-raises
+  the same object after the run, uncounted. The deferral gate recognised a run-context `count`
+  only by three positionals, so `count(self, "dropped_oversized", n=..., when=When.ALWAYS)`
+  passed it; it now recognises `when=`, `owner=` or `name=`, takes the counter from `name=` or the
+  second positional, fails closed on a non-literal, and accepts only a `SETTLED` spelt on `When`.
 - Deviations, each in the spec's 2026-11-08 revision-history entry: FR-004's mechanism and the base
   `_outcomes` built in Phase 2, beside the first `deliver`; the plan review's two narrowings of
   eligibility; N1 to N3 below; the shim's non-empty clause; per-round aggregation of
@@ -78,7 +85,7 @@
 
 ## Verification
 
-- Local, Python 3.13.1, at `9892c6a6` plus this revision: ruff, mypy, pytest, spec-lint,
+- Local, Python 3.13.1, at `3ab93aa3` plus this revision: ruff, mypy, pytest, spec-lint,
   docs-lint and docstring-lint, each exit 0.
 - Criterion 5.3, rerun after the rebase: `git worktree add --detach <dir> 26fad7ab`, HEAD's
   `test_sinks_http_refused.py`, `test_sinks_honeycomb.py` and `test_sinks_otlp.py` copied in, and
@@ -125,9 +132,16 @@
 
 ## Follow-ups
 
-- The hook guard covers the request-building hooks and the `2xx` readers only. A third-party
-  override of `_retryable_status`, `_response_limit`, `_items`, `_take`, `_event_ceiling`,
-  `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` that raises escapes the round, as it
-  escaped 1.x `emit`, and the engine fails that round's events. `_abandon_unreduced` keeps its
-  1.x signature `(chunk)` and reads the run's context through `run_context()`, so a third-party
-  override written against 1.x is still called.
+- The hook guard covers `_known_refused`, `_body`, `_prepare` with its `_apply_auth`, building the
+  `Request`, and the `2xx` readers. A raising third-party override of `_retryable_status`,
+  `_items`, `_take`, `_event_ceiling`, `_chunk_budget`, `_drop_refused` or `_abandon_unreduced`
+  escapes the round, as it escaped 1.x `emit`, and the engine fails that round's events.
+  `_abandon_unreduced` keeps its 1.x signature `(chunk)` and reads the run's context through
+  `run_context()`, so a third-party override written against 1.x is still called.
+- **Recorded edge, `_response_limit`.** `_attempt` reads it first, inside the attempt `_exchange`
+  classifies, so a raising override is that attempt's refused exception: `REJECTED`, `failed`
+  moved, a `connection error, <Type>` line, whatever the status, a `2xx` included. 1.x read it
+  once in `_send` before the first request, so the raise escaped `emit` raw with nothing sent.
+  `test_send_reraises_a_classifying_hooks_fault_unchanged[_response_limit]` pins it on `_send`.
+  Two `src` docstrings still describe it otherwise: `_round`'s lists `_response_limit` among the
+  hooks that escape the round, and `_Sent.raised` says its fault is re-raised unchanged.

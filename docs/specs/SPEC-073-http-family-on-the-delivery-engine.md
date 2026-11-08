@@ -244,13 +244,13 @@ adopts it: an unusable ceiling (`0`, negative, `NaN`) means backoff, and an infi
 hint up to `MAX_WAIT`. One round has one wait, so a batch whose several chunks failed retryably
 waits once per round, where 1.x waited once per chunk.
 
-**A hook fault costs its chunk.** The round runs everything that builds a chunk's request (`_body`,
-`_prepare`, `_apply_auth` and the construction of the `urllib.request.Request`), and the `2xx`
-readers (`_outcomes` and `_handle_response`), under a guard catching `Exception`, never
-`BaseException`:
+**A hook fault costs its chunk.** The round runs exactly these under a guard catching
+`Exception`, never `BaseException`: what builds a chunk's request (`_known_refused`, `_body`,
+`_prepare` with the `_apply_auth` it calls, and the construction of the
+`urllib.request.Request`), and the `2xx` readers (`_outcomes` and `_handle_response`):
 
-- If anything raises before the request is handed to `_attempt` (`_body`, `_prepare`,
-  `_apply_auth` or building the `Request`), the chunk's events are `DROPPED` and counted on
+- If anything raises before the request is handed to `_attempt` (`_known_refused`, `_body`,
+  `_prepare`, `_apply_auth` or building the `Request`), the chunk's events are `DROPPED` and counted on
   `_unrenderable` `SETTLED`, as a render fault is (SPEC-058). Nothing was sent, and the same
   inputs would fail the same way. The faults of one round aggregate as 1.x `_items`' render faults
   do: one count summing their events, and one line registered at the end of the round, naming the
@@ -268,9 +268,15 @@ So no fault from a request-building hook, a `2xx` reader, `_attempt` or the open
 A fault from `_attempt` or the opener is classified by FR-001's table, and a fault building the
 request or reading a `2xx` is under the guard. Under SPEC-072 an escaped exception fails the run,
 which would report total failure for a batch whose other chunks landed. The guard covers those
-hooks and no others: a third-party override of `_retryable_status`, `_response_limit`, `_items`,
-`_take`, `_event_ceiling`, `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` that raises
-escapes the round, as it escaped 1.x `emit`, and the engine fails that round's events.
+hooks and no others. A raising third-party override of `_retryable_status`, `_items`, `_take`,
+`_event_ceiling`, `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` escapes the round, as
+these escaped 1.x `emit`, and the engine then fails that round's events and announces the
+exception's type. (`_retryable_status` is asked only of a non-`2xx` status, so it escapes only
+then.) `_response_limit` is the one listed hook that does not escape: `_attempt` reads it first,
+inside the attempt `_exchange` classifies, so a raising override is that attempt's refused
+exception, `REJECTED` and counted in `failed` with a `connection error, <Type>` line, whatever
+status the response carried, a `2xx` included. 1.x read it once in `_send` before the first
+request, so the raise escaped `emit` raw with nothing sent.
 
 **`_send` keeps its 1.x contract** for its callers outside the chunk path: `SentrySink`'s fallback,
 and a third-party subclass that builds its own body.
@@ -291,8 +297,14 @@ and a third-party subclass that builds its own body.
 `_send` runs its attempts as rounds of one request, through SPEC-072's `_run`. Its budget is
 `max_retries`, its stop event is `log_foundry_stop_signal`, and it has no decline predicate. So
 `http.py` holds no retry loop and no wait of its own. `_prepare` runs once, before the run, as in
-1.x. Each round builds a fresh `Request`, and a raise there is kept and re-raised unchanged after
-the run, as 1.x let it escape. The run's engine totals go to a throwaway `SinkCounters`, never the
+1.x. Each round builds a fresh `Request`. A raise from building a request, or from a hook
+`_send`'s classification calls after the response (`_retryable_status`), is re-raised from
+`_send` unchanged, the same object, after the run ends, counted nowhere, as 1.x let it escape:
+never as a `SinkDeliveryError`, which every caller, `SentrySink` above all, reads as already
+counted. A raising `_response_limit` is read inside the attempt, so it is classified and counted
+as that attempt's refused exception: one request, `failed` moved, and `SinkDeliveryError` naming
+`connection error, <Type>` (with `count_unexpected=False`, the exception itself, uncounted); in
+1.x it escaped raw. The run's engine totals go to a throwaway `SinkCounters`, never the
 sink's `log_foundry_counters`, because a request is not an event: a `SentrySink` envelope or a
 nested `_send` never appears in the sink's event totals.
 
@@ -393,6 +405,11 @@ loop, and `_abandon_unreduced`'s direct store to `failed` (FR-002 replaces them)
     after 1 request, `failed` unmoved and no line written.
   - A raise building its `Request` is re-raised from `_send` unchanged, by identity, with no
     request made and `failed == 0`.
+  - A `_retryable_status` that raises on a `500` is re-raised from `_send` by identity after 1
+    request, with `failed == 0` and nothing on stderr; a `_response_limit` that raises is counted
+    as the attempt's refused exception, 1 request, `failed == 1`, and `SinkDeliveryError` reading
+    `<class>, 1 attempt(s), connection error, RuntimeError`
+    (`test_send_reraises_a_classifying_hooks_fault_unchanged`, both ids).
   - `tests/test_sinks_http.py`'s two `_send` tests and every `SentrySink` HTTP-fallback test pass
     with their bodies unedited. The other edits in their files are the ones FR-005 names: the
     wait patches (`tests/test_sinks_http.py`'s `_no_sleep` fixture and `tests/test_classify.py`'s
@@ -933,9 +950,12 @@ engine guarantees:
   to the run context.
   - `DEFERRING_SITES` lists `_engine._commit` beside `_run`, the one commit of every run context.
   - A new shape check holds a run-context `count` of a dropped counter to `when=When.SETTLED`. It
-    recognises the call by shape (an attribute call `count` with three or more positional
-    arguments, the second the counter's name), and fails closed on a name that is not a string
-    literal. A fixture corpus asserts each finding's reason and the silence of a `Deferral.count`.
+    recognises the call by shape: an attribute call `count` that passes a `when=`, `owner=` or
+    `name=` keyword, or three or more positional arguments. It takes the counter from `name=`,
+    else the second positional, and fails closed on a name that is missing or not a string
+    literal. Only a `SETTLED` spelt on `When` (bare, or through a module, `_engine.When`) is
+    settled; a `.SETTLED` on any other base is a finding. A fixture corpus asserts each finding's
+    text and the silence of a `Deferral.count` and of a forwarding ledger's two-argument count.
     So `dropped_oversized` and `_unrenderable` are still derived as dropped counters, committed
     only by a settled run.
   - No floor in that file or in `tests/test_worker_predicate_roster.py` is lowered.
@@ -1355,8 +1375,7 @@ tests/
     `_abandon_unreduced` stays with its 1.x signature and reads the run's context itself, so a
     third-party override written against 1.x is still called; the hook guard covers the request-building hooks
     and the `2xx` readers only, so a raising third-party override of another private method
-    (`_retryable_status`, `_response_limit`, `_items`, `_take` and the rest FR-001 lists) escapes
-    the round as it escaped 1.x `emit`; and *A client exception costs its chunk*, which FR-005 told
+    (`_retryable_status`, `_items`, `_take` and the rest FR-001 lists) escapes the round as it escaped 1.x `emit`; and *A client exception costs its chunk*, which FR-005 told
     the completion to mark, is about the AWS sinks' `_send` and is left as it stands.
   - Criterion 2.9 is narrowed to the five twin-path responses the build measures it over, where it
     said "after each FR-001 case".
@@ -1389,3 +1408,18 @@ tests/
     still adds no public name; the text that said "no public name is added" now says that, and
     that `HTTPSink.emit` calls the private adapter. FR-005's wait-patch count is sixteen: PR 312's
     three new files patched `log_foundry.sinks.http.wait` too.
+- 2026-11-08: revised on the frame-2 diff review (`3ab93aa3`):
+  - `_send` caught only the `Request` build, so a raising `_retryable_status` escaped into the
+    engine as a raised round and `_send` then raised `SinkDeliveryError("<class> made no
+    attempt")`, which `SentrySink` reads as already counted, though nothing was. It now catches the
+    classification too and re-raises the same object after the run, uncounted, as 1.x let it
+    escape. FR-001's `_send` paragraph says so and gains its criterion,
+    `test_send_reraises_a_classifying_hooks_fault_unchanged`, ticked.
+  - A raising `_response_limit` is recorded as an edge rather than changed: `_attempt` reads it
+    first, so it is the attempt's refused exception, counted in `failed`, in the round and in
+    `_send` alike, even for a response that was a `2xx`. In 1.x `_send` read it once before the
+    first request and the raise escaped `emit` raw. FR-001's guard paragraph lists exactly the
+    guarded hooks and the escaping ones, and names `_response_limit` as the one that is classified
+    rather than escaping, which earlier text here listed among the escaping ones.
+  - The deferral gate recognised a run-context `count` only by three positionals, so a keyword
+    form passed it. FR-005 describes the widened shape.
