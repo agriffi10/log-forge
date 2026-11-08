@@ -1765,36 +1765,117 @@ def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
     return not _wholly_rejected(_engine.detached(reader, _wholly_rejected))
 
 
-def _positions(batch: list[dict[str, object]], items: list[_Item]) -> list[int | None]:
-    """Maps each rendered item back to its event's index in the batch, by identity.
+class _Tally:
+    """A ``_Pending`` that forwards every drop and counts how many events ``_items`` dropped.
 
-    ``_items`` builds every item from the batch's own event object, in order, skipping what
-    it drops, so a pointer that only moves forward finds each one; an event it passes over
-    was dropped there and keeps the ``DROPPED`` it starts with. An item matching nothing —
-    only an ``_items`` override returning foreign objects could make one — maps to ``None``
-    and its outcome is not recorded.
+    The round needs the number to tell the events ``_items`` dropped, and counted, from events
+    an ``_items`` override merely returned as other objects (:func:`_positions`).
+
+    Attributes:
+      dropped: The events counted through this ledger.
+    """
+
+    def __init__(self, pending: _Pending) -> None:
+        """Wraps the ledger the drops really go to.
+
+        Args:
+          pending: The run's ``SETTLED`` view.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._pending = pending
+        self.dropped = 0
+
+    def count(self, counter: str, n: int = 1) -> None:
+        """Forwards a drop count and adds it to :attr:`dropped`.
+
+        Args:
+          counter: The owner's attribute.
+          n: How many events.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.dropped += n
+        self._pending.count(counter, n)
+
+    def announce(self, line: Callable[[], None]) -> None:
+        """Forwards a line.
+
+        Args:
+          line: A ``lambda`` wrapping a ``_diag`` call.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._pending.announce(line)
+
+
+def _positions(
+    batch: list[dict[str, object]], items: list[_Item], dropped: int
+) -> tuple[list[int | None], list[Outcome]]:
+    """Maps each rendered item to its event's batch index, and gives every unplaced event a fate.
+
+    ``_items`` builds every item from the batch's own event object, in order, skipping what it
+    drops, so a pointer that only moves forward finds each one by identity; that is exact for
+    every shipped sink. An ``_items`` override may return items built from other objects — a
+    subclass enriching each event first — so an item the identity walk cannot place is given, in
+    order, the next batch index no item claimed: an override returning one item per event, in
+    order, maps exactly.
+
+    An index still unclaimed after both passes is an event no request carries. When their number
+    is the number ``_items`` dropped and counted, they are those drops: ``DROPPED``. Otherwise
+    the mapping cannot say which they are, and each is ``REJECTED``: counted in the engine's
+    ``failed_events``, an upper bound, never resent, and able to fail a run that delivered
+    nothing else, so the loss is over-reported rather than hidden. Neither ``ACCEPTED`` nor
+    ``DROPPED`` is ever a default for an event the sink did not itself drop.
 
     Args:
       batch: The round's events.
       items: What ``_items`` returned for them.
+      dropped: How many events ``_items`` dropped and counted.
 
     Returns:
-      One batch index, or ``None``, per item.
+      Each item's batch index, ``None`` for an item past the batch's end, and the round's
+      starting fate for every event: ``REJECTED`` for a placed one, which its chunk's outcome
+      then replaces, so a path that forgot to settle a chunk would over-report, never hide.
 
     Raises:
       None.
     """
     found: list[int | None] = []
+    claimed = [False] * len(batch)
     cursor = 0
     for item in items:
-        while cursor < len(batch) and batch[cursor] is not item.event:
-            cursor += 1
-        if cursor < len(batch):
-            found.append(cursor)
-            cursor += 1
+        probe = cursor
+        while probe < len(batch) and batch[probe] is not item.event:
+            probe += 1
+        if probe < len(batch):
+            found.append(probe)
+            claimed[probe] = True
+            cursor = probe + 1
         else:
             found.append(None)
-    return found
+    free = (index for index, taken in enumerate(claimed) if not taken)
+    for at, position in enumerate(found):
+        if position is None:
+            index = next(free, None)
+            if index is not None:
+                found[at] = index
+                claimed[index] = True
+    unplaced = claimed.count(False)
+    fallback = Outcome.DROPPED if unplaced == dropped else Outcome.REJECTED
+    return found, [Outcome.REJECTED if taken else fallback for taken in claimed]
 
 
 def _settle(fates: list[Outcome], where: list[int | None], outcomes: tuple[Outcome, ...]) -> None:
@@ -2209,9 +2290,9 @@ class HTTPSink:
         budget = cast("int", notes.get("budget", self._chunk_budget()))
         refused_at = cast("int | None", notes.get("refused_at"))
         reductions = cast("int", notes.get("reductions", 0))
-        fates: list[Outcome] = [Outcome.DROPPED] * len(batch)
-        items = self._items(batch, drops)
-        positions = _positions(batch, items)
+        tally = _Tally(drops)
+        items = self._items(batch, tally)
+        positions, fates = _positions(batch, items, tally.dropped)
         hints: list[float] = []
         faults = 0
         first: Exception | None = None
@@ -2233,10 +2314,12 @@ class HTTPSink:
             except Exception as err:
                 faults += len(chunk)
                 first = first if first is not None else err
+                _settle(fates, where, (Outcome.DROPPED,) * len(chunk))
                 index += len(chunk)
                 continue
             if known:
                 self._drop_refused(chunk, drops)
+                _settle(fates, where, (Outcome.DROPPED,))
                 index += 1
                 continue
             answer = self._exchange(request, splittable=True, count_unexpected=True)
@@ -2248,6 +2331,7 @@ class HTTPSink:
                     continue
                 if len(chunk) == 1:
                     self._drop_refused(chunk, drops)
+                    _settle(fates, where, (Outcome.DROPPED,))
                 else:
                     self._abandon_unreduced(chunk)
                     _settle(fates, where, (Outcome.REJECTED,) * len(chunk))
@@ -2283,9 +2367,11 @@ class HTTPSink:
 
         A class whose bool ``_handle_response`` sits above its ``_outcomes`` is read through
         the base :meth:`_outcomes`, which is that override's verdict, even below a shipped reader
-        that defines ``_outcomes`` (``_READS_BOOL``). A raise, or a result that is not one
-        ``Outcome`` per event, makes the chunk unadjudicated: the request succeeded, so its events
-        may have landed.
+        that defines ``_outcomes`` (``_READS_BOOL``). A reader that raises makes the chunk
+        unadjudicated with a line naming the exception's type; a result that is not one
+        ``Outcome`` per event — not a sequence, the wrong length, or holding anything else — makes
+        it unadjudicated with the line ``gave no outcome per event``. Either way the request
+        succeeded, so its events may have landed.
 
         Args:
           payload: The response body; an ``_UnreadBody`` when it could not be read.
@@ -2302,9 +2388,12 @@ class HTTPSink:
                 result = HTTPSink._outcomes(self, payload, chunk)
             else:
                 result = self._outcomes(payload, chunk)
-            outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
         except Exception as err:
             return self._unadjudicated(chunk, f"reading a 2xx response raised {type(err).__name__}")
+        try:
+            outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
+        except Exception:
+            outcomes = None
         if outcomes is None:
             return self._unadjudicated(chunk, "reading a 2xx response gave no outcome per event")
         return outcomes
@@ -2417,7 +2506,7 @@ class HTTPSink:
         """Fills one chunk from ``start`` under the count limit and the current byte budget.
 
         Always yields at least one item, however small the budget: an item that cannot fit alone
-        is the caller's to resolve, which :meth:`emit` does by dropping it once the destination
+        is the caller's to resolve, which :meth:`_round` does by dropping it once the destination
         has refused it. That mirrors ``chunk_items``, which this replaces here only because the
         budget can change between chunks and a generator cannot be re-aimed mid-iteration.
 

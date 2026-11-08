@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 BACKOFF_BASE: Final = 0.1
 """The sinks' 1.x backoff within a cycle: the wait before attempt ``i + 1`` is ``0.1 * 2**i``.
 
-It is the formula twelve sink modules apply today with their own ``_BACKOFF_BASE``, restarting
+It is the formula each sink module defining its own ``_BACKOFF_BASE`` applies, restarting
 at ``i = 0`` in every cycle, written here once for every sink that adopts the engine.
 """
 

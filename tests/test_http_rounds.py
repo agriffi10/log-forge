@@ -1661,3 +1661,227 @@ def test_a_permanent_bool_readers_partial_loss_is_announced_by_the_engine_line(
             "dropped 0 after 1 delivery round(s) to _BoolReader"
         )
     ]
+
+
+# --- Frame-1 review: the mapping, the per-run search state and the untested branches -----------
+
+
+class _Enriching(HTTPSink):
+    """A third-party ``_items`` override that rebuilds every event before rendering it."""
+
+    def _items(self, batch: list[dict[str, object]], pending: Any) -> list[Any]:
+        return super()._items([{**event, "host": "h1"} for event in batch], pending)
+
+
+@pytest.mark.parametrize("answer", ["400", "200", "503-then-200"])
+def test_an_items_override_that_rebuilds_events_maps_each_one(
+    answer: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One rebuilt item per event, in order, maps exactly: no event is left ``DROPPED``."""
+    script = {
+        "400": [_status(400)],
+        "200": [_ok()],
+        "503-then-200": [_status(503), _ok()],
+    }[answer]
+    opener = Scripted(*script)
+    sink = _Enriching("http://h", max_retries=0, opener=opener)
+    delivered, failed_batches = _through_the_worker(sink, _events(2), max_retries=3)
+    err = capsys.readouterr().err
+    assert sink.log_foundry_counters.losses().dropped == 0
+    assert sink.losses().dropped == 0
+    if answer == "400":
+        assert not delivered and failed_batches == 1, "a run that delivered nothing fails"
+        assert len(opener.calls) == 1
+        return
+    assert delivered and failed_batches == 0
+    assert len(opener.calls) == (1 if answer == "200" else 2)
+    assert b'"host": "h1"' in opener.calls[-1]["body"] and _ids(opener.calls[-1]) == [0, 1]
+    assert [line for line in _lost(err) if "dropped" in line] == []
+
+
+def test_an_event_no_request_carries_is_rejected_never_dropped() -> None:
+    """An override that silently omits an event: unplaced, uncounted, so ``REJECTED``."""
+
+    class Omitting(HTTPSink):
+        def _items(self, batch: list[dict[str, object]], pending: Any) -> list[Any]:
+            return super()._items([{**batch[0], "host": "h1"}], pending)
+
+    sink = Omitting("http://h", opener=Scripted(_ok()))
+    assert sink.deliver(_events(2)) == Verdict(outcomes=(A, J))
+
+
+def test_a_resend_starts_from_the_budget_round_one_found() -> None:
+    """Criterion 1.12's second clause: two adjacent ``503``s are resent with no new ``413``."""
+    opener = _refusing_at({3, 4})
+    sink = HTTPSink("http://h", max_batch_bytes=5_000_000, max_retries=1, opener=opener)
+    sink.emit([{"i": n, "message": "small event"} for n in range(40)])
+    second = opener.calls[13:]
+    assert [_ids(call) for call in second] == [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]]
+    assert all(len(call["body"]) <= 300 for call in second), "round two makes no 413"
+
+
+def _refusing_at(indexes: set[int]) -> Scripted:
+    def answer(index: int, request: urllib.request.Request) -> FakeResponse:
+        if len(request.data or b"") > 300:
+            return _status(413)
+        return _status(503) if index in indexes else _ok()
+
+    return Scripted(answer)
+
+
+def test_a_resend_keeps_the_smallest_refused_size() -> None:
+    """A lone event no smaller than one round one refused is dropped in round two, unsent."""
+    opener = Scripted(_status(503), _status(413), _ok())
+    sink = HTTPSink("http://h", max_batch_count=1, max_retries=1, opener=opener)
+    batch = [{"i": 0, "big": "x" * 2000}, {"i": 1, "big": "x" * 1000}]
+    sink.emit(batch)
+    assert len(opener.calls) == 2, "round two sends nothing: event 0 is known refused"
+    assert sink.dropped_oversized == 2
+
+
+def test_a_resend_keeps_the_reductions_already_spent(capsys: pytest.CaptureFixture[str]) -> None:
+    """A run searches no more than one 1.x ``emit`` did: round two gets no fresh 24 halvings."""
+    from log_foundry.sinks.http import MAX_BUDGET_REDUCTIONS
+
+    def answer(index: int, request: urllib.request.Request) -> FakeResponse:
+        return _status(503) if index == 0 else _status(413)
+
+    opener = Scripted(answer)
+    sink = _Free("http://h", max_batch_count=4, max_retries=1, opener=opener)
+    sink.seen = []  # type: ignore[attr-defined]
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(_events(8))
+    assert len(opener.calls) == 1 + (MAX_BUDGET_REDUCTIONS + 1) + 1
+    assert sink.failed == 2, "both chunks abandoned unreduced, the retryable one not counted"
+
+
+def test_an_unreduced_chunk_is_counted_though_its_round_was_not_the_last(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``_abandon_unreduced`` counts ``ALWAYS``: a later round landing the other chunk keeps it."""
+    from log_foundry.sinks.http import MAX_BUDGET_REDUCTIONS
+
+    def answer(index: int, request: urllib.request.Request) -> FakeResponse:
+        if index == 0:
+            return _status(503)
+        return _status(413) if index <= MAX_BUDGET_REDUCTIONS + 1 else _ok()
+
+    opener = Scripted(answer)
+    sink = _Free("http://h", max_batch_count=4, max_retries=1, opener=opener)
+    sink.emit(_events(8))
+    assert len(opener.calls) == MAX_BUDGET_REDUCTIONS + 3
+    assert sink.failed == 1
+    assert _requests_lost(capsys.readouterr().err) == [
+        (
+            f"log-foundry: lost 1 request(s); _Free, 4 event(s) still 413 after "
+            f"{MAX_BUDGET_REDUCTIONS} reduction(s); lower max_batch_bytes to match the destination"
+        )
+    ]
+
+
+def test_a_retryable_413_is_retried_before_the_search() -> None:
+    """S10: a subclass whose ``_retryable_status`` accepts ``413`` keeps 1.x's order."""
+
+    class RetriesA413(HTTPSink):
+        def _retryable_status(self, status: int) -> bool:
+            return status == 413 or super()._retryable_status(status)
+
+    opener = Scripted(_status(413), _ok())
+    sink = RetriesA413("http://h", max_retries=1, opener=opener)
+    sink.emit(_events(1))
+    assert len(opener.calls) == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+def test_send_reraises_a_raise_building_its_request_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = ValueError("cannot build this request")
+
+    def refusing(*args: Any, **kwargs: Any) -> Any:
+        raise error
+
+    opener = Scripted(_ok())
+    sink = HTTPSink("http://h", opener=opener)
+    monkeypatch.setattr("log_foundry.sinks.http.urllib.request.Request", refusing)
+    with pytest.raises(ValueError) as raised:
+        sink._send(b"x", content_type="text/plain")
+    assert raised.value is error
+    assert opener.calls == []
+    assert sink.failed == 0
+
+
+def test_a_plain_child_of_an_engine_native_subclass_with_its_own_emit_keeps_deliver() -> None:
+    class Native(HTTPSink):
+        def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+            return Verdict.uniform(A, len(batch))
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            _engine.emit_via_deliver(self, batch)
+
+    class NativeChild(Native):
+        pass
+
+    assert _offered(Native) and _offered(NativeChild)
+    assert NativeChild.deliver is Native.deliver
+
+
+def test_the_request_building_line_names_the_rounds_first_exception(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class TwoFaults(HTTPSink):
+        def _body(self, items: list[Any]) -> tuple[bytes, str]:
+            kind = items[0].event.get("raise")
+            if kind == "value":
+                raise ValueError("first")
+            if kind == "key":
+                raise KeyError("second")
+            return super()._body(items)
+
+    opener = Scripted(_ok())
+    sink = TwoFaults("http://h", max_batch_count=1, opener=opener)
+    sink.emit([{"i": 0, "raise": "value"}, {"i": 1, "raise": "key"}, {"i": 2}])
+    assert len(opener.calls) == 1
+    assert _lost(capsys.readouterr().err) == [
+        "log-foundry: lost 2 event(s); TwoFaults, rendering raised ValueError"
+    ]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [None, {Outcome.ACCEPTED}, ["x"], (Outcome.ACCEPTED,)],
+    ids=["none", "set", "list-of-str", "wrong-length"],
+)
+def test_a_reader_result_that_is_not_one_outcome_per_event_is_unadjudicated(
+    result: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Odd(HTTPSink):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> Any:
+            return result
+
+    sink = Odd("http://h", opener=Scripted(_ok()))
+    assert sink.deliver(_events(2)) == Verdict(outcomes=(U, U))
+    assert _lost(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 2 event(s); Odd reading a 2xx response gave no outcome per event; "
+            "they may have landed; not retried"
+        )
+    ]
+
+
+def test_a_shim_called_inside_a_round_commits_at_once() -> None:
+    """``_handle_response`` called by a bool override inside its round commits its own counts."""
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+
+    seen: list[int] = []
+
+    class Strict(ElasticsearchSink):
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            ok = super()._handle_response(payload, items)
+            seen.append(self.item_errors)
+            return ok
+
+    sink = Strict("http://h", index="i", opener=Scripted(FakeResponse(200, _es_bulk(False, True))))
+    sink.emit(_events(2))
+    assert seen == [1], "committed when the shim returned, not when the outer run ends"
+    assert sink.item_errors == 1
