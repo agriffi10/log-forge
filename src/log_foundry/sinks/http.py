@@ -243,11 +243,13 @@ class _Sent:
 
     Attributes:
       answer: The last request's classification, or ``None`` before any.
-      unbuilt: An exception building the request raised, re-raised unchanged after the run.
+      raised: An exception building or classifying the request raised — the ``Request``, or a
+        hook :meth:`HTTPSink._exchange` calls (``_retryable_status``, ``_response_limit``) —
+        re-raised unchanged after the run.
     """
 
     answer: _Answer | None = None
-    unbuilt: Exception | None = None
+    raised: Exception | None = None
 
 
 DEFAULT_MAX_RETRY_AFTER = 30.0
@@ -1837,8 +1839,11 @@ def _positions(
     is the number ``_items`` dropped and counted, they are those drops: ``DROPPED``. Otherwise
     the mapping cannot say which they are, and each is ``REJECTED``: counted in the engine's
     ``failed_events``, an upper bound, never resent, and able to fail a run that delivered
-    nothing else, so the loss is over-reported rather than hidden. Neither ``ACCEPTED`` nor
-    ``DROPPED`` is ever a default for an event the sink did not itself drop.
+    nothing else, so the loss errs toward over-counting. It is not counted in the sink's 1.x
+    ``losses()``, which counts requests, and it is announced only by the engine's settled line,
+    which the engine writes only for a run in which the sink registers no line of its own; beside
+    a sink line it shows in ``log_foundry_counters`` alone. Neither ``ACCEPTED`` nor ``DROPPED``
+    is ever a default for an event the sink did not itself drop.
 
     Args:
       batch: The round's events.
@@ -2264,13 +2269,18 @@ class HTTPSink:
         budget, the smallest refused size and the reduction count live in the run's notes, so
         a later round starts from the budget already found.
 
-        **A hook fault costs its chunk.** Everything that builds a chunk's request runs under a
-        guard catching ``Exception``: a raise there makes the chunk's events ``DROPPED``, counted
-        on ``_unrenderable`` and announced with the render fault's line, once per round with the
-        first exception's type, since nothing was sent and the same inputs fail the same way. A
-        ``2xx`` reader that raises sends its chunk through :meth:`_unadjudicated`: the request
-        succeeded, so its events are ``UNKNOWN``. So no ``Exception`` escapes a round, which
-        would fail the whole run although other chunks landed.
+        **A hook fault costs its chunk.** What builds a chunk's request — :meth:`_known_refused`,
+        :meth:`_body`, :meth:`_prepare` with the :meth:`_apply_auth` it calls, and the
+        ``Request`` — runs under a guard catching ``Exception``: a raise there makes the chunk's
+        events ``DROPPED``, counted on ``_unrenderable`` and announced with the render fault's
+        line, once per round with the first exception's type, since nothing was sent and the
+        same inputs fail the same way. A ``2xx`` reader that raises sends its chunk through
+        :meth:`_unadjudicated`: the request succeeded, so its events are ``UNKNOWN``. Those
+        guards cover only those hooks. A raising third-party override of another private method
+        the round calls — ``_retryable_status``, ``_response_limit``, ``_items``, ``_take``,
+        ``_event_ceiling``, ``_chunk_budget``, ``_drop_refused`` or ``_abandon_unreduced`` —
+        escapes the round, as it escaped 1.x ``emit``, and the engine then fails that round's
+        events and announces the exception's type.
 
         The verdict's ``retry_after`` is the largest finite, positive ``Retry-After`` among the
         round's retryable responses, or ``None``; one round has one wait.
@@ -2972,10 +2982,6 @@ class HTTPSink:
         ``putheader`` sends an ``int`` or ``bytes`` value itself, which is how a caller's has
         always gone out.
 
-        The header map is handed to ``urllib`` under the ``str``-valued type its stub declares,
-        the one cast on this path: ``Request`` stores values untouched and ``putheader`` sends an
-        ``int`` or ``bytes`` value itself, which is how a caller's has always gone out.
-
         Args:
           body: The serialized batch.
           content_type: The default content type, overridable by caller headers.
@@ -3002,7 +3008,8 @@ class HTTPSink:
         Raises:
           Exception: An exception :meth:`_retryable_error` rejects, unchanged, only when
             ``count_unexpected`` is False and it is not a ``SinkDeliveryError``; and anything
-            building the ``Request`` raises, unchanged, as 1.x let it escape.
+            building the ``Request`` or a classifying hook (``_retryable_status``,
+            ``_response_limit``) raises, unchanged and uncounted, as 1.x let it escape.
           _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
             line, because the caller is about to re-send the same events in smaller requests.
           SinkDeliveryError: When the request was abandoned: refused, or still failing when the
@@ -3027,12 +3034,12 @@ class HTTPSink:
                 request = urllib.request.Request(  # noqa: S310
                     self.url, data=data, method=self.method, headers=cast("dict[str, str]", headers)
                 )
+                answer = self._exchange(
+                    request, splittable=splittable, count_unexpected=count_unexpected
+                )
             except Exception as err:
-                sent.unbuilt = err
+                sent.raised = err
                 return Verdict(outcomes=(Outcome.REJECTED,))
-            answer = self._exchange(
-                request, splittable=splittable, count_unexpected=count_unexpected
-            )
             sent.answer = answer
             outcome = Outcome.REJECTED if answer.outcome is None else answer.outcome
             return Verdict(outcomes=(outcome,), retry_after=answer.retry_after)
@@ -3047,8 +3054,8 @@ class HTTPSink:
             stop=_engine.stop_signal_of(self),
             decline=None,
         )
-        if sent.unbuilt is not None:
-            raise sent.unbuilt
+        if sent.raised is not None:
+            raise sent.raised
         answer = sent.answer
         if answer is None:
             raise SinkDeliveryError(f"{type(self).__name__} made no attempt")

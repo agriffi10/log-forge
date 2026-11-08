@@ -2430,20 +2430,38 @@ def test_the_dropped_counter_check_reports_what_it_claims_to(case: str) -> None:
 # --- SPEC-073 FR-005: a dropped counter counted through a run context commits only if settled ----
 
 
+def _is_when_settled(node: ast.expr | None) -> bool:
+    """Whether ``when=`` is ``When.SETTLED``, spelt bare or through a module (``_engine.When``).
+
+    A ``.SETTLED`` on anything not named ``When`` is not the run context's member, so it does
+    not count: the gate reads the spelling, and a lookalike base fails closed.
+    """
+    if not (isinstance(node, ast.Attribute) and node.attr == "SETTLED"):
+        return False
+    base = node.value
+    if isinstance(base, ast.Name):
+        return base.id == "When"
+    return isinstance(base, ast.Attribute) and base.attr == "When"
+
+
 def run_context_count_findings(where: str, source: str, counters: set[str]) -> list[str]:
     """Every run-context ``count`` that could count a ``dropped`` counter in a run that failed.
 
-    A sink on the delivery engine counts through ``RunContext.count(owner, name, n, when=...)``
+    A sink on the delivery engine counts through ``RunContext.count(owner, name, n, *, when)``
     rather than storing, so :func:`dropped_store_findings` sees no store, and a ``when`` other than
     ``When.SETTLED`` would count a drop that a failed run's catcher already counts. The call is
-    recognised by **shape**: an attribute call named ``count`` with three or more positional
-    arguments, the second the counter's name. ``Deferral.count`` and the context's ``drops`` view
-    take the counter first and at most two positionals, so they are not this shape and stay
-    silent: both are committed only by a settled run or a returning ``emit``.
+    recognised by **shape**: an attribute call named ``count`` that passes ``when=`` (which
+    ``RunContext.count`` requires, keyword-only), or names ``owner=`` or ``name=``, or takes
+    three or more positional arguments. ``Deferral.count(counter, n)``, the context's ``drops``
+    view and any ledger forwarding them take the counter first and at most two positionals with
+    no ``when=``, so they are not this shape and stay silent: each is committed only by a settled
+    run or a returning ``emit``.
 
-    In that shape a ``when=When.SETTLED`` keyword is silent whatever the name. Otherwise a name
-    that is not a string literal is a finding, because the gate cannot tell which counter it is
-    (it fails closed), and a literal naming one of ``counters`` is a finding too.
+    In that shape the counter's name is ``name=`` when given, else the second positional. A
+    ``when=When.SETTLED`` (bare, or through a module's ``When``) is silent whatever the name.
+    Otherwise a name that is missing or not a string literal is a finding, because the gate cannot
+    tell which counter it is (it fails closed), and a literal naming one of ``counters`` is a
+    finding too.
 
     Args:
       where: The module's path, for the message.
@@ -2459,22 +2477,27 @@ def run_context_count_findings(where: str, source: str, counters: set[str]) -> l
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "count"
-            and len(node.args) >= 3
         ):
             continue
-        when = next((k.value for k in node.keywords if k.arg == "when"), None)
-        if isinstance(when, ast.Attribute) and when.attr == "SETTLED":
+        keywords = {k.arg: k.value for k in node.keywords if k.arg is not None}
+        if not (
+            "when" in keywords or "owner" in keywords or "name" in keywords or len(node.args) >= 3
+        ):
+            continue
+        when = keywords.get("when")
+        if _is_when_settled(when):
             continue
         shown = ast.unparse(when) if when is not None else "no when"
-        name = node.args[1]
+        name = keywords.get("name", node.args[1] if len(node.args) >= 2 else None)
         if not (isinstance(name, ast.Constant) and isinstance(name.value, str)):
+            spelt = ast.unparse(name) if name is not None else "nothing"
             findings.append(
                 (
                     node.lineno,
                     (
                         f"{where}:{node.lineno}: a run-context count names its counter by "
-                        f"{ast.unparse(name)}, which the gate cannot read, with {shown}; name it "
-                        f"by a literal or pass when=When.SETTLED"
+                        f"{spelt}, which the gate cannot read, with {shown}; name it by a literal "
+                        f"or pass when=When.SETTLED"
                     ),
                 )
             )
@@ -2512,6 +2535,47 @@ _RUN_CONTEXT_CORPUS: dict[str, tuple[str, list[str]]] = {
     "settled-non-literal": ("ctx.count(self, name, 1, when=When.SETTLED)\n", []),
     "not-a-dropped-counter": ('ctx.count(self, "failed", 1, when=When.ALWAYS)\n', []),
     "a-deferral-count-without-when": ('pending.count("dropped_oversized", 2)\n', []),
+    "settled-through-a-module": (
+        'ctx.count(self, "dropped_oversized", 1, when=_engine.When.SETTLED)\n',
+        [],
+    ),
+    "a-forwarding-ledger": ("ledger.count(name, n)\n", []),
+    "keyword-n": (
+        'ctx.count(self, "dropped_oversized", n=1, when=When.ALWAYS)\n',
+        [
+            (
+                "m.py:1: the dropped counter dropped_oversized is counted through a run context "
+                "with When.ALWAYS; a dropped count commits only when the run settles"
+            )
+        ],
+    ),
+    "all-keywords": (
+        'ctx.count(owner=self, name="dropped_oversized", n=1, when=When.ALWAYS)\n',
+        [
+            (
+                "m.py:1: the dropped counter dropped_oversized is counted through a run context "
+                "with When.ALWAYS; a dropped count commits only when the run settles"
+            )
+        ],
+    ),
+    "non-literal-name-keyword": (
+        "ctx.count(owner=self, name=counter, n=1, when=When.ALWAYS)\n",
+        [
+            (
+                "m.py:1: a run-context count names its counter by counter, which the gate cannot "
+                "read, with When.ALWAYS; name it by a literal or pass when=When.SETTLED"
+            )
+        ],
+    ),
+    "a-settled-that-is-not-when": (
+        'ctx.count(self, "dropped_oversized", 1, when=Other.SETTLED)\n',
+        [
+            (
+                "m.py:1: the dropped counter dropped_oversized is counted through a run context "
+                "with Other.SETTLED; a dropped count commits only when the run settles"
+            )
+        ],
+    ),
     "always-literal": (
         'ctx.count(self, "dropped_oversized", 1, when=When.ALWAYS)\n',
         [

@@ -1885,3 +1885,45 @@ def test_a_shim_called_inside_a_round_commits_at_once() -> None:
     sink.emit(_events(2))
     assert seen == [1], "committed when the shim returned, not when the outer run ends"
     assert sink.item_errors == 1
+
+
+@pytest.mark.parametrize("hook", ["_retryable_status", "_response_limit"])
+def test_send_reraises_a_classifying_hooks_fault_unchanged(
+    hook: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hook ``_exchange`` calls that raises escapes ``_send`` as itself, as it did in 1.x.
+
+    Not as a ``SinkDeliveryError``: every caller (``SentrySink._capture`` above all) reads that
+    type as already counted, and nothing was. ``_response_limit`` is the exception: ``_attempt``
+    reads it first, inside the attempt ``_exchange`` classifies, so its fault is counted as the
+    attempt's own refused exception, one request, ``failed`` moved, and that is pinned too.
+    """
+    error = RuntimeError("hook")
+
+    class OwnSend(HTTPSink):
+        def _retryable_status(self, status: int) -> bool:
+            if hook == "_retryable_status":
+                raise error
+            return super()._retryable_status(status)
+
+        def _response_limit(self) -> int | None:
+            if hook == "_response_limit":
+                raise error
+            return super()._response_limit()
+
+    opener = Scripted(_status(500))
+    sink = OwnSend("http://h", opener=opener)
+    if hook == "_response_limit":
+        with pytest.raises(SinkDeliveryError) as counted:
+            sink._send(b"body", content_type="text/plain")
+        assert str(counted.value) == "OwnSend, 1 attempt(s), connection error, RuntimeError"
+        assert len(opener.calls) == 1 and sink.failed == 1, (
+            "_attempt reads the bound first, so its fault is the attempt's: counted, not hidden"
+        )
+        return
+    with pytest.raises(RuntimeError) as raised:
+        sink._send(b"body", content_type="text/plain")
+    assert raised.value is error
+    assert len(opener.calls) == 1
+    assert sink.failed == 0
+    assert capsys.readouterr().err == "", "no engine absorbed line, no lost line"
