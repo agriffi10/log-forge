@@ -12,11 +12,14 @@ chunk that had landed was sent again and one refused for good was re-POSTed once
 attempt. Now `HTTPSink.deliver(batch)` is one **round**: `_items` renders and drops what cannot be
 sent alone, `_take` chunks the rest, and each chunk goes in **one** request, built as `_send` builds
 one and classified by one private method, `_exchange`, which the round and `_send` share. Each
-event's fate is returned by index, and the engine (*A sink may report per event*) resends only the
-`RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
+event's fate is returned by index: items map back to events by identity, then by unclaimed
+position, so an `_items` override returning rebuilt events maps exactly, and an event no request
+carries is `DROPPED` only when that many were dropped and counted, else `REJECTED`, never a
+silent default. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
 the orphan path and through `emit`. Nothing in `http.py` waits or loops, and one round has one
 wait, so a batch whose several chunks failed retryably waits once per round where 1.x waited once
-per chunk. `emit` is `emit_via_deliver(self, batch, deliver=self._round)`, so a caller of `emit`
+per chunk. `emit` is `_engine.emit_via_deliver(self, batch, deliver=self._round)`, the private
+adapter behind the public `log_foundry.emit_via_deliver` (PR 312), so a caller of `emit`
 sees the 1.x contract, and its total-failure message is the adapter's, counted in events.
 `_send` keeps its 1.x signature, return, counter, line and raise for `SentrySink`'s fallback and a
 third party that builds its own body; its attempts are one-request rounds through `_engine._run`,
@@ -87,4 +90,6 @@ batch. (SPEC-073 FR-001 to FR-005)
 ### 2026-11-08
 
 - **Settled** by SPEC-073. The engine's settled-line refinement SPEC-072 FR-003 states was added
-  here, keyed on lines that will commit, because `_run` had no context to read before.
+  here, keyed on lines that will commit, because `_run` had no context to read before. The
+  item mapping by unclaimed position, and its `REJECTED` fallback, came from the frame-1 diff
+  review.

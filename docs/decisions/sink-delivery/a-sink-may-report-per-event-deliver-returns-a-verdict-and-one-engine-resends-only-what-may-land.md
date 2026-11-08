@@ -20,13 +20,13 @@ description: "a sink may add `deliver(batch) -> Verdict`, one closed `Outcome` p
 
 ### 2026-11-08
 
-- **Refined (the 1.2.0 follow-up fix, no spec), at Andrew's direction.** `emit_via_deliver` is public, a fifth name beside the four this decision made public, at `log_foundry` and `sinks.verdict`; the engine it delegates to stays private. The reasoning is in *The frozen surface is the import path, not just the class*.
 - **Applied** by SPEC-073, fence unchanged: the HTTP family is the first shipped family on the
   engine. The engine gains a family-neutral run context on which a sink keeps its 1.x counters'
   units, and writes no settled line of its own beside a sink line that will commit. A run started
   inside another run's round — a hook's `_send`, or a third-party `deliver` calling an engine
   sink's `emit` — is an independent run with its own context; the *Do NOT* on nesting rounds still
   means the worker never wraps an engine run in the adapter.
+- **Refined (the 1.2.0 follow-up fix, no spec), at Andrew's direction.** `emit_via_deliver` is public, a fifth name beside the four this decision made public, at `log_foundry` and `sinks.verdict`; the engine it delegates to stays private. The reasoning is in *The frozen surface is the import path, not just the class*.
 
 ### 2026-11-07
 
