@@ -448,6 +448,13 @@ and again on the worker's retry is a sink's own `failed` count, an upper bound, 
 sender faults included — `SQSSink._send` and, since SPEC-070, `SNSSink._send` count one before
 `emit` raises for a recoverable loss beside it.
 
+> **Superseded for the HTTP family by SPEC-073:** its drops (`HTTPSink._items`, `_drop_refused`'s
+> `413`, and a chunk whose request could not be built) register `SETTLED` on the delivery engine's
+> run context and are committed by `_engine._commit` only when the run settles, and its `failed`
+> commits once when the run ends rather than before a raise and again on the worker's retry, which
+> no longer resends a shipped family sink's batch. Decision: *The HTTP family delivers in rounds on
+> the engine, and a run context keeps its counters' units* (`docs/decisions/sink-delivery/`).
+
 SPEC-070 widens the first two of the original three cases. An **SNS sender fault** joins the SQS
 one — the same required `SenderFault` field, read through the same `sinks/_classify.sender_fault`,
 counted and never retried, a batch lost only to sender faults returning — and a Kinesis or Firehose
@@ -1034,7 +1041,8 @@ close it.
   accepts any positive finite number, and `socket.settimeout` raises `OverflowError` above about
   `9.2e9` seconds (the platform's `PyTime_t`), so `HTTPSink(timeout=1e10)` constructs and no
   `emit` can deliver. ~~Its `emit` raises that `OverflowError` uncounted — not an `OSError`, so the
-  retry guard never sees it.~~ Since SPEC-070 FR-001 `HTTPSink._send` catches it, counts the
+  retry guard never sees it.~~ Since SPEC-070 FR-001 the HTTP family catches it — since SPEC-073
+  in `HTTPSink._exchange`, the one classification the round and `_send` share — counts the
   request in `failed` at its one attempt with a `connection error, OverflowError` line and raises
   `SinkDeliveryError`, every `emit` (*A sink declares what it retries, and anything else fails at
   once*); the value still never delivers, so the item stays open. It is a `float` door of SPEC-049's, not an `int` door, so SPEC-066 did not change it.

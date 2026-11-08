@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A Honeycomb batch response is a per-event verdict, read all of a chunk or none of it"
-description: "`HoneycombSink` reads `/1/batch`'s `200` array positionally: an entry whose integer `status` is outside `2xx` counts on `rejected_events`, never re-sent; a body that is empty or unreadable (`b\"\"`), not an array of objects, the wrong length, or holding a status that is not an `int` (a `bool` and a float are not) counts the whole chunk on `dropped_unadjudicated`, never re-sent; a chunk whose every event was rejected is undelivered, so an `emit` with no delivered chunk raises. The server's `error` text is never written."
+description: "`HoneycombSink` reads `/1/batch`'s `200` array positionally: an entry whose integer `status` is outside `2xx` counts on `rejected_events`, never re-sent; a body that is empty or unreadable (`b\"\"`), not an array of objects, the wrong length, or holding a status that is not an `int` (a `bool` and a float are not) counts the whole chunk on `dropped_unadjudicated`, never re-sent; a chunk whose every event was rejected is `REJECTED`, so a run with no accepted event fails (`emit` raises) and, since SPEC-073, is not re-sent. The server's `error` text is never written."
 ---
 
 **A Honeycomb batch response is a per-event verdict, read all of a chunk or none of it** —
@@ -30,13 +30,15 @@ server writing either is not describing the event in the form Honeycomb document
 event, and reading every other integer as a rejection keeps a `429` or `500` inside the array from
 being read as delivery. Refinery's `429` is counted and not re-sent like any other rejection — a
 re-send would duplicate the events that landed beside it. Rejected events count on
-`rejected_events`, one `lost N event(s)` line names the class, and the chunk is **not re-sent**,
-because its other events landed and the worker retries whole batches. **A chunk whose every event
-was rejected is undelivered**: `_handle_response` returns False, so an `emit` with no delivered
-chunk raises `SinkDeliveryError`, and the worker's retry and `failed_batches` are how a permanent
-rejection is seen (invariant 7). The cost is the one *A populated partial success is counted, never
-retried; every record rejected raises* records for OTLP: `rejected_events` is counted before the
-raise, so each worker attempt adds the chunk's size again, an upper bound like `failed`.
+`rejected_events`, one `lost N event(s)` line names the class, and they are **not re-sent**,
+because the chunk's other events landed. Since SPEC-073 `HoneycombSink._outcomes` returns each
+event's outcome, `ACCEPTED` or `REJECTED`, and `_handle_response` is a 1.x shim over it. **A chunk
+whose every event was rejected is wholly `REJECTED`**, so a run with no accepted event fails —
+`emit` raises `SinkDeliveryError` and `failed_batches` moves, which is how a permanent rejection is
+seen (invariant 7) — and it is sent once and counted once, since no round resends an outcome
+rejected for good. Before SPEC-073 the worker re-sent such a batch and each attempt added the
+chunk's size to `rejected_events` again, the cost *A populated partial success is counted, never
+retried; every record rejected raises* recorded for OTLP.
 
 **A body that is no verdict is counted, never read as success.** That includes `b""`: since *After a
 status line the status decides; a 2xx whose body cannot be read is never re-sent* (#283), an empty
@@ -47,8 +49,9 @@ silently an all-rejected response whose tail was cut off. This is the `_bulk` si
 reached here on this destination's own argument rather than copied, as *A 2xx this sink cannot read
 is counted, and the `_bulk` reading is argued, never inherited* asks; ~~`OTLPSink` reads `b""` the
 other way because an OTLP success needs no body~~. The whole chunk goes to
-`dropped_unadjudicated` with a may-have-landed line, `losses().failed` sums it with `rejected_events` and the abandoned
-requests, and the chunk is settled. **The known cost**: a proxy that speaks Honeycomb's batch
+`dropped_unadjudicated` with a may-have-landed line, through `HTTPSink._unadjudicated`,
+`losses().failed` sums it with `rejected_events` and the abandoned requests, and its events are
+`UNKNOWN`, never re-sent and never a failed run. **The known cost**: a proxy that speaks Honeycomb's batch
 protocol but answers with something other than an array — none is known to; Refinery answers with
 the array, and `libhoney-go` itself fails a whole batch whose `200` body does not decode — would
 have every chunk charged as an upper bound, one stderr line per chunk, since `_diag.lost` is not
@@ -70,6 +73,13 @@ the caller logged, and invariant 11 names a type and never a value. **Not done: 
 response, and a bound would also change how an oversized non-`2xx` is retried.
 
 ## History
+
+### 2026-11-08
+
+- **Refined** by SPEC-073: the reader is `HoneycombSink._outcomes`, giving up through
+  `HTTPSink._unadjudicated`. A wholly rejected chunk is `REJECTED`, so a run with nothing accepted
+  fails and is sent and counted once, where the worker used to re-send it and recount
+  `rejected_events` on each attempt.
 
 ### 2026-11-07
 

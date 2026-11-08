@@ -98,15 +98,23 @@ hand-offs `KafkaSink` and `GooglePubSubSink` see refused, and `HTTPSink._drop_re
 (SPEC-059), and the encode step every record-building sink runs before its first bulk call,
 `sinks/_encode.encode_events`, whose count lands in `_unencodable` (or `rejected` for `KafkaSink`
 and `GooglePubSubSink`, and on `SocketTransport` for `SyslogSink` and socket-mode `LogstashSink`)
-(SPEC-069). A counter some `losses()` reports as `dropped` is written only by that commit: the
-counters are derived from the tree and the rule checked over it (`tests/test_deferral.py`). The
+(SPEC-069). On the delivery engine the commit is the run's (SPEC-073): the HTTP family's drop
+sites — `HTTPSink._items`, `_drop_refused` and a chunk whose request could not be built — register
+on the engine's **run context** as `SETTLED`, committed by `_engine._commit` only when the run
+settles, so a run that fails counts none of them and its catcher owns the batch. A counter some
+`losses()` reports as `dropped` is written only by that commit: the counters are derived from the
+tree and the rule checked over it (`tests/test_deferral.py`). The
 exception is a sink's own `failed` count, the upper bound above: it can land before a raise and
 again each time the worker retries that batch, the SQS and SNS sender faults included
 (`SQSSink._send` and, since SPEC-070, `SNSSink._send` count one before `emit` raises for a
 recoverable loss beside it), a failure the sink's retry predicate does not accept, counted at its
 first attempt before `emit` raises when nothing landed (SPEC-070), and the batch size a
 `SQLiteSink`, `FileSink` or `RotatingFileSink` adds to `failed` when its driver raises, before it
-raises in turn (SPEC-069 FR-004). A third-party sink that counts
+raises in turn (SPEC-069 FR-004). The HTTP family's `failed` lands once per batch since SPEC-073: it
+is registered on the run context and committed when the run ends, once per request refused for
+good and once per request of the last round still retryable, and a shipped family sink is never
+resent whole by the worker, which calls its `deliver`. A third-party subclass kept on its 1.x path
+(SPEC-073 FR-004) is resent through its `emit`, and its `failed` lands again on each attempt. A third-party sink that counts
 a drop before raising is outside what the library can hold to this (`MultiSink.emit` names the
 cost).
 A sink that offers `deliver` (SPEC-072) reports instead of counting: the delivery engine is the one
@@ -121,15 +129,20 @@ contract gives the never-retried losses above their outcomes — `UNKNOWN` for a
 response and both NATS cases, `REJECTED` for a sender fault, `DROPPED` for an oversized,
 unencodable or id-callable failure, and `SKIPPED`, counted in the wrapper's own `_dropped`, for a
 wrapper's per-event failure (SPEC-072 FR-003) — and the engine resends none of them unless
-the sink declares itself idempotent, which no shipped sink does. No shipped sink defines `deliver`
-yet; the sinks that adopt it in later specs return those outcomes.
+the sink declares itself idempotent, which no shipped sink does. The HTTP family defines
+`deliver` since SPEC-073 and returns those outcomes; the sinks that adopt it in later specs return
+them too. A sink whose own counters count something other than events — `HTTPSink.failed` counts
+requests — registers them on the engine's run context, which commits them once per run through
+one `Deferral` per owner, `SETTLED` for a drop.
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
 `tests/test_encode.py` and `tests/test_sinks_encode.py` (the encode step over a roster derived from
 the tree, SPEC-069), `tests/test_classify.py` (every retry loop counts once at the attempt that
 failed, the sender faults and the contradictory counts, SPEC-070), `tests/test_delivery_engine.py`
 (the engine's counting table and run-failed rule) and `tests/test_delivery_paths.py` (each catcher
-of a failed run, SPEC-072); `tests/test_invariants_model.py` is the identity itself, for an `emit`
-sink and, holding each term to its exact share, for a `deliver` sink.
+of a failed run, SPEC-072), `tests/test_run_context.py` (the run context's commit rules) and
+`tests/test_http_rounds.py` (the HTTP family's counts on both paths and both forms, SPEC-073);
+`tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,
+holding each term to its exact share, and for an `HTTPSink` behind a scripted opener.
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
@@ -263,7 +276,9 @@ with one that fails some calls, nothing raised, `losses()` is non-zero, and no e
 *Recorded exceptions:* an `emit` may return normally having delivered nothing, because what it did
 not deliver was counted — an all-oversized batch, a batch of nothing but events the sink cannot
 encode (an HTTP batch it cannot render, SPEC-058, and since SPEC-069 the same batch on every
-record-building sink, each event counted `dropped`; `NATSSink` and `SentrySink`, the declared
+record-building sink, each event counted `dropped`; since SPEC-073 also an HTTP batch whose every
+chunk's request cannot be built — a `_body`, `_prepare` or `_apply_auth` that raises, or a
+`Request` that cannot be built — each event counted `dropped` on `_unrenderable`; `NATSSink` and `SentrySink`, the declared
 exceptions, still count such an event `failed` and raise for a batch of nothing else), a wrapper
 batch of one failure and otherwise deliberate drops, an SQS batch of an id failure and an oversized
 or unencodable event (SPEC-058, SPEC-069), and an SQS or SNS batch rejected wholly as sender faults
@@ -280,8 +295,10 @@ chunk — delivered for a sink that ignores the body, unadjudicated for the `_bu
 re-sent; before any status line, a protocol error is retried and counted like a connection error.
 An OTLP server answering every POST with a `2xx` whose `partialSuccess` is present but cannot be
 read, or whose body cannot be read, or with a `2xx` over the 4 MiB response bound, leaves the same three signs for the same
-reason (SPEC-056); only a `2xx` rejecting every record of every chunk raises there, because nothing
-landed — and the same holds for a Honeycomb `200` rejecting every event of every chunk. A core
+reason (SPEC-056); only a `2xx` rejecting every record of every chunk raises there or, through
+`deliver`, fails the run, because nothing landed — and the same holds for a Honeycomb `200`
+rejecting every event of every chunk. Since SPEC-073 such a run is sent once and not re-sent, since
+the worker calls the family's `deliver` and a `REJECTED` event is final. A core
 `NATSSink` batch whose confirming round trip went unanswered leaves them too (SPEC-061 FR-003):
 `emit` returns having counted the batch in `failed` and announced it once, because its bytes are in
 flight to a server that may yet process them, and the next call is refused by the probe or its
@@ -302,8 +319,10 @@ faults returns, one with a recoverable loss beside it raises, SPEC-070), `tests/
 SPEC-069), `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass),
 `tests/integration/` against real services (SPEC-041), `tests/test_verdict.py` (a malformed
 `Verdict` refused where it is built), `tests/test_delivery_engine.py` (the run-failed rule, the
-unknown outcomes and the unreadable verdict) and `tests/test_delivery_paths.py` (a failed run on
-the worker, the orphan path and the adapter, a settled one on each, SPEC-072).
+unknown outcomes and the unreadable verdict), `tests/test_delivery_paths.py` (a failed run on
+the worker, the orphan path and the adapter, a settled one on each, SPEC-072) and
+`tests/test_http_rounds.py` (the HTTP family's total and partial failures through `emit`, the
+worker and the orphan path, and a third-party override on its 1.x path, SPEC-073).
 
 ## 8. An event is safe by construction, once, at assembly
 

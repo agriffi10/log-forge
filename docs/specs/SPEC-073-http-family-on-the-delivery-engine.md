@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-073
 title: "The HTTP Family on the Delivery Engine"
 description: "Puts HTTPSink and its eight shipped subclasses on SPEC-072's delivery engine: each offers deliver, one request per chunk per round, its emit runs the same engine inline, the three per-record readers return per-event outcomes through one shared unreadable-response method, every documented counter keeps its 1.x name and unit through a family-neutral run context, and a third-party subclass that overrides emit or _handle_response keeps its 1.x path."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-018, SPEC-027, SPEC-038, SPEC-056, SPEC-058, SPEC-059, SPEC-062, SPEC-066, SPEC-070, SPEC-072]
 arc: stability-redesign
 arc_order: 5
@@ -88,7 +88,8 @@ Figures, each with its instrument and the commit it was measured at:
 ### In Scope
 
 - `HTTPSink.deliver`, the round, its status-to-outcome rules, and `emit` and `_send` running through
-  the engine. `_BACKOFF_BASE`, `_sleep_backoff`, `_deliver` and the retry loop are deleted (FR-001).
+  the engine. `_BACKOFF_BASE`, `_sleep_backoff`, `_deliver`, `_abandon` and the retry loop are
+  deleted (FR-001).
 - One private, **family-neutral** addition to SPEC-072's `sinks/_engine.py`, the run context, and the
   HTTP family's counters on it (FR-002). The run context is how every shipped sink keeps its 1.x
   counter names, units and lines, and SPEC-074 extends it for the SDK and driver sinks.
@@ -117,7 +118,9 @@ Figures, each with its instrument and the commit it was measured at:
   OTLP rejected record stay `REJECTED`, whatever status the item carries: counted and never resent by
   the sink, as in 1.x.
 - **A new retryable status or a changed one.** `_retryable_status` and OTLP's `429`, `502`, `503`,
-  `504` are unchanged. A `413` is never `RETRYABLE`; it drives the budget search (FR-001).
+  `504` are unchanged. A `413` is never `RETRYABLE` for a shipped class; it drives the budget
+  search (FR-001). A third-party `_retryable_status` that accepts `413` keeps 1.x's order, in which
+  the retry test runs first, so its `413` is `RETRYABLE`.
 - **An adaptive budget across batches.** The `413` search is kept per run, as it was per `emit`. Its
   reduced budget is never carried into a later batch, for the ratchet `HTTPSink._chunk_budget`'s
   docstring records.
@@ -129,8 +132,14 @@ Figures, each with its instrument and the commit it was measured at:
     `_body_reserve`, `_prepare`, `_apply_auth`, `_attempt` and `_send` keep the signatures and
     meaning they have at the build's base. For `_prepare` and `_apply_auth` that meaning is the
     one PR 311 (`c4e51fbd`) gave them, which this spec does not change.
-  - `_deliver` and `_sleep_backoff` are removed, and so are `_abandon`'s and `_abandon_unreduced`'s
-    immediate stores. A third-party override of one of them is no longer called.
+  - `_deliver`, `_sleep_backoff` and `_abandon` are removed, and a third-party override of one of
+    them is no longer called. `_abandon_unreduced` stays, without its immediate store, and now
+    takes the run's context, `(context, chunk)`: a third-party override written to its 1.x
+    signature `(chunk)` raises a `TypeError` out of the round, which only a pathological
+    `_item_size`, or a `max_batch_count` above 33 million, can reach.
+  - `_items(batch, pending)` and `_drop_refused(chunk, pending)` keep their 1.x signatures. Their
+    `pending` is now typed by a private Protocol that both a `Deferral` and the run context's
+    `drops` view satisfy.
   - The chunk path no longer calls `_send`, so an override of `_send` still serves `SentrySink`
     and direct callers but no longer sees the chunks.
 - **Changing `_handle_response`'s signature**, `SinkLosses`, `configure()`, `Config`, or any
@@ -195,6 +204,12 @@ takes for a round function its static lookup would not find (FR-004). So `emit` 
 | a non-`2xx` longer than `_response_limit()` | `REJECTED` | `failed` |
 | any other status, or an exception `_retryable_error` refuses | `REJECTED` | `failed` |
 
+The table is one private method, `HTTPSink._exchange`, which makes the request once and registers
+its count and line on the run context. Its checks run in 1.x `_send`'s order: the exception, the
+`2xx`, the response bound, `_retryable_status`, then the `413`. So a third-party
+`_retryable_status` that accepts `413` still retries it, as in 1.x. Outside the round (`_send`
+called with `splittable=False`) a `413` is the counted `REJECTED` row.
+
 **The `413` search runs per run, not per round.** It works as SPEC-038 does:
 
 - A `413` halves the budget to the refused body's size and re-chunks the round's remaining items.
@@ -220,16 +235,24 @@ readers (`_outcomes` and `_handle_response`), under a guard catching `Exception`
 
 - If anything raises before the request is handed to `_attempt` (`_body`, `_prepare`,
   `_apply_auth` or building the `Request`), the chunk's events are `DROPPED` and counted on
-  `_unrenderable`, with the same line a `_body` fault writes, as a render fault is (SPEC-058).
-  Nothing was sent, and the same inputs would fail the same way.
+  `_unrenderable` `SETTLED`, as a render fault is (SPEC-058). Nothing was sent, and the same
+  inputs would fail the same way. The faults of one round aggregate as 1.x `_items`' render faults
+  do: one count summing their events, and one line registered at the end of the round, naming the
+  first exception's type, `lost <n> event(s); <class>, rendering raised <Type>`.
 - If the `2xx` reader raises, the request succeeded and its events may have landed. The chunk goes
-  through the unreadable-response method (FR-003) and its events are `UNKNOWN`.
+  through the unreadable-response method (FR-003) and its events are `UNKNOWN`, with the line
+  `lost <n> event(s); <class> reading a 2xx response raised <Type>; they may have landed; not
+  retried`. A reader that returns something other than one `Outcome` per event is read the same
+  way, its line saying `reading a 2xx response gave no outcome per event`. The result is checked by
+  wrapping it in a `Verdict` and reading it through SPEC-072's `outcomes_of`.
 
-A `deliver` of this family therefore never raises an `Exception`. A fault from `_attempt` or the
-opener is classified by FR-001's table, and a fault building the request or reading a `2xx` is
-under the guard.
-Under SPEC-072 an escaped exception fails the run, which would report total failure for a batch
-whose other chunks landed.
+So no fault from a request-building hook, a `2xx` reader, `_attempt` or the opener escapes a round.
+A fault from `_attempt` or the opener is classified by FR-001's table, and a fault building the
+request or reading a `2xx` is under the guard. Under SPEC-072 an escaped exception fails the run,
+which would report total failure for a batch whose other chunks landed. The guard covers those
+hooks and no others: a third-party override of `_retryable_status`, `_response_limit`, `_items`,
+`_take`, `_event_ceiling`, `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` that raises
+escapes the round, as it escaped 1.x `emit`, and the engine fails that round's events.
 
 **`_send` keeps its 1.x contract** for its callers outside the chunk path: `SentrySink`'s fallback,
 and a third-party subclass that builds its own body.
@@ -249,7 +272,11 @@ and a third-party subclass that builds its own body.
 
 `_send` runs its attempts as rounds of one request, through SPEC-072's `_run`. Its budget is
 `max_retries`, its stop event is `log_foundry_stop_signal`, and it has no decline predicate. So
-`http.py` holds no retry loop and no wait of its own.
+`http.py` holds no retry loop and no wait of its own. `_prepare` runs once, before the run, as in
+1.x. Each round builds a fresh `Request`, and a raise there is kept and re-raised unchanged after
+the run, as 1.x let it escape. The run's engine totals go to a throwaway `SinkCounters`, never the
+sink's `log_foundry_counters`, because a request is not an event: a `SentrySink` envelope or a
+nested `_send` never appears in the sink's event totals.
 
 **A run inside a run is independent.** SPEC-072 lets a third-party `deliver` call another sink's
 `emit`, and every engine sink's `emit` is a run. Nesting is therefore reachable through any engine
@@ -263,54 +290,57 @@ sink, not only through `_send`, and no rule here can forbid it. What holds inste
 - Its waits run inside the enclosing round. The worker's SPEC-062 prediction measures that round
   as one longer round.
 
-**Deleted:** `_BACKOFF_BASE`, `_sleep_backoff`, `_deliver`, `_send`'s `for attempt` loop, and
-`_abandon`'s and `_abandon_unreduced`'s direct stores to `failed` (FR-002 replaces them).
+**Deleted:** `_BACKOFF_BASE`, `_sleep_backoff`, `_deliver`, `_abandon`, `_send`'s `for attempt`
+loop, and `_abandon_unreduced`'s direct store to `failed` (FR-002 replaces them).
 
 #### Acceptance Criteria:
 
-- [ ] `http.py` holds no `for` loop over `range(...)` naming `retries`, no `_BACKOFF_BASE`, and no
+- [x] `http.py` holds no `for` loop over `range(...)` naming `retries`, no `_BACKOFF_BASE`, and no
       call to `wait`, `time.sleep` or `Event.wait`, and neither does any module of the family (an
-      AST check over every class the family scan finds).
-- [ ] Worker budget: an `HTTPSink` at its defaults under a default `Worker`, answered nine `503`s
+      AST check over every class the family scan finds: 8 modules, `http.py` and the seven its
+      subclasses live in, `OpenSearchSink` sharing `elasticsearch.py`).
+- [x] Worker budget: an `HTTPSink` at its defaults under a default `Worker`, answered nine `503`s
       then a `200`, is delivered on the 10th request with `failed_batches == 0`, as at `fda134a`.
-- [ ] Worker budget: `HTTPSink(max_retries=0)` under `Worker(max_retries=3)`, answered `503` then
+- [x] Worker budget: `HTTPSink(max_retries=0)` under `Worker(max_retries=3)`, answered `503` then
       `200`, is delivered on the 2nd request. Answered `503` throughout, it makes 4 requests and
       `failed_batches == 1`.
-- [ ] Orphan budget: an orphan `info()` against `HTTPSink(max_retries=2)` answered `503` throughout
+- [x] Orphan budget: an orphan `info()` against `HTTPSink(max_retries=2)` answered `503` throughout
       makes 3 requests on the caller's thread, and `orphan_lost == 1`.
-- [ ] A two-chunk batch answered `200` and `400` makes 2 requests and `failed` rises by 1. Through a
+- [x] A two-chunk batch answered `200` and `400` makes 2 requests and `failed` rises by 1. Through a
       real `Worker` with `max_retries=3` it is still 2 requests (where `fda134a` made 2), `flush()` is
       truthy and `failed_batches == 0`.
-- [ ] A one-chunk batch answered `400` throughout, through a real `Worker` with `max_retries=3`, makes
+- [x] A one-chunk batch answered `400` throughout, through a real `Worker` with `max_retries=3`, makes
       1 request where `fda134a` made 4, and `failed_batches == 1`.
-- [ ] Through `emit` with `max_retries=2`, a one-chunk batch answered `503` then `200` makes 2
+- [x] Through `emit` with `max_retries=2`, a one-chunk batch answered `503` then `200` makes 2
       requests, waits `0.1` s once and leaves `failed` at 0. Answered `503` throughout it makes 3
       requests, and `failed` is 1, with one line reading `3 attempt(s), HTTP 503`.
-- [ ] Two chunks answered `503` and `200`, then `200`, make 3 requests in all, and the second round's
+- [x] Two chunks answered `503` and `200`, then `200`, make 3 requests in all, and the second round's
       request carries exactly the first chunk's events.
-- [ ] An opener raising `URLError` is `RETRYABLE`. One raising `RuntimeError` makes 1 request,
+- [x] An opener raising `URLError` is `RETRYABLE`. One raising `RuntimeError` makes 1 request,
       counts `failed == 1` and fails a one-chunk run, also through a real `Worker`.
-- [ ] Retry-After:
+- [x] Retry-After:
   - `Retry-After: 2.5` with `max_retry_after=1.0` waits `1.0`.
   - Two retryable chunks with hints `1` and `4` wait `4`, once.
   - With `max_retry_after` of `0`, `-1` or `nan` the hint is ignored and the wait is the backoff,
     as at `fda134a`.
   - With `inf`, a hint of `100` waits `100`.
-- [ ] A stop signal set during a hinted wait returns `emit` within 0.5 s of wall time and under
+- [x] A stop signal set during a hinted wait returns `emit` within 0.5 s of wall time and under
       0.05 s of CPU, measured through `tests/test_worker_exit_budget.py`'s helper.
-- [ ] A destination refusing any body over 300 bytes is sent 40 small events under a 5,000,000-byte
+- [x] A destination refusing any body over 300 bytes is sent 40 small events under a 5,000,000-byte
       budget. It gets the same requests in the same order as at `fda134a`. When one of those
       requests is answered `503` and resent in round two, round two sends nothing over 300 bytes.
-- [ ] The existing `413` tests in `tests/test_sinks_http.py` and `tests/test_sinks_http_refused.py`
-      pass with their bodies unedited, apart from the Probe D tests FR-005 names. Their files'
-      helpers and fixtures change only as FR-005 says.
-- [ ] A subclass whose `_body` raises `ValueError` for one chunk of three has that chunk's events
+- [x] The existing `413` tests in `tests/test_sinks_http.py` and `tests/test_sinks_http_refused.py`
+      pass with their bodies unedited, apart from the Probe D tests FR-005 names. Their files
+      change only as FR-005 says: the `_no_sleep` fixture, the Probe D tests and their helpers,
+      and the `match=` of `test_every_chunk_failing_is_the_total_failure_the_worker_retries`, a
+      `500` test, not a `413` one.
+- [x] A subclass whose `_body` raises `ValueError` for one chunk of three has that chunk's events
       counted on `losses().dropped` once, with a line naming `ValueError`. The other two chunks are
       sent, `deliver` raises nothing, and `emit` does not raise.
-- [ ] A subclass whose `_prepare` raises `ValueError` for one chunk of three has that chunk's
+- [x] A subclass whose `_prepare` raises `ValueError` for one chunk of three has that chunk's
       events counted on `losses().dropped` once, with a line naming `ValueError`. The other two
       chunks are sent, and neither `deliver` nor `emit` raises.
-- [ ] `_send` keeps 1.x behaviour:
+- [x] `_send` keeps 1.x behaviour:
   - A `400` raises `SinkDeliveryError` after 1 request with `failed == 1`.
   - A `503` throughout makes `max_retries + 1` requests.
   - A `413` with the default `splittable` is the counted abandonment, and with `splittable=True` it
@@ -318,24 +348,27 @@ sink, not only through `_send`, and no rule here can forbid it. What holds inste
   - With `count_unexpected=False`, an opener's `RuntimeError` is raised from `_send` by identity
     after 1 request, `failed` unmoved and no line written.
   - `tests/test_sinks_http.py`'s two `_send` tests and every `SentrySink` HTTP-fallback test pass
-    with their bodies unedited. The only edits in their files are FR-005's wait patches:
-    `tests/test_sinks_http.py`'s `_no_sleep` fixture and `tests/test_classify.py`'s `_sentry`
-    helper.
-- [ ] PR 311's header guards pass with their test bodies unedited:
+    with their bodies unedited. The other edits in their files are the ones FR-005 names: the
+    wait patches (`tests/test_sinks_http.py`'s `_no_sleep` fixture and `tests/test_classify.py`'s
+    `_sentry` helper), `tests/test_classify.py`'s loop roster, and the `match=` FR-005 names in
+    `tests/test_sinks_http.py`.
+- [x] PR 311's header guards pass with their test bodies unedited:
       `tests/test_sinks_http_auth.py`, `tests/test_sinks_http_header_collisions.py`,
       `tests/test_sinks_http_header_names.py`, `tests/test_sinks_http_header_merge.py` and
-      `tests/test_sinks_http_header_roster.py`. No family class gains an override of `_prepare`,
-      `_apply_auth` or `_send`.
-- [ ] Nested runs: a third-party test sink with `deliver` wraps a `SentrySink` on the HTTP fallback,
+      `tests/test_sinks_http_header_roster.py`. The only edits in those files are their
+      `_no_sleep` fixtures and one corpus row of `tests/test_sinks_http_header_collisions.py`
+      whose planted method was the deleted `_sleep_backoff`, now `_round`. No family class gains
+      an override of `_prepare`, `_apply_auth` or `_send`.
+- [x] Nested runs: a third-party test sink with `deliver` wraps a `SentrySink` on the HTTP fallback,
       and its `deliver` calls `inner.emit(batch)` against `503` then `200`. The inner `_send` makes
       2 requests and waits once, and the Sentry event is sent. Inside the inner run
       `run_context().round` reads 1, then 2. After it returns, the wrapper's context still reads
       its own round 1 with its own notes.
-- [ ] Nested runs, inside the sink's own round: a third-party `_outcomes` hook, on its chunk's `2xx`,
+- [x] Nested runs, inside the sink's own round: a third-party `_outcomes` hook, on its chunk's `2xx`,
       calls `self._send` against `503` then `200`. That `_send` makes 2 requests and returns the
       payload, and the chunk's outcome is what the hook returns. The outer run still has 1 round.
-- [ ] `read_deliver` is `None` for `SentrySink` on either backend.
-- [ ] Serves invariants 2, 3, 4, 7 and 13:
+- [x] `read_deliver` is `None` for `SentrySink` on either backend.
+- [x] Serves invariants 2, 3, 4, 7 and 13:
   - each event is offered until it has an outcome, and never after;
   - every wait is the engine's: bounded, idle and cut by the stop event;
   - an orphan call still retries on the caller's thread;
@@ -376,14 +409,24 @@ caller and every nested run (FR-001) each see only their own. A context exposes:
   - `LAST`: only when the round is the run's last.
 - At the end of the run the engine commits each owner's counts through a `Deferral` on that owner,
   under the owner's `_counter_lock`, read at commit time. It then writes every line outside the lock,
-  in registration order. A `BaseException` commits nothing, as SPEC-072 states.
+  in registration order. A `BaseException` commits nothing, as SPEC-072 states. A commit that
+  raises for one owner is announced through the engine's absorbed line and does not stop the
+  others' commits or any line.
+- `drops(owner)`: a `Deferral`-shaped view, `count(counter, n=1)` and `announce(line)`, that
+  registers every count and line `SETTLED` against `owner`. It is what `_items` and `_drop_refused`
+  receive as their 1.x `pending` argument, so both keep their signatures.
 
-The context holds no sink after its run ends, so it adds no global that holds a sink (invariant 12).
+Owners and notes are keyed by identity (`id`), so no third-party `__hash__` or `__eq__` runs. The
+context is cleared when its run ends, so it holds no sink afterwards and adds no global that holds
+a sink (invariant 12).
+
 A round called outside any run (a direct `sink.deliver(batch)`) commits its own ledger when it
 returns. It counts as a one-round run that is its own last and settles unless its verdict fails. So
-`losses()` still moves for a caller that bypasses the engine. Each count names its owner, so a
-delegate that forwards `deliver` (SPEC-075's `LogstashSink`) commits into the `HTTPSink` that made
-the count, never into itself.
+`losses()` still moves for a caller that bypasses the engine. `run_context()` called outside any
+run, as a direct call of a reader's `_outcomes` makes, returns an *immediate* context, in which each
+count and line commits at once as a one-round run that is its own last and settles. Each count
+names its owner, so a delegate that forwards `deliver` (SPEC-075's `LogstashSink`) commits into the
+`HTTPSink` that made the count, never into itself.
 
 **Where each 1.x count lands:**
 
@@ -395,11 +438,17 @@ the count, never into itself.
 | `item_errors`, `rejected_events`, `rejected_records` | events | `ALWAYS` |
 | `dropped_unadjudicated` | events | `ALWAYS`, or `LAST` for a sink declaring `log_foundry_idempotent` (FR-003) |
 
-Each line keeps its 1.x text, and the attempt count it names is the round number. A run in which the
-sink registered any announcement is announced by those lines alone, so a family loss keeps the
-line it has in 1.x and the engine writes no settled line of its own: that is SPEC-072 FR-003's
-refinement of the engine's settled line, which this spec relies on rather than adds. A failed run's catcher still
-writes its line: the worker's abandoned or declined line, the orphan path's, or the adapter's raise.
+Each line keeps its 1.x text, and the attempt count it names is the round number. A settled run in
+which the sink registered a line that will commit is announced by those lines alone, so a family
+loss keeps the line it has in 1.x and the engine writes no settled line of its own. That is SPEC-072
+FR-003's refinement of the engine's settled line. SPEC-072's `_run` did not carry it, since it had
+no context to read, so **this spec adds it**, keyed on lines that will commit rather than lines
+registered: a `LAST` line from an earlier round, which will not commit, does not silence the
+engine's line, so a settled loss is never left unannounced. A third-party bool
+`_handle_response` whose `False` makes its chunk `REJECTED` registers no line of its own, so a
+settled run beside it gets the engine's settled line, which 1.x never wrote. A failed run's catcher
+still writes its line: the worker's abandoned or declined line, the orphan path's, or the adapter's
+raise.
 
 The engine's event-unit totals still land in `log_foundry_counters` as SPEC-072 defines them.
 `HTTPSink.losses()` and each subclass's `losses()` keep their 1.x formula over the 1.x attributes, so
@@ -446,43 +495,50 @@ deliberate, and each is a line in the release notes:
 The drops (`SETTLED`) land at the same moment as in 1.x, when the run settles, and that is the moment
 `emit` returns.
 
+**One message changes with them.** `emit` is SPEC-072's adapter, so its total-failure
+`SinkDeliveryError` is the adapter's, `delivered none of <n> event(s): rejected <r>, unresolved
+<u>, raised <x> after <k> delivery round(s) to <class>`, where 1.x `HTTPSink.emit` raised
+`<class> delivered none of <n> chunk(s)`. It counts events, not chunks, and names counts and the
+class, never a value.
+
 #### Acceptance Criteria:
 
-- [ ] Run context basics:
+- [x] Run context basics:
   - `run_context()` inside a round reports `round` 1, 2 and 3 for three rounds of one run, and
     `notes(owner)` returns the same `dict` in each.
   - Two runs on two threads against one sink never see each other's notes or ledger.
   - A run nested in a round sees a fresh context, and the outer context is restored when it ends.
-- [ ] Commit rules:
+- [x] Commit rules:
   - `when=SETTLED` counts commit for a settled run and not for a failed one.
   - `ALWAYS` commits for both.
   - `LAST` commits only the final round's entries, including in a run ended by the worker's decline.
   - A `BaseException` raised from round two commits nothing, and writes none of the run's lines.
-- [ ] `failed` counts:
+- [x] `failed` counts:
   - Through `emit`, a one-chunk `503` throughout at `max_retries=2` leaves `failed == 1`, as at
     `fda134a`.
   - Through a real `Worker` with `max_retries=3`, the same batch makes 12 requests (as at `fda134a`)
     and leaves `failed == 1` where `fda134a` left 4.
   - Three chunks answered `503` throughout through `emit` leave `failed == 3`, with three lines each
     naming `3 attempt(s)`.
-- [ ] A `503`, `503`, `400` sequence leaves `failed == 1`, with one line naming `3 attempt(s), HTTP 400`.
-- [ ] Oversized events:
+- [x] A `503`, `503`, `400` sequence leaves `failed == 1`, with one line naming `3 attempt(s), HTTP 400`.
+- [x] Oversized events:
   - An oversized event beside a delivered chunk is counted on `dropped_oversized` once, with its 1.x
     line.
   - Beside a chunk answered `400`, the run fails and `dropped_oversized` stays 0.
-- [ ] A lone `413` refusal:
+- [x] A lone `413` refusal:
   - Beside a chunk answered `400`, the run fails, `dropped_oversized` stays 0 and through a real
     `Worker` `failed_batches == 1`.
   - Beside a delivered chunk, it is counted on `dropped_oversized` once.
-- [ ] A batch of three chunks whose every `_body` raises makes no request, counts
+- [x] A batch of three chunks whose every `_body` raises makes no request, counts
       `losses().dropped == n` with one line, settles, and leaves `flush()` truthy.
-- [ ] A settled family run with a loss writes exactly its 1.x line or lines and no engine line.
+- [x] A settled family run with a loss writes exactly its 1.x line or lines and no engine line.
       `tests/test_diag.py`'s roster covers every new call site, and no line carries a value.
-- [ ] `log_foundry.health().sink` for each family class, after each FR-001 case, equals
-      `sink.losses()` computed by its 1.x formula.
-- [ ] A forked child that finds the counters' lock held by a parent thread completes a family round
+- [x] `log_foundry.health().sink` for each family class equals `sink.losses()` computed by its
+      1.x formula, after each of FR-005's five twin-path responses (`200`; `400`; `503` then `200`;
+      an unreadable `2xx`; an oversized event) on the orphan path.
+- [x] A forked child that finds the counters' lock held by a parent thread completes a family round
       within 5 s, and its counts add to the inherited totals.
-- [ ] Serves invariants 2, 11 and 12:
+- [x] Serves invariants 2, 11 and 12:
   - every event is in one counted term exactly once, and a failed run counts no drop;
   - every line's attempt count is true;
   - the run context gives a forked child nothing to hang on.
@@ -517,7 +573,10 @@ replaces the three `_abandon_unadjudicated` copies. It:
 Each reader passes its own `detail`, so each line is byte-identical to its 1.x text. Every reader
 calls it on every route the 1.x copy covered (undecodable, non-object, misaligned,
 self-contradicting, over the response bound). It calls it first of all for a body SPEC-070's
-`_read_failed` flags. The round also calls it for a reader that raised (FR-001).
+`_read_failed` flags. The round also calls it for a reader that raised, and for one whose result
+is not one `Outcome` per event (FR-001), with the details `reading a 2xx response raised <Type>`
+and `reading a 2xx response gave no outcome per event`. It registers its line even for an empty
+chunk, as each 1.x copy wrote it.
 
 An `UNKNOWN` event never fails a run (SPEC-072), as a 1.x unadjudicated chunk settled. A shipped
 family sink is not idempotent, so its `UNKNOWN` is final at once, and `_unadjudicated` counts and
@@ -527,38 +586,46 @@ once per run, and only when it ended the run unadjudicated. A later round that a
 nothing.
 
 Each reader keeps `_handle_response(payload, items) -> bool` for a direct 1.x caller. It runs
-`_outcomes` in a context outside any run, commits that context at once as FR-002 describes, and
-returns `False` exactly when every outcome is `REJECTED`. So `tests/test_public_surface.py`'s calls
-and OTLP's hostile-bytes test read what they read at `fda134a`.
+`_outcomes` in a one-round context of its own, pushed whatever else is running, and commits that
+context when `_outcomes` returns, as FR-002 describes for a round outside any run. It returns
+`False` exactly when the chunk is non-empty and every outcome is `REJECTED`. The non-empty clause
+is what keeps `tests/test_sinks_otlp.py::test_handle_response_never_raises_on_hostile_bytes`,
+which calls it with an empty chunk and expects `True` for six payloads, reading what it read: "every
+outcome `REJECTED`" holds vacuously for no outcomes. One bool differs from 1.x as a result, and no
+existing test covers it: 1.x `OTLPSink` returned `False` for an empty chunk beside a positive
+`rejectedLogRecords`, and the shim returns `True`. So `tests/test_public_surface.py`'s calls and
+OTLP's hostile-bytes test read what they read at `fda134a`.
 
 #### Acceptance Criteria:
 
-- [ ] `_abandon_unadjudicated` is defined nowhere in `src/`. `HTTPSink._unadjudicated` is the only
-      definition that writes `dropped_unadjudicated`, and an AST check holds that for every family
-      class.
-- [ ] For each reader, every unadjudicated case in its existing tests behaves as at `fda134a`: the
+- [x] `_abandon_unadjudicated` is defined nowhere in `src/`. `HTTPSink._unadjudicated` is the only
+      definition that writes `dropped_unadjudicated`, beside `HTTPSink.__init__`'s zero, and an AST
+      check holds that for every family class.
+- [x] For each reader, every unadjudicated case in its existing tests behaves as at `fda134a`: the
       same line text, the same `dropped_unadjudicated`, one request, nothing resent, and `flush()`
       truthy.
-- [ ] `ElasticsearchSink` with items `[ok, error, ok]` returns `[ACCEPTED, REJECTED, ACCEPTED]` and
+- [x] `ElasticsearchSink` with items `[ok, error, ok]` returns `[ACCEPTED, REJECTED, ACCEPTED]` and
       `item_errors == 1`. `[error, error]` fails a one-chunk run, and `emit` raises.
-- [ ] `HoneycombSink` statuses `[202, 400, 202]` return `[ACCEPTED, REJECTED, ACCEPTED]` and
+- [x] `HoneycombSink` statuses `[202, 400, 202]` return `[ACCEPTED, REJECTED, ACCEPTED]` and
       `rejected_events == 1`. Statuses `[400, 400, 400]` fail a one-chunk run.
-- [ ] `OTLPSink`:
+- [x] `OTLPSink`:
   - `rejectedLogRecords` of 2 of 5 returns two `REJECTED` and three `ACCEPTED`, with
     `rejected_records == 2`.
   - 5 of 5 fails the run.
   - `"9" * 30` is `UNKNOWN`, through `_unadjudicated`.
-- [ ] A body a reader cannot read is `UNKNOWN` for all four readers, one request each. The cases are
+- [x] A body a reader cannot read is `UNKNOWN` for all four readers, one request each. The cases are
       `tests/test_sinks_http_body_read.py`'s three `_READ_ERRORS`, a truncated `Content-Length` body
       and a truncated chunked one. An empty `2xx` body is `ACCEPTED` for `OTLPSink` and `UNKNOWN` for
       the other three, as SPEC-070 leaves them.
-- [ ] A third-party `ElasticsearchSink` subclass declaring `log_foundry_idempotent = True` gets an
+- [x] A third-party `ElasticsearchSink` subclass declaring `log_foundry_idempotent = True` gets an
       unreadable `2xx` and then a `200`. It makes 2 requests, ends with `dropped_unadjudicated == 0`,
       and writes no unadjudicated line. Unreadable throughout at `max_retries=2`, it makes 3 requests
       and counts `dropped_unadjudicated == n` once, with one line.
-- [ ] Each reader's `_handle_response`, called directly, returns the bool it returned at `fda134a`
-      for every payload in that reader's existing tests, and moves the same counters.
-- [ ] Serves invariants 2, 7 and 11:
+- [x] Each reader's `_handle_response`, called directly, returns the bool its 1.x code returned for
+      every payload in that reader's existing tests, and moves the same counters. The expectations
+      were recorded from the readers at the Phase 2 commit (`caaaba85`), still the build base's
+      1.x code, so the test is a differential oracle, never recomputed from the shims.
+- [x] Serves invariants 2, 7 and 11:
   - each event is counted once, even across an idempotent resend;
   - a chunk wholly rejected still fails, while a partial one reports;
   - each line keeps its type-only, count-true text.
@@ -592,22 +659,36 @@ one on its 1.x path.
   - Its `emit` raises on total failure and returns on partial success. The worker's 1.x resend is
     what a total failure gets.
 
-**The base decides per class, in `HTTPSink.__init_subclass__`.** A class whose own body defines
-`deliver` is left alone. For every other subclass it computes eligibility from the new class's MRO
-down to `HTTPSink`:
+**The base decides per class, in `HTTPSink.__init_subclass__`.** It reads every member through
+`sinks.base`'s static accessors (`_class_member`, `_MRO`, `_NAMESPACE`), comparing positions in the
+MRO and finding `HTTPSink`'s own position by identity, so no metaclass hook runs and no class is
+compared with `==`.
 
-- **ineligible** when a class above `HTTPSink` in the MRO defines `emit`, or when the first class
-  defining `_handle_response` comes before the first defining `_outcomes`;
-- **eligible** otherwise.
+- It writes a private class flag, `_READS_BOOL`, on **every** subclass, `False` included: true when
+  the first class defining `_handle_response` comes before the first defining `_outcomes`. The
+  round reads a class with the flag through `HTTPSink._outcomes`, which is the override's bool.
+- A class whose own body defines `deliver` is then left alone.
+- For every other subclass the eligibility slice runs from the new class down to the **nearest
+  ancestor whose own body defines a non-`None` `deliver`**: `HTTPSink`, or a third party's
+  engine-native subclass. So a plain child of a third party's engine-native subclass keeps that
+  parent's `deliver`.
+- The class is **ineligible** when a class in that slice defines `emit`, or when its
+  `_handle_response` comes before its `_outcomes` and inside the slice; **eligible** otherwise.
 
 It then assigns `deliver` on the class only where the inherited value is wrong:
 
-- An ineligible class gets `deliver = None`. SPEC-072's static lookup offers `deliver` only when it
-  is a plain function, so `None` is not offered.
-- An eligible class whose inherited `deliver` is `None` gets `deliver = HTTPSink.deliver` back. That
-  happens when it defines `_outcomes` below an ancestor's `_handle_response`, and its MRO holds no
-  `emit` override. Because an `emit` override makes a class ineligible, restoring `deliver` can never
-  bypass one.
+- An ineligible class gets `deliver = None`, and a second private class flag,
+  `_DELIVER_WITHDRAWN = True`, marks that `None` as the base's own. SPEC-072's static lookup offers
+  `deliver` only when it is a plain function, so `None` is not offered.
+- An eligible class gets its `deliver` back **only over a `None` the base itself assigned**: when
+  the `deliver` it inherits is `None` and the class holding that `None` carries
+  `_DELIVER_WITHDRAWN`. It gets the nearest non-`None` `deliver` above it, which is
+  `HTTPSink.deliver` unless a third party's engine-native ancestor defines its own. That happens
+  when it defines `_outcomes` below an ancestor's `_handle_response`, and its slice holds no `emit`
+  override. Because an `emit` override in the slice makes a class ineligible, restoring `deliver`
+  can never bypass one.
+- A third party's own `deliver = None` is an opt-out. It carries no `_DELIVER_WITHDRAWN`, so
+  neither that class nor any plain child of it is ever restored.
 
 The shipped classes are eligible, and so are a third-party subclass that overrides only other hooks
 and one that overrides both `_handle_response` and `_outcomes`. The detection is static, by class and
@@ -623,33 +704,42 @@ and the worker resent chunks that had landed. Now the raise costs its chunk:
 
 #### Acceptance Criteria:
 
-- [ ] `read_deliver` returns the bound `deliver` for an instance of each of the nine shipped classes.
+- [x] `read_deliver` returns the bound `deliver` for an instance of each of the nine shipped classes.
       An AST-derived roster over the family asserts that no shipped class defines `emit`, `deliver`
       or `deliver = None`, and that each is eligible.
-- [ ] A third-party `HTTPSink` subclass whose `emit` calls `super().emit(batch)` is not offered
+- [x] A third-party `HTTPSink` subclass whose `emit` calls `super().emit(batch)` is not offered
       `deliver`.
   - Through a real `Worker` with `max_retries=2`, against an endpoint answering `400` throughout,
     its `emit` is called 3 times with 3 requests in all, and `failed_batches == 1`.
   - Against `503` then `200`, its events land once.
-- [ ] A third-party subclass of `HTTPSink`, and one of `ElasticsearchSink`, whose
+  - On the orphan path, `info()` outside a span against `503` throughout makes `s + 1` requests
+    through its `emit`, and `orphan_lost == 1`.
+- [x] A third-party subclass of `HTTPSink`, and one of `ElasticsearchSink`, whose
       `_handle_response(self, payload, items)` returns `False` are not offered `deliver`.
   - Through a real `Worker` with `max_retries=2` and a one-chunk batch, `emit` raises each time and
     the worker makes 3 attempts.
   - Beside a second chunk whose override returns `True`, `emit` returns and neither chunk is resent.
-- [ ] The `ElasticsearchSink` subclass above has its override called on every `2xx`, and
+  - On the orphan path, `info()` outside a span against `503` throughout makes `s + 1` requests
+    through its `emit`, and `orphan_lost == 1`.
+- [x] The `ElasticsearchSink` subclass above has its override called on every `2xx`, and
       `ElasticsearchSink._outcomes` is never called for it.
-- [ ] Eligibility of other third-party subclasses:
+- [x] Eligibility of other third-party subclasses:
   - A subclass overriding only `_render` or `_body` is offered `deliver`.
   - One defining both `_handle_response` and `_outcomes` is offered it.
   - `B(A)`, where `A` overrides `_handle_response` and `B` adds `_outcomes`, is offered it, with
     `A` still not offered.
-  - `B(A)`, where `A` overrides `emit` and `B` adds `_outcomes`, is not offered it.
-- [ ] A third-party `_handle_response` that raises `ValueError` for one chunk of two leaves the other
+  - `B(A)`, where `A` overrides `emit` and `B` adds `_outcomes`, is not offered it, and neither is
+    `B(A)` where `A` overrides both `emit` and `_handle_response` and `B` adds `_outcomes`.
+  - A third-party class setting `deliver = None` is not offered it, and neither is its child that
+    adds `_outcomes`.
+  - A plain child of a third-party subclass that defines its own `deliver` is offered that
+    parent's `deliver`.
+- [x] A third-party `_handle_response` that raises `ValueError` for one chunk of two leaves the other
       chunk delivered and `emit` returning. The raising chunk is counted on `dropped_unadjudicated`
       once, with a line naming `ValueError`.
-- [ ] `tests/test_public_surface.py`'s existing pins on the family's hooks pass unedited, and
+- [x] `tests/test_public_surface.py`'s existing pins on the family's hooks pass unedited, and
       `_handle_response`'s signature is `(self, payload: bytes, items: list[_Item]) -> bool`.
-- [ ] Serves invariants 6, 7 and 10:
+- [x] Serves invariants 6, 7 and 10:
   - an eligible and an ineligible subclass each keep the ledger their path owes;
   - total failure raises from every `emit` a 1.x caller reaches;
   - the surface only grows.
@@ -729,14 +819,19 @@ engine guarantees:
 **Tests that pin a removed mechanism are rewritten:**
 
 - **The wait patches.** `http.py` loses its only call to `wait` with `_sleep_backoff`, and so its
-  import. Twelve test files at `c4e51fbd` patch `log_foundry.sinks.http.wait` (the instrument is
-  `grep -rln 'log_foundry.sinks.http.wait\|http_module, "wait"' tests/`), and a `monkeypatch`
-  of a missing attribute raises, so each is re-pointed at the engine's wait:
+  import. Thirteen sites at `c4e51fbd` patch `log_foundry.sinks.http.wait`, and a `monkeypatch` of a
+  missing attribute raises. Twelve are in the files the instrument finds (`grep -rln
+  'log_foundry.sinks.http.wait\|http_module, "wait"' tests/`). The thirteenth is
+  `tests/test_sink_losses.py`'s `_no_sleep`, which builds the path with an f-string over a tuple of
+  module names holding `"http"`, so the grep cannot see it. Each is re-pointed at the engine's
+  wait, `log_foundry.sinks._retry.wait`, which `_engine._wait` calls through the module:
   - the autouse `_no_sleep` fixtures of `tests/test_sinks_http.py`, `test_sinks_http_render.py`,
     `test_sinks_honeycomb.py`, `test_sinks_otlp.py`, `test_sinks_http_body_read.py`,
     `test_wrapper_failures.py`, `test_sinks_http_auth.py`, `test_sinks_http_header_collisions.py`,
     `test_sinks_http_header_names.py`, `test_sinks_http_header_merge.py` and
     `test_sinks_http_header_roster.py`, with no test body edited;
+  - `tests/test_sink_losses.py`'s `_no_sleep`, whose tuple loses `"http"` and which patches
+    `_retry.wait` beside the per-module patches it keeps;
   - `tests/test_sinks_otlp.py::test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal`
     spies on the engine's wait, still asserting 3 requests and two waits on the sink's signal;
   - `tests/test_sinks_http_body_read.py::test_retry_after_survives_a_failed_body_read` records the
@@ -748,7 +843,8 @@ engine guarantees:
 - `tests/test_sinks_http_url.py`'s two `sink._sleep_backoff = ...` assignments patch a deleted
   method. In its `_counted_at_one_attempt` helper the assignment records waits for the "takes no
   backoff" assertion, which would pass vacuously, so the helper records the engine's waits
-  instead. In `test_an_invalid_url_failed_every_request_without_a_socket` the run's stop signal,
+  instead, through a `threading.Event` subclass set as the sink's stop signal that records each
+  `wait`. In `test_an_invalid_url_failed_every_request_without_a_socket` the run's stop signal,
   set before `emit`, replaces it.
 - `tests/test_sink_retry.py`'s interruptible-wait roster loses its `_sleep_backoff` branch.
   - Its derived module set is pinned to the set at the build's base minus `http`, so `http` leaving
@@ -774,18 +870,39 @@ engine guarantees:
     pass with their bodies unedited.
 - `tests/test_deferral.py`: `HTTPSink`'s `DEFERRING_SITES` entry and its two `IMMEDIATE` entries move
   to the run context.
-  - The gate counts a `count(..., when=SETTLED)` as a deferred write. So `dropped_oversized` and
-    `_unrenderable` are still derived as dropped counters, written only by a commit.
+  - `DEFERRING_SITES` lists `_engine._commit` beside `_run`, the one commit of every run context.
+  - A new shape check holds a run-context `count` of a dropped counter to `when=When.SETTLED`. It
+    recognises the call by shape (an attribute call `count` with three or more positional
+    arguments, the second the counter's name), and fails closed on a name that is not a string
+    literal. A fixture corpus asserts each finding's reason and the silence of a `Deferral.count`.
+    So `dropped_oversized` and `_unrenderable` are still derived as dropped counters, committed
+    only by a settled run.
   - No floor in that file or in `tests/test_worker_predicate_roster.py` is lowered.
 - The OTLP truncated-`2xx` test that replaces `sink._handle_response` on the instance spies on
   `_outcomes` instead.
+- **`emit`'s total-failure message** (FR-002) is the adapter's, so two `match=` arguments that
+  quoted 1.x `HTTPSink.emit`'s own raise, `delivered none of <n> chunk`, now quote the adapter's
+  `delivered none of <n> event`, with every other assertion unedited:
+  `tests/test_sinks_http.py::test_every_chunk_failing_is_the_total_failure_the_worker_retries`
+  (3 events) and
+  `tests/test_sinks_elasticsearch.py::test_every_chunk_rejecting_every_item_is_a_total_failure`
+  (4 events).
+- `tests/test_encode.py`'s `derive`, the gate deriving which classes reach `json.dumps` from
+  `emit`, follows a callable passed as a `deliver=` keyword as a call, since `HTTPSink.emit`
+  reaches its round only as `emit_via_deliver(..., deliver=self._round)`. Without that the nine
+  family classes drop out of its roster. One corpus case, an engine sink whose round reaches
+  `json.dumps` unguarded, is added; the roster's floor is not lowered.
+- `tests/test_declared_exceptions.py`'s `_shipped_readers` reads a reader of `_outcomes` as well
+  as one of `_handle_response`, so row 4 keeps finding the four readers.
+- One corpus row of `tests/test_sinks_http_header_collisions.py` planted its header write in the
+  deleted `_sleep_backoff`; it plants it in `_round`, and its id becomes `in-round`.
 
 The build runs the suite before editing any test and reports every failing id in the PR body. Each
 id is either one named above or a test the build edits, and the PR body gives each edited test's
 removed mechanism. A test that pinned a behaviour named in `docs/invariants.md` is not edited unless
 it is named above, with its invariant still asserted.
 
-**Prose and records, at completion.** The two decisions below are rewritten in place, each with a
+**Prose and records, at completion.** The decisions below are rewritten in place, each with a
 dated History entry, at the sentences named, as SPEC-070 leaves them. The completion ritual records
 one new decision in `docs/decisions/sink-delivery/`. Its fence states:
 
@@ -818,52 +935,73 @@ The rewrites and markers:
   - In *Rejected: `bytes | None`*, "lets `json.loads(None)`'s `TypeError` escape `emit`, so the batch
     is re-sent" becomes "makes the override raise on every unreadable body, which the round's guard
     then counts unadjudicated even where the override meant success".
-- Superseded markers, each at the sentence still stating the old mechanism:
-  - *A client exception costs its chunk*: "guarded *inside* `_send`" becomes "inside the round's
-    request".
+  - In *Rejected: a keyword parameter `read_failed`*, the `TypeError` "out of `emit`" that "the
+    worker re-sends" becomes a `TypeError` the round's guard counts unadjudicated on every
+    unreadable body.
+- Rewritten in place too, each with a dated History entry, at the sentence still stating the old
+  mechanism:
   - *A protocol's retry set is a private predicate hook*: "read at `_send`'s one site" becomes "read
-    at the one classification FR-001 describes".
+    at the one classification FR-001 describes", and its rejected per-sink retry set on the worker
+    records that SPEC-073 made a `REJECTED` HTTP request final.
   - *A `dropped` count is written only by a `Deferral` commit*: `HTTPSink`'s sites now commit
     through the run context.
+  - The completion's grep found five more decisions stating the old mechanism, each rewritten the
+    same way: *A sink declares what it retries* (the twelve loops, `HTTPSink._send`'s among them,
+    the floor of twelve, and "the worker still re-sends a raised batch"); *A populated partial
+    success is counted, never retried* (a fully rejected chunk resent by the worker, counted once
+    per attempt, immediately); *A Honeycomb batch response is a per-event verdict* (the same);
+    *The sinks keep four declared exceptions* (row 2's inherited loop); and *The response is read
+    under a bound* (`_send` abandoning an oversized non-`2xx`). *A sink may report per event*
+    gains a History entry saying the HTTP family adopted it.
+  - *A client exception costs its chunk* is **not** edited. Its "guarded *inside* `_send`" is the
+    four AWS sinks' `_send`, not `HTTPSink._send`, and the decision names no HTTP sink, so this
+    spec's earlier instruction to mark it was mis-aimed.
+- `docs/architecture.md`'s statement that a `dropped` count is made only by an `emit` that
+  returned gains a superseded marker for the HTTP family, and its open item on a `timeout` too large
+  for a socket names `_exchange` where it named `HTTPSink._send`.
 - The search state's scope is stated in the docstrings of `MAX_BUDGET_REDUCTIONS` ("one `emit` may
   make") and `_chunk_budget`, which become "one run". *A destination's limit is found by halving the
   budget* states no scope and is not edited.
 - `docs/invariants.md`:
   - Entry 7's "only a `2xx` rejecting every record of every chunk raises there" gains "or, through
     `deliver`, fails the run".
-  - Entry 7's recorded exceptions gain a batch whose every `_body` raises, beside SPEC-069's "a
-    batch of nothing but events the sink cannot encode", which replaced the all-unrenderable HTTP
-    batch.
+  - Entry 7's recorded exceptions gain a batch whose every chunk's request cannot be built (a
+    `_body`, `_prepare` or `_apply_auth` that raises, or a `Request` that cannot be built), beside
+    SPEC-069's "a batch of nothing but events the sink cannot encode", which replaced the
+    all-unrenderable HTTP batch.
   - Entry 2's list of deferring sites names the run context for `HTTPSink`.
 - The README's HTTP-family retry paragraph, the docstrings of `HTTPSink`, `_send` and the three
-  readers, and `docs/component-inventory.md`'s `http` row describe the round.
+  readers, and `docs/component-inventory.md`'s `http` row describe the round. The README's OTLP
+  paragraph, which said a wholly rejected chunk engages the worker's retry, and its general
+  statement that a sink that delivered nothing raises so the worker's retry engages, say what the
+  engine does instead. The inventory's delivery-engine row names the run context.
 
 #### Acceptance Criteria:
 
-- [ ] `tests/test_sink_losses.py` and `tests/test_sinks_http_body_read.py` pass, and every test in
+- [x] `tests/test_sink_losses.py` and `tests/test_sinks_http_body_read.py` pass, and every test in
       them not named above is unedited (`git diff` on each file touches only the named tests and
       the wait patches named above).
-- [ ] The named "pass unedited" tests in `tests/test_sinks_http_render.py` and
+- [x] The named "pass unedited" tests in `tests/test_sinks_http_render.py` and
       `tests/test_sinks_otlp.py` pass with their files unedited at those tests.
-- [ ] Each rewritten test above asserts the figure stated for it. Each one whose figure changes
+- [x] Each rewritten test above asserts the figure stated for it. Each one whose figure changes
       fails at the build's base. A test whose only edit re-points a wait patch keeps its figures
       and need not.
-- [ ] Twin paths, for each of the nine shipped classes: the same scripted responses through a real
+- [x] Twin paths, for each of the nine shipped classes: the same scripted responses through a real
       `Worker` and through an orphan `info()` outside a span leave equal `losses()` after each, and
       equal request counts. The responses are `200`; `400`; `503` then `200`; an unreadable `2xx`;
       and an oversized event.
-- [ ] Twin forms, for each of the nine: `emit(batch)` and an orphan run through `deliver`, which
+- [x] Twin forms, for each of the nine: `emit(batch)` and an orphan run through `deliver`, which
       have the same budget `s`, leave equal `losses()`, equal request bodies in the same order and
       equal stderr lines over the same responses.
-- [ ] The model test runs every seed with a family sink behind a scripted opener. No event is
+- [x] The model test runs every seed with a family sink behind a scripted opener. No event is
       accepted twice, and every event is accepted or inside one counted term.
-- [ ] The two pinned rosters each fail when mutated once. Deleting `http` from the expected
-      retry-module set reddens `tests/test_sink_retry.py`. Restoring a `for attempt` loop in `_send`
-      reddens SPEC-070's roster.
-- [ ] Each decision named above carries its rewrite and a dated History entry. The build runs a
+- [x] The two pinned rosters each fail when mutated once. Expecting `http` back in the
+      retry-module set (dropping the pin's `- {"http"}`) reddens `tests/test_sink_retry.py`.
+      Restoring a `for attempt` loop in `_send` reddens SPEC-070's roster.
+- [x] Each decision named above carries its rewrite and a dated History entry. The build runs a
       `grep` and reports it: no file under `docs/` or in `README.md` still says `_send` retries the
       chunk path, or that the worker resends an HTTP batch that delivered nothing.
-- [ ] Serves invariants 2, 6 and 7:
+- [x] Serves invariants 2, 6 and 7:
   - the ledger balances for every class on both delivery paths and both forms;
   - a run that delivered nothing raises or fails, while a partial one reports.
 
@@ -881,41 +1019,82 @@ class When(enum.Enum):
     LAST = "last"          # committed only if this round is the run's last
 
 class RunContext:
-    round: int                                             # 1-based, the round in progress
+    round: int                                             # read-only, 1-based, the round in progress
     def notes(self, owner: object) -> dict[str, object]: ...   # per run, per owner, across rounds
-    def count(self, owner: _Counted, name: str, n: int, *, when: When) -> None: ...
+    def count(self, owner: _Counted, name: str, n: int, *, when: When) -> None: ...  # a zero is not kept
     def announce(self, line: Callable[[], None], *, when: When) -> None: ...
+    def drops(self, owner: _Counted) -> _Drops: ...        # a Deferral-shaped view, all SETTLED
+    # private: _begin(n) records the round; _committed(settled=, final=) selects what commits;
+    # _close() clears it when its run ends; an immediate context commits each entry at once
 
-def run_context() -> RunContext: ...   # the innermost run on the calling context (a ContextVar
-                                       # stack), or a detached one-round run outside any run
+class _Drops:                                              # count(counter, n=1), announce(line)
+    ...
 
+_RUNS: ContextVar[tuple[RunContext, ...]]                  # the runs on the calling context, innermost last
+
+def run_context() -> RunContext: ...   # the innermost run on the calling context, or, outside any
+                                       # run, an immediate context whose entries commit at once
+def detached(call, failed) -> T: ...   # call as a one-round run of its own, pushed whatever else is
+                                       # running, committed when it returns (settled unless failed)
+def one_round(round_fn, batch) -> Verdict: ...   # a sink's deliver: inside a run, part of it;
+                                                 # outside one, detached
+def _commit(owners, lines) -> None: ...          # one Deferral per owner, then every line; listed
+                                                 # in tests/test_deferral.py's DEFERRING_SITES
+def _uncounted(fault, n, what) -> None: ...      # the absorbed line for a commit that raised
+
+# _run pushes a RunContext for the whole run, records each round on it, commits it after the
+# engine's own Deferral, and writes its settled line only when no sink line will commit.
 # used from SPEC-072, not added here: run_delivery(..., worker_retries=w | None); the budget table
 # of FR-001; emit_via_deliver(sink, batch, *, deliver=None); _run(sink, deliver, counters, batch,
-# *, sink_retries, worker_retries, stop, decline); the static lookup that offers only a plain function.
+# *, sink_retries, worker_retries, stop, decline); outcomes_of; the static lookup that offers only
+# a plain function.
 
 
 # src/log_foundry/sinks/http.py
+class _Pending(Protocol):                                  # what _items and _drop_refused take as
+    def count(self, counter: str, n: int = 1) -> None: ...  # pending: a Deferral or RunContext.drops
+    def announce(self, line: Callable[[], None]) -> None: ...
+
+@dataclass(frozen=True)
+class _Answer:                                             # _exchange's classification of one request
+    outcome: Outcome | None                                # None: a 413 the caller may split
+    payload: bytes; retry_after: float | None; detail: str; error: Exception | None
+
+@dataclass
+class _Sent:                                               # what _send's one-request rounds leave
+    answer: _Answer | None; unbuilt: Exception | None
+
 class HTTPSink:
     log_foundry_counters: SinkCounters                     # SPEC-072's event-unit totals
     failed: int                                            # requests, as in 1.x
     dropped_oversized: int                                 # events, SETTLED, as in 1.x
     dropped_unadjudicated: int                             # new on the base; 0 unless a reader gives up
+    _READS_BOOL: ClassVar[bool]                            # written on every subclass: read 2xx via the bool
+    _DELIVER_WITHDRAWN: ClassVar[bool]                     # this class's deliver = None is the base's
 
-    def __init_subclass__(cls, **kwargs: object) -> None: ...   # FR-004's eligibility
-    def deliver(self, batch: list[dict[str, object]]) -> Verdict: ...   # one round
+    def __init_subclass__(cls, **kwargs: Any) -> None: ...      # FR-004's eligibility
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict: ...   # _engine.one_round(self._round, ...)
                                                            # class attribute None when ineligible
     def emit(self, batch: list[dict[str, object]]) -> None: ...         # the engine inline
     def _round(self, batch: list[dict[str, object]]) -> Verdict: ...
+    def _exchange(self, request, *, splittable: bool, count_unexpected: bool) -> _Answer: ...
+                                                           # FR-001's one classification
+    def _give_up(self, context: RunContext, reason: str, when: When) -> str: ...  # failed + its line
+    def _read(self, payload: bytes, chunk: list[_Item]) -> tuple[Outcome, ...]: ...  # the reader guard
     def _outcomes(self, payload: bytes, items: list[_Item]) -> tuple[Outcome, ...]: ...
     def _unadjudicated(self, items: list[_Item], detail: str, noun: str = "event"
                        ) -> tuple[Outcome, ...]: ...       # the one unreadable-response method
+    def _abandon_unreduced(self, context: RunContext, chunk: list[_Item]) -> None: ...  # was (chunk)
     def _handle_response(self, payload: bytes, items: list[_Item]) -> bool: ...   # unchanged
     def _send(self, body: bytes, *, content_type: str,
               extra_headers: dict[str, str] | None = None,
               splittable: bool = False,
               count_unexpected: bool = True) -> bytes: ... # 1.x contract (SPEC-070's keyword);
                                                            # its rounds run through _engine._run
-    # deleted: _BACKOFF_BASE, _sleep_backoff, _deliver, _send's for-attempt loop
+    # deleted: _BACKOFF_BASE, _sleep_backoff, _deliver, _abandon, _send's for-attempt loop
+
+# module helpers: _wholly_rejected(outcomes) and _read_as_1x(reader), the readers' bool shim;
+# _positions(batch, items), the forward-only identity walk from items to batch indices; _settle.
 ```
 
 ## API / Interface Contract
@@ -942,22 +1121,28 @@ read_deliver(ElasticsearchSink("http://h", index="i"))         # the bound deliv
 
 ```
 src/log_foundry/sinks/
-├── _engine.py          # + When, RunContext, run_context()
-├── http.py             # deliver/_round/_outcomes/_unadjudicated/__init_subclass__; emit and _send on the engine
+├── _engine.py          # + When, RunContext, _Drops, run_context(), detached(), one_round(), _commit()
+├── http.py             # deliver/_round/_exchange/_outcomes/_unadjudicated/__init_subclass__; emit and _send on the engine
 ├── elasticsearch.py    # _outcomes; _handle_response as the 1.x shim; no _abandon_unadjudicated
 ├── honeycomb.py        # likewise
-└── otlp.py             # likewise
+├── otlp.py             # likewise
+└── sentry.py           # one docstring: _send, not the deleted _abandon, counts what it raises
 
 tests/
-├── test_http_rounds.py            # new: FR-001, FR-002 and FR-004 against scripted openers
+├── test_http_rounds.py            # new: FR-001 to FR-004 and FR-005's twins against scripted openers
+├── test_run_context.py            # new: the run context against scripted test sinks (FR-002)
 ├── test_sinks_http_body_read.py   # _BODY_READERS beside the derived _outcomes set
 ├── test_sink_retry.py             # pinned module set; _sleep_backoff branch removed
-├── test_deferral.py               # HTTPSink's sites moved to the run context
+├── test_deferral.py               # HTTPSink's sites moved to the run context; the SETTLED shape check
 ├── test_classify.py               # SPEC-070's loop roster: floor 11, the engine-only check,
 │                                  #   no HTTPSink in _LOOPS, _sentry on the engine's wait
 ├── test_sinks_{honeycomb,otlp,http_refused,http_url}.py   # the named rewrites
+├── test_sinks_{http,elasticsearch}.py   # one match= each: the adapter's total-failure message
+├── test_encode.py                 # derive follows a deliver= callable; one corpus case
+├── test_declared_exceptions.py    # row 4's readers include the _outcomes definers
+├── test_sinks_http_header_collisions.py   # one corpus row planted in _round
 ├── test_numeric_doors.py          # the Retry-After waits read from the engine
-├── (eleven files' _no_sleep fixtures)   # re-pointed at the engine's wait (FR-005)
+├── (eleven files' _no_sleep fixtures, and test_sink_losses.py's)   # the engine's wait (FR-005)
 └── test_invariants_model.py       # + an HTTPSink behind a scripted opener
 ```
 
@@ -972,7 +1157,9 @@ tests/
 ### Phase 2: The round
 
 - Write `HTTPSink._round`, `deliver`, the classification table, the `413` search in the run's notes,
-  the hint and the hook guards.
+  the hint and the hook guards. `__init_subclass__`'s eligibility and the base `_outcomes` and
+  `_unadjudicated` land here, beside the first definition of `deliver`, so no commit offers
+  `deliver` to a bool reader; the three shipped readers stay ineligible until Phase 3.
 - Move `emit` and `_send` onto the engine, keeping `count_unexpected`, and delete `_BACKOFF_BASE`,
   `_sleep_backoff`, `_deliver` and the loop.
 - Run the suite and record every failing id, then rewrite the retry and deferral rosters and the
@@ -980,13 +1167,12 @@ tests/
 
 ### Phase 3: The readers
 
-- Add `_outcomes` and `_unadjudicated`.
-- Move the three readers onto them, keep each `_handle_response` as the shim, and derive
+- Move the three readers onto `_outcomes` and `_unadjudicated`, keep each `_handle_response` as the shim, and derive
   `_BODY_READERS` beside `_outcomes`.
 
 ### Phase 4: Overrides and both paths
 
-- Add `__init_subclass__`'s eligibility and the third-party fixtures.
+- Add the third-party fixtures that hold `__init_subclass__`'s eligibility.
 - Add the worker, orphan and `emit` twin sweeps over the nine classes, and the model-test recorder.
 
 ### Phase 5: Prose and records
@@ -1066,3 +1252,51 @@ tests/
     `_unrenderable` with the same line, since nothing was sent. "A `deliver` of this family never
     raises an `Exception`" covers those sites too. FR-001 gains the `_prepare` criterion, FR-002's
     move 3 and FR-004's departures name the new hooks, and the `dropped` table row says so.
+- 2026-11-08: revised to match the build (`4d0ae2f2` to `e75bf41c`), at completion. Each item is
+  what the build decided or found, and the text above now says it:
+  - S1: SPEC-072's `_run` did not carry FR-003's "no engine settled line beside a sink line"
+    refinement, since it had no context to read. This spec adds it, keyed on lines that will
+    commit rather than lines registered; FR-002 said it relied on it.
+  - S2: a reader's `_handle_response` shim returns `False` exactly when the chunk is non-empty and
+    every outcome is `REJECTED`, and it runs `_outcomes` in a context of its own, pushed whatever
+    else is running.
+  - S3 and the line texts: a request-building fault aggregates per round into one `_unrenderable`
+    count and one line, `<class>, rendering raised <Type>`, naming the first type; a raising reader
+    writes `<class> reading a 2xx response raised <Type>; they may have landed; not retried`; a
+    malformed reader result writes `reading a 2xx response gave no outcome per event`.
+  - S6: `run_context()` outside any run returns an immediate context that commits each entry at
+    once. S9: `_send`'s runs count into a throwaway `SinkCounters`. S10: a third-party
+    `_retryable_status` accepting `413` keeps 1.x's order, so the retry wins. S11 and S12: the
+    Data Model gains the private additions, `RunContext.drops(owner)`, the `_Pending` Protocol,
+    `_READS_BOOL`, `_DELIVER_WITHDRAWN`, `_exchange`, `_give_up`, `_read`, `_Answer`, `_Sent`,
+    `detached`, `one_round` and `_commit`.
+  - FR-004's eligibility, narrowed by the plan review: `__init_subclass__` restores `deliver` only
+    over a `None` the base itself assigned, so a third-party `deliver = None` opt-out and its plain
+    children stay not offered; and the slice ends at the nearest ancestor whose own body defines a
+    non-`None` `deliver`, so a plain child of a third-party engine-native subclass keeps it.
+    Criteria 4.2 and 4.3 gain an orphan-path case each, and 4.5 the opt-out, the engine-native
+    child and an `emit` override beside a bool reader.
+  - N1 and N2: `emit`'s total-failure message is the adapter's `delivered none of <n> event(s):
+    ...`, and two `match=` arguments were edited for it; FR-005 names them, and criteria 1.13 and
+    1.16 account for them. N3: `tests/test_encode.py`'s `derive` follows a callable passed as
+    `deliver=`. FR-005 also names the `tests/test_declared_exceptions.py` reader set and the
+    `tests/test_sinks_http_header_collisions.py` corpus row the build edited.
+  - FR-005's wait-patch list gains its thirteenth site, `tests/test_sink_losses.py`'s `_no_sleep`,
+    an f-string the grep instrument could not see; every patch targets `log_foundry.sinks._retry.wait`.
+  - FR-001's family scan finds 8 modules, `OpenSearchSink` sharing `elasticsearch.py`; criterion
+    1.1 says so. `tests/test_run_context.py` is a new file beside `tests/test_http_rounds.py`.
+  - Found at completion, each stated where it applies rather than left implied:
+    `_abandon_unreduced` stays and now takes the run's context, so a third-party override written
+    to its 1.x signature raises out of the round; the hook guard covers the request-building hooks
+    and the `2xx` readers only, so a raising third-party override of another private method
+    (`_retryable_status`, `_response_limit`, `_items`, `_take` and the rest FR-001 lists) escapes
+    the round as it escaped 1.x `emit`; and *A client exception costs its chunk*, which FR-005 told
+    the completion to mark, is about the AWS sinks' `_send` and is left as it stands.
+  - Criterion 2.9 is narrowed to the five twin-path responses the build measures it over, where it
+    said "after each FR-001 case".
+  - FR-004's mechanism and the base `_outcomes` and `_unadjudicated` were built in Phase 2, beside
+    the first `deliver`, rather than in Phases 3 and 4, so that no commit offered `deliver` to a
+    bool reader. The Phase 2 commit was knowingly red on four ids of
+    `test_every_http_subclass_counts_no_413_drop_when_down`, the `ElasticsearchSink`,
+    `OpenSearchSink`, `HoneycombSink` and `OTLPSink` ids, whose readers were still ineligible, and
+    green from Phase 3.

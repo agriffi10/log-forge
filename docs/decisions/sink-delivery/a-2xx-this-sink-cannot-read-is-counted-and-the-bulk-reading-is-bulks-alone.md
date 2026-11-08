@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A 2xx this sink cannot read is counted, and the `_bulk` reading is argued, never inherited"
-description: "an OTLP `2xx` with a `partialSuccess` that is not an object, a count that is not a usable integer, a body over the response bound, or a body that could not be read counts the chunk on `dropped_unadjudicated` (an upper bound, into `failed`) and settles it; a body that is empty, not JSON or not an object is full success, because OTLP needs no `partialSuccess` to succeed. `_bulk`'s counted reading of an empty or undecodable 2xx is not the family's: a sink takes it only on its own argument, as `HoneycombSink` does. (SPEC-056, SPEC-070)"
+description: "an OTLP `2xx` with a `partialSuccess` that is not an object, a count that is not a usable integer, a body over the response bound, or a body that could not be read counts the chunk on `dropped_unadjudicated` (an upper bound, into `failed`) through `HTTPSink._unadjudicated`, and its events are `UNKNOWN`: never resent by a shipped sink, and never a failed run; a body that is empty, not JSON or not an object is full success, because OTLP needs no `partialSuccess` to succeed. `_bulk`'s counted reading of an empty or undecodable 2xx is not the family's: a sink takes it only on its own argument, as `HoneycombSink` does. (SPEC-056, SPEC-070, SPEC-073)"
 ---
 
 **A 2xx this sink cannot read is counted, and the `_bulk` reading is argued, never inherited** —
@@ -11,25 +11,26 @@ body longer than the 4 MiB response bound — is counted on `dropped_unadjudicat
 as the upper bound, with one `lost N log record(s)` line naming the class and never the body, and
 is **not retried**: the request succeeded, so re-sending could duplicate what landed (*A positional
 response adjudicates all of a chunk or none of it*, SPEC-018). Since SPEC-070 a `2xx` whose body
-could not be read at all is counted the same way (below). The chunk is settled; `losses()` sums
-the counter into `failed`. **What is not counted is as deliberate as what is.** A body that is
+could not be read at all is counted the same way (below). The chunk is counted there through
+`HTTPSink._unadjudicated`, and its events are `UNKNOWN`: never resent by a shipped sink, and never
+a failed run; `losses()` sums the counter into `failed`. **What is not counted is as deliberate as what is.** A body that is
 empty, not JSON, not an object or without a `partialSuccess` is full success here, where
 `ElasticsearchSink` counts an undecodable or non-object `_bulk` body unadjudicated (*A 2xx `_bulk`
 response with no readable verdict is counted, never retried*, #276). The two readings differ because
 the protocols do: a `_bulk` verdict can only come from the body, so no body is no verdict, while an
 OTLP success needs no `partialSuccess` at all and a proxy's page or a protobuf body is not this
 sink's to adjudicate. **`_bulk`'s counted reading is not the family's**: `HTTPSink`'s default
-`_handle_response` still reads any `2xx` as delivered, and a new subclass copies neither reading
+`_outcomes`, through `_handle_response`, still reads any `2xx` as `ACCEPTED`, and a new subclass copies neither reading
 without arguing for it — `HoneycombSink` takes the counted one on its own argument, that its
 per-event verdict too is only in the body (*A Honeycomb batch response is a per-event verdict, read
 all of a chunk or none of it*). **A body that cannot be read at all is counted, and an empty one
 is full success** (SPEC-070 FR-004). *After a status line the status decides; a 2xx whose body
 cannot be read is never re-sent* (#283) reads the body under a guard once the status is in hand and
-hands `_handle_response` an `_UnreadBody`, equal to `b""`, for a read that failed; `_read_failed`
+hands the reader an `_UnreadBody`, equal to `b""`, for a read that failed; `_read_failed`
 tells it from an honestly empty body. This sink asks first, before the response bound: an unreadable
 body may have been an all-rejected `partialSuccess` cut short, so settling it as delivered would
 lose its rejections silently, and it is counted on `dropped_unadjudicated` with the line written for
-an unreadable `partialSuccess`, settled and never re-sent. An empty body is still a success with
+an unreadable `partialSuccess`, its events `UNKNOWN` and never re-sent. An empty body is still a success with
 nothing to say — the one place this sink reads a body differently from the `_bulk` sinks and
 `HoneycombSink`, which count an empty body too because their only verdict is in it (*The sinks keep
 four declared exceptions to their shared rules*, row 4). Before SPEC-070 the hook could not tell the
@@ -45,13 +46,21 @@ on every gate run (`tests/test_sinks_otlp.py`, the truncated-`2xx` cases): a `20
 closes reaches `OTLPSink` unread, equal to `b""`, and is one POST with all five records counted on
 `dropped_unadjudicated`, nothing raised and nothing re-sent — which is also what makes the
 `response.length` check a mutation target, since without it the same bytes parse and raise; the chunked twin raises inside `read(amt)` and arrives the same way. A `2xx`
-over the bound is a different case: the read returns one byte past it and `_handle_response` counts
-the chunk unadjudicated. "Over the bound" is measured on the bytes read, not on the length declared:
+over the bound is a different case: the read returns one byte past it and `OTLPSink._outcomes`
+counts the chunk unadjudicated. "Over the bound" is measured on the bytes read, not on the length declared:
 a body declared at 10 MiB that is cut after 5 MiB is over the bound and counted, while one cut after
 2 MiB returns fewer bytes than asked with bytes still owed, so it is truncated, reaches the sink
-unread and is counted unadjudicated too. Both settle the chunk without a re-send. (SPEC-056 FR-003, FR-004; #283)
+unread and is counted unadjudicated too. Both are `UNKNOWN`; neither is re-sent. (SPEC-056 FR-003, FR-004; #283)
 
 ## History
+
+### 2026-11-08
+
+- **Refined** by SPEC-073: the reader is `OTLPSink._outcomes`, which gives up through the one
+  `HTTPSink._unadjudicated` the three readers share, and an unreadable or unadjudicable chunk's
+  events are `UNKNOWN` rather than a settled chunk: counted the same, never resent by a shipped
+  sink and never a failed run. `HTTPSink`'s default reading is `_outcomes` through
+  `_handle_response`. *Never re-sent* is unchanged.
 
 ### 2026-11-07
 
