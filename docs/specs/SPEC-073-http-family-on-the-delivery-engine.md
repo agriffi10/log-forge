@@ -61,10 +61,14 @@ Figures, each with its instrument and the commit it was measured at:
   defined three times, once on each of those three, with three different line texts.
 - **One retry loop and one backoff constant** (`fda134a`). An AST walk of `http.py` finds one
   `for attempt in range(...)` loop, in `HTTPSink._send`, and one `_BACKOFF_BASE = 0.1` assignment.
-- **Tests that drive a family sink through a real `Worker`** (`fda134a`). Thirteen test files name
-  both `Worker(` and a family class, `SentrySink` or `LogstashSink`. The instrument is
-  `grep -l 'Worker('` over `tests/*.py`, filtered by `grep -l` for the eleven class names. Which of
-  them pin the removed whole-batch resend is FR-005's list.
+- **Tests that drive a family sink through a real `Worker`** (`fda134a`, re-measured at
+  `c4e51fbd`). Thirteen test files at `fda134a`, and fifteen at `c4e51fbd`, name both `Worker(`
+  and a family class, `SentrySink` or `LogstashSink`. The instrument is `grep -l 'Worker('` over
+  `tests/*.py`, filtered by `grep -l` for the eleven class names. It counts co-occurrence, so it is
+  an upper bound: the two files added since, `tests/test_classify.py` (SPEC-070) and
+  `tests/test_numeric_doors.py` (SPEC-066), build their `Worker` around a Redis, SQS, SNS or stub
+  sink and drive no family sink through one. Which files pin the removed whole-batch resend is
+  FR-005's list.
 - **Probe D** (`tests/test_sinks_http_refused.py`). It made 8 requests through
   `Worker(max_retries=3)` at `fda134a`: four whole-batch attempts of a `413` and an opener
   `RuntimeError`. SPEC-070 changed that shape: `HTTPSink._send` now catches an opener's
@@ -72,9 +76,12 @@ Figures, each with its instrument and the commit it was measured at:
   the `413` drop has settled chunk 1, `emit` returns, the worker sees success and the whole run is
   2 requests with the drop counted once
   (`test_an_opener_exception_after_a_drop_is_counted_and_the_drop_settles`). SPEC-070 rebuilt
-  Probe D's tests on an instance-level `_handle_response` that raises on chunk 2's `200`,
-  outside `_send`'s guard, so the raise still escapes `emit` and the probe still makes 8 requests
-  on SPEC-070's tree.
+  Probe D's tests on an instance-level `_handle_response`, set by the file's `_arm` helper, that
+  raises on chunk 2's `200` outside `_send`'s guard, so the raise still escapes `emit` and the
+  probe still makes 8 requests at `c4e51fbd`. Under this spec neither fault keeps its meaning. The
+  raising reader makes its chunk `UNKNOWN` (FR-001, FR-003), and an `UNKNOWN` settles the run, so
+  the drop would be counted. The opener's `RuntimeError` beside the drop now fails the run, which
+  is FR-002's move 2. FR-005 rebuilds each Probe D test on a fault that keeps the rule it pins.
 
 ## Scope
 
@@ -119,8 +126,9 @@ Figures, each with its instrument and the commit it was measured at:
   it, and FR-003 counts that case once.
 - **A compatibility promise for private methods other than the documented hooks.**
   - `_render`, `_body`, `_handle_response`, `_retryable_status`, `_response_limit`, `_item_size`,
-    `_body_reserve`, `_prepare`, `_apply_auth`, `_attempt` and `_send` keep their signatures and
-    meaning.
+    `_body_reserve`, `_prepare`, `_apply_auth`, `_attempt` and `_send` keep the signatures and
+    meaning they have at the build's base. For `_prepare` and `_apply_auth` that meaning is the
+    one PR 311 (`c4e51fbd`) gave them, which this spec does not change.
   - `_deliver` and `_sleep_backoff` are removed, and so are `_abandon`'s and `_abandon_unreduced`'s
     immediate stores. A third-party override of one of them is no longer called.
   - The chunk path no longer calls `_send`, so an override of `_send` still serves `SentrySink`
@@ -151,8 +159,15 @@ Figures, each with its instrument and the commit it was measured at:
 
 - `_items` renders every event and drops what cannot be sent alone.
 - The remaining items are chunked by `_take` as today.
-- Each chunk is sent in **one** request, built by `_body`, `_prepare` and `_apply_auth` and made by
-  `_attempt`, exactly as 1.x builds and makes it.
+- Each chunk is sent in **one** request, exactly as `_send` builds and makes one at the build's
+  base. `_body` builds the body. `_prepare` builds the headers and the optionally compressed
+  bytes, and it calls `_apply_auth`, which writes the `Authorization` value built once at
+  construction (PR 311). `_attempt` makes the request.
+
+The round adds no header of its own. PR 311's header guards read this path: the `extra_headers`
+scan in `tests/test_sinks_http_auth.py` reads every `_prepare` call's third argument and every
+`extra_headers=` keyword in `src/`, and it reports any value other than a `dict` literal or the
+forwarded parameter `extra_headers`. So the round passes one of those two, never `None`.
 
 Nothing in the round waits or retries. The engine (SPEC-072) resends the `RETRYABLE` events in later
 rounds, with the sink's own `max_retry_after`, its stop signal and, on the worker path, SPEC-062's
@@ -206,7 +221,7 @@ waits once per round, where 1.x waited once per chunk.
 - If the `2xx` reader raises, the request succeeded and its events may have landed. The chunk goes
   through the unreadable-response method (FR-003) and its events are `UNKNOWN`.
 
-A `deliver` of this family therefore never raises an `Exception`. Under SPEC-072 an escaped
+A fault in one of those three hooks therefore never escapes `deliver`. Under SPEC-072 an escaped
 exception fails the run, which would report total failure for a batch whose other chunks landed.
 
 **`_send` keeps its 1.x contract** for its callers outside the chunk path: `SentrySink`'s fallback,
@@ -221,7 +236,9 @@ and a third-party subclass that builds its own body.
   counted by neither `_send` nor its run's line, and **re-raised unchanged**, the same object with
   its own traceback. `SentrySink` then counts it on `.transport_errors` as today. The engine never
   sees it: `_send`'s one-request round catches it and returns `REJECTED`, and `_send` raises the
-  stored exception after the run ends.
+  stored exception after the run ends. The one exception to this is a `SinkDeliveryError`
+  (`_PayloadTooLarge` included), which every caller reads as already counted, so `_send` counts it
+  once in `failed` and writes its line, as SPEC-070 leaves it.
 
 `_send` runs its attempts as rounds of one request, through SPEC-072's `_run`. Its budget is
 `max_retries`, its stop event is `log_foundry_stop_signal`, and it has no decline predicate. So
@@ -278,7 +295,8 @@ sink, not only through `_send`, and no rule here can forbid it. What holds inste
       budget. It gets the same requests in the same order as at `fda134a`. When one of those
       requests is answered `503` and resent in round two, round two sends nothing over 300 bytes.
 - [ ] The existing `413` tests in `tests/test_sinks_http.py` and `tests/test_sinks_http_refused.py`
-      pass unedited, apart from the Probe D tests FR-005 names.
+      pass with their bodies unedited, apart from the Probe D tests FR-005 names. Their files'
+      helpers and fixtures change only as FR-005 says.
 - [ ] A subclass whose `_body` raises `ValueError` for one chunk of three has that chunk's events
       counted on `losses().dropped` once, with a line naming `ValueError`. The other two chunks are
       sent, `deliver` raises nothing, and `emit` does not raise.
@@ -290,7 +308,14 @@ sink, not only through `_send`, and no rule here can forbid it. What holds inste
   - With `count_unexpected=False`, an opener's `RuntimeError` is raised from `_send` by identity
     after 1 request, `failed` unmoved and no line written.
   - `tests/test_sinks_http.py`'s two `_send` tests and every `SentrySink` HTTP-fallback test pass
-    unedited.
+    with their bodies unedited. The only edits in their files are FR-005's wait patches:
+    `tests/test_sinks_http.py`'s `_no_sleep` fixture and `tests/test_classify.py`'s `_sentry`
+    helper.
+- [ ] PR 311's header guards pass with their test bodies unedited:
+      `tests/test_sinks_http_auth.py`, `tests/test_sinks_http_header_collisions.py`,
+      `tests/test_sinks_http_header_names.py`, `tests/test_sinks_http_header_merge.py` and
+      `tests/test_sinks_http_header_roster.py`. No family class gains an override of `_prepare`,
+      `_apply_auth` or `_send`.
 - [ ] Nested runs: a third-party test sink with `deliver` wraps a `SentrySink` on the HTTP fallback,
       and its `deliver` calls `inner.emit(batch)` against `503` then `200`. The inner `_send` makes
       2 requests and waits once, and the Sentry event is sent. Inside the inner run
@@ -300,11 +325,13 @@ sink, not only through `_send`, and no rule here can forbid it. What holds inste
       calls `self._send` against `503` then `200`. That `_send` makes 2 requests and returns the
       payload, and the chunk's outcome is what the hook returns. The outer run still has 1 round.
 - [ ] `read_deliver` is `None` for `SentrySink` on either backend.
-- [ ] Serves invariants 2, 3, 4 and 7:
+- [ ] Serves invariants 2, 3, 4, 7 and 13:
   - each event is offered until it has an outcome, and never after;
   - every wait is the engine's: bounded, idle and cut by the stop event;
   - an orphan call still retries on the caller's thread;
-  - a run that delivered nothing raises from `emit`, and a partial one reports.
+  - a run that delivered nothing raises from `emit`, and a partial one reports;
+  - the round sends the headers and credentials construction checked, so no argument PR 311
+    refuses or freezes there is read differently on the chunk path.
 
 ### FR-002: The family's counters keep their 1.x names and units through a family-neutral run context
 
@@ -574,7 +601,8 @@ It then assigns `deliver` on the class only where the inherited value is wrong:
 The shipped classes are eligible, and so are a third-party subclass that overrides only other hooks
 and one that overrides both `_handle_response` and `_outcomes`. The detection is static, by class and
 never by instance. A test that assigns `sink._handle_response` on an instance is spying, not
-subclassing, and FR-005 moves those spies to `_outcomes`.
+subclassing. FR-005 moves the one such spy that keeps a purpose, in OTLP's truncated-`2xx` test, to
+`_outcomes`, and replaces Probe D's `_arm` spy with a fault in the opener's script.
 
 **The departures** are FR-002's moves 3 and 4. A third-party hook that raised escaped `emit` in 1.x,
 and the worker resent chunks that had landed. Now the raise costs its chunk:
@@ -652,35 +680,87 @@ engine guarantees:
 - `tests/test_sinks_otlp.py::test_every_record_rejected_raises_and_the_worker_recounts_per_attempt`
   asserts 1 POST and `rejected_records == 5`, where `fda134a` gave 4 and 20. It is renamed to say it
   counts once.
-- **Probe D** (`tests/test_sinks_http_refused.py`): the opener's `RuntimeError` is refused by
-  SPEC-070's predicate, so it is `REJECTED` at its first attempt and never resent. Four test
-  functions are rewritten, 13 test ids in all:
-  - `test_probe_d_down_counts_no_413_drop` keeps the `RuntimeError` and asserts one round: 2 calls
-    where `fda134a` made 8, `dropped_oversized == 0`, no `413` line, `failed_batches == 1`, and the
-    worker's abandoned line under SPEC-072's wording. It still pins invariant 2's rule that a failed
-    run counts no drop.
-  - `test_every_http_subclass_counts_no_413_drop_when_down` (9 ids) is rewritten the same way, with 2
-    calls each.
-  - `test_the_never_offered_route_defers_too[down]` is rewritten the same way, with 2 calls.
-  - `test_probe_d_once_counts_the_413_drop_once` cannot keep a non-retryable fault, because no run
-    resends it, so its first fault becomes a retryable `URLError`. It then asserts round one's `413`
-    drop and the `URLError`, round two's single request answered `200` (3 calls where `fda134a` made
-    4), and the drop counted once with one line. It still pins the rule that a resend never recounts
-    a drop.
+- **Probe D** (`tests/test_sinks_http_refused.py`). Its tests inject their fault through `_arm`, an
+  instance-level `_handle_response` that raises on chunk 2's `200`. Under this spec that chunk is
+  `UNKNOWN`, which settles the run, so a "down" test would count the drop it exists to forbid.
+  Each test gets a fault in the opener's script instead, and the spy has no use left. The "down"
+  tests pin invariant 2's rule that a failed run counts no drop, so their fault must fail the run:
+  a `400`, which is `REJECTED` for every family class. The "once" tests pin that a resend never
+  recounts a drop, so their fault must be resent: a `URLError`, which is `RETRYABLE`. Six test
+  functions are rewritten, 14 test ids in all. Each id fails at `c4e51fbd`, where every one of
+  these scripts settles its batch after 2 requests and counts the drop.
+  - `test_probe_d_down_counts_no_413_drop` answers `413` then `400`, and asserts one round: 2 calls
+    where `fda134a` and `c4e51fbd` made 8, `dropped_oversized == 0`, no `413` line, `failed == 1`
+    with the `lost 1 request(s); HTTPSink, 1 attempt(s), HTTP 400` line, `failed_batches == 1`, and
+    the worker's abandoned line under SPEC-072's wording, `batch abandoned after 1 emit attempts`.
+  - `test_every_http_subclass_counts_no_413_drop_when_down` (8 ids, one per shipped subclass) is
+    rewritten the same way: 2 calls each, `losses().dropped == 0` and `failed_batches == 1`.
+  - `test_the_never_offered_route_defers_too[down]` is rewritten the same way: 2 calls for its three
+    events, `dropped_oversized == 0` and no line.
+  - `test_probe_d_once_counts_the_413_drop_once` answers `413`, then a `URLError`, then `200`. It
+    asserts round one's `413` drop and `RETRYABLE` event, round two's single request answered `200`
+    (3 calls where `fda134a` and `c4e51fbd` made 4), `failed == 0`, and the drop counted once with
+    one line.
   - `test_the_never_offered_route_defers_too[once]` changes the same way: 3 calls,
     `dropped_oversized == 2` and two lines.
+  - `test_a_fanout_absorbs_the_probe_d_batch` answers its child `413` then `400`. The child's run
+    fails, so its `emit` raises, the child's `losses().dropped` is 0 and the fan-out counts both
+    events, as its existing assertion on `multi.losses()` says. It still pins that a raise
+    discards the child's drop.
+  - `test_an_opener_exception_after_a_drop_is_counted_and_the_drop_settles` keeps its opener
+    `RuntimeError`, which is now FR-002's move 2. It asserts 2 calls as before, `failed_batches ==
+    1`, `losses() == SinkLosses(dropped=0, failed=1)`, no `413` line, the `lost 1 request(s)` line
+    unchanged and the worker's abandoned line. It is renamed to say the drop is not counted. With
+    the `400` tests it pins the same rule on the other `REJECTED` route of FR-001's table.
+  - `test_an_all_413_batch_settles_and_counts_all` and `test_an_orphan_413_settles_inside_the_sink`
+    pass with their bodies unedited: an all-`DROPPED` run settles, as SPEC-072's rule says.
 
 **Tests that pin a removed mechanism are rewritten:**
 
-- `tests/test_sinks_http_url.py`'s `sink._sleep_backoff = ...` assignment patches a deleted method.
-  The run's stop signal, set before `emit`, replaces it.
+- **The wait patches.** `http.py` loses its only call to `wait` with `_sleep_backoff`, and so its
+  import. Twelve test files at `c4e51fbd` patch `log_foundry.sinks.http.wait` (the instrument is
+  `grep -rln 'log_foundry.sinks.http.wait\|http_module, "wait"' tests/`), and a `monkeypatch`
+  of a missing attribute raises, so each is re-pointed at the engine's wait:
+  - the autouse `_no_sleep` fixtures of `tests/test_sinks_http.py`, `test_sinks_http_render.py`,
+    `test_sinks_honeycomb.py`, `test_sinks_otlp.py`, `test_sinks_http_body_read.py`,
+    `test_wrapper_failures.py`, `test_sinks_http_auth.py`, `test_sinks_http_header_collisions.py`,
+    `test_sinks_http_header_names.py`, `test_sinks_http_header_merge.py` and
+    `test_sinks_http_header_roster.py`, with no test body edited;
+  - `tests/test_sinks_otlp.py::test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal`
+    spies on the engine's wait, still asserting 3 requests and two waits on the sink's signal;
+  - `tests/test_sinks_http_body_read.py::test_retry_after_survives_a_failed_body_read` records the
+    engine's waits, still asserting `[2.0]`;
+  - `tests/test_numeric_doors.py`'s `_retry_after_waits` helper records the engine's waits, and the
+    nine ids of `test_a_float_subclass_max_retry_after_is_judged_by_the_number_it_holds` and
+    `test_a_numeric_max_retry_after_is_still_judged_floor_side` read the backoff from
+    `_engine.BACKOFF_BASE`, which equals the deleted `_BACKOFF_BASE` (both `0.1`).
+- `tests/test_sinks_http_url.py`'s two `sink._sleep_backoff = ...` assignments patch a deleted
+  method. In its `_counted_at_one_attempt` helper the assignment records waits for the "takes no
+  backoff" assertion, which would pass vacuously, so the helper records the engine's waits
+  instead. In `test_an_invalid_url_failed_every_request_without_a_socket` the run's stop signal,
+  set before `emit`, replaces it.
 - `tests/test_sink_retry.py`'s interruptible-wait roster loses its `_sleep_backoff` branch.
   - Its derived module set is pinned to the set at the build's base minus `http`, so `http` leaving
     the set is asserted rather than silent.
   - The engine's round loop joins the check that a retry loop waits through `wait`.
-- SPEC-070's loop roster (`_retryable_error` over every `for` loop on `range(...)` naming `retries`)
-  goes from a floor of 12 to 11. It gains a check that `HTTPSink.deliver`, `emit` and `_send` reach
-  `_attempt` only through `_engine`.
+- SPEC-070's loop roster in `tests/test_classify.py` (`_retryable_error` over every `for` loop on
+  `range(...)` naming `retries`) goes from a floor of 12 to 11 (`_LOOP_FLOOR`). It gains a check
+  that `HTTPSink.deliver`, `emit` and `_send` reach `_attempt` only through `_engine`. In the same
+  file:
+  - the floor's corpus test, `test_the_loop_roster_fails_eleven_conforming_loops_on_its_floor`,
+    moves its two ids from 11 and 12 loops to 10 and 11, with its expected message;
+  - `_LOOPS` loses its `HTTPSink` entry, whose `_http` builder records waits through an instance
+    `_sleep_backoff`, so `test_the_sweep_covers_every_retry_loop_the_roster_finds` holds the
+    eleven owners. The `[HTTPSink]` id of each of the four sweeps over `sorted(_LOOPS)` goes with
+    it: `test_a_type_error_is_one_attempt_counted_as_exhaustion_counts`,
+    `test_an_accepted_exception_is_attempted_max_retries_plus_one`,
+    `test_a_keyboard_interrupt_propagates_and_moves_no_counter` and
+    `test_a_predicate_that_raises_fails_at_once_naming_the_original`. Each of the four HTTP cases
+    is re-expressed against `HTTPSink.emit` in `tests/test_http_rounds.py`, with its figures and
+    the engine's waits;
+  - the `_sentry` helper's `monkeypatch.setattr(sink._http, "_sleep_backoff", ...)` raises on a
+    deleted method, so it patches the engine's wait instead. The four `SentrySink` tests that use it
+    pass with their bodies unedited.
 - `tests/test_deferral.py`: `HTTPSink`'s `DEFERRING_SITES` entry and its two `IMMEDIATE` entries move
   to the run context.
   - The gate counts a `count(..., when=SETTLED)` as a deferred write. So `dropped_oversized` and
@@ -719,8 +799,8 @@ The rewrites and markers:
 - `after-a-status-line-the-status-decides-a-2xx-whose-body-cannot-be-read-is-never-re-sent.md`:
   - The fence's "are retried, then counted in `failed`" becomes "are `RETRYABLE`, resent by the
     engine within its budget, and counted in `failed` for the last round's request".
-  - The fence's "a `2xx` settles its chunk (`_bulk` counts it unadjudicated), a `503` retries, a
-    `413` splits, a `400` is abandoned" becomes FR-001's outcome table.
+  - The fence's "a `2xx` settles its chunk (the body readers count it unadjudicated), a `503`
+    retries, a `413` splits, a `400` is abandoned" becomes FR-001's outcome table.
   - The body's "anything escaping escapes `emit`, and the worker re-sends a batch the destination
     may have accepted" becomes "anything escaping a round would fail the engine's run, reporting as
     undelivered a batch the destination may have accepted, so the round guards every hook".
@@ -750,10 +830,13 @@ The rewrites and markers:
 #### Acceptance Criteria:
 
 - [ ] `tests/test_sink_losses.py` and `tests/test_sinks_http_body_read.py` pass, and every test in
-      them not named above is unedited (`git diff` on each file touches only the named tests).
+      them not named above is unedited (`git diff` on each file touches only the named tests and
+      the wait patches named above).
 - [ ] The named "pass unedited" tests in `tests/test_sinks_http_render.py` and
       `tests/test_sinks_otlp.py` pass with their files unedited at those tests.
-- [ ] Each rewritten test above asserts the figure stated for it, and fails at the build's base.
+- [ ] Each rewritten test above asserts the figure stated for it. Each one whose figure changes
+      fails at the build's base. A test whose only edit re-points a wait patch keeps its figures
+      and need not.
 - [ ] Twin paths, for each of the nine shipped classes: the same scripted responses through a real
       `Worker` and through an orphan `info()` outside a span leave equal `losses()` after each, and
       equal request counts. The responses are `200`; `400`; `503` then `200`; an unreadable `2xx`;
@@ -859,8 +942,11 @@ tests/
 ├── test_sinks_http_body_read.py   # _BODY_READERS beside the derived _outcomes set
 ├── test_sink_retry.py             # pinned module set; _sleep_backoff branch removed
 ├── test_deferral.py               # HTTPSink's sites moved to the run context
-├── test_classify.py               # SPEC-070's loop roster: floor 11, the engine-only check
+├── test_classify.py               # SPEC-070's loop roster: floor 11, the engine-only check,
+│                                  #   no HTTPSink in _LOOPS, _sentry on the engine's wait
 ├── test_sinks_{honeycomb,otlp,http_refused,http_url}.py   # the named rewrites
+├── test_numeric_doors.py          # the Retry-After waits read from the engine
+├── (eleven files' _no_sleep fixtures)   # re-pointed at the engine's wait (FR-005)
 └── test_invariants_model.py       # + an HTTPSink behind a scripted opener
 ```
 
@@ -936,3 +1022,32 @@ tests/
 - 2026-11-07: SPEC-070 changed the Probe D premise. An opener `RuntimeError` after a drop is now 2
   requests and `emit` returns, and Probe D was rebuilt on a raising `_handle_response`, which still
   makes 8 requests; the Probe D paragraph under the measured figures is revised to say so.
+- 2026-11-08: re-derived against `c4e51fbd`. Every PR from #293 to #311 has landed since
+  `fda134a`, SPEC-066, SPEC-069 to SPEC-072 and PR 311 among them.
+  - FR-005's Probe D list rested on the opener `RuntimeError` SPEC-070 removed. It is rebuilt on
+    faults in the opener's script: a `400` for the "down" tests, so the run still fails, and a
+    `URLError` for the "once" tests, so it is still resent. Under this design SPEC-070's raising
+    reader would make its chunk `UNKNOWN` and settle the run. The list now also names
+    `test_a_fanout_absorbs_the_probe_d_batch` and the opener-exception test, which this design
+    breaks too. The subclass sweep has 8 ids, not 9; it holds the shipped subclasses only and had
+    8 at `fda134a` as well. The count is 14 ids in six functions, collected with
+    `pytest --collect-only`.
+  - The Worker-test figure moved from 13 to 15 files: SPEC-066 and SPEC-070 each added one that
+    names a family class beside a `Worker` it builds around another sink.
+  - FR-005 gains the test sites that patch what this spec deletes and were not named: twelve files
+    patching `log_foundry.sinks.http.wait` (six of them at `fda134a`, six added since by SPEC-066
+    and PR 311), `tests/test_numeric_doors.py`'s two readers of `_BACKOFF_BASE`, a second
+    `_sleep_backoff` site in `tests/test_sinks_http_url.py`, and SPEC-070's `tests/test_classify.py`:
+    the `HTTPSink` entry of `_LOOPS`, the floor's corpus test and the `_sentry` helper. FR-001's
+    "pass unedited" criteria now say "bodies unedited" and name those helper edits.
+  - PR 311 moved request building: `_apply_auth` writes the `Authorization` value built once at
+    construction. FR-001 now says each chunk's request is built as `_send` builds it at the
+    build's base, names PR 311's `extra_headers` scan, which reads every `_prepare` call, and
+    holds PR 311's header guards to passing with their bodies unedited, under invariant 13. Out of
+    Scope's list of kept private methods means their meaning at the build's base.
+  - FR-001's `count_unexpected=False` paragraph gains SPEC-070's exception for a
+    `SinkDeliveryError`. "A `deliver` of this family never raises" is narrowed to the three
+    guarded hooks, which is what the guard covers. FR-005 quotes the second decision's fence as
+    SPEC-070 left it. FR-004 says which instance spy moves and which goes. FR-005's "fails at the
+    build's base" criterion now applies to the rewrites whose figures change, since a re-pointed
+    wait patch keeps its figures.
