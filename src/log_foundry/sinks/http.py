@@ -2249,7 +2249,7 @@ class HTTPSink:
                 if len(chunk) == 1:
                     self._drop_refused(chunk, drops)
                 else:
-                    self._abandon_unreduced(context, chunk)
+                    self._abandon_unreduced(chunk)
                     _settle(fates, where, (Outcome.REJECTED,) * len(chunk))
                 index += len(chunk)
                 continue
@@ -2443,7 +2443,7 @@ class HTTPSink:
             end += 1
         return items[start:end]
 
-    def _abandon_unreduced(self, context: RunContext, chunk: list[_Item]) -> None:
+    def _abandon_unreduced(self, chunk: list[_Item]) -> None:
         """Records a multi-item chunk the reduction budget could not shrink: ``REJECTED``.
 
         It is counted against ``failed`` and announced, ``ALWAYS``, but its events are not
@@ -2457,8 +2457,11 @@ class HTTPSink:
         chunk cannot survive ``MAX_BUDGET_REDUCTIONS`` halvings unless ``max_batch_count``
         exceeds 33 million.
 
+        It keeps its 1.x signature, so a third-party override written against 1.x is still
+        called; the count goes to the innermost run's context, read here through
+        ``run_context()``, since it is only ever called inside a round.
+
         Args:
-          context: The run's context.
           chunk: The events that could not be placed.
 
         Returns:
@@ -2467,6 +2470,7 @@ class HTTPSink:
         Raises:
           None.
         """
+        context = _engine.run_context()
         name = type(self).__name__
         size = len(chunk)
         context.count(self, "failed", 1, when=When.ALWAYS)

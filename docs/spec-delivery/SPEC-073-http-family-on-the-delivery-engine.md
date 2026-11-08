@@ -113,5 +113,6 @@
 - The hook guard covers the request-building hooks and the `2xx` readers only. A third-party
   override of `_retryable_status`, `_response_limit`, `_items`, `_take`, `_event_ceiling`,
   `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` that raises escapes the round, as it
-  escaped 1.x `emit`, and the engine fails that round's events. `_abandon_unreduced` now takes the
-  run's context, so a third-party override with its 1.x signature raises `TypeError` there.
+  escaped 1.x `emit`, and the engine fails that round's events. `_abandon_unreduced` keeps its
+  1.x signature `(chunk)` and reads the run's context through `run_context()`, so a third-party
+  override written against 1.x is still called.

@@ -133,10 +133,9 @@ Figures, each with its instrument and the commit it was measured at:
     meaning they have at the build's base. For `_prepare` and `_apply_auth` that meaning is the
     one PR 311 (`c4e51fbd`) gave them, which this spec does not change.
   - `_deliver`, `_sleep_backoff` and `_abandon` are removed, and a third-party override of one of
-    them is no longer called. `_abandon_unreduced` stays, without its immediate store, and now
-    takes the run's context, `(context, chunk)`: a third-party override written to its 1.x
-    signature `(chunk)` raises a `TypeError` out of the round, which only a pathological
-    `_item_size`, or a `max_batch_count` above 33 million, can reach.
+    them is no longer called. `_abandon_unreduced` stays, without its immediate store, and keeps
+    its 1.x signature `(chunk)`: it reads the run's context through `run_context()`, so a
+    third-party override written against 1.x is still called on the unreduced-`413` path.
   - `_items(batch, pending)` and `_drop_refused(chunk, pending)` keep their 1.x signatures. Their
     `pending` is now typed by a private Protocol that both a `Deferral` and the run context's
     `drops` view satisfy.
@@ -1084,7 +1083,7 @@ class HTTPSink:
     def _outcomes(self, payload: bytes, items: list[_Item]) -> tuple[Outcome, ...]: ...
     def _unadjudicated(self, items: list[_Item], detail: str, noun: str = "event"
                        ) -> tuple[Outcome, ...]: ...       # the one unreadable-response method
-    def _abandon_unreduced(self, context: RunContext, chunk: list[_Item]) -> None: ...  # was (chunk)
+    def _abandon_unreduced(self, chunk: list[_Item]) -> None: ...  # unchanged; reads run_context()
     def _handle_response(self, payload: bytes, items: list[_Item]) -> bool: ...   # unchanged
     def _send(self, body: bytes, *, content_type: str,
               extra_headers: dict[str, str] | None = None,
@@ -1286,8 +1285,8 @@ tests/
   - FR-001's family scan finds 8 modules, `OpenSearchSink` sharing `elasticsearch.py`; criterion
     1.1 says so. `tests/test_run_context.py` is a new file beside `tests/test_http_rounds.py`.
   - Found at completion, each stated where it applies rather than left implied:
-    `_abandon_unreduced` stays and now takes the run's context, so a third-party override written
-    to its 1.x signature raises out of the round; the hook guard covers the request-building hooks
+    `_abandon_unreduced` stays with its 1.x signature and reads the run's context itself, so a
+    third-party override written against 1.x is still called; the hook guard covers the request-building hooks
     and the `2xx` readers only, so a raising third-party override of another private method
     (`_retryable_status`, `_response_limit`, `_items`, `_take` and the rest FR-001 lists) escapes
     the round as it escaped 1.x `emit`; and *A client exception costs its chunk*, which FR-005 told

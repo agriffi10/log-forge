@@ -1591,3 +1591,73 @@ def test_emit_and_deliver_leave_equal_ledgers_bodies_and_lines(
     assert [call["body"] for call in by_emit.calls] == [call["body"] for call in by_deliver.calls]
     assert emit_lines == deliver_lines
     assert log_foundry.sinks.base.read_losses(emit_sink) == _formula(emit_sink)
+
+
+# --- The unreduced 413 path and a permanent bool reader's settled line --------------------------
+
+
+class _Free(HTTPSink):
+    """Charges every item nothing, so no budget reduction ever shrinks a multi-item chunk."""
+
+    def _item_size(self, rendered: str, event: dict[str, object]) -> int:
+        return 0
+
+
+class _OverridesUnreduced(_Free):
+    """A third-party override of ``_abandon_unreduced`` written to its 1.x signature."""
+
+    seen: list[int]
+
+    def _abandon_unreduced(self, chunk: list[Any]) -> None:  # type: ignore[override]
+        self.seen.append(len(chunk))
+        super()._abandon_unreduced(chunk)
+
+
+@pytest.mark.parametrize("cls", [_Free, _OverridesUnreduced], ids=["base", "override"])
+def test_an_unreduced_413_chunk_is_rejected_and_counted_once(
+    cls: type[_Free], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The base counts ``failed`` once with its 1.x line; a 1.x-signature override is still called."""
+    from log_foundry.sinks.http import MAX_BUDGET_REDUCTIONS
+
+    opener = Scripted(_status(413))
+    sink = cls("http://h", max_batch_count=8, max_retries=0, opener=opener)
+    sink.seen = []  # type: ignore[attr-defined]
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(_events(8))
+    assert len(opener.calls) == MAX_BUDGET_REDUCTIONS + 1
+    if cls is _OverridesUnreduced:
+        assert sink.seen == [8]  # type: ignore[attr-defined]
+    assert sink.failed == 1
+    assert sink.dropped_oversized == 0
+    assert _lost(capsys.readouterr().err) == [
+        (
+            f"log-foundry: lost 1 request(s); {cls.__name__}, 8 event(s) still 413 after "
+            f"{MAX_BUDGET_REDUCTIONS} reduction(s); lower max_batch_bytes to match the destination"
+        )
+    ]
+
+
+def test_a_permanent_bool_readers_partial_loss_is_announced_by_the_engine_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A bool reader's ``False`` counts nothing of its own, so the engine's settled line says it.
+
+    Ineligible, so ``emit`` runs the engine inline over its round: one chunk read ``True`` is
+    ``ACCEPTED``, one read ``False`` is ``REJECTED``, and the run settles. The sink registers no
+    line for the rejected chunk — a 1.x bool override counted its own, if anything — so the
+    engine's settled line is the run's only announcement.
+    """
+    opener = Scripted(FakeResponse(200, b"ok"), FakeResponse(200, b"no"))
+    sink = _BoolReader("http://h", max_batch_count=1, opener=opener)
+    assert read_deliver(sink) is None
+    sink.emit(_events(2))
+    assert len(opener.calls) == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=0), "the 1.x counters are untouched"
+    assert sink.log_foundry_counters.losses() == SinkLosses(dropped=0, failed=1)
+    assert _lost(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 1 event(s); rejected 1, unresolved 0, raised 0, unknown 0, "
+            "dropped 0 after 1 delivery round(s) to _BoolReader"
+        )
+    ]
