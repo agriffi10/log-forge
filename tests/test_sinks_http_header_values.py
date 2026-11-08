@@ -60,7 +60,7 @@ class _IntSub(int):
 
 
 class _OwnStr(int):
-    """An ``int`` subclass whose ``__str__`` is its own, which ``putheader``'s ``int`` branch calls."""
+    """An ``int`` subclass whose own ``__str__`` ``putheader``'s ``int`` branch calls."""
 
     def __str__(self) -> str:
         return "own"
@@ -182,19 +182,47 @@ class _CountedInt(int):
         return "41"
 
 
+class _ClaimsEverything(type):
+    """A metaclass whose ``__eq__`` says its classes equal any type, ``str`` included."""
+
+    def __eq__(cls, other: object) -> bool:
+        return True
+
+    __hash__ = type.__hash__
+
+
+class _PosesAsStr(metaclass=_ClaimsEverything):
+    """A value whose type compares equal to ``str``; its ``encode`` answers anew each call."""
+
+    calls = 0
+
+    def encode(self, codec: str) -> bytes:
+        type(self).calls += 1
+        return f"v{type(self).calls}".encode()
+
+
 def test_a_callers_value_runs_none_of_its_code_on_any_emit() -> None:
-    """At ``c4e51fbd``: each of these ran once more on every emit, inside ``putheader``."""
-    _Counted.reads = _Counted.encodes = _CountedInt.calls = 0
+    """At ``c4e51fbd``: each of these ran once more on every emit, inside ``putheader``.
+
+    ``_PosesAsStr`` is the one a membership test lets through: ``type(value) in (str, ...)``
+    compares with ``==``, and its metaclass answers ``True``, so the caller's object was stored
+    and the wire sent ``v2``, ``v3``, ``v4``. The plain types are recognised by identity."""
+    _Counted.reads = _Counted.encodes = _CountedInt.calls = _PosesAsStr.calls = 0
     opener = _PutheaderOpener()
-    sink = HTTPSink(URL, headers={"X-A": _Counted(), "X-B": _CountedInt(41)}, opener=opener)
-    built = (_Counted.reads, _Counted.encodes, _CountedInt.calls)
+    sink = HTTPSink(
+        URL,
+        headers={"X-A": _Counted(), "X-B": _CountedInt(41), "X-C": _PosesAsStr()},
+        opener=opener,
+    )
+    built = (_Counted.reads, _Counted.encodes, _CountedInt.calls, _PosesAsStr.calls)
 
     for i in range(4):
         sink.emit([{"i": i}])
 
-    assert (_Counted.reads, _Counted.encodes, _CountedInt.calls) == built
+    assert (_Counted.reads, _Counted.encodes, _CountedInt.calls, _PosesAsStr.calls) == built
     for lines in opener.lines:
         assert b"X-A: counted" in lines and b"X-B: 41" in lines, lines
+        assert b"X-C: v1" in lines, lines
     assert len(opener.lines) == 4
 
 
@@ -311,8 +339,9 @@ class _LatinInt(int):
         (_EncodesToStr(), "TypeError"),
         (_EncodeRaises(), "UnicodeEncodeError"),
         (_LatinInt(1), "UnicodeEncodeError"),
+        (memoryview(b"abcdef")[::2], "TypeError"),
     ],
-    ids=["float", "none", "encode-to-str", "encode-raises", "non-ascii-int"],
+    ids=["float", "none", "encode-to-str", "encode-raises", "non-ascii-int", "strided-view"],
 )
 def test_a_value_putheader_refused_keeps_its_refusal(value: object, reason: str) -> None:
     """Each was refused at ``c4e51fbd`` with this message, by ``putheader`` on the caller's value;
@@ -361,3 +390,14 @@ def test_every_class_taking_headers_sends_the_copy_and_runs_no_caller_code_per_e
     assert opener.lines, "no request reached putheader"
     for lines in opener.lines:
         assert b"X-A: counted" in lines and b"X-B: 41" in lines, lines
+
+
+def test_a_contiguous_view_of_more_than_one_dimension_still_sends_its_bytes() -> None:
+    """``putheader`` read a C-contiguous buffer of any shape, so this constructed and sent
+    ``abcdef`` at ``c4e51fbd``; only a strided view, which it could not read, is refused."""
+    opener = _PutheaderOpener()
+    sink = HTTPSink(URL, headers={"X-V": memoryview(b"abcdef").cast("B", (2, 3))}, opener=opener)
+
+    sink.emit([{"i": 1}])
+
+    assert b"X-V: abcdef" in opener.lines[-1]

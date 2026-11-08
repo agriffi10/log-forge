@@ -24,7 +24,7 @@ from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.sentry import SentrySink
 from log_foundry.sinks.splunk import SplunkHECSink
-from test_sinks_http import FakeOpener
+from test_sinks_http import FakeOpener, FakeResponse
 from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
 
 if TYPE_CHECKING:
@@ -300,6 +300,41 @@ def test_gzip_set_false_after_construction_beside_a_gzip_header_still_compresses
 
     assert gzip.decompress(request["body"]) == plain["body"]
     assert request["headers"]["content-encoding"] == value
+
+
+def _refusal_run(flip: bool) -> tuple[Any, list[int]]:
+    """Emits an incompressible then a compressible event against a 200-byte ``413`` limit.
+
+    The sink is built with ``gzip=True`` beside a caller ``Content-Encoding: gzip``, and with
+    ``flip`` its ``gzip`` is set false afterwards, which the caller's header overrules.
+    """
+    import hashlib
+
+    noise = "".join(hashlib.sha256(str(i).encode()).hexdigest() for i in range(8))
+    sizes: list[int] = []
+
+    def opener(request, timeout=None):
+        sizes.append(len(request.data))
+        return FakeResponse(413 if len(request.data) > 200 else 200, b"")
+
+    sink = HTTPSink(
+        URL, gzip=True, headers={"Content-Encoding": "gzip"}, max_retries=0, opener=opener
+    )
+    if flip:
+        sink.gzip = False
+    sink.emit([{"i": 0, "pad": noise}, {"i": 1, "pad": "a" * 6000}])
+    return sink, sizes
+
+
+@pytest.mark.parametrize("flip", [False, True], ids=["as-built", "gzip-set-false"])
+def test_a_compressed_request_never_meets_the_uncompressed_refusal_memory(flip: bool) -> None:
+    """At ``d247ca31``: ``_known_refused`` asked ``self.gzip`` while ``_prepare`` obeyed the
+    caller's header, so after the flip the 6,000-byte event that gzips to 64 bytes was discarded
+    unsent (``dropped_oversized`` 2, requests ``[375, 333]``). One predicate answers both now."""
+    sink, sizes = _refusal_run(flip)
+
+    assert sink.dropped_oversized == 1, f"dropped {sink.dropped_oversized}; requests {sizes}"
+    assert sizes[-1] <= 200, f"the compressible event was offered alone, and fitted: {sizes}"
 
 
 def test_without_a_callers_header_the_gzip_attribute_decides_after_construction() -> None:

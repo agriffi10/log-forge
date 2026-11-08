@@ -342,8 +342,8 @@ def emit_via_deliver(
 
     **The 1.x** ``emit`` **contract it keeps.** It returns normally when anything landed, when the
     verdict could not be read, and when an event's outcome is ``UNKNOWN`` — a partial outcome is
-    counted, never raised — and it raises :class:`~log_foundry.SinkDeliveryError` only when the run
-    failed outright, naming counts and the sink's type, never an event's data. An empty batch
+    counted, never raised — and it raises :class:`~log_foundry.SinkDeliveryError` only when the
+    run failed outright, naming counts and the sink's type, never an event's data. An empty batch
     returns at once, before anything about the sink is checked, since ``emit([])`` never raises.
     To the worker's retry rule the call is one attempt, as any 1.x ``emit`` is, and it is never
     declined.

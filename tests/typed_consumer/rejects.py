@@ -55,4 +55,4 @@ _l = OTLPSink("u", body_format="ndjson")       # want: Unexpected keyword argume
 _k = LogstashSink(host="h", port=1, unknown=2) # want: Unexpected keyword argument "unknown" for "LogstashSink"
 
 # 1.2.0: emit_via_deliver is public and keyword-first, so `deliver` is never positional.
-emit_via_deliver(object(), [], None)       # want: Too many positional arguments for "emit_via_deliver"
+emit_via_deliver(object(), [], None)  # want: Too many positional arguments for "emit_via_deliver"
