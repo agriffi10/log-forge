@@ -963,31 +963,58 @@ def _wire_name(name: str) -> str:
 
 
 def _caller_encoding(headers: dict[str, str]) -> tuple[str, str | None] | None:
-    """Returns the caller's ``Content-Encoding`` name and value, by the name ``urllib`` sends.
+    """Returns the caller's ``Content-Encoding`` name, and the text its value sends.
 
     One reader for :func:`_valid_encoding` at construction and :meth:`HTTPSink._prepare` per
-    request, so the two cannot disagree about which header is the caller's. :func:`_valid_headers`
-    has already refused two names that fold together, so at most one matches. Both come back as
-    exact ``str``, a subclass copied as the text it stores so none of its methods runs, and a
-    value that is not a ``str`` as ``None`` — it is not text this module reads a coding from, so
-    it names neither gzip, which ``gzip=True`` needs, nor no coding at all, which ``gzip=False``
-    needs. It used to come back as the empty string, which said the first and, read beside
-    ``gzip=False``, would have said the second.
+    request, so the two cannot disagree about which header is the caller's or what it says.
+    :func:`_valid_headers` has already refused two names that fold together, so at most one
+    matches. The name comes back as exact ``str``. The value is read by **the bytes it sends**,
+    never by its type (:func:`_wire_text`): ``b"identity"`` says ``identity`` on the wire, so it is
+    read as ``identity``, and ``5`` says ``5``, a coding named ``5``. Judging by type used to read
+    every value that was not a ``str`` as naming nothing, which refused ``b"identity"`` beside
+    ``gzip=False`` and ``b"gzip"`` beside ``gzip=True`` though each label was true.
 
     Args:
-      headers: The caller's headers, already judged by :func:`_valid_headers`.
+      headers: The caller's headers, already judged and copied by :func:`_valid_headers`.
 
     Returns:
-      The name as the caller spelled it and the value, ``None`` for a value that is not a
-      ``str``; or ``None`` when the caller set no ``Content-Encoding``.
+      The name as the caller spelled it and the value's wire text, ``None`` for a value whose
+      bytes cannot be told (none reaches here from :func:`_valid_headers`); or ``None`` when the
+      caller set no ``Content-Encoding``.
 
     Raises:
       None.
     """
     for name, value in headers.items():
         if _wire_name(name) == "Content-Encoding":
-            text = _diag._STR_STR(value) if issubclass(type(value), str) else None
-            return _diag._STR_STR(name), text
+            return _diag._STR_STR(name), _wire_text(value)
+    return None
+
+
+def _wire_text(value: object) -> str | None:
+    """Returns the text a stored header value puts on the wire, running none of its code.
+
+    :func:`_valid_headers` stores every value as an exact ``str``, ``int``, ``bool`` or ``bytes``
+    (:func:`_sent_value`), and ``putheader`` sends each as fixed bytes: a ``str`` encoded as
+    Latin-1, an ``int`` or ``bool`` as ``str(value)`` in ASCII — ``True`` as ``True`` — and
+    ``bytes`` as they are, here decoded as Latin-1 so each byte is one character. The three are
+    told apart by exact type, and ``str()`` of an exact ``int`` or ``bool`` runs no caller code.
+
+    Args:
+      value: A header value as :func:`_valid_headers` stored it.
+
+    Returns:
+      The text sent, or ``None`` for a value of any other type.
+
+    Raises:
+      None.
+    """
+    if type(value) is str:
+        return value
+    if type(value) is int or type(value) is bool:
+        return str(value)
+    if type(value) is bytes:
+        return value.decode("latin-1")
     return None
 
 
@@ -998,20 +1025,21 @@ def _valid_encoding(gzip: bool, headers: dict[str, str], owner: str) -> None:
     the body is in some other coding. SPEC-048 FR-007 resolved it by letting the header win and
     sending the body uncompressed, which silently ignored ``gzip=True`` — one argument
     discarded because another was given (invariant 13). Refused instead (1.2.0): ``identity``,
-    ``br``, a list such as ``gzip, br``, the empty string and a value that is not a ``str``
-    all name something other than gzip (:func:`_names_gzip`). A value that names gzip, in any case
-    and with optional whitespace, is no contradiction and is honoured by ``_prepare``. The
+    ``br``, a list such as ``gzip, br``, the empty string and ``5`` all name something other than
+    gzip (:func:`_names_gzip`). A value that names gzip, in any case and with optional whitespace,
+    is no contradiction and is honoured by ``_prepare``. Every value is read by the text it sends
+    (:func:`_caller_encoding`), so ``b"gzip"`` names gzip exactly as ``"gzip"`` does. The
     message names ``gzip`` and the caller's spelling of the header, never its value. It runs after
     :func:`_valid_headers`, so the header's own checks — and its folded duplicates — are judged
     first.
 
     **With** ``gzip=False`` **the header must name no coding** (1.2.0). The sink builds the body
     itself and sends it as built, so the caller cannot have encoded it, and a header naming
-    ``gzip``, ``br``, a list such as ``identity, gzip``, or a value that is not a ``str`` labels
-    the body with a coding it is not in, on every request; it used to construct and send that
-    label. ``identity`` in any case, and a value that is empty once its space and tab are stripped
-    — an empty list of codings, which names none — are true labels and still construct
-    (:func:`_names_no_coding`). The message names ``gzip`` and the caller's spelling, never the
+    ``gzip``, ``br``, a list such as ``identity, gzip``, or ``5`` labels the body with a coding it
+    is not in, on every request; it used to construct and send that label. ``identity`` in any
+    case, and a value that is empty once its space and tab are stripped — an empty list of
+    codings, which names none — are true labels and still construct (:func:`_names_no_coding`),
+    as ``bytes`` or as ``str``. The message names ``gzip`` and the caller's spelling, never the
     value, as the ``gzip=True`` one does.
 
     Args:
@@ -1051,8 +1079,8 @@ def _names_gzip(encoding: str | None) -> bool:
     ``gzip, br``, does not: it says the body is gzipped and then brotli'd.
 
     Args:
-      encoding: The caller's ``Content-Encoding`` value, or ``None`` for one that is not a
-        ``str``, which names nothing.
+      encoding: The text the caller's ``Content-Encoding`` value sends, or ``None`` for one
+        whose bytes cannot be told, which names nothing.
 
     Returns:
       Whether it names gzip alone.
@@ -1072,8 +1100,8 @@ def _names_no_coding(encoding: str | None) -> bool:
     token. A list, ``identity, identity`` included, is not read further.
 
     Args:
-      encoding: The caller's ``Content-Encoding`` value, or ``None`` for one that is not a
-        ``str``, which is not read as naming no coding.
+      encoding: The text the caller's ``Content-Encoding`` value sends, or ``None`` for one
+        whose bytes cannot be told, which is not read as naming no coding.
 
     Returns:
       Whether it names no coding.
@@ -1593,7 +1621,10 @@ class HTTPSink:
           gzip: Whether to compress the body. Refused beside a caller ``Content-Encoding``, in
             any case, that names a coding other than gzip; beside one naming gzip the body is
             compressed and sent under the caller's header. ``False`` is refused beside one naming
-            any coding but ``identity``, since the body is sent as built.
+            any coding but ``identity``, since the body is sent as built. A value is read by the
+            text it sends, ``bytes`` included. Once a caller ``Content-Encoding`` is set, it and
+            not this attribute decides compression on every request, so changing ``gzip`` later
+            cannot put a body under a label it is not in.
           max_retries: Retries after a failing request, floored at zero as ``Worker._emit``
             floors its own (SPEC-021) — a negative value otherwise skipped the loop entirely, so
             the request was abandoned with no attempt made and no counter moved. Anything but an
@@ -2388,16 +2419,24 @@ class HTTPSink:
         second ``Content-Encoding: gzip`` written after it, which ``urllib`` folded over the
         caller's. The caller's own spelling is the one sent, and it is the only one.
 
-        A caller's header that **names gzip** beside ``gzip=True`` is the exception to
-        "suppresses": the body is compressed and sent under the caller's header, since that is
-        what both said (:func:`_names_gzip`). It used to be sent uncompressed and labelled
-        ``gzip``, undecodable on every ``emit`` — in exact case since SPEC-048 FR-007, and in any
-        case once the name was folded. Any other value beside ``gzip=True`` is refused at
-        construction (:func:`_valid_encoding`), so at construction the suppression is reachable
-        only with ``gzip=False``, where nothing is compressed anyway. It is kept, read per request
-        by the same :func:`_caller_encoding`, because ``gzip`` is a public attribute: a sink whose
-        ``gzip`` is set true after construction, beside an ``identity`` header, must still not send
-        a compressed body labelled ``identity``.
+        A caller's header that **names gzip** is the exception to "suppresses": the body is
+        compressed and sent under the caller's header, since that is what both said
+        (:func:`_names_gzip`). It used to be sent uncompressed and labelled ``gzip``, undecodable
+        on every ``emit`` — in exact case since SPEC-048 FR-007, and in any case once the name was
+        folded.
+
+        **The rule, per request: when the caller set a** ``Content-Encoding``, **the header
+        decides the body, whatever** ``self.gzip`` **says now** (1.2.0). The body is compressed
+        exactly when the header names gzip, and never under any other header. With no caller
+        header, ``self.gzip`` decides, as it always has. :func:`_valid_encoding` lets a header
+        survive construction only when it names gzip beside ``gzip=True`` or names no coding beside
+        ``gzip=False``, so at construction the two agree; the rule is what keeps them agreeing
+        after it, because ``gzip`` is a public attribute. A sink whose ``gzip`` is set true beside
+        an ``identity`` header still sends the body as built, and one whose ``gzip`` is set false
+        beside a ``gzip`` header still compresses — it used to send an uncompressed body under the
+        caller's ``gzip`` label on every request. The header is read per request by the same
+        :func:`_caller_encoding` construction judged, by the text its value sends, so construction
+        and the wire cannot disagree about what it says.
 
         Args:
           body: The serialized batch.
@@ -2416,10 +2455,12 @@ class HTTPSink:
         headers.update(self._headers)
         data = body
         caller = _caller_encoding(self._headers)
-        if self.gzip and (caller is None or _names_gzip(caller[1])):
-            data = _gzip.compress(body)
-            if caller is None:
+        if caller is None:
+            if self.gzip:
+                data = _gzip.compress(body)
                 headers["Content-Encoding"] = "gzip"
+        elif _names_gzip(caller[1]):
+            data = _gzip.compress(body)
         self._apply_auth(headers)
         return headers, data
 

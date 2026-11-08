@@ -120,7 +120,9 @@ def test_a_non_dict_whitespace_name_is_refused_as_httpsink_refuses_it(cls: str) 
 
 
 _ENCODING_NAMES = ["Content-Encoding", "content-encoding", "CONTENT-ENCODING"]
-_NOT_GZIP = ["identity", "br", "gzip, br", "", 5]
+_NOT_GZIP = ["identity", "br", "gzip, br", "", 5, True, b"identity", b"br", b""]
+"""Each names something other than gzip by the text it sends: ``5`` and ``True`` are codings of
+those names, and ``bytes`` say what they hold."""
 
 
 def _gzip_refused(owner: str, name: str) -> str:
@@ -145,13 +147,35 @@ def test_gzip_beside_a_callers_other_encoding_is_refused(name: str, value) -> No
     assert caught.value.__context__ is None
 
 
-_A_CODING = ["gzip", "GZIP", " x-gzip\t", "br", "identity, gzip", "identity, identity", 5, b"gzip"]
-"""Values naming a coding the sink never applies under ``gzip=False``: a token other than
-``identity``, a list, and a value that is not a ``str``, which names no coding this module reads."""
+_A_CODING = [
+    "gzip",
+    "GZIP",
+    " x-gzip\t",
+    "br",
+    "identity, gzip",
+    "identity, identity",
+    5,
+    True,
+    b"gzip",
+    b"x-gzip",
+    b"br",
+]
+"""Values naming a coding the sink never applies under ``gzip=False``, read by the text each
+sends: a token other than ``identity``, a list, ``5`` and ``True``, and ``bytes`` holding one."""
 
-_NO_CODING = ["identity", "IDENTITY", " Identity\t", "", " ", "\t \t"]
+_NO_CODING = [
+    "identity",
+    "IDENTITY",
+    " Identity\t",
+    "",
+    " ",
+    "\t \t",
+    b"identity",
+    b" IDENTITY",
+    b"",
+]
 """``identity`` in any case and padding, and a value empty once space and tab are stripped — an
-empty list of codings — both true of a body sent as built."""
+empty list of codings — both true of a body sent as built, as ``str`` or as ``bytes``."""
 
 
 def _gzip_false_refused(owner: str, name: str) -> str:
@@ -210,6 +234,8 @@ def test_every_class_refuses_gzip_false_beside_a_coding_and_sends_identity(name:
 @pytest.mark.parametrize("value", _NO_CODING, ids=repr)
 @pytest.mark.parametrize("name", _ENCODING_NAMES)
 def test_no_coding_beside_gzip_false_is_sent_over_an_uncompressed_body(name: str, value) -> None:
+    """At the first build of this refusal, ``b"identity"`` was refused, judged by its type though
+    its label was true; it is read by the bytes it sends now, as a ``str`` is."""
     plain_opener = FakeOpener()
     plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
     opener = FakeOpener()
@@ -243,6 +269,70 @@ def test_gzip_without_a_callers_content_encoding_still_compresses() -> None:
 
     assert request["headers"]["content-encoding"] == "gzip"
     assert gzip.decompress(request["body"]).startswith(b"{")
+
+
+def test_gzip_set_true_after_construction_beside_an_empty_header_still_sends_it_uncompressed() -> (
+    None
+):
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+    sink = HTTPSink(URL, headers={"Content-Encoding": b""}, opener=opener)
+    sink.gzip = True
+
+    request = _sent(sink, opener)
+
+    assert request["body"] == plain["body"]
+    assert request["headers"]["content-encoding"] == b""
+
+
+@pytest.mark.parametrize("value", ["gzip", "X-GZIP", b"gzip", b" x-gzip "], ids=repr)
+def test_gzip_set_false_after_construction_beside_a_gzip_header_still_compresses(value) -> None:
+    """At ``c4e51fbd``: the body went out uncompressed under the caller's ``gzip`` label on every
+    request. Once the caller set a ``Content-Encoding`` it decides the body, not ``self.gzip``."""
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+    sink = HTTPSink(URL, headers={"Content-Encoding": value}, gzip=True, opener=opener)
+    sink.gzip = False
+
+    request = _sent(sink, opener)
+
+    assert gzip.decompress(request["body"]) == plain["body"]
+    assert request["headers"]["content-encoding"] == value
+
+
+def test_without_a_callers_header_the_gzip_attribute_decides_after_construction() -> None:
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+    sink = HTTPSink(URL, opener=opener)
+
+    sink.gzip = True
+    on = _sent(sink, opener)
+    sink.gzip = False
+    off = _sent(sink, opener)
+
+    assert gzip.decompress(on["body"]) == plain["body"]
+    assert on["headers"]["content-encoding"] == "gzip"
+    assert off["body"] == plain["body"]
+    assert "content-encoding" not in off["headers"]
+
+
+@pytest.mark.parametrize("value", [b"gzip", b"GZIP", b" x-gzip\t"], ids=repr)
+@pytest.mark.parametrize("name", _ENCODING_NAMES)
+def test_bytes_naming_gzip_beside_gzip_are_compressed_under_the_callers_header(
+    name: str, value: bytes
+) -> None:
+    """At ``c4e51fbd``: refused, the value judged by its type though it sent ``gzip``."""
+    plain_opener = FakeOpener()
+    plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
+    opener = FakeOpener()
+
+    request = _sent(HTTPSink(URL, headers={name: value}, gzip=True, opener=opener), opener)
+
+    assert gzip.decompress(request["body"]) == plain["body"]
+    assert request["headers"]["content-encoding"] == value, "the caller's header, and only it"
 
 
 @pytest.mark.parametrize("value", ["gzip", "GZIP", " gzip "], ids=repr)
