@@ -661,3 +661,120 @@ def test_auth_is_applied_above_a_per_request_authorization() -> None:
     headers, _body = sink._prepare(b"{}", "application/json", {"Authorization": "Bearer extra"})
 
     assert headers["Authorization"] == BASIC_U_P
+
+
+# --- an empty credential ----------------------------------------------------------------------
+
+
+EMPTY = (
+    "auth is empty, so every request would carry an empty credential; drop auth= or give it a value"
+)
+"""The refusal's tail, written out rather than imported."""
+
+
+class _EmptyText(str):
+    """A ``str`` subclass holding no text, whose methods would claim otherwise if asked."""
+
+    def __len__(self) -> int:
+        return 5
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    __hash__ = str.__hash__
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        "",
+        ("", ""),
+        ["", ""],
+        lambda: iter(("", "")),
+        _EmptyText(""),
+        (_EmptyText(""), _EmptyText("")),
+        " ",
+        "\t",
+        " \t  ",
+        _EmptyText(" \t"),
+    ],
+    ids=[
+        "token",
+        "pair",
+        "list",
+        "iterator",
+        "str-subclass",
+        "subclass-pair",
+        "space-token",
+        "tab-token",
+        "blank-token",
+        "blank-str-subclass",
+    ],
+)
+def test_an_empty_token_or_pair_is_refused_naming_auth(auth) -> None:
+    """At ``c4e51fbd``: constructs, then sends ``Bearer `` or ``Basic Og==`` on every request.
+
+    Judged on the exact-``str`` copy, so a subclass whose ``__eq__`` or ``__len__`` lies is read
+    as the empty text it holds."""
+    given = auth() if callable(auth) else auth
+
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=given)
+
+    assert str(caught.value) == f"HTTPSink {EMPTY}"
+    _assert_chains_nothing(caught.value)
+
+
+@pytest.mark.parametrize("auth", ["", ("", ""), "  "], ids=["token", "pair", "blank-token"])
+@pytest.mark.parametrize("name", sorted(_FORWARDERS))
+def test_every_forwarder_refuses_an_empty_credential(name: str, auth) -> None:
+    make, owner = _FORWARDERS[name]
+
+    with pytest.raises(ValueError) as caught:
+        make(auth=auth)
+
+    assert str(caught.value) == f"{owner} {EMPTY}"
+
+
+@pytest.mark.parametrize("auth", ["", ("", "")], ids=["token", "pair"])
+def test_splunk_refuses_an_empty_auth_as_it_refuses_any(auth) -> None:
+    """Splunk's conflict is judged first by design, so the caller is told to drop ``auth=``."""
+    with pytest.raises(ValueError) as caught:
+        SplunkHECSink(URL, HEC_VALUE, auth=auth)
+
+    assert str(caught.value) == SPLUNK
+
+
+@pytest.mark.parametrize("auth", ["", ("", "")], ids=["token", "pair"])
+def test_an_empty_credential_beside_an_authorization_header_meets_the_conflict_first(
+    auth,
+) -> None:
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, auth=auth, headers={"authorization": HEADER_VALUE})
+
+    assert str(caught.value) == f"HTTPSink {BESIDE_HEADER}"
+
+
+@pytest.mark.parametrize(
+    ("auth", "sent"),
+    [
+        (("key", ""), "Basic a2V5Og=="),
+        (("", "token"), "Basic OnRva2Vu"),
+        ((" ", " "), "Basic IDog"),
+        ((" ", ""), "Basic IDo="),
+        (" key ", "Bearer  key "),
+    ],
+    ids=["empty-password", "empty-user", "blank-halves", "blank-user", "padded-token"],
+)
+@pytest.mark.parametrize("name", sorted(_FORWARDERS))
+def test_a_pair_with_one_empty_half_constructs_and_is_sent(name: str, auth, sent: str) -> None:
+    """RFC 7617 basic auth with an empty user or password is legal, and services take it — an API
+    key as the user with no password — so it is not broken and is not refused. Only the wholly
+    empty pair is. Halves of whitespace are not empty either: base64 turns ``" : "`` into the
+    credential bytes ``IDog``. A token with text in it is sent as given, padding and all; only a
+    token of nothing but spaces and tabs arrives as a bare ``Bearer``, and that one is refused."""
+    make, _owner = _FORWARDERS[name]
+    opener = FakeOpener()
+    sink = make(auth=auth, opener=opener)
+
+    assert _sent_authorization(sink, opener) == sent

@@ -481,14 +481,24 @@ naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra r
 constructor that needs it, and `tests/test_extras_roster.py`, which fails naming an extra imported
 other than through `import_extra` (SPEC-071); `tests/test_sinks_http_auth.py` for `auth` refused
 beside an `Authorization` header in any case, a one-shot `auth` copied once and sent on every
-request, a pair that is not two `str` refused, and its scan failing naming any `extra_headers=` key
-in `src/` that folds to `Authorization`; `tests/test_sinks_http_header_names.py` for a header name
-holding whitespace, `tests/test_sinks_http_header_merge.py` for a non-mapping `headers=` refused,
-a platform sink's non-`dict` one sent and `gzip=True` refused beside a `Content-Encoding`
-in any case naming another coding, across every class forwarding `gzip`, and
+request, a pair that is not two `str` refused, an empty or blank token or empty pair refused
+after the conflict while a pair with one empty half is sent, and its scan failing naming any
+`extra_headers=` key in `src/` that folds to `Authorization`; `tests/test_sinks_http_header_names.py`
+for a header name holding whitespace, `tests/test_sinks_http_header_merge.py` for a non-mapping
+`headers=` refused, a platform sink's non-`dict` one sent, `gzip=True` refused beside a
+`Content-Encoding` in any case naming another coding and `gzip=False` beside one naming any coding
+but `identity`, each value read by the bytes it sends, across every class forwarding `gzip`, and
+compression fixed at construction when `gzip` is changed afterwards;
+`tests/test_sinks_http_body_hook.py` for that `gzip=False` refusal held to the library's own
+`_body`, a subclass encoding its own body sending the bytes it sent, and `gzip` read once;
+`tests/test_sinks_http_credentials.py` for an empty or blank platform credential argument refused,
+over a derived roster;
+`tests/test_sinks_http_header_values.py` for a header value that is not a `str` copied once at
+construction, sending the bytes it sent before and running none of the caller's code on any
+`emit`, across every class taking `headers`; and
 `tests/test_sinks_http_header_collisions.py` for a caller header naming a platform sink's own
 credential header or two names folding to one, with an AST scan naming any subscript write or
 `.update`/`.setdefault` on a `headers` attribute and any `"headers"` key write, and
 `tests/test_sinks_http_header_roster.py`, which builds every HTTP sink with default options,
 replays each header its first emit sends as a caller header and fails naming one not refused (the
-HTTP auth fix, no spec).
+HTTP auth fix and the 1.2.0 follow-up fix, no spec).

@@ -11,6 +11,7 @@ from log_foundry.sinks.http import (
     HTTPSink,
     _holds_at,
     _holds_delimiter,
+    _refuse_empty_credential,
     _refuse_userinfo,
     _valid_url,
     merge_headers,
@@ -103,7 +104,9 @@ class DatadogSink(HTTPSink):
             header in a forwarded ``headers``, in any case, refused by
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class. Also if a forwarded
             header's name folds to ``DD-API-KEY``, which would replace ``api_key`` on the wire
-            (:func:`~log_foundry.sinks.http.merge_headers`).
+            (:func:`~log_foundry.sinks.http.merge_headers`). Also, last, if ``api_key`` is empty
+            or only spaces and tabs, which sent an empty ``DD-API-KEY`` on every request
+            (1.2.0), so a configuration refused before keeps its message.
         """
         _refuse_userinfo(
             f"https://http-intake.logs.{site}/api/v2/logs",
@@ -136,6 +139,7 @@ class DatadogSink(HTTPSink):
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]
         )
+        _refuse_empty_credential(api_key, type(self).__name__, "api_key")
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one enriched entry for the JSON array (FR-007).

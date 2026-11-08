@@ -22,7 +22,13 @@ from log_foundry.sinks.base import (
     flush_sink,
     read_losses,
 )
-from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict, read_deliver
+from log_foundry.sinks.verdict import (
+    Outcome,
+    SinkCounters,
+    Verdict,
+    emit_via_deliver,
+    read_deliver,
+)
 from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, Health
 
 try:
@@ -227,6 +233,7 @@ __all__ = [
     "current_trace_context",
     "current_traceparent",
     "debug",
+    "emit_via_deliver",
     "error",
     "flush",
     "flush_sink",

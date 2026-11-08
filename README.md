@@ -565,8 +565,9 @@ Wire one up by passing an instance to `configure(sink=...)`; if you never do, th
 call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
 `SinkDeliveryError`, `SinkLosses`, `read_losses` and `flush_sink` — the last two being the probes
 a wrapper sink needs to ask a child for its losses and to push its client-side buffer — the
-optional per-event contract `Outcome`, `Verdict`, `SinkCounters` and its probe `read_deliver`
-(also importable from `log_foundry.sinks.verdict`; see *Reporting per event* below), plus the
+optional per-event contract `Outcome`, `Verdict`, `SinkCounters`, its probe `read_deliver` and
+its adapter `emit_via_deliver` (also importable from `log_foundry.sinks.verdict`; see *Reporting
+per event* below), plus the
 two default bounds, `DEFAULT_SHUTDOWN_TIMEOUT` and `DEFAULT_SWAP_TIMEOUT`. The
 **concrete sinks** are not exported, so import each from its own module, e.g.
 `from log_foundry.sinks.sqs import SQSSink`.
@@ -1114,7 +1115,7 @@ counts what was lost.
 
 ```python
 import threading
-from log_foundry import Outcome, SinkCounters, SinkLosses, Verdict
+from log_foundry import Outcome, SinkCounters, SinkLosses, Verdict, emit_via_deliver
 
 class MyBatchSink:
     def __init__(self) -> None:
@@ -1131,7 +1132,8 @@ class MyBatchSink:
             retry_after=None,                        # or the server's hint, in seconds
         )
 
-    def emit(self, batch: list[dict[str, object]]) -> None: ...   # still required, see below
+    def emit(self, batch: list[dict[str, object]]) -> None:   # still required, see below
+        emit_via_deliver(self, batch)
 
     def losses(self) -> SinkLosses:
         return self.log_foundry_counters.losses()
@@ -1164,7 +1166,11 @@ class MyBatchSink:
   run's losses at the end of the run, and `losses()` returning `log_foundry_counters.losses()`
   makes `health().sink` read them.
 - **`emit` is still required**, and is what a wrapper calling `inner.emit(batch)` reaches; the
-  worker never calls it on a sink that offers `deliver`. Keep it to the three rules above. A
+  worker never calls it on a sink that offers `deliver`. Keep it to the three rules above. Make
+  it `emit_via_deliver(self, batch)`, as in the example: it runs the same engine inline and keeps
+  the 1.x `emit` contract, returning when anything landed and raising `SinkDeliveryError` when the
+  run failed outright. `sink` and `batch` are its only positional parameters; `deliver=` names the
+  callable to run instead of the sink's own. A
   subclass that overrides `emit` — to stamp or scrub a batch before calling `super().emit()` — is
   not offered `deliver` at all, so its override always runs, and a class attribute
   `deliver = None` opts a subclass out explicitly. `deliver` must not call its own `emit`.

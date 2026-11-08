@@ -32,6 +32,7 @@ from log_foundry import (
     current_trace_context,
     current_traceparent,
     debug,
+    emit_via_deliver,
     error,
     flush,
     flush_sink,
@@ -178,7 +179,7 @@ class _MyEngineSink:
         return Verdict.uniform(Outcome.RETRYABLE, len(batch), retry_after=1.5)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Delivers through ``deliver`` when nothing else would.
+        """Delivers through the engine inline, as the ``Sink`` docstring tells an author to.
 
         Args:
           batch: The events to deliver.
@@ -190,8 +191,10 @@ class _MyEngineSink:
           None.
         """
         offered: Callable[[list[dict[str, object]]], Verdict] | None = read_deliver(self)
-        if offered is not None:
-            offered(batch)
+        if offered is None:
+            emit_via_deliver(self, batch)
+        else:
+            emit_via_deliver(self, batch, deliver=offered)
 
     def close(self) -> None:
         """Releases nothing.

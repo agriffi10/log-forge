@@ -19,6 +19,7 @@ from log_foundry import (
     SinkLosses,
     Verdict,
     configure,
+    emit_via_deliver,
     trace,
 )
 from log_foundry.sinks.datadog import DatadogSink
@@ -52,3 +53,6 @@ _i = SplunkHECSink("u", "tok", nonsense=1)     # want: Unexpected keyword argume
 _j = DatadogSink("k", body_format="ndjson")    # want: Unexpected keyword argument "body_format" for "DatadogSink"
 _l = OTLPSink("u", body_format="ndjson")       # want: Unexpected keyword argument "body_format" for "OTLPSink"
 _k = LogstashSink(host="h", port=1, unknown=2) # want: Unexpected keyword argument "unknown" for "LogstashSink"
+
+# 1.2.0: emit_via_deliver is public and keyword-first, so `deliver` is never positional.
+emit_via_deliver(object(), [], None)  # want: Too many positional arguments for "emit_via_deliver"

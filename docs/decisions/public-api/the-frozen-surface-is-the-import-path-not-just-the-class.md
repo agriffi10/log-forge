@@ -59,12 +59,36 @@ version missed both a sink shipped in a package's `__init__.py` and a new class 
 already-documented module. ~~`sinks/base` is the one exempt module~~ — since SPEC-072, `sinks/base`
 and `sinks/verdict` are the two exempt modules, each because everything it exports is a top-level
 export, so the `__all__` clause of the freeze covers it without a README table row; `sinks/verdict`
-(`Outcome`, `Verdict`, `SinkCounters`, `read_deliver`) is a documented path the freeze covers. Each
+(`Outcome`, `Verdict`, `SinkCounters`, `read_deliver`, `emit_via_deliver`) is a documented path the
+freeze covers. Each
 exemption is derived from the module's own `__all__` rather than a listed set — a listed one stops
 describing the module the moment a name is added, which is what a hand-written three-name version
 of it did while `base.__all__` already had five.
 
+**A documented contract that names a function puts that function on the surface.** SPEC-072 left
+`emit_via_deliver` in the private `sinks/_engine.py` while the public `Sink` docstring told a
+third-party author whose sink defines `deliver` to make its `emit` `emit_via_deliver(self, batch)`,
+so following the documented contract meant importing a path free to move — the gap this decision
+exists to close, one level down from a class. For 1.2.0 it is public, a fifth new name beside
+SPEC-072's four, in `log_foundry.__all__` and `sinks.verdict.__all__`, and `sinks.verdict` is its
+documented path. It is its own definition there, delegating to the engine through a function-level
+import, because `_engine` imports `verdict` at module level; so the engine stays private and free
+to move, and the public name does not depend on its name. Its surface is keyword-first, as *A
+frozen surface is keyword-first, and says what it will not grow* asks of a dataclass: `sink` and
+`batch` are its only positional parameters, `deliver` is keyword-only with a default, anything it
+gains in 1.x is keyword-only with a default, and it returns `None` (invariant 10).
+`tests/test_public_surface.py` pins the exact set, the defining module, the parameter kinds and the
+signature equal to the engine's, and the delegation per argument; `tests/typed_consumer/` imports
+and calls it from `log_foundry`, and `rejects.py` holds a positional `deliver` that `mypy` refuses.
+
 ## History
+
+### 2026-11-08
+
+- **Refined (the 1.2.0 follow-up fix, no spec), at Andrew's direction.** `emit_via_deliver` is
+  public at `log_foundry` and `log_foundry.sinks.verdict`, keyword-first, because the `Sink`
+  docstring already pointed third-party authors at it while it lived only in private `_engine`;
+  `__all__` goes from 30 names to 35 in 1.2.0.
 
 ### 2026-11-07
 

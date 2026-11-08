@@ -28,7 +28,15 @@ from log_foundry.sinks._retry import (
     require_timeout,
     wait,
 )
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks.base import (
+    _ABSENT,
+    _MRO,
+    _NAMESPACE,
+    SinkDeliveryError,
+    SinkLosses,
+    _class_member,
+    _own_attribute,
+)
 
 __all__ = [
     "HTTPAuthKwargs",
@@ -299,6 +307,16 @@ _CRLF = ("\r", "\n")
 
 _GZIP_CODINGS = ("gzip", "x-gzip")
 """The content-codings that name gzip: RFC 9110 §8.4.1.3 has ``x-gzip`` read as ``gzip``."""
+
+_NO_CODINGS = ("", "identity")
+"""The values naming no content-coding: ``identity``, and the empty list (RFC 9110 §8.4.1)."""
+
+_HeaderValue = str | int | bytes
+"""A caller header value as stored: an exact ``str``, ``int``, ``bool`` or ``bytes``.
+
+:func:`_sent_value` makes it. The public ``headers`` parameters stay ``dict[str, str]``, as 1.x
+declared them; this is what the copy actually holds, since an ``int`` or ``bytes`` value has
+always been sent as ``http.client`` sends it."""
 
 _MAX_PORT = 65535
 
@@ -764,7 +782,7 @@ def _valid_method(method: str, owner: str) -> str:
     return method
 
 
-def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
+def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, _HeaderValue]:
     """Returns headers that cannot inject a second header, or raises (SPEC-049 FR-001).
 
     A ``CR`` or ``LF`` in a name or a value makes ``http.client`` raise from inside ``emit``, on
@@ -803,12 +821,21 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
     Every check reads the exact-``str`` copies :func:`_copied_headers` makes, and those copies
     are what is returned and stored, so none of a ``str`` subclass's methods runs after this.
 
+    **A value that is not a** ``str`` **is copied once too** (1.2.0), into the value
+    :func:`_sent_value` derives — the bytes ``putheader`` would have put on the wire — and the
+    copy is what the ``putheader`` check judges and what is stored. It used to be stored as the
+    caller's object, so its ``encode``, its ``__getattribute__``, or an ``int`` subclass's
+    ``__str__``, ran inside ``putheader`` on every request, free to answer differently from the
+    check here. The ``CR``/``LF`` check still reads ``str(value)`` once, as it always has, so
+    which values it refuses is unchanged.
+
     Args:
       headers: The caller's headers.
       owner: The class refusing them, for the message.
 
     Returns:
-      The headers, every name and ``str`` value copied as the exact ``str`` it stores.
+      The headers, every name and ``str`` value copied as the exact ``str`` it stores, and every
+      other value as :func:`_sent_value` copied it.
 
     Raises:
       TypeError: If a header name is not a ``str`` (:func:`_copied_headers`).
@@ -816,6 +843,7 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
         the header, a name contains whitespace anywhere, or two names fold to one.
     """
     copied = _copied_headers(headers, owner)
+    stored: list[tuple[str, _HeaderValue]] = []
     seen: dict[str, str] = {}
     for name, value in copied:
         for text, part in ((name, "name"), (str(value), "value")):
@@ -823,8 +851,10 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
                 raise ValueError(
                     f"{owner} header {part} must not contain CR or LF: {name!r}"
                 )
-        failure = _unsendable_header(_wire_name(name), value)
-        if failure:
+        sent, failure = _sent_value(value)
+        if sent is not None:
+            failure = _unsendable_header(_wire_name(name), sent)
+        if failure or sent is None:
             raise ValueError(f"{owner} header cannot be sent over HTTP ({failure}): {name!r}")
         if any(char.isspace() for char in name):
             raise ValueError(f"{owner} header name must not contain whitespace: {name!r}")
@@ -835,10 +865,77 @@ def _valid_headers(headers: dict[str, str], owner: str) -> dict[str, str]:
                 "sent once; drop one"
             )
         seen[wire] = name
-    return dict(copied)
+        stored.append((name, sent))
+    return dict(stored)
 
 
-def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, str]]:
+_NOT_CONTIGUOUS = "TypeError"
+"""What ``putheader`` raised for a buffer that is not C-contiguous, which its regex cannot read."""
+
+
+def _sent_value(value: object) -> tuple[_HeaderValue | None, str | None]:
+    """Copies a header value once into what ``putheader`` would send, or names why it cannot.
+
+    ``putheader`` turns a value into bytes on every request, in three branches: anything with an
+    ``encode`` attribute is ``value.encode("latin-1")``, an ``int`` is ``str(value)`` encoded as
+    ASCII, and anything else is passed through as a bytes-like object. This runs the same three
+    branches **once**, at construction, in the same order and with the same tests —
+    ``hasattr`` and ``isinstance``, not the real-type routing used elsewhere in this module,
+    because the point is to reproduce what ``putheader`` did with the value byte for byte — and
+    copies the result into exact ``bytes`` through a ``memoryview``, the buffer ``putheader``'s
+    own legality check and ``join`` read. ``putheader`` passes exact ``bytes`` through, so every
+    request then sends the bytes this computed and runs none of the caller's code.
+
+    An exact ``str`` — every ``str`` value, once :func:`_copied_headers` has copied it — and an
+    exact ``int``, ``bool`` or ``bytes`` are returned as given: ``putheader`` runs no caller code
+    for one, and none can change, so the caller's object is the plain value already — ``True``
+    still goes out as ``True``, an ``int`` as its digits. The four are recognised by identity,
+    ``type(value) is str``, never by ``==``, so a metaclass whose ``__eq__`` claims ``str``
+    cannot pass the caller's object through. Every other value is the caller's: an ``int``
+    subclass whose ``__str__`` is its own, an object whose ``encode`` or ``__getattribute__`` is,
+    a ``bytearray`` or ``memoryview`` the caller can still mutate. Each now has those methods
+    run once, here, and sends what they answered then, frozen as ``auth`` is.
+
+    A buffer that is not C-contiguous, ``memoryview(b"abcdef")[::2]``, is refused with the
+    ``TypeError`` ``putheader``'s legality check raised for it, since that check reads a simple
+    buffer, although ``tobytes`` could flatten it: nothing ``putheader`` refused constructs here.
+
+    A failure is returned as its type name rather than raised, as :func:`_unsendable_header`
+    returns one, so the refusal chains nothing that carries the value. Only ``ValueError`` and
+    ``TypeError`` are caught, the two that check catches, so a value the check refused before is
+    refused with the same message, and any other exception a caller's method raises propagates
+    as it did from that check.
+
+    Args:
+      value: A header value, a ``str`` one already copied as exact ``str``.
+
+    Returns:
+      The value to store and ``None``, or ``None`` and the type name of the exception deriving it
+      raised.
+
+    Raises:
+      None.
+    """
+    if type(value) is str or type(value) is bytes:
+        return value, None
+    if type(value) is int or type(value) is bool:
+        return value, None
+    try:
+        if hasattr(value, "encode"):
+            derived = cast("Any", value).encode("latin-1")
+        elif isinstance(value, int):
+            derived = str(value).encode("ascii")
+        else:
+            derived = value
+        with memoryview(derived) as view:
+            if not view.c_contiguous:
+                return None, _NOT_CONTIGUOUS
+            return view.tobytes(), None
+    except (ValueError, TypeError) as err:
+        return None, type(err).__name__
+
+
+def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, object]]:
     """Copies every header name, and every ``str`` value, as the exact ``str`` it stores.
 
     A ``str``-subclass name or value used to be stored as the caller's object, so its methods
@@ -848,7 +945,8 @@ def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, str]
     Every check now judges the copy :func:`_valid_headers` stores, so none of the caller's methods
     runs after this. A name that is not a ``str`` is refused here, naming its real type, where it
     used to raise a bare ``TypeError`` from the first check that read it; a value that is not a
-    ``str`` is kept as given, as ``http.client`` sends an ``int`` or ``bytes`` value itself. The
+    ``str`` is kept as given here, for :func:`_valid_headers` to copy through :func:`_sent_value`
+    once its ``CR``/``LF`` check has read it. The
     copies are a list rather than a ``dict``, so two subclass names with one text cannot collapse
     into one silently: the duplicate check sees both.
 
@@ -862,7 +960,7 @@ def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, str]
     Raises:
       TypeError: If a header name is not a ``str``.
     """
-    copied: list[tuple[str, str]] = []
+    copied: list[tuple[str, object]] = []
     for name, value in headers.items():
         if not issubclass(type(name), str):
             raise TypeError(f"{owner} header name must be a str, not {_type_name(name)}")
@@ -890,65 +988,169 @@ def _wire_name(name: str) -> str:
     return name.capitalize().title()
 
 
-def _caller_encoding(headers: dict[str, str]) -> tuple[str, str] | None:
-    """Returns the caller's ``Content-Encoding`` name and value, by the name ``urllib`` sends.
+def _caller_encoding(headers: dict[str, _HeaderValue]) -> tuple[str, str] | None:
+    """Returns the caller's ``Content-Encoding`` name, and the text its value sends.
 
-    One reader for :func:`_valid_encoding` at construction and :meth:`HTTPSink._prepare` per
-    request, so the two cannot disagree about which header is the caller's. :func:`_valid_headers`
-    has already refused two names that fold together, so at most one matches. Both come back as
-    exact ``str``, a subclass copied as the text it stores so none of its methods runs, and a
-    value that is not a ``str`` as the empty string — it names no coding this module compresses
-    for.
+    Read once, at construction, by :func:`_valid_encoding` and by ``HTTPSink.__init__``, which
+    fixes from it whether the body is compressed (:meth:`HTTPSink._compresses`), so the refusal
+    and every request read the header one way. :func:`_valid_headers` has already refused two
+    names that fold together, so at most one matches. The name comes back as exact ``str``. The
+    value is read by **the bytes it sends**, never by its type (:func:`_wire_text`):
+    ``b"identity"`` says ``identity`` on the wire, so it is read as ``identity``, and ``5`` says
+    ``5``, a coding named ``5``. Judging by type used to read
+    every value that was not a ``str`` as naming nothing, which refused ``b"identity"`` beside
+    ``gzip=False`` and ``b"gzip"`` beside ``gzip=True`` though each label was true.
 
     Args:
-      headers: The caller's headers, already judged by :func:`_valid_headers`.
+      headers: The caller's headers, already judged and copied by :func:`_valid_headers`.
 
     Returns:
-      The name as the caller spelled it and the value, or ``None`` when the caller set no
-      ``Content-Encoding``.
+      The name as the caller spelled it and the value's wire text, or ``None`` when the caller
+      set no ``Content-Encoding``.
 
     Raises:
       None.
     """
     for name, value in headers.items():
         if _wire_name(name) == "Content-Encoding":
-            text = _diag._STR_STR(value) if issubclass(type(value), str) else ""
-            return _diag._STR_STR(name), text
+            return _diag._STR_STR(name), _wire_text(value)
     return None
 
 
-def _valid_encoding(gzip: bool, headers: dict[str, str], owner: str) -> None:
-    """Refuses ``gzip=True`` beside a caller ``Content-Encoding`` that names another coding.
+def _wire_text(value: _HeaderValue) -> str:
+    """Returns the text a stored header value puts on the wire, running none of its code.
+
+    :func:`_valid_headers` stores every value as an exact ``str``, ``int``, ``bool`` or ``bytes``
+    (:func:`_sent_value`), and ``putheader`` sends each as fixed bytes: a ``str`` encoded as
+    Latin-1, an ``int`` or ``bool`` as ``str(value)`` in ASCII — ``True`` as ``True`` — and
+    ``bytes`` as they are, here decoded as Latin-1 so each byte is one character. ``bytes`` is
+    told apart by exact type, and ``str()`` of an exact ``str``, ``int`` or ``bool`` runs no
+    caller code.
+
+    Args:
+      value: A header value as :func:`_valid_headers` stored it.
+
+    Returns:
+      The text sent.
+
+    Raises:
+      None.
+    """
+    if type(value) is bytes:
+        return value.decode("latin-1")
+    return str(value)
+
+
+def _valid_encoding(
+    gzip: bool, headers: dict[str, _HeaderValue], owner: str, *, library_body: bool
+) -> None:
+    """Refuses a caller ``Content-Encoding`` that the ``gzip`` argument makes untrue.
 
     The two arguments contradict each other: ``gzip=True`` says compress, and the header says
     the body is in some other coding. SPEC-048 FR-007 resolved it by letting the header win and
     sending the body uncompressed, which silently ignored ``gzip=True`` — one argument
     discarded because another was given (invariant 13). Refused instead (1.2.0): ``identity``,
-    ``br``, a list such as ``gzip, br``, the empty string and a value that is not a ``str``
-    all name something other than gzip (:func:`_names_gzip`). A value that names gzip, in any case
-    and with optional whitespace, is no contradiction and is honoured by ``_prepare``. The
+    ``br``, a list such as ``gzip, br``, the empty string and ``5`` all name something other than
+    gzip (:func:`_names_gzip`). A value that names gzip, in any case and with optional whitespace,
+    is no contradiction and is honoured by ``_prepare``. Every value is read by the text it sends
+    (:func:`_caller_encoding`), so ``b"gzip"`` names gzip exactly as ``"gzip"`` does. The
     message names ``gzip`` and the caller's spelling of the header, never its value. It runs after
     :func:`_valid_headers`, so the header's own checks — and its folded duplicates — are judged
     first.
 
+    **With** ``gzip=False`` **the header must name no coding** (1.2.0). The sink builds the body
+    itself and sends it as built, so the caller cannot have encoded it, and a header naming
+    ``gzip``, ``br``, a list such as ``identity, gzip``, or ``5`` labels the body with a coding it
+    is not in, on every request; it used to construct and send that label. ``identity`` in any
+    case, and a value that is empty once its space and tab are stripped — an empty list of
+    codings, which names none — are true labels and still construct (:func:`_names_no_coding`),
+    as ``bytes`` or as ``str``. The message names ``gzip`` and the caller's spelling, never the
+    value, as the ``gzip=True`` one does.
+
+    **Both refusals hold only for the library's own** ``_body`` (``library_body``,
+    :func:`_library_body`). ``_body`` is a documented 1.x extension hook, and a subclass whose
+    ``_body`` encodes the body itself — ``zlib.compress`` beside ``Content-Encoding: deflate``, or
+    its own gzip beside ``gzip`` — owns both the body and its label, with ``gzip`` true or false;
+    it constructed in 1.1.0, where a caller ``Content-Encoding`` suppressed compression, and
+    refusing it would break a working sink. Such a sink keeps 1.1.0's bytes: the library never
+    compresses its body beside a caller header (``HTTPSink._fixed_compression`` is ``False``).
+
     Args:
-      gzip: The ``gzip`` argument.
+      gzip: The ``gzip`` argument, already copied as an exact ``bool``.
       headers: The caller's headers, already judged by :func:`_valid_headers`.
       owner: The class refusing it, for the message.
+      library_body: Whether the body is built by the library's own ``_body``.
 
     Returns:
       None.
 
     Raises:
-      ValueError: If ``gzip`` is true and the caller's ``Content-Encoding`` names another
-        coding.
+      ValueError: If the body is the library's own and either ``gzip`` is true and the caller's
+        ``Content-Encoding`` names another coding, or ``gzip`` is false and the header names any
+        coding but ``identity``.
     """
     caller = _caller_encoding(headers)
-    if gzip and caller is not None and not _names_gzip(caller[1]):
+    if caller is None or not library_body:
+        return
+    if gzip and not _names_gzip(caller[1]):
         raise ValueError(
             f"{owner} gzip=True cannot apply beside header {caller[0]!r}, which names another "
             "encoding; drop gzip= or the header"
         )
+    if not gzip and not _names_no_coding(caller[1]):
+        raise ValueError(
+            f"{owner} gzip=False, the default, cannot apply beside header {caller[0]!r}, which "
+            "names an encoding the body is not in; drop the header, or pass gzip=True if it "
+            "names gzip"
+        )
+
+
+def _library_body(sink: object) -> bool:
+    """Says whether the sink's ``_body`` is the library's own, reading it statically.
+
+    The test is the module of the class whose namespace supplies ``_body``: the library's when
+    that class is defined in ``log_foundry`` or a module under it. The class is found by
+    SPEC-072's static reader — ``_class_member`` along the MRO read through ``type``'s unbound
+    accessors — and its ``__module__`` read from that class's own namespace, so no metaclass
+    ``__getattribute__``, ``__getattr__``, ``__mro__`` or ``__module__`` property runs, and none
+    can answer for the class. A ``_body`` set on the instance itself (``_own_attribute``) is the
+    caller's. Every shipped sink that overrides ``_body`` is defined under ``log_foundry`` and so
+    is the library's own; ``LogstashSink`` builds a plain :class:`HTTPSink`.
+
+    A subclass that overrides ``_body`` only to return ``super()._body(...)`` is read as its own:
+    a static read sees where ``_body`` is defined, not what it does, so it cannot tell a body that
+    is encoded from one that is not, and it errs on the side 1.1.0 took — the sink constructs. A
+    class outside the package that writes ``__module__ = "log_foundry..."`` into its own namespace
+    is read as the library's, and so meets the refusal the shipped sinks meet; nothing is gained by
+    it. A class whose MRO cannot be read this way is read as the caller's, which refuses nothing.
+
+    **The cost the static read accepts.** A pass-through ``super()._body`` override built with
+    ``gzip=True`` beside ``Content-Encoding: gzip`` is read as encoding its own body, so the
+    library does not compress it and it sends an uncompressed body under a ``gzip`` label — as
+    1.1.0 did; the read cannot tell it from an encoding hook, and that is the released behaviour.
+    And the read runs during construction, so a ``_body`` a subclass assigns to the instance
+    **after** ``super().__init__`` returns is invisible to it: such a sink is judged as the
+    library's and meets its refusals, where 1.1.0 constructed it. Assign the hook before calling
+    ``super().__init__``, or define it on the class.
+
+    Args:
+      sink: The sink under construction.
+
+    Returns:
+      Whether ``_body`` resolves to a class defined in ``log_foundry``.
+
+    Raises:
+      None.
+    """
+    try:
+        cls = type(sink)
+        found = _class_member(cls, "_body")
+        if found is None or _own_attribute(sink, "_body", found) is not _ABSENT:
+            return False
+        module = _NAMESPACE(_MRO(cls)[found[1]]).get("__module__")
+    except Exception:
+        return False
+    return type(module) is str and (module == "log_foundry" or module.startswith("log_foundry."))
 
 
 def _names_gzip(encoding: str) -> bool:
@@ -960,7 +1162,7 @@ def _names_gzip(encoding: str) -> bool:
     ``gzip, br``, does not: it says the body is gzipped and then brotli'd.
 
     Args:
-      encoding: The caller's ``Content-Encoding`` value.
+      encoding: The text the caller's ``Content-Encoding`` value sends.
 
     Returns:
       Whether it names gzip alone.
@@ -971,7 +1173,27 @@ def _names_gzip(encoding: str) -> bool:
     return encoding.strip(" \t").lower() in _GZIP_CODINGS
 
 
-def _unsendable_header(name: str, value: str) -> str | None:
+def _names_no_coding(encoding: str) -> bool:
+    """Says whether a ``Content-Encoding`` value is true of a body the sink did not encode.
+
+    ``identity`` means no transformation (RFC 9110 §8.4.1), and a value that is empty once the
+    optional whitespace is stripped (§5.5) is an empty list of codings, which names none. Both are
+    read as :func:`_names_gzip` reads ``gzip``: case-insensitive, space and tab stripped, one
+    token. A list, ``identity, identity`` included, is not read further.
+
+    Args:
+      encoding: The text the caller's ``Content-Encoding`` value sends.
+
+    Returns:
+      Whether it names no coding.
+
+    Raises:
+      None.
+    """
+    return encoding.strip(" \t").lower() in _NO_CODINGS
+
+
+def _unsendable_header(name: str, value: _HeaderValue) -> str | None:
     """Names why ``http.client`` cannot send one header, or returns ``None`` when it can.
 
     It returns the exception's type name rather than raising, so a caller's refusal is raised
@@ -981,7 +1203,7 @@ def _unsendable_header(name: str, value: str) -> str | None:
 
     Args:
       name: The header name, as it goes on the wire.
-      value: The header value.
+      value: The header value, a ``str`` or the copy :func:`_sent_value` made.
 
     Returns:
       The type name of the exception ``putheader`` raised, or ``None``.
@@ -997,7 +1219,10 @@ def _unsendable_header(name: str, value: str) -> str | None:
 
 
 def _valid_auth(
-    auth: str | tuple[str, str] | None, owner: str, headers: dict[str, str], conflict: str
+    auth: str | tuple[str, str] | None,
+    owner: str,
+    headers: dict[str, _HeaderValue],
+    conflict: str,
 ) -> tuple[str | tuple[str, str] | None, str | None]:
     """Returns the credentials, copied once, and the ``Authorization`` value every request sends.
 
@@ -1035,6 +1260,15 @@ def _valid_auth(
     the pair, raised ``UnicodeEncodeError`` out of every ``emit``, uncounted, and is refused here.
     The message names neither, and chains nothing that would.
 
+    **An empty token or an empty pair is refused** (1.2.0): ``""`` sent ``Authorization:
+    Bearer `` and ``("", "")`` sent ``Basic Og==`` on every request, a credential with nothing in
+    it. A token of only spaces and tabs is refused as empty too, since a recipient strips them and
+    receives a bare ``Bearer`` (:func:`_blank`). It is judged on the copy, so no caller code runs
+    for it, and after the conflict above, which is judged first by design. A pair with one empty
+    half — a key as the user with an empty password, or the reverse — is legal RFC 7617 basic
+    auth that real services take, and is not refused; nor is a pair of whitespace halves, which
+    base64 turns into credential bytes that are not empty.
+
     Args:
       auth: The bearer token, the user/password pair, or ``None``.
       owner: The class refusing it, for the message.
@@ -1047,8 +1281,9 @@ def _valid_auth(
     Raises:
       ValueError: If ``auth`` is given beside an ``Authorization`` header in any case, a bearer
         token contains ``CR`` or ``LF``, a value that is not a token is not a pair of two
-        ``str`` (:func:`_copied_pair`), or ``http.client`` cannot send the ``Authorization``
-        header either form builds.
+        ``str`` (:func:`_copied_pair`), the token is empty or only spaces and tabs or the pair is
+        ``("", "")``, or
+        ``http.client`` cannot send the ``Authorization`` header either form builds.
     """
     if auth is None:
         return None, None
@@ -1061,6 +1296,11 @@ def _valid_auth(
             raise ValueError(f"{owner} auth token must not contain CR or LF")
     else:
         stored = _copied_pair(auth, owner)
+    if (issubclass(type(stored), str) and _blank(cast("str", stored))) or stored == ("", ""):
+        raise ValueError(
+            f"{owner} auth is empty, so every request would carry an empty credential; drop "
+            "auth= or give it a value"
+        )
     value, failure = _built_authorization(stored)
     if value is None:
         raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
@@ -1068,6 +1308,64 @@ def _valid_auth(
     if failure:
         raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
     return stored, value
+
+
+_OWS = " \t"
+"""Optional whitespace (RFC 9110 §5.5), which a recipient strips from either end of a value."""
+
+
+def _blank(text: str) -> bool:
+    """Says whether an exact ``str`` holds nothing once optional whitespace is stripped.
+
+    A field value's leading and trailing space and tab are not part of it (RFC 9110 §5.5), so a
+    credential of only those arrives as no credential: ``Dd-Api-Key:    `` carries none, and
+    ``Bearer `` followed by spaces is a bare scheme.
+
+    Args:
+      text: The exact-``str`` copy of a credential.
+
+    Returns:
+      Whether it is empty or only spaces and tabs.
+
+    Raises:
+      None.
+    """
+    return not text.strip(_OWS)
+
+
+def _refuse_empty_credential(value: object, owner: str, argument: str) -> None:
+    """Refuses a credential argument that would put an empty credential on every request.
+
+    The platform sinks send their credential argument as a header of their own —
+    ``DatadogSink``'s ``api_key`` as ``DD-API-KEY``, ``SplunkHECSink``'s ``token`` as
+    ``Authorization: Splunk …`` — and ``""`` used to construct and send that header with nothing
+    in it, as ``auth=""`` sent ``Bearer `` (1.2.0, the rule :func:`_valid_auth` applies to
+    ``auth``). A value of only spaces and tabs is refused too (:func:`_blank`). The value is
+    judged **as sent**, by the rule the header path uses: a ``str`` copied as the exact ``str`` it
+    stores, then :func:`_sent_value` and :func:`_wire_text`, so ``b""`` and ``b"  "``, which
+    ``putheader`` sends as nothing, are refused as ``""`` is, and ``5`` reads as ``5``. An exact
+    ``str`` or ``bytes`` runs no caller code; any other value is read once more as the header
+    check reads it, and one that cannot be sent is left to that check. The message names the
+    argument and never the value.
+
+    Args:
+      value: The credential argument as the caller passed it.
+      owner: The class refusing it, for the message.
+      argument: The argument's name, for the message.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: If ``value`` sends nothing but spaces and tabs.
+    """
+    copied = _diag._STR_STR(cast("str", value)) if issubclass(type(value), str) else value
+    sent, _failure = _sent_value(copied)
+    if sent is not None and _blank(_wire_text(sent)):
+        raise ValueError(
+            f"{owner} {argument} is empty, so every request would carry an empty credential; "
+            "give it a value"
+        )
 
 
 _NOT_A_PAIR = (set, frozenset, Mapping)
@@ -1458,12 +1756,20 @@ class HTTPSink:
             built from an exact-``str`` copy and every request sends that value, so a list
             changed afterwards, an object yielding new values each time it is iterated, or a
             ``str`` subclass whose methods would answer differently later, is frozen at what it
-            held at construction.
+            held at construction. ``""`` and ``("", "")`` are refused; a pair with one empty half
+            is not.
           body_format: ``"ndjson"`` or ``"json_array"``.
           timeout: Seconds allowed per request.
           gzip: Whether to compress the body. Refused beside a caller ``Content-Encoding``, in
             any case, that names a coding other than gzip; beside one naming gzip the body is
-            compressed and sent under the caller's header.
+            compressed and sent under the caller's header. ``False`` is refused beside one naming
+            any coding but ``identity``, since the body is sent as built — when the body is the
+            library's own ``_body``; a subclass whose ``_body`` encodes the body itself keeps
+            1.1.0's freedom to label it. A value is read by the text it sends, ``bytes``
+            included. Anything but an exact ``bool`` is read once, with ``bool()``, and stored as
+            the ``bool`` it gave, so no ``__bool__`` runs per request. Once a caller
+            ``Content-Encoding`` is set, whether the body is compressed is fixed here from this
+            argument, and setting ``gzip`` later changes nothing (:meth:`_compresses`).
           max_retries: Retries after a failing request, floored at zero as ``Worker._emit``
             floors its own (SPEC-021) — a negative value otherwise skipped the loop entirely, so
             the request was abandoned with no attempt made and no counter moved. Anything but an
@@ -1511,9 +1817,11 @@ class HTTPSink:
             a header name or value or a bearer token contains CR or LF, a header name contains
             whitespace anywhere (refused after ``http.client``'s own check, so a name that already
             failed it keeps that message), two header names fold to one wire name, ``gzip`` is
-            true beside a caller ``Content-Encoding`` naming another coding, ``auth`` is
-            given beside an ``Authorization`` header in any case, ``auth`` cannot be sent or is
-            neither a ``str`` token nor a pair of two ``str``, the timeout cannot bound anything,
+            true beside a caller ``Content-Encoding`` naming another coding or false beside one
+            naming any coding but ``identity``, ``auth`` is
+            given beside an ``Authorization`` header in any case, ``auth`` cannot be sent, is
+            neither a ``str`` token nor a pair of two ``str``, or is ``""`` or ``("", "")``, the
+            timeout cannot bound anything,
             ``body_format`` is neither of the two this class renders, or ``max_batch_bytes`` is
             not positive — each refused here rather than raised out of every
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
@@ -1530,7 +1838,12 @@ class HTTPSink:
         self._headers = _valid_headers(
             dict(headers) if headers is not None else {}, type(self).__name__
         )
-        _valid_encoding(gzip, self._headers, type(self).__name__)
+        gzip = gzip if type(gzip) is bool else bool(gzip)
+        library_body = _library_body(self)
+        _valid_encoding(gzip, self._headers, type(self).__name__, library_body=library_body)
+        self._fixed_compression = (
+            None if _caller_encoding(self._headers) is None else gzip and library_body
+        )
         self._auth, self._authorization_value = _valid_auth(
             auth, type(self).__name__, self._headers, self._AUTH_CONFLICT
         )
@@ -1660,7 +1973,8 @@ class HTTPSink:
         "provably no smaller" has to be provable for all of them, and ``refused_at`` is itself a
         body length — so comparing body lengths is the like-for-like test.
 
-        **It is disabled under ``gzip``**, and that is the whole subtlety. ``_PayloadTooLarge``
+        **It is disabled whenever the request compresses** (:meth:`_compresses`, the rule
+        :meth:`_prepare` compresses by), and that is the whole subtlety. ``_PayloadTooLarge``
         carries the *uncompressed* length, because that is what this sink measures and chunks by,
         while a gzipped request is judged by the destination on its compressed bytes. Compression
         ratio is per-event, so "larger uncompressed" stops implying "also refused": measured, one
@@ -1669,7 +1983,11 @@ class HTTPSink:
         loss the library invented rather than loss it reported, which is what SPEC-025 and
         SPEC-026 exist to prevent, and it also inflated ``dropped``, whose contract is an exact
         count. Comparing like with like would mean gzipping each candidate purely to decide
-        whether to ask, which costs more than the request it saves.
+        whether to ask, which costs more than the request it saves. It used to ask ``self.gzip``,
+        which no longer decides once a caller ``Content-Encoding`` fixes compression at
+        construction, so a sink set ``gzip = False`` afterwards beside ``Content-Encoding: gzip``
+        compressed its body and yet discarded that 6,000-byte event unsent; the two reads are one
+        predicate now.
 
         Args:
           chunk: The chunk about to be sent.
@@ -1681,7 +1999,7 @@ class HTTPSink:
         Raises:
           None.
         """
-        if self.gzip or refused_at is None or refused_at <= 0 or len(chunk) != 1:
+        if self._compresses() or refused_at is None or refused_at <= 0 or len(chunk) != 1:
             return False
         return len(self._body(chunk)[0]) >= refused_at
 
@@ -2165,6 +2483,10 @@ class HTTPSink:
         backoff wait (SPEC-070 FR-001), through the same ``_abandon`` line the exhausted
         connection error writes, so its attempt count reads ``1``.
 
+        The header map is handed to ``urllib`` under the ``str``-valued type its stub declares,
+        the one cast on this path: ``Request`` stores values untouched and ``putheader`` sends an
+        ``int`` or ``bytes`` value itself, which is how a caller's has always gone out.
+
         Args:
           body: The serialized batch.
           content_type: The default content type, overridable by caller headers.
@@ -2208,7 +2530,7 @@ class HTTPSink:
         limit = self._response_limit()
         for attempt in range(retries + 1):
             request = urllib.request.Request(  # noqa: S310
-                self.url, data=data, method=self.method, headers=headers
+                self.url, data=data, method=self.method, headers=cast("dict[str, str]", headers)
             )
             try:
                 status, payload, retry_after = self._attempt(request)
@@ -2241,7 +2563,7 @@ class HTTPSink:
         body: bytes,
         content_type: str,
         extra_headers: dict[str, str] | None,
-    ) -> tuple[dict[str, str], bytes]:
+    ) -> tuple[dict[str, _HeaderValue], bytes]:
         """Builds the final header map and the optionally gzipped body.
 
         Caller-provided headers override the sink's defaults (SPEC-009 FR-002), and that includes
@@ -2256,16 +2578,25 @@ class HTTPSink:
         second ``Content-Encoding: gzip`` written after it, which ``urllib`` folded over the
         caller's. The caller's own spelling is the one sent, and it is the only one.
 
-        A caller's header that **names gzip** beside ``gzip=True`` is the exception to
-        "suppresses": the body is compressed and sent under the caller's header, since that is
-        what both said (:func:`_names_gzip`). It used to be sent uncompressed and labelled
-        ``gzip``, undecodable on every ``emit`` — in exact case since SPEC-048 FR-007, and in any
-        case once the name was folded. Any other value beside ``gzip=True`` is refused at
-        construction (:func:`_valid_encoding`), so at construction the suppression is reachable
-        only with ``gzip=False``, where nothing is compressed anyway. It is kept, read per request
-        by the same :func:`_caller_encoding`, because ``gzip`` is a public attribute: a sink whose
-        ``gzip`` is set true after construction, beside an ``identity`` header, must still not send
-        a compressed body labelled ``identity``.
+        A caller's header that **names gzip** is the exception to "suppresses": the body is
+        compressed and sent under the caller's header, since that is what both said
+        (:func:`_names_gzip`). It used to be sent uncompressed and labelled ``gzip``, undecodable
+        on every ``emit`` — in exact case since SPEC-048 FR-007, and in any case once the name was
+        folded.
+
+        **When the caller set a** ``Content-Encoding``, **whether the body is compressed is fixed
+        at construction** (1.2.0, :meth:`_compresses`), from the ``gzip`` given then, and setting
+        ``gzip`` afterwards changes nothing. For the library's own ``_body``,
+        :func:`_valid_encoding` lets a header survive construction only when it names gzip beside
+        ``gzip=True`` or names no coding beside ``gzip=False``, so the fixed decision is exactly
+        "compressed when the header names gzip": a sink whose ``gzip`` is set true beside an
+        ``identity`` header still sends the body as built, and one whose ``gzip`` is set false
+        beside a ``gzip`` header still compresses — it used to send an uncompressed body under the
+        caller's ``gzip`` label on every request. For a subclass whose own ``_body`` encodes the
+        body the library never compresses beside a caller header, with ``gzip`` true or false, so
+        it keeps 1.1.0's bytes, and is never gzipped a second time, which setting ``gzip`` true
+        used to do. With no caller header, ``self.gzip`` decides per request, as it always has, and
+        the sink writes its own ``Content-Encoding: gzip``.
 
         Args:
           body: The serialized batch.
@@ -2278,20 +2609,46 @@ class HTTPSink:
         Raises:
           None.
         """
-        headers: dict[str, str] = {"Content-Type": content_type}
+        headers: dict[str, _HeaderValue] = {"Content-Type": content_type}
         if extra_headers:
             headers.update(extra_headers)
         headers.update(self._headers)
         data = body
-        caller = _caller_encoding(self._headers)
-        if self.gzip and (caller is None or _names_gzip(caller[1])):
+        if self._compresses():
             data = _gzip.compress(body)
-            if caller is None:
+            if self._fixed_compression is None:
                 headers["Content-Encoding"] = "gzip"
         self._apply_auth(headers)
         return headers, data
 
-    def _apply_auth(self, headers: dict[str, str]) -> None:
+    def _compresses(self) -> bool:
+        """Says whether this request's body is gzipped: the one rule every send-path read asks.
+
+        With a caller ``Content-Encoding``, the decision fixed at construction answers
+        (``_fixed_compression``: the ``gzip`` given then for the library's own ``_body``, which is
+        exactly "the header names gzip", and ``False`` for a subclass's own ``_body``, which owns
+        its coding); otherwise ``self.gzip`` does, read now, since it is
+        a public attribute. Construction stores ``gzip`` as an exact ``bool``, so no caller
+        ``__bool__`` runs here; only a non-``bool`` assigned to ``gzip`` afterwards is asked, by
+        ``bool()``, as 1.x asked it. :meth:`_prepare` compresses by this and
+        :meth:`_known_refused` stands down by it, so the refusal memory, which holds uncompressed
+        lengths, is never applied to a body that went out compressed, and the two cannot disagree.
+
+        Args:
+          None.
+
+        Returns:
+          Whether the body is compressed.
+
+        Raises:
+          None.
+        """
+        if self._fixed_compression is not None:
+            return self._fixed_compression
+        gzip = self.gzip
+        return gzip if type(gzip) is bool else bool(gzip)
+
+    def _apply_auth(self, headers: dict[str, _HeaderValue]) -> None:
         """Applies bearer-token or basic-auth credentials, when the sink was given any.
 
         Nothing the caller wrote is overwritten: construction refuses ``auth`` beside an

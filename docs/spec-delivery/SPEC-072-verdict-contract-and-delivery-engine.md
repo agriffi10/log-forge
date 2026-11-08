@@ -6,6 +6,8 @@
   (frozen, keyword-only, refused on the real type), `SinkCounters` (`@final`) and the static probe
   `read_deliver`. All four are in `log_foundry.__all__`, which goes from 30 names to 34, and
   `log_foundry.sinks.verdict` joins the frozen documented layout.
+  > **Superseded in part by the 1.2.0 follow-up fix (no spec).** `emit_via_deliver` joined them,
+  > so 1.2.0's `__all__` holds 35 names (*Follow-ups* below).
 - New optional sink members, read statically and never declared on `Sink`: `deliver(batch) ->
   Verdict`, `log_foundry_counters` (exactly a `SinkCounters`, required for `deliver` to be offered)
   and `log_foundry_idempotent` (only `True` counts). The engine also reads the existing
@@ -61,9 +63,14 @@
 
 ## Follow-ups
 
-- `emit_via_deliver` is private (`sinks/_engine.py`), yet the public `Sink` docstring points
+- ~~`emit_via_deliver` is private (`sinks/_engine.py`), yet the public `Sink` docstring points
   third-party authors at it as their engine sink's `emit`; whether to make it public is raised as a
-  follow-up for the `stability-redesign` arc.
+  follow-up for the `stability-redesign` arc.~~
+  → **Resolved by the 1.2.0 follow-up fix (no spec), at Andrew's direction.** `emit_via_deliver`
+  is public at `log_foundry` and `log_foundry.sinks.verdict`, keyword-first, a fifth new name, so
+  `__all__` goes from 30 names to 35 in 1.2.0; the engine it delegates to stays private. The
+  decision: *The frozen surface is the import path, not just the class*, in
+  `docs/decisions/public-api/`.
 - **A registry of live `SinkCounters`** (SPEC-079). The fork reach finds counters one level from
   a value the walk declines, so an engine sink inside a third-party wrapper, or a third-party
   container-subclass sink, is not repaired, and a child whose parent held that lock at the fork
