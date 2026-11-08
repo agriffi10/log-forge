@@ -1131,3 +1131,448 @@ def test_each_shim_returns_its_1x_bool(
 
 def test_the_shim_oracle_covers_every_recorded_payload() -> None:
     assert set(_SHIM_PAYLOADS) == set(_SHIM_AT_BASE)
+
+
+# --- FR-004: a third-party subclass that overrides emit or _handle_response keeps its 1.x path --
+
+
+def _every_shipped_class() -> list[type[HTTPSink]]:
+    from test_sinks_http_render import _shipped_http_subclasses
+
+    return [HTTPSink, *_shipped_http_subclasses()]
+
+
+def _shipped(cls: type[HTTPSink], opener: Any, **kwargs: Any) -> HTTPSink:
+    if cls is HTTPSink:
+        return HTTPSink("http://h", opener=opener, **kwargs)
+    return _build(cls.__name__, opener, **kwargs)
+
+
+@pytest.mark.parametrize("cls", _every_shipped_class(), ids=lambda cls: cls.__name__)
+def test_every_shipped_family_class_offers_deliver(cls: type[HTTPSink]) -> None:
+    sink = _shipped(cls, FakeOpener())
+    assert read_deliver(sink) is not None
+    assert cls._READS_BOOL is False
+    assert "_READS_BOOL" in vars(cls), "written on every class, False included"
+
+
+def shipped_deliver_findings(sources: dict[str, str]) -> list[str]:
+    """Every shipped family subclass that defines ``emit`` or ``deliver``, or sets ``deliver``.
+
+    Args:
+      sources: Module text by stem.
+
+    Returns:
+      ``module.Class.member`` per finding.
+    """
+    found: list[str] = []
+    for stem, source in sources.items():
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.ClassDef) or node.name == "HTTPSink":
+                continue
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef) and item.name in {"emit", "deliver"}:
+                    found.append(f"{stem}.{node.name}.{item.name}")
+                targets = item.targets if isinstance(item, ast.Assign) else []
+                if isinstance(item, ast.AnnAssign):
+                    targets = [item.target]
+                found.extend(
+                    f"{stem}.{node.name}.deliver="
+                    for target in targets
+                    if isinstance(target, ast.Name) and target.id == "deliver"
+                )
+    return found
+
+
+def test_no_shipped_family_class_defines_emit_or_deliver() -> None:
+    assert shipped_deliver_findings(_family_modules()) == []
+
+
+@pytest.mark.parametrize(
+    ("planted", "finding"),
+    [
+        ("    deliver = None\n", "loki.LokiSink.deliver="),
+        ("    def deliver(self, batch):\n        return None\n", "loki.LokiSink.deliver"),
+        ("    def emit(self, batch):\n        return None\n", "loki.LokiSink.emit"),
+    ],
+    ids=["opt-out", "deliver", "emit"],
+)
+def test_the_eligibility_roster_names_a_planted_member(planted: str, finding: str) -> None:
+    sources = _family_modules()
+    anchor = "    def _render(self, event: dict[str, object]) -> str:\n"
+    assert sources["loki"].count(anchor) == 1
+    sources["loki"] = sources["loki"].replace(anchor, planted + "\n" + anchor)
+    assert shipped_deliver_findings(sources) == [finding]
+
+
+class _Stamped(HTTPSink):
+    """A 1.x subclass whose ``emit`` stamps each event and calls ``super().emit``."""
+
+    emits = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        type(self).emits += 1
+        super().emit([{**event, "stamp": 1} for event in batch])
+
+
+class _BoolReader(HTTPSink):
+    """A 1.x subclass whose bool ``_handle_response`` reads ``ok`` in the body as delivered."""
+
+    def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+        return b"ok" in payload
+
+
+def _bool_reader_of_elasticsearch() -> type[HTTPSink]:
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+
+    class _StrictBulk(ElasticsearchSink):
+        reads = 0
+
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            type(self).reads += 1
+            return b"ok" in payload
+
+    return _StrictBulk
+
+
+@pytest.mark.parametrize("case", ["rejected", "recovers", "orphan"])
+def test_an_emit_override_keeps_its_1x_path(case: str) -> None:
+    _Stamped.emits = 0
+    script = {
+        "rejected": [_status(400)],
+        "recovers": [_status(503), _ok()],
+        "orphan": [_status(503)],
+    }[case]
+    opener = Scripted(*script)
+    sink = _Stamped("http://h", max_retries=2, opener=opener)
+    assert read_deliver(sink) is None
+    if case == "orphan":
+        log_foundry.configure(service="t", sink=sink)
+        log_foundry.info("outside a span")
+        assert len(opener.calls) == 3, "s + 1 requests through its own emit"
+        assert log_foundry.health().orphan_lost == 1
+        return
+    delivered, failed_batches = _through_the_worker(sink, _events(1), max_retries=2)
+    if case == "rejected":
+        assert not delivered and failed_batches == 1
+        assert _Stamped.emits == 3 and len(opener.calls) == 3, "the worker's 1.x resend"
+    else:
+        assert delivered and failed_batches == 0
+        assert len(opener.calls) == 2
+        assert b'"stamp": 1' in opener.calls[1]["body"], "landed once, through its own emit"
+
+
+@pytest.mark.parametrize("case", ["one-chunk", "beside-a-true-chunk", "orphan"])
+@pytest.mark.parametrize("base", ["HTTPSink", "ElasticsearchSink"])
+def test_a_bool_reader_override_keeps_its_1x_path(base: str, case: str) -> None:
+    cls = _BoolReader if base == "HTTPSink" else _bool_reader_of_elasticsearch()
+    script = {
+        "one-chunk": [FakeResponse(200, b"no")],
+        "beside-a-true-chunk": [FakeResponse(200, b"ok"), FakeResponse(200, b"no")],
+        "orphan": [_status(503)],
+    }[case]
+    opener = Scripted(*script)
+    kwargs: dict[str, Any] = {"max_batch_count": 1, "max_retries": 2, "opener": opener}
+    sink = cls("http://h", **kwargs) if base == "HTTPSink" else cls("http://h", index="i", **kwargs)
+    assert read_deliver(sink) is None
+    if case == "orphan":
+        log_foundry.configure(service="t", sink=sink)
+        log_foundry.info("outside a span")
+        assert len(opener.calls) == 3
+        assert log_foundry.health().orphan_lost == 1
+        return
+    if case == "one-chunk":
+        with pytest.raises(SinkDeliveryError):
+            sink.emit(_events(1))
+        opener.calls.clear()
+        delivered, failed_batches = _through_the_worker(sink, _events(1), max_retries=2)
+        assert not delivered and failed_batches == 1
+        assert len(opener.calls) == 3, "the worker makes 3 attempts, as 1.x did"
+        return
+    sink.emit(_events(2))
+    assert len(opener.calls) == 2, "emit returned and neither chunk was resent"
+
+
+def test_a_bool_reader_below_a_shipped_reader_reads_through_its_bool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+
+    cls: Any = _bool_reader_of_elasticsearch()
+    called: list[bytes] = []
+
+    def spy(self: Any, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+        called.append(payload)
+        return (A,) * len(items)
+
+    monkeypatch.setattr(ElasticsearchSink, "_outcomes", spy)
+    sink = cls("http://h", index="i", max_batch_count=1, opener=Scripted(FakeResponse(200, b"ok")))
+    sink.emit(_events(3))
+    assert cls.reads == 3, "its override is called on every 2xx"
+    assert called == [], "ElasticsearchSink._outcomes is never called for it"
+
+
+def _offered(cls: type) -> bool:
+    return read_deliver(cls("http://h", opener=FakeOpener())) is not None
+
+
+def test_third_party_eligibility() -> None:
+    class RenderOnly(HTTPSink):
+        def _render(self, event: dict[str, object]) -> str:
+            return super()._render(event)
+
+    class BodyOnly(HTTPSink):
+        def _body(self, items: list[Any]) -> tuple[bytes, str]:
+            return super()._body(items)
+
+    class BothHooks(HTTPSink):
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            return True
+
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return (A,) * len(items)
+
+    class BoolA(HTTPSink):
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            return True
+
+    class OutcomesB(BoolA):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return (A,) * len(items)
+
+    class EmitA(HTTPSink):
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            super().emit(batch)
+
+    class OutcomesBelowEmit(EmitA):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return (A,) * len(items)
+
+    class OptOut(HTTPSink):
+        deliver = None
+
+    class OptOutChild(OptOut):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return (A,) * len(items)
+
+    class Native(HTTPSink):
+        def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+            return Verdict.uniform(A, len(batch))
+
+    class NativeChild(Native):
+        pass
+
+    assert _offered(RenderOnly) and _offered(BodyOnly) and _offered(BothHooks)
+    assert not _offered(BoolA) and BoolA._READS_BOOL
+    assert _offered(OutcomesB) and not OutcomesB._READS_BOOL
+    assert not _offered(EmitA) and not _offered(OutcomesBelowEmit)
+    assert not _offered(OptOut) and not _offered(OptOutChild), "an opt-out is never restored"
+    assert _offered(Native) and _offered(NativeChild)
+    assert NativeChild.deliver is Native.deliver, "a plain child keeps its parent's deliver"
+    assert "_READS_BOOL" in vars(RenderOnly) and RenderOnly._READS_BOOL is False
+
+
+def test_a_raising_reader_costs_only_its_chunk(capsys: pytest.CaptureFixture[str]) -> None:
+    class Raising(HTTPSink):
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            if b"boom" in payload:
+                raise ValueError("cannot read")
+            return True
+
+    opener = Scripted(FakeResponse(200, b"fine"), FakeResponse(200, b"boom"))
+    sink = Raising("http://h", max_batch_count=1, opener=opener)
+    sink.emit(_events(2))
+    assert len(opener.calls) == 2
+    assert sink.dropped_unadjudicated == 1
+    assert sink.losses() == SinkLosses(dropped=0, failed=1)
+    assert _lost(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 1 event(s); Raising reading a 2xx response raised ValueError; "
+            "they may have landed; not retried"
+        )
+    ]
+
+
+def test_handle_response_keeps_its_1x_signature() -> None:
+    import inspect
+
+    from log_foundry.sinks.http import _Item
+
+    signature = inspect.signature(HTTPSink._handle_response, eval_str=True)
+    assert list(signature.parameters) == ["self", "payload", "items"]
+    assert signature.parameters["payload"].annotation is bytes
+    assert signature.parameters["items"].annotation == list[_Item]
+    assert signature.return_annotation is bool
+
+
+# --- FR-001 1.18, 1.19: a run inside a run is independent --------------------------------------
+
+
+def test_a_run_nested_in_a_wrapper_round_is_independent(waits: list[float]) -> None:
+    from log_foundry.sinks.verdict import SinkCounters
+
+    inner_rounds: list[int] = []
+
+    def answer(index: int, request: urllib.request.Request) -> FakeResponse:
+        inner_rounds.append(_engine.run_context().round)
+        return _status(503) if index == 0 else _ok()
+
+    opener = Scripted(answer)
+    inner = SentrySink("http://k@sentry.local/1", backend="http", max_retries=3, opener=opener)
+    after: list[tuple[int, object]] = []
+
+    class Wrapper:
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+
+        def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+            context = _engine.run_context()
+            context.notes(self)["mine"] = "kept"
+            inner.emit(batch)
+            current = _engine.run_context()
+            after.append((current.round, current.notes(self).get("mine")))
+            return Verdict.uniform(A, len(batch))
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            _engine.emit_via_deliver(self, batch)
+
+    delivery = _engine.run_delivery(
+        Wrapper(), [{"level": "ERROR", "message": "m"}], worker_retries=None, stop=None
+    )
+    assert delivery is not None and not delivery.failed
+    assert len(opener.calls) == 2 and len(waits) == 1
+    assert inner.sent == 1
+    assert inner_rounds == [1, 2]
+    assert after == [(1, "kept")]
+
+
+def test_a_send_inside_the_sinks_own_round_is_its_own_run() -> None:
+    rounds: list[int] = []
+    sent: list[bytes] = []
+
+    class Hooked(HTTPSink):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            rounds.append(_engine.run_context().round)
+            sent.append(self._send(b"nested", content_type="text/plain"))
+            rounds.append(_engine.run_context().round)
+            return (J,) * len(items) if sent[-1] == b"payload" else (A,) * len(items)
+
+    opener = Scripted(_ok(), _status(503), FakeResponse(200, b"payload"))
+    sink = Hooked("http://h", max_retries=3, opener=opener)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(_events(1))
+    assert len(opener.calls) == 3, "the chunk's request and the nested send's two"
+    assert sent == [b"payload"]
+    assert rounds == [1, 1], "the outer run is still in its round one"
+    assert sink.failed == 0, "the nested 503 was not its run's last round"
+
+
+# --- FR-005 and FR-002 2.9: both paths and both forms over every shipped class ----------------
+
+_STAMP = "2026-08-10T00:00:00.000Z"
+_RESPONSES = ["200", "400", "503-then-200", "unreadable-2xx", "oversized"]
+
+
+def _event(i: int, **fields: object) -> dict[str, object]:
+    """An event every platform subclass renders: a message, a level, a timestamp, ``fields``."""
+    return {"message": f"m{i}", "level": "INFO", "timestamp": _STAMP, "fields": dict(fields)}
+
+
+def _success(cls: type[HTTPSink]) -> FakeResponse:
+    """A ``2xx`` each class reads as one event accepted."""
+    if cls.__name__ == "HoneycombSink":
+        return FakeResponse(200, b'[{"status": 202}]')
+    return FakeResponse(200, b"{}")
+
+
+def _script(cls: type[HTTPSink], response: str) -> list[Any]:
+    import http.client
+
+    from test_sinks_http_body_read import _UnreadableResponse
+
+    return {
+        "200": [_success(cls)],
+        "400": [_status(400)],
+        "503-then-200": [_status(503), _success(cls)],
+        "unreadable-2xx": [_UnreadableResponse(200, http.client.IncompleteRead(b""))],
+        "oversized": [_success(cls)],
+    }[response]
+
+
+def _expected(cls: type[HTTPSink], response: str, n: int) -> SinkLosses:
+    """What ``n`` events cost under each response, so the twins cannot agree on nothing."""
+    readers = {"ElasticsearchSink", "OpenSearchSink", "HoneycombSink", "OTLPSink"}
+    if response == "400":
+        return SinkLosses(dropped=0, failed=n)
+    if response == "unreadable-2xx" and cls.__name__ in readers:
+        return SinkLosses(dropped=0, failed=n)
+    if response == "oversized":
+        return SinkLosses(dropped=1, failed=0)
+    return SinkLosses(dropped=0, failed=0)
+
+
+def _formula(sink: Any) -> SinkLosses:
+    """``losses()`` by its 1.x formula over the 1.x attributes, independently of ``losses()``."""
+    failed = sum(
+        getattr(sink, name, 0)
+        for name in (
+            "failed",
+            "item_errors",
+            "rejected_events",
+            "rejected_records",
+            "dropped_unadjudicated",
+        )
+    )
+    return SinkLosses(dropped=sink.dropped_oversized + sink._unrenderable, failed=failed)
+
+
+@pytest.mark.parametrize("response", _RESPONSES)
+@pytest.mark.parametrize("cls", _every_shipped_class(), ids=lambda cls: cls.__name__)
+def test_worker_and_orphan_paths_leave_equal_ledgers(cls: type[HTTPSink], response: str) -> None:
+    """Invariant 6 and FR-002 2.9: equal ``losses()`` and requests, and ``health()`` reads 1.x."""
+    kwargs: dict[str, Any] = {"max_batch_bytes": 60} if response == "oversized" else {}
+    through_worker = Scripted(*_script(cls, response))
+    worker_sink = _shipped(cls, through_worker, **kwargs)
+    _through_the_worker(worker_sink, [_event(0)])
+
+    orphan = Scripted(*_script(cls, response))
+    orphan_sink = _shipped(cls, orphan, **kwargs)
+    log_foundry.configure(service="t", sink=orphan_sink)
+    log_foundry.info("outside a span")
+
+    assert worker_sink.losses() == orphan_sink.losses() == _expected(cls, response, 1)
+    assert len(through_worker.calls) == len(orphan.calls)
+    assert log_foundry.health().sink == _formula(orphan_sink) == orphan_sink.losses()
+
+
+@pytest.mark.parametrize("response", _RESPONSES)
+@pytest.mark.parametrize("cls", _every_shipped_class(), ids=lambda cls: cls.__name__)
+def test_emit_and_deliver_leave_equal_ledgers_bodies_and_lines(
+    cls: type[HTTPSink], response: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Twin forms: ``emit`` and an orphan run through ``deliver`` share the budget ``s``."""
+    kwargs: dict[str, Any] = {"max_batch_count": 1, "max_retries": 1}
+    if response == "oversized":
+        kwargs["max_batch_bytes"] = 1000
+        batch = [_event(0, big="x" * 2000), _event(1)]
+    else:
+        batch = [_event(0), _event(1)]
+    capsys.readouterr()
+
+    by_emit = Scripted(*_script(cls, response))
+    emit_sink = _shipped(cls, by_emit, **kwargs)
+    try:
+        emit_sink.emit(list(batch))
+    except SinkDeliveryError:
+        pass
+    emit_lines = capsys.readouterr().err
+
+    by_deliver = Scripted(*_script(cls, response))
+    deliver_sink = _shipped(cls, by_deliver, **kwargs)
+    _engine.run_delivery(deliver_sink, list(batch), worker_retries=None, stop=None)
+    deliver_lines = capsys.readouterr().err
+
+    assert emit_sink.losses() == deliver_sink.losses() == _expected(cls, response, 2)
+    assert [call["body"] for call in by_emit.calls] == [call["body"] for call in by_deliver.calls]
+    assert emit_lines == deliver_lines
+    assert log_foundry.sinks.base.read_losses(emit_sink) == _formula(emit_sink)
