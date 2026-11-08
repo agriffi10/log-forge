@@ -145,9 +145,71 @@ def test_gzip_beside_a_callers_other_encoding_is_refused(name: str, value) -> No
     assert caught.value.__context__ is None
 
 
-@pytest.mark.parametrize("value", _NOT_GZIP, ids=repr)
+_A_CODING = ["gzip", "GZIP", " x-gzip\t", "br", "identity, gzip", "identity, identity", 5, b"gzip"]
+"""Values naming a coding the sink never applies under ``gzip=False``: a token other than
+``identity``, a list, and a value that is not a ``str``, which names no coding this module reads."""
+
+_NO_CODING = ["identity", "IDENTITY", " Identity\t", "", " ", "\t \t"]
+"""``identity`` in any case and padding, and a value empty once space and tab are stripped — an
+empty list of codings — both true of a body sent as built."""
+
+
+def _gzip_false_refused(owner: str, name: str) -> str:
+    """The refusal of ``gzip=False`` beside ``name``, written out."""
+    return (
+        f"{owner} gzip=False, the default, cannot apply beside header {name!r}, which names an "
+        "encoding the body is not in; drop the header, or pass gzip=True if it names gzip"
+    )
+
+
+@pytest.mark.parametrize("gzip_given", [{}, {"gzip": False}], ids=["default", "explicit"])
+@pytest.mark.parametrize("value", _A_CODING, ids=repr)
 @pytest.mark.parametrize("name", _ENCODING_NAMES)
-def test_any_encoding_beside_gzip_false_is_sent_over_an_uncompressed_body(name: str, value) -> None:
+def test_gzip_false_beside_a_callers_coding_is_refused(name: str, value, gzip_given) -> None:
+    """At ``c4e51fbd``: constructs and labels a body sent as built with a coding it is not in, on
+    every request. The sink builds the body, so the caller cannot have encoded it."""
+    with pytest.raises(ValueError) as caught:
+        HTTPSink(URL, headers={name: value}, **gzip_given)
+
+    assert str(caught.value) == _gzip_false_refused("HTTPSink", name)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def _logstash(**kw: Any) -> LogstashSink:
+    """``LogstashSink`` wraps an ``HTTPSink`` in HTTP mode; its refusals name ``HTTPSink``."""
+    return LogstashSink(url=URL, **kw)
+
+
+_GZIP_TAKERS: dict[str, tuple[Callable[..., Any], str]] = {
+    **{name: (make, name) for name, make in _RECIPES.items()},
+    "HTTPSink": (lambda **kw: HTTPSink(URL, **kw), "HTTPSink"),
+    "LogstashSink": (_logstash, "HTTPSink"),
+}
+"""Every class taking ``gzip`` and ``headers``: a builder, and the owner its message names.
+``SentrySink`` takes neither."""
+
+
+def test_the_gzip_roster_covers_every_shipped_subclass() -> None:
+    assert {cls.__name__ for cls in _shipped_http_subclasses()} <= set(_GZIP_TAKERS)
+
+
+@pytest.mark.parametrize("name", sorted(_GZIP_TAKERS))
+def test_every_class_refuses_gzip_false_beside_a_coding_and_sends_identity(name: str) -> None:
+    make, owner = _GZIP_TAKERS[name]
+
+    with pytest.raises(ValueError) as caught:
+        make(headers={"content-encoding": "br"})
+
+    assert str(caught.value) == _gzip_false_refused(owner, "content-encoding")
+    opener = FakeOpener()
+    request = _sent(make(headers={"content-encoding": "Identity"}, opener=opener), opener)
+    assert request["headers"]["content-encoding"] == "Identity"
+
+
+@pytest.mark.parametrize("value", _NO_CODING, ids=repr)
+@pytest.mark.parametrize("name", _ENCODING_NAMES)
+def test_no_coding_beside_gzip_false_is_sent_over_an_uncompressed_body(name: str, value) -> None:
     plain_opener = FakeOpener()
     plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
     opener = FakeOpener()
