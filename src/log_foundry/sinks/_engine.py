@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import enum
 import math
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, cast
 
@@ -18,12 +20,14 @@ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict, _bound_del
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from log_foundry.sinks._deferral import _Counted
+
     type Deliver = Callable[[list[dict[str, object]]], object]
 
 BACKOFF_BASE: Final = 0.1
 """The sinks' 1.x backoff within a cycle: the wait before attempt ``i + 1`` is ``0.1 * 2**i``.
 
-It is the formula twelve sink modules apply today with their own ``_BACKOFF_BASE``, restarting
+It is the formula each sink module defining its own ``_BACKOFF_BASE`` applies, restarting
 at ``i = 0`` in every cycle, written here once for every sink that adopts the engine.
 """
 
@@ -365,6 +369,454 @@ def _snapshot(batch: list[dict[str, object]]) -> list[dict[str, object]]:
     return list(batch)
 
 
+class When(enum.Enum):
+    """When a run-context count or line commits, judged once the run has ended.
+
+    Attributes:
+      ALWAYS: Whatever the run's outcome.
+      SETTLED: Only when the run settles; a per-event drop, which a failed run's catcher owns.
+      LAST: Only when the round that registered it is the run's last, so a count of something a
+        later round may still fix is made once, for the round that ended the run.
+    """
+
+    ALWAYS = "always"
+    SETTLED = "settled"
+    LAST = "last"
+
+
+class RunContext:
+    """One engine run's counts and lines, committed once when the run ends (SPEC-073 FR-002).
+
+    The engine's own totals are events into ``SinkCounters``; a shipped sink's documented
+    counters count other things — ``HTTPSink.failed`` counts requests — and must keep their 1.x
+    names and units. So a sink registers its own counts here, each against a named owner, and the
+    engine commits them through one ``Deferral`` per owner, under that owner's ``_counter_lock``
+    read at commit time, then writes every committed line outside every lock, in registration
+    order. It is family-neutral: nothing here names a sink type.
+
+    Owners are kept by identity (``id``), never hashed or compared, so no third-party
+    ``__hash__`` or ``__eq__`` runs. When its run ends the context is cleared, so it holds no sink
+    afterwards and adds no global that holds one (invariant 12).
+
+    An *immediate* context is what :func:`run_context` hands a caller outside any run: each count
+    and line commits at once, as a one-round run that is its own last and settles.
+
+    Attributes:
+      round: The 1-based number of the round in progress.
+    """
+
+    __slots__ = ("_entries", "_immediate", "_lines", "_notes", "_round")
+
+    def __init__(self, *, immediate: bool = False) -> None:
+        """Starts an empty context at round one.
+
+        Args:
+          immediate: Whether every count and line commits at once.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._round = 1
+        self._immediate = immediate
+        self._notes: dict[int, tuple[object, dict[str, object]]] = {}
+        self._entries: list[tuple[_Counted, str, int, When, int]] = []
+        self._lines: list[tuple[Callable[[], None], When, int]] = []
+
+    @property
+    def round(self) -> int:
+        """The 1-based round in progress; a line naming attempts uses it.
+
+        Args:
+          None.
+
+        Returns:
+          The round number.
+
+        Raises:
+          None.
+        """
+        return self._round
+
+    def notes(self, owner: object) -> dict[str, object]:
+        """Returns the per-run, per-owner ``dict`` an owner keeps across the run's rounds.
+
+        Args:
+          owner: The object the notes belong to, matched by identity.
+
+        Returns:
+          The same ``dict`` on every call for that owner within this run.
+
+        Raises:
+          None.
+        """
+        found = self._notes.get(id(owner))
+        if found is None:
+            found = (owner, {})
+            self._notes[id(owner)] = found
+        return found[1]
+
+    def count(self, owner: _Counted, name: str, n: int, *, when: When) -> None:
+        """Registers ``n`` against ``owner.name``, committed when the run ends as ``when`` says.
+
+        A zero is not recorded, so it can never make a commit take a lock for nothing.
+
+        Args:
+          owner: The object whose counter it is; the commit takes its ``_counter_lock``.
+          name: The owner's counter attribute.
+          n: How much to add.
+          when: Which run endings commit it.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not n:
+            return
+        if self._immediate:
+            _commit([(owner, {name: n})], [])
+            return
+        self._entries.append((owner, name, n, when, self._round))
+
+    def announce(self, line: Callable[[], None], *, when: When) -> None:
+        """Registers a diagnostic line, written after the commit when ``when`` keeps it.
+
+        A site passes a ``lambda`` wrapping its own ``_diag`` call, so the detail stays inside a
+        call ``tests/test_diag.py`` reads for a ``repr``.
+
+        Args:
+          line: Called with no arguments once the counts are committed, outside every lock.
+          when: Which run endings write it.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if self._immediate:
+            _commit([], [line])
+            return
+        self._lines.append((line, when, self._round))
+
+    def drops(self, owner: _Counted) -> _Drops:
+        """Returns a ``Deferral``-shaped view that registers every count and line ``SETTLED``.
+
+        Args:
+          owner: The owner the view counts into.
+
+        Returns:
+          The view.
+
+        Raises:
+          None.
+        """
+        return _Drops(self, owner)
+
+    def _begin(self, number: int) -> None:
+        """Records the round about to run.
+
+        Args:
+          number: Its 1-based number.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._round = number
+
+    def _kept(self, when: When, registered: int, *, settled: bool, final: int) -> bool:
+        """Whether an entry registered in one round commits, given how the run ended.
+
+        Args:
+          when: The entry's rule.
+          registered: The round it was registered in.
+          settled: Whether the run settled.
+          final: The run's last round.
+
+        Returns:
+          True when it commits.
+
+        Raises:
+          None.
+        """
+        if when is When.ALWAYS:
+            return True
+        if when is When.SETTLED:
+            return settled
+        return registered == final
+
+    def _committed(
+        self, *, settled: bool, final: int
+    ) -> tuple[list[tuple[_Counted, dict[str, int]]], list[Callable[[], None]]]:
+        """Selects what commits: each owner's counts in first-registration order, then the lines.
+
+        Args:
+          settled: Whether the run settled.
+          final: The run's last round.
+
+        Returns:
+          ``(owners, lines)``: per owner its counts by name, and the lines in registration order.
+
+        Raises:
+          None.
+        """
+        owners: list[tuple[_Counted, dict[str, int]]] = []
+        position: dict[int, int] = {}
+        for owner, name, n, when, registered in self._entries:
+            if not self._kept(when, registered, settled=settled, final=final):
+                continue
+            at = position.get(id(owner))
+            if at is None:
+                at = position[id(owner)] = len(owners)
+                owners.append((owner, {}))
+            counts = owners[at][1]
+            counts[name] = counts.get(name, 0) + n
+        lines = [
+            line
+            for line, when, registered in self._lines
+            if self._kept(when, registered, settled=settled, final=final)
+        ]
+        return owners, lines
+
+    def _close(self) -> None:
+        """Drops every reference the context holds, so no owner outlives its run here.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._notes.clear()
+        self._entries.clear()
+        self._lines.clear()
+
+
+class _Drops:
+    """A ``Deferral``-shaped view of a run context that registers everything ``SETTLED``.
+
+    It keeps the 1.x ``pending`` parameter of ``HTTPSink._items`` and ``_drop_refused`` whole:
+    a per-event drop is counted only by a run that settles, as it was only by an ``emit`` that
+    returned, and a ``Deferral`` still fits the same parameter.
+    """
+
+    __slots__ = ("_context", "_owner")
+
+    def __init__(self, context: RunContext, owner: _Counted) -> None:
+        """Binds the view to its context and owner.
+
+        Args:
+          context: The run context.
+          owner: The owner every count names.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._context = context
+        self._owner = owner
+
+    def count(self, counter: str, n: int = 1) -> None:
+        """Registers ``n`` against the owner's ``counter``, committed only by a settled run.
+
+        Args:
+          counter: The owner's attribute.
+          n: How much to add.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._context.count(self._owner, counter, n, when=When.SETTLED)
+
+    def announce(self, line: Callable[[], None]) -> None:
+        """Registers a line written only by a settled run.
+
+        Args:
+          line: The line, a ``lambda`` wrapping a ``_diag`` call.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._context.announce(line, when=When.SETTLED)
+
+
+_RUNS: ContextVar[tuple[RunContext, ...]] = ContextVar("log_foundry_runs", default=())
+"""The engine runs in progress on the calling context, innermost last.
+
+A ``ContextVar`` rather than a thread-local, so an asyncio task, a thread and a run nested inside
+another run's round each see only their own; a new thread starts empty. ``_run`` pushes and pops
+it in a ``finally``, and each context is cleared when its run ends.
+"""
+
+
+def run_context() -> RunContext:
+    """Returns the context of the innermost engine run on the calling context.
+
+    Outside any run it returns a fresh *immediate* context, whose counts and lines commit at once,
+    so a direct call of a sink's reader still moves its counters rather than losing them.
+
+    Args:
+      None.
+
+    Returns:
+      The context.
+
+    Raises:
+      None.
+    """
+    runs = _RUNS.get()
+    if runs:
+        return runs[-1]
+    return RunContext(immediate=True)
+
+
+def _verdict_failed(verdict: object, n: int) -> bool:
+    """Applies the run-failed rule to one round's verdict, as a one-round run's tally would.
+
+    Args:
+      verdict: What the round returned.
+      n: How many events it was handed.
+
+    Returns:
+      True when the round would fail a run; an unreadable verdict settles, as in :func:`_run`.
+
+    Raises:
+      None.
+    """
+    outcomes = outcomes_of(verdict, n)
+    if outcomes is None:
+        return False
+    return _tally(list(outcomes), 1, 1, False).failed
+
+
+def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
+    """Runs ``call`` as a one-round run of its own, committing its context when it returns.
+
+    The context is pushed whatever else is running, so a count inside it is committed here and
+    never by an enclosing run. It is its own last round and settles unless ``failed`` says
+    otherwise. An ``Exception`` from ``call`` commits it as a failed run and propagates; a
+    ``BaseException`` commits nothing.
+
+    Args:
+      call: The work to run.
+      failed: Whether its result fails the run.
+
+    Returns:
+      What ``call`` returned.
+
+    Raises:
+      Exception: Whatever ``call`` raises, after the failed run's commit.
+      BaseException: Whatever ``call`` raises that is not an ``Exception``, uncommitted.
+    """
+    context = RunContext()
+    token = _RUNS.set((*_RUNS.get(), context))
+    try:
+        try:
+            result = call()
+        except Exception:
+            _commit(*context._committed(settled=False, final=1))
+            raise
+        _commit(*context._committed(settled=not failed(result), final=1))
+        return result
+    finally:
+        _RUNS.reset(token)
+        context._close()
+
+
+def one_round(
+    round_fn: Callable[[list[dict[str, object]]], Verdict], batch: list[dict[str, object]]
+) -> Verdict:
+    """Runs one round as a sink's ``deliver``: inside a run as part of it, outside one detached.
+
+    Inside an engine run the round counts into that run's context, each count under its own
+    owner, so a delegate forwarding ``deliver`` commits into the sink that made the count. A
+    direct ``sink.deliver(batch)`` outside any run commits its own ledger when it returns, as a
+    one-round run that is its own last and settles unless its verdict fails.
+
+    Args:
+      round_fn: The sink's round.
+      batch: The events.
+
+    Returns:
+      The round's verdict.
+
+    Raises:
+      BaseException: Whatever the round raises that is not an ``Exception``.
+    """
+    if _RUNS.get():
+        return round_fn(batch)
+    size = len(batch)
+    return detached(lambda: round_fn(batch), lambda verdict: _verdict_failed(verdict, size))
+
+
+def _uncounted(fault: Exception, n: int, what: str) -> None:
+    """Announces a commit that raised, so a misspelt counter never drops a count silently.
+
+    Args:
+      fault: What the commit raised.
+      n: How many were not counted.
+      what: What they were, named by type and unit only.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _diag.absorbed("counting a delivery", fault, f"{n} {what} not counted")
+
+
+def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[[], None]]) -> None:
+    """Commits a run context's selected counts, one ``Deferral`` per owner, then its lines.
+
+    Each owner's counts commit under that owner's ``_counter_lock``, read at commit time, so a
+    fork repair that rebound it is honoured. The lines are written after every count, outside
+    every lock, in registration order, and even when an owner's commit raised, since an
+    announced loss is better than a silent one.
+
+    Args:
+      owners: Each owner with its counts by name.
+      lines: The lines to write.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    for owner, counts in owners:
+        try:
+            with Deferral(owner) as ledger:
+                for name, n in counts.items():
+                    ledger.count(name, n)
+        except Exception as fault:
+            _uncounted(
+                fault,
+                sum(counts.values()),
+                f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(owner)))}",
+            )
+    for line in lines:
+        line()
+
+
 def _wait(delay: float, stop: threading.Event | None) -> threading.Event | None:
     """Waits between rounds on the stop event, falling back to a sleep if waiting on it raises.
 
@@ -430,6 +882,15 @@ def _run(
     commit; then each distinct exception type that escaped ``deliver`` gets one ``absorbed`` line,
     record first, announce second, by type and never by text.
 
+    **The run's context** (SPEC-073 FR-002) is pushed onto :data:`_RUNS` for the whole run and
+    popped in a ``finally``, so a round reads its own :func:`run_context` and a run nested inside
+    a round has its own. Each round's number is recorded on it before ``deliver`` is called.
+    After the engine's own commit, the counts the sink registered commit through :func:`_commit`
+    as the run ended — ``ALWAYS``, ``SETTLED`` for a settled run, ``LAST`` for the final round —
+    and then their lines. A settled run whose sink will write a line of its own gets no engine
+    line, so a loss is never announced twice; that is SPEC-072 FR-003's refinement, which needs
+    this context and is added with it. A ``BaseException`` commits nothing of either.
+
     Args:
       sink: The sink, read statically for its idempotence and predicate.
       deliver: The callable to run each round.
@@ -450,87 +911,96 @@ def _run(
     total_events = len(events)
     if not total_events:
         return _SETTLED_EMPTY
-    per_cycle = _count(sink_retries) + 1
-    rounds_allowed = per_cycle * (_count(worker_retries) + 1)
-    idempotent = _idempotent(sink)
-    ceiling = _ceiling(sink)
-    fate: list[object] = [Outcome.RETRYABLE] * total_events
-    pending = list(range(total_events))
-    escaped: list[Exception] = []
-    attempts = 0
-    longest = 0.0
-    hint: float | None = None
-    declined = False
-    while True:
-        if attempts:
-            cycle, position = divmod(attempts, per_cycle)
-            delay = None if hint is None else _retry.clamp_server_delay(hint, ceiling)
-            if delay is None:
-                delay = cycle_backoff(cycle - 1) if position == 0 else _backoff(position - 1)
-            stop = _wait(delay, stop)
-            if decline is not None and decline(longest):
-                declined = True
-                break
-        offered = batch if not attempts else [events[index] for index in pending]
-        n = len(pending)
-        attempts += 1
-        hint = None
-        started = time.monotonic()
-        try:
-            result = deliver(offered)
-        except Exception as exc:
-            longest = max(longest, time.monotonic() - started)
-            if not any(type(seen) is type(exc) for seen in escaped):
-                escaped.append(exc)
-            predicate = _predicate_of(sink) if idempotent else None
-            resend = predicate is not None and is_retryable(predicate, exc)
-            for index in pending:
-                fate[index] = _RAISED
-            if not resend:
-                pending = []
-        else:
-            longest = max(longest, time.monotonic() - started)
-            outcomes = outcomes_of(result, n)
-            if outcomes is None:
+    context = RunContext()
+    token = _RUNS.set((*_RUNS.get(), context))
+    try:
+        per_cycle = _count(sink_retries) + 1
+        rounds_allowed = per_cycle * (_count(worker_retries) + 1)
+        idempotent = _idempotent(sink)
+        ceiling = _ceiling(sink)
+        fate: list[object] = [Outcome.RETRYABLE] * total_events
+        pending = list(range(total_events))
+        escaped: list[Exception] = []
+        attempts = 0
+        longest = 0.0
+        hint: float | None = None
+        declined = False
+        while True:
+            if attempts:
+                cycle, position = divmod(attempts, per_cycle)
+                delay = None if hint is None else _retry.clamp_server_delay(hint, ceiling)
+                if delay is None:
+                    delay = cycle_backoff(cycle - 1) if position == 0 else _backoff(position - 1)
+                stop = _wait(delay, stop)
+                if decline is not None and decline(longest):
+                    declined = True
+                    break
+            offered = batch if not attempts else [events[index] for index in pending]
+            n = len(pending)
+            attempts += 1
+            context._begin(attempts)
+            hint = None
+            started = time.monotonic()
+            try:
+                result = deliver(offered)
+            except Exception as exc:
+                longest = max(longest, time.monotonic() - started)
+                if not any(type(seen) is type(exc) for seen in escaped):
+                    escaped.append(exc)
+                predicate = _predicate_of(sink) if idempotent else None
+                resend = predicate is not None and is_retryable(predicate, exc)
                 for index in pending:
-                    fate[index] = _UNREAD
-                if not idempotent:
+                    fate[index] = _RAISED
+                if not resend:
                     pending = []
             else:
-                hint = _hint_of(result)
-                still: list[int] = []
-                for index, outcome in zip(pending, outcomes, strict=True):
-                    fate[index] = outcome
-                    if outcome is Outcome.RETRYABLE or (idempotent and outcome is Outcome.UNKNOWN):
-                        still.append(index)
-                pending = still
-        if not pending or attempts >= rounds_allowed:
-            break
-    delivery = _tally(fate, attempts, -(-attempts // per_cycle), declined)
-    unconfirmed = delivery.rejected + delivery.unresolved + delivery.raised + delivery.unknown
-    dropped = 0 if delivery.failed else delivery.dropped
-    name = _diag._STR_STR(_diag._STORED_NAME(type(sink)))
-    try:
-        with Deferral(counters) as ledger:
-            ledger.count("failed_events", unconfirmed)
-            ledger.count("dropped_events", dropped)
-            if not delivery.failed and unconfirmed + dropped:
-                ledger.announce(
-                    lambda: _diag.lost(
-                        "event",
-                        unconfirmed + dropped,
-                        f"rejected {delivery.rejected}, unresolved {delivery.unresolved}, "
-                        f"raised {delivery.raised}, unknown {delivery.unknown}, dropped {dropped} "
-                        f"after {delivery.attempts} delivery round(s) to {name}",
+                longest = max(longest, time.monotonic() - started)
+                outcomes = outcomes_of(result, n)
+                if outcomes is None:
+                    for index in pending:
+                        fate[index] = _UNREAD
+                    if not idempotent:
+                        pending = []
+                else:
+                    hint = _hint_of(result)
+                    still: list[int] = []
+                    for index, outcome in zip(pending, outcomes, strict=True):
+                        fate[index] = outcome
+                        if outcome is Outcome.RETRYABLE or (
+                            idempotent and outcome is Outcome.UNKNOWN
+                        ):
+                            still.append(index)
+                    pending = still
+            if not pending or attempts >= rounds_allowed:
+                break
+        delivery = _tally(fate, attempts, -(-attempts // per_cycle), declined)
+        unconfirmed = delivery.rejected + delivery.unresolved + delivery.raised + delivery.unknown
+        dropped = 0 if delivery.failed else delivery.dropped
+        name = _diag._STR_STR(_diag._STORED_NAME(type(sink)))
+        owners, lines = context._committed(settled=not delivery.failed, final=attempts)
+        try:
+            with Deferral(counters) as ledger:
+                ledger.count("failed_events", unconfirmed)
+                ledger.count("dropped_events", dropped)
+                if not delivery.failed and unconfirmed + dropped and not lines:
+                    ledger.announce(
+                        lambda: _diag.lost(
+                            "event",
+                            unconfirmed + dropped,
+                            f"rejected {delivery.rejected}, unresolved {delivery.unresolved}, "
+                            f"raised {delivery.raised}, unknown {delivery.unknown}, dropped {dropped} "
+                            f"after {delivery.attempts} delivery round(s) to {name}",
+                        )
                     )
-                )
-    except Exception as fault:
-        _diag.absorbed(
-            "counting a delivery", fault, f"{unconfirmed + dropped} event(s) not counted"
-        )
-    for one in escaped:
-        _diag.absorbed("delivering a batch", one, f"its round's events not confirmed by {name}")
-    return delivery
+        except Exception as fault:
+            _uncounted(fault, unconfirmed + dropped, "event(s)")
+        _commit(owners, lines)
+        for one in escaped:
+            _diag.absorbed("delivering a batch", one, f"its round's events not confirmed by {name}")
+        return delivery
+    finally:
+        _RUNS.reset(token)
+        context._close()
 
 
 def _tally(fate: list[object], attempts: int, cycles: int, declined: bool) -> Delivery:

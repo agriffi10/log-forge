@@ -620,8 +620,10 @@ A few conventions hold across every sink below:
 - **Never crashes the app.** A broken destination degrades logging and nothing more. A sink that
   delivered *part* of a batch counts what it lost (`.failed`, `.dropped_oversized`,
   `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
-  A sink that delivered **none** of it raises instead, so the worker's bounded retry engages and
-  `health().failed_batches` records the loss — there is nothing downstream to duplicate. Three
+  A sink that delivered **none** of it raises instead (a sink on the delivery engine, such as the
+  HTTP family, reports its run failed), so the worker's bounded retry engages for whatever can
+  still land and `health().failed_batches` records the loss — there is nothing downstream to
+  duplicate. Three
   cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
   event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
   landed), and an SQS or SNS sender fault (a byte-identical re-send can only fail again). Within a
@@ -704,7 +706,11 @@ lf.configure(sink=RotatingFileSink("app.log.jsonl", max_bytes=10_000_000, backup
 
 All build on `HTTPSink` (stdlib `urllib`): they POST batches with bounded `429`/`5xx` retry
 (honoring `Retry-After`) — `OTLPSink` alone retries OTLP's own set, `429`/`502`/`503`/`504`, and
-abandons a `500` on the first request — and need **no** extra. On the specialized sinks, `**http_kwargs` forwards
+abandons a `500` on the first request — and need **no** extra. Each offers `deliver`, so the
+library's delivery engine runs the retries: every chunk of a batch goes in one request, and a
+retry carries only the chunks that failed retryably, never one that landed or was refused for good
+(a `4xx`, or a record the destination's `2xx` rejected), which is sent once. One wait covers every
+chunk of a round, and the batch keeps `max_retries + 1` attempts per worker attempt, as before. On the specialized sinks, `**http_kwargs` forwards
 to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`, `max_retry_after=`,
 `max_batch_count=`, `max_batch_bytes=`, `opener=`).
 
@@ -779,9 +785,9 @@ A `2xx` carrying `partialSuccess` is counted on `.rejected_records` and never re
 retry would re-send what landed; a `2xx` whose verdict cannot be read — a count that is not a
 usable integer, a body over the 4 MiB bound — is counted on `.dropped_unadjudicated`, also never
 retried, and so is a `2xx` whose body could not be read at all (cut short, stalled or reset after
-the status line); a `2xx` with an empty body is success. Both feed `health().sink.failed`. A chunk whose every record was rejected raises, so the
-worker's retry and `failed_batches` show a permanent rejection. A `413` still halves the byte
-budget and re-sends in smaller requests, since nothing landed.
+the status line); a `2xx` with an empty body is success. Both feed `health().sink.failed`. A batch whose every record was rejected fails —
+`emit` raises, and `failed_batches` shows a permanent rejection — and is sent once, never retried.
+A `413` still halves the byte budget and re-sends in smaller requests, since nothing landed.
 
 ```python
 from log_foundry.sinks.otlp import OTLPSink

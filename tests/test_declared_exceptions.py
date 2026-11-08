@@ -189,10 +189,17 @@ def empty_body_successes(readers: Iterable[type[HTTPSink]]) -> set[str]:
 
 
 def _shipped_readers() -> list[type[HTTPSink]]:
+    """The shipped body readers: a reader of ``_outcomes`` or of ``_handle_response`` (SPEC-073).
+
+    Each shipped reader defines both — ``_outcomes`` reads the body and ``_handle_response`` is
+    its 1.x shim — so the union is the set either derivation finds; a reader that defined only
+    ``_outcomes`` is still swept here.
+    """
     return [
         cls
         for cls in _shipped_http_subclasses()
         if cls._handle_response is not HTTPSink._handle_response
+        or cls._outcomes is not HTTPSink._outcomes
     ]
 
 

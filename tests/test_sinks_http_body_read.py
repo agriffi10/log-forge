@@ -50,7 +50,7 @@ _TIMEOUT = 5.0
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize backoff waits, as ``test_sinks_http`` does for its own module."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _event(i: int) -> dict[str, object]:
@@ -469,6 +469,24 @@ def test_every_body_reader_counts_an_unreadable_body() -> None:
     assert _COUNTS_UNREADABLE == _BODY_READERS
 
 
+def test_the_body_readers_are_the_outcomes_definers() -> None:
+    """SPEC-073 FR-005: the readers of ``_outcomes`` and of ``_handle_response`` are one set.
+
+    Each shipped reader reads the body through ``_outcomes`` and keeps ``_handle_response`` as
+    the 1.x shim, so the two derivations agree; a reader that moved only one of them would be
+    read through a different path than the one its tests drive.
+    """
+    outcomes = {
+        cls for cls in _shipped_http_subclasses() if cls._outcomes is not HTTPSink._outcomes
+    }
+    readers = {
+        cls
+        for cls in _shipped_http_subclasses()
+        if cls._handle_response is not HTTPSink._handle_response
+    }
+    assert outcomes == readers == _BODY_READERS
+
+
 def test_the_body_readers_are_exactly_the_listed_set() -> None:
     """Defines-or-inherits: attribute lookup sees ``OpenSearchSink`` through its parent."""
     readers = {
@@ -522,7 +540,7 @@ def test_retry_after_survives_a_failed_body_read(monkeypatch: pytest.MonkeyPatch
     """The headers are read off the response even when its body is not."""
     delays: list[float] = []
     monkeypatch.setattr(
-        "log_foundry.sinks.http.wait", lambda delay, _stop=None: delays.append(delay)
+        "log_foundry.sinks._retry.wait", lambda delay, _stop=None: delays.append(delay)
     )
     opener = FakeOpener(
         [

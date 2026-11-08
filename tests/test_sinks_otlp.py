@@ -32,7 +32,11 @@ from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from log_foundry.sinks.verdict import Outcome
+
 STAMP = "2026-10-05T12:34:56.789Z"
+_real_wait = _retry.wait
+"""The real shared wait, kept before any fixture replaces the module's attribute."""
 MIB = 1024 * 1024
 LIMIT = 4 * MIB
 
@@ -40,7 +44,7 @@ LIMIT = 4 * MIB
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
     """Neutralize the HTTP backoff so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _event(i: int = 0, **over: object) -> dict[str, object]:
@@ -210,14 +214,20 @@ def test_every_other_status_is_abandoned_on_the_first_request(
 def test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-7 (invariant 3). The backoff goes through ``_retry.wait`` with the sink's signal."""
+    """AC-7 (invariant 3). The backoff goes through ``_retry.wait`` with the sink's signal.
+
+    Since SPEC-073 the wait is the delivery engine's, which calls ``_retry.wait`` through the
+    module; the spy keeps the real function to call, since the autouse fixture has already
+    replaced the module's attribute.
+    """
     seen: list[tuple[float, threading.Event | None]] = []
+    real = _real_wait
 
     def spy(delay: float, stop: threading.Event | None = None) -> None:
         seen.append((delay, stop))
-        _retry.wait(delay, stop)
+        real(delay, stop)
 
-    monkeypatch.setattr("log_foundry.sinks.http.wait", spy)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", spy)
     sink, opener = _sink(FakeResponse(503, b""), max_retries=2)
     sink.log_foundry_stop_signal = threading.Event()
     sink.log_foundry_stop_signal.set()
@@ -634,8 +644,12 @@ def test_a_2xx_over_the_bound_is_unadjudicated_and_exactly_the_bound_is_read() -
     assert (sink.rejected_records, sink.dropped_unadjudicated) == (2, 0)
 
 
-def test_every_record_rejected_raises_and_the_worker_recounts_per_attempt() -> None:
-    """AC-7 (invariants 2 and 7)."""
+def test_every_record_rejected_raises_and_the_worker_counts_once() -> None:
+    """AC-7 (invariants 2 and 7). Since SPEC-073 sent once and counted once through a worker.
+
+    ``fda134a`` made 4 POSTs and counted 20: the worker resent the raising batch whole, and each
+    attempt recounted it. No round resends an outcome rejected for good.
+    """
     sink, opener = _sink(_partial("5"))
     with pytest.raises(SinkDeliveryError):
         sink.emit([_event(i) for i in range(5)])
@@ -648,8 +662,9 @@ def test_every_record_rejected_raises_and_the_worker_recounts_per_attempt() -> N
         failed_batches = worker.health().failed_batches
     finally:
         worker.stop()
-    assert not delivered and failed_batches > 0
-    assert sink.rejected_records == 5 * len(opener.calls) == 20
+    assert not delivered and failed_batches == 1
+    assert len(opener.calls) == 1
+    assert sink.rejected_records == 5
     assert sink.losses().dropped == 0
 
 
@@ -871,13 +886,13 @@ def test_a_truncated_2xx_reaches_the_sink_unread_and_is_counted(mode: str) -> No
     seen: list[bytes] = []
     with _truncating(mode) as server:
         sink = OTLPSink(f"http://127.0.0.1:{server.server_address[1]}/v1/logs", timeout=5.0)
-        original = sink._handle_response
+        original = sink._outcomes
 
-        def spy(payload: bytes, items: list[Any]) -> bool:
+        def spy(payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
             seen.append(payload)
             return original(payload, items)
 
-        sink._handle_response = spy  # type: ignore[method-assign]
+        sink._outcomes = spy  # type: ignore[method-assign]
         sink.emit([_event(i) for i in range(5)])
         posts = server.posts
     assert posts == 1

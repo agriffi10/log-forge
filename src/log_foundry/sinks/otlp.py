@@ -7,14 +7,17 @@ from typing import Unpack
 
 from log_foundry import __version__, _diag
 from log_foundry._otel import framing, log_record, request_body, resource_key
+from log_foundry.sinks._engine import When, run_context
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
     _Item,
+    _read_as_1x,
     _read_failed,
     _valid_url,
 )
+from log_foundry.sinks.verdict import Outcome
 
 __all__ = ["OTLPSink"]
 
@@ -80,7 +83,9 @@ class OTLPSink(HTTPSink):
       MAX_RESPONSE_BYTES: 4 MiB, what :meth:`_response_limit` returns; OTLP's recommended bound.
       rejected_records: Records the server reported rejected in a ``2xx`` partial success,
         clamped to each chunk's size so a confused server cannot inflate ``failed`` past what
-        was sent. Never retried: a retry would re-send what landed.
+        was sent. Never resent: a retry would re-send what landed. The response gives a count,
+        not an identity, so the chunk's first *r* events are ``REJECTED`` and the rest
+        ``ACCEPTED``; those positions carry no claim about which records the server refused.
       dropped_unadjudicated: Records in a ``2xx`` response this sink could not read — a
         ``partialSuccess`` that is not an object, a count that is not a usable integer, a body
         over the response bound. Counted as an upper bound, like ``failed``, and never retried,
@@ -133,7 +138,6 @@ class OTLPSink(HTTPSink):
         super().__init__(endpoint, body_format="json_array", **http_kwargs)
         self._scope_version = __version__
         self.rejected_records = 0
-        self.dropped_unadjudicated = 0
 
     def _retryable_status(self, status: int) -> bool:
         """OTLP's exact retryable set: ``429``, ``502``, ``503`` and ``504``.
@@ -228,24 +232,11 @@ class OTLPSink(HTTPSink):
         return request_body(pairs, self._scope_version).encode("utf-8"), "application/json"
 
     def _handle_response(self, payload: bytes, items: list[_Item]) -> bool:
-        """Sorts a ``2xx`` body into full success, rejected records or unadjudicated (FR-004).
+        """Reads a ``2xx`` as a 1.x caller did: ``False`` when every record of the chunk bounced.
 
-        Never raises, on any bytes: an exception escaping here escapes ``emit``, and the worker
-        then re-sends chunks that already landed. A body that is empty, not JSON, not an object
-        or without a ``partialSuccess`` is full success — what a server must send on success, so
-        a proxy's page or a protobuf body is not this sink's to adjudicate, unlike a ``_bulk``
-        response, whose only verdict is in the body.
-
-        **A body that could not be read is not one of those** (SPEC-070 FR-004). A ``2xx`` whose
-        body was cut short, stalled or reset after the status line arrives as an
-        ``_UnreadBody``, equal to ``b""``; it used to read as an empty body and so as full
-        success, settling silently a chunk whose verdict may have rejected every record. It is
-        asked about first, before the response bound, and counted on ``dropped_unadjudicated``
-        with the line written for an unreadable ``partialSuccess``, settled and never re-sent. An
-        honestly empty body is still success. The body is parsed with ``parse_int=str``
-        so a bare over-long ``rejectedLogRecords`` takes the digit rule rather than reading as
-        not-JSON and settling as success; ``except Exception`` because a ``RecursionError`` from a
-        deeply nested body is not a ``ValueError``.
+        Kept for a direct 1.x caller (SPEC-073 FR-003): it runs :meth:`_outcomes` in a context of
+        its own, committed at once, and returns ``False`` exactly when the chunk is non-empty and
+        every outcome is ``REJECTED``. It never raises, on any bytes.
 
         Args:
           payload: The response body, read under :meth:`_response_limit`; an ``_UnreadBody``
@@ -253,72 +244,83 @@ class OTLPSink(HTTPSink):
           items: The chunk the response describes.
 
         Returns:
-          False only when every record of the chunk was rejected, so an ``emit`` whose every
-          chunk came back that way raises (invariant 7); True otherwise, the unadjudicated case
-          included, since the request succeeded and a re-send could duplicate what landed.
+          False only when every record of a non-empty chunk was rejected; True otherwise.
+
+        Raises:
+          None.
+        """
+        return _read_as_1x(lambda: self._outcomes(payload, items))
+
+    def _outcomes(self, payload: bytes, items: list[_Item]) -> tuple[Outcome, ...]:
+        """Sorts a ``2xx`` body into full success, rejected records or unadjudicated (FR-004).
+
+        Never raises, on any bytes. A body that is empty, not JSON, not an object or without a
+        ``partialSuccess`` is full success — what a server must send on success, so a proxy's
+        page or a protobuf body is not this sink's to adjudicate, unlike a ``_bulk`` response,
+        whose only verdict is in the body.
+
+        **A body that could not be read is not one of those** (SPEC-070 FR-004). A ``2xx`` whose
+        body was cut short, stalled or reset after the status line arrives as an
+        ``_UnreadBody``, equal to ``b""``; it is asked about first, before the response bound,
+        and given up on through ``HTTPSink._unadjudicated``, its records ``UNKNOWN``, never
+        resent. So is a body over the response bound, a ``partialSuccess`` that is not an object
+        and a count that is not a usable integer. An honestly empty body is still success. The
+        body is parsed with ``parse_int=str`` so a bare over-long ``rejectedLogRecords`` takes the
+        digit rule rather than reading as not-JSON and settling as success; ``except Exception``
+        because a ``RecursionError`` from a deeply nested body is not a ``ValueError``.
+
+        A ``partialSuccess`` rejecting *r* of *n* records, *r* clamped to the chunk, is counted on
+        ``rejected_records``. **The response gives a count, not an identity**, so the chunk's first
+        *r* events are ``REJECTED`` and the rest ``ACCEPTED``: the positions carry no claim about
+        which record the server refused, only how many.
+
+        Args:
+          payload: The response body, read under :meth:`_response_limit`; an ``_UnreadBody``
+            when it could not be read.
+          items: The chunk the response describes.
+
+        Returns:
+          One outcome per record.
 
         Raises:
           None.
         """
         sent = len(items)
+        unreadable = "could not read the partial-success response"
         if _read_failed(payload):
-            self._abandon_unadjudicated(sent)
-            return True
+            return self._unadjudicated(items, unreadable, _NOUN)
         limit = self._response_limit()
         if limit is not None and len(payload) > limit:
-            self._abandon_unadjudicated(sent)
-            return True
+            return self._unadjudicated(items, unreadable, _NOUN)
+        accepted = (Outcome.ACCEPTED,) * sent
         try:
             data = json.loads(payload, parse_int=str)
         except Exception:
-            return True
+            return accepted
         if not isinstance(data, dict):
-            return True
+            return accepted
         partial = data.get("partialSuccess")
         if partial is None:
-            return True
+            return accepted
         if not isinstance(partial, dict):
-            self._abandon_unadjudicated(sent)
-            return True
+            return self._unadjudicated(items, unreadable, _NOUN)
         count = partial.get("rejectedLogRecords")
         if count is None:
-            return True
+            return accepted
         rejected = _rejected_count(count)
         if rejected is None:
-            self._abandon_unadjudicated(sent)
-            return True
+            return self._unadjudicated(items, unreadable, _NOUN)
         if rejected == 0:
-            return True
+            return accepted
         rejected = min(rejected, sent)
-        with self._counter_lock:
-            self.rejected_records += rejected
-        _diag.lost(_NOUN, rejected, f"{type(self).__name__}, rejected by the server")
-        return rejected < sent
-
-    def _abandon_unadjudicated(self, sent: int) -> None:
-        """Counts and announces a ``2xx`` whose partial-success verdict could not be read.
-
-        The whole chunk is charged because the response cannot say which records landed, which
-        makes the count an upper bound, like ``failed``. The line carries the class and the
-        count and never the body, which is the server's text (invariant 11).
-
-        Args:
-          sent: How many records were in the request.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        with self._counter_lock:
-            self.dropped_unadjudicated += sent
-        _diag.lost(
-            _NOUN,
-            sent,
-            f"{type(self).__name__} could not read the partial-success response; "
-            f"they may have landed; not retried",
+        context = run_context()
+        name = type(self).__name__
+        context.count(self, "rejected_records", rejected, when=When.ALWAYS)
+        context.announce(
+            lambda: _diag.lost(_NOUN, rejected, f"{name}, rejected by the server"),
+            when=When.ALWAYS,
         )
+        return (Outcome.REJECTED,) * rejected + (Outcome.ACCEPTED,) * (sent - rejected)
 
     def losses(self) -> SinkLosses:
         """Reports abandoned requests plus rejected and unadjudicated records (SPEC-026 FR-002).

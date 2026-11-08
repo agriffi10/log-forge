@@ -23,12 +23,15 @@ the whole ledger so the interleaving can be replayed from the seed alone.
 
 from __future__ import annotations
 
+import json
 import pathlib
 import random
 import re
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
 
@@ -37,7 +40,9 @@ from conftest import run_concurrently
 from log_foundry import _lifecycle
 from log_foundry.sinks import _engine
 from log_foundry.sinks._engine import emit_via_deliver
+from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+from test_sinks_http import FakeResponse
 
 SEEDS = range(16)
 THREADS = 4
@@ -188,6 +193,103 @@ class DeliverRecorder(Recorder):
         emit_via_deliver(self, batch)
 
 
+_HTTP_ANSWERS = ((200, 0.7), (503, 0.15), (400, 0.1))
+"""Each request's answer in the ``http`` form; the remaining share raises ``RuntimeError``."""
+
+
+class HTTPRecorder(HTTPSink):
+    """The ``http`` form: a shipped family sink behind a scripted opener (SPEC-073 FR-005).
+
+    Each request's answer is drawn from a ``random.Random`` seeded by the test seed, the first
+    ``log_id`` the request carried and how many times that event had been offered, so a seed
+    replays exactly: a ``200``, a retryable ``503``, a ``400`` refused for good, or an opener
+    ``RuntimeError`` the predicate refuses. ``accepted`` lists every event a ``2xx`` carried, so a
+    second acceptance is visible; ``fates`` the last answer each event's request had; ``events``
+    every event the opener was handed, which the identity reads as "offered". It declares
+    ``max_retries=0``, as :class:`DeliverRecorder` does, to keep the file's runtime. It keeps
+    :class:`Recorder`'s close counting for invariant 5, and defines no ``emit``, so the worker
+    and the orphan path deliver to it through ``deliver``, as to any shipped family sink.
+
+    **Its records are dropped when the test ends** (:meth:`forget`, from :func:`_forget_records`).
+    A sink handed to the library stays in ``_lifecycle._owned`` for the life of the process, and
+    a forked child's marking walk visits the objects that record reaches, up to a cap of 100,000. Sixteen seeds of decoded events kept here added about 140,000 objects to
+    that walk in the pytest worker that ran them, measured, enough to trip the cap in
+    ``tests/test_fork_lifecycle.py`` when it ran later in the same worker.
+    """
+
+    live: weakref.WeakSet[HTTPRecorder] = weakref.WeakSet()
+
+    def __init__(self, emit_delay: float, seed: int) -> None:
+        super().__init__("http://model", max_retries=0, max_batch_count=3, opener=self._answer)
+        HTTPRecorder.live.add(self)
+        self.emit_delay = emit_delay
+        self.seed = seed
+        self.events: list[dict[str, object]] = []
+        self.accepted: list[str] = []
+        self.fates: dict[str, object] = {}
+        self.offered: dict[str, int] = {}
+        self.closes = 0
+        self.inside = 0
+        self.overlapped = 0
+        self._lock = threading.Lock()
+
+    def _answer(self, request: Any, timeout: float | None = None) -> FakeResponse:
+        if self.emit_delay:
+            time.sleep(self.emit_delay)
+        batch = [json.loads(line) for line in request.data.decode().splitlines() if line]
+        ids = [str(event.get("log_id")) for event in batch]
+        with self._lock:
+            seen = self.offered.get(ids[0], 0)
+            for log_id, event in zip(ids, batch, strict=True):
+                self.offered[log_id] = self.offered.get(log_id, 0) + 1
+                self.events.append(event)
+        roll = random.Random(f"{self.seed}:{ids[0]}:{seen}:http").random()  # noqa: S311
+        status = 0
+        for code, weight in _HTTP_ANSWERS:
+            if roll < weight:
+                status = code
+                break
+            roll -= weight
+        with self._lock:
+            for log_id in ids:
+                self.fates[log_id] = status
+            if status == 200:
+                self.accepted.extend(ids)
+        if not status:
+            raise RuntimeError("model-secret")
+        return FakeResponse(status, b"")
+
+    def close(self) -> None:
+        with self._lock:
+            self.closes += 1
+            self.inside += 1
+            if self.inside > 1:
+                self.overlapped += 1
+        time.sleep(CLOSE_SECONDS)
+        with self._lock:
+            self.inside -= 1
+
+    def count(self, message: str) -> int:
+        with self._lock:
+            return sum(1 for event in self.events if event.get("message") == message)
+
+    def forget(self) -> None:
+        """Drops every record, so nothing this recorder saw outlives the test that read it."""
+        with self._lock:
+            self.events.clear()
+            self.accepted.clear()
+            self.fates.clear()
+            self.offered.clear()
+
+
+@pytest.fixture(autouse=True)
+def _forget_records() -> Any:
+    """Clears every :class:`HTTPRecorder`'s records once its test has asserted on them."""
+    yield
+    for recorder in list(HTTPRecorder.live):
+        recorder.forget()
+
+
 def _draw(rng: random.Random) -> Outcome:
     """One outcome by :data:`_OUTCOME_WEIGHTS`."""
     roll = rng.random()
@@ -272,6 +374,8 @@ def _recorder(ledger: Ledger, emit_delay: float) -> Recorder:
     """A recorder of the ledger's form."""
     if ledger.form == "deliver":
         return DeliverRecorder(emit_delay, ledger.seed)
+    if ledger.form == "http":
+        return HTTPRecorder(emit_delay, ledger.seed)  # type: ignore[return-value]
     return Recorder(emit_delay)
 
 
@@ -325,7 +429,7 @@ def _stranded_markers() -> int:
         return sum(1 for item in worker._queue.queue if not isinstance(item, list))
 
 
-@pytest.mark.parametrize("form", ["emit", "deliver"])
+@pytest.mark.parametrize("form", ["emit", "deliver", "http"])
 @pytest.mark.parametrize("seed", SEEDS)
 def test_the_accounting_identity_holds_under_every_interleaving(
     seed: int,
@@ -343,10 +447,14 @@ def test_the_accounting_identity_holds_under_every_interleaving(
 
     The ``deliver`` form (SPEC-072 FR-005) runs the same seeds with :class:`DeliverRecorder`,
     whose mixed verdicts make "delivered" a per-event fate, and holds each counted term to its
-    exact share (:func:`_assert_the_deliver_ledger`).
+    exact share (:func:`_assert_the_deliver_ledger`). The ``http`` form (SPEC-073 FR-005) runs
+    them with :class:`HTTPRecorder`, a shipped family sink behind a scripted opener
+    (:func:`_assert_the_http_ledger`).
     """
     ledger = Ledger(form=form, seed=seed)
-    runs = _spy_on_runs(monkeypatch) if form == "deliver" else None
+    runs = _spy_on_runs(monkeypatch) if form != "emit" else None
+    if form == "http":
+        monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
     first = _recorder(ledger, random.Random(seed).choice([0.0, 0.0, 0.002]))  # noqa: S311
     ledger.add_sink(first)
     log_foundry.configure(service="model", sink=first)
@@ -386,6 +494,8 @@ def test_the_accounting_identity_holds_under_every_interleaving(
     assert health.in_span_lost == 0, f"nothing here can fail assembly: {picture}"
     if runs is None:
         assert health.failed_batches == 0, f"the recorder never raises: {picture}"
+    elif form == "http":
+        _assert_the_http_ledger(ledger, runs, health.orphan_lost, capfd.readouterr().err, picture)
     else:
         _assert_the_deliver_ledger(
             ledger, runs, health.orphan_lost, capfd.readouterr().err, picture
@@ -457,6 +567,45 @@ def _assert_the_deliver_ledger(
     assert failed == sum(
         1 for fate in fates.values() if not any(fate is ok for ok in unconfirmed)
     ), f"invariant 2 (failed_events is each unconfirmed event once): {picture}"
+    worker_failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
+    orphan_failed = sum(1 for _ids_, path, d in runs.calls if path == "orphan" and d.failed)
+    batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())
+    assert batches == len(worker_failed), f"invariant 6 (one failed batch per run): {picture}"
+    assert sorted(int(n) for n in _WORKER_LOST.findall(err)) == sorted(worker_failed), (
+        f"invariant 2 (a failed run's events are in its lost line): {picture}"
+    )
+    assert orphan_lost == orphan_failed == len(_ORPHAN_LOST.findall(err)), (
+        f"invariant 2 (a failed orphan run is one orphan_lost): {picture}"
+    )
+
+
+def _assert_the_http_ledger(
+    ledger: Ledger, runs: _Runs, orphan_lost: int, err: str, picture: str
+) -> None:
+    """Holds the ``http`` form: nothing accepted twice, every event accepted or counted once.
+
+    The opener knows every request's answer; the spy knows which run each event was in and
+    whether it failed. No event is in two ``2xx`` bodies; ``failed_events`` is exactly the events
+    whose last request was not a ``2xx``, each once however many rounds offered it; nothing is
+    dropped; and the catchers' terms match the failed runs, as in the ``deliver`` form.
+    """
+    recorders = [s for s in ledger.sinks if isinstance(s, HTTPRecorder)]
+    assert runs.calls and recorders, f"the spy saw no engine run, so nothing is held: {picture}"
+    accepted = [log_id for s in recorders for log_id in s.accepted]
+    assert len(accepted) == len(set(accepted)), f"invariant 2 (accepted twice): {picture}"
+    fates: dict[str, object] = {}
+    for sink in recorders:
+        fates.update(sink.fates)
+    failed_run = {log_id: d.failed for ids, _path, d in runs.calls for log_id in ids}
+    assert set(fates) == set(failed_run), f"invariant 2 (one fate each): {picture}"
+    assert set(accepted) == {log_id for log_id, fate in fates.items() if fate == 200}, (
+        f"invariant 2 (accepted exactly when its last request was a 2xx): {picture}"
+    )
+    counted = [s.log_foundry_counters.losses() for s in recorders]
+    assert sum(c.dropped for c in counted) == 0, f"nothing here is dropped: {picture}"
+    assert sum(c.failed for c in counted) == sum(1 for fate in fates.values() if fate != 200), (
+        f"invariant 2 (failed_events is each unconfirmed event once): {picture}"
+    )
     worker_failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
     orphan_failed = sum(1 for _ids_, path, d in runs.calls if path == "orphan" and d.failed)
     batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())

@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "After a status line the status decides; a 2xx whose body cannot be read is never re-sent"
-description: "before a status line, `URLError`, `OSError` and `http.client.HTTPException` are retried, then counted in `failed`; after one, a body read that fails is an `_UnreadBody`, equal to `b\"\"`, and the status decides as it always did — a `2xx` settles its chunk (the body readers count it unadjudicated), a `503` retries, a `413` splits, a `400` is abandoned. `_handle_response` keeps `bytes`; `_read_failed` tells an unreadable body from an empty one."
+description: "before a status line, `URLError`, `OSError` and `http.client.HTTPException` are `RETRYABLE`, resent by the engine within its budget, and counted in `failed` for the last round's request; after one, a body read that fails is an `_UnreadBody`, equal to `b\"\"`, and the status decides — a `2xx` is what its reader returns (`UNKNOWN` for a body reader that cannot read it), a retryable status is `RETRYABLE`, a `413` drives the search, any other is `REJECTED`. `_handle_response` keeps `bytes`; `_read_failed` tells an unreadable body from an empty one. (SPEC-073)"
 ---
 
 **After a status line the status decides; a 2xx whose body cannot be read is never re-sent** —
@@ -22,8 +22,8 @@ then abandoned with the existing `connection error, <Type>` line, counted in `fa
 exception there fails at its first attempt through the same line (*A sink declares what it retries,
 and anything else fails at once*, SPEC-070). After it, the body is read under its own guard
 catching `Exception` (never `BaseException`), for the reason `ElasticsearchSink`'s JSON guard
-gives: anything escaping escapes `emit`, and the worker re-sends a batch the destination may have
-accepted. A failed read yields an `_UnreadBody`, a private `bytes` subclass equal to `b""`, and the
+gives: anything escaping a round would fail the engine's run, reporting as undelivered a batch the
+destination may have accepted, so the round guards every hook. A failed read yields an `_UnreadBody`, a private `bytes` subclass equal to `b""`, and the
 status and its `Retry-After` decide exactly as they would have with a body. So the change reaches non-`2xx` statuses
 too: a `503` whose body is cut short is retried and reported as `HTTP 503`, a `413` still drives the
 budget search, and a `400` is abandoned once, where each used to raise out of `emit` on a short body
@@ -61,14 +61,15 @@ and a destination sending malformed headers on a success is pathological.
 **Rejected: retrying after a `2xx`.** That is the defect: a chunk the destination accepted is sent
 again, once per retry. **Rejected: `bytes | None`.** Passing `None` for an unreadable body breaks a
 third-party override at type-check time, and at runtime an override whose JSON guard catches only
-`ValueError` lets `json.loads(None)`'s `TypeError` escape `emit`, so the batch is re-sent — the
-defect again, moved into the caller's code. **Rejected: a separate `_handle_unreadable` hook.** It
+`ValueError` makes the override raise on every unreadable body, which the round's guard then counts
+unadjudicated even where the override meant success. **Rejected: a separate `_handle_unreadable` hook.** It
 would be one more extension surface held under `1.x` that cannot be removed; the flag in the payload
 gives the readers that need the difference what they need without one. **Rejected: a keyword
 parameter `read_failed: bool = False` on `_handle_response`** (SPEC-070). A third-party override
 with the two-argument signature, or a `*args, **kwargs` wrapper forwarding to one, would raise
-`TypeError` out of `emit` exactly when a body fails to read, and the worker re-sends anything
-escaping `emit` — the defect this decision exists to prevent. **Rejected: `read(amt)`.** It hides a
+`TypeError` exactly when a body fails to read, which the round's guard counts unadjudicated on
+every unreadable body even where the override meant success (before SPEC-073 the raise escaped
+`emit` and the worker re-sent the batch, the defect this decision exists to prevent). **Rejected: `read(amt)`.** It hides a
 short body (above).
 
 **Do NOT build** a retry on a failed body read after a `2xx`, or a body read outside the guard.
@@ -76,6 +77,15 @@ short body (above).
 protocol error is now `HTTPSink`'s counted abandonment rather than one of its `transport_errors`.
 
 ## History
+
+### 2026-11-08
+
+- **Refined** by SPEC-073: the fence's outcomes are FR-001's table. A pre-status transport error
+  is `RETRYABLE`, resent by the engine and counted in `failed` only for the last round's request;
+  a `2xx` is what its reader's `_outcomes` returns, `UNKNOWN` for one it cannot read. A hook that
+  raises no longer escapes `emit` to a worker resend: the round guards it, so the two rejected
+  alternatives' cost is now a chunk counted unadjudicated rather than a batch re-sent.
+  *Never re-sent* is unchanged.
 
 ### 2026-11-07
 

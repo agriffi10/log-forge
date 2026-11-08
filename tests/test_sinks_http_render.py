@@ -35,7 +35,7 @@ STAMP = "2026-08-10T00:00:00.000Z"
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize the HTTP backoff so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks.http.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 class _Opaque:

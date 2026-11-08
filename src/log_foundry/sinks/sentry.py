@@ -437,7 +437,7 @@ class SentrySink:
           True when it landed, False when it did not.
 
         Raises:
-          None. ``SinkDeliveryError`` is caught separately only because ``HTTPSink._abandon``
+          None. ``SinkDeliveryError`` is caught separately only because ``HTTPSink._send``
             has already counted and announced it, and counting it again would double-report.
             Only the exception type is ever written (arch §6).
         """

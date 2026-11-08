@@ -311,20 +311,74 @@ def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
                 and node.target.id == "attempt"
                 and not any(
                     isinstance(inner, ast.Call)
-                    and (
-                        (isinstance(inner.func, ast.Name) and inner.func.id == "wait")
-                        # ``HTTPSink`` reaches ``wait`` through its own helper, which is where
-                        # the ``Retry-After`` clamp lives; the helper is checked by its own tests.
-                        or (
-                            isinstance(inner.func, ast.Attribute)
-                            and inner.func.attr == "_sleep_backoff"
-                        )
-                    )
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "wait"
                     for inner in ast.walk(node)
                 )
             )
         )
     assert missing == [], f"retry loops with no interruptible wait: {missing}"
+
+
+_RETRY_MODULES_AT_BASE = frozenset(
+    {
+        "_socket",
+        "clickhouse",
+        "eventhubs",
+        "firehose",
+        "http",
+        "kinesis",
+        "mongodb",
+        "postgres",
+        "rabbitmq",
+        "redis",
+        "sns",
+        "sqs",
+    }
+)
+"""The twelve modules :func:`_modules_with_a_retry_loop` derived at SPEC-073's base (``c4e51fbd``)."""
+
+
+def test_the_retry_loop_modules_are_the_base_set_less_http() -> None:
+    """SPEC-073 FR-005: ``http`` leaving the derived set is asserted, never silent.
+
+    The HTTP family's retries moved onto the delivery engine, so ``http.py`` holds no re-send
+    loop; a derivation that shrank for any other reason, or a loop restored there, reddens here.
+    """
+    assert set(_modules_with_a_retry_loop()) == _RETRY_MODULES_AT_BASE - {"http"}
+
+
+def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
+    """SPEC-073 FR-005: the engine's round loop joins the check that a retry loop waits idly.
+
+    ``_engine._run``'s ``while`` loop is the one resend loop for every sink on the engine; it
+    waits through ``_wait``, which calls ``_retry.wait`` on the stop event.
+    """
+    import ast
+    import pathlib as _pathlib
+
+    import log_foundry
+
+    tree = ast.parse(
+        (_pathlib.Path(log_foundry.__file__).parent / "sinks" / "_engine.py").read_text()
+    )
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    loops = [node for node in ast.walk(functions["_run"]) if isinstance(node, ast.While)]
+    assert len(loops) == 1, "the engine has one round loop"
+    assert any(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "_wait"
+        for call in ast.walk(loops[0])
+    ), "the round loop waits through _wait"
+    assert any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "wait"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "_retry"
+        for call in ast.walk(functions["_wait"])
+    ), "and _wait waits through _retry.wait"
 
 
 def test_every_module_with_a_retry_loop_declares_a_stop_signal() -> None:

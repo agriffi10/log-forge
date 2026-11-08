@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A sink declares what it retries, and anything else fails at once"
-description: "every sink retry loop asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker still re-sends it. (SPEC-070)"
+description: "every sink retry loop asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver` (the HTTP family since SPEC-073), whose refused events are final. (SPEC-070, SPEC-073)"
 ---
 
 **A sink declares what it retries, and anything else fails at once** — before SPEC-070 ten SDK and
@@ -13,11 +13,14 @@ PostgreSQL 17.11 twice, at `fda134a`. The HTTP family and the socket transport e
 they caught transport errors only and let any other exception escape `emit` raw and uncounted, so
 an opener raising `RuntimeError` left `failed=0`.
 
-**The rule.** Each of the twelve retry loops — `SocketTransport._send_one`, `HTTPSink._send`, and
+**The rule.** Each of the retry loops — twelve when SPEC-070 settled this, eleven since SPEC-073
+moved `HTTPSink._send`'s onto the delivery engine — `SocketTransport._send_one` and
 the loops of `ClickHouseSink`, `AzureEventHubsSink`, `FirehoseSink`, `KinesisSink`, `MongoDBSink`,
 `PostgresSink`, `RabbitMQSink`, `_RedisSink` (both Redis sinks), `SNSSink` and `SQSSink` — catches
 `Exception`, runs the cleanup it always ran (`_reset`, `_rollback`), and retries only when another
-attempt remains **and** `is_retryable(self._retryable_error, err)` says so. Otherwise it takes the
+attempt remains **and** `is_retryable(self._retryable_error, err)` says so. The HTTP family asks
+the same question at its one classification, `HTTPSink._exchange`: an accepted exception is
+`RETRYABLE` for the engine to resend, and any other is `REJECTED` at its first attempt. Otherwise it takes the
 exit it takes when attempts run out: the same counter, the same `_diag` line, the same return or
 `SinkDeliveryError`, with the attempt count the truth, `attempt + 1`. The six loops that wrote a
 bare `N attempts` now write `N attempt(s)` like the rest. A failure that fails at once takes no
@@ -95,12 +98,15 @@ error is retried on both callers as before. The HTTP abandonment line keeps its 
 <Type>` wording for any exception before a status line, a `RuntimeError` included, because the rule
 is the same exit with the same line.
 
-**The worker still re-sends a raised batch.** `emit`'s contract is unchanged: a sink that delivered
-nothing still raises, and the worker re-sends a raised batch up to its own `max_retries`, so a
-non-retryable failure costs one sink attempt per worker attempt (3 calls through
-`Worker(max_retries=2)`, where it cost 3 × 4) and is counted once per call. Teaching the worker not
-to re-send it is a contract change for every sink, rejected in *A protocol's retry set is a private
-predicate hook, not a second loop*; SPEC-072's verdict is where it lands.
+**The worker still re-sends a raised batch, for a sink not on the engine.** `emit`'s contract is
+unchanged: a sink that delivered nothing still raises, and the worker re-sends a raised batch up to
+its own `max_retries`, so a non-retryable failure costs one sink attempt per worker attempt (3 calls
+through `Worker(max_retries=2)`, where it cost 3 × 4) and is counted once per call. Teaching the
+worker not to re-send it is a contract change for every sink, rejected in *A protocol's retry set
+is a private predicate hook, not a second loop*; SPEC-072's verdict is where it lands. Since
+SPEC-073 the worker calls the HTTP family's `deliver` instead of its `emit`, so a refused HTTP
+request is sent once and counted once (*The HTTP family delivers in rounds on the engine*); a
+third-party subclass not offered `deliver` keeps this resend.
 
 **Rejected: naming the transient classes in each `except` clause.** It cannot import a driver the
 caller has not installed, it gives SPEC-072's engine nothing to take as an argument, and it would
@@ -110,11 +116,20 @@ See above: a lazily imported driver would leave the set empty for good.
 **Do NOT build** a retry loop that does not ask `is_retryable(self._retryable_error, err)`, a
 predicate that imports its driver, or a cached class set. `tests/test_classify.py` holds the loops
 to the rule with a roster derived from the AST (every `for` over `range(...)` naming `retries`, a
-floor of twelve, a fixture corpus), holds SQS and SNS to reading `SenderFault` only through
+floor of eleven since SPEC-073, a fixture corpus), holds `http.py` to reaching `_attempt` only
+through `_exchange` inside an engine round, holds SQS and SNS to reading `SenderFault` only through
 `sender_fault`, and — on the integration workflow's extras leg — checks every class name a
 predicate resolves exists in the installed driver, so a rename cannot empty a set unnoticed.
 
 ## History
+
+### 2026-11-08
+
+- **Refined** by SPEC-073: `HTTPSink._send`'s loop is gone, so the roster's floor is eleven, and the
+  HTTP family asks the predicate at `HTTPSink._exchange`, one classification inside the engine's
+  rounds. The worker no longer re-sends a refused HTTP batch, since it calls the family's
+  `deliver`; the resend remains for every sink not on the engine. The table's `HTTPSink` row is
+  unchanged.
 
 ### 2026-11-07
 

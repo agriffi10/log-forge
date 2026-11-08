@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip as _gzip
 import http.client
 import json
+import math
 import re
 import threading
 import unicodedata
@@ -13,20 +14,19 @@ import urllib.request
 from base64 import b64encode
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, NoReturn, TypedDict, cast
+from typing import Any, ClassVar, NoReturn, Protocol, TypedDict, cast
 from urllib.parse import unquote, unwrap, urlparse
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._classify import is_retryable
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._engine import RunContext, When
 from log_foundry.sinks._retry import (
-    clamp_server_delay,
     exact_seconds,
     floor_count,
     require_positive,
     require_timeout,
-    wait,
 )
 from log_foundry.sinks.base import (
     _ABSENT,
@@ -37,6 +37,7 @@ from log_foundry.sinks.base import (
     _class_member,
     _own_attribute,
 )
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 __all__ = [
     "HTTPAuthKwargs",
@@ -47,8 +48,6 @@ __all__ = [
     "HTTPSink",
     "merge_headers",
 ]
-
-_BACKOFF_BASE = 0.1
 
 DEFAULT_MAX_BATCH_COUNT = 1000
 """Entries one request may carry, unless a subclass documents its destination's own (FR-001).
@@ -67,7 +66,11 @@ knows nothing about, while every subclass that has a documented figure sets its 
 """
 
 MAX_BUDGET_REDUCTIONS = 24
-"""``413``-driven halvings of the byte budget one ``emit`` may make (FR-001 AC-4).
+"""``413``-driven halvings of the byte budget one run may make (FR-001 AC-4, SPEC-073 FR-001).
+
+The search state — the budget, the smallest refused size and this count — is kept in the run's
+notes (``RunContext.notes``), so a later round's resend starts from the budget already found and
+one run searches no more than one 1.x ``emit`` did.
 
 A ``413`` says the destination's real limit is below the configured budget, and the search for a
 size it accepts is a **halving of the budget**, not a halving of the chunk. The distinction is
@@ -117,11 +120,12 @@ class _PayloadTooLarge(SinkDeliveryError):
     """A ``413`` for a request the caller may be able to make smaller (FR-001 AC-4).
 
     It subclasses ``SinkDeliveryError`` so that every pre-existing caller of :meth:`HTTPSink._send`
-    — ``SentrySink`` above all — keeps catching it exactly as before. Only the chunk loop, which
-    passes ``splittable=True``, ever sees it as its own type.
+    — ``SentrySink`` above all — keeps catching it exactly as before. Only a caller passing
+    ``splittable=True`` ever sees it as its own type; the round reads a ``413`` from
+    :meth:`HTTPSink._exchange` directly.
 
     Attributes:
-      size: The refused body's length in bytes, which lets one ``emit`` avoid building another
+      size: The refused body's length in bytes, which lets one run avoid building another
         request that large. Without it a destination refusing everything costs one request per
         event — ~5,980 for one exit backlog — each asking a question already answered.
     """
@@ -150,10 +154,12 @@ class _UnreadBody(bytes):
     status line, so the flag travels in the value :meth:`HTTPSink._handle_response` already
     receives and the hook's signature is unchanged (SPEC-070 FR-004). A keyword parameter was the
     alternative and was rejected: an override with the two-argument signature, or a
-    ``*args, **kwargs`` wrapper forwarding to one, would raise ``TypeError`` out of ``emit``
-    exactly when a body fails to read, and the worker re-sends anything escaping ``emit``. An
-    override that does not ask :func:`_read_failed` sees ``b""``, as under ``1.x``; it has no
-    content, and ``json.loads``, ``len`` and slicing behave on it as on ``b""``.
+    ``*args, **kwargs`` wrapper forwarding to one, would raise ``TypeError`` exactly when a body
+    fails to read — under 1.x out of ``emit``, for the worker to re-send whole, and on the engine
+    into the round's reader guard, which would count the chunk unadjudicated even where the
+    override meant success. An override that does not ask :func:`_read_failed` sees ``b""``, as
+    under ``1.x``; it has no content, and ``json.loads``, ``len`` and slicing behave on it as on
+    ``b""``. ``_outcomes`` receives the same payload.
     """
 
     __slots__ = ()
@@ -173,6 +179,78 @@ def _read_failed(payload: bytes) -> bool:
       None.
     """
     return isinstance(payload, _UnreadBody)
+
+
+class _Pending(Protocol):
+    """What :meth:`HTTPSink._items` and :meth:`HTTPSink._drop_refused` record a drop into.
+
+    Both a ``Deferral`` and a run context's ``drops`` view fit it, so the two methods keep their
+    1.x ``pending`` parameter: a drop recorded here is counted only by a run that settles, as it
+    was only by an ``emit`` that returned.
+    """
+
+    def count(self, counter: str, n: int = 1) -> None:
+        """Adds ``n`` to the owner's ``counter``, pending a settled run.
+
+        Args:
+          counter: The owner's attribute.
+          n: How much to add.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+    def announce(self, line: Callable[[], None]) -> None:
+        """Registers a line written once the counts are committed.
+
+        Args:
+          line: A ``lambda`` wrapping a ``_diag`` call.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+
+@dataclass(frozen=True)
+class _Answer:
+    """How :meth:`HTTPSink._exchange` classified one request: the one table both callers read.
+
+    Attributes:
+      outcome: The fate of the request's events; ``None`` for a ``413`` the caller may split.
+      payload: The ``2xx`` body, or the response body otherwise.
+      retry_after: The server's ``Retry-After``, for a ``RETRYABLE`` status.
+      detail: The abandonment detail when the request was counted, else ``""``.
+      error: An exception the predicate refused and the caller counts itself
+        (``count_unexpected=False``), to be re-raised unchanged.
+    """
+
+    outcome: Outcome | None
+    payload: bytes = b""
+    retry_after: float | None = None
+    detail: str = ""
+    error: Exception | None = None
+
+
+@dataclass
+class _Sent:
+    """What :meth:`HTTPSink._send`'s one-request rounds leave behind, read once the run ends.
+
+    Attributes:
+      answer: The last request's classification, or ``None`` before any.
+      raised: An exception building or classifying the request raised — the ``Request``, or
+        ``_retryable_status``, which :meth:`HTTPSink._exchange` asks of a non-``2xx`` — re-raised
+        unchanged after the run. A raising ``_response_limit`` is not one: ``_attempt`` reads it
+        inside the attempt, so it is classified and counted as that attempt's own exception.
+    """
+
+    answer: _Answer | None = None
+    raised: Exception | None = None
 
 
 DEFAULT_MAX_RETRY_AFTER = 30.0
@@ -1653,21 +1731,205 @@ def _refuse_credential_collision(
             )
 
 
+def _wholly_rejected(outcomes: tuple[Outcome, ...]) -> bool:
+    """Whether a chunk's outcomes are all ``REJECTED``: a reader shim's 1.x ``False``.
+
+    An empty chunk is not wholly rejected, so a direct ``_handle_response(payload, [])`` reads
+    ``True``, as every existing call of that shape expects (SPEC-073 FR-003).
+
+    Args:
+      outcomes: One chunk's outcomes.
+
+    Returns:
+      True only for a non-empty chunk whose every event was refused for good.
+
+    Raises:
+      None.
+    """
+    return bool(outcomes) and all(outcome is Outcome.REJECTED for outcome in outcomes)
+
+
+def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
+    """Runs a reader's ``_outcomes`` as a 1.x ``_handle_response`` call: committed, then a bool.
+
+    The reader runs in a one-round context of its own, committed when it returns, so a direct
+    1.x caller sees the counters move as they did; its run fails exactly when the chunk was
+    wholly rejected, which is when 1.x returned ``False``.
+
+    Args:
+      reader: The bound ``_outcomes`` call, with its arguments.
+
+    Returns:
+      False exactly when the chunk is non-empty and every outcome is ``REJECTED``.
+
+    Raises:
+      Exception: Whatever the reader raises, after its context is committed as a failed run.
+    """
+    return not _wholly_rejected(_engine.detached(reader, _wholly_rejected))
+
+
+class _Tally:
+    """A ``_Pending`` that forwards every drop and counts how many events ``_items`` dropped.
+
+    The round needs the number to tell the events ``_items`` dropped, and counted, from events
+    an ``_items`` override merely returned as other objects (:func:`_positions`).
+
+    Attributes:
+      dropped: The events counted through this ledger.
+    """
+
+    def __init__(self, pending: _Pending) -> None:
+        """Wraps the ledger the drops really go to.
+
+        Args:
+          pending: The run's ``SETTLED`` view.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._pending = pending
+        self.dropped = 0
+
+    def count(self, counter: str, n: int = 1) -> None:
+        """Forwards a drop count and adds it to :attr:`dropped`.
+
+        Args:
+          counter: The owner's attribute.
+          n: How many events.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.dropped += n
+        self._pending.count(counter, n)
+
+    def announce(self, line: Callable[[], None]) -> None:
+        """Forwards a line.
+
+        Args:
+          line: A ``lambda`` wrapping a ``_diag`` call.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._pending.announce(line)
+
+
+def _positions(
+    batch: list[dict[str, object]], items: list[_Item], dropped: int
+) -> tuple[list[int | None], list[Outcome]]:
+    """Maps each rendered item to its event's batch index, and gives every unplaced event a fate.
+
+    ``_items`` builds every item from the batch's own event object, in order, skipping what it
+    drops, so a pointer that only moves forward finds each one by identity; that is exact for
+    every shipped sink. An ``_items`` override may return items built from other objects — a
+    subclass enriching each event first — so an item the identity walk cannot place is given, in
+    order, the next batch index no item claimed: an override returning one item per event, in
+    order, maps exactly.
+
+    An index still unclaimed after both passes is an event no request carries. When their number
+    is the number ``_items`` dropped and counted, they are those drops: ``DROPPED``. Otherwise
+    the mapping cannot say which they are, and each is ``REJECTED``: counted in the engine's
+    ``failed_events``, an upper bound, never resent, and able to fail a run that delivered
+    nothing else, so the loss errs toward over-counting. It is not counted in the sink's 1.x
+    ``losses()``, which counts requests, and it is announced only by the engine's settled line,
+    which the engine writes only for a run in which the sink registers no line of its own; beside
+    a sink line it shows in ``log_foundry_counters`` alone. Neither ``ACCEPTED`` nor ``DROPPED``
+    is ever a default for an event the sink did not itself drop.
+
+    Args:
+      batch: The round's events.
+      items: What ``_items`` returned for them.
+      dropped: How many events ``_items`` dropped and counted.
+
+    Returns:
+      Each item's batch index, ``None`` for an item past the batch's end, and the round's
+      starting fate for every event: ``REJECTED`` for a placed one, which its chunk's outcome
+      then replaces, so a path that forgot to settle a chunk would over-report, never hide.
+
+    Raises:
+      None.
+    """
+    found: list[int | None] = []
+    claimed = [False] * len(batch)
+    cursor = 0
+    for item in items:
+        probe = cursor
+        while probe < len(batch) and batch[probe] is not item.event:
+            probe += 1
+        if probe < len(batch):
+            found.append(probe)
+            claimed[probe] = True
+            cursor = probe + 1
+        else:
+            found.append(None)
+    free = (index for index, taken in enumerate(claimed) if not taken)
+    for at, position in enumerate(found):
+        if position is None:
+            index = next(free, None)
+            if index is not None:
+                found[at] = index
+                claimed[index] = True
+    unplaced = claimed.count(False)
+    fallback = Outcome.DROPPED if unplaced == dropped else Outcome.REJECTED
+    return found, [Outcome.REJECTED if taken else fallback for taken in claimed]
+
+
+def _settle(fates: list[Outcome], where: list[int | None], outcomes: tuple[Outcome, ...]) -> None:
+    """Records one chunk's outcomes at its events' batch indices.
+
+    Args:
+      fates: The round's outcomes by batch index, updated in place.
+      where: Each chunk item's batch index, or ``None``.
+      outcomes: One outcome per chunk item.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    for position, outcome in zip(where, outcomes, strict=True):
+        if position is not None:
+            fates[position] = outcome
+
+
 class HTTPSink:
     """A :class:`~log_foundry.sinks.base.Sink` that POSTs each batch to an HTTP endpoint.
 
     This is the dependency-free base every other HTTP platform sink builds on: it re-chunks a
     batch to the destination's limits, serializes each chunk, applies headers, auth and optional
-    gzip, POSTs it, and retries ``429`` and ``5xx`` with bounded exponential backoff. These are
-    terminal, direct-ship sinks — per arch §9.1 they couple application delivery to the
-    destination's availability, so for durability put a queue in front.
+    gzip, and POSTs it. These are terminal, direct-ship sinks — per arch §9.1 they couple
+    application delivery to the destination's availability, so for durability put a queue in
+    front.
+
+    **It delivers in rounds on the delivery engine** (SPEC-073). :meth:`deliver` is one round:
+    every event is rendered and chunked, each chunk goes in **one** request, and each event's
+    fate is returned by index in a ``Verdict``. Nothing in a round waits or retries; the engine
+    resends only the events a round called ``RETRYABLE``, in later rounds, so a chunk that landed
+    or was refused for good is never sent again. Its budget keeps the 1.x total: on the worker
+    path ``(max_retries + 1) * (worker retries + 1)`` rounds, on the orphan path and through
+    :meth:`emit` ``max_retries + 1``. :meth:`emit` runs the same engine inline, so a caller of
+    ``emit`` sees the 1.x contract. Every documented counter keeps its 1.x name and unit through
+    the engine's run context: ``failed`` counts abandoned **requests**.
 
     **Subclasses extend it by overriding hooks, never** :meth:`emit` (FR-001). The chunk loop
     lives here, so a subclass that overrode ``emit`` would deliver whatever batch it was handed —
     which is what three shipped subclasses did, and why ``Worker._final_drain`` could hand this
     family an entire exit backlog (5,980 events measured) in one request that the destination
-    then rejected whole. The hooks are :meth:`_render`, :meth:`_body` and
-    :meth:`_handle_response`; a test asserts no subclass defines ``emit``.
+    then rejected whole. The hooks are :meth:`_render`, :meth:`_body`, :meth:`_outcomes` and
+    :meth:`_handle_response`; a test asserts no subclass defines ``emit``. A third-party subclass
+    that does override ``emit``, or whose ``_handle_response`` sits above its ``_outcomes``, is
+    not offered ``deliver`` and keeps its 1.x path (:meth:`__init_subclass__`).
 
     Credentials passed as ``auth`` are sent on every request to the URL as given, and nothing
     here requires ``https://``: over a plaintext endpoint a bearer token, and a basic-auth pair,
@@ -1676,20 +1938,16 @@ class HTTPSink:
     class takes them instead, ``_CREDENTIALS``, which a subclass with a credential argument of its
     own overrides.
 
-    **The worst case is now per chunk, not per batch** (FR-001). One chunk costs ``max_retries``
-    waits, each at most ``max_retry_after`` when the server sends a ``Retry-After`` and
-    exponential otherwise — 90 s at the defaults, plus the request timeouts — and an ``emit``
-    pays that for *each* chunk it produces. All of it runs on the single drain thread, so it is a
-    pause on all log delivery, and a large enough backlog of failing chunks can outlast
-    ``shutdown()``'s own timeout, which then expires and leaves the sink open by SPEC-027
-    FR-004's rule. What bounds it is ``shutdown(timeout=)`` itself, plus
-    ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing ``max_batch_bytes`` to the
-    destination is what keeps the chunk count low in the first place. Nothing here *skips* work
-    because a shutdown is in progress — a revision that did was measured to disable both retries
-    and the ``413`` search for the whole of ``Worker._final_drain``, since the stop event is set
-    before the join, losing events that had been delivering. The signal is read at one site,
-    :meth:`_sleep_backoff`, where SPEC-027 has it cut a *wait* short rather than cancel an
-    attempt.
+    **The worst case is per run.** Each wait between rounds is at most ``max_retry_after`` when a
+    server sends a ``Retry-After`` and exponential otherwise, and one round has one wait, however
+    many of its chunks failed retryably. On the worker path it all runs on the single drain
+    thread, so it is a pause on all log delivery; what bounds it is ``shutdown(timeout=)`` itself,
+    through SPEC-062's prediction, plus ``MAX_BUDGET_REDUCTIONS`` on the ``413`` search; sizing
+    ``max_batch_bytes`` to the destination is what keeps the chunk count low in the first place.
+    Nothing here *skips* work because a shutdown is in progress — a revision that did was
+    measured to disable both retries and the ``413`` search for the whole of
+    ``Worker._final_drain``, since the stop event is set before the join. Every wait is the
+    engine's, cut short by the stop signal rather than cancelling an attempt (SPEC-027).
 
     Attributes:
       MAX_BATCH_COUNT: Entries one request may carry. A subclass overrides it with its
@@ -1699,12 +1957,19 @@ class HTTPSink:
         publishes none. Distinct from the request budget: Datadog accepts a 5 MB payload but
         caps one log at 1 MB, so an event between the two is rejected by a limit the request
         budget cannot see.
-      failed: Requests abandoned past the retry bound, counted per chunk.
+      failed: Requests abandoned, counted per chunk: one refused for good, and one still failing
+        retryably when its run's rounds ran out. Committed when the run ends.
       dropped_oversized: Events dropped for exceeding the per-event ceiling, plus those a
         destination answered ``413`` to and no split could rescue. Both are counted and
-        announced only when ``emit`` returns (SPEC-058 FR-005, SPEC-059 FR-004), so a batch the
-        worker retries counts each once. An event whose render raised is counted apart from this
-        and folded into ``losses().dropped``, so this stays oversize only.
+        announced only when ``emit`` returns (SPEC-058 FR-005, SPEC-059 FR-004) — on the engine,
+        only by a run that settles — so each is counted once. An event whose render raised, or
+        whose chunk's request could not be built, is counted apart from this and folded into
+        ``losses().dropped``, so this stays oversize only.
+      dropped_unadjudicated: Events of a ``2xx`` this sink could not read — a body reader that
+        raised, or a subclass reader giving up on a response (:meth:`_unadjudicated`) — folded
+        into ``losses().failed``; they may have landed.
+      log_foundry_counters: The engine's event-unit totals (SPEC-072); ``losses()`` does not
+        read them, so ``read_losses`` and ``health().sink`` read what they read in 1.x.
 
     The two lifecycle decisions this class records, inherited by every platform subclass. It
     takes **no** transport lock (SPEC-028 FR-002): there is no transport to guard, since
@@ -1723,6 +1988,70 @@ class HTTPSink:
     MAX_EVENT_BYTES: int | None = None
     _CREDENTIALS = _AUTH_REMEDY
     _AUTH_CONFLICT = _AUTH_BESIDE_HEADER
+    _READS_BOOL: ClassVar[bool] = False
+    _DELIVER_WITHDRAWN: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Decides once per class whether it is offered ``deliver`` (SPEC-073 FR-004).
+
+        A subclass written against 1.x extends the family through its documented hooks, and two
+        of its overrides would change meaning if the worker called ``deliver`` around them. An
+        ``emit`` override expects to be the call the worker makes; a bool ``_handle_response``
+        meant "not settled" by its ``False``, and the worker resent such a batch. So a class is
+        **ineligible** when a class in its MRO above the nearest ancestor offering ``deliver``
+        defines ``emit``, or when the first class defining ``_handle_response`` comes before the
+        first defining ``_outcomes``. The slice ends at the nearest ancestor whose own body
+        defines a non-``None`` ``deliver`` — ``HTTPSink``, or a third party's engine-native
+        subclass — so a plain child of the latter keeps its parent's ``deliver``.
+
+        It assigns ``deliver`` only where the inherited value is wrong. An ineligible class gets
+        ``deliver = None``, which SPEC-072's static probe never offers, marked as the base's own
+        with ``_DELIVER_WITHDRAWN``. An eligible class whose inherited ``deliver`` is a ``None``
+        the base assigned gets the nearest non-``None`` ``deliver`` back — a ``B(A)`` that adds
+        ``_outcomes`` below ``A``'s bool reader. A third party's own ``deliver = None`` is an
+        opt-out, and neither it nor any plain child of it is restored. A class whose own body
+        defines ``deliver`` is left alone. ``_READS_BOOL`` is written on every class: whether its
+        round reads a ``2xx`` through the base :meth:`_outcomes`, which is the bool override's
+        verdict even below a shipped reader that defines ``_outcomes``.
+
+        Everything is read through ``sinks.base``'s static accessors, so no metaclass hook runs
+        and no class is compared by ``==``. The detection is by class, never by instance.
+
+        Args:
+          **kwargs: Passed to ``object.__init_subclass__``.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        super().__init_subclass__(**kwargs)
+        mro = _MRO(cls)
+        base = next(index for index, klass in enumerate(mro) if klass is HTTPSink)
+        reader = _class_member(cls, "_handle_response")
+        outcomes = _class_member(cls, "_outcomes")
+        reader_at = reader[1] if reader is not None else base
+        outcomes_at = outcomes[1] if outcomes is not None else base
+        cls._READS_BOOL = reader_at < outcomes_at
+        if "deliver" in _NAMESPACE(cls):
+            return
+        offering = _class_member(cls, "deliver", skip_none=True)
+        end = offering[1] if offering is not None else base
+        emit = _class_member(cls, "emit")
+        eligible = not (emit is not None and emit[1] < end) and not (
+            reader_at < outcomes_at and reader_at < end
+        )
+        inherited = _class_member(cls, "deliver")
+        if not eligible:
+            setattr(cls, "deliver", None)  # noqa: B010
+            cls._DELIVER_WITHDRAWN = True
+            return
+        if inherited is not None and inherited[0] is None and offering is not None:
+            holder = _NAMESPACE(mro[inherited[1]])
+            if holder.get("_DELIVER_WITHDRAWN") is True:
+                setattr(cls, "deliver", offering[0])  # noqa: B010
+                cls._DELIVER_WITHDRAWN = False
 
     def __init__(
         self,
@@ -1869,30 +2198,27 @@ class HTTPSink:
         self.failed = 0
         self.dropped_oversized = 0
         self._unrenderable = 0
+        self.dropped_unadjudicated = 0
         self._counter_lock = threading.Lock()
+        self.log_foundry_counters = SinkCounters()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunks the batch to this destination's limits and POSTs each chunk (FR-001).
+        """Runs the delivery engine inline over :meth:`_round`, keeping the 1.x ``emit`` contract.
 
         Subclasses must not override this. They shape the request through :meth:`_render`,
-        :meth:`_body` and :meth:`_handle_response`, which is what keeps the chunk loop on every
-        path to the wire.
+        :meth:`_body`, :meth:`_outcomes` and :meth:`_handle_response`, which is what keeps the
+        chunk loop on every path to the wire. It is ``emit_via_deliver`` with ``deliver=`` the
+        round itself rather than :meth:`deliver`, so a subclass that overrides ``emit`` and calls
+        ``super().emit(batch)``, and one not offered ``deliver``, still get the chunking, the
+        sink's own ``max_retries`` as rounds, the ``413`` search and a raise on total failure.
 
-        The drops :meth:`_items` decides — an oversized event, an unrenderable one — are counted
-        and announced through the deferral helper, so they land only if this call returns
-        normally (SPEC-058 FR-005). They are decided before any request, and this call can still
-        raise afterwards and be retried whole: counting them first counted one oversized event
-        once per attempt. A ``413`` drop — a lone item the destination refused, or one
-        :meth:`_known_refused` discards without offering it — is counted and announced only when
-        ``emit`` returns as well, through :meth:`_drop_refused` and the same ledger (SPEC-059
-        FR-004). Once a drop has settled a chunk, this call raises only through a later chunk's
-        exception :meth:`_deliver` does not catch — one any subclass hook raises, since
-        :meth:`_body` and :meth:`_handle_response` run outside :meth:`_send`'s guard, or a
-        ``BaseException`` — and that raise now discards the drop rather than leaving it counted
-        once per attempt. An exception a caller-injected ``opener`` raises is no longer such a
-        route: :meth:`_send` catches every ``Exception`` and counts one it does not retry as an
-        abandoned request (SPEC-070 FR-001). The abandonment
-        counter stays immediate: ``failed`` is an upper bound neither spec recounts.
+        The drops a round decides — an oversized event, an unrenderable one, a chunk whose
+        request could not be built, a lone item the destination answered ``413`` — are counted
+        and announced only when ``emit`` returns (SPEC-058 FR-005, SPEC-059 FR-004): they go to
+        the run's context as ``SETTLED``, so a run that fails, which is the call that raises,
+        counts none of them and its catcher owns the batch. ``failed`` counts abandoned requests
+        when the run ends: one refused for good whatever the outcome, one still failing
+        retryably only for the run's last round.
 
         Args:
           batch: The events to ship. An empty batch is a no-op.
@@ -1901,67 +2227,255 @@ class HTTPSink:
           None.
 
         Raises:
-          SinkDeliveryError: When no chunk was **settled**, which is the total failure the
-            worker's retry exists for (SPEC-026 FR-001). A chunk is settled when it was
-            delivered, when it was permanently discarded, *or* when a ``2xx`` gave no readable
-            verdict — a body that could not be decoded, or could not be read at all — and
-            :meth:`_handle_response` counted it, because none is helped by a retry
-            — a ``413`` is a verdict on the bytes, not a transient fault, and re-sending
-            identical bytes can only earn the same answer (the rule SPEC-016 and SPEC-018 both
-            already apply), while re-sending a chunk that may have landed could duplicate it.
-            A batch that settled *some* chunks does not raise either: the worker
-            retries whole batches, so raising would re-send what landed. A raise leaves nothing
-            from :meth:`_items` or :meth:`_drop_refused` counted, and a batch whose every event
-            was unrenderable or oversized makes no request and does not raise.
+          SinkDeliveryError: When the run failed: no event was accepted, at least one was
+            rejected for good or still retryable when the rounds ran out, and none ended
+            unknown. A partial outcome, an unadjudicated ``2xx`` and a batch whose every event
+            was dropped return normally, because none is helped by a retry and a resend could
+            duplicate what landed (SPEC-026 FR-001, SPEC-072).
         """
-        if not batch:
-            return
-        with Deferral(self) as pending:
-            items = self._items(batch, pending)
-            if not items:
-                return
-            budget = self._chunk_budget()
-            refused_at: int | None = None
-            reductions = index = chunks = settled = 0
-            while index < len(items):
-                chunk = self._take(items, index, budget)
-                if self._known_refused(chunk, refused_at):
-                    self._drop_refused(chunk, pending)
-                    chunks += 1
-                    settled += 1
-                    index += 1
-                    continue
-                try:
-                    delivered = self._deliver(chunk)
-                except _PayloadTooLarge as refusal:
-                    refused_at = (
-                        refusal.size if refused_at is None else min(refused_at, refusal.size)
+        _engine.emit_via_deliver(self, batch, deliver=self._round)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-073 FR-001).
+
+        Inside an engine run the round counts into that run's context; called directly, outside
+        any run, it is a one-round run of its own whose counts commit when it returns. A class
+        that is not offered ``deliver`` holds ``None`` here instead (:meth:`__init_subclass__`).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from a hook or the opener propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Sends every chunk of the batch in one request each, and classifies every event.
+
+        ``_items`` renders and drops what cannot be sent alone; ``_take`` chunks the rest under
+        the count limit and the run's byte budget; each chunk's request is built exactly as
+        ``_send`` builds one — :meth:`_body`, then :meth:`_prepare`, which calls
+        :meth:`_apply_auth`, then the ``Request`` — and made once by :meth:`_exchange`, which
+        classifies it. Nothing here waits or retries: the engine resends the ``RETRYABLE``
+        events in a later round.
+
+        **The ``413`` search runs per run.** A ``413`` halves the budget to the refused body's
+        size and re-chunks the round's remaining items; a lone refused item, or one
+        :meth:`_known_refused` proves no smaller than one already refused, is ``DROPPED``; a
+        multi-item chunk still refused after ``MAX_BUDGET_REDUCTIONS`` is ``REJECTED``. The
+        budget, the smallest refused size and the reduction count live in the run's notes, so
+        a later round starts from the budget already found.
+
+        **A hook fault costs its chunk.** What builds a chunk's request — :meth:`_known_refused`,
+        :meth:`_body`, :meth:`_prepare` with the :meth:`_apply_auth` it calls, and the
+        ``Request`` — runs under a guard catching ``Exception``: a raise there makes the chunk's
+        events ``DROPPED``, counted on ``_unrenderable`` and announced with the render fault's
+        line, once per round with the first exception's type, since nothing was sent and the
+        same inputs fail the same way. A ``2xx`` reader that raises sends its chunk through
+        :meth:`_unadjudicated`: the request succeeded, so its events are ``UNKNOWN``. Those
+        guards cover only those hooks. A raising third-party override of another private method
+        the round calls — ``_retryable_status`` (asked only of a non-``2xx``), ``_items``,
+        ``_take``, ``_event_ceiling``, ``_chunk_budget``, ``_drop_refused`` or
+        ``_abandon_unreduced`` — escapes the round, as it escaped 1.x ``emit``, and the engine
+        then fails that round's events and announces the exception's type. A raising
+        ``_response_limit`` does not escape: :meth:`_attempt` reads it inside the attempt, so
+        :meth:`_exchange` classifies its exception as the attempt's own, through
+        :meth:`_retryable_error` — counted in ``failed``, and for anything but a transport
+        error the chunk is ``REJECTED``.
+
+        The verdict's ``retry_after`` is the largest finite, positive ``Retry-After`` among the
+        round's retryable responses, or ``None``; one round has one wait.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from any hook or the opener propagates.
+        """
+        context = _engine.run_context()
+        notes = context.notes(self)
+        drops = context.drops(self)
+        budget = cast("int", notes.get("budget", self._chunk_budget()))
+        refused_at = cast("int | None", notes.get("refused_at"))
+        reductions = cast("int", notes.get("reductions", 0))
+        tally = _Tally(drops)
+        items = self._items(batch, tally)
+        positions, fates = _positions(batch, items, tally.dropped)
+        hints: list[float] = []
+        faults = 0
+        first: Exception | None = None
+        index = 0
+        while index < len(items):
+            chunk = self._take(items, index, budget)
+            where = positions[index : index + len(chunk)]
+            try:
+                known = self._known_refused(chunk, refused_at)
+                if not known:
+                    body, content_type = self._body(chunk)
+                    headers, data = self._prepare(body, content_type, {})
+                    request = urllib.request.Request(  # noqa: S310
+                        self.url,
+                        data=data,
+                        method=self.method,
+                        headers=cast("dict[str, str]", headers),
                     )
-                    if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
-                        budget = max(min(budget, refusal.size) // 2, 1)
-                        reductions += 1
-                        continue
-                    chunks += 1
-                    if len(chunk) == 1:
-                        self._drop_refused(chunk, pending)
-                        settled += 1
-                    else:
-                        self._abandon_unreduced(chunk)
-                    index += len(chunk)
-                    continue
-                chunks += 1
-                settled += delivered
+            except Exception as err:
+                faults += len(chunk)
+                first = first if first is not None else err
+                _settle(fates, where, (Outcome.DROPPED,) * len(chunk))
                 index += len(chunk)
-            if chunks and not settled:
-                raise SinkDeliveryError(
-                    f"{type(self).__name__} delivered none of {chunks} chunk(s)"
-                )
+                continue
+            if known:
+                self._drop_refused(chunk, drops)
+                _settle(fates, where, (Outcome.DROPPED,))
+                index += 1
+                continue
+            answer = self._exchange(request, splittable=True, count_unexpected=True)
+            if answer.outcome is None:
+                refused_at = len(body) if refused_at is None else min(refused_at, len(body))
+                if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
+                    budget = max(min(budget, len(body)) // 2, 1)
+                    reductions += 1
+                    continue
+                if len(chunk) == 1:
+                    self._drop_refused(chunk, drops)
+                    _settle(fates, where, (Outcome.DROPPED,))
+                else:
+                    self._abandon_unreduced(chunk)
+                    _settle(fates, where, (Outcome.REJECTED,) * len(chunk))
+                index += len(chunk)
+                continue
+            if answer.outcome is Outcome.ACCEPTED:
+                outcomes = self._read(answer.payload, chunk)
+            else:
+                outcomes = (answer.outcome,) * len(chunk)
+                hint = answer.retry_after
+                if (
+                    answer.outcome is Outcome.RETRYABLE
+                    and hint is not None
+                    and math.isfinite(hint)
+                    and hint > 0
+                ):
+                    hints.append(hint)
+            _settle(fates, where, outcomes)
+            index += len(chunk)
+        notes["budget"] = budget
+        notes["refused_at"] = refused_at
+        notes["reductions"] = reductions
+        if first is not None:
+            kind = type(first).__name__
+            name = type(self).__name__
+            lost = faults
+            drops.count("_unrenderable", lost)
+            drops.announce(lambda: _diag.lost("event", lost, f"{name}, rendering raised {kind}"))
+        return Verdict(outcomes=tuple(fates), retry_after=max(hints) if hints else None)
+
+    def _read(self, payload: bytes, chunk: list[_Item]) -> tuple[Outcome, ...]:
+        """Reads a ``2xx`` through the class's reader, under the guard every reader runs in.
+
+        A class whose bool ``_handle_response`` sits above its ``_outcomes`` is read through
+        the base :meth:`_outcomes`, which is that override's verdict, even below a shipped reader
+        that defines ``_outcomes`` (``_READS_BOOL``). A reader that raises makes the chunk
+        unadjudicated with a line naming the exception's type; a result that is not one
+        ``Outcome`` per event — not a sequence, the wrong length, or holding anything else — makes
+        it unadjudicated with the line ``gave no outcome per event``. Either way the request
+        succeeded, so its events may have landed.
+
+        Args:
+          payload: The response body; an ``_UnreadBody`` when it could not be read.
+          chunk: The chunk the response describes.
+
+        Returns:
+          One outcome per item of ``chunk``.
+
+        Raises:
+          None. A ``BaseException`` from the reader propagates.
+        """
+        try:
+            if type(self)._READS_BOOL:
+                result = HTTPSink._outcomes(self, payload, chunk)
+            else:
+                result = self._outcomes(payload, chunk)
+        except Exception as err:
+            return self._unadjudicated(chunk, f"reading a 2xx response raised {type(err).__name__}")
+        try:
+            outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
+        except Exception:
+            outcomes = None
+        if outcomes is None:
+            return self._unadjudicated(chunk, "reading a 2xx response gave no outcome per event")
+        return outcomes
+
+    def _outcomes(self, payload: bytes, items: list[_Item]) -> tuple[Outcome, ...]:
+        """Reports each event's fate from a ``2xx`` body: the hook a per-record reader overrides.
+
+        The base asks :meth:`_handle_response`, so a 1.x override's bool keeps its meaning:
+        ``True`` makes every event ``ACCEPTED`` and ``False`` makes every event ``REJECTED``,
+        which a chunk of nothing delivered meant in 1.x. It counts nothing; an override counts
+        what it reads through the run context, and gives up on a body it cannot read through
+        :meth:`_unadjudicated`.
+
+        Args:
+          payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
+            read.
+          items: The chunk the response describes.
+
+        Returns:
+          One outcome per item.
+
+        Raises:
+          Exception: Whatever :meth:`_handle_response` raises; the round's guard takes it.
+        """
+        verdict = Outcome.ACCEPTED if self._handle_response(payload, items) else Outcome.REJECTED
+        return (verdict,) * len(items)
+
+    def _unadjudicated(
+        self, items: list[_Item], detail: str, noun: str = "event"
+    ) -> tuple[Outcome, ...]:
+        """Gives up on a ``2xx`` this sink cannot read: the one method every reader calls.
+
+        The chunk is counted on ``dropped_unadjudicated`` — an upper bound folded into
+        ``failed``, since its events may have landed — announced as ``lost <n> <noun>(s);
+        <class> <detail>; they may have landed; not retried``, and every event is ``UNKNOWN``,
+        which never fails a run. A shipped sink is not idempotent, so its ``UNKNOWN`` is final at
+        once and this counts ``ALWAYS``. A subclass declaring ``log_foundry_idempotent = True``
+        has an ``UNKNOWN`` chunk resent, so for it this counts ``LAST``: an event is counted once
+        per run, and only when it ended the run unadjudicated.
+
+        Args:
+          items: The chunk the response describes.
+          detail: What could not be read, carrying only counts and types, never the body.
+          noun: What one item is, for the line.
+
+        Returns:
+          ``UNKNOWN`` for every item.
+
+        Raises:
+          None.
+        """
+        context = _engine.run_context()
+        when = When.LAST if _engine._idempotent(self) else When.ALWAYS
+        sent = len(items)
+        name = type(self).__name__
+        context.count(self, "dropped_unadjudicated", sent, when=when)
+        context.announce(
+            lambda: _diag.lost(noun, sent, f"{name} {detail}; they may have landed; not retried"),
+            when=when,
+        )
+        return (Outcome.UNKNOWN,) * sent
 
     def _known_refused(self, chunk: list[_Item], refused_at: int | None) -> bool:
         """Reports whether this chunk is provably no smaller than one already refused.
 
         Only a lone item qualifies: a multi-item chunk can still be reduced, and reducing is
-        cheaper than discarding. The point is to stop the tail of a hopeless ``emit`` becoming
+        cheaper than discarding. The point is to stop the tail of a hopeless run becoming
         one request per event once the budget has fallen below a single item.
 
         The comparison builds the item's **real body** rather than reading its charged size,
@@ -1991,7 +2505,7 @@ class HTTPSink:
 
         Args:
           chunk: The chunk about to be sent.
-          refused_at: The smallest body this ``emit`` has seen refused, or ``None``.
+          refused_at: The smallest body this run has seen refused, or ``None``.
 
         Returns:
           True when the chunk can be discarded without offering it.
@@ -2007,7 +2521,7 @@ class HTTPSink:
         """Fills one chunk from ``start`` under the count limit and the current byte budget.
 
         Always yields at least one item, however small the budget: an item that cannot fit alone
-        is the caller's to resolve, which :meth:`emit` does by dropping it once the destination
+        is the caller's to resolve, which :meth:`_round` does by dropping it once the destination
         has refused it. That mirrors ``chunk_items``, which this replaces here only because the
         budget can change between chunks and a generator cannot be re-aimed mid-iteration.
 
@@ -2034,17 +2548,22 @@ class HTTPSink:
         return items[start:end]
 
     def _abandon_unreduced(self, chunk: list[_Item]) -> None:
-        """Records a multi-item chunk the reduction budget could not shrink.
+        """Records a multi-item chunk the reduction budget could not shrink: ``REJECTED``.
 
-        It is counted against ``failed`` and announced, but **not** settled: those events were
-        never individually refused, so calling them permanent drops would invent loss, while
-        saying nothing at all would leave them invisible whenever a sibling chunk delivered and
-        ``emit`` therefore returned normally. Measured before this: 10 events in, 2 delivered,
-        8 gone, every counter at zero and stderr empty.
+        It is counted against ``failed`` and announced, ``ALWAYS``, but its events are not
+        drops: they were never individually refused, so calling them permanent drops would invent
+        loss, while saying nothing at all would leave them invisible whenever a sibling chunk
+        delivered. Measured before this: 10 events in, 2 delivered, 8 gone, every counter at zero
+        and stderr empty. It is final: a resend of the same events after the same search earns
+        the same answer.
 
         Reaching it needs a pathological ``_item_size`` — with the default one, a multi-item
         chunk cannot survive ``MAX_BUDGET_REDUCTIONS`` halvings unless ``max_batch_count``
         exceeds 33 million.
+
+        It keeps its 1.x signature, so a third-party override written against 1.x is still
+        called; the count goes to the innermost run's context, read here through
+        ``run_context()``, since it is only ever called inside a round.
 
         Args:
           chunk: The events that could not be placed.
@@ -2055,42 +2574,47 @@ class HTTPSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            self.failed += 1
-        _diag.lost(
-            "request",
-            1,
-            f"{type(self).__name__}, {len(chunk)} event(s) still 413 after "
-            f"{MAX_BUDGET_REDUCTIONS} reduction(s); lower max_batch_bytes to match the destination",
+        context = _engine.run_context()
+        name = type(self).__name__
+        size = len(chunk)
+        context.count(self, "failed", 1, when=When.ALWAYS)
+        context.announce(
+            lambda: _diag.lost(
+                "request",
+                1,
+                f"{name}, {size} event(s) still 413 after "
+                f"{MAX_BUDGET_REDUCTIONS} reduction(s); lower max_batch_bytes to match the "
+                f"destination",
+            ),
+            when=When.ALWAYS,
         )
 
-    def _drop_refused(self, chunk: list[_Item], pending: Deferral) -> None:
+    def _drop_refused(self, chunk: list[_Item], pending: _Pending) -> None:
         """Discards a single item this destination will not accept at any size available.
 
         Only ever called with one item. It reaches here two ways: the item was offered alone and
         answered ``413``, or :meth:`_known_refused` proved its body is no smaller than one this
-        ``emit`` has already had refused — in which case it was **never offered**, which is the
-        whole point of that shortcut. Either way it is permanently undeliverable here, so the
-        chunk reports *settled*, and the drop goes to ``pending`` against ``dropped_oversized``:
-        it is counted and announced only when ``emit`` returns (SPEC-059 FR-004). Permanence
-        alone never made ``dropped`` exact. Once a drop has settled a chunk, ``emit`` can still
-        raise through a later chunk's exception :meth:`_deliver` does not catch — one a
-        caller-injected ``opener`` raises that :meth:`_send` does not catch, one any subclass
-        hook raises, or a ``BaseException``; the
-        worker then retried the batch, re-ran the identical search and re-counted the identical
-        drop once per attempt. It is the deferral that keeps ``dropped`` an exact count, while
-        ``failed`` stays an upper bound. The line keeps its shape, one per call.
+        run has already had refused — in which case it was **never offered**, which is the whole
+        point of that shortcut. Either way it is permanently undeliverable here, so its event is
+        ``DROPPED``, and the drop goes to ``pending`` against ``dropped_oversized``: it is
+        counted and announced only when ``emit`` returns (SPEC-059 FR-004) — on the engine, only
+        by a run that settles. Permanence alone never made ``dropped`` exact. Under 1.x a later
+        chunk's raise sent the batch back to the worker, which re-ran the identical search and
+        re-counted the identical drop once per attempt; now a run that fails — the drop beside a
+        chunk refused for good — counts none of its drops, and its catcher owns the batch. It is
+        the deferral that keeps ``dropped`` an exact count, while ``failed`` stays an upper
+        bound. The line keeps its shape, one per drop.
 
         A *multi*-item chunk reaching the end of the reduction budget is deliberately **not**
         routed here. It needs a pathological ``_item_size`` to happen at all (measured: an
         override returning zero abandoned 20 events in whole chunks), and those events were never
         individually refused, so counting them as permanent drops would be loss the library
-        invented. They are left unsettled and reach the worker as the failure they are.
+        invented. They are ``REJECTED`` instead (:meth:`_abandon_unreduced`).
 
         Args:
           chunk: The refused items.
-          pending: The calling ``emit``'s deferral, which holds the drop until that ``emit`` is
-            known not to raise.
+          pending: The run's ``SETTLED`` view (``RunContext.drops``), or any ledger of the same
+            shape, which holds the drop until the run is known to settle.
 
         Returns:
           None.
@@ -2108,7 +2632,7 @@ class HTTPSink:
             )
         )
 
-    def _items(self, batch: list[dict[str, object]], pending: Deferral) -> list[_Item]:
+    def _items(self, batch: list[dict[str, object]], pending: _Pending) -> list[_Item]:
         """Renders each event and discards any that cannot fit a request on its own.
 
         ``chunk_items`` documents oversized items as the caller's to filter, because a group it
@@ -2127,8 +2651,9 @@ class HTTPSink:
 
         Args:
           batch: The events to render.
-          pending: The calling ``emit``'s deferral, which holds every drop decided here until
-            that ``emit`` is known not to raise (SPEC-058 FR-005).
+          pending: The run's ``SETTLED`` view (``RunContext.drops``), or a ``Deferral``, which
+            holds every drop decided here until the run is known to settle, which is when
+            ``emit`` returns (SPEC-058 FR-005).
 
         Returns:
           The items that can be sent, in order.
@@ -2243,7 +2768,9 @@ class HTTPSink:
         depth-bound abandonment recoverable-by-retry while the code reported it settled. The
         rediscovery it saved is real but is bounded by ``MAX_BUDGET_REDUCTIONS`` and only arises
         against a destination whose limit is below the configured budget, which has a direct
-        remedy: pass ``max_batch_bytes=``.
+        remedy: pass ``max_batch_bytes=``. The ``413`` search's reduced budget is kept for one
+        run, in the run's notes, so a later round's resend starts from it, and never carried into
+        a later batch (SPEC-073 FR-001).
 
         Args:
           None.
@@ -2331,8 +2858,8 @@ class HTTPSink:
     def _retryable_status(self, status: int) -> bool:
         """Reports whether a status is worth another attempt (SPEC-056 FR-003).
 
-        The family's default is ``429`` and every ``5xx``. It is a hook, read at one site in
-        :meth:`_send`, so a subclass whose protocol names its own retryable set — OTLP's is
+        The family's default is ``429`` and every ``5xx``. It is a hook, read at one site,
+        :meth:`_exchange`'s classification, so a subclass whose protocol names its own retryable set — OTLP's is
         ``429``, ``502``, ``503`` and ``504``, with a ``500`` abandoned on the first request —
         narrows it without touching the loop, and every other sink is unchanged by construction.
 
@@ -2371,7 +2898,7 @@ class HTTPSink:
         ``None`` is the family's default and keeps :meth:`_attempt` calling a bare ``read()``,
         which is what every existing sink and every test double of a response relies on. A
         subclass returning a bound makes :meth:`_attempt` read at most one byte past it; a
-        non-``2xx`` response longer than the bound is then abandoned in :meth:`_send` as
+        non-``2xx`` response longer than the bound is then abandoned by :meth:`_exchange` as
         non-retryable, whatever its status — a ``413`` included, which is read literally rather
         than as a request to split, since a server answering a refusal with megabytes is not
         describing the request — and a ``2xx`` reaches :meth:`_handle_response` as it was read,
@@ -2388,35 +2915,6 @@ class HTTPSink:
         """
         return None
 
-    def _deliver(self, items: list[_Item]) -> bool:
-        """Sends one chunk and reports whether it needs no further attention.
-
-        A ``413`` is *not* handled here. It is a statement about the request size rather than
-        about this chunk, so it propagates to :meth:`emit`, which lowers the byte budget and
-        re-chunks the remaining work — see :data:`MAX_BUDGET_REDUCTIONS` for why that is the
-        cheap shape and recursive chunk-halving is not. Re-sending after a ``413`` cannot
-        duplicate anything: the rejection precedes ingestion, so nothing landed (SPEC-018's rule
-        that only provable non-delivery may be re-sent).
-
-        Args:
-          items: The chunk to send, known non-empty.
-
-        Returns:
-          True when the chunk is settled as ``emit`` defines it, False for a failure a retry might
-          yet fix.
-
-        Raises:
-          _PayloadTooLarge: When the destination refused the request as too large.
-        """
-        body, content_type = self._body(items)
-        try:
-            payload = self._send(body, content_type=content_type, splittable=True)
-        except _PayloadTooLarge:
-            raise
-        except SinkDeliveryError:
-            return False
-        return self._handle_response(payload, items)
-
     def losses(self) -> SinkLosses:
         """Reports oversized drops and abandoned requests (SPEC-026 FR-002).
 
@@ -2426,15 +2924,18 @@ class HTTPSink:
         Returns:
           The counters. ``failed`` counts abandoned requests rather than events, since this
           class has no per-event outcome to report and an abandoned request took its whole body
-          with it; subclasses that do learn per-record outcomes add them. ``dropped`` is the
-          oversized events plus those whose render raised (SPEC-058 FR-005).
+          with it, plus ``dropped_unadjudicated``'s events, whose ``2xx`` could not be read;
+          subclasses that do learn per-record outcomes add them. ``dropped`` is the oversized
+          events plus those whose render raised or whose chunk's request could not be built
+          (SPEC-058 FR-005, SPEC-073 FR-001).
 
         Raises:
           None.
         """
         with self._counter_lock:
             return SinkLosses(
-                dropped=self.dropped_oversized + self._unrenderable, failed=self.failed
+                dropped=self.dropped_oversized + self._unrenderable,
+                failed=self.failed + self.dropped_unadjudicated,
             )
 
     def close(self) -> None:
@@ -2461,48 +2962,46 @@ class HTTPSink:
         splittable: bool = False,
         count_unexpected: bool = True,
     ) -> bytes:
-        """POSTs a body with bounded retry and returns the response bytes.
+        """POSTs one body with the sink's own retries, on the delivery engine, and returns the reply.
 
-        Raising from here rather than from each ``emit`` is deliberate: every platform subclass
-        builds its own body and calls this, so the rule reaches them without a line of their
-        own. The one caller that must not propagate is ``SentrySink``, which sends one envelope
-        per event and therefore catches it.
+        The 1.x contract, kept for callers outside the chunk path — ``SentrySink``'s fallback,
+        and a third-party subclass that builds its own body. The chunk path does not call it, so
+        an override of ``_send`` no longer sees the chunks. Its attempts run as rounds of one
+        request through the engine's ``_run``: the budget is ``max_retries``, the stop event
+        ``log_foundry_stop_signal``, there is no decline predicate, and the classification is
+        :meth:`_exchange`'s, the same one the round reads, so the two cannot drift. Its counts and
+        lines are its own run's, committed when that run ends, so it makes ``max_retries + 1``
+        attempts and counts as 1.x did even when called from inside another run's round, waiting
+        inside that round. The engine's event totals for it go to a throwaway ``SinkCounters``:
+        a request is not an event.
 
-        A failure **before** any status line is a connection error when :meth:`_retryable_error`
-        accepts it: an ``OSError``, a ``URLError``, and an ``http.client.HTTPException`` such as
-        ``BadStatusLine``, which is neither and used to escape ``emit`` raw, handing the worker a
-        batch to re-send whole, chunks that had already landed included. Those three are retried,
-        then abandoned and counted in ``failed``. A header block that fails to parse raises the
-        same class *after* a status line the library never sees, which may have been a ``2xx``;
-        it is retried like a read timeout awaiting the headers, on the expected-cost reasoning
-        SPEC-048 records for those. **After** a status line the status decides, whatever happened
-        to the body (:meth:`_attempt`).
-
-        Any other exception — what a caller-injected ``opener`` can raise — also used to escape
-        ``emit`` raw and uncounted. It is now caught and abandoned at its first attempt with no
-        backoff wait (SPEC-070 FR-001), through the same ``_abandon`` line the exhausted
-        connection error writes, so its attempt count reads ``1``.
+        A failure **before** any status line that :meth:`_retryable_error` accepts — an
+        ``OSError``, a ``URLError``, an ``http.client.HTTPException`` such as ``BadStatusLine``
+        — is retried, then abandoned and counted in ``failed``. **After** a status line the
+        status decides, whatever happened to the body (:meth:`_attempt`). Any other exception —
+        what a caller-injected ``opener`` can raise — is abandoned at its first attempt with no
+        wait (SPEC-070 FR-001), through the same line, so its attempt count reads ``1``.
 
         The header map is handed to ``urllib`` under the ``str``-valued type its stub declares,
-        the one cast on this path: ``Request`` stores values untouched and ``putheader`` sends an
-        ``int`` or ``bytes`` value itself, which is how a caller's has always gone out.
+        the one cast on this path and the round's: ``Request`` stores values untouched and
+        ``putheader`` sends an ``int`` or ``bytes`` value itself, which is how a caller's has
+        always gone out.
 
         Args:
           body: The serialized batch.
           content_type: The default content type, overridable by caller headers.
           extra_headers: Per-request headers beneath the caller's own.
-          splittable: Whether the caller can respond to a ``413`` by sending smaller requests.
-            Only :meth:`_deliver` can, so it alone passes ``True`` and alone sees
-            ``_PayloadTooLarge``. Every other caller — ``SentrySink``, which sends one envelope
-            per event and has nothing left to split — keeps the counted, announced abandonment
-            it has always had, because a ``413`` raised past it uncounted would be exactly the
-            silent loss this file's counters exist to prevent.
+          splittable: Whether the caller can respond to a ``413`` by sending smaller requests;
+            only then is a ``413`` raised as ``_PayloadTooLarge``, uncounted. Every other caller —
+            ``SentrySink``, which sends one envelope per event and has nothing left to split —
+            keeps the counted, announced abandonment it has always had.
           count_unexpected: Whether an exception :meth:`_retryable_error` rejects is counted and
             abandoned here. ``SentrySink`` passes ``False``: it counts such an exception on its
             own ``.transport_errors``, a documented counter, so moving the count to this held
             sink's ``failed`` would reclassify it in a minor release. With ``False`` the
-            exception is re-raised unchanged after its one attempt, uncounted here — unless it is
-            a ``SinkDeliveryError`` (``_PayloadTooLarge`` included), which every caller reads as
+            exception is attempted once and re-raised unchanged, the same object, after the run
+            ends, counted by neither this nor its run's line — unless it is a
+            ``SinkDeliveryError`` (``_PayloadTooLarge`` included), which every caller reads as
             already counted and announced; that one is abandoned here, counted once in
             ``failed``, so an opener raising it is never counted nowhere.
 
@@ -2513,50 +3012,148 @@ class HTTPSink:
 
         Raises:
           Exception: An exception :meth:`_retryable_error` rejects, unchanged, only when
-            ``count_unexpected`` is False and it is not a ``SinkDeliveryError``.
+            ``count_unexpected`` is False and it is not a ``SinkDeliveryError``; and anything
+            building the ``Request`` or ``_retryable_status`` (asked of a non-``2xx``) raises,
+            unchanged and uncounted, as 1.x let it escape. A raising ``_response_limit`` is read
+            inside the attempt, so it is classified as that attempt's own exception: a refused
+            one is counted once in ``failed`` and raised as ``SinkDeliveryError``.
           _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
-            line, because the caller is about to re-send the same events in smaller requests and
-            only what finally fails is a loss.
-          SinkDeliveryError: If the request was retried to exhaustion. It used to return
-            ``None``, which every caller spelled as "nothing to parse" and the worker read as a
-            successful emit; an abandoned request delivered nothing, which is the total failure
-            the worker's retry exists for (SPEC-026 FR-001). Since FR-001 a request carries one
-            *chunk* rather than the whole batch, so it is :meth:`emit` that decides whether the
-            batch as a whole failed — one abandoned chunk beside a delivered one is partial
-            failure, and partial failure must not raise.
+            line, because the caller is about to re-send the same events in smaller requests.
+          SinkDeliveryError: When the request was abandoned: refused, or still failing when the
+            rounds ran out. ``failed`` has moved by one and its line is written first.
         """
         headers, data = self._prepare(body, content_type, extra_headers)
-        retries = self.max_retries
-        limit = self._response_limit()
-        for attempt in range(retries + 1):
-            request = urllib.request.Request(  # noqa: S310
-                self.url, data=data, method=self.method, headers=cast("dict[str, str]", headers)
-            )
+        sent = _Sent()
+
+        def one(batch: list[dict[str, object]]) -> Verdict:
+            """Makes one attempt, as one round of the run.
+
+            Args:
+              batch: The run's single placeholder event.
+
+            Returns:
+              The attempt's outcome, with its ``Retry-After``.
+
+            Raises:
+              None. A ``BaseException`` from the opener propagates.
+            """
             try:
-                status, payload, retry_after = self._attempt(request)
-            except Exception as err:
-                retryable = is_retryable(self._retryable_error, err)
-                if retryable and attempt < retries:
-                    self._sleep_backoff(attempt, None)
-                    continue
-                counted_by_caller = not count_unexpected and not isinstance(err, SinkDeliveryError)
-                if not retryable and counted_by_caller:
-                    raise
-                self._abandon(
-                    f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip(),
-                    attempt + 1,
+                request = urllib.request.Request(  # noqa: S310
+                    self.url, data=data, method=self.method, headers=cast("dict[str, str]", headers)
                 )
-            if 200 <= status < 300:
-                return payload
-            if limit is not None and len(payload) > limit:
-                self._abandon(f"HTTP {status}, response over {limit} bytes", attempt + 1)
-            if self._retryable_status(status) and attempt < retries:
-                self._sleep_backoff(attempt, retry_after)
-                continue
-            if status == 413 and splittable:
-                raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413", len(body))
-            self._abandon(f"HTTP {status}", attempt + 1)
-        raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
+                answer = self._exchange(
+                    request, splittable=splittable, count_unexpected=count_unexpected
+                )
+            except Exception as err:
+                sent.raised = err
+                return Verdict(outcomes=(Outcome.REJECTED,))
+            sent.answer = answer
+            outcome = Outcome.REJECTED if answer.outcome is None else answer.outcome
+            return Verdict(outcomes=(outcome,), retry_after=answer.retry_after)
+
+        _engine._run(
+            self,
+            one,
+            SinkCounters(),
+            [{}],
+            sink_retries=self.max_retries,
+            worker_retries=0,
+            stop=_engine.stop_signal_of(self),
+            decline=None,
+        )
+        if sent.raised is not None:
+            raise sent.raised
+        answer = sent.answer
+        if answer is None:
+            raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
+        if answer.outcome is Outcome.ACCEPTED:
+            return answer.payload
+        if answer.error is not None:
+            raise answer.error
+        if answer.outcome is None:
+            raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413", len(body))
+        raise SinkDeliveryError(answer.detail)
+
+    def _exchange(
+        self, request: urllib.request.Request, *, splittable: bool, count_unexpected: bool
+    ) -> _Answer:
+        """Makes one request and classifies it: the one table the round and :meth:`_send` read.
+
+        ========================================================  ==============  ================
+        The request                                               Outcome         ``failed``
+        ========================================================  ==============  ================
+        an exception :meth:`_retryable_error` accepts             ``RETRYABLE``   ``LAST``
+        an exception it refuses, ``count_unexpected`` false        ``REJECTED``    none, re-raised
+        any other exception it refuses                            ``REJECTED``    ``ALWAYS``
+        a ``2xx``                                                 ``ACCEPTED``    the reader's
+        a non-``2xx`` longer than :meth:`_response_limit`          ``REJECTED``    ``ALWAYS``
+        a status :meth:`_retryable_status` accepts                ``RETRYABLE``   ``LAST``
+        a ``413``, ``splittable``                                 the search      none
+        any other status                                          ``REJECTED``    ``ALWAYS``
+        ========================================================  ==============  ================
+
+        ``failed`` counts the **request**, its line naming the attempts its events have had,
+        which is the run's round. A retryable request counts ``LAST``, only when its round is the
+        run's last, so a request a later round lands is never counted; one refused for good
+        counts ``ALWAYS``. The checks run in 1.x ``_send``'s order, so a subclass whose
+        ``_retryable_status`` accepts ``413`` still retries it. A ``SinkDeliveryError`` an opener
+        raises is always counted here, since every caller reads that type as already counted.
+
+        Args:
+          request: The request to make.
+          splittable: Whether a ``413`` goes to the caller's search, uncounted.
+          count_unexpected: Whether a refused exception is counted here or handed back.
+
+        Returns:
+          The classification.
+
+        Raises:
+          None. A ``BaseException`` from the opener propagates.
+        """
+        context = _engine.run_context()
+        try:
+            status, payload, retry_after = self._attempt(request)
+        except Exception as err:
+            reason = f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip()
+            if is_retryable(self._retryable_error, err):
+                return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
+            if not count_unexpected and not isinstance(err, SinkDeliveryError):
+                return _Answer(Outcome.REJECTED, error=err)
+            return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
+        if 200 <= status < 300:
+            return _Answer(Outcome.ACCEPTED, payload=payload)
+        limit = self._response_limit()
+        if limit is not None and len(payload) > limit:
+            reason = f"HTTP {status}, response over {limit} bytes"
+            return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
+        if self._retryable_status(status):
+            detail = self._give_up(context, f"HTTP {status}", When.LAST)
+            return _Answer(Outcome.RETRYABLE, retry_after=retry_after, detail=detail)
+        if status == 413 and splittable:
+            return _Answer(None, payload=payload)
+        return _Answer(
+            Outcome.REJECTED, detail=self._give_up(context, f"HTTP {status}", When.ALWAYS)
+        )
+
+    def _give_up(self, context: RunContext, reason: str, when: When) -> str:
+        """Counts one abandoned request on ``failed`` and registers its line, as ``when`` says.
+
+        Args:
+          context: The run's context, whose round is the attempt count the line names.
+          reason: Why, carrying only library-controlled values — a status, an exception type, an
+            ``errno`` — never a server's body or an exception's text (SPEC-029 FR-002).
+          when: Which run endings commit it.
+
+        Returns:
+          The detail, which :meth:`_send` raises as its ``SinkDeliveryError`` message.
+
+        Raises:
+          None.
+        """
+        detail = f"{type(self).__name__}, {context.round} attempt(s), {reason}"
+        context.count(self, "failed", 1, when=when)
+        context.announce(lambda: _diag.lost("request", 1, detail), when=when)
+        return detail
 
     def _prepare(
         self,
@@ -2690,8 +3287,9 @@ class HTTPSink:
         readable response object, so it is unified here rather than raised.
 
         **The status line is the dividing line.** Everything before it — the connection, the
-        request, a status line or header block the server garbled — raises, and :meth:`_send`
-        retries it, if :meth:`_retryable_error` accepts it, as a connection error. Once a status
+        request, a status line or header block the server garbled — raises, and
+        :meth:`_exchange` makes its events ``RETRYABLE``, if :meth:`_retryable_error` accepts it,
+        as a connection error. Once a status
         is in hand the server has answered, so a body read that fails afterwards is not a fault to
         retry but a body nobody can read: the payload is an :class:`_UnreadBody` and the status,
         with its ``Retry-After``, decides as it always did. A
@@ -2711,8 +3309,8 @@ class HTTPSink:
         plain ``b""``.
 
         The guard catches ``Exception``, not the read's documented errors, for the reason
-        ``ElasticsearchSink._parse_bulk_response`` gives for its own: anything escaping here
-        escapes ``emit``, and the worker re-sends a batch the destination may have accepted. It
+        the readers give for their own: anything escaping here would escape the round, fail the
+        engine's run and report as undelivered a batch the destination may have accepted. It
         never catches ``BaseException``.
 
         The read takes no size argument unless :meth:`_response_limit` names a bound, and the
@@ -2720,7 +3318,7 @@ class HTTPSink:
         ``Content-Length`` body that arrives short and for a truncated chunked body, but
         ``read(amt)`` returns a short ``Content-Length`` body **silently**, leaving
         ``response.length`` above zero (measured on 3.12 and 3.13). So the bounded read, which
-        asks for one byte past the bound so :meth:`_send` and :meth:`_handle_response` can tell
+        asks for one byte past the bound so :meth:`_exchange` and the reader can tell
         "exactly the bound" from "over it", sits inside the same guard and checks
         ``response.length`` itself: fewer bytes than it asked for while the response still owes
         some is a body nobody can read, and becomes an :class:`_UnreadBody` exactly as a raise
@@ -2737,10 +3335,10 @@ class HTTPSink:
           read — and any ``Retry-After`` delay.
 
         Raises:
-          urllib.error.URLError: On a connection-level failure, for the retry loop to handle.
+          urllib.error.URLError: On a connection-level failure, for :meth:`_exchange` to classify.
           OSError: Likewise.
           http.client.HTTPException: When the status line or headers could not be parsed, such
-            as ``BadStatusLine``, for the retry loop to handle as a connection error.
+            as ``BadStatusLine``, which :meth:`_exchange` classifies as a connection error.
         """
         try:
             response = self._opener(request, timeout=self.timeout)
@@ -2760,61 +3358,6 @@ class HTTPSink:
         except Exception:
             payload = _UnreadBody()
         return int(status), payload, _parse_retry_after(getattr(response, "headers", None))
-
-    def _sleep_backoff(self, attempt: int, retry_after: float | None) -> None:
-        """Waits before the next attempt, honouring a usable ``Retry-After``.
-
-        The server's value is clamped and sign-checked first (SPEC-027 FR-001): it is advice
-        from the destination, not an instruction the application must obey. Unbounded, a
-        measured ``Retry-After: 8`` held ``shutdown()`` for 22 s and a header of ``86400`` would
-        have held it for a day, while a negative one made ``time.sleep`` raise, which the orphan
-        path handed to the caller.
-
-        Args:
-          attempt: The zero-based attempt just made, which sets the exponential delay.
-          retry_after: The server's requested delay, or ``None``. Anything rejected falls back
-            to this sink's own backoff, which is what the destination would have got had it sent
-            no header at all.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        server = clamp_server_delay(retry_after, self.max_retry_after)
-        delay = server if server is not None else _BACKOFF_BASE * (2**attempt)
-        wait(delay, self.log_foundry_stop_signal)
-
-    def _abandon(self, reason: str, attempts: int) -> NoReturn:
-        """Counts and logs a request abandoned past the retry bound, then raises (FR-012).
-
-        The counter moves before the raise: ``failed`` is this sink's own record of what it
-        could not put on the wire, and it must not depend on who catches what. It therefore
-        counts every worker retry attempt too, and now every *chunk* of a batch, making it an
-        upper bound on loss rather than a count of it — see
-        :class:`~log_foundry.sinks.base.SinkLosses`.
-
-        Args:
-          reason: Why the request was abandoned. It carries only library-controlled values — an
-            HTTP status, an exception type, an ``errno`` — never a server-supplied body or an
-            exception's text (SPEC-029 FR-002), and it is also the raised error's message for
-            the same reason.
-          attempts: How many requests were actually made. Passed in rather than derived from
-            ``max_retries``, because a non-retryable status abandons on the first attempt: the
-            derived form reported "4 attempt(s)" for an HTTP 400 that was sent once.
-
-        Returns:
-          Never returns.
-
-        Raises:
-          SinkDeliveryError: Always.
-        """
-        with self._counter_lock:
-            self.failed += 1
-        detail = f"{type(self).__name__}, {attempts} attempt(s), {reason}"
-        _diag.lost("request", 1, detail)
-        raise SinkDeliveryError(detail)
 
 
 def _parse_retry_after(headers: Any) -> float | None:
