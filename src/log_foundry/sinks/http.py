@@ -243,9 +243,10 @@ class _Sent:
 
     Attributes:
       answer: The last request's classification, or ``None`` before any.
-      raised: An exception building or classifying the request raised — the ``Request``, or a
-        hook :meth:`HTTPSink._exchange` calls (``_retryable_status``, ``_response_limit``) —
-        re-raised unchanged after the run.
+      raised: An exception building or classifying the request raised — the ``Request``, or
+        ``_retryable_status``, which :meth:`HTTPSink._exchange` asks of a non-``2xx`` — re-raised
+        unchanged after the run. A raising ``_response_limit`` is not one: ``_attempt`` reads it
+        inside the attempt, so it is classified and counted as that attempt's own exception.
     """
 
     answer: _Answer | None = None
@@ -2277,10 +2278,14 @@ class HTTPSink:
         same inputs fail the same way. A ``2xx`` reader that raises sends its chunk through
         :meth:`_unadjudicated`: the request succeeded, so its events are ``UNKNOWN``. Those
         guards cover only those hooks. A raising third-party override of another private method
-        the round calls — ``_retryable_status``, ``_response_limit``, ``_items``, ``_take``,
-        ``_event_ceiling``, ``_chunk_budget``, ``_drop_refused`` or ``_abandon_unreduced`` —
-        escapes the round, as it escaped 1.x ``emit``, and the engine then fails that round's
-        events and announces the exception's type.
+        the round calls — ``_retryable_status`` (asked only of a non-``2xx``), ``_items``,
+        ``_take``, ``_event_ceiling``, ``_chunk_budget``, ``_drop_refused`` or
+        ``_abandon_unreduced`` — escapes the round, as it escaped 1.x ``emit``, and the engine
+        then fails that round's events and announces the exception's type. A raising
+        ``_response_limit`` does not escape: :meth:`_attempt` reads it inside the attempt, so
+        :meth:`_exchange` classifies its exception as the attempt's own, through
+        :meth:`_retryable_error` — counted in ``failed``, and for anything but a transport
+        error the chunk is ``REJECTED``.
 
         The verdict's ``retry_after`` is the largest finite, positive ``Retry-After`` among the
         round's retryable responses, or ``None``; one round has one wait.
@@ -3008,8 +3013,10 @@ class HTTPSink:
         Raises:
           Exception: An exception :meth:`_retryable_error` rejects, unchanged, only when
             ``count_unexpected`` is False and it is not a ``SinkDeliveryError``; and anything
-            building the ``Request`` or a classifying hook (``_retryable_status``,
-            ``_response_limit``) raises, unchanged and uncounted, as 1.x let it escape.
+            building the ``Request`` or ``_retryable_status`` (asked of a non-``2xx``) raises,
+            unchanged and uncounted, as 1.x let it escape. A raising ``_response_limit`` is read
+            inside the attempt, so it is classified as that attempt's own exception: a refused
+            one is counted once in ``failed`` and raised as ``SinkDeliveryError``.
           _PayloadTooLarge: On a ``413`` when ``splittable``. It moves no counter and writes no
             line, because the caller is about to re-send the same events in smaller requests.
           SinkDeliveryError: When the request was abandoned: refused, or still failing when the
