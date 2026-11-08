@@ -142,6 +142,5 @@
   classifies, so a raising override is that attempt's refused exception: `REJECTED`, `failed`
   moved, a `connection error, <Type>` line, whatever the status, a `2xx` included. 1.x read it
   once in `_send` before the first request, so the raise escaped `emit` raw with nothing sent.
-  `test_send_reraises_a_classifying_hooks_fault_unchanged[_response_limit]` pins it on `_send`.
-  Two `src` docstrings still describe it otherwise: `_round`'s lists `_response_limit` among the
-  hooks that escape the round, and `_Sent.raised` says its fault is re-raised unchanged.
+  `test_send_reraises_a_classifying_hooks_fault_unchanged[_response_limit]` pins it on `_send`,
+  and the docstrings of `_round`, `_Sent.raised` and `_send` say the same since `2c611dff`.
