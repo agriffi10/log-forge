@@ -29,6 +29,7 @@ import random
 import re
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -208,10 +209,19 @@ class HTTPRecorder(HTTPSink):
     ``max_retries=0``, as :class:`DeliverRecorder` does, to keep the file's runtime. It keeps
     :class:`Recorder`'s close counting for invariant 5, and defines no ``emit``, so the worker
     and the orphan path deliver to it through ``deliver``, as to any shipped family sink.
+
+    **Its records are dropped when the test ends** (:meth:`forget`, from :func:`_forget_records`).
+    A sink handed to the library stays in ``_lifecycle._owned`` for the life of the process, and
+    a forked child's marking walk visits the objects that record reaches, up to a cap of 100,000. Sixteen seeds of decoded events kept here added about 140,000 objects to
+    that walk in the pytest worker that ran them, measured, enough to trip the cap in
+    ``tests/test_fork_lifecycle.py`` when it ran later in the same worker.
     """
+
+    live: weakref.WeakSet[HTTPRecorder] = weakref.WeakSet()
 
     def __init__(self, emit_delay: float, seed: int) -> None:
         super().__init__("http://model", max_retries=0, max_batch_count=3, opener=self._answer)
+        HTTPRecorder.live.add(self)
         self.emit_delay = emit_delay
         self.seed = seed
         self.events: list[dict[str, object]] = []
@@ -262,6 +272,22 @@ class HTTPRecorder(HTTPSink):
     def count(self, message: str) -> int:
         with self._lock:
             return sum(1 for event in self.events if event.get("message") == message)
+
+    def forget(self) -> None:
+        """Drops every record, so nothing this recorder saw outlives the test that read it."""
+        with self._lock:
+            self.events.clear()
+            self.accepted.clear()
+            self.fates.clear()
+            self.offered.clear()
+
+
+@pytest.fixture(autouse=True)
+def _forget_records() -> Any:
+    """Clears every :class:`HTTPRecorder`'s records once its test has asserted on them."""
+    yield
+    for recorder in list(HTTPRecorder.live):
+        recorder.forget()
 
 
 def _draw(rng: random.Random) -> Outcome:
