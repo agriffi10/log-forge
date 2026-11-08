@@ -154,10 +154,12 @@ class _UnreadBody(bytes):
     status line, so the flag travels in the value :meth:`HTTPSink._handle_response` already
     receives and the hook's signature is unchanged (SPEC-070 FR-004). A keyword parameter was the
     alternative and was rejected: an override with the two-argument signature, or a
-    ``*args, **kwargs`` wrapper forwarding to one, would raise ``TypeError`` out of ``emit``
-    exactly when a body fails to read, and the worker re-sends anything escaping ``emit``. An
-    override that does not ask :func:`_read_failed` sees ``b""``, as under ``1.x``; it has no
-    content, and ``json.loads``, ``len`` and slicing behave on it as on ``b""``.
+    ``*args, **kwargs`` wrapper forwarding to one, would raise ``TypeError`` exactly when a body
+    fails to read — under 1.x out of ``emit``, for the worker to re-send whole, and on the engine
+    into the round's reader guard, which would count the chunk unadjudicated even where the
+    override meant success. An override that does not ask :func:`_read_failed` sees ``b""``, as
+    under ``1.x``; it has no content, and ``json.loads``, ``len`` and slicing behave on it as on
+    ``b""``. ``_outcomes`` receives the same payload.
     """
 
     __slots__ = ()

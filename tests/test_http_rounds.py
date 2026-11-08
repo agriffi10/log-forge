@@ -1348,6 +1348,17 @@ def test_third_party_eligibility() -> None:
         def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
             return (A,) * len(items)
 
+    class BoolAndEmitA(HTTPSink):
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            return True
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            super().emit(batch)
+
+    class OutcomesBelowBoolAndEmit(BoolAndEmitA):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return (A,) * len(items)
+
     class OptOut(HTTPSink):
         deliver = None
 
@@ -1366,6 +1377,10 @@ def test_third_party_eligibility() -> None:
     assert not _offered(BoolA) and BoolA._READS_BOOL
     assert _offered(OutcomesB) and not OutcomesB._READS_BOOL
     assert not _offered(EmitA) and not _offered(OutcomesBelowEmit)
+    assert not _offered(OutcomesBelowBoolAndEmit), (
+        "restoring deliver below a withdrawn class must never bypass an emit override"
+    )
+    assert vars(OutcomesBelowBoolAndEmit)["deliver"] is None
     assert not _offered(OptOut) and not _offered(OptOutChild), "an opt-out is never restored"
     assert _offered(Native) and _offered(NativeChild)
     assert NativeChild.deliver is Native.deliver, "a plain child keeps its parent's deliver"

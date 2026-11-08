@@ -575,12 +575,23 @@ def _mutated(old: str, new: str) -> str:
             "HTTPSink.emit is not _engine.emit_via_deliver(..., deliver=self._round)",
         ),
         (
+            "        _engine.emit_via_deliver(self, batch, deliver=self._round)\n",
+            "        _engine.emit_via_deliver(self, batch)\n",
+            "HTTPSink.emit is not _engine.emit_via_deliver(..., deliver=self._round)",
+        ),
+        (
             "            if is_retryable(self._retryable_error, err):\n",
             "            if self._retryable_error(err):\n",
             "HTTPSink._exchange's handler does not ask is_retryable(self._retryable_error, err)",
         ),
     ],
-    ids=["attempt-in-send", "exchange-in-deliver", "emit-off-the-engine", "predicate-bypassed"],
+    ids=[
+        "attempt-in-send",
+        "exchange-in-deliver",
+        "emit-off-the-engine",
+        "emit-without-the-round",
+        "predicate-bypassed",
+    ],
 )
 def test_the_engine_only_check_names_each_route_around_the_engine(
     old: str, new: str, finding: str
