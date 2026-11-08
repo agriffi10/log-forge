@@ -655,6 +655,25 @@ def test_the_enforcement_actually_sees_the_call_sites() -> None:
     assert calls >= 30, f"expected the converted call sites to be found, saw {calls}"
 
 
+def test_the_engines_diagnostics_are_on_the_roster() -> None:
+    """SPEC-072 FR-003 AC9: the engine's lines are ``_diag.<writer>`` calls the scan above sees.
+
+    A ``from log_foundry._diag import lost`` would be a bare-name call this walker never matches,
+    so the repr check would pass the engine vacuously; pinning the exact count here stops that,
+    and a writer added or removed is a visible edit here.
+    """
+    engine = _SRC / "sinks" / "_engine.py"
+    writers = sorted(
+        call.func.attr
+        for call in _diag_calls(ast.parse(engine.read_text(encoding="utf-8")))
+        if isinstance(call.func, ast.Attribute)
+        and call.func.attr in {"lost", "absorbed", "pending"}
+    )
+    assert writers == ["absorbed", "absorbed", "absorbed", "lost"], (
+        f"the engine writes three absorbed lines and one lost line, as _diag calls: {writers}"
+    )
+
+
 _STDERR_NAMES = {"stderr", "__stderr__"}
 _WRITE_METHODS = {"write", "writelines"}
 

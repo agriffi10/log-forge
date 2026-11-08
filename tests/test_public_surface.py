@@ -1259,6 +1259,7 @@ _PUBLIC_DATACLASSES = (
     ("FlushResult", log_foundry.FlushResult, (True,)),
     ("ContinueResult", log_foundry.ContinueResult, (True,)),
     ("Config", log_foundry.Config, ("svc",)),
+    ("Verdict", log_foundry.Verdict, ((log_foundry.Outcome.ACCEPTED,),)),
 )
 
 
@@ -1622,7 +1623,7 @@ def test_a_zero_x_sink_building_sinklosses_positionally_degrades_to_none() -> No
     row[0] for row in _PUBLIC_DATACLASSES
 ])
 def test_keyword_only_construction_empties_match_args(name, cls, args) -> None:
-    """SPEC-051 FR-001, the second outward consequence: `__match_args__` is empty on all five.
+    """SPEC-051 FR-001, the second outward consequence: `__match_args__` is empty on all six.
 
     What that empties means for a `match` statement is pinned by
     `test_an_empty_match_args_raises_for_its_own_type_and_falls_through_for_others`, which is
@@ -1851,18 +1852,23 @@ def test_every_frozen_sink_import_path_still_resolves() -> None:
         f"path the library still promises: {undocumented_frozen}"
     )
 
-    # `base` is the one public sink module with no table row, and correctly so: it is re-exported
-    # wholesale from the top level, so the `__all__` clause of the freeze covers it instead.
+    # `base` and `verdict` (SPEC-072) are the public sink modules with no table row, and correctly
+    # so: each is re-exported wholesale from the top level, so the `__all__` clause of the freeze
+    # covers it instead. `verdict` is held to the same rule below.
     # Derived from its own `__all__` rather than a hand-listed set -- a listed one silently stops
     # describing the module the moment a name is added to it.
     from log_foundry.sinks import base as _base
+    from log_foundry.sinks import verdict as _verdict
 
-    exempt = "log_foundry.sinks.base"
-    not_reexported = sorted(set(_base.__all__) - set(log_foundry.__all__))
-    assert not not_reexported, (
-        f"{exempt} has no README row only because everything it exports is a top-level export; "
-        f"these are not: {not_reexported}"
-    )
+    for exempt, module in (
+        ("log_foundry.sinks.base", _base),
+        ("log_foundry.sinks.verdict", _verdict),
+    ):
+        not_reexported = sorted(set(module.__all__) - set(log_foundry.__all__))
+        assert not not_reexported, (
+            f"{exempt} has no README row only because everything it exports is a top-level "
+            f"export; these are not: {not_reexported}"
+        )
 
     # Class-level, not module-level. A module glob missed both a sink shipped in a package's
     # `__init__.py` and a NEW class added to an already-documented module, and the promise is
@@ -2478,3 +2484,44 @@ def test_the_frozen_path_gate_reports_a_truncated_baseline(monkeypatch: pytest.M
     )
     with pytest.raises(AssertionError, match=r"v1\.0\.0 promised 37 and the freeze only"):
         test_every_frozen_sink_import_path_still_resolves()
+
+
+# ── SPEC-072 FR-001: the verdict names, and nothing else, grow the surface ──────────────────
+
+_THIRTY = (
+    "DEFAULT_SHUTDOWN_TIMEOUT", "DEFAULT_SWAP_TIMEOUT", "Config", "ContinueResult", "FlushResult",
+    "Health", "Sink", "SinkDeliveryError", "SinkLosses", "__version__", "configure",
+    "continue_trace", "critical", "current_baggage_header", "current_trace_context",
+    "current_traceparent", "debug", "error", "flush", "flush_sink", "get_baggage", "get_config",
+    "health", "info", "read_losses", "reset_context", "set_baggage", "shutdown", "trace",
+    "warning",
+)
+"""The top-level surface of 1.1.0, written out from ``39a3f08c``."""
+
+_VERDICT_NAMES = ("Outcome", "SinkCounters", "Verdict", "read_deliver")
+
+
+def test_all_is_the_thirty_plus_the_four_verdict_names() -> None:
+    """FR-001 AC8: the 30 names plus exactly the four, none leaving, each once."""
+    assert len(set(_THIRTY)) == 30
+    assert len(log_foundry.__all__) == len(set(log_foundry.__all__)) == 34
+    assert set(log_foundry.__all__) == {*_THIRTY, *_VERDICT_NAMES}
+
+
+def test_the_verdict_names_resolve_at_both_import_paths() -> None:
+    """FR-001 AC8: ``log_foundry.sinks.verdict`` is the documented path, and the top level is it."""
+    from log_foundry.sinks import verdict
+
+    assert verdict.__all__ == sorted(_VERDICT_NAMES)
+    for name in _VERDICT_NAMES:
+        assert getattr(log_foundry, name) is getattr(verdict, name), name
+
+
+def test_configure_and_config_gain_nothing() -> None:
+    """FR-001 AC8: no ``configure()`` parameter and no ``Config`` field, as at ``39a3f08c``."""
+    names = [
+        "service", "version", "env", "sink", "defaults", "max_value_bytes", "max_stack_bytes",
+        "max_keys", "max_depth",
+    ]
+    assert list(inspect.signature(log_foundry.configure).parameters) == names
+    assert [f.name for f in dataclasses.fields(log_foundry.Config)] == names

@@ -12,6 +12,7 @@ from log_foundry.context import set_baggage
 from log_foundry.decorator import _note_in_span_loss, _note_orphan_loss
 from log_foundry.ids import new_span_id, new_trace_id
 from log_foundry.model import Span, build_event
+from log_foundry.sinks import _engine
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -96,6 +97,17 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     two fields because the populations differ: this branch can fail at the destination, the
     in-span branch can only fail at the data.
 
+    **A sink that offers ``deliver`` is delivered to through the delivery engine** (SPEC-072
+    FR-005), on the caller's own thread, with the sink's ``log_foundry_stop_signal`` as the stop
+    event and no decline predicate; ``run_delivery`` returns ``None`` for any other sink, which
+    then takes the single ``sink.emit([event])`` unchanged. The orphan path has no worker resend,
+    so the engine's budget is the sink's own ``max_retries``. A failed run — the event ended
+    rejected, unresolved or in a raising round, the cases in which a 1.x ``emit`` raised —
+    counts one ``orphan_lost`` and writes one ``_diag.lost`` line; ``DROPPED``, ``UNKNOWN``,
+    ``SKIPPED`` and an unreadable verdict settle, counted in the sink's own counters instead.
+    Nothing raises into the application: the engine lets no ``Exception`` out, and the guard
+    below is unchanged.
+
     The echo runs after the emit, so a closed or redirected stream never costs the event itself.
     The ``echo`` argument's own truth is read **inside** that guard (SPEC-063 FR-003): it is the
     caller's object, and measured at ``71e42dd`` an ``echo=`` whose ``__bool__`` raised propagated
@@ -138,7 +150,18 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
             event = build_event(orphan, level, message, fields=fields, baggage=baggage)
             sink = _ensure_sink()
             _note_orphan_emit(sink)
-            sink.emit([event])
+            delivery = _engine.run_delivery(
+                sink, [event], worker_retries=None, stop=_engine.stop_signal_of(sink)
+            )
+            if delivery is None:
+                sink.emit([event])
+            elif delivery.failed:
+                _note_orphan_loss()
+                _diag.lost(
+                    "event",
+                    1,
+                    f"orphan log not delivered after {delivery.attempts} delivery round(s)",
+                )
         except Exception as exc:
             _note_orphan_loss()
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")

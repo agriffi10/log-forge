@@ -35,6 +35,9 @@ import pytest
 import log_foundry
 from conftest import run_concurrently
 from log_foundry import _lifecycle
+from log_foundry.sinks import _engine
+from log_foundry.sinks._engine import emit_via_deliver
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 SEEDS = range(16)
 THREADS = 4
@@ -110,6 +113,91 @@ class Recorder:
             return sum(1 for event in self.events if event.get("message") == message)
 
 
+_RAISED = "raised"
+_MALFORMED = "malformed"
+_OUTCOME_WEIGHTS = (
+    (Outcome.ACCEPTED, 0.55),
+    (Outcome.RETRYABLE, 0.15),
+    (Outcome.REJECTED, 0.08),
+    (Outcome.DROPPED, 0.08),
+    (Outcome.UNKNOWN, 0.07),
+    (Outcome.SKIPPED, 0.07),
+)
+"""Each event's outcome per round in the ``deliver`` form, drawn per event and round."""
+
+_ROUND_FAULT = 0.06
+"""The share of rounds that raise, and again the share that return a malformed verdict."""
+
+
+class DeliverRecorder(Recorder):
+    """The ``deliver`` form of :class:`Recorder`: mixed verdicts, and its own ground truth.
+
+    Every round's outcome per event is drawn from a ``random.Random`` seeded by the test seed,
+    the event's ``log_id`` and the round that event is in, so a seed replays exactly; a share of
+    rounds raise or return a malformed verdict instead. ``fates`` records the last mark each event
+    was given — an ``Outcome``, ``"raised"`` or ``"malformed"`` — which is the engine's final fate
+    for it, since the engine offers an event again only while its last mark is ``RETRYABLE``.
+    ``accepted`` lists every acceptance, so a second one for an event is visible. It declares
+    ``max_retries = 0``: on the worker path that is ``w + 1`` one-attempt cycles at the worker's
+    0.01-0.04 s waits, on the orphan path one attempt, which keeps the file's runtime.
+    """
+
+    max_retries = 0
+
+    def __init__(self, emit_delay: float, seed: int) -> None:
+        super().__init__(emit_delay)
+        self.log_foundry_counters = SinkCounters()
+        self.seed = seed
+        self.fates: dict[str, object] = {}
+        self.accepted: list[str] = []
+        self.offered: dict[str, int] = {}
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        if self.emit_delay:
+            time.sleep(self.emit_delay)
+        ids = [str(event.get("log_id")) for event in batch]
+        with self._lock:
+            rounds = [self.offered.get(log_id, 0) for log_id in ids]
+            for log_id, seen, event in zip(ids, rounds, batch, strict=True):
+                self.offered[log_id] = seen + 1
+                self.events.append(event)
+        fault = random.Random(f"{self.seed}:{ids[0]}:{rounds[0]}:round").random()  # noqa: S311
+        if fault < _ROUND_FAULT:
+            self._mark(ids, _RAISED)
+            raise ConnectionError("model-secret")
+        if fault < 2 * _ROUND_FAULT:
+            self._mark(ids, _MALFORMED)
+            return Verdict(outcomes=())  # the wrong length: malformed for any non-empty batch
+        outcomes = tuple(
+            _draw(random.Random(f"{self.seed}:{log_id}:{seen}"))  # noqa: S311
+            for log_id, seen in zip(ids, rounds, strict=True)
+        )
+        with self._lock:
+            for log_id, outcome in zip(ids, outcomes, strict=True):
+                self.fates[log_id] = outcome
+                if outcome is Outcome.ACCEPTED:
+                    self.accepted.append(log_id)
+        return Verdict(outcomes=outcomes)
+
+    def _mark(self, ids: list[str], mark: str) -> None:
+        with self._lock:
+            for log_id in ids:
+                self.fates[log_id] = mark
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+
+def _draw(rng: random.Random) -> Outcome:
+    """One outcome by :data:`_OUTCOME_WEIGHTS`."""
+    roll = rng.random()
+    for outcome, weight in _OUTCOME_WEIGHTS:
+        if roll < weight:
+            return outcome
+        roll -= weight
+    return Outcome.ACCEPTED
+
+
 @dataclass
 class Ledger:
     """What the actors did, counted where they did it, so the identity has a left-hand side."""
@@ -119,6 +207,8 @@ class Ledger:
     slowest_flush: float = 0.0
     slowest_shutdown: float = 0.0
     sinks: list[Recorder] = field(default_factory=list)
+    form: str = "emit"
+    seed: int = 0
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def add_sink(self, sink: Recorder) -> None:
@@ -169,13 +259,50 @@ def _actor(ledger: Ledger, rng: random.Random, *, shutdown_in_mix: bool) -> None
             log_foundry.flush(timeout=FLUSH_TIMEOUT)
             ledger.timed("slowest_flush", time.monotonic() - started)
         elif roll < 0.95:
-            sink = Recorder(emit_delay=rng.choice([0.0, 0.0, 0.002]))
+            sink = _recorder(ledger, rng.choice([0.0, 0.0, 0.002]))
             ledger.add_sink(sink)
             log_foundry.configure(service="model", sink=sink)
         else:
             started = time.monotonic()
             log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
             ledger.timed("slowest_shutdown", time.monotonic() - started)
+
+
+def _recorder(ledger: Ledger, emit_delay: float) -> Recorder:
+    """A recorder of the ledger's form."""
+    if ledger.form == "deliver":
+        return DeliverRecorder(emit_delay, ledger.seed)
+    return Recorder(emit_delay)
+
+
+@dataclass
+class _Runs:
+    """Every ``run_delivery`` call: its batch's ids, its path, its result and the worker."""
+
+    calls: list[tuple[list[str], str, _engine.Delivery]] = field(default_factory=list)
+    workers: dict[int, object] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
+    """Wraps ``_engine.run_delivery`` so each call's batch, path and ``Delivery`` are recorded."""
+    runs = _Runs()
+    real = _engine.run_delivery
+
+    def spy(sink: object, batch: list[dict[str, object]], **kwargs: object) -> object:
+        ids = [str(event.get("log_id")) for event in batch]
+        path = "orphan" if kwargs.get("worker_retries") is None else "worker"
+        result = real(sink, batch, **kwargs)  # type: ignore[arg-type]
+        if result is not None:
+            with runs._lock:
+                runs.calls.append((ids, path, result))
+                owner = getattr(kwargs.get("decline"), "__self__", None)
+                if owner is not None:
+                    runs.workers[id(owner)] = owner
+        return result
+
+    monkeypatch.setattr(_engine, "run_delivery", spy)
+    return runs
 
 
 def _stranded_markers() -> int:
@@ -198,8 +325,14 @@ def _stranded_markers() -> int:
         return sum(1 for item in worker._queue.queue if not isinstance(item, list))
 
 
+@pytest.mark.parametrize("form", ["emit", "deliver"])
 @pytest.mark.parametrize("seed", SEEDS)
-def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> None:
+def test_the_accounting_identity_holds_under_every_interleaving(
+    seed: int,
+    form: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
     """Invariants 1, 2, 3, 5 and 6 of ``docs/invariants.md``, over one seeded interleaving.
 
     The identity is the whole test: every span the actors started is either delivered as a
@@ -207,9 +340,14 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
     orphan is delivered or counted in ``orphan_lost``; nothing is missing and nothing is counted
     twice. A regression in the lifecycle plumbing shows up here as a seed whose ledger does not
     balance, before anyone has written the test that names it.
+
+    The ``deliver`` form (SPEC-072 FR-005) runs the same seeds with :class:`DeliverRecorder`,
+    whose mixed verdicts make "delivered" a per-event fate, and holds each counted term to its
+    exact share (:func:`_assert_the_deliver_ledger`).
     """
-    ledger = Ledger()
-    first = Recorder(emit_delay=random.Random(seed).choice([0.0, 0.0, 0.002]))  # noqa: S311
+    ledger = Ledger(form=form, seed=seed)
+    runs = _spy_on_runs(monkeypatch) if form == "deliver" else None
+    first = _recorder(ledger, random.Random(seed).choice([0.0, 0.0, 0.002]))  # noqa: S311
     ledger.add_sink(first)
     log_foundry.configure(service="model", sink=first)
 
@@ -224,6 +362,14 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
 
     ends = sum(sink.count("span.end") for sink in ledger.sinks)
     orphans = sum(sink.count("orphan") for sink in ledger.sinks)
+    if runs is not None:
+        # In the deliver form an event offered to the sink has a fate rather than a delivery: a
+        # span.end offered once is out of the queue whatever its fate (a failed worker run is
+        # failed_batches, held below), and an orphan whose run failed is the orphan_lost term,
+        # so "delivered" is the orphans whose run settled.
+        ends = len({e for s in ledger.sinks for e in _ids(s, "span.end")})
+        failed_orphans = sum(1 for _, path, d in runs.calls if path == "orphan" and d.failed)
+        orphans = len({e for s in ledger.sinks for e in _ids(s, "orphan")}) - failed_orphans
     unclosed = [i for i, sink in enumerate(ledger.sinks) if sink.events and sink.closes == 0]
     overlapped = [i for i, sink in enumerate(ledger.sinks) if sink.overlapped]
     picture = (
@@ -238,7 +384,12 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
 
     assert not escaped, f"invariant 1 (never fail the caller): {picture}"
     assert health.in_span_lost == 0, f"nothing here can fail assembly: {picture}"
-    assert health.failed_batches == 0, f"the recorder never raises: {picture}"
+    if runs is None:
+        assert health.failed_batches == 0, f"the recorder never raises: {picture}"
+    else:
+        _assert_the_deliver_ledger(
+            ledger, runs, health.orphan_lost, capfd.readouterr().err, picture
+        )
     assert ends + queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
     assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
     assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
@@ -252,6 +403,69 @@ def test_the_accounting_identity_holds_under_every_interleaving(seed: int) -> No
     assert ledger.slowest_flush < FLUSH_TIMEOUT + BOUND_SLACK, f"invariant 3 (flush): {picture}"
     assert ledger.slowest_shutdown < SHUTDOWN_TIMEOUT + BOUND_SLACK, (
         f"invariant 3 (shutdown): {picture}"
+    )
+
+
+def _ids(sink: Recorder, message: str) -> list[str]:
+    """The ``log_id`` of every event of one message a recorder was offered."""
+    with sink._lock:
+        return [str(e.get("log_id")) for e in sink.events if e.get("message") == message]
+
+
+_WORKER_LOST = re.compile(
+    r"^log-foundry: lost (\d+) event\(s\); (?:batch abandoned after \d+ emit attempts|"
+    r"retry declined after \d+ emit attempt\(s\); the next was predicted)",
+    re.MULTILINE,
+)
+_ORPHAN_LOST = re.compile(
+    r"^log-foundry: lost 1 event\(s\); orphan log not delivered after \d+ delivery round",
+    re.MULTILINE,
+)
+
+
+def _assert_the_deliver_ledger(
+    ledger: Ledger, runs: _Runs, orphan_lost: int, err: str, picture: str
+) -> None:
+    """Holds each counted term of the ``deliver`` form to its exact share of the recorders' truth.
+
+    The recorders know every event's final fate; the spy knows which run it was in and whether
+    that run failed. From the two: no event accepted twice; ``dropped_events`` is exactly the
+    events whose fate was ``DROPPED`` in a settled run; ``failed_events`` is exactly the events
+    neither accepted, ``DROPPED`` nor ``SKIPPED``, in any run; every failed worker-path run is one
+    ``failed_batches`` and one lost line naming its batch's size; every failed orphan run is one
+    ``orphan_lost``; and every event offered has exactly one final fate.
+    """
+    recorders = [s for s in ledger.sinks if isinstance(s, DeliverRecorder)]
+    assert runs.calls and recorders, f"the spy saw no engine run, so nothing is held: {picture}"
+    accepted = [log_id for s in recorders for log_id in s.accepted]
+    assert len(accepted) == len(set(accepted)), f"invariant 2 (accepted twice): {picture}"
+    fates: dict[str, object] = {}
+    for sink in recorders:
+        fates.update(sink.fates)
+    failed_run: dict[str, bool] = {}
+    for ids, _path, delivery in runs.calls:
+        for log_id in ids:
+            failed_run[log_id] = delivery.failed
+    offered = {log_id for s in recorders for log_id in s.offered}
+    assert offered == set(fates) == set(failed_run), f"invariant 2 (one fate each): {picture}"
+    dropped = sum(s.log_foundry_counters.losses().dropped for s in recorders)
+    failed = sum(s.log_foundry_counters.losses().failed for s in recorders)
+    assert dropped == sum(
+        1 for log_id, fate in fates.items() if fate is Outcome.DROPPED and not failed_run[log_id]
+    ), f"invariant 2 (dropped_events is exact): {picture}"
+    unconfirmed = (Outcome.ACCEPTED, Outcome.DROPPED, Outcome.SKIPPED)
+    assert failed == sum(
+        1 for fate in fates.values() if not any(fate is ok for ok in unconfirmed)
+    ), f"invariant 2 (failed_events is each unconfirmed event once): {picture}"
+    worker_failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
+    orphan_failed = sum(1 for _ids_, path, d in runs.calls if path == "orphan" and d.failed)
+    batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())
+    assert batches == len(worker_failed), f"invariant 6 (one failed batch per run): {picture}"
+    assert sorted(int(n) for n in _WORKER_LOST.findall(err)) == sorted(worker_failed), (
+        f"invariant 2 (a failed run's events are in its lost line): {picture}"
+    )
+    assert orphan_lost == orphan_failed == len(_ORPHAN_LOST.findall(err)), (
+        f"invariant 2 (a failed orphan run is one orphan_lost): {picture}"
     )
 
 

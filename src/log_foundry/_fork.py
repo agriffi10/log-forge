@@ -10,6 +10,7 @@ import types
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+from log_foundry.sinks.base import _static_value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,6 +28,34 @@ _RLOCK_TYPE = type(threading.RLock())
 _LOCK_TYPES: tuple[type, ...] = (type(threading.Lock()), _RLOCK_TYPE)
 
 _CONTAINER_TYPES: tuple[type, ...] = (list, tuple, set, frozenset, dict, collections.deque)
+
+_COUNTERS_ATTRIBUTE = "log_foundry_counters"
+"""The one attribute the walk reads on a value it would not otherwise enter (SPEC-072 FR-003)."""
+
+_SCALAR_TYPES: tuple[type, ...] = (
+    str,
+    int,
+    float,
+    bool,
+    bytes,
+    type(None),
+    types.FunctionType,
+    types.BuiltinFunctionType,
+    types.ModuleType,
+)
+"""Exact types that are never an engine sink, skipped before the static read; classes are too.
+
+The counters reach is asked of every value the walk declines to push. For a buffering sink most
+of those are caller data — the strings and numbers inside the events a ``MemorySink`` holds — and
+in an idle process most are the package's own functions, classes and imported modules, so each
+would otherwise pay a static read for an attribute that can never matter: none of
+these types defines ``deliver``, so no engine run ever counts into counters one of them holds.
+Matched through :data:`_SKIPPED_TYPE_IDS`, by identity, never by ``in`` over a set of the types
+themselves, so a hostile metaclass ``__eq__`` or ``__hash__`` never runs here.
+"""
+
+_SKIPPED_TYPE_IDS = frozenset(id(kind) for kind in _SCALAR_TYPES)
+"""The ids of :data:`_SCALAR_TYPES`; each is a builtin type alive for the process, so stable."""
 
 _child_handlers: list[Callable[[], None]] = []
 """What runs in the child once its locks are its own again, in registration order.
@@ -437,6 +466,90 @@ def _skipped_names(holder: object) -> frozenset[str]:
         return frozenset()
 
 
+def _counters_type() -> type | None:
+    """Returns ``SinkCounters`` when its module is already loaded, without importing anything.
+
+    Read from ``sys.modules`` once per walk: this runs in a child that has not yet returned from
+    ``fork``, where an import can deadlock on an import lock a parent thread held at the fork, and
+    ``tests/test_fork_lifecycle.py`` holds this module to importing nothing from the package but
+    ``_diag`` and ``sinks.base``. A process that never loaded ``sinks.verdict`` holds no
+    ``SinkCounters`` to repair, so ``None`` costs nothing.
+
+    Args:
+      None.
+
+    Returns:
+      The class, or ``None`` when the module is not loaded or holds no such class.
+
+    Raises:
+      None.
+    """
+    try:
+        module = sys.modules.get(f"{_PACKAGE}.sinks.verdict")
+        if not isinstance(module, types.ModuleType):
+            return None
+        found = vars(module).get("SinkCounters")
+    except Exception:
+        return None
+    return found if isinstance(found, type) else None
+
+
+def _counters_reach(value: object, kind: type | None) -> Any | None:
+    """Returns a value's ``log_foundry_counters`` when it is exactly ``kind``, read statically.
+
+    The walk enters only this package's own objects, and the sinks SPEC-072's engine counts for
+    are typically third-party ones it never enters, so their counters' lock would stay dead in a
+    child. This reads the one attribute :data:`_COUNTERS_ATTRIBUTE` with
+    ``sinks.base._static_value`` — no property, ``__getattr__``, ``__getattribute__``,
+    descriptor ``__get__`` or metaclass hook (``__mro__``, ``__name__``, ``__eq__``,
+    ``__hash__``) of the third-party object runs, the one residue being the ``__eq__`` of a
+    namespace or instance-dict key whose hash collides with the name (see ``_class_member``;
+    ``getattr`` has it too) — resolving a
+    ``__slots__`` member through its builtin descriptor, and hands back the counters only when
+    they are exactly ``SinkCounters``,
+    which is this package's own class and so is then walked as any owned holder is. Nothing else of
+    the value's namespace is read, so the walk's boundary (SPEC-039 FR-005) is otherwise unchanged.
+
+    Args:
+      value: A value the walk would not push.
+      kind: ``SinkCounters``, from :func:`_counters_type`, or ``None``.
+
+    Returns:
+      The counters, or ``None``.
+
+    Raises:
+      None.
+    """
+    if kind is None:
+        return None
+    probed = type(value)
+    if id(probed) in _SKIPPED_TYPE_IDS or issubclass(probed, type):
+        return None
+    found = _static_value(value, _COUNTERS_ATTRIBUTE)
+    return found if type(found) is kind else None
+
+
+def _container_push(child: object, kind: type | None) -> Any | None:
+    """Returns what the walk pushes for one member of a container it entered, or ``None``.
+
+    The member itself when the walk descends into it, else its counters through
+    :func:`_counters_reach`. This branch is the only repair for an engine sink held in a
+    container — ``MultiSink._sinks`` is a tuple — which is why it is a function of its own: a
+    test can take this branch away alone and watch that child hang.
+
+    Args:
+      child: A member of the container.
+      kind: ``SinkCounters``, from :func:`_counters_type`, or ``None``.
+
+    Returns:
+      The value to push, or ``None``.
+
+    Raises:
+      None.
+    """
+    return child if _is_traversable(child) else _counters_reach(child, kind)
+
+
 def _reinit_primitives() -> list[Any]:
     """Replaces every lock and event this package owns, wherever the walk reaches one.
 
@@ -451,6 +564,15 @@ def _reinit_primitives() -> list[Any]:
     containers hold, which for a buffering sink is caller data — a ``MemorySink`` holding 100k
     events measured 202 ms, against 0.45 ms idle. That is accepted rather than bounded: a cap
     would be a lock this cannot promise to find, and the alternative to finding it is a hang.
+
+    **A value the walk would not push is asked for one attribute** (SPEC-072 FR-003): its
+    ``log_foundry_counters``, read statically by :func:`_counters_reach` and pushed when it is
+    exactly a ``SinkCounters``, so a third-party engine sink's counters' lock is replaced like an
+    owned one. ``SinkCounters`` is looked up in ``sys.modules`` once per walk, not per value, and
+    a scalar is skipped before the static read, so the reach adds one type test per value the
+    walk declines and one static read per non-scalar one. Its boundary is the one
+    level it reads: an engine sink held *inside* a third-party wrapper, or a sink that is itself
+    a third-party container subclass, is not reached.
 
     **The sinks carrying FR-004's buffer hook are collected on this same walk** rather than by
     a second one, because the traversal is the expensive part and its cost is proportional to
@@ -471,6 +593,7 @@ def _reinit_primitives() -> list[Any]:
     keepalive: list[Any] = []
     seen: set[int] = set()
     buffered: list[Any] = []
+    counters_type = _counters_type()
     stack: list[Any] = [
         module
         for name, module in list(sys.modules.items())
@@ -482,7 +605,10 @@ def _reinit_primitives() -> list[Any]:
             continue
         seen.add(id(holder))
         if _is_container(holder):
-            stack.extend(child for child in _container_children(holder) if _is_traversable(child))
+            for child in _container_children(holder):
+                pushed = _container_push(child, counters_type)
+                if pushed is not None:
+                    stack.append(pushed)
         if not isinstance(holder, types.ModuleType | type):
             if not _is_owned(holder):
                 continue
@@ -497,6 +623,10 @@ def _reinit_primitives() -> list[Any]:
                 _assign(holder, name, fresh)
             elif _is_traversable(value):
                 stack.append(value)
+            else:
+                counters = _counters_reach(value, counters_type)
+                if counters is not None:
+                    stack.append(counters)
     return buffered
 
 

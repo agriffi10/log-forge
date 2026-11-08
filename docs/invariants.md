@@ -109,31 +109,60 @@ first attempt before `emit` raises when nothing landed (SPEC-070), and the batch
 raises in turn (SPEC-069 FR-004). A third-party sink that counts
 a drop before raising is outside what the library can hold to this (`MultiSink.emit` names the
 cost).
+A sink that offers `deliver` (SPEC-072) reports instead of counting: the delivery engine is the one
+writer of its `SinkCounters`, committing once at the end of a run through one `Deferral`.
+`dropped_events` is committed only by a run that settles, and is exact; a run that fails commits
+only `failed_events` and hands the batch to its catcher — the worker's abandon or declined line and
+`failed_batches`, the orphan path's `orphan_lost`, or the inline adapter's raise — so a catcher's
+retry of an adapter's raise counts no drop twice. `failed_events` takes each event at most once per
+run, never once per round, and is the same upper bound as every `failed`: an event of a failed run
+is also in its catcher's term. The engine is a fourth catcher, for a `deliver` that raised. The
+contract gives the never-retried losses above their outcomes — `UNKNOWN` for an unadjudicable
+response and both NATS cases, `REJECTED` for a sender fault, `DROPPED` for an oversized,
+unencodable or id-callable failure, and `SKIPPED`, counted in the wrapper's own `_dropped`, for a
+wrapper's per-event failure (SPEC-072 FR-003) — and the engine resends none of them unless
+the sink declares itself idempotent, which no shipped sink does. No shipped sink defines `deliver`
+yet; the sinks that adopt it in later specs return those outcomes.
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
 `tests/test_encode.py` and `tests/test_sinks_encode.py` (the encode step over a roster derived from
 the tree, SPEC-069), `tests/test_classify.py` (every retry loop counts once at the attempt that
-failed, the sender faults and the contradictory counts, SPEC-070); `tests/test_invariants_model.py` is the identity itself.
+failed, the sender faults and the contradictory counts, SPEC-070), `tests/test_delivery_engine.py`
+(the engine's counting table and run-failed rule) and `tests/test_delivery_paths.py` (each catcher
+of a failed run, SPEC-072); `tests/test_invariants_model.py` is the identity itself, for an `emit`
+sink and, holding each term to its exact share, for a `deliver` sink.
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
 `flush(timeout)`, `shutdown(timeout)` and `configure(sink=…)` return within their budget, and a
 bound is measured in CPU as well as wall clock, so a busy-spin cannot pass as a wait (SPEC-038).
 Every backoff waits on the worker's stop event, never `time.sleep`, so a shutdown cuts it short
-(SPEC-027). A shutdown shortens a wait; it never skips work (SPEC-038).
+(SPEC-027). A shutdown shortens a wait; it never skips work (SPEC-038). The delivery engine's waits
+between rounds are the same (SPEC-072): each goes through `sinks._retry.wait`, capped at `MAX_WAIT`,
+on the worker's `_stop` or, on the orphan path and in the inline adapter, on the sink's
+`log_foundry_stop_signal`; a server's hint is bounded by the sink's `max_retry_after`; and SPEC-062's
+prediction is asked before every further round, so on the exit drain an engine run declines a round
+predicted to end past `shutdown()`'s deadline, as the 1.x `emit` loop does.
 
 *Observable:* elapsed wall time ≤ the timeout plus the sink's one in-flight call; CPU time ≈ 0.
 *Recorded exceptions:* `Sink.close()` takes no timeout and is unbounded on both delivery paths;
 what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
+An engine run whose stop event's `wait` raises announces it once and sleeps the rest of its waits,
+each still capped, rather than letting the exception out or skipping a wait; and an engine sink that
+declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in the adapter, as a
+1.x sink without the attribute backs off uninterruptibly (SPEC-072).
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
 `tests/test_sink_retry.py`, `tests/test_sinks_nats_liveness.py` (every `NATSSink` wait, the
 backstop and the latch, SPEC-061), `tests/test_sinks_nats_matrix.py` (those waits and both latches
-as a mutation-gated corpus, including the next and the queued caller's latency) and `tests/test_worker_exit_budget.py` (the exit drain's
-retries fit the `shutdown()` budget, SPEC-062); the CPU half by `tests/test_sinks_pubsub.py`,
-`tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight) and
+as a mutation-gated corpus, including the next and the queued caller's latency), `tests/test_worker_exit_budget.py` (the exit drain's
+retries fit the `shutdown()` budget, SPEC-062) and `tests/test_delivery_paths.py` (the same cases
+through `deliver`, SPEC-072); the CPU half by `tests/test_sinks_pubsub.py`,
+`tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight),
 `tests/test_worker_exit_budget.py` (each of its D/T cases' `shutdown()` over the exit drain,
-through one measuring helper) — `flush()` has no CPU-time assertion, listed so the gap is
-visible.
+through one measuring helper), and through that helper `tests/test_delivery_engine.py` (a stop cuts
+a hinted engine wait short, idly; the 1.x schedule, the hint's bounds and a raising stop event,
+SPEC-072) and `tests/test_delivery_paths.py` — `flush()` has no CPU-time assertion, listed so the
+gap is visible.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -193,11 +222,22 @@ this invariant takes: not a review obligation but a shape in which the fix canno
 What remains a twin is what the two paths genuinely do differently, which is where the event goes
 and on whose thread.
 
+**A sink's `deliver` and its `emit` are a twin pair too** (SPEC-072), and both delivery paths run
+the same engine over `deliver`. The worker and the orphan path each call `run_delivery` first, so
+one probe and one engine serve both, and fall back to `emit` unchanged for a sink that does not
+offer it; the worker spends the engine's budget with no whole-batch resend around it, and the
+orphan path runs the sink's own `max_retries` on the caller's thread. A sink's `emit` that is
+`emit_via_deliver` runs the same engine inline, so a wrapper calling `inner.emit(batch)` and the
+worker calling `deliver` keep one ledger in the sink's `SinkCounters`.
+
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
 than a hand list; `tests/test_invariants_model.py` drives both delivery paths in one run and
 catches the races reached at an unforced rate — a window a few instructions wide needs an
-injected preemption point, which is `tests/test_lifecycle_races.py`'s job, one race at a time.
+injected preemption point, which is `tests/test_lifecycle_races.py`'s job, one race at a time;
+`tests/test_delivery_paths.py` sends each of six outcomes, a raising `deliver` and a malformed
+verdict as one event through the worker and through the orphan path and holds the two to the same
+`SinkLosses`, and drives `emit` and `deliver` of one sink through a real `Worker` (SPEC-072).
 
 ## 7. A sink that delivered nothing raises; one that delivered something reports
 
@@ -206,6 +246,17 @@ moves. Partial failure returns and reports through `losses()`; a client exceptio
 chunk and nothing else (SPEC-026, SPEC-043, SPEC-048). A redirect is a delivery failure, not a
 route to follow (SPEC-048). A sink that released its transport refuses after `close()`; one that
 released nothing keeps accepting (SPEC-032).
+
+**A sink that offers `deliver` states the same promise per event** (SPEC-072): it returns a
+`Verdict` rather than raising, and the engine applies the rule to the run. A run **fails** when no
+event was `ACCEPTED` (`SKIPPED` is not), at least one ended `REJECTED`, still `RETRYABLE` when the
+rounds ran out or were declined, or in a round whose `deliver` raised, and none ended `UNKNOWN` or
+in a round whose verdict could not be read; otherwise it settles. A failed run is a failed batch:
+the worker moves `failed_batches` once with no whole-batch resend, the orphan path moves
+`orphan_lost`, and the inline adapter raises `SinkDeliveryError`, so a wrapper calling
+`inner.emit(batch)` sees what a 1.x `emit` showed it. A settled run moves no failed-batch counter
+and its losses are counted in `SinkCounters`; across the rounds the engine offers again only the
+events still to send, so no event a verdict called `ACCEPTED` is sent again.
 
 *Observable:* with a destination that fails every call, `flush()` is falsy and a counter moved;
 with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice.
@@ -236,12 +287,23 @@ landed — and the same holds for a Honeycomb `200` rejecting every event of eve
 flight to a server that may yet process them, and the next call is refused by the probe or its
 latch, so a sustained stall is still reported as failed batches and only the one batch that
 straddles its onset is counted rather than raised.
+The recorded exception extends to `deliver` (SPEC-072 FR-004): a run whose verdict marks an event
+`UNKNOWN`, or whose verdict cannot be read — not a `Verdict`, outcomes that are not exact `Outcome`
+members, the wrong length, or a field that raises when read — settles even when nothing else was
+accepted, its events counted in `failed_events` and resent only by a sink that declares
+`log_foundry_idempotent = True`, because `deliver` returned and the events may have landed. So does
+a run of nothing but `DROPPED` events, counted in `dropped_events`, and a run of nothing but
+`SKIPPED` events, a deliberate non-send the engine counts nowhere. An exception escaping `deliver`
+is not this exception: no response is in hand, so its round's events fail the run.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_encode.py` (an all-unencodable batch settles on every record-building sink,
 SPEC-069), `tests/test_classify.py` and `tests/test_sinks_sns.py` (a batch lost only to sender
 faults returns, one with a recoverable loss beside it raises, SPEC-070), `tests/test_driver_error.py` (a SQLite or file driver error raises with `failed` moved,
 SPEC-069), `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subclass),
-`tests/integration/` against real services (SPEC-041).
+`tests/integration/` against real services (SPEC-041), `tests/test_verdict.py` (a malformed
+`Verdict` refused where it is built), `tests/test_delivery_engine.py` (the run-failed rule, the
+unknown outcomes and the unreadable verdict) and `tests/test_delivery_paths.py` (a failed run on
+the worker, the orphan path and the adapter, a settled one on each, SPEC-072).
 
 ## 8. An event is safe by construction, once, at assembly
 
@@ -364,8 +426,19 @@ and closes no transport the parent opened.
 `close()` returns without touching anything, because the child acquired no thread, loop or
 connection and `reacquire_after_fork` is not implemented (SPEC-061 FR-001; `architecture.md` §12
 names what would close it). The pid is compared before the sink's lock, since a lock a caller
-held at fork time stays held in the child.
-*Guarded:* `tests/test_fork_lifecycle.py`, `tests/test_sink_ownership.py`,
+held at fork time stays held in the child. The walk enters only this package's objects, so a sink
+of your own is repaired only if it subclasses `Sink` or a shipped sink — with one reach past that
+boundary (SPEC-072 FR-003): a value the walk would not enter, such as a structurally typed sink the
+worker holds, is read for the one attribute `log_foundry_counters`, statically, and an exact
+`SinkCounters` there has its lock replaced, so a child does not hang on a reached engine sink's
+counters. The reach is one level deep: an engine sink held inside a wrapper of your own, or a sink
+that is itself a container subclass of your own, is not reached, and nothing else of a foreign
+namespace is read. **An unreached shape whose counters' lock a parent thread held at the fork
+hangs the child's first run that commits into it:** an `info()` on the orphan path blocks the
+caller, and on the worker path the drain thread blocks, so `flush()` times out. A registry of live
+`SinkCounters` the walk reads, rather than finds, is SPEC-079's follow-up.
+*Guarded:* `tests/test_fork_lifecycle.py` (including an engine sink's counters, SPEC-072),
+`tests/test_sink_ownership.py`,
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`).
 
 ## 13. A bad argument is refused where it is written, never later on the drain thread

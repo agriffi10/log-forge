@@ -43,9 +43,11 @@ class Deferral:
     in two terms.
 
     **One instance per call, never stored.** It is constructed as a ``with`` item inside
-    ``emit``, so its pending counts and lines are local to that call: the drain thread and any
-    number of orphan callers on other threads never share them (SPEC-028). Shared state is
-    touched only in the commit, under the owner's ``_counter_lock``, and the AST check in
+    ``emit``, or inside a module-level function ``tests/test_deferral.py`` lists — the delivery
+    engine's ``_run`` (SPEC-072), which commits a whole run into a sink's ``SinkCounters`` — so
+    its pending counts and lines are local to that call: the drain thread and any number of
+    orphan callers on other threads never share them (SPEC-028). Shared state is touched only in
+    the commit, under the owner's ``_counter_lock``, and the AST check in
     ``tests/test_deferral.py`` refuses a construction anywhere else.
 
     **The lock is read from the owner at commit time**, not held from construction. A fork

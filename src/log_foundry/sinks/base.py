@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import types
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import Final, Protocol, cast, runtime_checkable
 
 __all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "flush_sink", "read_losses"]
 
@@ -178,6 +180,30 @@ class Sink(Protocol):
     because a swallowed flush failure is exactly the "sink the worker believes" this file exists
     to prevent.
 
+    A seventh is optional in the same way and changes how a batch is delivered rather than what
+    is reported: ``deliver(batch) -> Verdict`` (SPEC-072), which returns one ``Outcome`` per
+    event, by index, instead of raising for the whole batch. ``read_deliver`` is the probe, and it
+    reads the sink's **type** statically: ``deliver`` must be a plain function defined on the
+    class, no class earlier in the MRO than the one defining it may define ``emit``, and no
+    ``emit`` may be set on the instance (so a subclass that overrides ``emit`` to stamp or scrub
+    keeps running its override, and so does ``sink.emit = scrub``); some class must define
+    ``emit``, and none may define ``__getattribute__`` as a plain function, which could hand the
+    worker another ``emit``; and the sink
+    must also carry ``log_foundry_counters``, exactly a ``SinkCounters``, which the engine is
+    the one writer of; ``losses()`` then returns ``log_foundry_counters.losses()``. A class
+    attribute ``deliver = None`` declares an opt-out. When ``deliver`` is offered, the worker and
+    the orphan path call it through the delivery engine instead of calling ``emit``: the engine
+    resends only the events marked ``RETRYABLE``, within the 1.x total of attempts
+    (``max_retries`` + 1 times the worker's ``max_retries`` + 1, the sink's own ``max_retries``
+    read as an exact ``int``), waits the 1.x backoff on the stop signal, honours a verdict's
+    ``retry_after`` under the sink's ``max_retry_after`` (30 seconds when it declares none), and
+    counts what did not land into the counters at the end of the run. Two more optional
+    attributes refine it: ``log_foundry_idempotent = True`` (exactly ``True``) lets an
+    ``UNKNOWN`` outcome, an unreadable verdict or an exception escaping ``deliver`` be resent,
+    the last only when the sink's ``_retryable_error`` accepts it. Such a sink's ``emit`` should
+    be ``emit_via_deliver(self, batch)``, which runs the same engine inline and raises when the
+    run fails, so a wrapper calling ``inner.emit(batch)`` sees what a 1.x ``emit`` showed it.
+    **A ``deliver`` must not call its own ``emit``**, and must not mutate the list it is given.
     """
 
     @abstractmethod
@@ -266,6 +292,202 @@ class Sink(Protocol):
           Exception: Whatever releasing the transport raises; the worker absorbs it.
         """
         ...
+
+
+_ABSENT: Final = object()
+"""What :func:`_static_value` answers for an attribute that is missing or cannot be read."""
+
+_MRO = type.__dict__["__mro__"].__get__
+"""``type.__mro__``, unbound, so a metaclass ``__mro__`` property is never consulted."""
+
+_NAMESPACE = type.__dict__["__dict__"].__get__
+"""``type.__dict__``, unbound, so a class's own namespace is read without any hook running."""
+
+_GETSET_GET = types.GetSetDescriptorType.__get__
+"""The builtin ``__get__`` of a getset descriptor: the instance ``__dict__`` slot, read in C."""
+
+_MEMBER_GET = types.MemberDescriptorType.__get__
+"""The builtin ``__get__`` of a ``__slots__`` member descriptor, read in C."""
+
+
+def _class_member(cls: type, name: str, *, skip_none: bool = False) -> tuple[object, int] | None:
+    """Finds ``name`` in a class's own MRO namespaces, returning the value and its MRO index.
+
+    The MRO and each namespace are read through the unbound ``type`` accessors, so no metaclass
+    hook runs — no ``__mro__`` or ``__dict__`` property, and no metaclass ``__eq__`` or
+    ``__hash__``, since nothing here hashes or compares a class. One residue is accepted rather
+    than closed, and ordinary ``getattr`` shares it: the name is looked up in each namespace's
+    dict (and the instance dict, in :func:`_own_attribute`), so any key there whose hash collides
+    with the name has its ``__eq__`` run — a ``str`` subclass with its own ``__eq__``, or any
+    object whose ``__hash__`` returns ``hash(name)``, planted with ``setattr`` or
+    ``__dict__[key] = value``. With ``skip_none`` a ``None`` found in a
+    namespace is passed over and the walk goes on, which is how SPEC-072's adapter reads a
+    ``deliver = None`` opt-out: "do not offer", not "do not have".
+
+    Args:
+      cls: The class to search.
+      name: The member's name, an exact ``str``.
+      skip_none: Whether a ``None`` value is passed over rather than returned.
+
+    Returns:
+      ``(value, index)`` for the first class in the MRO whose namespace holds ``name``, or
+      ``None``.
+
+    Raises:
+      Exception: Whatever an unusual class object raises while its MRO is read; callers guard.
+    """
+    for index, klass in enumerate(_MRO(cls)):
+        namespace = _NAMESPACE(klass)
+        if name in namespace:
+            value = namespace[name]
+            if value is None and skip_none:
+                continue
+            return value, index
+    return None
+
+
+def _instance_dict(obj: object) -> dict[str, object] | None:
+    """Returns an object's own ``__dict__`` through a builtin getset descriptor, or ``None``.
+
+    The descriptor is the first exact ``GetSetDescriptorType`` named ``__dict__`` along the MRO
+    that applies to the object, called through its builtin ``__get__``, so a ``__dict__``
+    property or any other hook never runs. One that does not apply — a getset borrowed from an
+    unrelated class — is passed over. ``None`` means the dict cannot be read this way: there is
+    none (a slotted or builtin object), or the class shadows ``__dict__`` where it defines it, so
+    no builtin descriptor exists for it. The caller treats that as "no instance attribute".
+
+    Args:
+      obj: The object.
+
+    Returns:
+      The instance dict, or ``None``.
+
+    Raises:
+      Exception: Whatever an unusual class object raises while its MRO is read; callers guard.
+    """
+    cls = type(obj)
+    for klass in _MRO(cls):
+        holder = _NAMESPACE(klass).get("__dict__")
+        if type(holder) is not types.GetSetDescriptorType:
+            continue
+        with contextlib.suppress(Exception):
+            own = _GETSET_GET(holder, obj, cls)
+            return cast("dict[str, object]", own) if issubclass(type(own), dict) else None
+    return None
+
+
+_GENERIC_GETATTR = object.__getattribute__
+"""CPython's generic attribute lookup, unbound: no ``__getattribute__`` or ``__getattr__`` runs.
+
+Called only where it cannot run a descriptor: when the class holds nothing for the name, or a
+plain value whose type defines no ``__get__``, or a plain function, whose ``__get__`` is C. It
+reads the real instance dict whatever the class does to ``__dict__`` — a property, a borrowed
+getset — which no Python-level accessor can.
+"""
+
+_METHOD_FUNC = types.MethodType.__dict__["__func__"].__get__
+"""A bound method's ``__func__``, read through its builtin member."""
+
+_METHOD_SELF = types.MethodType.__dict__["__self__"].__get__
+"""A bound method's ``__self__``, read through its builtin member."""
+
+
+def _own_attribute(obj: object, name: str, member: tuple[object, int] | None) -> object:
+    """Returns the value ``obj``'s own instance dict holds for ``name``, or :data:`_ABSENT`.
+
+    ``member`` is the class's (from :func:`_class_member`); the caller has already ruled out a
+    data descriptor. Three routes, chosen so that none runs a hook:
+
+    - nothing on the class, or a value whose type defines no ``__get__``: CPython's generic
+      lookup, which answers from the instance dict when it holds the name, else with the class
+      value (read here as "not the instance's own") or ``AttributeError``;
+    - a plain function: the generic lookup binds it in C when the instance does not shadow it, so
+      a bound method of that very function on this very object means "not the instance's own";
+    - any other non-data descriptor, whose ``__get__`` the generic lookup would call: the
+      instance dict read through :func:`_instance_dict`. **The one limit:** when the class
+      shadows ``__dict__`` where it defines it, an instance value shadowing such a descriptor is
+      not seen.
+
+    Args:
+      obj: The object.
+      name: The attribute's name, an exact ``str``.
+      member: ``_class_member(type(obj), name)``.
+
+    Returns:
+      The instance's own value, or :data:`_ABSENT`.
+
+    Raises:
+      Exception: Whatever an unusual object raises; callers guard.
+    """
+    held = None if member is None else member[0]
+    if member is None or _class_member(type(held), "__get__") is None:
+        try:
+            value = _GENERIC_GETATTR(obj, name)
+        except AttributeError:
+            return _ABSENT
+        return _ABSENT if member is not None and value is held else value
+    if type(held) is types.FunctionType:
+        value = _GENERIC_GETATTR(obj, name)
+        if type(value) is types.MethodType and _METHOD_FUNC(value) is held:
+            return _ABSENT if _METHOD_SELF(value) is obj else value
+        return value
+    own = _instance_dict(obj)
+    return _ABSENT if own is None else dict.get(own, name, _ABSENT)
+
+
+def _static_value(obj: object, name: str) -> object:
+    """Reads one attribute the way ordinary access finds it, running none of the object's code.
+
+    The order is CPython's own for an instance: a **data descriptor** on the class (one whose
+    type defines ``__get__`` and also ``__set__`` or ``__delete__``) wins, then the instance's own
+    value, then any other class attribute. A value whose type defines ``__set__`` or
+    ``__delete__`` without ``__get__`` is not one for reading — CPython reads the instance dict
+    past it — so a "validated field" descriptor guarding ``log_foundry_counters`` on assignment
+    leaves the instance value visible. The class side reads through ``type``'s unbound
+    ``__mro__`` and ``__dict__`` accessors and a ``__slots__`` member through its builtin
+    ``__get__``; the instance side is :func:`_own_attribute`'s. So no property, ``__getattr__``,
+    ``__getattribute__``, descriptor ``__get__`` or metaclass hook (``__mro__``, ``__name__``,
+    ``__eq__``, ``__hash__``) runs; the one residue, the ``__eq__`` of a dict key whose hash
+    collides with the name, is :func:`_class_member`'s, and ``getattr`` has it too.
+    ``inspect.getattr_static`` was used
+    here first and is not this: its shadowed-``__dict__`` check is ``lru_cache``-wrapped, so it
+    hashes the class and can compare it, which runs a metaclass's ``__hash__`` and ``__eq__``
+    (SPEC-072's first diff review, measured on 3.12 and 3.13). A slot that is unset reads as
+    absent; any other descriptor is returned as found, so a property reads as the property object
+    and is refused by the caller's type test. Where the instance side raises, the class's own
+    member is still returned. ``tests/test_static_read_corpus.py`` holds this to ``getattr`` over
+    a corpus of class shapes, the divergences named case by case.
+
+    Args:
+      obj: The object to read.
+      name: The attribute's name, an exact ``str``.
+
+    Returns:
+      The value, or :data:`_ABSENT` when it is missing or could not be read.
+
+    Raises:
+      None.
+    """
+    try:
+        cls = type(obj)
+        found = _class_member(cls, name)
+        if found is not None:
+            kind = type(found[0])
+            if kind is types.MemberDescriptorType:
+                return _MEMBER_GET(cast("types.MemberDescriptorType", found[0]), obj, cls)
+            if _class_member(kind, "__get__") and (
+                _class_member(kind, "__set__") or _class_member(kind, "__delete__")
+            ):
+                return found[0]
+    except Exception:
+        return _ABSENT
+    try:
+        own = _own_attribute(obj, name, found)
+    except Exception:
+        own = _ABSENT
+    if own is not _ABSENT:
+        return own
+    return _ABSENT if found is None else found[0]
 
 
 def read_losses(sink: object) -> SinkLosses | None:

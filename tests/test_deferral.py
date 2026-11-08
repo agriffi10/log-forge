@@ -182,6 +182,17 @@ def test_wrapped_losses_rule(
 
 _HELPER_MODULE = "log_foundry.sinks._deferral"
 
+MODULE_LEVEL = "<module>"
+"""The :data:`DEFERRING_SITES` key under which a module lists its module-level deferring functions.
+
+SPEC-072's engine commits a whole delivery run in one module function, ``_engine._run``, rather
+than in an ``emit``: it is shared by the worker, the orphan path and the inline adapter, so no one
+class owns it. A function listed here is held to what a listed ``emit`` is, with one difference
+that follows from having no ``self``: it may make **no** attribute store through any root, its
+same-module callees included, since a second ledger there would be a store through the counters
+object the ``Deferral`` already commits into.
+"""
+
 DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
@@ -205,6 +216,7 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
     "sinks/postgres.py": {"PostgresSink": ("emit",)},
     "sinks/redis.py": {"_RedisSink": ("emit",)},
+    "sinks/_engine.py": {MODULE_LEVEL: ("_run",)},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
@@ -324,27 +336,41 @@ counts as it happens rather than through the ``Deferral``:
 class _Scope(ast.NodeVisitor):
     """Collects ``Deferral(...)`` calls, and which are ``with`` items in an ``emit`` and how bound.
 
-    A ``with`` item inside an ``emit`` is *blessed* when it binds nothing or a bare local name.
-    One bound to anything else — ``as self._pending``, ``as box[0]`` — is recorded in ``bound``
-    with its target, because the target outlives the call and so shares the pending drops.
+    A ``with`` item inside an ``emit``, or directly inside a module-level function the site lists
+    under :data:`MODULE_LEVEL`, is *blessed* when it binds nothing or a bare local name. One bound
+    to anything else — ``as self._pending``, ``as box[0]`` — is recorded in ``bound`` with its
+    target, because the target outlives the call and so shares the pending drops. A function of
+    a listed name that is a method, or nested in another function, is not blessed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, module_functions: tuple[str, ...] = ()) -> None:
         self.functions: list[str] = []
+        self.nesting: list[str] = []
+        self.module_functions = module_functions
         self.calls: list[ast.Call] = []
         self.blessed: set[int] = set()
         self.bound: dict[int, ast.expr] = {}
 
     def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         self.functions.append(node.name)
+        self.nesting.append(node.name)
         self.generic_visit(node)
+        self.nesting.pop()
         self.functions.pop()
 
     visit_FunctionDef = _function
     visit_AsyncFunctionDef = _function
 
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self.nesting.append("<class>")
+        self.generic_visit(node)
+        self.nesting.pop()
+
+    def _listed_here(self) -> bool:
+        return len(self.nesting) == 1 and self.nesting[0] in self.module_functions
+
     def visit_With(self, node: ast.With) -> None:
-        if self.functions and self.functions[-1] == "emit":
+        if self.functions and (self.functions[-1] == "emit" or self._listed_here()):
             for item in node.items:
                 if not _is_deferral_call(item.context_expr):
                     continue
@@ -575,7 +601,9 @@ def deferral_findings(
     method call (``self.counts.update(...)``). Outside a named site it does not see a blessed
     ``Deferral``'s local stored afterwards; inside one that is a store to ``self`` and a finding.
     A ``Deferral`` entered by an ``emit`` that is not a method — a module-level function — has
-    no class to list, so it is held only to the construction rule.
+    no class to list, so it is held only to the construction rule; a module-level function that
+    commits is listed under :data:`MODULE_LEVEL` instead and held as
+    :func:`_module_function_findings` says.
     Nor does it check the block's extent: neither this check nor :func:`dropped_store_findings`
     verifies that an ``emit``'s ``with Deferral(...)`` encloses every statement that can raise
     after a drop is decided, so a send or a ``raise`` moved out of the block commits the drop
@@ -600,7 +628,8 @@ def deferral_findings(
     """
     tree = ast.parse(source)
     findings: list[str] = []
-    scope = _Scope()
+    module_functions = (sites or {}).get(MODULE_LEVEL, ())
+    scope = _Scope(module_functions)
     scope.visit(tree)
     for call in scope.calls:
         if id(call) in scope.blessed:
@@ -621,7 +650,10 @@ def deferral_findings(
         return findings
     if not _imports_the_helper(tree):
         findings.append(f"{where}: does not import Deferral from {_HELPER_MODULE}")
+    findings.extend(_module_function_findings(where, tree, module_functions))
     for cls_name, functions in sites.items():
+        if cls_name == MODULE_LEVEL:
+            continue
         cls = _class(tree, cls_name)
         if cls is None:
             findings.append(f"{where}: class {cls_name} not found; the site list is stale")
@@ -636,6 +668,95 @@ def deferral_findings(
             if name == "emit" and not _enters_deferral(fn):
                 findings.append(f"{where}: {cls_name}.emit enters no Deferral")
             findings.extend(_reach(where, cls_name, fn, None, methods, seen, immediate, used))
+    return findings
+
+
+def _attribute_stores(fn: ast.AST) -> list[tuple[str, int]]:
+    """Every attribute store through any root in ``fn``, nested code included, by line.
+
+    A store's target is an attribute, or a subscript whose chain passes through one, parsed with
+    ``ctx=Store`` (:func:`_self_stores` says why that covers every binding form); a subscript of a
+    bare local (``fate[i] = x``) stores nothing that outlives the call and is not one. A
+    ``setattr(...)`` call is a store whatever its arguments.
+
+    Args:
+      fn: The function to scan.
+
+    Returns:
+      ``(rendered target, line)`` per store, in source order.
+
+    Raises:
+      None.
+    """
+    stores: list[tuple[str, int, int]] = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Attribute | ast.Subscript) and isinstance(node.ctx, ast.Store):
+            chain: ast.expr = node
+            through_attribute = False
+            while isinstance(chain, ast.Attribute | ast.Subscript):
+                through_attribute = through_attribute or isinstance(chain, ast.Attribute)
+                chain = chain.value
+            if through_attribute:
+                stores.append((ast.unparse(node), node.lineno, node.col_offset))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+        ):
+            stores.append((ast.unparse(node), node.lineno, node.col_offset))
+    return [(text, line) for text, line, _ in sorted(stores, key=lambda s: (s[1], s[2]))]
+
+
+def _module_function_findings(where: str, tree: ast.Module, names: tuple[str, ...]) -> list[str]:
+    """Holds each listed module-level function to the one-helper rule, one line per breach.
+
+    Each listed name must be a function in the module's own body, so a rename is a finding; it
+    must enter a ``Deferral``; and neither it nor any module-level function it reaches through a
+    bare-name call — followed transitively, each once — may make an attribute store through any
+    root (:func:`_attribute_stores`). A call through an attribute (``_diag.lost``), an imported
+    name or a parameter (``deliver``) is not followed.
+
+    Args:
+      where: The module's path, for the message.
+      tree: The parsed module.
+      names: The functions :data:`DEFERRING_SITES` lists under :data:`MODULE_LEVEL`.
+
+    Returns:
+      The findings, empty when every listed function complies.
+
+    Raises:
+      None.
+    """
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    findings: list[str] = []
+    seen = {name for name in names if name in functions}
+    for name in names:
+        fn = functions.get(name)
+        if fn is None:
+            findings.append(f"{where}: {name} not found; the site list is stale")
+            continue
+        if not _enters_deferral(fn):
+            findings.append(f"{where}: {name} enters no Deferral")
+        route: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, str]] = [(fn, "")]
+        while route:
+            current, via = route.pop(0)
+            findings.extend(
+                f"{where}:{line}: {current.name}{via} stores {target} directly; count it "
+                f"through the Deferral"
+                for target, line in _attribute_stores(current)
+            )
+            for call in ast.walk(current):
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)):
+                    continue
+                callee = functions.get(call.func.id)
+                if callee is None or callee.name in seen:
+                    continue
+                seen.add(callee.name)
+                route.append((callee, f", called from {current.name},"))
     return findings
 
 
@@ -1168,6 +1289,92 @@ class Sink:
 }
 
 
+_ENGINE_SITES: dict[str, tuple[str, ...]] = {MODULE_LEVEL: ("_run",)}
+
+_ENGINE_RUN = """
+def _run(counters, batch):
+    total = _tally(batch)
+    with Deferral(counters) as ledger:
+        ledger.count("failed_events", total)
+    return total
+def _tally(batch):
+    fate = [0] * len(batch)
+    fate[0] = 1
+    return sum(fate)
+"""
+
+_COMMIT_LINES = (
+    '    with Deferral(counters) as ledger:\n        ledger.count("failed_events", total)\n'
+)
+
+_CORPUS.update(
+    {
+        "a listed module function's Deferral is blessed": (
+            _IMPORT + _ENGINE_RUN,
+            _ENGINE_SITES,
+            [],
+        ),
+        "a module function with no Deferral is named": (
+            _IMPORT + _ENGINE_RUN.replace(_COMMIT_LINES, ""),
+            _ENGINE_SITES,
+            ["m.py: _run enters no Deferral"],
+        ),
+        "a renamed module function is named": (
+            _IMPORT + _ENGINE_RUN.replace("def _run(", "def _run_renamed("),
+            _ENGINE_SITES,
+            [f"m.py:5: {_BUILT_OUTSIDE}", "m.py: _run not found; the site list is stale"],
+        ),
+        "a store through the counters object is a second ledger": (
+            _IMPORT
+            + _ENGINE_RUN.replace(
+                "    return total\n", "    counters.failed_events += total\n    return total\n"
+            ),
+            _ENGINE_SITES,
+            ["m.py:7: _run stores counters.failed_events directly; count it through the Deferral"],
+        ),
+        "a store in a callee is named with its route": (
+            _IMPORT
+            + _ENGINE_RUN.replace(
+                "    return sum(fate)\n",
+                "    batch.owner.dropped_events = 1\n    return sum(fate)\n",
+            ),
+            _ENGINE_SITES,
+            [
+                (
+                    "m.py:11: _tally, called from _run, stores batch.owner.dropped_events directly; "
+                    "count it through the Deferral"
+                )
+            ],
+        ),
+        "a setattr in a listed function is a store": (
+            _IMPORT
+            + _ENGINE_RUN.replace(
+                "    return total\n", "    setattr(counters, name, 1)\n    return total\n"
+            ),
+            _ENGINE_SITES,
+            [
+                (
+                    "m.py:7: _run stores setattr(counters, name, 1) directly; count it through the "
+                    "Deferral"
+                )
+            ],
+        ),
+        "an unlisted module function's Deferral is still refused": (
+            _IMPORT + _ENGINE_RUN,
+            None,
+            [f"m.py:5: {_BUILT_OUTSIDE}"],
+        ),
+        "a method named like a listed function is not blessed": (
+            _IMPORT
+            + "class Engine:\n"
+            + "".join(f"    {line}\n" for line in _ENGINE_RUN.strip().splitlines()),
+            _ENGINE_SITES,
+            [f"m.py:5: {_BUILT_OUTSIDE}", "m.py: _run not found; the site list is stale"],
+        ),
+    }
+)
+
+
 @pytest.mark.parametrize("case", sorted(_CORPUS))
 def test_the_deferral_lint_reports_what_it_claims_to(case: str) -> None:
     """Each check's failure text, and the shapes that must stay silent, on synthetic modules."""
@@ -1231,7 +1438,15 @@ def test_every_deferring_site_takes_the_one_helper() -> None:
 # --- SPEC-059 FR-005: a dropped counter is written only by a Deferral commit --------------
 
 DROPPED_FLOOR = frozenset(
-    {"dropped_oversized", "_unrenderable", "_id_failed", "rejected", "_dropped", "_unencodable"}
+    {
+        "dropped_oversized",
+        "_unrenderable",
+        "_id_failed",
+        "rejected",
+        "_dropped",
+        "_unencodable",
+        "dropped_events",
+    }
 )
 """Counters the derivation must find over the tree; a floor, not the set.
 
@@ -1466,7 +1681,9 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
     ``Sink.__init__.<locals>.<lambda>``. Each store is reported once: the search for a class's
     functions enters neither a nested class nor another function (:func:`_code_roots`), and the
     scan of a function skips the functions of a class defined inside it
-    (:func:`_outside_nested_methods`), each of which that class's own scan covers.
+    (:func:`_outside_nested_methods`), each of which that class's own scan covers. Since SPEC-072
+    it also scans every module-level function and lambda (:func:`_code_roots` over the module),
+    named by its own name, because the engine writes ``SinkCounters`` from a module function.
 
     **What it checks.** Each store :func:`_self_stores` recognises whose path names a derived
     counter at **any** position — so ``self._socket.dropped_oversized += 1`` is a finding though
@@ -1477,12 +1694,16 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
     unrelated class storing a same-named attribute after construction is a finding too, and
     renames it. There is no allowlist: a ``dropped`` count is exact by promise (invariant 2), so a
     store that has to be immediate belongs to a counter no ``losses()`` reports as ``dropped``.
+    And, since SPEC-072, each store whose chain from **any** other root names a derived counter
+    — ``sink.log_foundry_counters.dropped_events += 1`` — and ``setattr(<any>, "<counter>", ...)``
+    with the counter as a literal (:func:`_foreign_findings`); ``setattr(<not self>,
+    <computed>, ...)`` stays silent, since it is the ``Deferral`` commit's form.
 
     **What it does not see.** It reads syntax. A store through an alias of ``self``
     (``me = self``), a mutating method call (``self.counts.update(...)``), a store through
     ``self.__dict__[...]`` (its path is ``__dict__``, which names no counter), a counter reported
-    as ``SinkLosses(**mapping)`` (there is no ``dropped`` argument to read), a store outside a
-    class, ``__init__``'s own statements, the statements a class body runs as the class is
+    as ``SinkLosses(**mapping)`` (there is no ``dropped`` argument to read), a store in a
+    module's top-level statements, ``__init__``'s own statements, the statements a class body runs as the class is
     defined — unless the class is defined inside scanned code, whose scan takes them as its own,
     since they can close over that code's ``self`` — and a counter reported through a call or a
     property rather than a plain ``self`` read — ``SyslogSink.losses`` returns
@@ -1501,7 +1722,8 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
       The findings in source order, empty when the module complies.
     """
     findings: list[tuple[int, str]] = []
-    for cls in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    for cls in ast.walk(tree):
         if not isinstance(cls, ast.ClassDef):
             continue
         for name, fn in _scan_roots(cls):
@@ -1516,7 +1738,78 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
                     continue
                 text = f"{where}:{line}: {name} {what}{why}{_THROUGH_THE_LEDGER}"
                 findings.append((line, text))
+            findings.extend(_foreign_findings(where, name, fn, counters, skip_self=True))
+    for fn in _code_roots(tree):
+        findings.extend(_foreign_findings(where, _code_name(fn), fn, counters, skip_self=False))
     return [text for _, text in sorted(findings, key=lambda finding: finding[0])]
+
+
+def _foreign_findings(
+    where: str,
+    name: str,
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    counters: set[str],
+    *,
+    skip_self: bool,
+) -> list[tuple[int, str]]:
+    """Stores to a derived counter through a root other than ``self``, one finding each (SPEC-072).
+
+    SPEC-072's ``SinkCounters`` is written through the sink's counters object, not ``self``, so a
+    check that saw only ``self`` stores would let ``sink.log_foundry_counters.dropped_events += 1``
+    pass anywhere. A store whose target chain names a derived counter at any position, from any
+    root — a name, a call, a subscript — is a finding, as is ``setattr(<any>, "<counter>", ...)``
+    with the counter as a string literal. ``setattr(<not self>, <computed>, ...)`` is silent: it is
+    the ``Deferral`` commit's own form, and refusing it would refuse the one permitted writer. In a
+    class the ``self``-rooted stores are :func:`_self_stores`' and are skipped here; at module
+    level ``self`` is an ordinary name.
+
+    Args:
+      where: The module's path, for the message.
+      name: The function's name, as a finding names it.
+      fn: The function or lambda to scan, nested classes' functions excluded.
+      counters: The derived counter names.
+      skip_self: Whether ``self``-rooted stores are left to :func:`_self_stores`.
+
+    Returns:
+      ``(line, finding)`` pairs.
+
+    Raises:
+      None.
+    """
+    found: list[tuple[int, str]] = []
+    for node in _outside_nested_methods(fn):
+        target: str | None = None
+        names: list[str] = []
+        if isinstance(node, ast.Attribute | ast.Subscript) and isinstance(node.ctx, ast.Store):
+            chain: ast.expr = node
+            while isinstance(chain, ast.Attribute | ast.Subscript):
+                if isinstance(chain, ast.Attribute):
+                    names.append(chain.attr)
+                chain = chain.value
+            if skip_self and isinstance(chain, ast.Name) and chain.id == "self":
+                continue
+            target = ast.unparse(node)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "setattr"
+            and len(node.args) > 1
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            owner = node.args[0]
+            if skip_self and isinstance(owner, ast.Name) and owner.id == "self":
+                continue
+            names = [node.args[1].value]
+            target = f"{ast.unparse(owner)}.{node.args[1].value} through setattr"
+        if target is None or not counters.intersection(names):
+            continue
+        text = (
+            f"{where}:{node.lineno}: {name} stores {target}, which a losses() reports as dropped; "
+            f"count it{_THROUGH_THE_LEDGER}"
+        )
+        found.append((node.lineno, text))
+    return found
 
 
 _THROUGH_THE_LEDGER = " through the calling emit's Deferral"
@@ -2069,6 +2362,65 @@ store sits — a closure or lambda in ``__init__``, a method under a class-body 
 locally defined class — assert the whole list, so a store reported twice fails as surely as one
 missed.
 """
+
+
+_COUNTERS_CLASS = """
+class SinkCounters:
+    def __init__(self):
+        self.dropped_events = 0
+    def losses(self):
+        dropped = self.dropped_events
+        return SinkLosses(dropped=dropped, failed=0)
+"""
+
+
+def _foreign(line: int, name: str, target: str) -> str:
+    """One expected store finding for a store through a root other than ``self``."""
+    return (
+        f"m.py:{line}: {name} stores {target}, which a losses() reports as dropped; count it "
+        f"through the calling emit's Deferral"
+    )
+
+
+_DROPPED_CORPUS.update(
+    {
+        "a module function's chain store is named": (
+            _COUNTERS_CLASS
+            + "def _run(sink, n):\n    sink.log_foundry_counters.dropped_events += n\n",
+            [_foreign(9, "_run", "sink.log_foundry_counters.dropped_events")],
+        ),
+        "a module function's literal setattr is named": (
+            _COUNTERS_CLASS + 'def _run(c):\n    setattr(c, "dropped_events", 1)\n',
+            [_foreign(9, "_run", "c.dropped_events through setattr")],
+        ),
+        "a call-rooted chain is named": (
+            _COUNTERS_CLASS + "def _run(get):\n    get().dropped_events = 2\n",
+            [_foreign(9, "_run", "get().dropped_events")],
+        ),
+        "a lambda at module level is scanned": (
+            _COUNTERS_CLASS + "bump = lambda c: setattr(c, 'dropped_events', 1)\n",
+            [_foreign(8, "<lambda>", "c.dropped_events through setattr")],
+        ),
+        "a method's store through another object is named": (
+            _COUNTERS_CLASS
+            + "class Engine:\n    def run(self, other):\n        other.dropped_events = 0\n",
+            [_foreign(10, "Engine.run", "other.dropped_events")],
+        ),
+        "the Deferral commit's computed setattr is silent": (
+            _COUNTERS_CLASS
+            + "class Deferral:\n"
+            + "    def __exit__(self, owner, name, n):\n"
+            + "        setattr(owner, name, getattr(owner, name) + n)\n"
+            + "def _commit(owner, name):\n    setattr(owner, name, 1)\n",
+            [],
+        ),
+        "the counters' own construction is silent": (_COUNTERS_CLASS, []),
+        "a name that only contains a counter is silent": (
+            _COUNTERS_CLASS + "def _run(x):\n    x.dropped_eventsX = 1\n    x.n.events = 2\n",
+            [],
+        ),
+    }
+)
 
 
 @pytest.mark.parametrize("case", sorted(_DROPPED_CORPUS))

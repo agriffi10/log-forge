@@ -564,7 +564,9 @@ nothing.
 Wire one up by passing an instance to `configure(sink=...)`; if you never do, the first decorated
 call falls back to `StdoutSink()`. The **protocol** is a top-level export, alongside
 `SinkDeliveryError`, `SinkLosses`, `read_losses` and `flush_sink` — the last two being the probes
-a wrapper sink needs to ask a child for its losses and to push its client-side buffer — plus the
+a wrapper sink needs to ask a child for its losses and to push its client-side buffer — the
+optional per-event contract `Outcome`, `Verdict`, `SinkCounters` and its probe `read_deliver`
+(also importable from `log_foundry.sinks.verdict`; see *Reporting per event* below), plus the
 two default bounds, `DEFAULT_SHUTDOWN_TIMEOUT` and `DEFAULT_SWAP_TIMEOUT`. The
 **concrete sinks** are not exported, so import each from its own module, e.g.
 `from log_foundry.sinks.sqs import SQSSink`.
@@ -608,7 +610,9 @@ A few conventions hold across every sink below:
   sink whose `close()` costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote
   yourself is repaired only if it subclasses `Sink` or a shipped sink; one that satisfies the
   protocol structurally is outside the repair, along with any third-party client's own locks and
-  buffers. The second exception: if you subclass a shipped sink **and add a transport of your
+  buffers — except that a sink the library holds directly has its `log_foundry_counters` lock
+  replaced, so an engine sink of your own never hangs a child on its counters (that reach does not
+  extend into a wrapper of yours holding one). The second exception: if you subclass a shipped sink **and add a transport of your
   own**, override `reacquire_after_fork()` — inheriting it claims the whole object on the strength
   of re-opening only the part the parent class knows about, after which the child *will* close
   your connection.
@@ -1099,6 +1103,74 @@ class MyWrapper:
 
 Every wrapper shipped here — `MultiSink`, `FilteringSink`, `TransformSink`, `SyslogSink`,
 `LogstashSink`, `SentrySink` — does exactly this.
+
+##### Reporting per event: `deliver` (optional)
+
+Instead of raising for a whole batch, a sink may say what happened to **each** event by adding
+`deliver(batch) -> Verdict`. When it does, the worker and the no-span path call `deliver` instead
+of `emit`, and the library's delivery engine does the rest: it resends only the events you marked
+retryable — never one that already landed — waits between attempts on the shutdown signal, and
+counts what was lost.
+
+```python
+import threading
+from log_foundry import Outcome, SinkCounters, SinkLosses, Verdict
+
+class MyBatchSink:
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()   # required: the engine counts here
+        self.max_retries = 3                         # optional: read as an exact int
+        self.log_foundry_stop_signal: threading.Event | None = None
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        statuses = self._post(batch)                 # your transport; never mutate `batch`
+        return Verdict(
+            outcomes=tuple(
+                Outcome.ACCEPTED if ok else Outcome.RETRYABLE for ok in statuses
+            ),
+            retry_after=None,                        # or the server's hint, in seconds
+        )
+
+    def emit(self, batch: list[dict[str, object]]) -> None: ...   # still required, see below
+
+    def losses(self) -> SinkLosses:
+        return self.log_foundry_counters.losses()
+
+    def close(self) -> None: ...
+```
+
+- **One `Outcome` per event, by index**: `outcomes[i]` is the fate of `batch[i]`.
+  `ACCEPTED` landed; `RETRYABLE` did not and may on a resend; `REJECTED` was refused for good
+  (counted in `failed`); `DROPPED` is one you refused to send because it could never be accepted
+  (counted in `dropped`); `UNKNOWN` may have landed, such as a `2xx` whose body you could not read
+  (counted in `failed`, and resent only if you declare `log_foundry_idempotent = True`); `SKIPPED`
+  is a deliberate non-send the engine counts nowhere.
+  Build a `Verdict` with keywords; `Verdict.uniform(Outcome.ACCEPTED, len(batch))` gives every
+  event one outcome. A verdict of the wrong length, or anything that is not a `Verdict`, is
+  counted as unknown for the whole call.
+- **Total failure still fails.** When nothing was accepted and something was rejected, still
+  retryable after the last attempt, or in a call whose `deliver` raised — with nothing unknown —
+  the batch counts in `health().failed_batches` and `flush()` returns falsy (outside a span, in
+  `health().orphan_lost`), exactly as a raising `emit` would. Anything else settles, with what was lost counted in your `SinkCounters`.
+- **Retries keep the 1.x numbers.** A batch gets `max_retries + 1` attempts of yours for each of
+  the worker's, 16 at the defaults of 3 and 3, and outside a span your own `max_retries + 1`, as
+  with `emit`, with the same backoff — but each attempt after the first carries only the events
+  still retryable. A `retry_after` hint replaces the backoff, bounded by your `max_retry_after` (30
+  seconds if you declare none). An exception escaping `deliver` fails that call's events and is
+  resent only if you declare `log_foundry_idempotent = True` *and* the sink's `_retryable_error(exc)`
+  — the retry predicate a subclass of a shipped sink inherits — returns `True`; catch your client's
+  transient errors inside `deliver` and return `RETRYABLE` instead.
+- **Counted once, by the library.** Never write to `SinkCounters` yourself: the engine adds each
+  run's losses at the end of the run, and `losses()` returning `log_foundry_counters.losses()`
+  makes `health().sink` read them.
+- **`emit` is still required**, and is what a wrapper calling `inner.emit(batch)` reaches; the
+  worker never calls it on a sink that offers `deliver`. Keep it to the three rules above. A
+  subclass that overrides `emit` — to stamp or scrub a batch before calling `super().emit()` — is
+  not offered `deliver` at all, so its override always runs, and a class attribute
+  `deliver = None` opts a subclass out explicitly. `deliver` must not call its own `emit`.
+- `read_deliver(sink)` returns a sink's bound `deliver` when the library would use it and `None`
+  otherwise, for a wrapper that wants to know. No shipped sink offers `deliver` yet; nothing
+  changes for a sink that does not add it.
 
 ### Flushing and shutdown
 

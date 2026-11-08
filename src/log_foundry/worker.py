@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, cast
 
 from log_foundry import _diag, _lifecycle
 from log_foundry.results import FlushResult
+from log_foundry.sinks import _engine
 from log_foundry.sinks._retry import floor_count
 
 if TYPE_CHECKING:
@@ -1726,8 +1727,41 @@ class Worker:
                 marker.event.set()
                 self._release_marker(marker)
 
+    def _retry_declined(self, longest: float) -> bool:
+        """Whether another attempt is predicted to end past the ``shutdown()`` deadline (SPEC-062).
+
+        The rule is ``now + longest + _JOIN_MARGIN > _exit_deadline``, written here once so the
+        1.x ``emit`` loop and the delivery engine (SPEC-072) ask the same question: the engine
+        is handed this bound method as its decline predicate. A deadline of ``None`` declines
+        nothing. ``_JOIN_MARGIN`` is read at each call, so a test can patch it to prove it is
+        added; the deadline is read without the lock, as :meth:`_emit` documents.
+
+        Args:
+          longest: The longest attempt of the current batch so far, in seconds.
+
+        Returns:
+          True when the next attempt should not be made.
+
+        Raises:
+          None.
+        """
+        deadline = self._exit_deadline
+        return deadline is not None and time.monotonic() + longest + _JOIN_MARGIN > deadline
+
     def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
         """Flattens queued per-span event-lists into one batch and emits it, retrying.
+
+        **A sink that offers ``deliver`` is run through the delivery engine first** (SPEC-072
+        FR-005): ``run_delivery`` probes the sink once per batch, so a swap to or from an engine
+        sink takes effect on the next batch, and returns ``None`` for a sink that does not offer
+        it, which then takes the ``emit`` loop below unchanged. The engine's budget already holds
+        the worker's share — ``(sink + 1) * (worker + 1)`` rounds — so no whole batch is resent
+        around it; it waits on this worker's ``_stop`` and declines through
+        :meth:`_retry_declined`. A failed run moves ``failed_batches`` once and writes one line, the
+        declined wording with ``k`` the ``deliver`` calls made, or 1.x's abandoned wording with the
+        cycles the run started; a settled run adds nothing, as a partial outcome never did. The
+        line counts the batch as it was before the run, so a ``deliver`` that mutates the list it
+        was handed cannot change it.
 
         A failing ``sink.emit`` is retried up to ``max_retries`` times; past that the batch is
         abandoned with a counted warning and draining continues, so a broken sink never crashes
@@ -1783,8 +1817,34 @@ class Worker:
             return
         retries = max(self.max_retries, 0)
         longest = 0.0
-        self._in_flight = len(batch)
+        size = len(batch)
+        self._in_flight = size
         try:
+            delivery = _engine.run_delivery(
+                self.sink,
+                batch,
+                worker_retries=self.max_retries,
+                stop=self._stop,
+                decline=self._retry_declined,
+            )
+            if delivery is not None:
+                if delivery.failed:
+                    with self._lock:
+                        self.failed_batches += 1
+                    if delivery.declined:
+                        _diag.lost(
+                            "event",
+                            size,
+                            f"retry declined after {delivery.attempts} emit attempt(s); the next "
+                            f"was predicted to end after the shutdown() deadline",
+                        )
+                    else:
+                        _diag.lost(
+                            "event",
+                            size,
+                            f"batch abandoned after {delivery.cycles} emit attempts",
+                        )
+                return
             for attempt in range(retries + 1):
                 started = time.monotonic()
                 try:
@@ -1801,9 +1861,8 @@ class Worker:
                             f"batch abandoned after {retries + 1} emit attempts",
                         )
                         return
-                self._stop.wait(min(0.01 * (2**attempt), 0.5))
-                deadline = self._exit_deadline
-                if deadline is not None and time.monotonic() + longest + _JOIN_MARGIN > deadline:
+                self._stop.wait(_engine.cycle_backoff(attempt))
+                if self._retry_declined(longest):
                     with self._lock:
                         self.failed_batches += 1
                     _diag.lost(

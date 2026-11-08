@@ -401,10 +401,14 @@ class Sink(Protocol):
     # log_foundry_stop_signal: threading.Event | None # interruptible backoff (SPEC-027)
     # def reacquire_after_fork(self) -> None:  # strand a forked child's inherited
     #                                                 # buffer (SPEC-039)
+    # def deliver(self, batch) -> Verdict: ...        # per-event outcomes (SPEC-072), with
+    # log_foundry_counters: SinkCounters              # required for deliver to be offered
+    # log_foundry_idempotent: bool                    # only `True` counts
 ```
 
-`sinks/base.py` is authoritative for all three — what each promises, and for the last one which
-sinks are actually asked, which is narrower than "whichever define it".
+`sinks/base.py` is authoritative for all of these — what each promises, and for
+`reacquire_after_fork` which sinks are actually asked, which is narrower than "whichever define
+it"; `sinks/verdict.py` and `sinks/_engine.py` are authoritative for `deliver`.
 
 **A sink carries two reporting obligations** (SPEC-026), because the worker's retry and
 `health()` are built on them:
@@ -457,6 +461,45 @@ by a different route. A sink holding nothing to release keeps **accepting**, bec
 batch that would have delivered is loss the library invented. Which applies is a property of the
 sink, so each records its answer in its class docstring and a lint holds every sink to one.
 `emit([])` remains a no-op either way.
+
+**A sink may report per event instead of raising for the batch** (SPEC-072). The optional
+`deliver(batch) -> Verdict` returns one `Outcome` per event, by index — `ACCEPTED`, `RETRYABLE`,
+`REJECTED`, `DROPPED`, `UNKNOWN` or `SKIPPED` — and an optional `retry_after` hint. `Outcome`,
+`Verdict`, `SinkCounters` and the probe `read_deliver` are public (`sinks/verdict.py`, re-exported
+from `log_foundry`); `deliver` is never declared on the `Sink` Protocol. The probe reads the sink's
+**type** and never runs a `__getattr__`, a property or a metaclass hook: `deliver` must be a plain
+function in a class namespace, the `emit` ordinary lookup resolves must be a plain function on
+or below that class, defined by some class and not one set on the instance, and no class may
+define `__getattribute__` as a plain function (so an `emit` override that stamps or scrubs keeps
+running, in a subclass, on the instance or through `__getattribute__`), and `log_foundry_counters` must be exactly a
+`SinkCounters`; a class attribute `deliver = None` opts out.
+
+One private engine, `sinks/_engine.py`, runs the rounds. The worker and the orphan path call
+`run_delivery` first and fall back to `emit` unchanged when the sink does not offer `deliver`; an
+engine sink's own `emit` is `emit_via_deliver`, which runs the same engine inline and keeps the 1.x
+`emit` contract for a wrapper calling `inner.emit(batch)`. Only the events a verdict called
+`RETRYABLE` are offered again, within the 1.x total of attempts — `(s + 1) × (w + 1)` on the worker
+path, `s + 1` on the orphan path and in the adapter, `s` and `w` the sink's and the worker's
+`max_retries` read as exact `int`s — and the 1.x wait schedule: the sinks' 0.1 s backoff restarting
+each cycle, the worker's `cycle_backoff` between cycles, a usable hint replacing the wait it falls
+on under the sink's `max_retry_after` (30 s when it declares none), every wait cut short by the
+stop event when there is one, and SPEC-062's prediction asked before every further round. The worker does not resend a whole
+batch around an engine run. The engine holds no lock while `deliver` runs.
+
+The engine is the one writer of the sink's `SinkCounters`, at the end of the run through one
+`Deferral`. A run **fails** when nothing was accepted and some event ended `REJECTED`, unresolved
+or in a raising round, with none `UNKNOWN` or unreadable; a failed run commits only
+`failed_events` and its catcher owns the batch — the worker's `failed_batches` and abandon or
+declined line, `orphan_lost`, or the adapter's `SinkDeliveryError`. A settled run commits
+`dropped_events` too and is announced in one `_diag.lost` line. **This extends SPEC-058's
+principle to `deliver`:** a `deliver` counts nothing itself, and the engine is a fourth catcher, for
+a `deliver` that raised. An exception escaping `deliver` fails its round's events (it is not a
+response); an `UNKNOWN` outcome or an unreadable verdict settles, counted, because the events may
+have landed; either is resent only by a sink declaring `log_foundry_idempotent = True`, and the
+exception only when the sink's `_retryable_error` accepts it. The fork repair reads
+`log_foundry_counters` on a sink it does not enter and replaces that one lock (invariant 12). No
+shipped sink defines `deliver` at SPEC-072. The decisions are *A raising `emit` counts nothing,
+nor does a `deliver`* and *A sink may report per event* in `docs/decisions/sink-delivery/`.
 
 Planned implementations:
 
@@ -572,7 +615,10 @@ decorated call ends
   only retry what reaches it as an exception, so the guarantee is conditional on §8's
   raise-on-total-failure rule. A sink that swallows its own total failure gets no retry, no
   `failed_batches`, and a `flush()` that returns `True` — the library's loss reporting is the
-  sink's contract as much as the worker's code (SPEC-026).
+  sink's contract as much as the worker's code (SPEC-026). A sink that offers `deliver` is the
+  other form (SPEC-072, §8): the worker runs the delivery engine instead of its `emit` loop, the
+  engine's budget already holds the worker's share of retries, and a failed run moves
+  `failed_batches` once with the 1.x abandon or declined line.
 - **Loss the sink absorbs on purpose is reported, not retried** — a partially-failed batch, an
   oversized record, an unadjudicable response. `health().sink` carries the configured sink's
   `losses()` snapshot so the documented alert idiom covers it; it is nested rather than folded

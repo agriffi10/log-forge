@@ -17,8 +17,9 @@ A *door* is a function raising a `TypeError` that names the type of one of its p
    rewritten earlier test, or a second copy of an exempt one, is still reported. A read of
    `p.__class__` anywhere in a door's body (`if not value.__class__ is int:`) is reported too,
    since it asks the value what it is by another spelling.
-3. The derived set of doors equals, exactly, the ten written out below from `2368ade3`: a door
-   removed, renamed or inlined back reddens by name, and a new one is a visible edit.
+3. The derived set of doors equals, exactly, the eleven written out below (the ten of `2368ade3`
+   and SPEC-072's `_engine.emit_via_deliver`): a door removed, renamed or inlined back reddens by
+   name, and a new one is a visible edit.
 
 **What it does not see**, each a deliberate edge its corpus asserts silence on: a type named by a
 helper (`raise TypeError(_type_name(value))`), a message held in a local and raised later, a
@@ -54,9 +55,14 @@ EXPECTED_DOORS = frozenset(
         "sinks._retry.wait_budget",
         "sinks.otlp.OTLPSink.__init__",
         "sinks._args.require_callable",
+        "sinks._engine.emit_via_deliver",
     }
 )
-"""The ten doors: SPEC-080's two, the seven SPEC-071 converts, and ``require_callable``."""
+"""The eleven doors: SPEC-080's two, SPEC-071's seven, ``require_callable``, SPEC-072's adapter.
+
+``emit_via_deliver`` names ``type(sink)`` in its two ``TypeError`` messages, and routes ``batch`` on
+its real type through ``_snapshot``, so it contributes both kinds of plant to the sweep below.
+"""
 
 RAISE_EXEMPT = frozenset({"sanitize._coerce_unbounded", "sinks.transform.TransformSink._apply"})
 """Raises judging a transform's result per event, not an argument."""
@@ -355,7 +361,7 @@ def _tree() -> dict[str, str]:
     }
 
 
-def test_the_real_tree_is_clean_and_holds_the_ten_doors() -> None:
+def test_the_real_tree_is_clean_and_holds_the_pinned_doors() -> None:
     assert scan(_tree()) == []
 
 

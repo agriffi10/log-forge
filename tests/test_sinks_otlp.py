@@ -771,7 +771,11 @@ def test_nothing_from_otel_is_public_and_the_surface_grew_by_one_path_only() -> 
             importlib.import_module(f"log_foundry.sinks.{module.name}"), "__all__", ()
         )
         assert not otel_names & set(exported), module.name
-    assert len(log_foundry.__all__) == 30, "the top-level surface is the 30 names of 1.0.2"
+    verdict_names = {"Outcome", "SinkCounters", "Verdict", "read_deliver"}
+    assert len(log_foundry.__all__) == 34, (
+        "the top-level surface is the 30 names of 1.0.2 plus SPEC-072's four verdict names"
+    )
+    assert verdict_names <= set(log_foundry.__all__)
     assert not hasattr(log_foundry.sinks, "__all__")
     assert log_foundry.sinks.otlp.__all__ == ["OTLPSink"]
 

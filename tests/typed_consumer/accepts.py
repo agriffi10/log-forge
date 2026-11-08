@@ -18,9 +18,12 @@ from log_foundry import (
     ContinueResult,
     FlushResult,
     Health,
+    Outcome,
     Sink,
+    SinkCounters,
     SinkDeliveryError,
     SinkLosses,
+    Verdict,
     __version__,
     configure,
     continue_trace,
@@ -36,6 +39,7 @@ from log_foundry import (
     get_config,
     health,
     info,
+    read_deliver,
     read_losses,
     reset_context,
     set_baggage,
@@ -132,6 +136,91 @@ class _MySink:
         return SinkLosses(dropped=0, failed=0)
 
 
+class _MyEngineSink:
+    """A sink offering SPEC-072's optional ``deliver``, with the counters the engine writes.
+
+    Attributes:
+      log_foundry_counters: The counters the engine commits each run into.
+      max_retries: The sink's own resend budget, read by the engine.
+    """
+
+    def __init__(self) -> None:
+        """Builds the counters.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters = SinkCounters()
+        self.max_retries = 2
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Reports a fate per event, built by keyword from a tuple.
+
+        Args:
+          batch: The events to deliver.
+
+        Returns:
+          The verdict.
+
+        Raises:
+          None.
+        """
+        if not batch:
+            return Verdict(outcomes=(), retry_after=None)
+        if len(batch) == 1:
+            return Verdict(outcomes=(Outcome.ACCEPTED,), retry_after=None)
+        return Verdict.uniform(Outcome.RETRYABLE, len(batch), retry_after=1.5)
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Delivers through ``deliver`` when nothing else would.
+
+        Args:
+          batch: The events to deliver.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        offered: Callable[[list[dict[str, object]]], Verdict] | None = read_deliver(self)
+        if offered is not None:
+            offered(batch)
+
+    def close(self) -> None:
+        """Releases nothing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+    def losses(self) -> SinkLosses:
+        """Reports the engine's counters.
+
+        Args:
+          None.
+
+        Returns:
+          The counters' snapshot.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.losses()
+
+
 def _wire() -> None:
     """Exercises the top-level surface the way a consumer's startup module does.
 
@@ -220,5 +309,6 @@ _NAMES: tuple[object, ...] = (
     _HEALTH, _LOSSES, _FLUSH, _CONTINUE, _CONFIG, _LABELS, _wire, _work, _sinks,
     __version__, health, get_config, get_baggage, current_baggage_header, current_trace_context,
     read_losses, flush_sink, SinkDeliveryError, merge_headers, _BACKEND, _GROUP, _DEDUP,
+    _MyEngineSink, read_deliver, Outcome, Verdict, SinkCounters,
 )
 _READERS: tuple[Callable[..., Any], ...] = (read_losses, flush_sink)
