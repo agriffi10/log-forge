@@ -465,9 +465,9 @@ sink, so each records its answer in its class docstring and a lint holds every s
 **A sink may report per event instead of raising for the batch** (SPEC-072). The optional
 `deliver(batch) -> Verdict` returns one `Outcome` per event, by index — `ACCEPTED`, `RETRYABLE`,
 `REJECTED`, `DROPPED`, `UNKNOWN` or `SKIPPED` — and an optional `retry_after` hint. `Outcome`,
-`Verdict`, `SinkCounters` and the probe `read_deliver` are public (`sinks/verdict.py`, re-exported
-from `log_foundry`); `deliver` is never declared on the `Sink` Protocol. The probe reads the sink's
-**type** and never runs a `__getattr__`, a property or a metaclass hook: `deliver` must be a plain
+`Verdict`, `SinkCounters`, the probe `read_deliver` and the adapter `emit_via_deliver` are public
+(`sinks/verdict.py`, re-exported from `log_foundry`); `deliver` is never declared on the `Sink`
+Protocol. The probe reads the sink's **type** and never runs a `__getattr__`, a property or a metaclass hook: `deliver` must be a plain
 function in a class namespace, the `emit` ordinary lookup resolves must be a plain function on
 or below that class, defined by some class and not one set on the instance, and no class may
 define `__getattribute__` as a plain function (so an `emit` override that stamps or scrubs keeps
@@ -884,12 +884,6 @@ close it.
 
 ### Open
 
-- **An empty `auth` token or pair is accepted, and sends an empty credential** (HTTP auth fix's
-  frame-2 review; invariant 13). `HTTPSink(url, auth="")` sends `Authorization: Bearer ` and
-  `auth=("", "")` sends `Basic Og==` (reproduced at `a8d87119`), so against an endpoint that
-  requires credentials every request is refused, on every `emit`, for the life of the process.
-  **Closed by** refusing an empty token and an all-empty pair at construction, or recording either
-  as deliberate.
 - **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
   (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
   `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
@@ -1078,6 +1072,19 @@ close it.
 
 ### Resolved
 
+- ~~**An empty `auth` token or pair is accepted, and sends an empty credential**~~ (HTTP auth fix's
+  frame-2 review; invariant 13) → **closed by the 1.2.0 follow-up fix (no spec)**, by refusal, at
+  Andrew's direction. `HTTPSink(url, auth="")` sent `Authorization: Bearer ` and
+  `auth=("", "")` sent `Basic Og==` (reproduced at `a8d87119`), so against an endpoint requiring
+  credentials every request was refused for the life of the process. Both are now a `ValueError`
+  at construction from `HTTPSink` and every sink forwarding `auth`, naming `auth` and never a
+  value, judged on the exact-`str` copy after the `Authorization` conflict, so an empty `auth`
+  beside that header gets the conflict's message and `SplunkHECSink` keeps its own refusal of any
+  `auth`. A pair with one empty half, `("key", "")` or `("", "token")`, still constructs: RFC 7617
+  allows it and real services take a key as the user with no password, so it was not already
+  broken. `tests/test_sinks_http_auth.py` guards both across every forwarder. The reasoning:
+  *`auth` beside an `Authorization` header is refused, never resolved by precedence*, in
+  `docs/decisions/sink-delivery/`.
 - ~~**A caller's `headers=` silently replaces a platform sink's own credential header**~~ (HTTP auth
   fix's build; invariant 13) → **closed by the HTTP auth fix (no spec)**, by refusal. A caller
   name folding to Splunk's `Authorization`, Datadog's `DD-API-KEY`, New Relic's `Api-Key` or

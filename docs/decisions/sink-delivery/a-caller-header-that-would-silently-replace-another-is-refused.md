@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A caller header that would silently replace another is refused"
-description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — every key of the base it hands `merge_headers` with `argument=` — is a `ValueError` at construction naming the argument it would replace; two caller names folding to one are refused by `_valid_headers`; `gzip=True` beside a caller `Content-Encoding` naming another coding is refused. None quotes a value. Without `argument=`, `merge_headers` lets the caller win, as in 1.x. Do NOT let either side win silently on a shipped sink, or hand-list the credential headers: a run-time roster replays each header one default emit per sink sends, and an AST scan names writes to any `headers` map. (HTTP auth fix, no spec; reverses SPEC-048 FR-007)"
+description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — a key of the base it hands `merge_headers` with `argument=` — is a `ValueError` at construction naming the argument it would replace; two caller names folding to one are refused; a caller `Content-Encoding`, read by the bytes it sends, is refused beside `gzip=True` unless it names gzip and beside `gzip=False` unless it is `identity` or empty, and then decides every body. None quotes a value. Without `argument=`, `merge_headers` lets the caller win, as in 1.x. Do NOT let either side win silently on a shipped sink, or hand-list the credential headers: a run-time roster and an AST scan derive them. (HTTP auth fix and the 1.2.0 follow-up fix, no spec; reverses SPEC-048 FR-007)"
 ---
 
 **A caller header is refused at construction when it would silently replace another header,
@@ -23,7 +23,21 @@ header, so no later check can quote one first, and it folds both sides as the ex
 `_valid_headers` copies every header name and `str` value as the exact `str` it stores before any
 check and stores the copies, so a `str` subclass's `capitalize` cannot fold one way at construction
 and another on the wire, and a refusal prints the stored text, never a `__repr__`; a name that is
-not a `str` is a `TypeError` naming its type. It then refuses the second of two names folding
+not a `str` is a `TypeError` naming its type. **A value that is not a `str` is copied once too**
+(the 1.2.0 follow-up fix), by `_sent_value`, into what `putheader` would send. An exact `int`,
+`bool` or `bytes` is kept as given, since `putheader` runs no caller code for one. Any other value
+— an `int` subclass with its own `__str__`, an object with its own `encode` or `__getattribute__`,
+a `bytearray` or `memoryview` — goes through `putheader`'s own three branches once, at
+construction, and is stored as exact `bytes`. So a caller object's methods run only at
+construction, never per `emit`, and a `bytearray` changed afterwards, or an object that would
+answer differently later, sends what it held then, as `auth` does. It used to be stored as the
+caller's object, its code run inside `putheader` on every request, free to answer differently from
+the check. The wire bytes are unchanged: `tests/test_sinks_http_header_values.py` pins, byte for
+byte, a raw-socket request head captured at `c4e51fbd` with fifteen value shapes. Nothing that
+constructed before is refused: the `putheader` check judges the copy and catches the same two
+exceptions, and the `CR`/`LF` check still reads `str(value)` once, so a `bytes` value holding `CRLF`
+followed by a space or tab, the obsolete line folding `putheader` admits, is still admitted.
+`_valid_headers` then refuses the second of two names folding
 together, `<Owner> headers 'x-a' and 'X-A' name the same header, which is sent once; drop one`,
 after the whitespace refusal, so names differing only by whitespace meet that one instead. A
 platform sink's own header beside a caller's spelling of it gets the credential message, never the
@@ -36,23 +50,44 @@ resolved by precedence*: either winner drops an argument the caller wrote, and a
 was not sending what it was given breaks only a program that was already wrong. Andrew decided on
 2026-11-07 that 1.2.0 refuses both gaps.
 
-**`gzip=True` and a `Content-Encoding` header.** They are two arguments setting one header, so
-the same rule settles them. SPEC-048 FR-007 let the caller's header win and sent the body
-uncompressed, which silently ignored `gzip=True`; Andrew decided on 2026-11-07 to refuse the
-pairing instead. `_valid_encoding` runs after `_valid_headers` and finds the header by folded name
-(`_caller_encoding`), so `gzip=True` beside a `Content-Encoding` in any case whose value does not
-name gzip — `identity`, `br`, a list such as `gzip, br`, the empty string, a value that is not a
-`str` — raises `<Owner> gzip=True cannot apply beside header 'content-encoding', which names
-another encoding; drop gzip= or the header`, naming the caller's spelling and never the value.
-A value naming gzip, `gzip` or `x-gzip` (RFC 9110 §8.4.1.3), in any case and with surrounding
-spaces and tabs stripped (`_names_gzip`),
-is no contradiction: the body is compressed and sent under the caller's header. `gzip=False`
-beside any `Content-Encoding` sends the caller's header over an uncompressed body. The check
+**`gzip` and a `Content-Encoding` header.** They are two arguments setting one header, so the
+same rule settles them: the caller's header must be true of the body the sink sends. SPEC-048
+FR-007 let the caller's header win and sent the body uncompressed, which silently ignored
+`gzip=True`; Andrew decided on 2026-11-07 to refuse that pairing, and on 2026-11-08 to refuse its
+twin, `gzip=False` beside a header naming a coding. `_valid_encoding` runs after `_valid_headers`
+and finds the header by folded name (`_caller_encoding`). It reads the value by **the bytes it
+sends**, never by its type (`_wire_text`): a `str` as itself, `bytes` decoded as Latin-1, an `int`
+or `bool` as `putheader` formats it, so `b"gzip"` names gzip exactly as `"gzip"` does and `5` or
+`True` is a coding of that name. A value is read as one token, in any case and with surrounding
+spaces and tabs stripped; a list is not read further.
+
+- Beside `gzip=True`, a value naming gzip, `gzip` or `x-gzip` (RFC 9110 §8.4.1.3; `_names_gzip`),
+  is no contradiction: the body is compressed and sent under the caller's header. Any other —
+  `identity`, `br`, a list such as `gzip, br`, an empty value, `5` — raises `<Owner> gzip=True
+  cannot apply beside header 'content-encoding', which names another encoding; drop gzip= or the
+  header`.
+- Beside `gzip=False`, the default, the sink sends the body as built, so the caller cannot have
+  encoded it. A value naming any coding other than `identity` — `gzip`, `br`, any list
+  (`identity, identity` included), `5` — raises `<Owner> gzip=False, the default, cannot apply
+  beside header 'content-encoding', which names an encoding the body is not in; drop the header,
+  or pass gzip=True if it names gzip`. `identity`, and a value empty once stripped (an empty list
+  of codings, which names none), are true labels and construct (`_names_no_coding`), as `bytes` or
+  as `str`. Until this fix it constructed and sent the caller's label over an uncompressed body on
+  every request, which a destination honouring the label cannot decode, so the configuration was
+  already broken and the refusal breaks only a program that was already wrong.
+
+Both messages name `gzip` and the caller's spelling of the header, never its value. The check
 reaches every class forwarding `gzip`, `LogstashSink`'s HTTP mode under `HTTPSink`'s name;
-`SentrySink` takes no `gzip`. `_prepare` keeps its per-request suppression for a non-gzip value,
-read through the same `_caller_encoding`, because `gzip` is a public attribute: set true after
-construction beside an `identity` header, the body is still sent uncompressed rather than
-compressed under a label that says otherwise.
+`SentrySink` takes no `gzip`.
+
+**Once a caller `Content-Encoding` is set, it decides the body on every request.** `gzip` is a
+public attribute `_prepare` reads per request, so a sink built with `gzip=True` beside
+`Content-Encoding: gzip` and then set `gzip = False` sent an uncompressed body under the gzip label
+on every request. `_prepare` now compresses exactly when the caller's header names gzip, read
+through the same `_caller_encoding` construction judged, whatever `self.gzip` says; set true beside
+an `identity` header, the body is still sent as built. With no caller header `self.gzip` decides,
+as it always has, and the sink writes its own `Content-Encoding: gzip`. Construction lets a header
+through only when the two agree; this rule keeps them agreeing after it.
 
 **What stays overridable.** Only a credential header is protected from the caller. `Content-Type`
 and the `Content-Encoding` `HTTPSink` writes per request sit beneath the caller's headers
@@ -106,11 +141,32 @@ nobody's approval, and was reverted as a technical correction.
   sink's working override of its own default, a break in a public function's behaviour.
 - *Either guard alone.* The scans missed a new route each round, and the run-time roster sees one
   default request; together each covers the other's blind spot.
+- *`gzip=False` beside any `Content-Encoding` sends the caller's header,* as this decision first
+  pinned. A header naming `gzip` or `br` over a body the sink did not encode is a label the body is
+  not in, on every request — one argument made untrue by another, the failure refused here.
+- *Judging a `Content-Encoding` value by its type.* The follow-up fix's first version read every
+  value that was not a `str` as naming nothing, which refused `b"identity"` beside `gzip=False` and
+  `b"gzip"` beside `gzip=True` though each label was true: a refusal of a configuration that was
+  not broken, which SPEC-049 does not allow.
+- *`self.gzip` deciding the body after construction beside a caller header.* Setting the public
+  attribute could then put a body under a label it is not in, which construction had just refused.
 
 ## History
 
 ### 2026-11-08
 
+- **Revised (the 1.2.0 follow-up fix, no spec), at Andrew's direction.** `gzip=False`, the
+  default, beside a caller `Content-Encoding` naming any coding other than `identity` is refused
+  at construction, reversing the case this decision pinned on 2026-11-07, that `gzip=False` beside
+  any `Content-Encoding` sends the caller's header over an uncompressed body. `identity`, an empty
+  or whitespace value, and no header construct. Two technical refinements landed with it: a value
+  is read by the bytes it sends, so `b"identity"` beside `gzip=False` and `b"gzip"` beside
+  `gzip=True` construct while `5` and `True` name a coding and are refused by both; and a caller
+  `Content-Encoding` decides the body on every request, whatever `gzip` is set to later.
+- **Refined (the 1.2.0 follow-up fix, no spec).** A header value that is not a `str` is copied
+  once, at construction, into the bytes `putheader` would send (`_sent_value`), so a caller
+  object's code runs only at construction; an exact `int`, `bool` or `bytes` is kept as given.
+  The wire bytes and the set of refused values are unchanged.
 - **Corrected (HTTP auth fix, no spec).** The run-time roster sees one default first-attempt
   request per sink, not every header a sink can send, so the AST route scan, which now names any
   write to a `headers` map, is a guard beside it rather than a supplement. `merge_headers` runs no

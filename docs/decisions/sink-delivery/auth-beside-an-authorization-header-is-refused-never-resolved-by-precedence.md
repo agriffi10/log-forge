@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "`auth` beside an `Authorization` header is refused, never resolved by precedence"
-description: "`auth=` beside an `Authorization` header in any case, matched by the name `urllib` sends (`http._wire_name`), is a `ValueError` at construction from `HTTPSink` and every sink forwarding `auth`, judged before the credential and naming no value; `SplunkHECSink`, which sends its token as that header, refuses any `auth=`. Credentials are copied once, at construction, as exact `str`, and every request sends the `Authorization` value built from the copy then. Do NOT resolve the conflict by letting either side win, or match the header by exact case. A caller header naming a platform sink's own credential header is refused under *A caller header that would silently replace another is refused*. (HTTP auth fix, no spec)"
+description: "`auth=` beside an `Authorization` header in any case, matched by the name `urllib` sends (`http._wire_name`), is a `ValueError` at construction from `HTTPSink` and every sink forwarding `auth`, judged before the credential and naming no value; `SplunkHECSink`, which sends its token as that header, refuses any `auth=`. Credentials are copied once, as exact `str`, and every request sends the value built then; `\"\"` and `(\"\", \"\")` are refused after the conflict, a pair with one empty half is not. Do NOT resolve the conflict by letting either side win, or match the header by exact case. A caller header naming a platform sink's own credential header is refused under *A caller header that would silently replace another is refused*. (HTTP auth fix and the 1.2.0 follow-up fix, no spec)"
 ---
 
 **Credentials and an `Authorization` header given together are refused at construction, because
@@ -69,6 +69,21 @@ time it is iterated, or a `str` subclass answering differently later, is frozen 
 pair outside `tuple[str, str]` is refused by real type (*An argument door asks the type, never the
 value*).
 
+**An empty credential is refused** (the 1.2.0 follow-up fix, Andrew's call). `auth=""` sent
+`Authorization: Bearer ` and `auth=("", "")` sent `Basic Og==` on every request, so against an
+endpoint that requires credentials every `emit` was refused for the life of the process. Both now
+raise `<Owner> auth is empty, so every request would carry an empty credential; drop auth= or give
+it a value`, naming `auth` and never a value, from `HTTPSink` and every sink forwarding `auth`. The
+check compares the exact-`str` copy above, so it runs no caller code, and it sits after the
+conflict, which is judged first by design: an empty `auth` beside an `Authorization` header gets
+the conflict message, and `SplunkHECSink` keeps its own refusal of any `auth`. A pair with one
+empty half, `("key", "")` or `("", "token")`, still constructs and is sent: RFC 7617 allows an
+empty user-id or password, and real services take an API key as the user with no password, so it
+was not already broken and refusing it would break a working program. It lives here rather than
+under *A bad argument is floored if it works and refused if it is already broken; a new one is
+refused*, whose rule it follows, because it is a property of how `_valid_auth` judges the copy
+and that fence has no room.
+
 **Next to it.** A caller header naming a platform sink's own credential header, and two caller
 header names folding to one, were the same class of gap, found during this fix's build. Both are
 refused too, by their own rule: *A caller header that would silently replace another is refused*.
@@ -84,7 +99,9 @@ refused too, by their own rule: *A caller header that would silently replace ano
 **The guard.** `tests/test_sinks_http_auth.py` sweeps every shipped `HTTPSink` subclass, found
 transitively and held to the render sweep's recipes, plus `HTTPSink` and `LogstashSink`, for the
 refusal in each case, Splunk's own wording, a token the check never reaches, `auth` sent beside a
-header that only contains the word, and a one-shot pair sent on every request; a whitespace
+header that only contains the word, a one-shot pair sent on every request, an empty token or pair
+refused (after the conflict, and by Splunk's own message) and a pair with one empty half sent
+through every forwarder; a whitespace
 spelling of `Authorization` is refused as a header name, before the conflict is reached.
 It also scans every `extra_headers=` key in `src/` and fails naming one that folds to
 `Authorization` or is not a literal. `tests/test_sinks_http_header_names.py` holds the whitespace
@@ -92,6 +109,13 @@ refusal itself, and `tests/test_sinks_http_header_merge.py` the platform sinks' 
 `headers=`.
 
 ## History
+
+### 2026-11-08
+
+- **Refined (the 1.2.0 follow-up fix, no spec), at Andrew's direction.** An empty token and an
+  all-empty pair are refused at construction, after the `Authorization` conflict and Splunk's own
+  refusal; a pair with one empty half still constructs. Closed the `architecture.md` §12 entry
+  the HTTP auth fix's frame-2 review had left open.
 
 ### 2026-11-07
 

@@ -245,6 +245,13 @@ joins the documented layout the freeze covers. `__all__` goes from 30 names to 3
 it. `Verdict` is a frozen, keyword-only dataclass that grows by appending fields, as every public
 dataclass does. `configure()`, `Config` and every existing signature are unchanged.
 
+> **Superseded in part by the 1.2.0 follow-up fix (no spec), at Andrew's direction.**
+> `emit_via_deliver` (FR-006) is public too, at `log_foundry` and `log_foundry.sinks.verdict`, its
+> own definition there delegating to the private engine, keyword-first with `sink` and `batch` its
+> only positional parameters, so `__all__` goes from 30 names to 35. FR-001's criterion pinning
+> exactly four new names no longer holds; FR-006's `_engine` function is unchanged. The decision:
+> *The frozen surface is the import path, not just the class*, in `docs/decisions/public-api/`.
+
 #### Acceptance Criteria:
 
 - [ ] `Verdict(outcomes=(Outcome.ACCEPTED, Outcome.RETRYABLE), retry_after=2.0)` constructs, a
