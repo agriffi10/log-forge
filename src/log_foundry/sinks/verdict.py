@@ -22,7 +22,7 @@ from log_foundry.sinks.base import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-__all__ = ["Outcome", "SinkCounters", "Verdict", "read_deliver"]
+__all__ = ["Outcome", "SinkCounters", "Verdict", "emit_via_deliver", "read_deliver"]
 
 
 class Outcome(enum.Enum):
@@ -310,3 +310,74 @@ def read_deliver(sink: object) -> Callable[[list[dict[str, object]]], Verdict] |
     """
     probe = _probe(sink)
     return None if probe is None else probe[0]
+
+
+def emit_via_deliver(
+    sink: object,
+    batch: list[dict[str, object]],
+    *,
+    deliver: Callable[[list[dict[str, object]]], Verdict] | None = None,
+) -> None:
+    """Delivers a batch through the sink's own ``deliver``, as that sink's ``emit`` should.
+
+    **What it is for.** A sink that defines ``deliver(batch) -> Verdict`` still has to define
+    ``emit``, because ``emit`` is the 1.x contract every caller outside the worker uses: a
+    wrapper calling ``inner.emit(batch)``, a subclass calling ``super().emit(batch)``, a test, an
+    application that ships one batch by hand. Make that ``emit`` this call, so both routes run the
+    same delivery::
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            emit_via_deliver(self, batch)
+
+    **What it does.** It runs the delivery engine the worker runs, inline on the calling thread:
+    ``deliver`` is called, and only the events its verdict marks ``RETRYABLE`` are resent — plus,
+    for a sink declaring ``log_foundry_idempotent = True``, the ones it marks ``UNKNOWN``, a
+    verdict it could not read, and an exception its ``_retryable_error`` accepts — within
+    ``max_retries + 1`` rounds, the sink's own ``max_retries`` read as an exact ``int`` floored
+    at zero (zero when it has none). Between rounds it waits the 1.x backoff, cut short by the
+    sink's ``log_foundry_stop_signal``, or a verdict's ``retry_after`` bounded by the sink's
+    ``max_retry_after``. Once, when the run ends, it counts every event that did not land into
+    the sink's ``log_foundry_counters``, which ``losses()`` then reports; ``DROPPED`` events are
+    counted only when the call returns rather than raises, as a 1.x ``emit``'s were.
+
+    **The 1.x** ``emit`` **contract it keeps.** It returns normally when anything landed, when the
+    verdict could not be read, and when an event's outcome is ``UNKNOWN`` — a partial outcome is
+    counted, never raised — and it raises :class:`~log_foundry.SinkDeliveryError` only when the run
+    failed outright, naming counts and the sink's type, never an event's data. An empty batch
+    returns at once, before anything about the sink is checked, since ``emit([])`` never raises.
+    To the worker's retry rule the call is one attempt, as any 1.x ``emit`` is, and it is never
+    declined.
+
+    **What it asks of the sink.** A ``deliver`` it can find, and ``log_foundry_counters`` set to
+    exactly a :class:`SinkCounters`; without either it raises ``TypeError`` naming the sink's type
+    and the missing member, so a misspelt member is a failure the worker counts rather than events
+    that vanish. With ``deliver=None`` the sink's class is searched for one the way
+    :func:`read_deliver` searches, except that an ``emit`` the class defines does not hide it —
+    this *is* that ``emit`` — and a ``deliver = None`` opt-out is passed over for one further up.
+    ``deliver=`` hands it the callable to run instead. Every member it reads from the sink is
+    read statically, so no ``__getattr__``, ``__getattribute__`` or property of the sink runs; a
+    property in place of a member reads as that member missing.
+
+    **Its surface.** ``sink`` and ``batch`` are its only positional parameters, and anything it
+    gains in 1.x is keyword-only with a default, as ``deliver`` is; it returns ``None``. This is
+    the documented import path, beside :class:`Verdict`; the engine behind it is private and free
+    to move.
+
+    Args:
+      sink: The sink whose ``emit`` this is — normally ``self``.
+      batch: The events, as ``emit`` received them. The list is not mutated.
+      deliver: The ``deliver`` to run, or ``None`` to find the sink's own.
+
+    Returns:
+      None.
+
+    Raises:
+      TypeError: When the sink has no usable ``deliver`` or no ``log_foundry_counters`` that is
+        exactly a ``SinkCounters``, naming its type's stored name and the missing member.
+      SinkDeliveryError: When the run delivered nothing and something was rejected, unresolved
+        or raised, naming counts and the sink's type, never a value.
+      BaseException: Whatever ``deliver`` raises that is not an ``Exception``, unchanged.
+    """
+    from log_foundry.sinks import _engine
+
+    _engine.emit_via_deliver(sink, batch, deliver=deliver)

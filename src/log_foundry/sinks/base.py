@@ -201,7 +201,8 @@ class Sink(Protocol):
     attributes refine it: ``log_foundry_idempotent = True`` (exactly ``True``) lets an
     ``UNKNOWN`` outcome, an unreadable verdict or an exception escaping ``deliver`` be resent,
     the last only when the sink's ``_retryable_error`` accepts it. Such a sink's ``emit`` should
-    be ``emit_via_deliver(self, batch)``, which runs the same engine inline and raises when the
+    be ``emit_via_deliver(self, batch)`` — public at ``log_foundry`` and
+    ``log_foundry.sinks.verdict`` — which runs the same engine inline and raises when the
     run fails, so a wrapper calling ``inner.emit(batch)`` sees what a 1.x ``emit`` showed it.
     **A ``deliver`` must not call its own ``emit``**, and must not mutate the list it is given.
     """

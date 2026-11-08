@@ -2498,14 +2498,20 @@ _THIRTY = (
 )
 """The top-level surface of 1.1.0, written out from ``39a3f08c``."""
 
-_VERDICT_NAMES = ("Outcome", "SinkCounters", "Verdict", "read_deliver")
+_VERDICT_NAMES = ("Outcome", "SinkCounters", "Verdict", "emit_via_deliver", "read_deliver")
+"""SPEC-072's four, and ``emit_via_deliver``, made public for 1.2.0 because the ``Sink`` docstring
+already told third-party authors to make it their ``emit`` while it lived in private ``_engine``."""
 
 
-def test_all_is_the_thirty_plus_the_four_verdict_names() -> None:
-    """FR-001 AC8: the 30 names plus exactly the four, none leaving, each once."""
+def test_all_is_the_thirty_plus_the_five_verdict_names() -> None:
+    """FR-001 AC8: the 30 names plus exactly the five, none leaving, each once."""
     assert len(set(_THIRTY)) == 30
-    assert len(log_foundry.__all__) == len(set(log_foundry.__all__)) == 34
+    assert len(log_foundry.__all__) == len(set(log_foundry.__all__))
     assert set(log_foundry.__all__) == {*_THIRTY, *_VERDICT_NAMES}
+    assert set(log_foundry.__all__) - {*_THIRTY, "Outcome", "SinkCounters", "Verdict"} == {
+        "emit_via_deliver",
+        "read_deliver",
+    }
 
 
 def test_the_verdict_names_resolve_at_both_import_paths() -> None:
@@ -2515,6 +2521,52 @@ def test_the_verdict_names_resolve_at_both_import_paths() -> None:
     assert verdict.__all__ == sorted(_VERDICT_NAMES)
     for name in _VERDICT_NAMES:
         assert getattr(log_foundry, name) is getattr(verdict, name), name
+
+
+def test_emit_via_deliver_is_defined_at_its_documented_path_and_keyword_first() -> None:
+    """1.2.0: the public name lives in ``sinks/verdict``, ``deliver`` keyword-only, as the engine's.
+
+    The engine behind it stays private: the public function is its own definition, so the
+    documented path does not depend on ``_engine``'s name, and it forwards every parameter.
+    """
+    from log_foundry.sinks import _engine, verdict
+
+    public = verdict.emit_via_deliver
+    assert public.__module__ == "log_foundry.sinks.verdict"
+    assert public is not _engine.emit_via_deliver
+    signature = inspect.signature(public)
+    assert signature == inspect.signature(_engine.emit_via_deliver)
+    kinds = [(p.name, p.kind) for p in signature.parameters.values()]
+    assert kinds == [
+        ("sink", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        ("batch", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+        ("deliver", inspect.Parameter.KEYWORD_ONLY),
+    ]
+    assert signature.parameters["deliver"].default is None
+    doc = " ".join((public.__doc__ or "").split())
+    for clause in ("emit_via_deliver(self, batch)", "SinkDeliveryError", "keyword-only"):
+        assert clause in doc, clause
+
+
+def test_emit_via_deliver_forwards_sink_batch_and_deliver_to_the_engine(monkeypatch) -> None:
+    """The public function is the engine's adapter by delegation, every argument passed through."""
+    from log_foundry.sinks import _engine
+
+    seen: list[tuple[object, object, object]] = []
+    monkeypatch.setattr(
+        _engine,
+        "emit_via_deliver",
+        lambda sink, batch, *, deliver: seen.append((sink, batch, deliver)),
+    )
+    sink, batch = object(), [{"i": 1}]
+
+    def given(events: list[dict[str, object]]) -> object:
+        return None
+
+    assert log_foundry.emit_via_deliver(sink, batch) is None
+    log_foundry.emit_via_deliver(sink, batch, deliver=given)
+
+    assert seen == [(sink, batch, None), (sink, batch, given)]
 
 
 def test_configure_and_config_gain_nothing() -> None:
