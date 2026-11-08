@@ -79,7 +79,16 @@ conflict, which is judged first by design: an empty `auth` beside an `Authorizat
 the conflict message, and `SplunkHECSink` keeps its own refusal of any `auth`. A pair with one
 empty half, `("key", "")` or `("", "token")`, still constructs and is sent: RFC 7617 allows an
 empty user-id or password, and real services take an API key as the user with no password, so it
-was not already broken and refusing it would break a working program. It lives here rather than
+was not already broken and refusing it would break a working program. A token of only spaces and
+tabs counts as empty, since a recipient strips a field value's surrounding whitespace (RFC 9110
+§5.5) and receives a bare `Bearer`; a pair of whitespace halves does not, since base64 makes it
+credential bytes. The same rule covers the platform sinks' own credential arguments —
+`api_key` for `DatadogSink`, `NewRelicSink` and `HoneycombSink`, `token` for `SplunkHECSink` —
+each of which sent its credential header empty: `_refuse_empty_credential` raises `<Owner>
+<argument> is empty, so every request would carry an empty credential; give it a value` on the
+exact-`str` copy, last, so a configuration refused for another reason keeps its message, and a
+derived roster (`tests/test_sinks_http_credentials.py`) fails by name on a credential argument it
+does not cover. It lives here rather than
 under *A bad argument is floored if it works and refused if it is already broken; a new one is
 refused*, whose rule it follows, because it is a property of how `_valid_auth` judges the copy
 and that fence has no room.
@@ -114,7 +123,8 @@ refusal itself, and `tests/test_sinks_http_header_merge.py` the platform sinks' 
 
 - **Refined (the 1.2.0 follow-up fix, no spec), at Andrew's direction.** An empty token and an
   all-empty pair are refused at construction, after the `Authorization` conflict and Splunk's own
-  refusal; a pair with one empty half still constructs. Closed the `architecture.md` §12 entry
+  refusal; a pair with one empty half still constructs. A token of only spaces and tabs counts as
+  empty, and the rule covers the platform sinks' credential arguments too, Andrew's call. Closed the `architecture.md` §12 entry
   the HTTP auth fix's frame-2 review had left open.
 
 ### 2026-11-07

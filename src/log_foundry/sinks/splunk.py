@@ -6,7 +6,13 @@ import json
 from typing import Unpack
 
 from log_foundry.sinks._time import epoch_seconds
-from log_foundry.sinks.http import HTTPKwargs, HTTPSink, _Item, merge_headers
+from log_foundry.sinks.http import (
+    HTTPKwargs,
+    HTTPSink,
+    _Item,
+    _refuse_empty_credential,
+    merge_headers,
+)
 
 __all__ = ["SplunkHECSink"]
 
@@ -82,7 +88,9 @@ class SplunkHECSink(HTTPSink):
             forwarded header whose name folds to ``Authorization`` is refused before that, by
             :func:`~log_foundry.sinks.http.merge_headers`, naming ``token``: it would have
             replaced the token on the wire. So the token is always the ``Authorization`` sent,
-            and the ``auth=`` refusal's wording holds in every case.
+            and the ``auth=`` refusal's wording holds in every case. Last, a ``token`` that is
+            empty or only spaces and tabs is refused (1.2.0): it sent ``Authorization: Splunk``
+            with no token on every request.
         """
         self._host = host
         self._source = source
@@ -93,6 +101,7 @@ class SplunkHECSink(HTTPSink):
             argument="token",
         )
         super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[misc]
+        _refuse_empty_credential(token, type(self).__name__, "token")
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event's HEC envelope (FR-008).

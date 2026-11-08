@@ -247,8 +247,8 @@ def test_no_coding_beside_gzip_false_is_sent_over_an_uncompressed_body(name: str
 
 
 def test_gzip_set_true_after_construction_beside_identity_still_sends_it_uncompressed() -> None:
-    """``gzip`` is a public attribute, so ``_prepare`` still reads the caller's coding per
-    request: a compressed body must never go out labelled ``identity``."""
+    """``gzip`` is a public attribute, but beside a caller header compression is fixed at
+    construction: a compressed body must never go out labelled ``identity``."""
     plain_opener = FakeOpener()
     plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
     opener = FakeOpener()
@@ -289,7 +289,7 @@ def test_gzip_set_true_after_construction_beside_an_empty_header_still_sends_it_
 @pytest.mark.parametrize("value", ["gzip", "X-GZIP", b"gzip", b" x-gzip "], ids=repr)
 def test_gzip_set_false_after_construction_beside_a_gzip_header_still_compresses(value) -> None:
     """At ``c4e51fbd``: the body went out uncompressed under the caller's ``gzip`` label on every
-    request. Once the caller set a ``Content-Encoding`` it decides the body, not ``self.gzip``."""
+    request. Once the caller set a ``Content-Encoding``, compression is fixed at construction."""
     plain_opener = FakeOpener()
     plain = _sent(HTTPSink(URL, opener=plain_opener), plain_opener)
     opener = FakeOpener()

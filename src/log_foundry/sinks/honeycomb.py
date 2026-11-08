@@ -17,6 +17,7 @@ from log_foundry.sinks.http import (
     _holds_delimiter,
     _Item,
     _read_failed,
+    _refuse_empty_credential,
     _started_request,
     _valid_base_url,
     _valid_url,
@@ -251,7 +252,9 @@ class HoneycombSink(HTTPSink):
             in a forwarded ``headers``, in any case, refused by
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class; or if a forwarded
             header's name folds to ``X-Honeycomb-Team``, which would replace ``api_key`` on the
-            wire (:func:`~log_foundry.sinks.http.merge_headers`).
+            wire (:func:`~log_foundry.sinks.http.merge_headers`); or, last, if ``api_key`` is
+            empty or only spaces and tabs, which sent an empty ``X-Honeycomb-Team`` on every
+            request (1.2.0).
         """
         _one_segment(dataset, type(self).__name__)
         _carried_in_a_path(dataset, type(self).__name__)
@@ -270,6 +273,7 @@ class HoneycombSink(HTTPSink):
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]
         )
+        _refuse_empty_credential(api_key, type(self).__name__, "api_key")
         self.rejected_events = 0
         self.dropped_unadjudicated = 0
 

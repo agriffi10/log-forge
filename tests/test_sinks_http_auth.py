@@ -693,8 +693,23 @@ class _EmptyText(str):
         lambda: iter(("", "")),
         _EmptyText(""),
         (_EmptyText(""), _EmptyText("")),
+        " ",
+        "\t",
+        " \t  ",
+        _EmptyText(" \t"),
     ],
-    ids=["token", "pair", "list", "iterator", "str-subclass", "subclass-pair"],
+    ids=[
+        "token",
+        "pair",
+        "list",
+        "iterator",
+        "str-subclass",
+        "subclass-pair",
+        "space-token",
+        "tab-token",
+        "blank-token",
+        "blank-str-subclass",
+    ],
 )
 def test_an_empty_token_or_pair_is_refused_naming_auth(auth) -> None:
     """At ``c4e51fbd``: constructs, then sends ``Bearer `` or ``Basic Og==`` on every request.
@@ -710,7 +725,7 @@ def test_an_empty_token_or_pair_is_refused_naming_auth(auth) -> None:
     _assert_chains_nothing(caught.value)
 
 
-@pytest.mark.parametrize("auth", ["", ("", "")], ids=["token", "pair"])
+@pytest.mark.parametrize("auth", ["", ("", ""), "  "], ids=["token", "pair", "blank-token"])
 @pytest.mark.parametrize("name", sorted(_FORWARDERS))
 def test_every_forwarder_refuses_an_empty_credential(name: str, auth) -> None:
     make, owner = _FORWARDERS[name]
@@ -742,14 +757,22 @@ def test_an_empty_credential_beside_an_authorization_header_meets_the_conflict_f
 
 @pytest.mark.parametrize(
     ("auth", "sent"),
-    [(("key", ""), "Basic a2V5Og=="), (("", "token"), "Basic OnRva2Vu"), (" ", "Bearer  ")],
-    ids=["empty-password", "empty-user", "space-token"],
+    [
+        (("key", ""), "Basic a2V5Og=="),
+        (("", "token"), "Basic OnRva2Vu"),
+        ((" ", " "), "Basic IDog"),
+        ((" ", ""), "Basic IDo="),
+        (" key ", "Bearer  key "),
+    ],
+    ids=["empty-password", "empty-user", "blank-halves", "blank-user", "padded-token"],
 )
 @pytest.mark.parametrize("name", sorted(_FORWARDERS))
 def test_a_pair_with_one_empty_half_constructs_and_is_sent(name: str, auth, sent: str) -> None:
     """RFC 7617 basic auth with an empty user or password is legal, and services take it — an API
     key as the user with no password — so it is not broken and is not refused. Only the wholly
-    empty token and pair are; a token of a space is not empty, and is sent as given."""
+    empty pair is. Halves of whitespace are not empty either: base64 turns ``" : "`` into the
+    credential bytes ``IDog``. A token with text in it is sent as given, padding and all; only a
+    token of nothing but spaces and tabs arrives as a bare ``Bearer``, and that one is refused."""
     make, _owner = _FORWARDERS[name]
     opener = FakeOpener()
     sink = make(auth=auth, opener=opener)

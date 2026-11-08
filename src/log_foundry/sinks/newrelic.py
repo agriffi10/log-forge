@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import Unpack
 
-from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, merge_headers
+from log_foundry.sinks.http import (
+    HTTPPlatformKwargs,
+    HTTPSink,
+    _refuse_empty_credential,
+    merge_headers,
+)
 
 __all__ = ["NewRelicSink"]
 
@@ -55,7 +60,9 @@ class NewRelicSink(HTTPSink):
             accompanies an ``Authorization`` header in a forwarded ``headers``, in any case,
             refused by :class:`~log_foundry.sinks.http.HTTPSink` naming this class, or a
             forwarded header's name folds to ``Api-Key``, which would replace ``api_key`` on
-            the wire (:func:`~log_foundry.sinks.http.merge_headers`).
+            the wire (:func:`~log_foundry.sinks.http.merge_headers`), or, last, ``api_key`` is
+            empty or only spaces and tabs, which sent an empty ``Api-Key`` on every request
+            (1.2.0).
         """
         region = region.upper()
         if region not in _HOSTS:
@@ -74,3 +81,4 @@ class NewRelicSink(HTTPSink):
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]
         )
+        _refuse_empty_credential(api_key, type(self).__name__, "api_key")

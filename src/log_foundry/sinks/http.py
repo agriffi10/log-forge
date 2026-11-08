@@ -28,7 +28,15 @@ from log_foundry.sinks._retry import (
     require_timeout,
     wait,
 )
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks.base import (
+    _ABSENT,
+    _MRO,
+    _NAMESPACE,
+    SinkDeliveryError,
+    SinkLosses,
+    _class_member,
+    _own_attribute,
+)
 
 __all__ = [
     "HTTPAuthKwargs",
@@ -983,12 +991,13 @@ def _wire_name(name: str) -> str:
 def _caller_encoding(headers: dict[str, _HeaderValue]) -> tuple[str, str] | None:
     """Returns the caller's ``Content-Encoding`` name, and the text its value sends.
 
-    One reader for :func:`_valid_encoding` at construction and :meth:`HTTPSink._prepare` per
-    request, so the two cannot disagree about which header is the caller's or what it says.
-    :func:`_valid_headers` has already refused two names that fold together, so at most one
-    matches. The name comes back as exact ``str``. The value is read by **the bytes it sends**,
-    never by its type (:func:`_wire_text`): ``b"identity"`` says ``identity`` on the wire, so it is
-    read as ``identity``, and ``5`` says ``5``, a coding named ``5``. Judging by type used to read
+    Read once, at construction, by :func:`_valid_encoding` and by ``HTTPSink.__init__``, which
+    fixes from it whether the body is compressed (:meth:`HTTPSink._compresses`), so the refusal
+    and every request read the header one way. :func:`_valid_headers` has already refused two
+    names that fold together, so at most one matches. The name comes back as exact ``str``. The
+    value is read by **the bytes it sends**, never by its type (:func:`_wire_text`):
+    ``b"identity"`` says ``identity`` on the wire, so it is read as ``identity``, and ``5`` says
+    ``5``, a coding named ``5``. Judging by type used to read
     every value that was not a ``str`` as naming nothing, which refused ``b"identity"`` beside
     ``gzip=False`` and ``b"gzip"`` beside ``gzip=True`` though each label was true.
 
@@ -1032,7 +1041,9 @@ def _wire_text(value: _HeaderValue) -> str:
     return str(value)
 
 
-def _valid_encoding(gzip: bool, headers: dict[str, _HeaderValue], owner: str) -> None:
+def _valid_encoding(
+    gzip: bool, headers: dict[str, _HeaderValue], owner: str, *, library_body: bool
+) -> None:
     """Refuses a caller ``Content-Encoding`` that the ``gzip`` argument makes untrue.
 
     The two arguments contradict each other: ``gzip=True`` says compress, and the header says
@@ -1056,17 +1067,25 @@ def _valid_encoding(gzip: bool, headers: dict[str, _HeaderValue], owner: str) ->
     as ``bytes`` or as ``str``. The message names ``gzip`` and the caller's spelling, never the
     value, as the ``gzip=True`` one does.
 
+    **That refusal holds only for the library's own** ``_body`` (``library_body``,
+    :func:`_library_body`). ``_body`` is a documented 1.x extension hook, and a subclass whose
+    ``_body`` encodes the body itself — ``zlib.compress`` beside ``Content-Encoding: deflate``, or
+    its own gzip beside ``gzip`` — built with ``gzip=False`` sends a true label, and constructed
+    in 1.1.0; refusing it would break a working sink. Such a sink keeps 1.1.0's bytes.
+
     Args:
-      gzip: The ``gzip`` argument.
+      gzip: The ``gzip`` argument, already copied as an exact ``bool``.
       headers: The caller's headers, already judged by :func:`_valid_headers`.
       owner: The class refusing it, for the message.
+      library_body: Whether the body is built by the library's own ``_body``.
 
     Returns:
       None.
 
     Raises:
       ValueError: If ``gzip`` is true and the caller's ``Content-Encoding`` names another
-        coding, or ``gzip`` is false and it names any coding but ``identity``.
+        coding, or ``gzip`` is false, the body is the library's own, and the header names any
+        coding but ``identity``.
     """
     caller = _caller_encoding(headers)
     if caller is None:
@@ -1076,12 +1095,51 @@ def _valid_encoding(gzip: bool, headers: dict[str, _HeaderValue], owner: str) ->
             f"{owner} gzip=True cannot apply beside header {caller[0]!r}, which names another "
             "encoding; drop gzip= or the header"
         )
-    if not gzip and not _names_no_coding(caller[1]):
+    if library_body and not gzip and not _names_no_coding(caller[1]):
         raise ValueError(
             f"{owner} gzip=False, the default, cannot apply beside header {caller[0]!r}, which "
             "names an encoding the body is not in; drop the header, or pass gzip=True if it "
             "names gzip"
         )
+
+
+def _library_body(sink: object) -> bool:
+    """Says whether the sink's ``_body`` is the library's own, reading it statically.
+
+    The test is the module of the class whose namespace supplies ``_body``: the library's when
+    that class is defined in ``log_foundry`` or a module under it. The class is found by
+    SPEC-072's static reader — ``_class_member`` along the MRO read through ``type``'s unbound
+    accessors — and its ``__module__`` read from that class's own namespace, so no metaclass
+    ``__getattribute__``, ``__getattr__``, ``__mro__`` or ``__module__`` property runs, and none
+    can answer for the class. A ``_body`` set on the instance itself (``_own_attribute``) is the
+    caller's. Every shipped sink that overrides ``_body`` is defined under ``log_foundry`` and so
+    is the library's own; ``LogstashSink`` builds a plain :class:`HTTPSink`.
+
+    A subclass that overrides ``_body`` only to return ``super()._body(...)`` is read as its own:
+    a static read sees where ``_body`` is defined, not what it does, so it cannot tell a body that
+    is encoded from one that is not, and it errs on the side 1.1.0 took — the sink constructs. A
+    class outside the package that writes ``__module__ = "log_foundry..."`` into its own namespace
+    is read as the library's, and so meets the refusal the shipped sinks meet; nothing is gained by
+    it. A class whose MRO cannot be read this way is read as the caller's, which refuses nothing.
+
+    Args:
+      sink: The sink under construction.
+
+    Returns:
+      Whether ``_body`` resolves to a class defined in ``log_foundry``.
+
+    Raises:
+      None.
+    """
+    try:
+        cls = type(sink)
+        found = _class_member(cls, "_body")
+        if found is None or _own_attribute(sink, "_body", found) is not _ABSENT:
+            return False
+        module = _NAMESPACE(_MRO(cls)[found[1]]).get("__module__")
+    except Exception:
+        return False
+    return type(module) is str and (module == "log_foundry" or module.startswith("log_foundry."))
 
 
 def _names_gzip(encoding: str) -> bool:
@@ -1193,10 +1251,12 @@ def _valid_auth(
 
     **An empty token or an empty pair is refused** (1.2.0): ``""`` sent ``Authorization:
     Bearer `` and ``("", "")`` sent ``Basic Og==`` on every request, a credential with nothing in
-    it. It is judged on the copy, so no caller code runs for it, and after the conflict above,
-    which is judged first by design. A pair with one empty half — a key as the user with an empty
-    password, or the reverse — is legal RFC 7617 basic auth that real services take, and is not
-    refused.
+    it. A token of only spaces and tabs is refused as empty too, since a recipient strips them and
+    receives a bare ``Bearer`` (:func:`_blank`). It is judged on the copy, so no caller code runs
+    for it, and after the conflict above, which is judged first by design. A pair with one empty
+    half — a key as the user with an empty password, or the reverse — is legal RFC 7617 basic
+    auth that real services take, and is not refused; nor is a pair of whitespace halves, which
+    base64 turns into credential bytes that are not empty.
 
     Args:
       auth: The bearer token, the user/password pair, or ``None``.
@@ -1210,7 +1270,8 @@ def _valid_auth(
     Raises:
       ValueError: If ``auth`` is given beside an ``Authorization`` header in any case, a bearer
         token contains ``CR`` or ``LF``, a value that is not a token is not a pair of two
-        ``str`` (:func:`_copied_pair`), the token is ``""`` or the pair ``("", "")``, or
+        ``str`` (:func:`_copied_pair`), the token is empty or only spaces and tabs or the pair is
+        ``("", "")``, or
         ``http.client`` cannot send the ``Authorization`` header either form builds.
     """
     if auth is None:
@@ -1224,7 +1285,7 @@ def _valid_auth(
             raise ValueError(f"{owner} auth token must not contain CR or LF")
     else:
         stored = _copied_pair(auth, owner)
-    if stored in _EMPTY_AUTH:
+    if (issubclass(type(stored), str) and _blank(cast("str", stored))) or stored == ("", ""):
         raise ValueError(
             f"{owner} auth is empty, so every request would carry an empty credential; drop "
             "auth= or give it a value"
@@ -1238,8 +1299,58 @@ def _valid_auth(
     return stored, value
 
 
-_EMPTY_AUTH = ("", ("", ""))
-"""The two credentials that carry nothing: compared against the exact-``str`` copy only."""
+_OWS = " \t"
+"""Optional whitespace (RFC 9110 §5.5), which a recipient strips from either end of a value."""
+
+
+def _blank(text: str) -> bool:
+    """Says whether an exact ``str`` holds nothing once optional whitespace is stripped.
+
+    A field value's leading and trailing space and tab are not part of it (RFC 9110 §5.5), so a
+    credential of only those arrives as no credential: ``Dd-Api-Key:    `` carries none, and
+    ``Bearer `` followed by spaces is a bare scheme.
+
+    Args:
+      text: The exact-``str`` copy of a credential.
+
+    Returns:
+      Whether it is empty or only spaces and tabs.
+
+    Raises:
+      None.
+    """
+    return not text.strip(_OWS)
+
+
+def _refuse_empty_credential(value: object, owner: str, argument: str) -> None:
+    """Refuses a credential argument that would put an empty credential on every request.
+
+    The platform sinks send their credential argument as a header of their own —
+    ``DatadogSink``'s ``api_key`` as ``DD-API-KEY``, ``SplunkHECSink``'s ``token`` as
+    ``Authorization: Splunk …`` — and ``""`` used to construct and send that header with nothing
+    in it, as ``auth=""`` sent ``Bearer `` (1.2.0, the rule :func:`_valid_auth` applies to
+    ``auth``). A value of only spaces and tabs is refused too (:func:`_blank`). The value is
+    judged as the exact ``str`` it stores, so no caller code runs; a value that is not a ``str`` is
+    left to the header checks, which judge it as they always have. The message names the argument
+    and never the value.
+
+    Args:
+      value: The credential argument as the caller passed it.
+      owner: The class refusing it, for the message.
+      argument: The argument's name, for the message.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: If ``value`` is a ``str`` that is empty or only spaces and tabs.
+    """
+    if issubclass(type(value), str) and _blank(_diag._STR_STR(cast("str", value))):
+        raise ValueError(
+            f"{owner} {argument} is empty, so every request would carry an empty credential; "
+            "give it a value"
+        )
+
 
 _NOT_A_PAIR = (set, frozenset, Mapping)
 """Containers that unpack into two items but hold no ``(user, password)`` order (SPEC-049)."""
@@ -1636,10 +1747,13 @@ class HTTPSink:
           gzip: Whether to compress the body. Refused beside a caller ``Content-Encoding``, in
             any case, that names a coding other than gzip; beside one naming gzip the body is
             compressed and sent under the caller's header. ``False`` is refused beside one naming
-            any coding but ``identity``, since the body is sent as built. A value is read by the
-            text it sends, ``bytes`` included. Once a caller ``Content-Encoding`` is set, it and
-            not this attribute decides compression on every request, so changing ``gzip`` later
-            cannot put a body under a label it is not in.
+            any coding but ``identity``, since the body is sent as built — when the body is the
+            library's own ``_body``; a subclass whose ``_body`` encodes the body itself keeps
+            1.1.0's freedom to label it. A value is read by the text it sends, ``bytes``
+            included. Anything but an exact ``bool`` is read once, with ``bool()``, and stored as
+            the ``bool`` it gave, so no ``__bool__`` runs per request. Once a caller
+            ``Content-Encoding`` is set, whether the body is compressed is fixed here from this
+            argument, and setting ``gzip`` later changes nothing (:meth:`_compresses`).
           max_retries: Retries after a failing request, floored at zero as ``Worker._emit``
             floors its own (SPEC-021) — a negative value otherwise skipped the loop entirely, so
             the request was abandoned with no attempt made and no counter moved. Anything but an
@@ -1708,7 +1822,11 @@ class HTTPSink:
         self._headers = _valid_headers(
             dict(headers) if headers is not None else {}, type(self).__name__
         )
-        _valid_encoding(gzip, self._headers, type(self).__name__)
+        gzip = gzip if type(gzip) is bool else bool(gzip)
+        _valid_encoding(
+            gzip, self._headers, type(self).__name__, library_body=_library_body(self)
+        )
+        self._fixed_compression = None if _caller_encoding(self._headers) is None else gzip
         self._auth, self._authorization_value = _valid_auth(
             auth, type(self).__name__, self._headers, self._AUTH_CONFLICT
         )
@@ -1849,9 +1967,10 @@ class HTTPSink:
         SPEC-026 exist to prevent, and it also inflated ``dropped``, whose contract is an exact
         count. Comparing like with like would mean gzipping each candidate purely to decide
         whether to ask, which costs more than the request it saves. It used to ask ``self.gzip``,
-        which a caller ``gzip`` header now overrules per request, so a sink set ``gzip = False``
-        after construction beside ``Content-Encoding: gzip`` compressed its body and yet discarded
-        that 6,000-byte event unsent; the two reads are one predicate now.
+        which no longer decides once a caller ``Content-Encoding`` fixes compression at
+        construction, so a sink set ``gzip = False`` afterwards beside ``Content-Encoding: gzip``
+        compressed its body and yet discarded that 6,000-byte event unsent; the two reads are one
+        predicate now.
 
         Args:
           chunk: The chunk about to be sent.
@@ -2448,18 +2567,19 @@ class HTTPSink:
         on every ``emit`` — in exact case since SPEC-048 FR-007, and in any case once the name was
         folded.
 
-        **The rule, per request: when the caller set a** ``Content-Encoding``, **the header
-        decides the body, whatever** ``self.gzip`` **says now** (1.2.0). The body is compressed
-        exactly when the header names gzip, and never under any other header. With no caller
-        header, ``self.gzip`` decides, as it always has. :func:`_valid_encoding` lets a header
-        survive construction only when it names gzip beside ``gzip=True`` or names no coding beside
-        ``gzip=False``, so at construction the two agree; the rule is what keeps them agreeing
-        after it, because ``gzip`` is a public attribute. A sink whose ``gzip`` is set true beside
-        an ``identity`` header still sends the body as built, and one whose ``gzip`` is set false
+        **When the caller set a** ``Content-Encoding``, **whether the body is compressed is fixed
+        at construction** (1.2.0, :meth:`_compresses`), from the ``gzip`` given then, and setting
+        ``gzip`` afterwards changes nothing. For the library's own ``_body``,
+        :func:`_valid_encoding` lets a header survive construction only when it names gzip beside
+        ``gzip=True`` or names no coding beside ``gzip=False``, so the fixed decision is exactly
+        "compressed when the header names gzip": a sink whose ``gzip`` is set true beside an
+        ``identity`` header still sends the body as built, and one whose ``gzip`` is set false
         beside a ``gzip`` header still compresses — it used to send an uncompressed body under the
-        caller's ``gzip`` label on every request. The header is read per request by the same
-        :func:`_caller_encoding` construction judged, by the text its value sends, so construction
-        and the wire cannot disagree about what it says.
+        caller's ``gzip`` label on every request. For a subclass whose own ``_body`` encodes the
+        body, built with ``gzip=False`` beside its own label, it keeps 1.1.0's bytes and is never
+        compressed a second time, where setting ``gzip`` true used to gzip it again. With no
+        caller header, ``self.gzip`` decides per request, as it always has, and the sink writes
+        its own ``Content-Encoding: gzip``.
 
         Args:
           body: The serialized batch.
@@ -2479,7 +2599,7 @@ class HTTPSink:
         data = body
         if self._compresses():
             data = _gzip.compress(body)
-            if _caller_encoding(self._headers) is None:
+            if self._fixed_compression is None:
                 headers["Content-Encoding"] = "gzip"
         self._apply_auth(headers)
         return headers, data
@@ -2487,11 +2607,14 @@ class HTTPSink:
     def _compresses(self) -> bool:
         """Says whether this request's body is gzipped: the one rule every send-path read asks.
 
-        With a caller ``Content-Encoding``, the header decides — compressed exactly when it names
-        gzip — and otherwise ``self.gzip`` does, read now, since it is a public attribute.
-        :meth:`_prepare` compresses by it and :meth:`_known_refused` stands down by it, so the
-        refusal memory, which holds uncompressed lengths, is never applied to a body that went out
-        compressed.
+        With a caller ``Content-Encoding``, the decision fixed at construction answers
+        (``_fixed_compression``, the ``gzip`` given then, which for the library's own ``_body``
+        is exactly "the header names gzip"); otherwise ``self.gzip`` does, read now, since it is
+        a public attribute. Construction stores ``gzip`` as an exact ``bool``, so no caller
+        ``__bool__`` runs here; only a non-``bool`` assigned to ``gzip`` afterwards is asked, by
+        ``bool()``, as 1.x asked it. :meth:`_prepare` compresses by this and
+        :meth:`_known_refused` stands down by it, so the refusal memory, which holds uncompressed
+        lengths, is never applied to a body that went out compressed, and the two cannot disagree.
 
         Args:
           None.
@@ -2502,10 +2625,10 @@ class HTTPSink:
         Raises:
           None.
         """
-        caller = _caller_encoding(self._headers)
-        if caller is None:
-            return bool(self.gzip)
-        return _names_gzip(caller[1])
+        if self._fixed_compression is not None:
+            return self._fixed_compression
+        gzip = self.gzip
+        return gzip if type(gzip) is bool else bool(gzip)
 
     def _apply_auth(self, headers: dict[str, _HeaderValue]) -> None:
         """Applies bearer-token or basic-auth credentials, when the sink was given any.
