@@ -213,16 +213,23 @@ adopts it: an unusable ceiling (`0`, negative, `NaN`) means backoff, and an infi
 hint up to `MAX_WAIT`. One round has one wait, so a batch whose several chunks failed retryably
 waits once per round, where 1.x waited once per chunk.
 
-**A hook fault costs its chunk.** The round calls each hook a subclass can override (`_body`,
-`_outcomes` and `_handle_response`) under a guard catching `Exception`, never `BaseException`:
+**A hook fault costs its chunk.** The round runs everything that builds a chunk's request (`_body`,
+`_prepare`, `_apply_auth` and the construction of the `urllib.request.Request`), and the `2xx`
+readers (`_outcomes` and `_handle_response`), under a guard catching `Exception`, never
+`BaseException`:
 
-- If `_body` raises, the chunk's events are `DROPPED` and counted on `_unrenderable`, as a render
-  fault is (SPEC-058). Nothing was sent, and the same bytes would fail the same way.
+- If anything raises before the request is handed to `_attempt` (`_body`, `_prepare`,
+  `_apply_auth` or building the `Request`), the chunk's events are `DROPPED` and counted on
+  `_unrenderable`, with the same line a `_body` fault writes, as a render fault is (SPEC-058).
+  Nothing was sent, and the same inputs would fail the same way.
 - If the `2xx` reader raises, the request succeeded and its events may have landed. The chunk goes
   through the unreadable-response method (FR-003) and its events are `UNKNOWN`.
 
-A fault in one of those three hooks therefore never escapes `deliver`. Under SPEC-072 an escaped
-exception fails the run, which would report total failure for a batch whose other chunks landed.
+A `deliver` of this family therefore never raises an `Exception`. A fault from `_attempt` or the
+opener is classified by FR-001's table, and a fault building the request or reading a `2xx` is
+under the guard.
+Under SPEC-072 an escaped exception fails the run, which would report total failure for a batch
+whose other chunks landed.
 
 **`_send` keeps its 1.x contract** for its callers outside the chunk path: `SentrySink`'s fallback,
 and a third-party subclass that builds its own body.
@@ -300,6 +307,9 @@ sink, not only through `_send`, and no rule here can forbid it. What holds inste
 - [ ] A subclass whose `_body` raises `ValueError` for one chunk of three has that chunk's events
       counted on `losses().dropped` once, with a line naming `ValueError`. The other two chunks are
       sent, `deliver` raises nothing, and `emit` does not raise.
+- [ ] A subclass whose `_prepare` raises `ValueError` for one chunk of three has that chunk's
+      events counted on `losses().dropped` once, with a line naming `ValueError`. The other two
+      chunks are sent, and neither `deliver` nor `emit` raises.
 - [ ] `_send` keeps 1.x behaviour:
   - A `400` raises `SinkDeliveryError` after 1 request with `failed == 1`.
   - A `503` throughout makes `max_retries + 1` requests.
@@ -379,7 +389,7 @@ the count, never into itself.
 
 | Count | Unit | `when` |
 |---|---|---|
-| `dropped_oversized` (per-event ceiling, a `413` lone item) and `_unrenderable` (render or `_body` fault) | events | `SETTLED` |
+| `dropped_oversized` (per-event ceiling, a `413` lone item) and `_unrenderable` (render fault, or a fault building a chunk's request) | events | `SETTLED` |
 | `failed` for a `REJECTED` request (status, response bound, refused exception, unreduced `413`) | requests | `ALWAYS` |
 | `failed` for a request whose events were `RETRYABLE` | requests | `LAST` |
 | `item_errors`, `rejected_events`, `rejected_records` | events | `ALWAYS` |
@@ -417,7 +427,8 @@ deliberate, and each is a line in the release notes:
    Now the chunk is dropped, the rest are sent, and a batch whose every `_body` raises settles with
    `flush()` truthy and `failed_batches` at 0. That is invariant 7's recorded exception for a batch
    of nothing but events the sink cannot encode, as SPEC-069 words it, which FR-005 extends to name
-   it.
+   it. The move covers a raise from `_prepare`, from `_apply_auth` or from building the `Request`
+   as well, each of which escaped `emit` through `_send` in 1.x and is now a `_body` fault's drop.
 4. **A `2xx` reader that raises** moves from the catcher's failed term to `dropped_unadjudicated`
    (into `failed`). The events may have landed, so the run never fails on them and they are never
    resent.
@@ -607,7 +618,7 @@ subclassing. FR-005 moves the one such spy that keeps a purpose, in OTLP's trunc
 **The departures** are FR-002's moves 3 and 4. A third-party hook that raised escaped `emit` in 1.x,
 and the worker resent chunks that had landed. Now the raise costs its chunk:
 
-- a `_body` fault is counted on `_unrenderable`, inside `dropped`;
+- a `_body`, `_prepare` or `_apply_auth` fault is counted on `_unrenderable`, inside `dropped`;
 - a `2xx`-reader fault is counted on `dropped_unadjudicated`, inside `failed`.
 
 #### Acceptance Criteria:
@@ -1046,8 +1057,12 @@ tests/
     holds PR 311's header guards to passing with their bodies unedited, under invariant 13. Out of
     Scope's list of kept private methods means their meaning at the build's base.
   - FR-001's `count_unexpected=False` paragraph gains SPEC-070's exception for a
-    `SinkDeliveryError`. "A `deliver` of this family never raises" is narrowed to the three
-    guarded hooks, which is what the guard covers. FR-005 quotes the second decision's fence as
+    `SinkDeliveryError`. FR-005 quotes the second decision's fence as
     SPEC-070 left it. FR-004 says which instance spy moves and which goes. FR-005's "fails at the
     build's base" criterion now applies to the rewrites whose figures change, since a re-pointed
     wait patch keeps its figures.
+  - Decided by the orchestrator: the round's guard extends to `_prepare`, `_apply_auth` and
+    building the `Request`, and a raise from any of them is a `_body` fault, `DROPPED` on
+    `_unrenderable` with the same line, since nothing was sent. "A `deliver` of this family never
+    raises an `Exception`" covers those sites too. FR-001 gains the `_prepare` criterion, FR-002's
+    move 3 and FR-004's departures name the new hooks, and the `dropped` table row says so.
