@@ -193,7 +193,10 @@ def test_through_a_worker_a_partial_success_is_delivered_once() -> None:
 
 
 def test_through_a_worker_every_event_rejected_moves_failed_batches() -> None:
-    """The worker's retry recounts per attempt — an upper bound, like ``failed``."""
+    """Sent and counted once (SPEC-073): no round resends an outcome rejected for good.
+
+    ``fda134a`` made 4 POSTs and counted 12, since the worker resent the raising batch whole.
+    """
     sink, opener = _sink(_verdict(400, 400, 400))
     worker = Worker(sink, batch_size=3, max_retries=3)
     try:
@@ -202,8 +205,9 @@ def test_through_a_worker_every_event_rejected_moves_failed_batches() -> None:
         failed_batches = worker.health().failed_batches
     finally:
         worker.stop()
-    assert not delivered and failed_batches > 0
-    assert sink.rejected_events == 3 * len(opener.calls) == 12
+    assert not delivered and failed_batches == 1
+    assert len(opener.calls) == 1
+    assert sink.rejected_events == 3
 
 
 def test_on_the_orphan_path_a_rejected_event_is_an_orphan_loss() -> None:

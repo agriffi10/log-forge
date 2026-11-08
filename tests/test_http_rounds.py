@@ -780,3 +780,354 @@ def test_the_engine_reads_httpsinks_own_max_retries_and_stop_signal() -> None:
     sink.log_foundry_stop_signal = event
     assert _engine.stop_signal_of(sink) is event
     assert read_deliver(sink) is not None
+
+
+# --- FR-003: the three readers return per-event outcomes ---------------------------------------
+
+
+def _unadjudicated_writers(sources: dict[str, str]) -> list[str]:
+    """Every place in the family's modules that counts or stores ``dropped_unadjudicated``.
+
+    Args:
+      sources: Module text by stem.
+
+    Returns:
+      ``module.Class.method`` per writer, ``HTTPSink.__init__``'s zero included.
+    """
+    found: list[str] = []
+    for stem, source in sources.items():
+        for cls in ast.walk(ast.parse(source)):
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for fn in cls.body:
+                if not isinstance(fn, ast.FunctionDef):
+                    continue
+                for node in ast.walk(fn):
+                    counts = (
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "count"
+                        and any(
+                            isinstance(arg, ast.Constant) and arg.value == "dropped_unadjudicated"
+                            for arg in node.args
+                        )
+                    )
+                    stores = (
+                        isinstance(node, ast.Attribute)
+                        and node.attr == "dropped_unadjudicated"
+                        and isinstance(node.ctx, ast.Store)
+                    )
+                    if counts or stores:
+                        found.append(f"{stem}.{cls.name}.{fn.name}")
+    return sorted(set(found))
+
+
+def test_only_unadjudicated_counts_dropped_unadjudicated() -> None:
+    sources = _family_modules()
+    assert not any("_abandon_unadjudicated" in source for source in sources.values())
+    assert _unadjudicated_writers(sources) == [
+        "http.HTTPSink.__init__",
+        "http.HTTPSink._unadjudicated",
+    ]
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [
+        '        run_context().count(self, "dropped_unadjudicated", 1, when=When.ALWAYS)\n',
+        "        self.dropped_unadjudicated += 1\n",
+    ],
+    ids=["count", "store"],
+)
+def test_the_unadjudicated_roster_names_a_planted_writer(planted: str) -> None:
+    sources = _family_modules()
+    anchor = "        sent = len(items)\n        if _read_failed(payload):\n"
+    assert sources["honeycomb"].count(anchor) == 1
+    sources["honeycomb"] = sources["honeycomb"].replace(anchor, planted + anchor)
+    assert "honeycomb.HoneycombSink._outcomes" in _unadjudicated_writers(sources)
+
+
+def _build(name: str, opener: Any, **kwargs: Any) -> HTTPSink:
+    from test_sinks_http_render import _RECIPES
+
+    sink: HTTPSink = _RECIPES[name](opener=opener, **kwargs)
+    return sink
+
+
+def _es_bulk(*errors: bool) -> bytes:
+    items = [{"index": {"error": "x"} if error else {"status": 201}} for error in errors]
+    return json.dumps({"errors": True, "items": items}).encode()
+
+
+def _honeycomb(*statuses: int) -> bytes:
+    return json.dumps([{"status": status} for status in statuses]).encode()
+
+
+def _otlp(count: str) -> bytes:
+    return json.dumps({"partialSuccess": {"rejectedLogRecords": count}}).encode()
+
+
+@pytest.mark.parametrize("case", ["partial", "all-errors"])
+def test_elasticsearch_outcomes_are_per_item(case: str) -> None:
+    if case == "partial":
+        sink = _build(
+            "ElasticsearchSink", Scripted(FakeResponse(200, _es_bulk(False, True, False)))
+        )
+        assert sink.deliver(_events(3)) == Verdict(outcomes=(A, J, A))
+        assert sink.item_errors == 1  # type: ignore[attr-defined]
+        return
+    sink = _build("ElasticsearchSink", Scripted(FakeResponse(200, _es_bulk(True, True))))
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(_events(2))
+    assert sink.item_errors == 2  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("case", ["partial", "all-rejected"])
+def test_honeycomb_outcomes_are_per_status(case: str) -> None:
+    if case == "partial":
+        sink = _build("HoneycombSink", Scripted(FakeResponse(200, _honeycomb(202, 400, 202))))
+        assert sink.deliver(_events(3)) == Verdict(outcomes=(A, J, A))
+        assert sink.rejected_events == 1  # type: ignore[attr-defined]
+        return
+    sink = _build("HoneycombSink", Scripted(FakeResponse(200, _honeycomb(400, 400, 400))))
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(_events(3))
+
+
+@pytest.mark.parametrize("case", ["2-of-5", "5-of-5", "unreadable-count"])
+def test_otlp_outcomes_are_positional_by_count(case: str) -> None:
+    count = {"2-of-5": "2", "5-of-5": "5", "unreadable-count": "9" * 30}[case]
+    sink = _build("OTLPSink", Scripted(FakeResponse(200, _otlp(count))))
+    if case == "5-of-5":
+        with pytest.raises(SinkDeliveryError):
+            sink.emit(_events(5))
+        return
+    verdict = sink.deliver(_events(5))
+    if case == "2-of-5":
+        assert verdict == Verdict(outcomes=(J, J, A, A, A))
+        assert sink.rejected_records == 2  # type: ignore[attr-defined]
+    else:
+        assert verdict == Verdict(outcomes=(U,) * 5)
+        assert sink.dropped_unadjudicated == 5
+
+
+_READERS = ["ElasticsearchSink", "OpenSearchSink", "HoneycombSink", "OTLPSink"]
+
+
+@pytest.mark.parametrize(
+    "case", ["IncompleteRead", "TimeoutError", "ValueError", "short:200", "chunked:200"]
+)
+@pytest.mark.parametrize("name", _READERS)
+def test_every_reader_reads_an_unreadable_body_as_unknown(name: str, case: str) -> None:
+    from test_sinks_http_body_read import (
+        _READ_ERRORS,
+        _READERS_AT,
+        _TIMEOUT,
+        _serving,
+        _UnreadableResponse,
+    )
+
+    if ":" in case:
+        with _serving([case]) as server:
+            sink = _READERS_AT[name](server.url, max_retries=2, timeout=_TIMEOUT)
+            verdict = sink.deliver(_events(2))
+            posts = len(server.posts)
+    else:
+        error = next(err for err in _READ_ERRORS if type(err).__name__ == case)
+        opener = Scripted(_UnreadableResponse(200, error))
+        sink = _build(name, opener, max_retries=2)
+        verdict = sink.deliver(_events(2))
+        posts = len(opener.calls)
+    assert verdict == Verdict(outcomes=(U, U))
+    assert posts == 1
+    assert sink.dropped_unadjudicated == 2
+
+
+@pytest.mark.parametrize("name", _READERS)
+def test_an_empty_2xx_is_accepted_only_by_otlp(name: str) -> None:
+    sink = _build(name, Scripted(FakeResponse(200, b"")))
+    expected = A if name == "OTLPSink" else U
+    assert sink.deliver(_events(2)) == Verdict(outcomes=(expected, expected))
+
+
+@pytest.mark.parametrize("mode", ["recovers", "down"])
+def test_an_idempotent_reader_counts_an_unknown_once_per_run(
+    mode: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+
+    class Idempotent(ElasticsearchSink):
+        log_foundry_idempotent = True
+
+    unreadable = FakeResponse(200, b"not json")
+    opener = (
+        Scripted(unreadable, FakeResponse(200, b"{}"))
+        if mode == "recovers"
+        else Scripted(unreadable)
+    )
+    sink = Idempotent("http://es", index="i", max_retries=2, opener=opener)
+    sink.emit(_events(2))
+    lines = [line for line in _lost(capsys.readouterr().err) if "may have landed" in line]
+    if mode == "recovers":
+        assert len(opener.calls) == 2
+        assert sink.dropped_unadjudicated == 0
+        assert lines == []
+    else:
+        assert len(opener.calls) == 3
+        assert sink.dropped_unadjudicated == 2
+        assert len(lines) == 1
+
+
+_UNADJUDICATED_BODIES = {
+    ("ElasticsearchSink", "short-items"): _es_bulk(True),
+    ("ElasticsearchSink", "undecodable"): b"\xff\xfe",
+    ("ElasticsearchSink", "not-an-object"): b"[1, 2]",
+    ("ElasticsearchSink", "empty"): b"",
+    ("OpenSearchSink", "undecodable"): b"\xff\xfe",
+    ("HoneycombSink", "short"): _honeycomb(202),
+    ("HoneycombSink", "undecodable"): b"\xff",
+    ("HoneycombSink", "empty"): b"",
+    ("OTLPSink", "partial-not-object"): json.dumps({"partialSuccess": [1]}).encode(),
+    ("OTLPSink", "too-many-digits"): _otlp("9" * 30),
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "route"), sorted(_UNADJUDICATED_BODIES), ids=lambda part: str(part)
+)
+def test_every_unadjudicated_route_settles_through_a_worker(name: str, route: str) -> None:
+    opener = Scripted(FakeResponse(200, _UNADJUDICATED_BODIES[(name, route)]))
+    sink = _build(name, opener)
+    delivered, failed_batches = _through_the_worker(sink, _events(2))
+    assert delivered and failed_batches == 0
+    assert len(opener.calls) == 1, "nothing resent"
+    assert sink.dropped_unadjudicated == 2
+
+
+_MIB = 1024 * 1024
+_SHIM_PAYLOADS: dict[tuple[str, str], tuple[bytes, int]] = {
+    ("ElasticsearchSink", "ok"): (b'{"errors": false, "items": []}', 2),
+    ("ElasticsearchSink", "one-error"): (_es_bulk(False, True, False), 3),
+    ("ElasticsearchSink", "all-errors"): (_es_bulk(True, True), 2),
+    ("ElasticsearchSink", "errors-without-error-items"): (_es_bulk(False, False), 2),
+    ("ElasticsearchSink", "short-items"): (_es_bulk(True), 2),
+    ("ElasticsearchSink", "long-items"): (_es_bulk(True, True, True), 2),
+    ("ElasticsearchSink", "no-errors-key"): (b"{}", 2),
+    ("ElasticsearchSink", "not-an-object"): (b"[1, 2]", 2),
+    ("ElasticsearchSink", "undecodable"): (b"\xff\xfe", 2),
+    ("ElasticsearchSink", "empty"): (b"", 2),
+    ("ElasticsearchSink", "items-not-objects"): (b'{"errors": true, "items": [1, 2]}', 2),
+    ("HoneycombSink", "all-accepted"): (_honeycomb(202, 202), 2),
+    ("HoneycombSink", "one-rejected"): (_honeycomb(202, 400, 202), 3),
+    ("HoneycombSink", "all-rejected"): (_honeycomb(400, 400, 400), 3),
+    ("HoneycombSink", "short"): (_honeycomb(202), 2),
+    ("HoneycombSink", "bool-status"): (b'[{"status": true}, {"status": 202}]', 2),
+    ("HoneycombSink", "float-status"): (b'[{"status": 202.0}, {"status": 202}]', 2),
+    ("HoneycombSink", "not-objects"): (b"[1, 2]", 2),
+    ("HoneycombSink", "object-not-array"): (b"{}", 2),
+    ("HoneycombSink", "undecodable"): (b"\xff", 2),
+    ("HoneycombSink", "empty"): (b"", 2),
+    ("OTLPSink", "empty"): (b"", 5),
+    ("OTLPSink", "no-partial"): (b"{}", 5),
+    ("OTLPSink", "partial-null"): (b'{"partialSuccess": null}', 5),
+    ("OTLPSink", "partial-not-object"): (b'{"partialSuccess": [1]}', 5),
+    ("OTLPSink", "count-absent"): (b'{"partialSuccess": {}}', 5),
+    ("OTLPSink", "two-of-five"): (_otlp("2"), 5),
+    ("OTLPSink", "five-of-five"): (_otlp("5"), 5),
+    ("OTLPSink", "five-as-number"): (b'{"partialSuccess": {"rejectedLogRecords": 5}}', 5),
+    ("OTLPSink", "zero"): (_otlp("0"), 5),
+    ("OTLPSink", "over-count-clamped"): (_otlp("9"), 5),
+    ("OTLPSink", "too-many-digits"): (_otlp("9" * 30), 5),
+    ("OTLPSink", "negative"): (_otlp("-1"), 5),
+    ("OTLPSink", "over-the-bound"): (b" " * (4 * _MIB + 1), 5),
+    ("OTLPSink", "hostile-ff"): (b"\xff\xfe", 0),
+    ("OTLPSink", "hostile-dict-count"): (
+        b'{"partialSuccess": {"rejectedLogRecords": {"a": 1}}}',
+        0,
+    ),
+    ("OTLPSink", "hostile-deep"): (b"{" * 100_000, 0),
+    ("OTLPSink", "hostile-null"): (b"null", 0),
+    ("OTLPSink", "hostile-1"): (b"1", 0),
+    ("OTLPSink", "hostile-s"): (b'"s"', 0),
+}
+"""Payloads the readers' existing tests use, with the chunk size each was read for."""
+
+_SHIM_AT_BASE: dict[tuple[str, str], tuple[bool, dict[str, int], int]] = {
+    ("ElasticsearchSink", "ok"): (True, {}, 0),
+    ("ElasticsearchSink", "one-error"): (True, {"item_errors": 1}, 1),
+    ("ElasticsearchSink", "all-errors"): (False, {"item_errors": 2}, 1),
+    ("ElasticsearchSink", "errors-without-error-items"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("ElasticsearchSink", "short-items"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("ElasticsearchSink", "long-items"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("ElasticsearchSink", "no-errors-key"): (True, {}, 0),
+    ("ElasticsearchSink", "not-an-object"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("ElasticsearchSink", "undecodable"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("ElasticsearchSink", "empty"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("ElasticsearchSink", "items-not-objects"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "all-accepted"): (True, {}, 0),
+    ("HoneycombSink", "one-rejected"): (True, {"rejected_events": 1}, 1),
+    ("HoneycombSink", "all-rejected"): (False, {"rejected_events": 3}, 1),
+    ("HoneycombSink", "short"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "bool-status"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "float-status"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "not-objects"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "object-not-array"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "undecodable"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("HoneycombSink", "empty"): (True, {"dropped_unadjudicated": 2}, 1),
+    ("OTLPSink", "empty"): (True, {}, 0),
+    ("OTLPSink", "no-partial"): (True, {}, 0),
+    ("OTLPSink", "partial-null"): (True, {}, 0),
+    ("OTLPSink", "partial-not-object"): (True, {"dropped_unadjudicated": 5}, 1),
+    ("OTLPSink", "count-absent"): (True, {}, 0),
+    ("OTLPSink", "two-of-five"): (True, {"rejected_records": 2}, 1),
+    ("OTLPSink", "five-of-five"): (False, {"rejected_records": 5}, 1),
+    ("OTLPSink", "five-as-number"): (False, {"rejected_records": 5}, 1),
+    ("OTLPSink", "zero"): (True, {}, 0),
+    ("OTLPSink", "over-count-clamped"): (False, {"rejected_records": 5}, 1),
+    ("OTLPSink", "too-many-digits"): (True, {"dropped_unadjudicated": 5}, 1),
+    ("OTLPSink", "negative"): (True, {"dropped_unadjudicated": 5}, 1),
+    ("OTLPSink", "over-the-bound"): (True, {"dropped_unadjudicated": 5}, 1),
+    ("OTLPSink", "hostile-ff"): (True, {}, 0),
+    ("OTLPSink", "hostile-dict-count"): (True, {}, 1),
+    ("OTLPSink", "hostile-deep"): (True, {}, 0),
+    ("OTLPSink", "hostile-null"): (True, {}, 0),
+    ("OTLPSink", "hostile-1"): (True, {}, 0),
+    ("OTLPSink", "hostile-s"): (True, {}, 0),
+}
+"""``(bool, counter deltas, lost lines)`` per payload, recorded from the 1.x readers.
+
+Recorded by calling each reader's ``_handle_response`` at the build's Phase 2 commit
+(``caaaba85``), where the readers were still their 1.x code, so the expectation is a
+differential oracle against the old readers, never recomputed from the shims under test. The
+``ok`` case there used ``{"errors": false}`` with two non-error items; any body without a truthy
+``errors`` reads the same.
+"""
+
+_COUNTERS = (
+    "failed",
+    "item_errors",
+    "rejected_events",
+    "rejected_records",
+    "dropped_unadjudicated",
+)
+
+
+@pytest.mark.parametrize(("name", "case"), sorted(_SHIM_PAYLOADS), ids=lambda part: str(part))
+def test_each_shim_returns_its_1x_bool(
+    name: str, case: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    payload, n = _SHIM_PAYLOADS[(name, case)]
+    sink: Any = _build(name, FakeOpener())
+    before = {counter: getattr(sink, counter, 0) for counter in _COUNTERS}
+    result = sink._handle_response(payload, [object()] * n)
+    moved = {
+        counter: getattr(sink, counter, 0) - before[counter]
+        for counter in _COUNTERS
+        if getattr(sink, counter, 0) != before[counter]
+    }
+    lines = len(_lost(capsys.readouterr().err))
+    assert (result, moved, lines) == _SHIM_AT_BASE[(name, case)]
+
+
+def test_the_shim_oracle_covers_every_recorded_payload() -> None:
+    assert set(_SHIM_PAYLOADS) == set(_SHIM_AT_BASE)

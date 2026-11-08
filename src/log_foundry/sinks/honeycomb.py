@@ -9,6 +9,7 @@ from typing import Any, Unpack
 
 from log_foundry import _diag
 from log_foundry.sinks._batch import usable_results
+from log_foundry.sinks._engine import When, run_context
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
@@ -16,6 +17,7 @@ from log_foundry.sinks.http import (
     _holds_at,
     _holds_delimiter,
     _Item,
+    _read_as_1x,
     _read_failed,
     _refuse_empty_credential,
     _started_request,
@@ -23,6 +25,7 @@ from log_foundry.sinks.http import (
     _valid_url,
     merge_headers,
 )
+from log_foundry.sinks.verdict import Outcome
 
 __all__ = ["HoneycombSink"]
 
@@ -193,10 +196,10 @@ class HoneycombSink(HTTPSink):
       MAX_BATCH_BYTES: 1,000,000 — Honeycomb's documented 1 MB of uncompressed JSON for the
         Create Events endpoint.
       rejected_events: Events a ``2xx`` batch response reported with a status outside ``2xx``.
-        Never retried by the sink: the chunk's other events landed, and a re-send would
-        duplicate them. A chunk whose every event was rejected is undelivered, so an ``emit``
-        with no delivered chunk raises and the worker's retry counts it again on each attempt —
-        an upper bound, like ``failed``.
+        Never resent: the chunk's other events landed, and a re-send would duplicate them. A
+        chunk whose every event was rejected delivered nothing, so a run with no delivered chunk
+        fails — ``emit`` raises, the worker counts a failed batch — and each event is counted
+        here once, since no round resends an outcome rejected for good (SPEC-073).
       dropped_unadjudicated: Events whose outcome a ``2xx`` batch response did not settle — a
         body that is empty, could not be read or decoded, is not an array of objects, has a
         length other than the chunk's, or holds an entry whose ``status`` is not an integer.
@@ -275,7 +278,6 @@ class HoneycombSink(HTTPSink):
         )
         _refuse_empty_credential(api_key, type(self).__name__, "api_key")
         self.rejected_events = 0
-        self.dropped_unadjudicated = 0
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event in Honeycomb's ``{"data": event}`` batch shape (FR-010).
@@ -295,28 +297,11 @@ class HoneycombSink(HTTPSink):
         return json.dumps({"data": event})
 
     def _handle_response(self, payload: bytes, items: list[_Item]) -> bool:
-        """Counts the events a ``2xx`` batch response rejected and reports whether any landed.
+        """Reads a ``2xx`` batch response as a 1.x caller did: ``False`` when every event bounced.
 
-        Honeycomb's only per-event verdict is the body, so a body that does not carry one is no
-        verdict, and the chunk is counted on ``dropped_unadjudicated`` rather than read as
-        delivered. That includes a body that could not be read after the status line, an
-        ``_UnreadBody`` (``HTTPSink._attempt``), which is asked about first (SPEC-070 FR-004) —
-        reading it as success would settle silently an all-rejected response whose body was cut
-        short — and an empty ``b""``, which carries no verdict either. It is the ``_bulk`` sinks'
-        reading, argued here for this destination's own reason. ``OTLPSink`` counts an
-        unreadable body too, but reads an empty one as success, since its ``2xx`` needs no body.
-
-        The array is positional — Honeycomb names no event in it — so it must prove it describes
-        the chunk before entry *i* is read as event *i*: the same length, and every entry an
-        object whose ``status`` is an ``int`` (a ``bool`` is not one). One entry that fails that
-        leaves the chunk unadjudicated whole, because the success signal here is the status
-        itself, and a missing one is neither an acceptance nor a rejection. A status in
-        ``200``–``299`` is an acceptance and any other integer a rejection. The server's
-        ``error`` text is never written anywhere (invariant 11).
-
-        Never raises, on any bytes, and catches ``Exception`` rather than the decoding errors,
-        for the reason ``ElasticsearchSink._parse_bulk_response`` gives: an exception escaping
-        here escapes ``emit``, and the worker re-sends a batch the server may have accepted.
+        Kept for a direct 1.x caller (SPEC-073 FR-003): it runs :meth:`_outcomes` in a context of
+        its own, committed at once, and returns ``False`` exactly when every outcome is
+        ``REJECTED``. An unadjudicated chunk returns ``True``: the request succeeded.
 
         Args:
           payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
@@ -324,33 +309,70 @@ class HoneycombSink(HTTPSink):
           items: The chunk the response describes.
 
         Returns:
-          False only when every event of the chunk was rejected, so an ``emit`` whose every
-          chunk came back that way raises (invariant 7); True otherwise, the unadjudicated case
-          included, since the request succeeded and a re-send could duplicate what landed.
+          False only when every event of a non-empty chunk was rejected; True otherwise.
+
+        Raises:
+          None.
+        """
+        return _read_as_1x(lambda: self._outcomes(payload, items))
+
+    def _outcomes(self, payload: bytes, items: list[_Item]) -> tuple[Outcome, ...]:
+        """Reads each event's fate from a ``2xx`` batch response (SPEC-073 FR-003).
+
+        Honeycomb's only per-event verdict is the body, so a body that does not carry one is no
+        verdict, and the chunk is given up on through ``HTTPSink._unadjudicated``, its events
+        ``UNKNOWN``, rather than read as delivered. That includes a body that could not be read
+        after the status line, an ``_UnreadBody`` (``HTTPSink._attempt``), which is asked about
+        first (SPEC-070 FR-004) — reading it as success would settle silently an all-rejected
+        response whose body was cut short — and an empty ``b""``, which carries no verdict
+        either. It is the ``_bulk`` sinks' reading, argued here for this destination's own
+        reason. ``OTLPSink`` counts an unreadable body too, but reads an empty one as success,
+        since its ``2xx`` needs no body.
+
+        The array is positional — Honeycomb names no event in it — so it must prove it describes
+        the chunk before entry *i* is read as event *i*: the same length, and every entry an
+        object whose ``status`` is an ``int`` (a ``bool`` is not one). One entry that fails that
+        leaves the chunk unadjudicated whole, because the success signal here is the status
+        itself, and a missing one is neither an acceptance nor a rejection. A status in
+        ``200``–``299`` is ``ACCEPTED`` and any other integer ``REJECTED``, counted on
+        ``rejected_events`` and never resent. The server's ``error`` text is never written
+        anywhere (invariant 11). The decode catches ``Exception`` rather than the decoding errors,
+        since a ``RecursionError`` is neither.
+
+        Args:
+          payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
+            read.
+          items: The chunk the response describes.
+
+        Returns:
+          One outcome per event.
 
         Raises:
           None.
         """
         sent = len(items)
         if _read_failed(payload):
-            self._abandon_unadjudicated(sent)
-            return True
+            return self._unadjudicated(items, _detail(sent))
         try:
             data = json.loads(payload)
         except Exception:
-            self._abandon_unadjudicated(sent)
-            return True
+            return self._unadjudicated(items, _detail(sent))
         entries = usable_results(data)
         statuses = [status for status in map(_status, entries) if status is not None]
         if len(statuses) != sent or len(entries) != sent:
-            self._abandon_unadjudicated(sent, readable=len(statuses))
-            return True
+            return self._unadjudicated(items, _detail(sent, len(statuses)))
         rejected = sum(1 for status in statuses if not 200 <= status < 300)
         if rejected:
-            with self._counter_lock:
-                self.rejected_events += rejected
-            _diag.lost("event", rejected, f"{type(self).__name__}, rejected by the server")
-        return rejected < sent
+            context = run_context()
+            name = type(self).__name__
+            context.count(self, "rejected_events", rejected, when=When.ALWAYS)
+            context.announce(
+                lambda: _diag.lost("event", rejected, f"{name}, rejected by the server"),
+                when=When.ALWAYS,
+            )
+        return tuple(
+            Outcome.ACCEPTED if 200 <= status < 300 else Outcome.REJECTED for status in statuses
+        )
 
     def losses(self) -> SinkLosses:
         """Reports abandoned requests plus the events a batch response rejected or left unsettled.
@@ -374,34 +396,24 @@ class HoneycombSink(HTTPSink):
                 failed=self.failed + self.rejected_events + self.dropped_unadjudicated,
             )
 
-    def _abandon_unadjudicated(self, sent: int, *, readable: int = 0) -> None:
-        """Counts and announces a chunk whose ``2xx`` response did not settle its events' outcome.
 
-        The whole chunk is charged because the response cannot be relied on to say which events
-        landed, which makes the count an upper bound, like ``failed``, and the line says the
-        events may have landed. It carries only counts and never the body, which is the
-        server's text (invariant 11).
+def _detail(sent: int, readable: int = 0) -> str:
+    """The unadjudicated line's detail for a batch response, counts only, never the body.
 
-        Args:
-          sent: How many events were in the request.
-          readable: How many entries carried a status this sink could read — none when any
-            element of the array is not an object, since such an array is not read at all.
+    Args:
+      sent: How many events were in the request.
+      readable: How many entries carried a status this sink could read.
 
-        Returns:
-          None.
+    Returns:
+      The detail ``HTTPSink._unadjudicated`` writes after the class name.
 
-        Raises:
-          None.
-        """
-        with self._counter_lock:
-            self.dropped_unadjudicated += sent
-        _diag.lost(
-            "event",
-            sent,
-            f"{type(self).__name__} could not adjudicate a batch response "
-            f"({sent} event(s) sent, {readable} readable status(es)); "
-            f"they may have landed; not retried",
-        )
+    Raises:
+      None.
+    """
+    return (
+        f"could not adjudicate a batch response ({sent} event(s) sent, {readable} readable "
+        f"status(es))"
+    )
 
 
 def _status(entry: dict[str, Any]) -> int | None:

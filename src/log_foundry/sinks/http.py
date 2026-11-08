@@ -1726,6 +1726,43 @@ def _refuse_credential_collision(
             )
 
 
+def _wholly_rejected(outcomes: tuple[Outcome, ...]) -> bool:
+    """Whether a chunk's outcomes are all ``REJECTED``: a reader shim's 1.x ``False``.
+
+    An empty chunk is not wholly rejected, so a direct ``_handle_response(payload, [])`` reads
+    ``True``, as every existing call of that shape expects (SPEC-073 FR-003).
+
+    Args:
+      outcomes: One chunk's outcomes.
+
+    Returns:
+      True only for a non-empty chunk whose every event was refused for good.
+
+    Raises:
+      None.
+    """
+    return bool(outcomes) and all(outcome is Outcome.REJECTED for outcome in outcomes)
+
+
+def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
+    """Runs a reader's ``_outcomes`` as a 1.x ``_handle_response`` call: committed, then a bool.
+
+    The reader runs in a one-round context of its own, committed when it returns, so a direct
+    1.x caller sees the counters move as they did; its run fails exactly when the chunk was
+    wholly rejected, which is when 1.x returned ``False``.
+
+    Args:
+      reader: The bound ``_outcomes`` call, with its arguments.
+
+    Returns:
+      False exactly when the chunk is non-empty and every outcome is ``REJECTED``.
+
+    Raises:
+      Exception: Whatever the reader raises, after its context is committed as a failed run.
+    """
+    return not _wholly_rejected(_engine.detached(reader, _wholly_rejected))
+
+
 def _positions(batch: list[dict[str, object]], items: list[_Item]) -> list[int | None]:
     """Maps each rendered item back to its event's index in the batch, by identity.
 
@@ -1757,9 +1794,8 @@ def _positions(batch: list[dict[str, object]], items: list[_Item]) -> list[int |
             found.append(None)
     return found
 
-def _settle(
-    fates: list[Outcome], where: list[int | None], outcomes: tuple[Outcome, ...]
-) -> None:
+
+def _settle(fates: list[Outcome], where: list[int | None], outcomes: tuple[Outcome, ...]) -> None:
     """Records one chunk's outcomes at its events' batch indices.
 
     Args:
@@ -2266,9 +2302,7 @@ class HTTPSink:
                 result = self._outcomes(payload, chunk)
             outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
         except Exception as err:
-            return self._unadjudicated(
-                chunk, f"reading a 2xx response raised {type(err).__name__}"
-            )
+            return self._unadjudicated(chunk, f"reading a 2xx response raised {type(err).__name__}")
         if outcomes is None:
             return self._unadjudicated(chunk, "reading a 2xx response gave no outcome per event")
         return outcomes
@@ -2988,7 +3022,9 @@ class HTTPSink:
             return _Answer(Outcome.RETRYABLE, retry_after=retry_after, detail=detail)
         if status == 413 and splittable:
             return _Answer(None, payload=payload)
-        return _Answer(Outcome.REJECTED, detail=self._give_up(context, f"HTTP {status}", When.ALWAYS))
+        return _Answer(
+            Outcome.REJECTED, detail=self._give_up(context, f"HTTP {status}", When.ALWAYS)
+        )
 
     def _give_up(self, context: RunContext, reason: str, when: When) -> str:
         """Counts one abandoned request on ``failed`` and registers its line, as ``when`` says.
