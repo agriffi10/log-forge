@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-073
 title: "The HTTP Family on the Delivery Engine"
 description: "Puts HTTPSink and its eight shipped subclasses on SPEC-072's delivery engine: each offers deliver, one request per chunk per round, its emit runs the same engine inline, the three per-record readers return per-event outcomes through one shared unreadable-response method, every documented counter keeps its 1.x name and unit through a family-neutral run context, and a third-party subclass that overrides emit or _handle_response keeps its 1.x path."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-018, SPEC-027, SPEC-038, SPEC-056, SPEC-058, SPEC-059, SPEC-062, SPEC-066, SPEC-070, SPEC-072]
 arc: stability-redesign
 arc_order: 5
