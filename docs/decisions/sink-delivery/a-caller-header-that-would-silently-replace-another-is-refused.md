@@ -87,7 +87,10 @@ on every request. `_prepare` now compresses exactly when the caller's header nam
 through the same `_caller_encoding` construction judged, whatever `self.gzip` says; set true beside
 an `identity` header, the body is still sent as built. With no caller header `self.gzip` decides,
 as it always has, and the sink writes its own `Content-Encoding: gzip`. Construction lets a header
-through only when the two agree; this rule keeps them agreeing after it.
+through only when the two agree; this rule keeps them agreeing after it. It is one predicate,
+`_compresses`, which `_known_refused` reads too: that check keeps its uncompressed refusal memory
+away from a compressed request, and while it still asked `self.gzip` the same flip discarded unsent
+an event that would have fitted once compressed.
 
 **What stays overridable.** Only a credential header is protected from the caller. `Content-Type`
 and the `Content-Encoding` `HTTPSink` writes per request sit beneath the caller's headers
@@ -162,7 +165,8 @@ nobody's approval, and was reverted as a technical correction.
   or whitespace value, and no header construct. Two technical refinements landed with it: a value
   is read by the bytes it sends, so `b"identity"` beside `gzip=False` and `b"gzip"` beside
   `gzip=True` construct while `5` and `True` name a coding and are refused by both; and a caller
-  `Content-Encoding` decides the body on every request, whatever `gzip` is set to later.
+  `Content-Encoding` decides the body on every request, whatever `gzip` is set to later, for the
+  413 refusal memory as for the body (`_compresses`).
 - **Refined (the 1.2.0 follow-up fix, no spec).** A header value that is not a `str` is copied
   once, at construction, into the bytes `putheader` would send (`_sent_value`), so a caller
   object's code runs only at construction; an exact `int`, `bool` or `bytes` is kept as given.
