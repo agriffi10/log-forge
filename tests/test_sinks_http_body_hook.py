@@ -119,13 +119,18 @@ def _head(length: int, coding: str) -> bytes:
     )
 
 
-def test_a_deflating_body_hook_constructs_and_sends_what_it_sent() -> None:
-    """At ``d247ca31``: refused, as if the library had built the body under ``deflate``. At
-    ``c4e51fbd`` it sent the head below and a 17-byte deflated body; it still does."""
+@pytest.mark.parametrize("given", [False, True], ids=["gzip-false", "gzip-true"])
+def test_a_deflating_body_hook_constructs_and_sends_what_it_sent_in_1_1_0(given: bool) -> None:
+    """The head and 17-byte body below were captured on a raw socket against ``v1.1.0`` with
+    either ``gzip``: a caller ``Content-Encoding`` suppressed compression there. With
+    ``gzip=False`` it was refused at ``d247ca31``; with ``gzip=True`` at ``c4e51fbd`` and every
+    head since, by the ``gzip=True`` refusal, which now holds only for the library's ``_body``."""
     _Deflating.built.clear()
 
     head, body = _exchange(
-        lambda url: _Deflating(url, headers={"Content-Encoding": "deflate"}).emit([{"i": 1}])
+        lambda url: _Deflating(url, headers={"Content-Encoding": "deflate"}, gzip=given).emit(
+            [{"i": 1}]
+        )
     )
 
     assert head == _head(17, "deflate")
@@ -133,13 +138,18 @@ def test_a_deflating_body_hook_constructs_and_sends_what_it_sent() -> None:
     assert zlib.decompress(body) == PLAIN
 
 
-def test_a_self_gzipping_body_hook_beside_gzip_false_constructs_and_sends_what_it_built() -> None:
-    """At ``d247ca31``: refused. Its gzip header's OS byte differs between interpreters, so the
-    body is held to what its own ``_body`` returned, and to the plain body once decoded."""
+@pytest.mark.parametrize("given", [False, True], ids=["gzip-false", "gzip-true"])
+def test_a_self_gzipping_body_hook_sends_what_it_built_once_as_in_1_1_0(given: bool) -> None:
+    """Against ``v1.1.0`` either ``gzip`` sent the hook's 29-byte body once under its ``gzip``
+    label. With ``gzip=False`` it was refused at ``d247ca31``; with ``gzip=True`` it was gzipped a
+    second time (46 bytes) at ``c4e51fbd`` and every head since. Its gzip header's OS byte differs
+    between interpreters, so the body is held to what its own ``_body`` returned."""
     _SelfGzipping.built.clear()
 
     head, body = _exchange(
-        lambda url: _SelfGzipping(url, headers={"Content-Encoding": "gzip"}).emit([{"i": 1}])
+        lambda url: _SelfGzipping(url, headers={"Content-Encoding": "gzip"}, gzip=given).emit(
+            [{"i": 1}]
+        )
     )
 
     assert head == _head(29, "gzip")
@@ -190,6 +200,64 @@ def test_a_body_set_on_the_instance_is_read_as_the_callers() -> None:
     sink._body = lambda items: (b"x", "text/plain")  # type: ignore[method-assign]
 
     assert http_sink._library_body(sink) is False
+
+
+def test_a_pass_through_body_hook_beside_gzip_true_sends_an_uncompressed_body_as_1_1_0_did() -> (
+    None
+):
+    """The cost the static read accepts: it cannot tell this from an encoding hook, so the library
+    does not compress it, and the body goes out uncompressed under a ``gzip`` label, which is what
+    ``v1.1.0`` sent."""
+    opener = FakeOpener()
+    sink = _PassThrough(URL, headers={"Content-Encoding": "gzip"}, gzip=True, opener=opener)
+
+    sink.emit([{"i": 1}])
+
+    assert opener.calls[-1]["body"] == PLAIN
+    assert opener.calls[-1]["headers"]["content-encoding"] == "gzip"
+
+
+def _deflate(items: Any) -> tuple[bytes, str]:
+    """A body hook assigned to an instance: the library's body, deflated."""
+    body, content_type = HTTPSink._body(_PLAIN_SINK, items)
+    return zlib.compress(body), content_type
+
+
+_PLAIN_SINK = HTTPSink(URL)
+"""A sink whose library ``_body`` the instance-assigned hook calls."""
+
+
+class _AssignsAfter(HTTPSink):
+    """Assigns its body hook to the instance after ``super().__init__`` has returned."""
+
+    def __init__(self, url: str, **kw: Any) -> None:
+        super().__init__(url, headers={"Content-Encoding": "deflate"}, **kw)
+        self._body = _deflate  # type: ignore[method-assign]
+
+
+class _AssignsBefore(HTTPSink):
+    """Assigns the same hook before calling ``super().__init__``."""
+
+    def __init__(self, url: str, **kw: Any) -> None:
+        self._body = _deflate  # type: ignore[method-assign]
+        super().__init__(url, headers={"Content-Encoding": "deflate"}, **kw)
+
+
+def test_a_body_assigned_after_super_init_is_unseen_and_refused_the_accepted_edge() -> None:
+    """Construction cannot see an assignment made after it returns, so the sink is judged as the
+    library's and refused, where ``v1.1.0`` constructed it. Assigning before ``super().__init__``,
+    or defining ``_body`` on the class (``_Deflating``), constructs."""
+    with pytest.raises(ValueError) as caught:
+        _AssignsAfter(URL)
+
+    assert str(caught.value) == (
+        "_AssignsAfter gzip=False, the default, cannot apply beside header 'Content-Encoding', "
+        "which names an encoding the body is not in; drop the header, or pass gzip=True if it "
+        "names gzip"
+    )
+    opener = FakeOpener()
+    _AssignsBefore(URL, opener=opener).emit([{"i": 1}])
+    assert zlib.decompress(opener.calls[-1]["body"]) == PLAIN
 
 
 def _overriders() -> list[type[HTTPSink]]:

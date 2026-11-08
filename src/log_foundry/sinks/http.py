@@ -1067,11 +1067,13 @@ def _valid_encoding(
     as ``bytes`` or as ``str``. The message names ``gzip`` and the caller's spelling, never the
     value, as the ``gzip=True`` one does.
 
-    **That refusal holds only for the library's own** ``_body`` (``library_body``,
+    **Both refusals hold only for the library's own** ``_body`` (``library_body``,
     :func:`_library_body`). ``_body`` is a documented 1.x extension hook, and a subclass whose
     ``_body`` encodes the body itself — ``zlib.compress`` beside ``Content-Encoding: deflate``, or
-    its own gzip beside ``gzip`` — built with ``gzip=False`` sends a true label, and constructed
-    in 1.1.0; refusing it would break a working sink. Such a sink keeps 1.1.0's bytes.
+    its own gzip beside ``gzip`` — owns both the body and its label, with ``gzip`` true or false;
+    it constructed in 1.1.0, where a caller ``Content-Encoding`` suppressed compression, and
+    refusing it would break a working sink. Such a sink keeps 1.1.0's bytes: the library never
+    compresses its body beside a caller header (``HTTPSink._fixed_compression`` is ``False``).
 
     Args:
       gzip: The ``gzip`` argument, already copied as an exact ``bool``.
@@ -1083,19 +1085,19 @@ def _valid_encoding(
       None.
 
     Raises:
-      ValueError: If ``gzip`` is true and the caller's ``Content-Encoding`` names another
-        coding, or ``gzip`` is false, the body is the library's own, and the header names any
+      ValueError: If the body is the library's own and either ``gzip`` is true and the caller's
+        ``Content-Encoding`` names another coding, or ``gzip`` is false and the header names any
         coding but ``identity``.
     """
     caller = _caller_encoding(headers)
-    if caller is None:
+    if caller is None or not library_body:
         return
     if gzip and not _names_gzip(caller[1]):
         raise ValueError(
             f"{owner} gzip=True cannot apply beside header {caller[0]!r}, which names another "
             "encoding; drop gzip= or the header"
         )
-    if library_body and not gzip and not _names_no_coding(caller[1]):
+    if not gzip and not _names_no_coding(caller[1]):
         raise ValueError(
             f"{owner} gzip=False, the default, cannot apply beside header {caller[0]!r}, which "
             "names an encoding the body is not in; drop the header, or pass gzip=True if it "
@@ -1121,6 +1123,15 @@ def _library_body(sink: object) -> bool:
     class outside the package that writes ``__module__ = "log_foundry..."`` into its own namespace
     is read as the library's, and so meets the refusal the shipped sinks meet; nothing is gained by
     it. A class whose MRO cannot be read this way is read as the caller's, which refuses nothing.
+
+    **The cost the static read accepts.** A pass-through ``super()._body`` override built with
+    ``gzip=True`` beside ``Content-Encoding: gzip`` is read as encoding its own body, so the
+    library does not compress it and it sends an uncompressed body under a ``gzip`` label — as
+    1.1.0 did; the read cannot tell it from an encoding hook, and that is the released behaviour.
+    And the read runs during construction, so a ``_body`` a subclass assigns to the instance
+    **after** ``super().__init__`` returns is invisible to it: such a sink is judged as the
+    library's and meets its refusals, where 1.1.0 constructed it. Assign the hook before calling
+    ``super().__init__``, or define it on the class.
 
     Args:
       sink: The sink under construction.
@@ -1330,9 +1341,12 @@ def _refuse_empty_credential(value: object, owner: str, argument: str) -> None:
     ``Authorization: Splunk …`` — and ``""`` used to construct and send that header with nothing
     in it, as ``auth=""`` sent ``Bearer `` (1.2.0, the rule :func:`_valid_auth` applies to
     ``auth``). A value of only spaces and tabs is refused too (:func:`_blank`). The value is
-    judged as the exact ``str`` it stores, so no caller code runs; a value that is not a ``str`` is
-    left to the header checks, which judge it as they always have. The message names the argument
-    and never the value.
+    judged **as sent**, by the rule the header path uses: a ``str`` copied as the exact ``str`` it
+    stores, then :func:`_sent_value` and :func:`_wire_text`, so ``b""`` and ``b"  "``, which
+    ``putheader`` sends as nothing, are refused as ``""`` is, and ``5`` reads as ``5``. An exact
+    ``str`` or ``bytes`` runs no caller code; any other value is read once more as the header
+    check reads it, and one that cannot be sent is left to that check. The message names the
+    argument and never the value.
 
     Args:
       value: The credential argument as the caller passed it.
@@ -1343,9 +1357,11 @@ def _refuse_empty_credential(value: object, owner: str, argument: str) -> None:
       None.
 
     Raises:
-      ValueError: If ``value`` is a ``str`` that is empty or only spaces and tabs.
+      ValueError: If ``value`` sends nothing but spaces and tabs.
     """
-    if issubclass(type(value), str) and _blank(_diag._STR_STR(cast("str", value))):
+    copied = _diag._STR_STR(cast("str", value)) if issubclass(type(value), str) else value
+    sent, _failure = _sent_value(copied)
+    if sent is not None and _blank(_wire_text(sent)):
         raise ValueError(
             f"{owner} {argument} is empty, so every request would carry an empty credential; "
             "give it a value"
@@ -1823,10 +1839,11 @@ class HTTPSink:
             dict(headers) if headers is not None else {}, type(self).__name__
         )
         gzip = gzip if type(gzip) is bool else bool(gzip)
-        _valid_encoding(
-            gzip, self._headers, type(self).__name__, library_body=_library_body(self)
+        library_body = _library_body(self)
+        _valid_encoding(gzip, self._headers, type(self).__name__, library_body=library_body)
+        self._fixed_compression = (
+            None if _caller_encoding(self._headers) is None else gzip and library_body
         )
-        self._fixed_compression = None if _caller_encoding(self._headers) is None else gzip
         self._auth, self._authorization_value = _valid_auth(
             auth, type(self).__name__, self._headers, self._AUTH_CONFLICT
         )
@@ -2576,10 +2593,10 @@ class HTTPSink:
         ``identity`` header still sends the body as built, and one whose ``gzip`` is set false
         beside a ``gzip`` header still compresses — it used to send an uncompressed body under the
         caller's ``gzip`` label on every request. For a subclass whose own ``_body`` encodes the
-        body, built with ``gzip=False`` beside its own label, it keeps 1.1.0's bytes and is never
-        compressed a second time, where setting ``gzip`` true used to gzip it again. With no
-        caller header, ``self.gzip`` decides per request, as it always has, and the sink writes
-        its own ``Content-Encoding: gzip``.
+        body the library never compresses beside a caller header, with ``gzip`` true or false, so
+        it keeps 1.1.0's bytes, and is never gzipped a second time, which setting ``gzip`` true
+        used to do. With no caller header, ``self.gzip`` decides per request, as it always has, and
+        the sink writes its own ``Content-Encoding: gzip``.
 
         Args:
           body: The serialized batch.
@@ -2608,8 +2625,9 @@ class HTTPSink:
         """Says whether this request's body is gzipped: the one rule every send-path read asks.
 
         With a caller ``Content-Encoding``, the decision fixed at construction answers
-        (``_fixed_compression``, the ``gzip`` given then, which for the library's own ``_body``
-        is exactly "the header names gzip"); otherwise ``self.gzip`` does, read now, since it is
+        (``_fixed_compression``: the ``gzip`` given then for the library's own ``_body``, which is
+        exactly "the header names gzip", and ``False`` for a subclass's own ``_body``, which owns
+        its coding); otherwise ``self.gzip`` does, read now, since it is
         a public attribute. Construction stores ``gzip`` as an exact ``bool``, so no caller
         ``__bool__`` runs here; only a non-``bool`` assigned to ``gzip`` afterwards is asked, by
         ``bool()``, as 1.x asked it. :meth:`_prepare` compresses by this and

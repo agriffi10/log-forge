@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A caller header that would silently replace another is refused"
-description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — a key of the base it hands `merge_headers` with `argument=` — is refused at construction naming the argument it would replace; two caller names folding to one are refused; a caller `Content-Encoding`, read as sent, is refused beside `gzip=True` unless it names gzip and, with the library's `_body`, beside `gzip=False` unless `identity` or empty; compression is then fixed at construction. None quotes a value. Without `argument=`, `merge_headers` lets the caller win, as in 1.x. Do NOT let either side win silently on a shipped sink, or hand-list the credential headers: a run-time roster and an AST scan derive them. (HTTP auth fix and the 1.2.0 follow-up fix, no spec; reverses SPEC-048 FR-007)"
+description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — a key of the base it hands `merge_headers` with `argument=` — is refused at construction naming the argument it would replace; two caller names folding to one are refused; with the library's `_body`, a caller `Content-Encoding`, read as sent, is refused beside `gzip=True` unless it names gzip and beside `gzip=False` unless `identity` or empty; compression is fixed at construction. None quotes a value. Without `argument=`, `merge_headers` lets the caller win, as in 1.x. Do NOT let either side win silently on a shipped sink, or hand-list the credential headers: a run-time roster and an AST scan derive them. (HTTP auth fix and the 1.2.0 follow-up fix, no spec; reverses SPEC-048 FR-007)"
 ---
 
 **A caller header is refused at construction when it would silently replace another header,
@@ -74,16 +74,24 @@ spaces and tabs stripped; a list is not read further.
   of codings, which names none), are true labels and construct (`_names_no_coding`), as `bytes` or
   as `str`. Until this fix it constructed and sent the caller's label over an uncompressed body on
   every request, which a destination honouring the label cannot decode, so the configuration was
-  already broken and the refusal breaks only a program that was already wrong. **That holds only
-  for the library's own `_body`** (Andrew's call, 2026-11-08). `_body` is a documented 1.x
-  extension hook, and a subclass whose own `_body` encodes the body — `zlib.compress` beside
-  `deflate`, its own gzip beside `gzip` — sends a true label and constructed in 1.1.0, so it still
-  constructs and sends the bytes it sent. `_library_body` reads, statically, the module of the
-  class whose namespace supplies `_body` (SPEC-072's `_class_member`, and the class's own
-  namespace for `__module__`), so no metaclass or instance hook runs; a class defined under
-  `log_foundry` is the library's, which every shipped sink overriding `_body` is. A subclass whose
-  `_body` only returns `super()._body(...)` is read as its own, since a static read sees where
-  `_body` is defined and not what it does, and it constructs, as in 1.1.0.
+  already broken and the refusal breaks only a program that was already wrong.
+
+**Both refusals hold only for the library's own `_body`** (Andrew's call, 2026-11-08). `_body` is
+a documented 1.x extension hook, and a subclass whose own `_body` encodes the body — `zlib.compress`
+beside `deflate`, its own gzip beside `gzip` — owns the body and its label, with `gzip` true or
+false; in 1.1.0 a caller `Content-Encoding` suppressed compression, so it constructed and sent its
+body once. It still constructs, the library never compresses its body beside a caller header
+(`_fixed_compression` is `False`), and it sends byte for byte what `v1.1.0` sends, pinned against
+a raw-socket capture there with `gzip` true and false. `_library_body` reads, statically, the
+module of the class whose namespace supplies `_body` (SPEC-072's `_class_member`, and the class's
+own namespace for `__module__`), so no metaclass or instance hook runs; a class defined under
+`log_foundry` is the library's, which every shipped sink overriding `_body` is. A subclass whose
+`_body` only returns `super()._body(...)` is read as its own, since a static read sees where
+`_body` is defined and not what it does, and it constructs, as in 1.1.0. Two costs are accepted:
+such a pass-through built with `gzip=True` beside `Content-Encoding: gzip` sends an uncompressed
+body under a gzip label, as 1.1.0 did; and a `_body` assigned to the instance after
+`super().__init__` returns is unseen at construction, so the sink is refused as the library's where
+1.1.0 constructed it — assign it before `super().__init__`, or define it on the class.
 
 Both messages name `gzip` and the caller's spelling of the header, never its value. The check
 reaches every class forwarding `gzip`, `LogstashSink`'s HTTP mode under `HTTPSink`'s name;
@@ -96,14 +104,14 @@ under the gzip label on every request. Construction now stores the decision from
 then (`_fixed_compression`), and setting `gzip` later changes nothing. For the library's own
 `_body`, construction lets a header through only when it agrees with `gzip`, so the stored decision
 is exactly "compressed when the header names gzip": set false beside a `gzip` header the body is
-still compressed, set true beside `identity` it is still sent as built. For a subclass's own
-`_body` built with `gzip=False` beside its own label it is never gzipped a second time, which
-setting `gzip` true used to do. With no caller header `self.gzip` decides per request, as it always
+still compressed, set true beside `identity` it is still sent as built. For a subclass's own `_body`
+it is `False` whatever `gzip` says, so its body is never gzipped a second time, which `gzip=True`,
+given or set later, used to do. With no caller header `self.gzip` decides per request, as it always
 has, and the sink writes its own `Content-Encoding: gzip`. `gzip` is read once: anything but an
 exact `bool` is asked `bool()` at construction and stored as the result, so no caller `__bool__`
-runs per request. It is one predicate, `_compresses`, which `_known_refused` reads too: that check keeps its uncompressed refusal memory
-away from a compressed request, and while it still asked `self.gzip` the same flip discarded unsent
-an event that would have fitted once compressed.
+runs per request. It is one predicate, `_compresses`, which `_known_refused` reads too: that check
+keeps its uncompressed refusal memory away from a compressed request, and while it still asked
+`self.gzip` the same flip discarded unsent an event that would have fitted once compressed.
 
 **What stays overridable.** Only a credential header is protected from the caller. `Content-Type`
 and the `Content-Encoding` `HTTPSink` writes per request sit beneath the caller's headers
@@ -166,8 +174,8 @@ nobody's approval, and was reverted as a technical correction.
   not broken, which SPEC-049 does not allow.
 - *`self.gzip` deciding the body after construction beside a caller header.* Setting the public
   attribute could then put a body under a label it is not in, which construction had just refused.
-- *Refusing `gzip=False` beside a coding whatever builds the body.* It refused a 1.x subclass whose
-  own `_body` encodes the body under a true label, a working sink.
+- *Either encoding refusal whatever builds the body.* It refused a 1.x subclass whose own `_body`
+  encodes the body under a true label, a working sink, with `gzip` false or true.
 - *The caller's header deciding the body per request.* It equals the stored decision for the
   library's own `_body`, but would gzip a second time a subclass that gzips its own body beside its
   own `gzip` label.
@@ -180,8 +188,10 @@ nobody's approval, and was reverted as a technical correction.
   default, beside a caller `Content-Encoding` naming any coding other than `identity` is refused
   at construction when the body is the library's own `_body`, reversing the case this decision
   pinned on 2026-11-07, that `gzip=False` beside any `Content-Encoding` sends the caller's header
-  over an uncompressed body; a subclass whose own `_body` encodes the body keeps 1.1.0's
-  behaviour, Andrew's call. `identity`, an empty or whitespace value, and no header construct.
+  over an uncompressed body. A subclass whose own `_body` encodes the body keeps 1.1.0's
+  behaviour byte for byte, Andrew's call: neither encoding refusal applies to it, the 2026-11-07
+  `gzip=True` one included, and the library never compresses its body beside a caller header.
+  `identity`, an empty or whitespace value, and no header construct.
   Technical refinements landed with it: a value is read by the bytes it sends, so `b"identity"`
   beside `gzip=False` and `b"gzip"` beside `gzip=True` construct while `5` and `True` name a coding
   and are refused by both; once a caller `Content-Encoding` is set, compression is fixed at

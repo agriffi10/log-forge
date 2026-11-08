@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Unpack
 
+from log_foundry import _diag
 from log_foundry.sinks._time import epoch_seconds
 from log_foundry.sinks.http import (
     HTTPKwargs,
@@ -90,18 +91,22 @@ class SplunkHECSink(HTTPSink):
             replaced the token on the wire. So the token is always the ``Authorization`` sent,
             and the ``auth=`` refusal's wording holds in every case. Last, a ``token`` that is
             empty or only spaces and tabs is refused (1.2.0): it sent ``Authorization: Splunk``
-            with no token on every request.
+            with no token on every request. A ``str`` token is copied once as the exact ``str``
+            it stores, and that copy is both judged and sent, so a subclass's ``__format__``
+            cannot answer one thing to the check and another on the wire; any other value is
+            formatted once, as 1.x formatted it, and the text is judged and sent.
         """
         self._host = host
         self._source = source
+        credential = _diag._STR_STR(token) if issubclass(type(token), str) else format(token)
         headers = merge_headers(
-            {"Authorization": f"Splunk {token}"},
+            {"Authorization": f"Splunk {credential}"},
             http_kwargs,
             owner=type(self).__name__,
             argument="token",
         )
         super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[misc]
-        _refuse_empty_credential(token, type(self).__name__, "token")
+        _refuse_empty_credential(credential, type(self).__name__, "token")
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event's HEC envelope (FR-008).

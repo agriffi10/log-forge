@@ -3,8 +3,9 @@
 ``DatadogSink("")`` sent ``DD-API-KEY:`` with nothing after it on every request,
 ``NewRelicSink("")`` an empty ``Api-Key``, ``HoneycombSink("", ...)`` an empty
 ``X-Honeycomb-Team`` and ``SplunkHECSink(url, "")`` ``Authorization: Splunk`` with no token.
-Each is refused at construction, naming the argument and never the value, and so is a value of only spaces and tabs,
-which a recipient strips (RFC 9110 §5.5) and receives as no credential (invariants 11 and 13).
+Each is refused at construction, naming the argument and never the value, and so is a value of
+only spaces and tabs, which a recipient strips (RFC 9110 §5.5) and receives as no credential
+(invariants 11 and 13).
 
 The population is derived, not hand-listed: every ``merge_headers(..., argument=)`` call in
 ``src/log_foundry/sinks/`` names a credential argument, and every constructor parameter of a
@@ -148,6 +149,80 @@ def test_an_empty_or_blank_credential_is_refused_naming_the_argument(case, value
     assert str(caught.value) == _message(*case)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+_BYTES_EMPTY = [b"", b"  ", b"\t", bytearray(b" ")]
+_HEADER_CASES = sorted(case for case in _CREDENTIALS if case[0] != "SplunkHECSink")
+"""The credentials sent as the whole header value, which a ``bytes`` value is sent as."""
+
+
+@pytest.mark.parametrize("value", _BYTES_EMPTY, ids=["empty", "space", "tab", "bytearray"])
+@pytest.mark.parametrize("case", _HEADER_CASES, ids=lambda case: f"{case[0]}.{case[1]}")
+def test_an_empty_or_blank_bytes_credential_is_refused_as_sent(case, value) -> None:
+    """At ``48d7d7d6``: only a ``str`` was judged, so ``DatadogSink(b"")`` sent ``DD-API-KEY:``
+    with nothing after it. The value is judged by the bytes it sends, as the header path reads
+    it."""
+    make, _header, _sent = _CREDENTIALS[case]
+
+    with pytest.raises(ValueError) as caught:
+        make(value)
+
+    assert str(caught.value) == _message(*case)
+
+
+@pytest.mark.parametrize("case", _HEADER_CASES, ids=lambda case: f"{case[0]}.{case[1]}")
+def test_a_bytes_credential_with_text_constructs_and_is_sent(case) -> None:
+    make, header, _sent = _CREDENTIALS[case]
+    opener = FakeOpener()
+
+    make(b"key", opener=opener).emit([{"i": 1}])
+
+    assert opener.calls[-1]["headers"][header] == b"key"
+
+
+def test_splunk_formats_a_bytes_token_as_1_x_did_and_judges_that_text() -> None:
+    """Splunk writes its token into ``Splunk <token>`` with ``format``, so ``b""`` was sent as
+    ``Splunk b''`` — a wrong credential, not an empty one — and is judged as that text."""
+    opener = FakeOpener()
+
+    SplunkHECSink(URL, b"", opener=opener).emit([{"i": 1}])  # type: ignore[arg-type]
+
+    assert opener.calls[-1]["headers"]["authorization"] == "Splunk b''"
+
+
+class _Formats(str):
+    """A token whose ``__format__`` answers something other than the text it holds."""
+
+    calls = 0
+    answer = ""
+
+    def __format__(self, spec: str) -> str:
+        type(self).calls += 1
+        return type(self).answer
+
+
+def test_splunk_judges_and_sends_the_exact_str_copy_and_never_formats_a_str_token() -> None:
+    """At ``48d7d7d6``: the check read the copy but the header was ``f"Splunk {token}"``, so a
+    ``__format__`` answering ``""`` constructed and sent ``Authorization: Splunk`` with no token."""
+    _Formats.calls = 0
+    _Formats.answer = ""
+    opener = FakeOpener()
+
+    SplunkHECSink(URL, _Formats("tok"), opener=opener).emit([{"i": 1}])
+
+    assert opener.calls[-1]["headers"]["authorization"] == "Splunk tok"
+    assert _Formats.calls == 0
+
+
+def test_splunk_refuses_an_empty_token_whatever_its_format_answers() -> None:
+    _Formats.calls = 0
+    _Formats.answer = "text"
+
+    with pytest.raises(ValueError) as caught:
+        SplunkHECSink(URL, _Formats(""))
+
+    assert str(caught.value) == _message("SplunkHECSink", "token")
+    assert _Formats.calls == 0
 
 
 @pytest.mark.parametrize("value", ["k", " key ", "a b"], ids=["short", "padded", "inner-space"])
