@@ -1088,10 +1088,14 @@ close it.
   of its own default still sends what it sent. So `SplunkHECSink`'s `auth=` refusal, which says the
   sink sends its token as `Authorization`, is true in every case. Its twin, two caller names
   folding to one wire name (`{"x-a": "1", "X-A": "2"}`), used to send only the last and is refused
-  by `_valid_headers`. Guard: `tests/test_sinks_http_header_roster.py`, a run-time roster that
-  replays every header each HTTP sink sends as a caller header and requires a refusal, with
-  `tests/test_sinks_http_header_collisions.py`'s AST scans supplementary. The reasoning: *A caller
-  header that would silently replace another is refused*, in `docs/decisions/sink-delivery/`.
+  by `_valid_headers`. Guards: `tests/test_sinks_http_header_roster.py`, a run-time roster that
+  replays as a caller header each header one default first-attempt emit per HTTP sink sends, and
+  requires a refusal; and, for what that one request never exercises (a header written only under
+  `gzip=True`, on a retry or 413 split, or for a non-default option), the AST route scan in
+  `tests/test_sinks_http_header_collisions.py`, which names a subscript write or an `.update` or
+  `.setdefault` call on any `headers` attribute, in any method, and a write of a `"headers"` key.
+  The reasoning: *A caller header that would silently replace another is refused*, in
+  `docs/decisions/sink-delivery/`.
 - ~~**An `auth` that unpacks only once is accepted at construction, and every `emit` then
   fails**~~ (SPEC-071 frame-2 review; invariant 13) → **closed by the HTTP auth fix (no spec)**.
   Credentials are copied once, at construction, as exact `str` (`_diag._STR_STR`; a pair unpacked

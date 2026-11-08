@@ -487,6 +487,8 @@ holding whitespace, `tests/test_sinks_http_header_merge.py` for a non-mapping `h
 a platform sink's non-`dict` one sent and `gzip=True` refused beside a `Content-Encoding`
 in any case naming another coding, across every class forwarding `gzip`, and
 `tests/test_sinks_http_header_collisions.py` for a caller header naming a platform sink's own
-credential header or two names folding to one, with AST scans of the routes a sink sets headers
-by, and `tests/test_sinks_http_header_roster.py`, which builds every HTTP sink, replays each header
-it sends as a caller header and fails naming one not refused (the HTTP auth fix, no spec).
+credential header or two names folding to one, with an AST scan naming any subscript write or
+`.update`/`.setdefault` on a `headers` attribute and any `"headers"` key write, and
+`tests/test_sinks_http_header_roster.py`, which builds every HTTP sink with default options,
+replays each header its first emit sends as a caller header and fails naming one not refused (the
+HTTP auth fix, no spec).

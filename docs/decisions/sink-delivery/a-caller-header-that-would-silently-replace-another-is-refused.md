@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A caller header that would silently replace another is refused"
-description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — every key of the base it hands `merge_headers` with `argument=` — is a `ValueError` at construction naming the argument it would replace; two caller names folding to one are refused by `_valid_headers`; `gzip=True` beside a caller `Content-Encoding` naming another coding is refused. None quotes a value. Without `argument=`, `merge_headers` lets the caller win, as in 1.x. Do NOT let either side win silently on a shipped sink, or hand-list the credential headers: a run-time roster replays every header each sink sends and requires a refusal. (HTTP auth fix, no spec; reverses SPEC-048 FR-007)"
+description: "A caller `headers=` name folding (`http._wire_name`) to a platform sink's own credential header — every key of the base it hands `merge_headers` with `argument=` — is a `ValueError` at construction naming the argument it would replace; two caller names folding to one are refused by `_valid_headers`; `gzip=True` beside a caller `Content-Encoding` naming another coding is refused. None quotes a value. Without `argument=`, `merge_headers` lets the caller win, as in 1.x. Do NOT let either side win silently on a shipped sink, or hand-list the credential headers: a run-time roster replays each header one default emit per sink sends, and an AST scan names writes to any `headers` map. (HTTP auth fix, no spec; reverses SPEC-048 FR-007)"
 ---
 
 **A caller header is refused at construction when it would silently replace another header,
@@ -58,21 +58,29 @@ compressed under a label that says otherwise.
 and the `Content-Encoding` `HTTPSink` writes per request sit beneath the caller's headers
 (SPEC-009 FR-002).
 
-**Asked of the running code, not of the source.** The credential set is every key of the dict
+**Asked of the running code, and of the source.** The credential set is every key of the dict
 literal each sink hands `merge_headers` with `argument=`, so a new platform sink is covered by
-calling it that way. The guard is `tests/test_sinks_http_header_roster.py`, a run-time roster: it
-builds every shipped `HTTPSink` subclass and every class that builds an `HTTPSink` (`LogstashSink`,
-`SentrySink`), emits once through a recording opener, takes every header the request carried
-(`Request.header_items()`) minus what `urllib` and the transport own, passes each back as a caller
-header in lower and upper case and requires a refusal — `auth=` too, for one folding to
-`Authorization` — and pins each class's own headers by name, failing by name on a class it has no
-builder for. The two AST scans in `tests/test_sinks_http_header_collisions.py`, the route roster
-and the `extra_headers` scan, are kept as supplementary: they read every code path where the
-run-time roster sees only what one `emit` exercises, but they were blind to routes their patterns
-do not name — `self._headers[...] = ...` after `super().__init__`, an `.update`, a
-`**{"headers": ...}` splat, an `_attempt` override calling `add_header` — which the run-time
-roster catches. The same class of miss recurred across two scans, which is why the guard moved to
-the running code rather than gaining another pattern.
+calling it that way. Two guards hold the rule, each covering what the other cannot.
+`tests/test_sinks_http_header_roster.py` is a run-time roster: it builds every shipped `HTTPSink`
+subclass and every class that builds an `HTTPSink` (`LogstashSink`, `SentrySink`) with default
+options, emits once through a recording opener, takes the headers that first attempt carried
+(`Request.header_items()`) minus what `urllib`, the transport and the body's encoding own,
+`Content-Type` among them, passes each back as a caller header in lower and upper case and requires
+a refusal — `auth=` too, for one folding to `Authorization` — and pins each class's own headers by
+name, failing by name on a class it has no builder for. It sees only that one request, so a header a
+sink writes only under `gzip=True`, on a retry, on a 413 split or for a non-default option, or a
+`Content-Type` the sink writes itself, escapes it. The AST scans in
+`tests/test_sinks_http_header_collisions.py` read every code path instead. The route scan reports a
+subscript write to, or an `.update` or `.setdefault` call on, any name or attribute holding
+`headers` — `self._headers[...]`, `self._http._headers.update(...)`, conditional or in any method —
+and a write of a `"headers"` key, as well as a `merge_headers` base that is not a literal and a
+`headers=` not built by `merge_headers`; the `extra_headers` scan names any per-request key folding
+to `Authorization`. Each scan once missed a route its patterns did not name (`self._headers[...] =
+...` after `super().__init__`, an `.update`, a `**{"headers": ...}` splat, an `_attempt` override
+calling `add_header`), which is why neither is the only guard: the roster catches what is actually
+sent by a route no pattern names, and the scan catches what the one request never exercises.
+`merge_headers` itself runs no caller `__hash__` or `__eq__`: it reads both maps by iteration and
+rebuilds the merged map by position.
 
 **`merge_headers` is public** (`sinks.http.__all__`, held by the typed consumer), so the refusal is
 opt-in and its two new parameters are keyword-only and defaulted (invariant 10). Without `argument=`
@@ -93,13 +101,20 @@ nobody's approval, and was reverted as a technical correction.
 - *Keeping SPEC-048 FR-007's header-wins for `Content-Encoding`.* It silently ignores `gzip=True`,
   the failure this decision refuses everywhere else.
 - *A hand-written list of credential headers.* It goes stale the day a sink is added; the derived
-  set and the run-time roster cannot.
+  set and the two guards cannot.
 - *Protecting every key of `base` for every caller of `merge_headers`.* It refuses a third-party
   sink's working override of its own default, a break in a public function's behaviour.
-- *Another AST pattern for each route found.* The scans missed a new route each round; the
-  run-time roster reads what is actually sent.
+- *Either guard alone.* The scans missed a new route each round, and the run-time roster sees one
+  default request; together each covers the other's blind spot.
 
 ## History
+
+### 2026-11-08
+
+- **Corrected (HTTP auth fix, no spec).** The run-time roster sees one default first-attempt
+  request per sink, not every header a sink can send, so the AST route scan, which now names any
+  write to a `headers` map, is a guard beside it rather than a supplement. `merge_headers` runs no
+  caller `__hash__` or `__eq__`.
 
 ### 2026-11-07
 
