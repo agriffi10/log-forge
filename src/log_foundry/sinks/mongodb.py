@@ -410,6 +410,10 @@ class MongoDBSink:
     def _settle_bulk(self, errors: object, positions: list[int], fates: list[Outcome]) -> None:
         """Reads a ``BulkWriteError``'s ``writeErrors`` by ``index`` through the keyed reader.
 
+        A list it cannot pair makes every document ``UNKNOWN`` with one line, ``ALWAYS``, or
+        ``LAST`` in a run that resends an ``UNKNOWN`` (``RunContext.resends_unknown``), so a
+        document is announced once per run.
+
         Args:
           errors: The details' ``writeErrors``, of any shape.
           positions: Each inserted document's position in the round's batch, in insert order.
@@ -434,7 +438,7 @@ class MongoDBSink:
                     f"MongoDBSink could not pair a bulk write's writeErrors to the {unread} "
                     "document(s) sent; not retried",
                 ),
-                when=When.ALWAYS,
+                when=When.LAST if context.resends_unknown(self) else When.ALWAYS,
             )
             return
         landed: list[int] = []

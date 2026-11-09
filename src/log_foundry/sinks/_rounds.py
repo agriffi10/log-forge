@@ -329,8 +329,10 @@ def settle_keyed(
 
     A raise makes the call's entries ``RETRYABLE`` (a ``LAST`` line) or ``REJECTED`` (an
     ``ALWAYS`` line) as ``_retryable_error`` answered, the line SPEC-070's ``<Class>, N
-    attempt(s), <Type>``; an unread reply makes them ``UNKNOWN`` with one ``ALWAYS`` line, never
-    resent; otherwise each entry takes its reply's outcome, a sender fault marked a final
+    attempt(s), <Type>``; an unread reply makes them ``UNKNOWN`` with one line, never resent by a
+    shipped sink's run, so ``ALWAYS``, or ``LAST`` in a run whose sink declares itself idempotent
+    and so resends them (``RunContext.resends_unknown``, asked of the run rather than ``owner``,
+    since a delegate forwarding ``deliver`` decides the resend); otherwise each entry takes its reply's outcome, a sender fault marked a final
     rejection with 1.x's ``rejected as invalid (first code: …); not retried`` line, and an entry
     still failing a ``LAST`` line ``still failing after N attempt(s); abandoned``.
 
@@ -369,6 +371,7 @@ def settle_keyed(
         for position in positions:
             fates[position] = Outcome.UNKNOWN
         unread = len(positions)
+        when = When.LAST if context.resends_unknown(owner) else When.ALWAYS
         context.announce(
             lambda: _diag.lost(
                 "message",
@@ -376,7 +379,7 @@ def settle_keyed(
                 f"{name} could not adjudicate a {call} reply ({unread} entry(ies) sent); not "
                 "retried",
             ),
-            when=When.ALWAYS,
+            when=when,
         )
         return []
     accepted: list[int] = []
@@ -432,8 +435,9 @@ def settle_positional(
     (SPEC-070 FR-003): a record it codes as failed is ``RETRYABLE`` — the entry predicate of both
     services answers every coded record retryable — the rest ``ACCEPTED``; a reply it cannot
     adjudicate, or one that is not a mapping, makes the call's records ``UNKNOWN``, never
-    resent, counted on ``dropped_unadjudicated`` ``ALWAYS`` with 1.x's line, so the sub-count
-    keeps its meaning and ``.failed`` keeps excluding it.
+    resent, counted on ``dropped_unadjudicated`` with 1.x's line, so the sub-count keeps its
+    meaning and ``.failed`` keeps excluding it. Both are ``ALWAYS``, or ``LAST`` in a run that
+    resends an ``UNKNOWN``, as :func:`settle_keyed`'s unread line is.
 
     Args:
       owner: The sink, whose class name the lines carry.
@@ -487,9 +491,8 @@ def settle_positional(
         described = describe_count(failed_count)
         for position in positions:
             fates[position] = Outcome.UNKNOWN
-        context.count(
-            cast("_Counted", owner), "dropped_unadjudicated", unadjudicated, when=When.ALWAYS
-        )
+        when = When.LAST if context.resends_unknown(owner) else When.ALWAYS
+        context.count(cast("_Counted", owner), "dropped_unadjudicated", unadjudicated, when=when)
         context.announce(
             lambda: _diag.lost(
                 "record",
@@ -497,7 +500,7 @@ def settle_positional(
                 f"{name} could not adjudicate a {call} response ({sent} record(s) sent, "
                 f"{returned}, {coded} coded, {described}); abandoned, not retried",
             ),
-            when=When.ALWAYS,
+            when=when,
         )
         return
     retry = {id(record) for record in verdict.retry}

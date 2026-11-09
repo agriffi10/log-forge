@@ -819,7 +819,9 @@ class NATSSink:
         round's events are sink-counted, so the engine adds nothing. Something published: the
         engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in
         1.x's order — each raised publish, the unattempted remainder, an abandoned publish
-        counted where it was abandoned, and an unanswered confirmation.
+        counted where it was abandoned, and an unanswered confirmation. The last two announce
+        ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that resends
+        an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per run.
 
         Args:
           published: The round's publishes.
@@ -849,18 +851,19 @@ class NATSSink:
                 lambda: _diag.lost("event", unattempted, f"NATSSink publish_timeout {timeout}s"),
                 when=When.ALWAYS,
             )
+        unknown = When.LAST if context.resends_unknown(self) else When.ALWAYS
         abandoned = states.count("abandoned")
         if abandoned and published.abandoned_counted:
             what = published.kind
             context.announce(
                 lambda: _diag.lost("event", abandoned, f"NATSSink unconfirmed, {what} abandoned"),
-                when=When.ALWAYS,
+                when=unknown,
             )
         if unconfirmed:
             sent = states.count("ok") + (0 if published.abandoned_counted else abandoned)
             context.announce(
                 lambda: _diag.lost("event", sent, "NATSSink unconfirmed, no PONG after the batch"),
-                when=When.ALWAYS,
+                when=unknown,
             )
 
     def _refusal_outside_the_lock(self, prefix: str) -> tuple[Outcome, SinkDeliveryError] | None:

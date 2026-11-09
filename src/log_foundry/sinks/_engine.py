@@ -684,29 +684,44 @@ class RunContext:
         """
         return _Drops(self, owner)
 
-    def _mark(self) -> tuple[int, int]:
+    def _mark(self) -> tuple[int, int, int, int, Exception | None]:
         """Returns a point :meth:`_rewind` can return the context to.
+
+        Its first two members are what a caller compares: the counts and the lines registered
+        so far. The rest are SPEC-074's marks — the final rejections, the sink-counted indices
+        and the refusal — so a rewind discards a mark a faulting hook set as it discards the
+        hook's counts.
 
         Args:
           None.
 
         Returns:
-          How many counts and how many lines are registered so far.
+          How many counts, lines, final rejections and sink-counted indices are registered so
+          far, and the refusal registered so far.
 
         Raises:
           None.
         """
-        return len(self._entries), len(self._lines)
+        return (
+            len(self._entries),
+            len(self._lines),
+            len(self._final),
+            len(self._counted),
+            self._refused,
+        )
 
-    def _rewind(self, mark: tuple[int, int]) -> None:
-        """Discards every count and line registered since ``mark``.
+    def _rewind(self, mark: tuple[int, int, int, int, Exception | None]) -> None:
+        """Discards every count, line and mark registered since ``mark``.
 
         A caller guarding a hook that may register a count and then raise uses it to replace
-        what the hook left with its own, so the loss is counted and announced once. An immediate
-        context has committed each entry already, so nothing is left to discard. It assumes no
-        other thread registers on this context between the mark and the rewind, as a context is
-        not thread-safe: a ``deliver`` fanning inner rounds out over threads that share it would
-        have one round's rewind discard a sibling's entries.
+        what the hook left with its own, so the loss is counted and announced once. A mark goes
+        too: the guard settles the hook's chunk itself, so a final rejection or a sink-counted
+        index the hook set there would no longer fit its outcome, and the engine would fail the
+        whole round as it fails one whose marks do not fit (SPEC-074). An immediate context has
+        committed each entry already and keeps no marks, so nothing is left to discard. It
+        assumes no other thread registers on this context between the mark and the rewind, as a
+        context is not thread-safe: a ``deliver`` fanning inner rounds out over threads that
+        share it would have one round's rewind discard a sibling's entries.
 
         Args:
           mark: What :meth:`_mark` returned.
@@ -719,6 +734,9 @@ class RunContext:
         """
         del self._entries[mark[0] :]
         del self._lines[mark[1] :]
+        del self._final[mark[2] :]
+        del self._counted[mark[3] :]
+        self._refused = mark[4]
 
     def _begin(self, number: int) -> None:
         """Records the round about to run.
