@@ -104,13 +104,12 @@ on the engine's **run context** as `SETTLED`, committed by `_engine._commit` onl
 settles, so a run that fails counts none of them and its catcher owns the batch. A counter some
 `losses()` reports as `dropped` is written only by that commit: the counters are derived from the
 tree and the rule checked over it (`tests/test_deferral.py`). The
-exception is a sink's own `failed` count, the upper bound above: it can land before a raise and
-again each time the worker retries that batch, the SQS and SNS sender faults included
-(`SQSSink._send` and, since SPEC-070, `SNSSink._send` count one before `emit` raises for a
-recoverable loss beside it), a failure the sink's retry predicate does not accept, counted at its
-first attempt before `emit` raises when nothing landed (SPEC-070), and the batch size a
+exception is a sink's own `failed` count, the upper bound above: on a sink still off the engine it
+can land before a raise and again each time the worker retries that batch — the batch size a
 `SQLiteSink`, `FileSink` or `RotatingFileSink` adds to `failed` when its driver raises, before it
-raises in turn (SPEC-069 FR-004). The HTTP family's `failed` lands once per batch since SPEC-073: it
+raises in turn (SPEC-069 FR-004). ~~The SQS and SNS sender faults and a failure the retry predicate
+refuses, counted before `emit` raised (SPEC-070)~~ — superseded by SPEC-074: those sinks are on the
+engine, where each lost event lands in `failed` once per run. The HTTP family's `failed` lands once per batch since SPEC-073: it
 is registered on the run context and committed when the run ends, once per request refused for
 good and once per request of the last round still retryable, and a shipped family sink is never
 resent whole by the worker, which calls its `deliver`. A third-party subclass kept on its 1.x path
@@ -130,8 +129,14 @@ response and both NATS cases, `REJECTED` for a sender fault, `DROPPED` for an ov
 unencodable or id-callable failure, and `SKIPPED`, counted in the wrapper's own `_dropped`, for a
 wrapper's per-event failure (SPEC-072 FR-003) — and the engine resends none of them unless
 the sink declares itself idempotent, which no shipped sink does. The HTTP family defines
-`deliver` since SPEC-073 and returns those outcomes; the sinks that adopt it in later specs return
-them too. A sink whose own counters count something other than events — `HTTPSink.failed` counts
+`deliver` since SPEC-073 and returns those outcomes; since SPEC-074 so do the queue, database,
+broker and socket sinks, whose drops — an oversize, an unencodable event, an SQS id-callable failure
+— register on the run context `SETTLED`, committed with the `SinkCounters` totals under one
+acquisition, so an engine sink's drop is counted only by a run that settled, and whose sub-counts
+(`dropped_oversized`, `dropped_unadjudicated`) commit in that same acquisition. A refusal — a closed
+sink, a NATS latch, an SQS batch whose every id callable raised — is marked on the run context and
+counted by its catcher alone; `NATSSink` registers 1.x's own per-publish counts for a round in which
+nothing was published, so its `failed` still moves once per raised publish per call. A sink whose own counters count something other than events — `HTTPSink.failed` counts
 requests — registers them on the engine's run context, which commits them once per run through
 one `Deferral` per owner, `SETTLED` for a drop.
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
@@ -140,7 +145,11 @@ the tree, SPEC-069), `tests/test_classify.py` (every retry loop counts once at t
 failed, the sender faults and the contradictory counts, SPEC-070), `tests/test_delivery_engine.py`
 (the engine's counting table and run-failed rule) and `tests/test_delivery_paths.py` (each catcher
 of a failed run, SPEC-072), `tests/test_run_context.py` (the run context's commit rules) and
-`tests/test_http_rounds.py` (the HTTP family's counts on both paths and both forms, SPEC-073);
+`tests/test_http_rounds.py` (the HTTP family's counts on both paths and both forms, SPEC-073),
+`tests/test_engine_shipped_verdicts.py` (the refusal marker, final rejections, sink-counted rounds
+and the one-lock commit), `tests/test_sinks_{queue,db,broker}_engine.py`, `tests/test_socket_engine.py`
+and `tests/test_engine_sinks_roster.py` (every engine sink's counts and the derived roster,
+SPEC-074), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
 `tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,
 holding each term to its exact share, and for an `HTTPSink` behind a scripted opener.
 
@@ -154,7 +163,10 @@ between rounds are the same (SPEC-072): each goes through `sinks._retry.wait`, c
 on the worker's `_stop` or, on the orphan path and in the inline adapter, on the sink's
 `log_foundry_stop_signal`; a server's hint is bounded by the sink's `max_retry_after`; and SPEC-062's
 prediction is asked before every further round, so on the exit drain an engine run declines a round
-predicted to end past `shutdown()`'s deadline, as the 1.x `emit` loop does.
+predicted to end past `shutdown()`'s deadline, as the 1.x `emit` loop does. Since SPEC-074 no sink
+module but the engine waits or holds a backoff constant (`pubsub`'s wait on its own futures is not a
+backoff): every SDK, driver and socket sink waits through the engine, and none holds its transport
+lock across a wait, so a `close()` during a backoff returns at once and the next round is refused.
 
 *Observable:* elapsed wall time ≤ the timeout plus the sink's one in-flight call; CPU time ≈ 0.
 *Recorded exceptions:* `Sink.close()` takes no timeout and is unbounded on both delivery paths;
@@ -165,7 +177,9 @@ each still capped, rather than letting the exception out or skipping a wait; and
 declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in the adapter, as a
 1.x sink without the attribute backs off uninterruptibly (SPEC-072).
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
-`tests/test_sink_retry.py`, `tests/test_sinks_nats_liveness.py` (every `NATSSink` wait, the
+`tests/test_sink_retry.py` (only the engine waits, derived over `sinks/`, SPEC-074),
+`tests/test_sinks_db_engine.py`, `tests/test_sinks_broker_engine.py` and `tests/test_socket_engine.py`
+(a `close()` during a backoff), `tests/test_sinks_nats_liveness.py` (every `NATSSink` wait, the
 backstop and the latch, SPEC-061), `tests/test_sinks_nats_matrix.py` (those waits and both latches
 as a mutation-gated corpus, including the next and the queued caller's latency), `tests/test_worker_exit_budget.py` (the exit drain's
 retries fit the `shutdown()` budget, SPEC-062) and `tests/test_delivery_paths.py` (the same cases

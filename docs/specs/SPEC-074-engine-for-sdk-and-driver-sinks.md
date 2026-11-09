@@ -775,8 +775,10 @@ reads as the property object to the static reader, so the engine would give the 
 
 **The deletions.** The eleven `for attempt in range` loops, the eleven `_BACKOFF_BASE` constants,
 `SocketTransport.send_all`, and the twelve hand-built `SinkLosses` of the Overview go, so after this
-spec (and SPEC-073) no module under `sinks/` but `_engine.py` assigns a backoff constant or calls
-`wait`, and no converted module builds a `SinkLosses`. Counted on SPEC-069's ledger rather than
+spec (and SPEC-073) no module under `sinks/` assigns a backoff constant or calls `wait` but
+`_engine.py`, `_retry.py`, which defines `wait`, and `pubsub.py`, whose result poll waits in slices
+through `_retry.wait` and which this spec does not edit (fixed decision) — and no converted module
+builds a `SinkLosses`. Counted on SPEC-069's ledger rather than
 `fda134a`'s: the Overview's grep, run on the build's base commit and again after the build, loses
 exactly the twelve converted modules. What it still finds is the nine the Overview names, plus
 `stdout`, `file` and `sqlite`, whose `losses()` SPEC-069 adds and this spec does not touch, for any
@@ -815,8 +817,8 @@ defines `deliver` nor `log_foundry_counters`, and each keeps `rejected` and `los
 - `tests/test_sink_retry.py`'s `_modules_with_a_retry_loop` (pinned by SPEC-073 to the base set less
   `http`, eleven names) finds
   none after SPEC-073 and this spec. Its pin and its two tests are replaced by a derived check over
-  `sinks/*.py` that no module but `_engine.py` and `_retry.py` calls `wait` or assigns a backoff
-  constant, with a fixture corpus that plants each, and the stop-signal test is restated over the
+  `sinks/*.py` that no module but `_engine.py`, `_retry.py` and `pubsub.py` (each a named exclusion,
+  for the reason under *The deletions*) calls `wait` or assigns a backoff constant, with a fixture corpus that plants each, and the stop-signal test is restated over the
   engine sinks. The tests that set `redis_mod._BACKOFF_BASE` and `sqs_mod._BACKOFF_BASE` patch the
   engine's.
 - SPEC-070's loop roster (floor 11 as SPEC-073 leaves it) is restated over the engine sinks: each
@@ -1083,3 +1085,4 @@ other site still stating the old claim:
 - 2026-11-08, build (plan review B1, M1, M2): the SQS FIFO hold is decided per chunk at send time, so same-group events never sent travel together and a healthy one-group batch is one call; a held event never sent is counted with a `0 attempt(s), held behind …` line (reading (a), pending Andrew's call); a repeated event identity keeps one cached entry per occurrence and entry `Id`s persist across rounds; a sink-counted loss is registered as `failed_events` on `log_foundry_counters`, never against the `failed` setter; `_Prepared.index` is `position`; the dedup-callable criterion's fallback case returns a blank string.
 - 2026-11-08, build (plan review Q1, Q2, Q3): `max_retries` on RabbitMQ, the socket transport and Syslog is a set-only refusing descriptor rather than a `property`, which the engine's static reader cannot see; a converted sink's total-failure message is the adapter's (listed under *What a caller sees change*); FR-004's wedged-loop backstop is a `REJECTED` refusal round, the reading the shipped NATS tests left standing when both were built and run.
 - 2026-11-08, build (FR-005): `SocketTransport` takes an optional `frame` and the owning sink's `sink_name`; `SyslogSink.log_foundry_stop_signal` is a plain attribute the engine can read statically.
+- 2026-11-09, build (plan review S2): the no-wait check names `pubsub.py` as an exclusion beside `_engine.py` and `_retry.py`, since its result poll waits through `_retry.wait` and this spec leaves it unedited; FR-006's deletion sentence said only `_engine.py` would.

@@ -201,6 +201,21 @@ class SyslogSink:
         """
         return self._socket.failed
 
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the transport's count, the one ledger this sink reads (SPEC-074 FR-006).
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._socket.failed = value
+
     def losses(self) -> SinkLosses:
         """Reports the counters this sink shares with its socket transport (SPEC-026 FR-002).
 

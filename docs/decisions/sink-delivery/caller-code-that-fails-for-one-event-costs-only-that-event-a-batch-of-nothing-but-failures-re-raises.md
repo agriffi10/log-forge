@@ -14,6 +14,10 @@ description: "`TransformSink`'s function, `FilteringSink`'s predicate and `SQSSi
 
 ## History
 
+### 2026-11-09
+
+- **Applied on the engine, `SQSSink` FIFO only**, by SPEC-074 FR-001: when every event's id callable raised, the events are `REJECTED` with the refusal marker (`refuse(first_exc)`), so the batch costs one attempt and is **no longer retried by the worker**; no sink counter moves, the catcher's `failed_batches` or `orphan_lost` counts it, and `emit` re-raises the first exception by identity. The fence's "re-raised unchanged and nothing is counted" stands. The wrappers' half is SPEC-075's to record.
+
 ### 2026-11-06
 
 - **Widened** by SPEC-069 FR-001, FR-002: the HTTP half's settle-don't-re-raise rule now covers every record-building sink's encode step, through one helper.

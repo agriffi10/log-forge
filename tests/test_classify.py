@@ -419,14 +419,74 @@ def engine_round_findings(
 
 
 def test_every_retry_loop_asks_its_sinks_predicate() -> None:
-    """FR-001 AC-10, over the shipped tree, and SPEC-074 FR-006's restatement over the rounds.
+    """FR-001 AC-10, restated by SPEC-074 FR-006 over the engine rounds, floor 11.
 
-    The floor counts loops and engine rounds together, so the population stays the eleven while
-    SPEC-074 moves each class from a loop to a round.
+    No retry loop is left in the tree; :func:`retry_loop_findings` still judges one should it
+    return. The eleven engine sinks other than the named exclusions are held to the rule instead.
     """
     engine, engine_findings = engine_round_findings(_SINKS)
-    _, findings = retry_loop_findings(_SINKS, floor=_LOOP_FLOOR - len(engine))
+    loops, findings = retry_loop_findings(_SINKS, floor=0)
+    assert loops == [], "a retry loop came back"
     assert findings + engine_findings == []
+    assert len(engine) >= _LOOP_FLOOR, f"the engine roster found {len(engine)}, under {_LOOP_FLOOR}"
+    assert len(engine) == _LOOP_FLOOR
+
+
+_ENGINE_CORPUS_GOOD = """
+class Sink:
+    def deliver(self, batch):
+        return one_round(self._round, batch)
+
+    def _round(self, batch):
+        try:
+            send()
+        except Exception as err:
+            ok = is_retryable(self._retryable_error, err)
+
+    def _retryable_error(self, err):
+        return True
+"""
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        (
+            _ENGINE_CORPUS_GOOD.replace(
+                "is_retryable(self._retryable_error, err)", "self._retryable_error(err)"
+            ),
+            "calls self._retryable_error directly",
+        ),
+        (
+            _ENGINE_CORPUS_GOOD.replace("is_retryable(self._retryable_error, err)", "True"),
+            "no handler of its round asks is_retryable",
+        ),
+        (
+            _ENGINE_CORPUS_GOOD.replace(
+                "    def _retryable_error(self, err):\n        return True\n", ""
+            ),
+            "defines no _retryable_error",
+        ),
+    ],
+    ids=["direct-call", "never-asks", "no-predicate"],
+)
+def test_the_engine_roster_names_the_class_and_the_reason(
+    tmp_path: Path, source: str, reason: str
+) -> None:
+    (tmp_path / "m.py").write_text(source, encoding="utf-8")
+    _, findings = engine_round_findings(tmp_path)
+    assert any("Sink" in f and reason in f for f in findings), findings
+
+
+def test_a_conforming_engine_round_is_silent(tmp_path: Path) -> None:
+    (tmp_path / "m.py").write_text(_ENGINE_CORPUS_GOOD, encoding="utf-8")
+    assert engine_round_findings(tmp_path) == (["Sink"], [])
+
+
+def test_removing_an_exclusion_reddens_naming_the_class() -> None:
+    exclusions = {k: v for k, v in ENGINE_EXCLUSIONS.items() if k != "SyslogSink"}
+    _, findings = engine_round_findings(_SINKS, exclusions)
+    assert any("SyslogSink" in f and "defines no _retryable_error" in f for f in findings), findings
 
 
 _CORPUS_HEAD = '"""A fixture sink module."""\n\nfrom x import is_retryable\n\n'

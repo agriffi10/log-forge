@@ -263,71 +263,11 @@ def test_shutdown_is_not_held_by_a_sink_mid_backoff() -> None:
 
 
 # --- FR-002 (Phase 2): every retrying sink waits through the shared helper ------------------
-
-
-def _modules_with_a_retry_loop() -> list[str]:
-    """Every sinks module containing a ``for attempt in range(...)`` re-send loop.
-
-    Derived, not listed: a hand-written roster is exactly how ``KinesisSink``, ``FirehoseSink``
-    and ``SNSSink`` shipped with a re-send loop, no wait and no stop signal while two tests
-    claimed to cover "every retrying sink". A new sink with a retry loop joins this set the day
-    it is written.
-    """
-    import ast
-    import pathlib as _pathlib
-
-    import log_foundry
-
-    found: list[str] = []
-    for path in sorted((_pathlib.Path(log_foundry.__file__).parent / "sinks").glob("*.py")):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.For)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "attempt"
-            ):
-                found.append(path.stem)
-                break
-    return found
-
-
-def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
-    """A re-send loop with no wait is the SQSSink defect, in a sink nobody listed."""
-    import ast
-    import pathlib as _pathlib
-
-    import log_foundry
-
-    root = _pathlib.Path(log_foundry.__file__).parent / "sinks"
-    missing: list[str] = []
-    for name in _modules_with_a_retry_loop():
-        source = (root / f"{name}.py").read_text()
-        missing.extend(
-            f"{name}.py:{node.lineno}"
-            for node in ast.walk(ast.parse(source))
-            if (
-                isinstance(node, ast.For)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "attempt"
-                and not any(
-                    isinstance(inner, ast.Call)
-                    and isinstance(inner.func, ast.Name)
-                    and inner.func.id == "wait"
-                    for inner in ast.walk(node)
-                )
-            )
-        )
-    assert missing == [], f"retry loops with no interruptible wait: {missing}"
-
-
-_NOT_YET_CONVERTED: frozenset[str] = frozenset()
-"""SPEC-074's transitional set: the modules whose retry loop a later phase of its build deletes.
-
-Each phase removes the modules it puts on the engine, so the set shrinks visibly and exactly; it
-was SPEC-073's eleven (``_RETRY_MODULES_AT_BASE`` less ``http``) and is deleted, empty, with the
-build's last phase.
-"""
+#
+# SPEC-027's derived roster of modules holding a ``for attempt in range`` loop found eleven, then
+# none once SPEC-073 and SPEC-074 put every retrying sink on the delivery engine. Its pin and its
+# two tests are replaced by the derived check below — only the engine waits — and the engine's
+# own loop is checked to wait through the shared helper.
 
 WAIT_EXCLUSIONS: dict[str, str] = {
     "_engine": "the delivery engine, the one module that waits between delivery rounds",
@@ -375,15 +315,6 @@ def _waiting_modules(root: pathlib.Path) -> set[str]:
     return found
 
 
-def test_the_retry_loop_modules_are_the_unconverted_set() -> None:
-    """SPEC-073 FR-005 and SPEC-074: a module leaving the derived set is asserted, never silent.
-
-    ``http`` left with SPEC-073, and each SPEC-074 phase takes its modules out; a derivation
-    that shrank for any other reason, or a loop restored, reddens here.
-    """
-    assert set(_modules_with_a_retry_loop()) == _NOT_YET_CONVERTED
-
-
 def test_only_the_engine_waits_or_backs_off() -> None:
     """SPEC-074 FR-006: no sinks module but the named exclusions waits or holds a backoff."""
     import log_foundry
@@ -391,20 +322,79 @@ def test_only_the_engine_waits_or_backs_off() -> None:
     root = pathlib.Path(log_foundry.__file__).parent / "sinks"
     found = _waiting_modules(root)
     assert set(WAIT_EXCLUSIONS) <= found | {"_retry"}, "an exclusion no longer waits: drop it"
-    assert found - set(WAIT_EXCLUSIONS) == _NOT_YET_CONVERTED
+    assert found - set(WAIT_EXCLUSIONS) == set()
 
 
-def test_every_module_with_a_retry_loop_declares_a_stop_signal() -> None:
+@pytest.mark.parametrize(
+    ("source", "found"),
+    [
+        ("from x import wait\ndef f():\n    wait(1.0)\n", True),
+        ("from x import _retry\ndef f():\n    _retry.wait(1.0, None)\n", True),
+        ("_BACKOFF_BASE = 0.1\n", True),
+        ("BACKOFF_BASE: float = 0.1\n", True),
+        ("def f(self):\n    self._stop.wait(1.0)\n", False),
+        ("def f():\n    sleep_less = 1\n", False),
+    ],
+    ids=["bare-wait", "retry-wait", "backoff", "annotated-backoff", "event-wait", "silent"],
+)
+def test_the_wait_scan_finds_each_plant(source: str, found: bool, tmp_path) -> None:
+    (tmp_path / "m.py").write_text(source, encoding="utf-8")
+    assert (_waiting_modules(tmp_path) == {"m"}) is found
+
+
+def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
+    """SPEC-073 FR-005: the engine's round loop joins the check that a retry loop waits idly.
+
+    ``_engine._run``'s ``while`` loop is the one resend loop for every sink on the engine; it
+    waits through ``_wait``, which calls ``_retry.wait`` on the stop event.
+    """
+    import ast
     import pathlib as _pathlib
 
     import log_foundry
 
-    root = _pathlib.Path(log_foundry.__file__).parent / "sinks"
-    missing = [
-        name
-        for name in _modules_with_a_retry_loop()
-        if "self.log_foundry_stop_signal" not in (root / f"{name}.py").read_text()
-    ]
+    tree = ast.parse(
+        (_pathlib.Path(log_foundry.__file__).parent / "sinks" / "_engine.py").read_text()
+    )
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    loops = [node for node in ast.walk(functions["_run"]) if isinstance(node, ast.While)]
+    assert len(loops) == 1, "the engine has one round loop"
+    assert any(
+        isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "_wait"
+        for call in ast.walk(loops[0])
+    ), "the round loop waits through _wait"
+    assert any(
+        isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "wait"
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "_retry"
+        for call in ast.walk(functions["_wait"])
+    ), "and _wait waits through _retry.wait"
+
+
+
+def test_every_engine_sink_declares_a_stop_signal() -> None:
+    """SPEC-027's rule restated over the engine sinks: each offers the engine a stop signal.
+
+    The engine waits on the sink's ``log_foundry_stop_signal`` when it runs one inline (the
+    adapter, the orphan path), so a sink without it backs off uninterruptibly there. ``NATSSink``
+    is named: it takes no ``max_retries``, so the adapter gives it one round and no wait.
+    """
+    import ast
+
+    from test_engine_sinks_roster import SINKS, engine_sink_findings
+
+    sinks, _ = engine_sink_findings(SINKS)
+    missing = []
+    for path in sorted(SINKS.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.ClassDef) or node.name not in sinks - {"NATSSink"}:
+                continue
+            if "self.log_foundry_stop_signal" not in ast.unparse(node):
+                missing.append(node.name)
     assert missing == [], f"no log_foundry_stop_signal: {missing}"
 
 
