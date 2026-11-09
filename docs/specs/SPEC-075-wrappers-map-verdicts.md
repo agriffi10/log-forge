@@ -537,8 +537,8 @@ No new type. The members each of the three classes gains, all set at constructio
 
 ```
 log_foundry_counters: SinkCounters | None   # the inner sink's / backend's own object, or None
-max_retries: int                            # copied from the inner sink when it has one; read-only
-max_retry_after: float                      # copied from the inner sink when it has one; read-only
+max_retries: int | None                     # copied as found from the inner sink, else None; read-only
+max_retry_after: float | None               # copied as found from the inner sink, else None; read-only
 # no log_foundry_idempotent, no _retryable_error
 ```
 
