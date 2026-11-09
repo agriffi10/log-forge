@@ -299,7 +299,7 @@ class RabbitMQSink:
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
             fates = [Outcome.DROPPED] * len(batch)
             lost = Lost(self)
-            for position, body in encode_round(self, batch, self._encode, sink="RabbitMQSink"):
+            for position, body in encode_round(self, batch, self._encode, sink=type(self).__name__):
                 mark_sent(self, [batch[position]])
                 called = self._publish(body)
                 if called.error is None:

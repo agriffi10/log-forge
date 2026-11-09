@@ -860,6 +860,38 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
     )
 
 
+DELIVER_LOCKERS = frozenset(
+    {
+        "AzureEventHubsSink",
+        "ClickHouseSink",
+        "NATSSink",
+        "PostgresSink",
+        "RabbitMQSink",
+        "SocketTransport",
+    }
+)
+"""SPEC-074 FR-006: the engine sinks whose ``deliver`` enters the transport lock, by name."""
+
+
+def test_the_engine_sinks_that_lock_in_deliver_are_the_six() -> None:
+    """FR-006's floor for the re-aimed lock roster: the walk from ``deliver`` finds all six.
+
+    :func:`_takes_the_transport_lock` now follows a helper a ``deliver`` hands on as well as one
+    it calls; were that walk to stop reaching ``_round``, these six would fall through to the
+    docstring check rather than fail, so the set is pinned by name. Equality, not a floor, so a
+    seventh locking ``deliver`` is a decision someone writes here.
+    """
+    found: set[str] = set()
+    for _, cls in _sink_classes_with_an_emit():
+        helpers = {
+            m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        deliver = helpers.get("deliver")
+        if deliver is not None and _takes_the_transport_lock(deliver, helpers, {deliver.name}):
+            found.add(cls.name)
+    assert found == DELIVER_LOCKERS
+
+
 def test_every_sink_records_a_client_buffering_decision() -> None:
     """Every sink either implements ``flush()`` or says, in its class docstring, why it need not.
 

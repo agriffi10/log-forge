@@ -677,3 +677,24 @@ def test_a_one_event_retryable_refusal_keeps_one_ledger_on_both_paths(kind: str)
     worker = through_worker(worked, events(1))
     assert worker.failed_batches == 1
     assert orphan.failed == worked.failed == 1
+
+
+@pytest.mark.parametrize("kind", STREAMS)
+def test_failed_is_read_under_the_counter_lock_so_a_commit_never_tears_it(kind: str) -> None:
+    """``.failed`` is ``failed_events - dropped_unadjudicated``, read under the lock that moves both.
+
+    Read outside it, a commit in progress showed one moved and not the other (frame-1 review).
+    """
+    import threading
+
+    sink, _ = build(kind)
+    read: list[int] = []
+    with sink._counter_lock:
+        sink.log_foundry_counters.failed_events += 2
+        reader = threading.Thread(target=lambda: read.append(sink.failed))
+        reader.start()
+        reader.join(0.2)
+        assert reader.is_alive(), "the read waits for the commit in progress"
+        sink.dropped_unadjudicated += 2
+    reader.join(10.0)
+    assert read == [0]

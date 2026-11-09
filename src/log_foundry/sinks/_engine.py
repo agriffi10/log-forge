@@ -380,11 +380,16 @@ class When(enum.Enum):
       SETTLED: Only when the run settles; a per-event drop, which a failed run's catcher owns.
       LAST: Only when the round that registered it is the run's last, so a count of something a
         later round may still fix is made once, for the round that ended the run.
+      FAILED: Only when the run fails and the round that registered it ended it: a count a sink
+        makes for a batch it lost whole, once per run (SPEC-074, the unencodable events that 1.x
+        ``PostgresSink`` and the Redis sinks counted in ``failed`` with the rest of a failed
+        batch). An immediate context, which knows no run ending, commits none.
     """
 
     ALWAYS = "always"
     SETTLED = "settled"
     LAST = "last"
+    FAILED = "failed"
 
 
 class _Marks(NamedTuple):
@@ -509,19 +514,30 @@ class RunContext:
         if not n:
             return
         if self._immediate:
-            _commit([(owner, {name: n})], [])
+            if when is not When.FAILED:
+                _commit([(owner, {name: n})], [])
             return
         self._entries.append((owner, name, n, when, self._round))
 
-    def announce(self, line: Callable[[], None], *, when: When) -> None:
+    def announce(
+        self,
+        line: Callable[[], None],
+        *,
+        when: When,
+        failed: Callable[[], None] | None = None,
+    ) -> None:
         """Registers a diagnostic line, written after the commit when ``when`` keeps it.
 
         A site passes a ``lambda`` wrapping its own ``_diag`` call, so the detail stays inside a
-        call ``tests/test_diag.py`` reads for a ``repr``.
+        call ``tests/test_diag.py`` reads for a ``repr``. ``failed`` is the same line for a batch
+        lost whole: written in its place when the run fails and this round ended it, so the one
+        line a 1.x ``emit`` wrote for a failed batch still counts every event of it (SPEC-074;
+        see :attr:`When.FAILED`). An immediate context writes ``line``.
 
         Args:
           line: Called with no arguments once the counts are committed, outside every lock.
           when: Which run endings write it.
+          failed: The line written instead when the run fails on this round, or ``None``.
 
         Returns:
           None.
@@ -532,7 +548,7 @@ class RunContext:
         if self._immediate:
             _commit([], [line])
             return
-        self._lines.append((line, when, self._round))
+        self._lines.append((line if failed is None else _Whole(line, failed), when, self._round))
 
     def resends_unknown(self, owner: object) -> bool:
         """Reports whether this run resends an ``UNKNOWN`` event: whether its sink is idempotent.
@@ -774,6 +790,8 @@ class RunContext:
             return True
         if when is When.SETTLED:
             return settled
+        if when is When.FAILED:
+            return not settled and registered == final
         return registered == final
 
     def _committed(
@@ -803,11 +821,14 @@ class RunContext:
                 owners.append((owner, {}))
             counts = owners[at][1]
             counts[name] = counts.get(name, 0) + n
-        lines = [
-            line
-            for line, when, registered in self._lines
-            if registered not in skip and self._kept(when, registered, settled=settled, final=final)
-        ]
+        lines: list[Callable[[], None]] = []
+        for line, when, registered in self._lines:
+            if registered in skip or not self._kept(when, registered, settled=settled, final=final):
+                continue
+            if type(line) is _Whole:
+                lines.append(line.failed if not settled and registered == final else line.settled)
+            else:
+                lines.append(line)
         return owners, lines
 
     def _close(self) -> None:
@@ -828,6 +849,47 @@ class RunContext:
         self._final = []
         self._counted = []
         self._refused = None
+
+
+class _Whole:
+    """A line with the variant :meth:`RunContext.announce` writes for a batch lost whole.
+
+    Attributes:
+      settled: The line written unless the run fails on the round that registered it.
+      failed: The line written when it does.
+    """
+
+    __slots__ = ("failed", "settled")
+
+    def __init__(self, settled: Callable[[], None], failed: Callable[[], None]) -> None:
+        """Holds both lines.
+
+        Args:
+          settled: The line written unless the run fails on the registering round.
+          failed: The line written when it does.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.settled = settled
+        self.failed = failed
+
+    def __call__(self) -> None:
+        """Writes the settled line, for a caller that writes a line without choosing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.settled()
 
 
 def _written() -> None:
@@ -1096,10 +1158,11 @@ def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[
                     for name, n in counts.items():
                         ledger.count_for(owner, name, n)
         except Exception as fault:
+            total = 0
+            for _, counts in group:
+                total += sum(counts.values())
             _uncounted(
-                fault,
-                sum(n for _, counts in group for n in counts.values()),
-                f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(lead)))}",
+                fault, total, f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(lead)))}"
             )
     for line in lines:
         line()

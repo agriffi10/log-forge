@@ -133,7 +133,7 @@ class SyslogSink:
             max_retries=max_retries,
             max_datagram_bytes=max_datagram_bytes,
             frame=self._frame,
-            sink_name="SyslogSink",
+            sink_name=type(self).__name__,
         )
         store_read_only(self, "max_retries", self._socket.max_retries)
         self.log_foundry_counters = self._socket.log_foundry_counters

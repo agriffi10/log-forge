@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._encode import encode_round, unencodable_in_run
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive
@@ -208,6 +208,10 @@ class _RedisSink:
         ``DROPPED`` with SPEC-069's line. The pipeline is built and executed inside this one call
         and never stored, since ``redis-py`` pipelines must not cross threads: all ``ACCEPTED``
         on ``execute()``, or all ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+        A run that fails counts the run's unencodable events in ``failed`` with the rest and its
+        line names them too, as 1.x's ``emit`` counted a failed batch whole
+        (:attr:`~log_foundry.sinks._engine.When.FAILED`); a run that settles leaves them
+        ``DROPPED``.
 
         Args:
           batch: The events this round is offered.
@@ -242,12 +246,15 @@ class _RedisSink:
         except Exception as err:
             retryable = is_retryable(self._retryable_error, err)
             kind = type(err).__name__
+            whole = unencodable_in_run(self)
+            context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
             lost = Lost(self)
             lost.add(
                 carried,
                 when=When.LAST if retryable else When.ALWAYS,
                 key=kind,
                 line=raised_line("event", type(self).__name__, kind),
+                whole=whole,
             )
             lost.register()
             outcome = Outcome.RETRYABLE if retryable else Outcome.REJECTED

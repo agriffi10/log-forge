@@ -11,7 +11,7 @@ from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._encode import NUL_ESCAPE, encode_round, repair_nul
+from log_foundry.sinks._encode import NUL_ESCAPE, encode_round, repair_nul, unencodable_in_run
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import floor_count, require_positive
@@ -331,7 +331,10 @@ class PostgresSink:
         or all ``RETRYABLE`` or ``REJECTED`` after :meth:`_rollback`, as ``_retryable_error``
         answers, the line naming the borrowed-broken connection exactly as 1.x wrote it. A
         non-empty round that produced no chunk is a refusal carrying 1.x's error: a chunker that
-        yields nothing would yield nothing again.
+        yields nothing would yield nothing again. A run that fails counts the run's unencodable
+        events in ``failed`` with the rest and its line names them too, as 1.x counted a spent
+        bound's whole batch (:attr:`~log_foundry.sinks._engine.When.FAILED`); a run that settles
+        leaves them ``DROPPED``.
 
         Args:
           batch: The events this round is offered.
@@ -376,12 +379,15 @@ class PostgresSink:
                     else ""
                 )
                 kind = type(called.error).__name__
+                whole = unencodable_in_run(self)
+                context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
                 lost = Lost(self)
                 lost.add(
                     carried,
                     when=When.LAST if called.retryable else When.ALWAYS,
                     key=kind + suffix,
                     line=raised_line("event", "PostgresSink", kind, suffix),
+                    whole=whole,
                 )
                 lost.register()
             for position in positions:

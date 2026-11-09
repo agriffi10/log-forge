@@ -220,6 +220,33 @@ def encode_round[T](
     return encoded
 
 
+def unencodable_in_run(owner: object) -> int:
+    """Returns how many event occurrences :func:`encode_round` has found unencodable this run.
+
+    A round is handed only the events still pending, so the run's unencodable events are read
+    from the run's cache rather than the round's batch. ``PostgresSink`` and the Redis sinks
+    count them in ``failed`` with a batch they lose whole, as 1.x did (SPEC-074).
+
+    Args:
+      owner: The object :func:`encode_round` was given.
+
+    Returns:
+      The count, 0 outside a run that has encoded nothing.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks._engine import run_context
+
+    cache = cast(
+        "dict[int, tuple[object, list[_Cell]]]", run_context().notes(owner).get("encoded", {})
+    )
+    found = 0
+    for _, cells in cache.values():
+        found += sum(1 for cell in cells if not cell.ok)
+    return found
+
+
 def encoded_landed(owner: object, positions: list[int]) -> None:
     """Records that the occurrences at these positions of the round's batch were accepted.
 

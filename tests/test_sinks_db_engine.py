@@ -23,6 +23,7 @@ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.clickhouse import ClickHouseSink
 from log_foundry.sinks.mongodb import MongoDBSink
 from log_foundry.sinks.postgres import PostgresSink
+from log_foundry.sinks.redis import RedisListSink, RedisStreamsSink
 from log_foundry.worker import Worker
 
 KINDS = ("ClickHouseSink", "MongoDBSink", "PostgresSink")
@@ -395,13 +396,61 @@ def test_the_twins_keep_one_ledger(kind: str, case: str) -> None:
     assert _orphan_losses(make()) == _worker_losses(make())
 
 
-@pytest.mark.parametrize(("kind", "method"), [("ClickHouseSink", "_row"), ("PostgresSink", "_row")])
+class ScriptedPipeline:
+    """A redis-py pipeline whose ``execute`` answers from a :class:`Script`."""
+
+    def __init__(self, script: Script) -> None:
+        self.script = script
+        self.staged = 0
+
+    def xadd(self, name: str, fields: Any, **options: Any) -> None:
+        self.staged += 1
+
+    def rpush(self, name: str, value: Any) -> None:
+        self.staged += 1
+
+    def ltrim(self, name: str, start: int, end: int) -> None:
+        pass
+
+    def execute(self) -> list[object]:
+        self.script.next([self.staged])
+        return []
+
+
+class ScriptedRedis:
+    def __init__(self, script: Script) -> None:
+        self.script = script
+
+    def pipeline(self) -> ScriptedPipeline:
+        return ScriptedPipeline(self.script)
+
+    def close(self) -> None:
+        pass
+
+
+def _encoding(kind: str, script: Script) -> Any:
+    if kind == "RedisStreamsSink":
+        return RedisStreamsSink("k", client=ScriptedRedis(script), max_retries=3)
+    if kind == "RedisListSink":
+        return RedisListSink("k", client=ScriptedRedis(script), max_retries=3)
+    return build(kind, script, max_retries=3)[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "method"),
+    [
+        ("ClickHouseSink", "_row"),
+        ("PostgresSink", "_row"),
+        ("RedisStreamsSink", "_encode"),
+        ("RedisListSink", "_encode"),
+    ],
+)
 def test_each_event_is_encoded_once_per_run(
     kind: str, method: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """FR-002's encode-once criterion for SPEC-069 FR-001's database sinks."""
+    """FR-002's encode-once criterion for SPEC-069 FR-001's database sinks and the Redis sinks."""
     script = Script(ConnectionError("down"), ConnectionError("down"), None)
-    sink, _ = build(kind, script, max_retries=3)
+    sink = _encoding(kind, script)
     real = getattr(sink, method)
     calls: list[object] = []
 

@@ -336,6 +336,15 @@ adds `DROPPED` events to `dropped_events` only when the run settles, which is th
 "counted only by a call that returned", and no `run_context().count` is made for it. Its line is
 SPEC-069's, unchanged in text, registered as `run_context().announce(<the line>, when=SETTLED)`.
 
+**`PostgresSink` and the Redis sinks keep 1.x's whole-batch `failed`.** Their 1.x `emit` counted a
+spent bound's whole batch in `failed`, the unencodable events included (SPEC-069 kept that, and its
+release-notes table says so). On the engine their unencodable events are still `DROPPED`, so a run
+that settles counts them in `dropped` alone. When the run fails, the round that ended it counts the
+run's unencodable events in `failed_events` with a fourth `When`, `FAILED` (committed only when the
+run fails and only from its last round, so once per run), and its raised line names them with the
+rest (`RunContext.announce(..., failed=<the line with them>)`), so `.failed` and the line read as
+1.x's. The other converted sinks counted only their encodable events in 1.x, and still do.
+
 **Each event is encoded once per run.** `encode_round` keeps every wire form, and every failure, in
 `run_context().notes(owner)`, keyed by event identity, as MongoDB keeps its documents (FR-003): a
 later round looks the event up instead of calling `encode` again. That keeps SPEC-069 FR-001's
@@ -778,9 +787,11 @@ reads as the property object to the static reader, so the engine would give the 
 spec (and SPEC-073) no module under `sinks/` assigns a backoff constant or calls `wait` but
 `_engine.py`, `_retry.py`, which defines `wait`, and `pubsub.py`, whose result poll waits in slices
 through `_retry.wait` and which this spec does not edit (fixed decision) — and no converted module
-builds a `SinkLosses`. Counted on SPEC-069's ledger rather than
-`fda134a`'s: the Overview's grep, run on the build's base commit and again after the build, loses
-exactly the twelve converted modules. What it still finds is the nine the Overview names, plus
+builds a `SinkLosses` but `nats.py`, whose `_unlocked(counters)` builds one for a forked child's
+`losses()` from the counters read without their lock: a lock another thread held at the fork is
+never released in the child, so the locked read could hang it (fork safety, invariant 12). Counted
+on SPEC-069's ledger rather than `fda134a`'s: the Overview's grep, run on the build's base commit
+and again after the build, loses eleven of the twelve converted modules, all but `nats`. What it still finds is the nine the Overview names, plus
 `stdout`, `file` and `sqlite`, whose `losses()` SPEC-069 adds and this spec does not touch, for any
 of the three that builds its report with a literal `SinkLosses(` rather than `wrapped_losses`.
 
@@ -1087,3 +1098,4 @@ other site still stating the old claim:
 - 2026-11-08, build (FR-005): `SocketTransport` takes an optional `frame` and the owning sink's `sink_name`; `SyslogSink.log_foundry_stop_signal` is a plain attribute the engine can read statically.
 - 2026-11-09, build (plan review S2): the no-wait check names `pubsub.py` as an exclusion beside `_engine.py` and `_retry.py`, since its result poll waits through `_retry.wait` and this spec leaves it unedited; FR-006's deletion sentence said only `_engine.py` would.
 - 2026-11-09, rebase onto #315 (`ddc78707`): every `UNKNOWN` a converted sink announces or counts itself (an unread SQS or SNS reply, an unadjudicable Kinesis or Firehose response, MongoDB's unpairable `writeErrors`, NATS's abandoned and unconfirmed lines) is `ALWAYS`, or `LAST` in a run whose sink resends an `UNKNOWN`, read from #315's `RunContext.resends_unknown`; #315's `_mark`/`_rewind` carry the three marks, so a hook its guard settles leaves none behind.
+- 2026-11-09, diff review frame 1: `PostgresSink` and the Redis sinks count a failed run's unencodable events in `failed` and name them in its line, as 1.x did (`When.FAILED`, `announce(..., failed=)`); the build had left them `DROPPED`, a change of term this spec rules out. FR-006 names `nats.py`'s fork-safe `_unlocked` as the one `SinkLosses` a converted module still builds.

@@ -191,7 +191,7 @@ class LogstashSink:
                     else DEFAULT_MAX_DATAGRAM_BYTES
                 ),
                 frame=self._frame,
-                sink_name="LogstashSink",
+                sink_name=type(self).__name__,
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")

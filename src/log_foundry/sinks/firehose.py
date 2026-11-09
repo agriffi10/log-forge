@@ -136,7 +136,9 @@ class FirehoseSink:
         """Records lost to an exhausted retry, a refused call or a raise, never the unadjudicated.
 
         The engine's ``failed_events`` less ``dropped_unadjudicated``: 1.x kept the two apart on
-        the instance and summed them in ``losses().failed`` (SPEC-074 FR-001).
+        the instance and summed them in ``losses().failed`` (SPEC-074 FR-001). Both are read
+        under the counter lock, which the engine's one commit holds while it moves both, so a
+        read never sees one moved and not the other.
 
         Args:
           None.
@@ -147,7 +149,8 @@ class FirehoseSink:
         Raises:
           None.
         """
-        return self.log_foundry_counters.failed_events - self.dropped_unadjudicated
+        with self._counter_lock:
+            return self.log_foundry_counters.failed_events - self.dropped_unadjudicated
 
     @failed.setter
     def failed(self, value: int) -> None:
@@ -261,6 +264,7 @@ class FirehoseSink:
                 retryable=sent.retryable,
                 response=sent.result,
                 call="put_record_batch",
+                name="FirehoseSink",
                 count_key="FailedPutCount",
                 results_key="RequestResponses",
                 fates=fates,

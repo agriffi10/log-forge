@@ -251,6 +251,7 @@ class SNSSink:
                 retryable=sent.retryable,
                 reply=sent.result,
                 call="publish_batch",
+                name="SNSSink",
                 fates=fates,
                 final=final,
                 lost=lost,

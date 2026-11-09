@@ -399,7 +399,7 @@ class SQSSink:
         final: list[int] = []
         blocked: set[str] = set()
         limit = self.max_retries + 1
-        name = type(self).__name__
+        name = "SQSSink"
         for chunk in plan.chunks:
             held = (
                 _hold(
@@ -433,6 +433,7 @@ class SQSSink:
                 retryable=sent.retryable,
                 reply=sent.result,
                 call="send_message_batch",
+                name="SQSSink",
                 fates=fates,
                 final=final,
                 lost=lost,

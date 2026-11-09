@@ -107,7 +107,7 @@ class Lost:
     itself, so the detail stays inside a ``_diag`` call ``tests/test_diag.py`` reads.
     """
 
-    __slots__ = ("_groups", "_owner")
+    __slots__ = ("_groups", "_owner", "_whole")
 
     def __init__(self, owner: object) -> None:
         """Starts an empty round for ``owner``.
@@ -123,6 +123,7 @@ class Lost:
         """
         self._owner = owner
         self._groups: dict[tuple[When, str, int], list[object]] = {}
+        self._whole: dict[tuple[When, str, int], int] = {}
 
     def add(
         self,
@@ -131,14 +132,20 @@ class Lost:
         when: When,
         key: str,
         line: Callable[[int, int], None],
+        whole: int = 0,
     ) -> None:
         """Adds events lost for one reason, to be announced with ``line(attempts, count)``.
+
+        ``whole`` is how many more events the line covers when the run fails on this round —
+        the run's unencodable events, which ``PostgresSink`` and the Redis sinks count with a
+        batch they lose whole, as 1.x did; it goes to the first group these events join.
 
         Args:
           events: The events.
           when: When the line commits.
           key: Names the reason, so two reasons with one count stay two lines.
           line: Writes the line, given the attempt count and how many events it covers.
+          whole: Events the line also covers on a run that fails on this round.
 
         Returns:
           None.
@@ -151,6 +158,9 @@ class Lost:
             group = self._groups.get((when, key, attempts))
             if group is None:
                 self._groups[(when, key, attempts)] = [line, 1]
+                if whole:
+                    self._whole[(when, key, attempts)] = whole
+                    whole = 0
             else:
                 group[1] = cast("int", group[1]) + 1
 
@@ -167,11 +177,18 @@ class Lost:
           None.
         """
         context = run_context()
-        for (when, _, attempts), (line, count) in self._groups.items():
+        for group, (line, count) in self._groups.items():
+            when, _, attempts = group
             write = cast("Callable[[int, int], None]", line)
             total = cast("int", count)
-            context.announce(_bound(write, attempts, total), when=when)
+            whole = self._whole.get(group, 0)
+            context.announce(
+                _bound(write, attempts, total),
+                when=when,
+                failed=_bound(write, attempts, total + whole) if whole else None,
+            )
         self._groups.clear()
+        self._whole.clear()
 
 
 def _bound(write: Callable[[int, int], None], attempts: int, total: int) -> Callable[[], None]:
@@ -321,6 +338,7 @@ def settle_keyed(
     retryable: bool,
     reply: KeyedReply | None,
     call: str,
+    name: str,
     fates: list[Outcome],
     final: list[int],
     lost: Lost,
@@ -332,18 +350,21 @@ def settle_keyed(
     attempt(s), <Type>``; an unread reply makes them ``UNKNOWN`` with one line, never resent by a
     shipped sink's run, so ``ALWAYS``, or ``LAST`` in a run whose sink declares itself idempotent
     and so resends them (``RunContext.resends_unknown``, asked of the run rather than ``owner``,
-    since a delegate forwarding ``deliver`` decides the resend); otherwise each entry takes its reply's outcome, a sender fault marked a final
-    rejection with 1.x's ``rejected as invalid (first code: …); not retried`` line, and an entry
-    still failing a ``LAST`` line ``still failing after N attempt(s); abandoned``.
+    since a delegate forwarding ``deliver`` decides the resend); otherwise each entry takes its
+    reply's outcome, a sender fault marked a final rejection with 1.x's ``rejected as invalid
+    (first code: …); not retried`` line, and an entry still failing a ``LAST`` line ``still
+    failing after N attempt(s); abandoned``. Every line names ``name``, the sink's own class name
+    as 1.x wrote it, so a subclass's lines read as 1.x's did.
 
     Args:
-      owner: The sink, whose class name the lines carry.
+      owner: The sink, whose send counts the lines read.
       positions: Each carried entry's position in the round's batch.
       carried: The carried events, in the same order.
       error: What the call raised, or ``None``.
       retryable: Whether ``_retryable_error`` accepted ``error``.
       reply: The reply per entry, or ``None`` when the call raised.
       call: The API's name, for the unread line.
+      name: The class name the lines carry: the shipped sink's, never a subclass's.
       fates: The round's outcomes, updated in place.
       final: The round's final rejections, extended in place.
       lost: The round's lost events.
@@ -355,7 +376,6 @@ def settle_keyed(
       None.
     """
     context = run_context()
-    name = type(owner).__name__
     if error is not None:
         kind = type(error).__name__
         for position in positions:
@@ -423,6 +443,7 @@ def settle_positional(
     retryable: bool,
     response: object,
     call: str,
+    name: str,
     count_key: str,
     results_key: str,
     fates: list[Outcome],
@@ -440,7 +461,7 @@ def settle_positional(
     resends an ``UNKNOWN``, as :func:`settle_keyed`'s unread line is.
 
     Args:
-      owner: The sink, whose class name the lines carry.
+      owner: The sink, whose send counts the lines read.
       positions: Each carried record's position in the round's batch.
       carried: The carried events, in the same order.
       records: The request entries sent, in the same order.
@@ -448,6 +469,7 @@ def settle_positional(
       retryable: Whether ``_retryable_error`` accepted ``error``.
       response: The client's reply, when the call returned.
       call: The API's name, for the unadjudicated line.
+      name: The class name the lines carry: the shipped sink's, never a subclass's.
       count_key: The reply's failed-count field.
       results_key: The reply's per-record field.
       fates: The round's outcomes, updated in place.
@@ -460,7 +482,6 @@ def settle_positional(
       None.
     """
     context = run_context()
-    name = type(owner).__name__
     if error is not None:
         kind = type(error).__name__
         for position in positions:

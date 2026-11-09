@@ -300,8 +300,12 @@ def test_encode_runs_once_per_emit_not_per_attempt(
     rig.sink.emit(batch)
     assert [kind for kind, _ in rig.state.log].count("refused") == 2, "three attempts were made"
     assert len(calls) == len(batch)
-    # Each lands once; since SPEC-074 a chunk that failed is resent after its round's later ones.
-    assert sorted(rig.delivered()) == ["a", "b", "c"]
+    delivered = rig.delivered()
+    if name == "ClickHouseSink":
+        # One insert per chunk since SPEC-074: a chunk that failed is resent after the round's
+        # later ones, so only the set is fixed. The other rigs send the batch in one call.
+        delivered = sorted(delivered)
+    assert delivered == ["a", "b", "c"]
 
 
 @pytest.mark.parametrize("name", ["StdoutSink", "HTTPSink"])
@@ -374,18 +378,54 @@ def test_multisink_all_unencodable_is_one_term(
 def test_a_spent_bound_counts_the_whole_batch_in_failed(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``failed`` is the batch's encodable events; the unencodable one is its catcher's.
-
-    Before SPEC-074 the whole batch, the unencodable event included, as before SPEC-069; on the
-    engine an unencodable event is ``DROPPED``, which a failed run hands to its catcher, so the
-    upper bound is tighter by it.
-    """
+    """``failed`` is the whole batch, the unencodable event included, as before SPEC-069."""
     rig = RIGS[name](monkeypatch, tmp_path)
     rig.state.down = True
     with pytest.raises(SinkDeliveryError):
         rig.sink.emit([ok("a"), unencodable()])
-    assert rig.sink.failed == 1
+    assert rig.sink.failed == 2
     assert rig.count() == 0
+
+
+@pytest.mark.parametrize("name", ["PostgresSink", "RedisStreamsSink", "RedisListSink"])
+def test_a_failed_run_counts_the_whole_batch_once_and_a_settled_one_drops(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-074 keeps 1.x's whole-batch ``failed`` on the engine, once per run, in one line.
+
+    Under a worker the run spans every attempt, so the batch is counted once and its one line
+    names both events; when a later round lands, the unencodable event is ``DROPPED`` instead and
+    nothing is counted in ``failed``.
+    """
+    from conftest import install_worker
+    from log_foundry.worker import Worker
+
+    def through_a_worker(rig: Any) -> int:
+        worker = Worker(rig.sink, batch_size=1000, flush_interval=60.0, max_retries=1)
+        install_worker(worker)
+        worker.submit([ok("a"), unencodable()])
+        worker.flush(timeout=30.0)
+        return worker.health().failed_batches
+
+    failed = RIGS[name](monkeypatch, tmp_path)
+    failed.state.down = True
+    assert through_a_worker(failed) == 1
+    assert len([kind for kind, _ in failed.state.log if kind == "refused"]) == 2, "one run"
+    assert failed.sink.failed == 2
+    sink_lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("log-foundry: lost") and f"; {name}, " in line
+    ]
+    assert len(sink_lines) == 1, sink_lines
+    assert sink_lines[0].startswith(f"log-foundry: lost 2 event(s); {name}, 2 attempt(s), ")
+
+    settled = RIGS[name](monkeypatch, tmp_path)
+    settled.state.fail_next = 1
+    assert through_a_worker(settled) == 0
+    assert settled.sink.failed == 0
+    assert read_losses(settled.sink) == SinkLosses(dropped=1, failed=0)
+    assert settled.delivered() == ["a"]
 
 
 def test_a_failing_remainder_raises_and_counts_nothing_until_a_retry_returns(
@@ -751,13 +791,13 @@ ENGINE_GAINED: dict[str, frozenset[str]] = {
 ENGINE_GAINED["RabbitMQSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
 ENGINE_GAINED["SyslogSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
 ENGINE_GAINED["SocketTransport"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
-ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
-"""SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
 ``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
 (invariant 10), so a name appearing beyond these is still a finding.
 """
+ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
+"""SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""
 
 
 def _public(obj: object) -> set[str]:
