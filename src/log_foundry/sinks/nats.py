@@ -814,14 +814,22 @@ class NATSSink:
         """Registers, ``ALWAYS``, the counts and lines 1.x's ``emit`` made for this round.
 
         Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
-        per publish that raised, in order — 1.x counted each as it happened and then raised —
-        and nothing for an event the deadline left unattempted, whose loss is its catcher's; the
-        round's events are sink-counted, so the engine adds nothing. Something published: the
-        engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in
-        1.x's order — each raised publish, the unattempted remainder, an abandoned publish
-        counted where it was abandoned, and an unanswered confirmation. The last two announce
-        ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that resends
-        an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per run.
+        per publish that raised, in order — 1.x counted each as it happened and then raised. The
+        round's events are sink-counted, so the engine adds nothing, and an event the deadline
+        left unattempted is its catcher's when the run fails, as in 1.x. A run can still settle
+        on such a round — an idempotent run resending an ``UNKNOWN`` after an earlier round
+        landed something, or a wrapper that accepts part of its batch itself — and a settled run
+        has no catcher, so the unattempted remainder is counted and announced here,
+        ``SETTLED_LAST``: only when the run settles on this round, since a later round resends
+        it. Before, nothing counted or named it. Every line of such a round names only events it
+        marked sink-counted, so each is registered ``counted_only`` and owns no other loss of the
+        round — a wrapper's own losses beside it are still the engine's to name. Something
+        published: the engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers
+        1.x's lines in 1.x's order — each raised publish, the unattempted remainder, an abandoned
+        publish counted where it was abandoned, and an unanswered confirmation. The last two
+        announce ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that
+        resends an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per
+        run.
 
         Args:
           published: The round's publishes.
@@ -841,12 +849,26 @@ class NATSSink:
                 continue
             if not landed:
                 context.count(self.log_foundry_counters, "failed_events", 1, when=When.ALWAYS)
-            context.announce(_publish_line(kind), when=When.ALWAYS)
-        if not landed:
-            return
+            context.announce(_publish_line(kind), when=When.ALWAYS, counted_only=not landed)
         unattempted = states.count("unattempted")
+        timeout = self.publish_timeout
+        if not landed:
+            if unattempted:
+                context.count(
+                    self.log_foundry_counters,
+                    "failed_events",
+                    unattempted,
+                    when=When.SETTLED_LAST,
+                )
+                context.announce(
+                    lambda: _diag.lost(
+                        "event", unattempted, f"NATSSink publish_timeout {timeout}s"
+                    ),
+                    when=When.SETTLED_LAST,
+                    counted_only=True,
+                )
+            return
         if unattempted:
-            timeout = self.publish_timeout
             context.announce(
                 lambda: _diag.lost("event", unattempted, f"NATSSink publish_timeout {timeout}s"),
                 when=When.ALWAYS,

@@ -139,7 +139,9 @@ acquisition, so an engine sink's drop is counted only by a run that settled, and
 sink, a NATS latch, an SQS batch whose every id callable raised, and since SPEC-075 a wrapper call
 whose every event's predicate or transform raised — is marked on the run context and
 counted by its catcher alone; `NATSSink` registers 1.x's own per-publish counts for a round in which
-nothing was published, so its `failed` still moves once per raised publish per call. A sink whose own counters count something other than events — `HTTPSink.failed` counts
+nothing was published, so its `failed` still moves once per raised publish per call, and counts and
+announces the round's unattempted events itself only when the run settles on that round, which has
+no catcher (`When.SETTLED_LAST`). A sink whose own counters count something other than events — `HTTPSink.failed` counts
 requests — registers them on the engine's run context, which commits them once per run through
 one `Deferral` per owner, `SETTLED` for a drop.
 **A wrapper on the engine keeps the wrapped sink's single ledger** (SPEC-075). `FilteringSink`,
@@ -165,8 +167,10 @@ of a failed run, SPEC-072), `tests/test_run_context.py` (the run context's commi
 `tests/test_http_rounds.py` (the HTTP family's counts on both paths and both forms, SPEC-073),
 `tests/test_engine_shipped_verdicts.py` (the refusal marker, final rejections, sink-counted rounds
 and the one-lock commit), `tests/test_engine_announces_every_loss.py` (every loss of a round that
-registered no line, or whose verdict the engine set aside, is in the engine's settled line unless
-the sink counted it or a refusal line names it, over every engine sink the roster derives), `tests/test_sinks_{queue,db,broker}_engine.py`, `tests/test_socket_engine.py`
+registered no line, or whose verdict the engine set aside, is in the engine's settled line for the
+round that decided it unless
+the sink counted it or a refusal line names it, over every engine sink the roster derives, and the
+`sink_counted` callers derived from the tree, each of which counts what it marks), `tests/test_sinks_{queue,db,broker}_engine.py`, `tests/test_socket_engine.py`
 and `tests/test_engine_sinks_roster.py` (every engine sink's counts and the derived roster,
 SPEC-074), `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's
 ledger against the bare sink's over real HTTP, SQS and NATS sinks, and an engine child's counts

@@ -121,6 +121,26 @@ batch. (SPEC-073 FR-001 to FR-005)
 
 ### 2026-11-09
 
+- **Refined** (fix/settled-line-fixes): the settled line named the run's total rounds for every
+  loss, so a loss decided in round one of a four-round run read `after 4 delivery round(s)`, which
+  is not when it was lost (invariant 11). It is now one line per round that decided a named loss, in
+  round order, each naming that round: per-round lines keep the one grammar and each line's count
+  still sums its terms, where one line carrying a round per term would need a new grammar. The same
+  fix closes a NATS gap the engine's exclusion opened: a `NATSSink` round that published nothing
+  marks every event sink-counted, so its catcher owns the batch as in 1.x, but its `_register`
+  counted only the raised publishes. A run that settles on such a round — an idempotent run
+  resending an `UNKNOWN` after an earlier round landed something, or a wrapper accepting part of its
+  batch itself (found by the frame-1 review) — has no catcher, so an event the deadline left
+  unattempted there was neither counted nor named. The round now registers that remainder's count
+  and line under a new `When.SETTLED_LAST`, kept only when the run settles on the registering round,
+  so a failed run keeps 1.x's ledger. A line naming only sink-counted events — that one, and since
+  PR 319 the `NATSSink publish, <Type>` line of a raised publish in the same kind of round — made
+  its round lined, so a wrapper's own losses beside it were counted and never named; the frame-2 and
+  frame-3 diff reviews found one each. The engine never names a sink-counted event, so such a line
+  has nothing to own: it is now registered `announce(..., counted_only=True)` and
+  `RunContext._lined` skips it, one rule in place of a case per `When`. `NATSSink` is the only
+  `sink_counted` caller, a population `tests/test_engine_announces_every_loss.py` derives from the
+  tree.
 - **Refined** (fix/engine-announce-every-loss): the engine's settled line was written only for a run
   in which the sink registered no line at all, so a `deliver` sink outside the HTTP family — a
   subclass of an SDK or driver sink, or one written from scratch — that announced a loss in one

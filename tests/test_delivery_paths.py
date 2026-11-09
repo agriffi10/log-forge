@@ -423,7 +423,7 @@ def test_a_later_round_indexes_the_snapshot_through_a_real_worker(
             1,
             "event",
             (
-                "; rejected 1, unresolved 0, raised 0, unknown 0, dropped 0 after 2 "
+                "; rejected 1, unresolved 0, raised 0, unknown 0, dropped 0 after 1 "
                 "delivery round(s) to Scripted"
             ),
         )
