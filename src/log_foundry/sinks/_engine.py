@@ -419,9 +419,9 @@ class When(enum.Enum):
       SETTLED_LAST: Only when the run settles and the round that registered it ended it: a loss
         of an event the sink marked counted (:meth:`RunContext.sink_counted`) because a failed
         run's catcher owns it, and that a later round could still have delivered — ``NATSSink``'s
-        unattempted events in a round that published nothing. A line under it is for those
-        sink-counted events only and owns no other loss of its round (:meth:`RunContext._lined`);
-        an immediate context commits it at once, as every rule but ``FAILED``.
+        unattempted events in a round that published nothing. A line under it owns a resendable
+        loss of its round as a ``LAST`` line does, unless registered ``counted_only``, as NATS's
+        is; an immediate context commits it at once, as every rule but ``FAILED``.
     """
 
     ALWAYS = "always"
@@ -518,7 +518,7 @@ class RunContext:
         self._immediate = immediate
         self._notes: dict[int, tuple[object, dict[str, object]]] = {}
         self._entries: list[tuple[_Counted, str, int, When, int]] = []
-        self._lines: list[tuple[Callable[[], None], When, int]] = []
+        self._lines: list[tuple[Callable[[], None], When, int, bool]] = []
         self._resends_unknown: bool | None = None
         self._final: list[object] = []
         self._counted: list[object] = []
@@ -613,6 +613,7 @@ class RunContext:
         *,
         when: When,
         failed: Callable[[], None] | None = None,
+        counted_only: bool = False,
     ) -> None:
         """Registers a diagnostic line, written after the commit when ``when`` keeps it.
 
@@ -622,10 +623,17 @@ class RunContext:
         line a 1.x ``emit`` wrote for a failed batch still counts every event of it (SPEC-074;
         see :attr:`When.FAILED`). An immediate context writes ``line``.
 
+        ``counted_only`` says the line names only events this round marked
+        :meth:`sink_counted`, which the engine's settled line never names, so the line owns no
+        other loss of its round (:meth:`_lined`). Without it a wrapper's own loss in a round where
+        a wrapped ``NATSSink`` announced its sink-counted publishes was counted and never named
+        (the frame-2 and frame-3 reviews of fix/settled-line-fixes).
+
         Args:
           line: Called with no arguments once the counts are committed, outside every lock.
           when: Which run endings write it.
           failed: The line written instead when the run fails on this round, or ``None``.
+          counted_only: Whether the line names only events the round marked sink-counted.
 
         Returns:
           None.
@@ -636,7 +644,9 @@ class RunContext:
         if self._immediate:
             _commit([], [line])
             return
-        self._lines.append((line if failed is None else _Whole(line, failed), when, self._round))
+        self._lines.append(
+            (line if failed is None else _Whole(line, failed), when, self._round, counted_only)
+        )
 
     def resends_unknown(self, owner: object) -> bool:
         """Reports whether this run resends an ``UNKNOWN`` event: whether its sink is idempotent.
@@ -692,7 +702,7 @@ class RunContext:
           None.
         """
         if not self._immediate:
-            self._lines.append((_written, When.ALWAYS, self._round))
+            self._lines.append((_written, When.ALWAYS, self._round, False))
 
     def final_rejections(self, indices: Iterable[int]) -> None:
         """Marks ``REJECTED`` indices of this round's verdict that do not fail the run (SPEC-074).
@@ -1002,7 +1012,7 @@ class RunContext:
             counts = owners[at][1]
             counts[name] = counts.get(name, 0) + n
         lines: list[Callable[[], None]] = []
-        for line, when, registered in self._lines:
+        for line, when, registered, _counted_only in self._lines:
             if registered in skip or not self._kept(
                 when, registered, settled=settled, final=final, whole=whole
             ):
@@ -1021,13 +1031,13 @@ class RunContext:
         the round-level form of the HTTP round's chunk key, since a line carries no event
         identity to count by. A line the run will not write — a ``LAST`` line of a round that
         was not the last, a ``SETTLED`` one of a failed run — announces nothing, so its round
-        owns nothing. The second set is the rounds with a kept ``LAST`` line: an event the round
-        left resendable is a loss only because the run ended there, and only a line registered for
-        that ending announces it. A ``SETTLED_LAST`` line is in neither: it announces only events
-        its sink counted (:meth:`sink_counted`), which the settled line never names anyway, and a
-        round sharing it — a wrapper's own events beside a wrapped sink's — cannot know the line
-        will be written, so it owns none of their losses (the frame-2 review of
-        fix/settled-line-fixes).
+        owns nothing. The second set is the rounds with a kept ``LAST`` or ``SETTLED_LAST`` line,
+        each written only for the run's ending: an event the round left resendable is a loss only
+        because the run ended there, and only a line registered for that ending announces it. A
+        line registered ``counted_only`` (:meth:`announce`) is in neither: it names only events
+        its sink counted (:meth:`sink_counted`), which the settled line never names anyway, so
+        it owns no other loss of its round, a wrapper's own events beside a wrapped sink's
+        included.
 
         Args:
           settled: Whether the run settled.
@@ -1041,13 +1051,16 @@ class RunContext:
         """
         kept = [
             (when, registered)
-            for _line, when, registered in self._lines
-            if when is not When.SETTLED_LAST
-            and self._kept(when, registered, settled=settled, final=final)
+            for _line, when, registered, counted_only in self._lines
+            if not counted_only and self._kept(when, registered, settled=settled, final=final)
         ]
         return (
             frozenset(registered for _when, registered in kept),
-            frozenset(registered for when, registered in kept if when is When.LAST),
+            frozenset(
+                registered
+                for when, registered in kept
+                if when is When.LAST or when is When.SETTLED_LAST
+            ),
         )
 
     def _close(self) -> None:
@@ -1559,7 +1572,8 @@ def _run(
     term, each loss decided in a round that registered none, and leaves the rest to the sink's
     lines. The key is the round, the engine's form of the HTTP round's chunk key, because a line
     carries no event identity to count against: a round that announces some of its losses owns
-    the rest. An event the round left resendable — ``RETRYABLE``, or ``UNKNOWN`` for an
+    the rest. A line registered ``counted_only`` names only events the sink counted, which this
+    line never names, and owns nothing (:meth:`RunContext._lined`). An event the round left resendable — ``RETRYABLE``, or ``UNKNOWN`` for an
     idempotent sink — is a loss only because the run ended on that round, so only a ``LAST``
     line the round registered for that ending owns it. A round whose verdict the engine set
     aside — one that raised, could not be read, or marked an index its outcome does not fit —

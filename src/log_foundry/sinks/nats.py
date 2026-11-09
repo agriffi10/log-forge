@@ -821,7 +821,9 @@ class NATSSink:
         landed something, or a wrapper that accepts part of its batch itself — and a settled run
         has no catcher, so the unattempted remainder is counted and announced here,
         ``SETTLED_LAST``: only when the run settles on this round, since a later round resends
-        it. Before, nothing counted or named it. Something published: the
+        it. Before, nothing counted or named it. Every line of such a round names only events it
+        marked sink-counted, so each is registered ``counted_only`` and owns no other loss of the
+        round — a wrapper's own losses beside it are still the engine's to name. Something published: the
         engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in
         1.x's order — each raised publish, the unattempted remainder, an abandoned publish
         counted where it was abandoned, and an unanswered confirmation. The last two announce
@@ -846,7 +848,7 @@ class NATSSink:
                 continue
             if not landed:
                 context.count(self.log_foundry_counters, "failed_events", 1, when=When.ALWAYS)
-            context.announce(_publish_line(kind), when=When.ALWAYS)
+            context.announce(_publish_line(kind), when=When.ALWAYS, counted_only=not landed)
         unattempted = states.count("unattempted")
         timeout = self.publish_timeout
         if not landed:
@@ -862,6 +864,7 @@ class NATSSink:
                         "event", unattempted, f"NATSSink publish_timeout {timeout}s"
                     ),
                     when=When.SETTLED_LAST,
+                    counted_only=True,
                 )
             return
         if unattempted:
