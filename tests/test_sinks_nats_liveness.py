@@ -2284,7 +2284,7 @@ SLOW_FIRST_PONG_BUDGET = 1.5 * SLOW_FIRST_PONG
 
 
 class SlowFirstPongParkedNATS(ParkedAndStalledNATS):
-    """The pre-publish PING is answered only after :data:`SLOW_FIRST_PONG`, then everything stalls."""
+    """The pre-publish PING is answered after :data:`SLOW_FIRST_PONG`, then everything stalls."""
 
     async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
         if not self.calls.count("flush"):

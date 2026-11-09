@@ -316,19 +316,20 @@ def cpu_window(scope: str = "thread"):
     a busy-spin satisfies a wall-clock bound. Two things outside a test's claim used to count
     against such a bound, and this removes both.
 
-    **Garbage collection.** A full collection in a pytest-xdist worker cost 0.04 to 0.16 s of CPU
-    on average, and up to 0.7 s, in one ``pytest tests -n 12`` run at ``c810333d`` with a
-    ``gc.callbacks`` probe, in which each worker ran 10 to 89 of them. CPython charges it to
+    **Garbage collection.** A full collection in a pytest-xdist worker cost about 0.03 to 0.16 s
+    of CPU on average, and up to 0.7 s, in two ``pytest tests -n 12`` runs at ``c810333d`` with a
+    ``gc.callbacks`` probe, in which each worker ran 10 to 93 of them. CPython charges it to
     whichever thread allocated past the threshold, and a 0.05 s bound read process-wide flaked
-    at 0.104 s on CI. Automatic collection
-    is off for the window, counted across windows open at once on several threads, and restored
-    as the first window found it when the last one closes. Nothing the library does depends on a
-    collection running.
+    at 0.104 s on CI. Automatic collection is off for the window, counted across windows open
+    at once on several threads, and restored as the first window found it when the last one
+    closes. Nothing the library does depends on a collection running. A thread that never leaves
+    its window leaves collection off for the rest of that worker's run, which costs memory, not
+    a result.
 
     **Other threads.** ``"thread"`` reads ``time.thread_time()``, so only the calling thread's CPU
-    counts: a worker leaked by an earlier test (2,222 of 8,576 tests started with one alive in
-    the same run) or pytest's own threads cannot reach it. Use it when every thread that could spin in
-    the window is this one: the caller, with the drain thread wedged inside a fake or not
+    counts: a library thread leaked by an earlier test, alive at the start of many tests in an
+    xdist worker, or pytest's own threads cannot reach it. Use it when every thread that could
+    spin in the window is this one: the caller, with the drain thread wedged inside a fake or not
     involved. ``"process"`` reads ``time.process_time()``, for a window where the thread that
     could spin is one the test cannot run the window on, such as a drain thread's retry loop. It
     still counts every other thread in the process, so prefer ``"thread"`` wherever the claim

@@ -9,8 +9,8 @@ reason rather than at import.
 
 The hang-shaped tests are guarded by ``test_assembly_budget``'s SIGALRM deadline, which raises a
 ``BaseException`` the coercer's ``except Exception`` cannot swallow, and assert on CPU time
-(``conftest.cpu_window``, on the calling thread, where assembly runs) with a generous budget. No failure message renders a hostile key or
-value: they name a route, a type or a number.
+(``conftest.cpu_window``, on the calling thread, where assembly runs) with a generous budget. No
+failure message renders a hostile key or value: they name a route, a type or a number.
 """
 
 from __future__ import annotations

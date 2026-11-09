@@ -509,10 +509,10 @@ def _refused_while_locked(sink: NATSSink) -> tuple[float, BaseException | None]:
     """Calls ``emit`` while another thread holds the sink's lock, so only a pre-lock check refuses.
 
     Waits for either latch to read held, since the probe a stalled call leaves behind is aged
-    from the start of the call whose budget it spent and holds by the call's return: on every
-    cell the wait returned within a millisecond, so its default bound costs nothing and no CI
-    stall can cut it short. A sink whose latch never holds fails the call's own assertion
-    instead, after :data:`HOLD` seconds.
+    from the start of the call whose budget it spent and holds by the call's return: measured at
+    ``c810333d``, the wait returned within a millisecond on every cell, so its default bound
+    costs nothing and no CI stall can cut it short. A sink whose latch never holds fails the
+    call's own assertion instead, after :data:`HOLD` seconds.
     """
     _wait_until(lambda: sink._latched() or sink._publish_stuck())
     holding = threading.Event()

@@ -39,14 +39,16 @@ assignment counts), the call to the duration-returning function, or the stopwatc
 - :data:`CEILING_UNDER_STALL`: a *ceiling*, the same durations on the lesser side of a comparison,
   whose bound resolves to a number under :data:`STALL_ALLOWANCE`. A call that returns at once took
   123 ms on CI, so ``elapsed < 0.1`` is a coin toss there: the NATS matrix's shared 0.1 s bound
-  and the NATS liveness tests' 0.05 s latch bounds were this shape. A ceiling is half the wait the defect it guards would
-  make, with that wait raised to a second or more. The bound resolves through literals, ``+ - *
-  /`` and module-level names, followed into a sibling test module they are imported from.
-- :data:`RAW_CPU_READ`: any reference under ``tests/`` to a CPU clock (``time.process_time`` and
-  ``thread_time``, their ``_ns`` forms, ``resource.getrusage``, ``os.times`` and the CPU clock ids)
-  other than the table ``conftest.cpu_window`` reads from. A process-wide reading counted a full
-  garbage collection and every leaked thread against a 0.05 s bound, and flaked at 0.104 s; the
-  helper pauses collection and makes the test name its scope.
+  and the NATS liveness tests' 0.05 s latch bounds were this shape. A ceiling is half the wait
+  the defect it guards would make, with that wait raised to a second or more. The bound resolves
+  through literals, ``+ - * /`` and module-level names, followed into a sibling test module they
+  are imported from.
+- :data:`RAW_CPU_READ`: a reference under ``tests/`` to a CPU clock by name (``time.process_time``
+  and ``thread_time``, their ``_ns`` forms, ``resource.getrusage``, ``os.times``,
+  ``pthread_getcpuclockid`` and the CPU clock ids) other than in the table ``conftest.cpu_window``
+  reads from. A process-wide reading counted a full garbage collection and every leaked thread
+  against a 0.05 s bound, and flaked at 0.104 s; the helper pauses collection and makes the test
+  name its scope.
 
 **What it does not see, recorded rather than chased:**
 
@@ -78,7 +80,13 @@ assignment counts), the call to the duration-returning function, or the stopwatc
 - a ceiling on a duration the scan does not recognise, by the same rules as a floor: a ``for``
   unpack (the NATS capability test's three calls), a ``max(...)`` over a list of durations, a
   subtraction of two recorded instants (``measured["returned"] - measured["released"]``), or a
-  tuple field of a helper that returns a duration it did not compute from a clock itself.
+  tuple field of a helper that returns a duration it did not compute from a clock itself;
+- a ceiling on a nanosecond clock (``time.monotonic_ns() - start < 50_000_000``), which is
+  recognised and then judged as that many seconds, so it is never refused;
+- a ``while`` condition is not a ceiling and is skipped, so a deadline loop is never refused, and
+  neither is a ceiling a test writes as a loop condition;
+- a CPU clock reached without its name: ``os`` imported under another name (``o.times()``), or
+  ``getattr(time, "process_time")``.
 
 Each is a reason to use ``release_after_clock`` in a new floor, and to derive a new ceiling from
 the wait it guards, not a hole this gate claims to close.
@@ -145,6 +153,7 @@ CPU_READERS = frozenset(
         "thread_time",
         "thread_time_ns",
         "getrusage",
+        "pthread_getcpuclockid",
         "CLOCK_PROCESS_CPUTIME_ID",
         "CLOCK_THREAD_CPUTIME_ID",
     }
@@ -338,6 +347,10 @@ def _arming_lines(own: list[ast.AST]) -> list[int]:
 def _returned_positions(own: list[ast.AST]) -> set[int | None]:
     """Returns the tuple positions at which a function's ``return`` gives a duration.
 
+    A returned name counts when the function assigned it a duration, as
+    ``test_worker_exit_budget._measured`` does (``elapsed = ...; return elapsed``), so a ceiling
+    on such a helper's result is judged like one on an inline subtraction.
+
     Args:
       own: The function's :func:`_own_nodes`.
 
@@ -347,13 +360,27 @@ def _returned_positions(own: list[ast.AST]) -> set[int | None]:
     Raises:
       None.
     """
+    named: set[str] = set()
+    for node in own:
+        if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            pairs = [(t, node.value) for t in targets]
+            for target, value in pairs:
+                if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
+                    pairs.extend(zip(target.elts, value.elts, strict=False))
+                elif isinstance(target, ast.Name) and _is_duration_expr(value):
+                    named.add(target.id)
+
+    def returns_duration(value: ast.AST) -> bool:
+        return _is_duration_expr(value) or (isinstance(value, ast.Name) and value.id in named)
+
     positions: set[int | None] = set()
     for node in own:
         if not isinstance(node, ast.Return) or node.value is None:
             continue
         if isinstance(node.value, ast.Tuple):
-            positions.update(i for i, v in enumerate(node.value.elts) if _is_duration_expr(v))
-        elif _is_duration_expr(node.value):
+            positions.update(i for i, v in enumerate(node.value.elts) if returns_duration(v))
+        elif returns_duration(node.value):
             positions.add(None)
     return positions
 
@@ -418,6 +445,9 @@ def _floors_in(
         (node for node in own if hasattr(node, "lineno")),
         key=lambda node: (node.lineno, node.col_offset),
     )
+    looping = {
+        id(part) for node in own if isinstance(node, ast.While) for part in ast.walk(node.test)
+    }
     clocks: dict[str, list[int]] = {}
     watches: dict[str, list[tuple[int, str | None]]] = {}
     durations: dict[str, list[tuple[int, Measured]]] = {}
@@ -501,7 +531,7 @@ def _floors_in(
                     measured, capped = None, (False, low)
                 if measured is not None:
                     floors.append(Floor(path, node.lineno, fn.name, *measured))
-                if capped[0] and ceilings is not None:
+                if capped[0] and ceilings is not None and id(node) not in looping:
                     ceilings.append(Ceiling(path, node.lineno, fn.name, capped[1]))
     return floors
 
@@ -801,7 +831,8 @@ def _seconds(
             return None
         if isinstance(node, ast.Constant) and type(node.value) in (int, float):
             return float(node.value)
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add | ast.Sub | ast.Mult | ast.Div):
+        arithmetic = ast.Add | ast.Sub | ast.Mult | ast.Div
+        if isinstance(node, ast.BinOp) and isinstance(node.op, arithmetic):
             left, right = value(node.left, where, depth + 1), value(node.right, where, depth + 1)
             if left is None or right is None or (isinstance(node.op, ast.Div) and right == 0):
                 return None
@@ -1452,6 +1483,43 @@ def test_it(sink):
         CEILING_UNDER_STALL,
         "assert elapsed < 1.0 - 0.7",
     ),
+    "a-ceiling-from-a-quotient": (
+        """
+HOLD = 0.6
+
+
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < HOLD / 2
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < HOLD / 2",
+    ),
+    "a-ceiling-on-a-helper-that-returns-a-named-duration": (
+        """
+def _measured(call):
+    wall = time.monotonic()
+    call()
+    elapsed = time.monotonic() - wall
+    return elapsed
+
+
+def test_it(sink):
+    assert _measured(sink.close) < 0.1
+""",
+        CEILING_UNDER_STALL,
+        "assert _measured(sink.close) < 0.1",
+    ),
+    "a-cpu-clock-id-read-for-another-thread": (
+        """
+def test_it(sink, thread):
+    clock = time.pthread_getcpuclockid(thread.ident)
+""",
+        RAW_CPU_READ,
+        "clock = time.pthread_getcpuclockid(thread.ident)",
+    ),
     "a-constant-reassigned-down-is-judged-at-its-last-value": (
         """
 BOUND = 1.0
@@ -1739,6 +1807,22 @@ def test_it(sink):
     elapsed = time.monotonic() - start
     assert elapsed < HOLD / 2
 """,
+    "a-ceiling-from-a-difference-taken-in-order": """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0 - 0.5
+""",
+    "a-deadline-loop-is-not-a-ceiling": """
+def test_it(sink):
+    start = time.monotonic()
+    while time.monotonic() - start < 0.3 and not sink.done:
+        sink.poll()
+    began = time.perf_counter()
+    while time.perf_counter() - began < 0.2:
+        pass
+""",
     "small-bounds-on-things-that-are-not-wall-durations": """
 def test_it(sink):
     start = time.monotonic()
@@ -1792,15 +1876,21 @@ def test_only_conftests_cpu_table_may_name_a_cpu_clock(case: str, tmp_path) -> N
 
 
 @pytest.mark.parametrize(
-    ("imported", "refused"), [("BOUND = 0.1\n", True), ("BOUND = 2.0\n", False)], ids=["small", "large"]
+    ("imported", "alias", "refused"),
+    [
+        ("BOUND = 0.1\n", "BOUND", True),
+        ("BOUND = 2.0\n", "BOUND", False),
+        ("SMALL = 0.1\n", "SMALL as BOUND", True),
+    ],
+    ids=["small", "large", "renamed"],
 )
 def test_a_ceiling_constant_is_followed_into_the_module_it_is_imported_from(
-    imported: str, refused: bool, tmp_path
+    imported: str, alias: str, refused: bool, tmp_path
 ) -> None:
     """``_SLACK`` and its kind are imported from a sibling test module, and judged there."""
     (tmp_path / "bounds_m.py").write_text(imported, encoding="utf-8")
     source = (
-        "from bounds_m import BOUND\n\n\ndef test_it(sink):\n    start = time.monotonic()\n"
+        f"from bounds_m import {alias}\n\n\ndef test_it(sink):\n    start = time.monotonic()\n"
         "    sink.close()\n    assert time.monotonic() - start < BOUND\n"
     )
     _floors, findings = _scan_source(tmp_path, source)
