@@ -304,13 +304,15 @@ SPEC-028 kept. Today their close does not wait at all. That is how the Kafka win
 loses a message.
 
 In `CLOSE_ONLY` mode an admitted section takes no lock across its body. It is counted in `_inside`
-under the state lock, and the `_idle` event is cleared while any section is inside. `close()` takes
-`_lock` for its whole run, so a second closer waits as FR-001 says. Then:
+under the state lock, and the `_idle` event is cleared while any section is inside. `close()`:
 
-1. It sets `CLOSING` under the state lock. From then on `enter()` refuses.
-2. If a section is inside, it waits on `_idle` for at most `CLOSE_OVERLAP_WAIT = 0.5` seconds. The
+1. Sets `CLOSING` under the state lock **before** it takes `_lock`, as FR-001 requires of both
+   modes, so a closer interrupted while it waits for the lock leaves the guard `CLOSING`. From then
+   on `enter()` refuses.
+2. Takes `_lock` for the rest of its run, so a second closer waits as FR-001 says.
+3. If a section is inside, it waits on `_idle` for at most `CLOSE_OVERLAP_WAIT = 0.5` seconds. The
    wait is an event wait, so it is idle, and it ends early when the last section leaves.
-3. It sets `CLOSED` and runs `release`, whether or not a section is still inside.
+4. It sets `CLOSED` and runs `release`, whether or not a section is still inside.
 
 **The bound** is `CLOSE_OVERLAP_WAIT` plus the release. For Kafka 0.5 s is measured headroom:
 `produce()` is a local hand-off, measured in this sink's docstring at 0.0001 s for three messages.
@@ -764,3 +766,7 @@ tests/
     claim is narrowed and the 0.5 s bound justified, Kafka's count is stated as an upper bound,
     and the AST check reads `run_context().refuse`.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-09, plan gate: FR-003's step list set `CLOSING` after taking `_lock`, which FR-001
+  forbids (a `CLOSE_ONLY` closer interrupted on the lock would leave the guard `OPEN`; an executed
+  prototype's mutant with that order fails FR-001's interrupted-closer criterion). FR-001 governs:
+  `CLOSING` is set before `_lock` in both modes, and the step list now says so.

@@ -629,6 +629,10 @@ def _base_names(cls: ast.ClassDef) -> list[str]:
     return names
 
 
+_NOT_SINKS = frozenset({("base", "Sink"), ("_guard", "ClosedGuard")})
+"""Classes in ``sinks/`` the roster passes over by name, each a non-sink (see below)."""
+
+
 def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.ClassDef]]:
     """Returns every class in ``sinks/`` defining ``deliver``, ``emit`` or ``close``.
 
@@ -651,8 +655,12 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
     the guard and the answer, and a duplicated claim would be noise.
 
     ``base.Sink`` is excluded by name: it is the Protocol stating the contract, not a sink that
-    can satisfy it. ``AsyncFunctionDef`` is walked alongside ``FunctionDef`` so a future async
-    sink cannot drop out of scope silently.
+    can satisfy it. ``_guard.ClosedGuard`` is excluded by name too (SPEC-076): it is the helper
+    the lints below recognise in a sink, not a sink, and it is in the trigger set only because
+    its release method is called ``close``.
+    :func:`test_the_closed_guard_is_not_a_sink` pins that it defines neither ``deliver`` nor
+    ``emit``, so the exclusion cannot hide one. ``AsyncFunctionDef`` is walked alongside
+    ``FunctionDef`` so a future async sink cannot drop out of scope silently.
 
     **A class that *inherits* one of the three is in scope too** (SPEC-038 FR-001). Keying on
     definition alone made scope a function of where a method happens to sit, and moving the five
@@ -737,7 +745,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
     in_scope = [
         (stem, cls)
         for stem, cls in ordered
-        if not (stem == "base" and cls.name == "Sink") and _implements(cls)
+        if (stem, cls.name) not in _NOT_SINKS and _implements(cls)
     ]
     stem_of = {id(cls): stem for stem, cls in ordered}
     for _stem, cls in in_scope:
@@ -811,6 +819,50 @@ def test_the_sink_roster_is_not_empty_and_has_not_collapsed() -> None:
     """
     roster = _sink_classes_with_an_emit()
     assert len(roster) >= 34, f"the sink roster collapsed to {len(roster)}: {sorted(roster)}"
+
+
+def _delivery_methods(source: str) -> list[str]:
+    """Every ``deliver`` or ``emit`` defined by any class in a module's source, by qualified name.
+
+    Args:
+      source: The module's source text.
+
+    Returns:
+      ``Class.method`` for each one found.
+
+    Raises:
+      None.
+    """
+    return [
+        f"{node.name}.{member.name}"
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ClassDef)
+        for member in node.body
+        if isinstance(member, ast.FunctionDef | ast.AsyncFunctionDef)
+        and member.name in ("deliver", "emit")
+    ]
+
+
+def test_the_closed_guard_is_not_a_sink() -> None:
+    """SPEC-076: the roster's by-name exclusion of ``ClosedGuard`` can never hide a sink.
+
+    The guard is in the trigger set only through ``close``. Were it, or any class beside it in
+    ``sinks/_guard.py``, to define ``deliver`` or ``emit``, the exclusion would be hiding a class
+    that delivers, so that is refused here; and ``_lifecycle`` records an object with ``emit`` and
+    ``close`` as a sink, which is a second reason the guard must never carry ``emit``. The second
+    half proves the check sees a plant.
+    """
+    import pathlib
+
+    import log_foundry
+
+    path = pathlib.Path(log_foundry.__file__).parent / "sinks" / "_guard.py"
+    source = path.read_text(encoding="utf-8")
+    assert _delivery_methods(source) == []
+    assert ("_guard", "ClosedGuard") in _NOT_SINKS
+    anchor = "    def close(self, release"
+    planted = source.replace(anchor, "    def emit(self, batch):\n        pass\n\n" + anchor, 1)
+    assert _delivery_methods(planted) == ["ClosedGuard.emit"]
 
 
 def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
