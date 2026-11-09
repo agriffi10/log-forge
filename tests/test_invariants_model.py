@@ -823,7 +823,7 @@ def _budget(step: str) -> float:
 
 def _fork_step(run: _Run, expected: State, where: str) -> None:
     """Forks at a step boundary and checks the child's half of invariant 12 and the parent's."""
-    before = [(len(s.events), s.closes) for s in run.sinks]
+    before = [(len(s.threads), s.closes) for s in run.sinks]
     parent_state = _lifecycle._state.state
     inherited = len(run.sinks)
 
@@ -861,9 +861,14 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
         f"invariant 5 (no child closed a sink it inherited): {report} {where}"
     )
     assert _lifecycle._state.state is parent_state, f"invariant 12 (parent state) {where}"
-    assert [(len(s.events), s.closes) for s in run.sinks] == before, (
-        f"invariant 12 (the parent's ledger is untouched by the fork) {where}"
-    )
+    driver = threading.get_ident()
+    for sink, (seen, closes) in zip(run.sinks, before, strict=False):
+        assert sink.closes == closes, f"invariant 12 (the fork closed no parent sink) {where}"
+        arrived = sink.threads[seen:]
+        assert all(thread != driver and message != "child-orphan" for thread, message in arrived), (
+            f"invariant 12 (the parent's ledger moved only by its own drain thread, which keeps "
+            f"delivering spans queued before the fork while the child runs): {arrived} {where}"
+        )
 
 
 def _take(run: _Run, step: str, nested: bool, label: str) -> object:
