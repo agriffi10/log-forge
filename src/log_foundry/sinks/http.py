@@ -1752,9 +1752,14 @@ def _wholly_rejected(outcomes: tuple[Outcome, ...]) -> bool:
 def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
     """Runs a reader's ``_outcomes`` as a 1.x ``_handle_response`` call: committed, then a bool.
 
-    The reader runs in a one-round context of its own, committed when it returns, so a direct
-    1.x caller sees the counters move as they did; its run fails exactly when the chunk was
-    wholly rejected, which is when 1.x returned ``False``.
+    Outside any run the reader runs in a one-round context of its own, committed when it
+    returns, so a direct 1.x caller sees the counters move as they did; its run fails exactly
+    when the chunk was wholly rejected, which is when 1.x returned ``False``. Inside a run too —
+    a third-party bool ``_handle_response`` calling a shipped reader's through ``super()`` from a
+    round — it commits at once, so the override reads the counters moved as in 1.x; when that
+    detached run wrote a line, the calling run records it (``RunContext._written_elsewhere``), so
+    the round adds no line of its own for the chunk (:func:`_announce_unlined`) and the engine
+    no settled line beside it.
 
     Args:
       reader: The bound ``_outcomes`` call, with its arguments.
@@ -1765,7 +1770,26 @@ def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
     Raises:
       Exception: Whatever the reader raises, after its context is committed as a failed run.
     """
-    return not _wholly_rejected(_engine.detached(reader, _wholly_rejected))
+    outer = _engine.run_context()
+
+    def read() -> tuple[tuple[Outcome, ...], int]:
+        """Runs the reader inside the detached run, and counts the lines it registered there.
+
+        Args:
+          None.
+
+        Returns:
+          The reader's outcomes, and how many lines the detached run holds.
+
+        Raises:
+          Exception: Whatever the reader raises.
+        """
+        return reader(), _engine.run_context()._mark()[1]
+
+    outcomes, lines = _engine.detached(read, lambda result: _wholly_rejected(result[0]))
+    if lines:
+        outer._written_elsewhere()
+    return not _wholly_rejected(outcomes)
 
 
 class _Tally:
@@ -1919,28 +1943,35 @@ def _settle(fates: list[Outcome], where: list[int | None], outcomes: tuple[Outco
 
 
 def _usable_chunk(taken: list[_Item], left: int) -> list[_Item]:
-    """Returns what ``_take`` gave when the round can send it, and raises otherwise.
+    """Returns a plain copy of what ``_take`` gave when the round can send it, else raises.
 
     The round advances by the chunk's length and maps it to the next indices, so an empty chunk
-    would loop forever and one longer than what is left would misplace its events. The raise is
-    the round's own guard's to take, as a ``_take`` that raised.
+    would loop forever and one longer than what is left would misplace its events. The result
+    is copied once, through ``list.__iter__`` for a ``list`` (``_engine._snapshot``), and only
+    the copy is measured and used, so a ``list`` subclass whose ``__len__`` answers differently
+    on each call cannot pass the check and then loop. The raise is the round's own guard's to
+    take, as a ``_take`` that raised.
 
     Args:
       taken: What ``_take`` returned.
       left: How many items the round has not yet placed.
 
     Returns:
-      ``taken``.
+      A new ``list`` of ``taken``'s items.
 
     Raises:
       ValueError: When ``taken`` is empty or longer than ``left``.
+      Exception: Whatever iterating a non-``list`` result raises.
     """
-    if not 0 < len(taken) <= left:
+    chunk = cast("list[_Item]", _engine._snapshot(cast("list[dict[str, object]]", taken)))
+    if not 0 < len(chunk) <= left:
         raise ValueError
-    return taken
+    return chunk
 
 
-def _announce_unlined(context: RunContext, sink: object, outcomes: tuple[Outcome, ...]) -> None:
+def _announce_unlined(
+    context: RunContext, sink: object, where: list[int | None], outcomes: tuple[Outcome, ...]
+) -> None:
     """Announces a chunk's losses when nothing that settled it registered a line of its own.
 
     Every shipped hook that settles a loss announces it, but a 1.x bool ``_handle_response``
@@ -1954,7 +1985,9 @@ def _announce_unlined(context: RunContext, sink: object, outcomes: tuple[Outcome
 
     Args:
       context: The run's context.
-      sink: The sink, for its class name and idempotence.
+      sink: The sink, for its class name and, outside a run, its idempotence.
+      where: Each chunk item's batch index; an item placed past the batch (``None``) is no
+        event, so its outcome is not announced.
       outcomes: The chunk's outcomes.
 
     Returns:
@@ -1964,15 +1997,16 @@ def _announce_unlined(context: RunContext, sink: object, outcomes: tuple[Outcome
       None.
     """
     name = type(sink).__name__
-    final = sum(1 for outcome in outcomes if outcome in (Outcome.REJECTED, Outcome.DROPPED))
-    unknown = outcomes.count(Outcome.UNKNOWN)
+    placed = [outcome for at, outcome in zip(where, outcomes, strict=True) if at is not None]
+    final = sum(1 for outcome in placed if outcome in (Outcome.REJECTED, Outcome.DROPPED))
+    unknown = placed.count(Outcome.UNKNOWN)
     if final:
         context.announce(
             lambda: _diag.lost("event", final, f"{name}, refused for good; not retried"),
             when=When.SETTLED,
         )
     if unknown:
-        when = When.LAST if _engine._idempotent(sink) else When.SETTLED
+        when = When.LAST if context.resends_unknown(sink) else When.SETTLED
         context.announce(
             lambda: _diag.lost("event", unknown, f"{name}, outcome unknown; they may have landed"),
             when=when,
@@ -1997,7 +2031,7 @@ def _unbuilt(drops: _Pending, name: str, lost: int, fault: Exception) -> None:
     Raises:
       None.
     """
-    kind = type(fault).__name__
+    kind = _type_name(fault)
     drops.count("_unrenderable", lost)
     drops.announce(lambda: _diag.lost("event", lost, f"{name}, rendering raised {kind}"))
 
@@ -2414,7 +2448,10 @@ class HTTPSink:
         ``_handle_response`` returning ``False``, or a third-party ``_outcomes`` or
         ``_abandon_unreduced`` — gets the round's line (:func:`_announce_unlined`), since the
         engine's settled line is suppressed by any other line in the run. Every shipped hook
-        announces its own losses, so this adds no line for a shipped class.
+        announces its own losses, so this adds no line for a shipped class. The key is the chunk,
+        not the event: a hook that registers any line while its chunk is handled owns the
+        announcement of every loss in that chunk, since a line carries no event identity to
+        count by, so a reader announcing some of its losses must announce all of them.
 
         The verdict's ``retry_after`` is the largest finite, positive ``Retry-After`` among the
         round's retryable responses, or ``None``; one round has one wait.
@@ -2496,13 +2533,13 @@ class HTTPSink:
                             hints.append(hint)
                 _settle(fates, where, outcomes)
                 if context._mark()[1] == mark[1]:
-                    _announce_unlined(context, self, outcomes)
+                    _announce_unlined(context, self, where, outcomes)
                 index += len(chunk)
             except Exception as err:
                 context._rewind(mark)
                 where = positions[index : index + len(chunk)]
                 if sent:
-                    detail = f"handling its response raised {type(err).__name__}"
+                    detail = f"handling its response raised {_type_name(err)}"
                     _settle(fates, where, HTTPSink._unadjudicated(self, chunk, detail))
                 else:
                     faults += len(chunk)
@@ -2547,7 +2584,7 @@ class HTTPSink:
                 result = self._outcomes(payload, chunk)
         except Exception as err:
             context._rewind(mark)
-            return self._unadjudicated(chunk, f"reading a 2xx response raised {type(err).__name__}")
+            return self._unadjudicated(chunk, f"reading a 2xx response raised {_type_name(err)}")
         try:
             outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
         except Exception:
@@ -2565,7 +2602,8 @@ class HTTPSink:
         which a chunk of nothing delivered meant in 1.x. It counts nothing; an override counts
         what it reads through the run context, and gives up on a body it cannot read through
         :meth:`_unadjudicated`. A loss it reports with no line of its own is announced by the
-        round (:func:`_announce_unlined`).
+        round (:func:`_announce_unlined`); an override that registers any line owns the
+        announcement of every loss it reports for the chunk.
 
         Args:
           payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
@@ -2590,9 +2628,11 @@ class HTTPSink:
         ``failed``, since its events may have landed — announced as ``lost <n> <noun>(s);
         <class> <detail>; they may have landed; not retried``, and every event is ``UNKNOWN``,
         which never fails a run. A shipped sink is not idempotent, so its ``UNKNOWN`` is final at
-        once and this counts ``ALWAYS``. A subclass declaring ``log_foundry_idempotent = True``
-        has an ``UNKNOWN`` chunk resent, so for it this counts ``LAST``: an event is counted once
-        per run, and only when it ended the run unadjudicated.
+        once and this counts ``ALWAYS``. A run whose sink declares ``log_foundry_idempotent =
+        True`` resends an ``UNKNOWN`` chunk, so in it this counts ``LAST``: an event is counted
+        once per run, and only when it ended the run unadjudicated. It asks the run
+        (``RunContext.resends_unknown``) rather than this class, since a delegate forwarding
+        ``deliver`` to this sink is the one whose idempotence decides the resend.
 
         Args:
           items: The chunk the response describes.
@@ -2606,7 +2646,7 @@ class HTTPSink:
           None.
         """
         context = _engine.run_context()
-        when = When.LAST if _engine._idempotent(self) else When.ALWAYS
+        when = When.LAST if context.resends_unknown(self) else When.ALWAYS
         sent = len(items)
         name = type(self).__name__
         context.count(self, "dropped_unadjudicated", sent, when=when)
@@ -2834,7 +2874,7 @@ class HTTPSink:
                 )
             )
         if first is not None:
-            kind = type(first).__name__
+            kind = _type_name(first)
             pending.count("_unrenderable", failures)
             pending.announce(
                 lambda: _diag.lost(
@@ -3259,7 +3299,7 @@ class HTTPSink:
         try:
             status, payload, retry_after = self._attempt(request)
         except Exception as err:
-            reason = f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip()
+            reason = f"connection error, {_type_name(err)} {_diag.errno_of(err)}".rstrip()
             if is_retryable(self._retryable_error, err):
                 return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
             if not count_unexpected and not isinstance(err, SinkDeliveryError):

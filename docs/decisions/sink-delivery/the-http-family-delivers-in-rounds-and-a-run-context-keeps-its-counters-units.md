@@ -52,8 +52,14 @@ a run in which the sink registers no line, so a loss whose hook registered none 
 `log_foundry_counters` alone whenever any other line was in the run. The round now registers a line
 for every chunk it settles `REJECTED`, `DROPPED` or `UNKNOWN` with no line registered while it was
 handled, `SETTLED` (an idempotent sink's `UNKNOWN`, which the engine resends, `LAST`). Every shipped
-hook announces its own losses, so no shipped class gains a line. Do NOT replace this with an engine
-that counts the events each sink line covers: a line carries no event identity to count by. An escaped exception would fail
+hook announces its own losses, so no shipped class gains a line. The key is the chunk: a hook that
+registers any line while its chunk is handled owns the announcement of every loss in it. The
+`UNKNOWN` rule reads the run's idempotence (`RunContext.resends_unknown`), not the inner sink's, since
+the engine decides resends on the sink it was handed, a delegate forwarding `deliver` included; so
+does `_unadjudicated`. A 1.x bool shim over a shipped reader still commits its reader's line at once,
+in a detached run, and records it on the calling run (`RunContext._written_elsewhere`), so neither
+the round nor the engine announces that loss again. Do NOT replace this with an engine that counts
+the events each sink line covers: a line carries no event identity to count by. An escaped exception would fail
 the engine's run and report as undelivered a batch whose other chunks landed. The population is
 derived from `_round`'s own calls (`tests/test_http_round_guards.py`), so a new hook has no
 fault scenario until one is written, and the roster test fails by its name.

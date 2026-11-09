@@ -405,7 +405,7 @@ class RunContext:
       round: The 1-based number of the round in progress.
     """
 
-    __slots__ = ("_entries", "_immediate", "_lines", "_notes", "_round")
+    __slots__ = ("_entries", "_immediate", "_lines", "_notes", "_resends_unknown", "_round")
 
     def __init__(self, *, immediate: bool = False) -> None:
         """Starts an empty context at round one.
@@ -424,6 +424,7 @@ class RunContext:
         self._notes: dict[int, tuple[object, dict[str, object]]] = {}
         self._entries: list[tuple[_Counted, str, int, When, int]] = []
         self._lines: list[tuple[Callable[[], None], When, int]] = []
+        self._resends_unknown: bool | None = None
 
     @property
     def round(self) -> int:
@@ -502,6 +503,62 @@ class RunContext:
             _commit([], [line])
             return
         self._lines.append((line, when, self._round))
+
+    def resends_unknown(self, owner: object) -> bool:
+        """Reports whether this run resends an ``UNKNOWN`` event: whether its sink is idempotent.
+
+        A run decides resends on the sink it was handed, which for a delegate forwarding
+        ``deliver`` is not the sink whose round registers the count, so a count keyed on the
+        resend reads the run's answer here rather than its own class. A detached or immediate
+        context has no run sink, and answers for ``owner``.
+
+        Args:
+          owner: The sink asking, read statically when the context has no run sink.
+
+        Returns:
+          True when an ``UNKNOWN`` event may be offered again in a later round.
+
+        Raises:
+          None.
+        """
+        if self._resends_unknown is None:
+            return _idempotent(owner)
+        return self._resends_unknown
+
+    def _run_sink_resends(self, idempotent: bool) -> None:
+        """Records whether the run's own sink is idempotent, for :meth:`resends_unknown`.
+
+        Args:
+          idempotent: The run sink's ``log_foundry_idempotent``, read statically.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._resends_unknown = idempotent
+
+    def _written_elsewhere(self) -> None:
+        """Records that a line for this round's loss was already written by a detached run.
+
+        A 1.x shim commits its reader's count and line in a detached run of its own, so its
+        caller sees the counters move as in 1.x; the run that called it then holds no line for
+        that loss. This registers a line that writes nothing, ``ALWAYS``, so the run counts the
+        loss as announced: a guard keyed on "registered no line" adds none, and the engine's
+        settled line is not written beside the one already on stderr.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not self._immediate:
+            self._lines.append((_written, When.ALWAYS, self._round))
 
     def drops(self, owner: _Counted) -> _Drops:
         """Returns a ``Deferral``-shaped view that registers every count and line ``SETTLED``.
@@ -636,6 +693,20 @@ class RunContext:
         self._notes.clear()
         self._entries.clear()
         self._lines.clear()
+
+
+def _written() -> None:
+    """Writes nothing: the line :meth:`RunContext._written_elsewhere` registers.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
 
 
 class _Drops:
@@ -953,6 +1024,7 @@ def _run(
         per_cycle = _count(sink_retries) + 1
         rounds_allowed = per_cycle * (_count(worker_retries) + 1)
         idempotent = _idempotent(sink)
+        context._run_sink_resends(idempotent)
         ceiling = _ceiling(sink)
         fate: list[object] = [Outcome.RETRYABLE] * total_events
         pending = list(range(total_events))

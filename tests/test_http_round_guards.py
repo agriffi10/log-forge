@@ -22,11 +22,12 @@ from typing import Any
 
 import pytest
 
-from log_foundry.sinks import http
+from log_foundry import SinkCounters, emit_via_deliver
+from log_foundry.sinks import _engine, http
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.verdict import Outcome, Verdict
-from test_http_rounds import Scripted, _ok, _status, _through_the_worker
+from test_http_rounds import Scripted, _es_bulk, _ok, _status, _through_the_worker
 from test_sinks_http import FakeResponse
 
 A, J, D, U = Outcome.ACCEPTED, Outcome.REJECTED, Outcome.DROPPED, Outcome.UNKNOWN
@@ -555,3 +556,197 @@ def test_a_reader_that_counts_then_raises_is_counted_once(
     assert sink.item_errors == 0, "the item error the reader registered is discarded"
     assert sink.dropped_unadjudicated == 1
     assert _lost(capsys.readouterr().err) == [_read_raised()]
+
+
+# --- frame-2 review: the run's idempotence, a 1.x shim's line, hostile results ------------------
+
+
+class _UnknownReader(HTTPSink):
+    """A reader that returns ``UNKNOWN`` for the event marked ``t`` with no line of its own."""
+
+    def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+        return tuple(U if item.event.get("t") else A for item in items)
+
+
+class _IdempotentUnknownReader(_UnknownReader):
+    log_foundry_idempotent = True
+
+
+class _GivingUpReader(HTTPSink):
+    """A reader that gives up on the event marked ``t`` through ``_unadjudicated``."""
+
+    def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+        if any(item.event.get("t") for item in items):
+            return self._unadjudicated(items, "gave up")
+        return (A,) * len(items)
+
+
+class _IdempotentGivingUpReader(_GivingUpReader):
+    log_foundry_idempotent = True
+
+
+class _Delegate:
+    """A third-party sink forwarding ``deliver`` to an inner HTTP sink, as ``one_round`` allows."""
+
+    max_retries = 1
+
+    def __init__(self, inner: HTTPSink) -> None:
+        self.inner = inner
+        self.log_foundry_counters = SinkCounters()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        return self.inner.deliver(batch)
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+
+class _IdempotentDelegate(_Delegate):
+    log_foundry_idempotent = True
+
+
+_UNKNOWN_LINE = "outcome unknown; they may have landed"
+
+
+@pytest.mark.parametrize("reader", ["no line", "_unadjudicated"])
+@pytest.mark.parametrize(
+    ("idempotent_inner", "outer", "script"),
+    [
+        (False, _IdempotentDelegate, (_status(503), _ok(), _ok())),
+        (True, _Delegate, (_status(503), _ok(), _ok(), _status(503))),
+    ],
+    ids=["idempotent-run-over-a-plain-inner", "plain-run-over-an-idempotent-inner"],
+)
+def test_an_unknowns_line_follows_the_runs_idempotence_not_the_inner_sinks(
+    reader: str,
+    idempotent_inner: bool,
+    outer: type[_Delegate],
+    script: tuple[Any, ...],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The engine resends on the run's sink, so an ``UNKNOWN``'s line is keyed on it.
+
+    Over a plain inner the idempotent run resends the event, so a line per round would announce
+    it twice; over an idempotent inner the plain run never resends it, so a ``LAST`` line from
+    round one would be discarded and nothing would announce it.
+    """
+    inner = {
+        ("no line", False): _UnknownReader,
+        ("no line", True): _IdempotentUnknownReader,
+        ("_unadjudicated", False): _GivingUpReader,
+        ("_unadjudicated", True): _IdempotentGivingUpReader,
+    }[(reader, idempotent_inner)]
+    sink = inner("http://h", max_batch_count=1, max_retries=0, opener=Scripted(*script))
+    batch: list[dict[str, object]] = [{"i": 0}, {"i": 1, "t": 1}, {"i": 2}]
+    delivery = _engine.run_delivery(outer(sink), batch, worker_retries=0, stop=None)
+    assert delivery.unknown == 1
+    lines = [line for line in _lost(capsys.readouterr().err) if "may have landed" in line]
+    assert lines == [
+        f"log-foundry: lost 1 event(s); {inner.__name__}, {_UNKNOWN_LINE}"
+        if reader == "no line"
+        else (
+            f"log-foundry: lost 1 event(s); {inner.__name__} gave up; they may have landed; "
+            "not retried"
+        )
+    ]
+
+
+def _ok_bulk() -> FakeResponse:
+    return FakeResponse(200, b'{"errors": false, "items": [{"index": {"status": 201}}]}')
+
+
+@pytest.mark.parametrize("path", ["emit", "worker"])
+def test_a_bool_override_of_a_shipped_reader_is_announced_once(
+    path: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A 1.x shim commits its reader's line in a detached run; the round adds no second line."""
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+
+    class Audited(ElasticsearchSink):
+        def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+            return super()._handle_response(payload, items)
+
+    opener = Scripted(_ok_bulk(), FakeResponse(200, _es_bulk(True)), _ok_bulk())
+    sink = Audited("http://h", index="i", max_batch_count=1, opener=opener)
+    batch: list[dict[str, object]] = [{"i": 0}, {"i": 1}, {"i": 2}]
+    if path == "emit":
+        sink.emit(batch)
+    else:
+        assert _through_the_worker(sink, batch) == (True, 0)
+    assert _lost(capsys.readouterr().err) == [
+        "log-foundry: lost 1 bulk item(s); Audited, rejected by the server"
+    ]
+    assert sink.item_errors == 1
+
+
+def test_a_hook_fault_whose_type_name_raises_still_costs_only_its_chunk(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The lines read the type's stored name, so a hostile metaclass ``__name__`` cannot escape."""
+
+    class Hostile(type):
+        @property
+        def __name__(cls) -> str:  # type: ignore[override]
+            raise RuntimeError("no name")
+
+    class Fault(Exception, metaclass=Hostile):
+        pass
+
+    class Faulting(HTTPSink):
+        def _body(self, items: list[Any]) -> tuple[bytes, str]:
+            if items[0].event.get("i") == 1:
+                raise Fault
+            return super()._body(items)
+
+        def _retryable_status(self, status: int) -> bool:
+            raise Fault
+
+    opener = Scripted(_ok(), _status(503))
+    sink = Faulting("http://h", max_batch_count=1, opener=opener)
+    batch: list[dict[str, object]] = [{"i": 0}, {"i": 1}, {"i": 2}]
+    assert sink.deliver(batch) == Verdict(outcomes=(A, D, U))
+    assert _lost(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 1 event(s); Faulting handling its response raised Fault; they "
+            "may have landed; not retried"
+        ),
+        "log-foundry: lost 1 event(s); Faulting, rendering raised Fault",
+    ]
+
+
+def test_a_take_whose_length_changes_between_calls_is_measured_once() -> None:
+    """``_usable_chunk`` measures a plain copy, so a ``__len__`` that lies cannot loop the round."""
+
+    class Shrinking(list[Any]):
+        calls = 0
+
+        def __len__(self) -> int:
+            Shrinking.calls += 1
+            return 1 if Shrinking.calls == 1 else 0
+
+    class Faulting(HTTPSink):
+        def _take(self, items: list[Any], start: int, budget: int) -> list[Any]:
+            return Shrinking(super()._take(items, start, budget))
+
+    opener = Scripted(_ok())
+    sink = Faulting("http://h", opener=opener)
+    assert sink.deliver([{"i": 0}]) == Verdict(outcomes=(A,))
+    assert len(opener.calls) == 1
+
+
+def test_an_item_placed_past_the_batch_is_not_announced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Extra(HTTPSink):
+        def _items(self, batch: list[dict[str, object]], pending: Any) -> list[Any]:
+            items = super()._items(batch, pending)
+            return [*items, items[0]]
+
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return tuple(J if item.event.get("i") == 0 else A for item in items)
+
+    sink = Extra("http://h", max_batch_count=1, opener=Scripted(_ok()))
+    assert sink.deliver([{"i": 0}, {"i": 1}]) == Verdict(outcomes=(J, A))
+    assert _lost(capsys.readouterr().err) == [
+        "log-foundry: lost 1 event(s); Extra, refused for good; not retried"
+    ], "the copy of event 0 past the batch's end is no event"
