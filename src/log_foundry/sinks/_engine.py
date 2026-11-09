@@ -489,7 +489,8 @@ class RunContext:
         it. A run can still end sooner — every event final, or the worker declining before a
         later round — and a held event is then never sent. A detached round and an immediate
         context answer False: their caller is handed the verdict and owns any later round, so
-        holding is still the right answer there.
+        holding is still the right answer there. This is the budget's last round, not
+        :attr:`When.LAST`'s sense, under which a detached round commits as its own last.
 
         Args:
           None.

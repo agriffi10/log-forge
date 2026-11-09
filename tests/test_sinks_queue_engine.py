@@ -364,23 +364,14 @@ def test_the_last_round_sends_a_held_event_after_its_predecessors_final_send(
     assert not any("held behind" in line for line in err), err
 
 
-def test_a_held_event_sent_in_the_last_round_is_counted_by_its_own_send(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    sink, client = _fifo(
-        failing("SQSSink", lambda e: e["i"] in (0, 1, 2), sender=True), max_retries=0, chunk=1
-    )
-    sink.emit(_grouped("AAA"))
-    assert _order(client) == [[0], [1], [2]], "a one-round run is its own last: nothing is held"
-    assert sink.failed == 3
-    err = lost(capsys.readouterr().err)
-    assert not any("held behind" in line for line in err), err
-
-
-def test_no_round_before_the_last_sends_a_held_event() -> None:
+@pytest.mark.parametrize("path", ["worker", "run_delivery"])
+def test_no_round_before_the_last_sends_a_held_event(path: str) -> None:
     sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1, 2)), max_retries=3, chunk=1)
     seen = _rounds(client, sink)
-    _engine.run_delivery(sink, _grouped("AAAA"), worker_retries=1, stop=None)
+    if path == "worker":
+        through_worker(sink, _grouped("AAAA"), retries=1)
+    else:
+        _engine.run_delivery(sink, _grouped("AAAA"), worker_retries=1, stop=None)
     first = {i: min(r for r, j in seen if j == i) for i in range(4)}
     assert first == {0: 1, 1: 4, 2: 7, 3: 8}, (
         "each successor waits for its predecessor's fourth send, and A3 for the run's last "
