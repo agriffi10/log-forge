@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import enum
 import os
 import threading
 import types
@@ -51,6 +52,36 @@ a close that is *nearly* done, not a second full attempt: it already had the swa
 more likely stuck than slow, and every second spent on it is a second the process does not exit.
 """
 
+class State(enum.Enum):
+    """The process's lifecycle state, read off today's flags and deciding nothing (SPEC-077 FR-002).
+
+    An **observer**: :attr:`Runtime.state` derives a member from fields the runtime already keeps,
+    and nothing in ``src/`` reads it, so a wrong derivation can fail a test and cannot change a
+    delivery. SPEC-078 is what makes the transitions checked; until then the states describe the
+    code rather than govern it, and the ways the code departs from the stability plan's diagram
+    are recorded rather than fixed: ``CLOSED`` is not terminal (a ``@trace`` after a no-worker
+    ``shutdown()`` builds a live worker and the state returns to ``RUNNING``), and ``SWAPPING`` is
+    entered from ``CLOSED`` as well as ``RUNNING``.
+
+    The values are ``enum.auto()`` because nothing reads them, and a literal ``"draining"`` would
+    be filed by ``tests/test_worker_predicate_roster.py`` as a worker question, its sentinel
+    vocabulary including that word.
+
+    Attributes:
+      UNCONFIGURED: Nothing resolved, owed, built or retired.
+      RUNNING: A live worker, or a sink resolved or owed, and not retired.
+      SWAPPING: ``_swap_sink`` is inside its work.
+      DRAINING: ``_shutdown_worker`` is inside its body, ``shutdown()`` and the exit drain alike.
+      CLOSED: Retired, with no live worker.
+    """
+
+    UNCONFIGURED = enum.auto()
+    RUNNING = enum.auto()
+    SWAPPING = enum.auto()
+    DRAINING = enum.auto()
+    CLOSED = enum.auto()
+
+
 class Runtime:
     """The process's delivery lifecycle: one owner, one lock, four questions (SPEC-040 FR-001).
 
@@ -95,7 +126,20 @@ class Runtime:
     acquire inside a question would deadlock them; and :func:`_get_worker`'s **outer** check is
     deliberately unlocked on the ``@trace`` hot path, where a lock would serialize every span
     flush in the process. Each read is a single reference load, which is atomic — a caller
-    needing consistency across two reads takes ``_lock`` itself.
+    needing consistency across two reads takes ``_lock`` itself. :attr:`state` (SPEC-077) is a
+    fourth reader under the same rule: it names which of the :class:`State` members today's
+    flags describe, decides nothing, and is read by tests only.
+
+    **Four locks, not one.** :attr:`_lock` guards the worker, the record, the count and the stop
+    event; :attr:`_closers_lock`, :attr:`_closing_now_lock` and :attr:`_owned_lock` each guard
+    the one structure they name, and moved here from module globals in SPEC-077 without being
+    merged. Folding ``_closing_now_lock`` into ``_lock`` would deadlock :meth:`in_flight` and
+    :meth:`held`, which are asked with ``_lock`` held and take that leaf by design; the other two
+    are taken beneath ``_lock`` and on closer threads beside it, and ``_lock`` is held across a
+    blocking ``Worker(_ensure_sink())`` build, so merging any of them changes the lock order,
+    which is behaviour. The order is ``_lock`` then ``_config_lock`` then ``_owned_lock``, and
+    ``_lock`` then ``Worker._lock``, ``_closers_lock`` and ``_closing_now_lock`` as leaves, with
+    nothing acquiring ``_lock`` beneath any of them.
 
     Args:
       None.
@@ -252,6 +296,26 @@ class Runtime:
 
         The orphan logging path is the opposite constraint and takes **no** lock at all: it reaches
         ``_ensure_sink``'s fast-path return once per event, which must never stamp (AC-10).
+        """
+        self._swaps_running: set[object] = set()
+        """One token per ``_swap_sink`` call inside its work; non-empty reads ``SWAPPING``.
+
+        A set of tokens rather than a counter or a flag, for ``_shutdown_running``'s reason: two
+        concurrent ``configure(sink=...)`` calls are documented as normal, and a boolean cleared by
+        the first to finish would misreport the second. A token is a fresh ``object()``, **added**
+        under ``_lock`` in a critical section the call already has and **discarded without the
+        lock** in its ``finally`` — one ``set.discard``, which CPython performs atomically, where an
+        ``int -= 1`` outside the lock is a read-modify-write that can lose a decrement. That is
+        what keeps the observer from adding a lock acquisition to any call (SPEC-077 FR-002).
+        ``python.md`` §13 says not to rely on a builtin's atomicity across threads; this is the
+        deliberate exception, and a lost discard would only misreport an observer nothing in
+        ``src/`` reads. A forked child empties it in :func:`_clear_after_fork`.
+        """
+        self._stops_running: set[object] = set()
+        """One token per ``_shutdown_worker`` call inside its body; non-empty reads ``DRAINING``.
+
+        The same mechanism as :attr:`_swaps_running`, for two concurrent ``shutdown()`` calls; the
+        exit drain is the same function with the same default budget, so it is the same state.
         """
 
     def worker_exists(self) -> Worker | None:
@@ -439,6 +503,60 @@ class Runtime:
             return True
         return _closing(sink)
 
+    @property
+    def state(self) -> State:
+        """The lifecycle state, derived from the flags the runtime keeps; takes no lock.
+
+        Each field is read **once** into a local and the rules are tested in this order, the first
+        that holds deciding (SPEC-077 FR-002):
+
+        1. a token in :attr:`_stops_running` is ``DRAINING`` — ``shutdown()`` or the exit drain is
+           inside :func:`_shutdown_worker`;
+        2. a token in :attr:`_swaps_running` is ``SWAPPING``;
+        3. a live worker (:meth:`live_worker`) is ``RUNNING``, which includes one built after a
+           ``shutdown()`` returned (SPEC-044 FR-001);
+        4. ``retirements > 0`` is ``CLOSED``: retired with no live worker, which is when
+           ``health().retired`` is true and nothing is being drained;
+        5. something owed a close, or a configured sink resolved, is ``RUNNING``. The configured
+           sink is the one input the runtime does not own, read through the config because it is
+           the recorded authority for the installed sink (``architecture.md`` §12); it is what
+           makes ``configure()`` leave ``UNCONFIGURED``, since ``configure()`` resolves the sink
+           unconditionally;
+        6. otherwise ``UNCONFIGURED``.
+
+        **A fourth lock-free reader**, beside the three worker questions and for their reason: it
+        must answer while another thread holds ``_lock``, and several guards hold that lock when
+        they ask, which a non-reentrant acquire here would deadlock. Each read is one reference
+        load or one ``len`` of a builtin; the answer is a snapshot, which is all an observer
+        needs. Nothing in ``src/`` reads it — the tests do.
+
+        Args:
+          None.
+
+        Returns:
+          The state the flags describe.
+
+        Raises:
+          None.
+        """
+        stopping = bool(self._stops_running)
+        swapping = bool(self._swaps_running)
+        live = self.live_worker()
+        retirements = self.retirements
+        owed = bool(self._owed)
+        resolved = _live_config_sink() is not None
+        if stopping:
+            return State.DRAINING
+        if swapping:
+            return State.SWAPPING
+        if live is not None:
+            return State.RUNNING
+        if retirements > 0:
+            return State.CLOSED
+        if owed or resolved:
+            return State.RUNNING
+        return State.UNCONFIGURED
+
 
 _state = Runtime()
 """The process's one lifecycle owner.
@@ -574,10 +692,17 @@ def _clear_after_fork() -> None:
     the placement is free rather than load-bearing: the registry holds ``int`` ids and no handler
     reads it.
 
-    This is the whole of the residue now (SPEC-054 FR-006). The process-wide orphan-close count
-    and its idle gate were reset here too and are gone: with a per-sink registration there is no
-    second thing that can be left inconsistent, and the events themselves are replaced by the
-    repair walk before any handler runs.
+    The process-wide orphan-close count and its idle gate were reset here too and are gone
+    (SPEC-054 FR-006): with a per-sink registration there is no second thing that can be left
+    inconsistent, and the events themselves are replaced by the repair walk before any handler
+    runs.
+
+    **It also empties the two token sets** (SPEC-077 FR-002), for the same reason as the
+    registry: a token is discarded by a ``finally`` in the ``_swap_sink`` or ``_shutdown_worker``
+    call that added it, and that call's thread did not survive the fork, so an inherited token
+    would leave the child reading ``SWAPPING`` or ``DRAINING`` forever. Under the registry's lock
+    only because this is the critical section the handler already has; the sets themselves need
+    none.
 
     Args:
       None.
@@ -590,6 +715,8 @@ def _clear_after_fork() -> None:
     """
     with _state._closing_now_lock:
         _state._closing_now.clear()
+        _state._swaps_running.clear()
+        _state._stops_running.clear()
 
 
 _FOREIGN = -1
@@ -1842,6 +1969,14 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     never waits on its own thread. A late worker is stopped through ``stop`` without a verdict
     and claims for itself, before it sets the different event it holds.
 
+    **The draining token** (SPEC-077 FR-002). A fresh ``object()`` is added to
+    :attr:`Runtime._stops_running` in the first critical section, before ``_stop`` is set, and
+    discarded in the outer ``finally`` once ``join_closers`` has returned, so
+    :attr:`Runtime.state` reads ``DRAINING`` for the whole body on both branches, the late
+    worker's stop and the second ``_close_owed`` pass included — and is never left there by an
+    exception. The discard takes no lock: it is one ``set.discard``, so the token adds no
+    acquisition to this call's pinned count.
+
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
@@ -1853,33 +1988,38 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """
     deadline = None if timeout is None else monotonic() + timeout
     claimed = False
-    with _state._lock:
-        _state.retirements += 1
-        worker = _state.worker_exists()
-        if worker is None:
-            _state._shutdown_running += 1
-        else:
-            claimed = worker.claim_stop(deadline)
-        _state._stop.set()
-    late_worker: Worker | None = None
-    if worker is not None:
-        worker.stop(timeout, claimed=claimed)
-        waited = _close_owed(deadline)
-    else:
-        try:
+    token = object()
+    try:
+        with _state._lock:
+            _state._stops_running.add(token)
+            _state.retirements += 1
+            worker = _state.worker_exists()
+            if worker is None:
+                _state._shutdown_running += 1
+            else:
+                claimed = worker.claim_stop(deadline)
+            _state._stop.set()
+        late_worker: Worker | None = None
+        if worker is not None:
+            worker.stop(timeout, claimed=claimed)
             waited = _close_owed(deadline)
-        finally:
-            with _state._lock:
-                late_worker = _state._late_worker
-                _state._late_worker = None
-                _state._shutdown_running -= 1
-        if late_worker is not None:
-            with _state._lock:
-                _state.retirements += 1
-            late_worker.stop(None if deadline is None else max(0.0, deadline - monotonic()))
-    if waited or late_worker is not None:
-        _close_owed(deadline, bystander_wait=False)
-    join_closers(deadline)
+        else:
+            try:
+                waited = _close_owed(deadline)
+            finally:
+                with _state._lock:
+                    late_worker = _state._late_worker
+                    _state._late_worker = None
+                    _state._shutdown_running -= 1
+            if late_worker is not None:
+                with _state._lock:
+                    _state.retirements += 1
+                late_worker.stop(None if deadline is None else max(0.0, deadline - monotonic()))
+        if waited or late_worker is not None:
+            _close_owed(deadline, bystander_wait=False)
+        join_closers(deadline)
+    finally:
+        _state._stops_running.discard(token)
 
 
 def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
@@ -1950,6 +2090,13 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     critical section under ``_state._lock``, so a preempted orphan emit cannot re-arm a sink in a
     gap where it is neither owed nor in flight (FR-003).
 
+    **The swapping token** (SPEC-077 FR-002). A fresh ``object()`` is added to
+    :attr:`Runtime._swaps_running` in the first critical section — after the early return for no
+    live worker and nothing owed, so a swap with no work never enters ``SWAPPING``, and before any
+    stale sink is released, so every close this swap starts runs inside the state. It is
+    discarded in the outer ``finally``, after the closers are joined, with no lock: one
+    ``set.discard``, so the token adds no acquisition to this call's pinned count.
+
     Args:
       new_sink: The sink to deliver to from now on.
       timeout: Seconds for the drain and the detached closes, or ``None``.
@@ -1963,49 +2110,56 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     """
     deadline = None if timeout is None else monotonic() + timeout
     closers: list[threading.Thread] = []
-    with _state._lock:
-        worker = _state.live_worker()
-        old = None if worker is None else worker.sink
-        if worker is None and not _state._owed:
-            return
-        for stale in list(_state._owed.values()):
-            if stale is new_sink or stale is old or _state.held(stale):
-                continue
-            del _state._owed[id(stale)]
-            closer = release(stale, detached=True, closing=_register_closing(stale))
-            if closer is not None:
-                closers.append(closer)
-        if worker is None:
-            _register_exit_handler()
-            _state._owed[id(new_sink)] = new_sink
-            _offer_orphan_signal(new_sink)
-    if worker is not None:
-        try:
-            outcome = worker.retarget(new_sink, deadline)
-        except Exception as exc:
-            _diag.absorbed(
-                "swapping the log sink", exc, "events may still be delivered to the previous sink"
-            )
-        else:
-            with _state._lock:
+    token = object()
+    try:
+        with _state._lock:
+            worker = _state.live_worker()
+            old = None if worker is None else worker.sink
+            if worker is None and not _state._owed:
+                return
+            _state._swaps_running.add(token)
+            for stale in list(_state._owed.values()):
+                if stale is new_sink or stale is old or _state.held(stale):
+                    continue
+                del _state._owed[id(stale)]
+                closer = release(stale, detached=True, closing=_register_closing(stale))
+                if closer is not None:
+                    closers.append(closer)
+            if worker is None:
                 _register_exit_handler()
                 _state._owed[id(new_sink)] = new_sink
-                previous = outcome.previous
-                fenced_out = (
-                    outcome.verdict == "fenced"
-                    and previous is not None
-                    and previous is not new_sink
-                    and not _state.held(previous)
+                _offer_orphan_signal(new_sink)
+        if worker is not None:
+            try:
+                outcome = worker.retarget(new_sink, deadline)
+            except Exception as exc:
+                _diag.absorbed(
+                    "swapping the log sink",
+                    exc,
+                    "events may still be delivered to the previous sink",
                 )
-                if fenced_out and previous is not None:
-                    _state._owed.pop(id(previous), None)
-                    closer = release(
-                        previous, detached=True, closing=_register_closing(previous)
+            else:
+                with _state._lock:
+                    _register_exit_handler()
+                    _state._owed[id(new_sink)] = new_sink
+                    previous = outcome.previous
+                    fenced_out = (
+                        outcome.verdict == "fenced"
+                        and previous is not None
+                        and previous is not new_sink
+                        and not _state.held(previous)
                     )
-                    if closer is not None:
-                        closers.append(closer)
-    for closer in closers:
-        closer.join(None if deadline is None else max(0.0, deadline - monotonic()))
+                    if fenced_out and previous is not None:
+                        _state._owed.pop(id(previous), None)
+                        closer = release(
+                            previous, detached=True, closing=_register_closing(previous)
+                        )
+                        if closer is not None:
+                            closers.append(closer)
+        for closer in closers:
+            closer.join(None if deadline is None else max(0.0, deadline - monotonic()))
+    finally:
+        _state._swaps_running.discard(token)
 
 
 def _flush_live_sink() -> bool:

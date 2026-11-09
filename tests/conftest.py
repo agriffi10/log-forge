@@ -508,6 +508,10 @@ def _reset_worker() -> None:
     a sink, and a leaked entry shows up as that sink never being closed rather than as a
     process-wide charge.
 
+    SPEC-077 adds the two token sets ``state`` reads: a test that injects an exception past a
+    ``finally`` it then bypasses, or sets a token directly, would otherwise leave every later test
+    reading ``SWAPPING`` or ``DRAINING``.
+
     SPEC-054 also merged four records into ``_state._owed``, so one ``clear()`` replaces the four
     lines that reset them, and ``retirements`` replaces the retirement flag: it is a **count**, so
     resetting it to zero is what puts a worker built by the next test back in step with it — one
@@ -527,6 +531,8 @@ def _reset_worker() -> None:
     _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
     _lifecycle._state._late_worker = None
+    _lifecycle._state._swaps_running.clear()
+    _lifecycle._state._stops_running.clear()
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
     with _lifecycle._state._closers_lock:

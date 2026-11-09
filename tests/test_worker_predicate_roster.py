@@ -481,6 +481,32 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "thread has ended answers False here and must, because then nothing is inside it."
         ),
     ),
+    ("Runtime.state", "self.live_worker()", 0): (
+        LIVENESS,
+        (
+            "the observer's rule 3 (SPEC-077 FR-002): a worker that still delivers reads RUNNING, "
+            "including one built after a shutdown() returned. Liveness rather than existence "
+            "because a retired worker is still the process worker and must read CLOSED. The "
+            "observer decides nothing, so this is the question asked in order to report it."
+        ),
+    ),
+    ("Runtime.state", "self.retirements", 0): (
+        LIVENESS,
+        (
+            "the snapshot of the retirement count rule 4 reads, filed as a binding because "
+            "rebinding is how a guard changes category with its text unchanged. Reading the count "
+            "to report it is the liveness question asked for a different purpose."
+        ),
+    ),
+    ("Runtime.state", "retirements > 0", 0): (
+        LIVENESS,
+        (
+            "the observer's rule 4: retired with no live worker reads CLOSED, which is when "
+            "health().retired is true and nothing is drained. Tested after rule 3 deliberately - "
+            "the other order reads a live worker built after a shutdown() as CLOSED, the mutant "
+            "SPEC-077 FR-004's sequential driver kills."
+        ),
+    ),
     ("_offer_orphan_signal", "_state.in_flight(sink)", 0): (
         MOMENT,
         (
