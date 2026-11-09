@@ -15,7 +15,8 @@ one and classified by one private method, `_exchange`, which the round and `_sen
 event's fate is returned by index: items map back to events by identity, then by unclaimed
 position, so an `_items` override returning rebuilt events maps exactly, and an event no request
 carries is `DROPPED` only when that many were dropped and counted, else `REJECTED`, never a
-silent default. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
+silent default, and the round announces the ones `_items` did not count itself, on a settled run,
+so the engine's settled line, which any sink line suppresses, is never their only announcement. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
 the orphan path and through `emit`. Nothing in `http.py` waits or loops, and one round has one
 wait, so a batch whose several chunks failed retryably waits once per round where 1.x waited once
 per chunk. `emit` is `_engine.emit_via_deliver(self, batch, deliver=self._round)`, the private
@@ -30,14 +31,20 @@ inside another run's round is a run of its own.
 run's notes, so a resend in a later round starts from the budget already found, and a run searches
 no more than one 1.x `emit` did. Its reduced budget is never carried into a later batch.
 
-**A hook fault costs its chunk.** A raise from `_body`, `_prepare`, `_apply_auth` or building the
-`Request` drops the chunk on `_unrenderable`, one count and one `rendering raised <Type>` line per
-round, since nothing was sent and the same inputs fail the same way. A raise from a `2xx` reader, or
-a result that is not one `Outcome` per event, makes the chunk `UNKNOWN` through
-`HTTPSink._unadjudicated`, the one method that gives up on a response, since the request
-succeeded. An escaped exception would fail the engine's run and report as undelivered a batch
-whose other chunks landed. The guard covers those hooks only; a raising third-party override of
-another private method escapes the round as it escaped 1.x `emit`.
+**A hook fault costs its chunk.** Every method the round reaches runs under its guard. A raise
+before the chunk's request is sent — `_take`, `_known_refused`, `_body`, `_prepare`, `_apply_auth`,
+building the `Request`, or the `_drop_refused` a known-refused item goes to — drops the chunk on
+`_unrenderable`, one count and one `rendering raised <Type>` line per round, since nothing was
+sent and the same inputs fail the same way; so does a raise from `_chunk_budget` or `_items`, for
+the whole round, and a `_take` result that is empty or longer than what is left. A raise once the
+request was sent — `_exchange` and the predicates it asks, a `2xx` reader, `_unadjudicated`, the
+`_drop_refused` or `_abandon_unreduced` a `413` goes to — or a reader result that is not one
+`Outcome` per event, makes the chunk `UNKNOWN` through the base `HTTPSink._unadjudicated`, since
+the request went out. What the faulting hook registered on the run's context before it raised is
+discarded, so the guard's count and line are the loss's only ones. An escaped exception would fail
+the engine's run and report as undelivered a batch whose other chunks landed. The population is
+derived from `_round`'s own calls (`tests/test_http_round_guards.py`), so a new hook has no
+fault scenario until one is written, and the roster test fails by its name.
 
 **The run context keeps the units.** `failed` counts requests, the per-record counters count
 events, and a per-event drop counts only when the batch did not fail, so the engine's event totals
@@ -89,6 +96,13 @@ batch. (SPEC-073 FR-001 to FR-005)
 
 ### 2026-11-08
 
+- **Refined** after SPEC-073: the guard now covers every hook the round reaches, where it covered
+  only the request builders and the `2xx` readers, and a raising `_retryable_status`, `_items`,
+  `_take`, `_event_ceiling`, `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` escaped the
+  round and failed every event in it, landed chunks included. An event `_items` leaves out
+  uncounted is now announced by the round, where beside any sink line it showed in
+  `log_foundry_counters` alone (invariant 2). Both close what SPEC-073's delivery doc recorded as
+  follow-ups; neither changes a promise, only where the code fell short of one.
 - **Settled** by SPEC-073. The engine's settled-line refinement SPEC-072 FR-003 states was added
   here, keyed on lines that will commit, because `_run` had no context to read before. The
   item mapping by unclaimed position, and its `REJECTED` fallback, came from the frame-1 diff

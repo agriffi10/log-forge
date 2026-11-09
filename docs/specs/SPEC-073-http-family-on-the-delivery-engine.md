@@ -278,6 +278,11 @@ exception, `REJECTED` and counted in `failed` with a `connection error, <Type>` 
 status the response carried, a `2xx` included. 1.x read it once in `_send` before the first
 request, so the raise escaped `emit` raw with nothing sent.
 
+> **Superseded** (fix/http-round-guards, after SPEC-073): the guard now covers every hook the
+> round reaches, a fault costing only its chunk, `DROPPED` before its request is sent and `UNKNOWN`
+> after; and an event `_items` leaves out uncounted is announced by the round itself. The decision
+> lives in `docs/decisions/sink-delivery/the-http-family-delivers-in-rounds-and-a-run-context-keeps-its-counters-units.md`.
+
 **`_send` keeps its 1.x contract** for its callers outside the chunk path: `SentrySink`'s fallback,
 and a third-party subclass that builds its own body.
 

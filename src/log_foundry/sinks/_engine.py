@@ -517,6 +517,39 @@ class RunContext:
         """
         return _Drops(self, owner)
 
+    def _mark(self) -> tuple[int, int]:
+        """Returns a point :meth:`_rewind` can return the context to.
+
+        Args:
+          None.
+
+        Returns:
+          How many counts and how many lines are registered so far.
+
+        Raises:
+          None.
+        """
+        return len(self._entries), len(self._lines)
+
+    def _rewind(self, mark: tuple[int, int]) -> None:
+        """Discards every count and line registered since ``mark``.
+
+        A caller guarding a hook that may register a count and then raise uses it to replace
+        what the hook left with its own, so the loss is counted and announced once. An immediate
+        context has committed each entry already, so nothing is left to discard.
+
+        Args:
+          mark: What :meth:`_mark` returned.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        del self._entries[mark[0] :]
+        del self._lines[mark[1] :]
+
     def _begin(self, number: int) -> None:
         """Records the round about to run.
 
