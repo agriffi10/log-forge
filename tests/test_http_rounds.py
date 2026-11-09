@@ -1638,15 +1638,15 @@ def test_an_unreduced_413_chunk_is_rejected_and_counted_once(
     ]
 
 
-def test_a_permanent_bool_readers_partial_loss_is_announced_by_the_engine_line(
+def test_a_permanent_bool_readers_partial_loss_is_announced_by_the_round(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A bool reader's ``False`` counts nothing of its own, so the engine's settled line says it.
+    """A bool reader's ``False`` counts nothing of its own, so the round announces its chunk.
 
     Ineligible, so ``emit`` runs the engine inline over its round: one chunk read ``True`` is
-    ``ACCEPTED``, one read ``False`` is ``REJECTED``, and the run settles. The sink registers no
-    line for the rejected chunk — a 1.x bool override counted its own, if anything — so the
-    engine's settled line is the run's only announcement.
+    ``ACCEPTED``, one read ``False`` is ``REJECTED``, and the run settles. The reader registers no
+    line for the rejected chunk — a 1.x bool override counted its own, if anything — so the round
+    registers one, and the engine writes no settled line beside it.
     """
     opener = Scripted(FakeResponse(200, b"ok"), FakeResponse(200, b"no"))
     sink = _BoolReader("http://h", max_batch_count=1, opener=opener)
@@ -1656,10 +1656,7 @@ def test_a_permanent_bool_readers_partial_loss_is_announced_by_the_engine_line(
     assert sink.losses() == SinkLosses(dropped=0, failed=0), "the 1.x counters are untouched"
     assert sink.log_foundry_counters.losses() == SinkLosses(dropped=0, failed=1)
     assert _lost(capsys.readouterr().err) == [
-        (
-            "log-foundry: lost 1 event(s); rejected 1, unresolved 0, raised 0, unknown 0, "
-            "dropped 0 after 1 delivery round(s) to _BoolReader"
-        )
+        "log-foundry: lost 1 event(s); _BoolReader, refused for good; not retried"
     ]
 
 

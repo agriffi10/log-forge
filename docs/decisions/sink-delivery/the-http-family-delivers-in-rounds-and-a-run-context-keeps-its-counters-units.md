@@ -37,11 +37,23 @@ building the `Request`, or the `_drop_refused` a known-refused item goes to — 
 `_unrenderable`, one count and one `rendering raised <Type>` line per round, since nothing was
 sent and the same inputs fail the same way; so does a raise from `_chunk_budget` or `_items`, for
 the whole round, and a `_take` result that is empty or longer than what is left. A raise once the
-request was sent — `_exchange` and the predicates it asks, a `2xx` reader, `_unadjudicated`, the
-`_drop_refused` or `_abandon_unreduced` a `413` goes to — or a reader result that is not one
-`Outcome` per event, makes the chunk `UNKNOWN` through the base `HTTPSink._unadjudicated`, since
-the request went out. What the faulting hook registered on the run's context before it raised is
-discarded, so the guard's count and line are the loss's only ones. An escaped exception would fail
+request was sent — `_exchange` with its `_retryable_status` and `_give_up`, a `2xx` reader,
+`_unadjudicated`, the `_drop_refused` or `_abandon_unreduced` a `413` goes to — or a reader result
+that is not one `Outcome` per event, makes the chunk `UNKNOWN` through the base
+`HTTPSink._unadjudicated`, since the request went out. A raise inside the attempt — `_attempt`, the
+`_response_limit` it reads, the `_retryable_error` asked about its exception — never reaches the
+guard: `_exchange` classifies it as the attempt's refused exception, `REJECTED` and counted in
+`failed`. What the faulting hook, or a faulting reader, registered on the run's context before it
+raised is discarded, so the guard's count and line are the loss's only ones.
+
+**A loss nothing announced is announced by the round.** The engine writes its settled line only for
+a run in which the sink registers no line, so a loss whose hook registered none — a 1.x bool
+`_handle_response` returning `False`, a third-party `_outcomes` or `_abandon_unreduced` — showed in
+`log_foundry_counters` alone whenever any other line was in the run. The round now registers a line
+for every chunk it settles `REJECTED`, `DROPPED` or `UNKNOWN` with no line registered while it was
+handled, `SETTLED` (an idempotent sink's `UNKNOWN`, which the engine resends, `LAST`). Every shipped
+hook announces its own losses, so no shipped class gains a line. Do NOT replace this with an engine
+that counts the events each sink line covers: a line carries no event identity to count by. An escaped exception would fail
 the engine's run and report as undelivered a batch whose other chunks landed. The population is
 derived from `_round`'s own calls (`tests/test_http_round_guards.py`), so a new hook has no
 fault scenario until one is written, and the roster test fails by its name.
@@ -101,8 +113,12 @@ batch. (SPEC-073 FR-001 to FR-005)
   `_take`, `_event_ceiling`, `_chunk_budget`, `_drop_refused` or `_abandon_unreduced` escaped the
   round and failed every event in it, landed chunks included. An event `_items` leaves out
   uncounted is now announced by the round, where beside any sink line it showed in
-  `log_foundry_counters` alone (invariant 2). Both close what SPEC-073's delivery doc recorded as
-  follow-ups; neither changes a promise, only where the code fell short of one.
+  `log_foundry_counters` alone (invariant 2), and so is any chunk whose hooks settled a loss with no
+  line, which the frame-1 diff review found the unplaced line made reachable beside a 1.x bool
+  reader's `False`. A third-party bool reader's lone `REJECTED` chunk is therefore announced by the
+  round's `refused for good` line, where SPEC-073 specified the engine's settled line. These close
+  what SPEC-073's delivery doc recorded as follow-ups; none changes a promise, only where the code
+  fell short of one.
 - **Settled** by SPEC-073. The engine's settled-line refinement SPEC-072 FR-003 states was added
   here, keyed on lines that will commit, because `_run` had no context to read before. The
   item mapping by unclaimed position, and its `REJECTED` fallback, came from the frame-1 diff

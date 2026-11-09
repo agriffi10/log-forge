@@ -812,6 +812,12 @@ and the worker resent chunks that had landed. Now the raise costs its chunk:
       leaves its 1.x counters at zero, and is announced by the engine's settled line alone,
       `lost 1 event(s); rejected 1, unresolved 0, raised 0, unknown 0, dropped 0 after 1 delivery
       round(s) to <class>`.
+
+      > **Superseded** (fix/http-round-guards, after SPEC-073): a lone `REJECTED` chunk from a bool
+      > reader is now announced by the round, `lost 1 event(s); <class>, refused for good; not retried`,
+      > and the engine writes no settled line beside it. The decision lives in
+      > `docs/decisions/sink-delivery/the-http-family-delivers-in-rounds-and-a-run-context-keeps-its-counters-units.md`.
+
 - [x] A third-party `_handle_response` that raises `ValueError` for one chunk of two leaves the other
       chunk delivered and `emit` returning. The raising chunk is counted on `dropped_unadjudicated`
       once, with a line naming `ValueError`.
@@ -1382,6 +1388,12 @@ tests/
     and the `2xx` readers only, so a raising third-party override of another private method
     (`_retryable_status`, `_items`, `_take` and the rest FR-001 lists) escapes the round as it escaped 1.x `emit`; and *A client exception costs its chunk*, which FR-005 told
     the completion to mark, is about the AWS sinks' `_send` and is left as it stands.
+
+    > **Superseded** (fix/http-round-guards, after SPEC-073): the guard now covers every hook the
+    > round reaches, a fault costing only its chunk, `DROPPED` before its request is sent and `UNKNOWN`
+    > after; and an event `_items` leaves out uncounted is announced by the round itself. The decision
+    > lives in `docs/decisions/sink-delivery/the-http-family-delivers-in-rounds-and-a-run-context-keeps-its-counters-units.md`.
+
   - Criterion 2.9 is narrowed to the five twin-path responses the build measures it over, where it
     said "after each FR-001 case".
   - FR-004's mechanism and the base `_outcomes` and `_unadjudicated` were built in Phase 2, beside

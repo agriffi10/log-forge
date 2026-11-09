@@ -536,7 +536,10 @@ class RunContext:
 
         A caller guarding a hook that may register a count and then raise uses it to replace
         what the hook left with its own, so the loss is counted and announced once. An immediate
-        context has committed each entry already, so nothing is left to discard.
+        context has committed each entry already, so nothing is left to discard. It assumes no
+        other thread registers on this context between the mark and the rewind, as a context is
+        not thread-safe: a ``deliver`` fanning inner rounds out over threads that share it would
+        have one round's rewind discard a sibling's entries.
 
         Args:
           mark: What :meth:`_mark` returned.

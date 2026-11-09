@@ -27,6 +27,7 @@ from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.verdict import Outcome, Verdict
 from test_http_rounds import Scripted, _ok, _status, _through_the_worker
+from test_sinks_http import FakeResponse
 
 A, J, D, U = Outcome.ACCEPTED, Outcome.REJECTED, Outcome.DROPPED, Outcome.UNKNOWN
 
@@ -450,3 +451,107 @@ def test_unplaced_events_of_a_failed_run_are_left_to_its_catcher(
         Empty("http://h", opener=opener).emit([{"i": 0}, {"i": 1}])
     assert opener.calls == []
     assert _lost(capsys.readouterr().err) == [], "the raise is the run's one announcement"
+
+
+# --- a loss whose hook registered no line is announced by the round ------------------------------
+
+
+class _Refusing(_Omitting):
+    """An ``_Omitting`` whose 1.x bool reader refuses the chunk carrying event 2."""
+
+    def _handle_response(self, payload: bytes, items: list[Any]) -> bool:
+        return items[0].event.get("i") != 2
+
+
+def test_a_silent_reader_beside_an_unplaced_event_is_still_announced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Frame-1 review: the unplaced line no longer silences the only line a bool reader had."""
+    sink = _Refusing("http://h", max_batch_count=1, opener=Scripted(_ok()))
+    sink.emit([{"i": 0}, {"i": 1}, {"i": 2}])
+    assert _lost(capsys.readouterr().err) == [
+        _UNPLACED.replace("_Omitting", "_Refusing"),
+        "log-foundry: lost 1 event(s); _Refusing, refused for good; not retried",
+    ]
+    assert sink.log_foundry_counters.failed_events == 2
+
+
+@pytest.mark.parametrize("outcome", ["rejected", "dropped", "unknown"])
+def test_a_reader_returning_a_loss_with_no_line_is_announced_once(
+    outcome: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lost = {"rejected": J, "dropped": D, "unknown": U}[outcome]
+
+    class Silent(HTTPSink):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return tuple(lost if item.event.get("i") == 1 else A for item in items)
+
+    sink = Silent("http://h", max_batch_bytes=200, max_batch_count=1, opener=Scripted(_ok()))
+    batch: list[dict[str, object]] = [{"i": 0, "big": "x" * 500}, {"i": 1}, {"i": 2}]
+    assert sink.deliver(batch) == Verdict(outcomes=(D, lost, A))
+    line = (
+        "log-foundry: lost 1 event(s); Silent, outcome unknown; they may have landed"
+        if outcome == "unknown"
+        else "log-foundry: lost 1 event(s); Silent, refused for good; not retried"
+    )
+    assert _lost(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 1 event(s); Silent, up to 520 bytes exceeds the 200-byte "
+            "per-event ceiling"
+        ),
+        line,
+    ]
+
+
+def test_an_abandon_unreduced_with_no_line_is_announced_by_the_round(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class Silent(HTTPSink):
+        def _item_size(self, rendered: str, event: dict[str, object]) -> int:
+            return 0
+
+        def _abandon_unreduced(self, chunk: list[Any]) -> None:
+            return None
+
+    sink = Silent("http://h", max_batch_count=2, opener=Scripted(_after_one))
+    assert sink.deliver([{"i": n} for n in range(4)]) == Verdict(outcomes=(A, A, J, J))
+    assert _lost(capsys.readouterr().err) == [
+        "log-foundry: lost 2 event(s); Silent, refused for good; not retried"
+    ]
+
+
+def test_an_idempotent_unknown_with_no_line_is_announced_only_by_the_last_round(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An idempotent sink's ``UNKNOWN`` is resent; one a later round lands is never announced."""
+    answers = iter([U, A])
+
+    class Silent(HTTPSink):
+        log_foundry_idempotent = True
+
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return (next(answers),) * len(items)
+
+    opener = Scripted(_ok())
+    Silent("http://h", max_retries=1, opener=opener).emit([{"i": 0}])
+    assert len(opener.calls) == 2
+    assert _lost(capsys.readouterr().err) == []
+
+
+def test_a_reader_that_counts_then_raises_is_counted_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Frame-1 review: ``_read`` discards what a faulting reader registered before it raised."""
+    from log_foundry.sinks.elasticsearch import ElasticsearchSink
+
+    class Faulting(ElasticsearchSink):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            super()._outcomes(payload, items)
+            raise _Planted
+
+    body = b'{"errors": true, "items": [{"index": {"status": 400, "error": {"type": "x"}}}]}'
+    sink = Faulting("http://h", index="i", opener=Scripted(FakeResponse(200, body)))
+    assert sink.deliver([{"i": 0}]) == Verdict(outcomes=(U,))
+    assert sink.item_errors == 0, "the item error the reader registered is discarded"
+    assert sink.dropped_unadjudicated == 1
+    assert _lost(capsys.readouterr().err) == [_read_raised()]
