@@ -7,12 +7,20 @@
   inner sink's own `SinkCounters` object, so a run through the wrapper counts where the bare sink's
   run would. Each round applies the 1.x per-event step, forwards the rest through
   `RunContext.delegate` and maps the inner verdict back to the wrapper's own indices. A declined
-  event is `SKIPPED` and counted nowhere. A failed event is `SKIPPED` and counted in the wrapper's
-  `_dropped` through the run context, `SETTLED`. A call whose every event failed is `REJECTED`
-  with the refusal marker. A malformed inner verdict turns the forwarded events `UNKNOWN`.
-- `TransformSink` keeps each event's forwarded result for one engine run, in the run context's
-  notes, so later rounds forward the same object (Andrew's call). A copy per round broke a FIFO
-  `SQSSink`'s order and its attempt-count line.
+  event is `SKIPPED` and counted nowhere, except in a round the engine fails as raising (the inner
+  `deliver` raised, or its marks did not fit): there SPEC-072's raising-round upper bound counts
+  every event of the round, `SKIPPED` ones included, in the shared `failed_events`. A failed event
+  is `SKIPPED` and counted in the wrapper's `_dropped` through the run context, `SETTLED`. A call
+  whose every event failed is `REJECTED` with the refusal marker. A malformed inner verdict turns
+  the forwarded events `UNKNOWN`. Inside an engine run it also sets aside what the inner call
+  registered, as the engine does for a bare sink since PR 319. A direct `deliver()` keeps those
+  registrations, as the bare call does.
+- Caller code runs once per event per engine run (Andrew's calls). `TransformSink` keeps each
+  event's forwarded result in the run context's notes, so later rounds forward the same object. A
+  copy per round broke a FIFO `SQSSink`'s order and its attempt-count line. `FilteringSink` keeps
+  each forwarded event's decision the same way, so a resend is not put to the predicate or the
+  level floor again. Asked again, a stateful predicate (dedupe, rate limit, sampling) could
+  decline its own resend and lose the event silently.
 - `LogstashSink` is a pure delegate in both modes. In HTTP mode it offers when the `HTTPSink`
   does. In socket mode it offers on the `SocketTransport`'s counters and calls the transport's
   `deliver` directly, as `SyslogSink` does. Its verdict is the backend's, unmapped.
@@ -50,16 +58,20 @@
 
 ## Verification
 
-- At `acf47384` the wrapper, fan-out, roster, deferral and wrapper-failure suites passed locally
-  (`tests/test_wrapper_verdicts.py`, `tests/test_multi_engine_children.py`, among others). The
-  PR's CI run is the record of the full suite.
+- The claims above are pinned by `tests/test_wrapper_verdicts.py` (FR-001 to FR-003, the
+  predicate and transform caches, the set-aside and the twins), `tests/test_multi_engine_children.py`
+  (FR-004) and `tests/test_engine_sinks_roster.py` (the exclusions). The PR's CI run is the record
+  of the full suite.
 
 ## Open and accepted edges
 
-- Accepted: the all-failed rule applies per `deliver` call. So if the caller's code fails on
-  every event of a **later** round, and an earlier round of that run landed something, that round
-  is a refusal too. Its events go into the shared `failed_events` with the line `refused by <Wrapper>
-  after others landed`, not into `_dropped`.
+- Closed by the predicate cache: caller code never runs in a later round. A later round resends
+  only events the inner sink answered `RETRYABLE`, and only a forwarded event gets an inner
+  outcome. Both wrappers forward such an event again from the run's notes without running the
+  predicate or the function. So the all-failed refusal, and any caller-code failure, can occur
+  only in the round that first sees an event. The frame-2 review's case (a predicate raising on a
+  resend, charged to the inner `failed_events` as "refused … after others landed") no longer
+  arises (`test_a_predicate_cannot_fail_a_forwarded_event_on_its_resend`).
 - Accepted: on the worker path, the engine's own lines through a wrapper name the wrapper (or
   `LogstashSink`), not the inner sink or transport. Lines the inner sink registers itself still
   name the inner sink.

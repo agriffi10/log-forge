@@ -147,7 +147,9 @@ one `Deferral` per owner, `SETTLED` for a drop.
 the inner sink's or backend's **own** `SinkCounters` object, so the engine commits a run through
 the wrapper into exactly the object, and through exactly the run-context counts, the bare sink's
 run would use. The wrapper counts only its own decisions: a declined event is `SKIPPED` and
-counted nowhere, and a caller-code failure beside other events is `SKIPPED` and registered on the
+counted nowhere, except in a round the engine fails as raising (the inner `deliver` raised or its
+marks did not fit), where SPEC-072's raising-round upper bound puts every event of the round,
+`SKIPPED` ones included, in the shared `failed_events`; a caller-code failure beside other events is `SKIPPED` and registered on the
 wrapper's `_dropped`, `SETTLED`, so it is in `dropped` once and only if the run settles. Socket-mode
 `LogstashSink` therefore counts each lost event once per batch on the worker path, where it counted
 once per worker attempt. `MultiSink` offers no `deliver`: an engine child's `emit` is the adapter,

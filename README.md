@@ -683,8 +683,9 @@ still land. The wrapped sink's losses are reported where they would be alone, an
 only the events your own code failed on. Each wrapper copies the inner sink's `max_retries` and
 `max_retry_after` as read-only attributes when it is built, so set them on the inner sink. Within one
 delivery a `TransformSink` runs your function once per event, however many retries the delivery
-makes, so a transform with side effects sees fewer calls than it did when the worker resent whole
-batches. If your predicate or function raises on **every** event of a batch, the batch is tried
+makes, and a `FilteringSink` asks your predicate once per event, sending a retry of an event it
+forwarded without asking again. A transform with side effects, or a predicate that keeps state
+(dedupe, rate limit, sampling), sees fewer calls than it did when the worker resent whole batches. If your predicate or function raises on **every** event of a batch, the batch is tried
 once and counted as failed, not retried. Your first exception is still what a direct `emit`
 raises. Whenever your code raises during such a delivery, the wrapper writes one stderr line for
 that attempt naming its class and the exception's type, never its message

@@ -43,7 +43,10 @@ instance's own `__dict__` through `_wrapper.ForwardedStopSignal`, and still forw
 sink, because the engine reads a property as no signal.
 
 **The verdict is mapped to the wrapper's own indices, and the wrapper counts only its own
-decisions.** A declined event is `SKIPPED` and counted nowhere. An event the caller's code failed
+decisions.** A declined event is `SKIPPED`. The wrapper never counts it, and the engine counts it
+only in a round it fails as raising, where the inner `deliver` raised or its marks did not fit.
+There SPEC-072's raising-round upper bound counts every event of the round, `SKIPPED` ones
+included, in the shared `failed_events`. An event the caller's code failed
 on, beside one forwarded or declined, is `SKIPPED` and registered as
 `run_context().count(self, "_dropped", n, when=SETTLED)`. That is SPEC-058's count at SPEC-058's
 moment, reported through the wrapper's unchanged `losses()`. It is not `DROPPED`, which the engine
@@ -52,16 +55,30 @@ A call whose every event failed is `REJECTED` with the refusal marker, under *Ca
 fails for one event*. A forwarded event takes the inner verdict's outcome at its position, or
 `UNKNOWN` when `outcomes_of` judges the verdict malformed. `RunContext.delegate` moves every mark
 the inner round registered (`final_rejections`, `sink_counted`) into the wrapper's positions, and
-an out-of-range mark stays invalid. A caller-code failure writes one `_diag.absorbed` line per
-call, not registered with the run context, since a registered line would suppress the engine's own
-settled line for the whole run.
+an out-of-range mark stays invalid. For a malformed inner verdict, inside an engine run, it sets
+aside every count, line and mark the inner call registered. The engine does the same for a bare
+sink's unreadable round (PR 319), and the wrapper's own registrations, made before the call, stay.
+A direct `deliver()` outside a run sets nothing aside, as the bare call does. A caller-code failure
+writes one `_diag.absorbed` line per call, and that line is not registered with the run context.
+A round that registers a line owns the announcement of every loss its verdict decided (PR 319,
+per round). A registered line here would therefore take the engine's settled line away from that
+round's losses, a third-party inner sink's among them, and leave them unannounced.
 
-**A `TransformSink` keeps each event's forwarded result for one engine run** (Andrew's call,
-2026-11-09). The result is held in the run context's notes, keyed by the original event's identity
-with the event kept in the entry, so a later round forwards the same object. A fresh copy per round
-is a stranger to the inner sink's own identity-keyed run notes: over a FIFO `SQSSink` it landed
-`[b, a]` where the bare sink lands `[a, b]`, and a standard queue's abandoned line counted one
-attempt where the message had made four. The notes end with the run.
+**Caller code runs once per event per engine run** (Andrew's calls, 2026-11-09). Both wrappers
+keep what they forwarded in the run context's notes, keyed by the original event's identity with
+the event kept in the entry, and the notes end with the run. **A `TransformSink` keeps each event's
+forwarded result**, so a later round forwards the same object. A fresh copy per round is a stranger
+to the inner sink's own identity-keyed run notes: over a FIFO `SQSSink` it landed `[b, a]` where
+the bare sink lands `[a, b]`, and a standard queue's abandoned line counted one attempt where the
+message had made four. **A `FilteringSink` keeps each forwarded event's decision**, so a resend is
+forwarded without putting it to the predicate or the level floor again. A predicate that is not a
+pure function of the event (dedupe, rate limit, sampling) would otherwise decline its own resend.
+That event would become `SKIPPED`, never resent and, in a round that settles, counted nowhere, so an event the inner sink
+answered `RETRYABLE` was lost silently. Behind a dedupe predicate, a real `HTTPSink` answering `503`
+then `200` made one POST where the `emit` path made two. A predicate raising on the resend charged
+a forwarded event to the inner `failed_events`. Only a forwarded event is kept, and only a
+forwarded event can be resent, so caller code never runs in a later round of a run. The all-failed
+refusal and every caller-code failure therefore arise only in the round that first sees an event.
 
 **What a wrapper never does.** It declares no `log_foundry_idempotent` and defines no
 `_retryable_error`, so nothing that may have landed is resent through it. It never calls
@@ -79,12 +96,13 @@ recorded upper bound (*A raising `emit` counts nothing*).
 **Do NOT** give a wrapper counters of its own; do NOT copy the budget with an ordinary read, which
 evaluates a property the bare engine reads as none; do NOT make the copied budget writable; do NOT
 call an inner `emit` or `run_delivery` from a wrapper's `deliver`; do NOT declare a wrapper
-idempotent; do NOT give `MultiSink` a `deliver`; do NOT copy a transform's result afresh on each
-round of one run. (SPEC-075 FR-001 to FR-004)
+idempotent; do NOT give `MultiSink` a `deliver`; do NOT copy a transform's result afresh, or ask
+the predicate again about a forwarded event, on a later round of one run. (SPEC-075 FR-001 to FR-004)
 
 ## History
 
 ### 2026-11-09
 
+- **Refined** the same day from the frame-2 diff review (Andrew's call): a `FilteringSink` keeps each forwarded event's predicate decision for the run, beside `TransformSink`'s result cache, so a stateful predicate can no longer drop its own resend; and a malformed inner verdict's registrations are set aside only inside an engine run.
 - **Settled** by SPEC-075 FR-001 to FR-004, with Andrew's calls on the read-only budget, the
   subclass-assignment break and the per-run transform cache.

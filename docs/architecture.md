@@ -535,8 +535,10 @@ sink's inline engine. `FilteringSink` and `TransformSink` map the inner verdict 
 indices and count only their own decisions: a declined event is `SKIPPED`, a caller-code failure is
 `SKIPPED` and counted on the wrapper's `_dropped` `SETTLED`, and a call whose every event failed is
 `REJECTED` with the refusal marker. `RunContext.delegate` moves the inner round's marks into the
-wrapper's positions. `TransformSink` keeps each event's result for one run, so later rounds
-forward the same object. `LogstashSink` returns its backend's verdict unmapped. No wrapper
+wrapper's positions, and for a malformed inner verdict inside a run sets aside what the inner
+call registered, as the engine does for a bare sink. Caller code runs once per event per run:
+`TransformSink` keeps each event's result and `FilteringSink` each forwarded event's decision, so a
+later round forwards the same object without asking the function or the predicate again. `LogstashSink` returns its backend's verdict unmapped. No wrapper
 declares idempotence or calls its inner sink's `emit` from `deliver`, and each wrapper's own `emit`
 keeps its 1.x body. `MultiSink` offers no `deliver`: it cannot give one verdict for an event one
 child took and another refused, so it keeps calling each child's `emit`, and an engine child's
