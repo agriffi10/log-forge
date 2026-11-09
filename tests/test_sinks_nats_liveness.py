@@ -1696,12 +1696,26 @@ class ParkedFlusherNATS(LiveFakeNATS):
 
 
 class SlowFlusherNATS(LiveFakeNATS):
-    """The flusher is parked for 0.2 s after the batch, then drains it."""
+    """The flusher is parked until 0.2 s after the batch's first publish, then drains it.
+
+    The timer starts at that publish, inside the emit the test times, and not when the fake is
+    built. The sink connects in its constructor, so a timer started in ``__init__`` was already
+    running before the test's clock started, and the test's ``0.2 <= elapsed`` read as low as
+    0.1998 s on CI (Release run 42509770284 attempt 1, on ``458d79e6``). asyncio never fires a
+    handle early by more than its clock resolution, so a window that opens after the clock does
+    is a floor load cannot break.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.flusher_parked = True
-        asyncio.get_running_loop().call_later(0.2, self._unpark)
+        self.unpark_scheduled = False
+
+    async def _enter_publish(self, payload: bytes) -> None:
+        if not self.unpark_scheduled:
+            self.unpark_scheduled = True
+            asyncio.get_running_loop().call_later(0.2, self._unpark)
+        await super()._enter_publish(payload)
 
     def _unpark(self) -> None:
         self.flusher_parked = False
