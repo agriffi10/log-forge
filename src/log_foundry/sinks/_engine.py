@@ -419,8 +419,9 @@ class When(enum.Enum):
       SETTLED_LAST: Only when the run settles and the round that registered it ended it: a loss
         of an event the sink marked counted (:meth:`RunContext.sink_counted`) because a failed
         run's catcher owns it, and that a later round could still have delivered — ``NATSSink``'s
-        unattempted events in a round that published nothing. Committed as ``LAST`` is, and by
-        an immediate context as every rule but ``FAILED`` is.
+        unattempted events in a round that published nothing. A line under it owns the round's
+        resendable losses as a ``LAST`` line does; an immediate context commits it at once, as
+        every rule but ``FAILED``.
     """
 
     ALWAYS = "always"

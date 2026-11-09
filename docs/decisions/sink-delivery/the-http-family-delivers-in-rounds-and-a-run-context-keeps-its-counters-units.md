@@ -128,9 +128,9 @@ batch. (SPEC-073 FR-001 to FR-005)
   count still sums its terms, where one line carrying a round per term would need a new grammar.
   The same fix closes a NATS gap the engine's exclusion opened: a `NATSSink` round that published
   nothing marks every event sink-counted, so its catcher owns the batch as in 1.x, but its
-  `_register` counted only the raised publishes. A run that settles on such a round — reachable
-  only when an idempotent run resends an `UNKNOWN` after an earlier round landed something — has
-  no catcher, so an event the deadline left unattempted there was neither counted nor named. The
+  `_register` counted only the raised publishes. A run that settles on such a round — an idempotent run
+  resending an `UNKNOWN` after an earlier round landed something, or a wrapper accepting part of
+  its batch itself (found by the frame-1 review) — has no catcher, so an event the deadline left unattempted there was neither counted nor named. The
   round now registers that remainder's count and line under a new `When.SETTLED_LAST`, kept only
   when the run settles on the registering round, so a failed run keeps 1.x's ledger. `NATSSink` is
   the only `sink_counted` caller, a population `tests/test_engine_announces_every_loss.py` derives

@@ -816,9 +816,10 @@ class NATSSink:
         Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
         per publish that raised, in order — 1.x counted each as it happened and then raised. The
         round's events are sink-counted, so the engine adds nothing, and an event the deadline
-        left unattempted is its catcher's when the run fails, as in 1.x. A run that settles has
-        no catcher, which only a run resending ``UNKNOWN`` reaches — an earlier round landed
-        something — so the unattempted remainder is counted and announced here,
+        left unattempted is its catcher's when the run fails, as in 1.x. A run can still settle
+        on such a round — an idempotent run resending an ``UNKNOWN`` after an earlier round
+        landed something, or a wrapper that accepts part of its batch itself — and a settled run
+        has no catcher, so the unattempted remainder is counted and announced here,
         ``SETTLED_LAST``: only when the run settles on this round, since a later round resends
         it. Before, nothing counted or named it. Something published: the
         engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in

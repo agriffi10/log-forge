@@ -552,6 +552,84 @@ def test_a_nats_event_left_unattempted_before_its_resend_lands_is_counted_nowher
 
 
 @pytest.mark.usefixtures("no_wait")
+def test_a_settled_runs_last_round_counts_its_raised_and_unattempted_publishes_once_each(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The remainder counted ``SETTLED_LAST`` is the unattempted events only, never the round.
+
+    Round two raises one publish and leaves the other unattempted; the raised one is counted by
+    1.x's own per-publish count, so a count of the whole round would book it twice.
+    """
+    inner = _scripted_nats(("ok", "abandoned", "abandoned"), ("raised", "unattempted"))
+    outer = _Delegate(inner, max_retries=1)
+    try:
+        delivery = _run(outer, events(3))
+    finally:
+        inner.close()
+    assert (delivery.attempts, delivery.accepted, delivery.unresolved, delivery.failed) == (
+        2,
+        1,
+        2,
+        False,
+    )
+    assert outer.log_foundry_counters.losses().failed + inner.losses().failed == 2
+    lines = [line for line in capsys.readouterr().err.splitlines() if "lost" in line]
+    assert lines == [
+        "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+        f"log-foundry: lost 1 event(s); NATSSink publish_timeout {inner.publish_timeout}s",
+    ]
+
+
+class _PartlyItsOwn:
+    """A non-idempotent wrapper that accepts event 0 itself and forwards the rest to ``NATSSink``.
+
+    The run settles on the wrapper's own acceptance, so a NATS round that published nothing can
+    end a settled run with no ``UNKNOWN`` resend at all.
+    """
+
+    def __init__(self, inner: NATSSink, max_retries: int) -> None:
+        self.inner = inner
+        self.max_retries = max_retries
+        self.log_foundry_counters = SinkCounters()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        own = 0 if run_context().round == 1 else -1
+        forwarded = [event for at, event in enumerate(batch) if at != own]
+        positions = [at for at in range(len(batch)) if at != own]
+        _result, outcomes = run_context().delegate(self.inner.deliver, forwarded, positions)
+        assert outcomes is not None
+        mapped = dict(zip(positions, outcomes, strict=True))
+        return Verdict(outcomes=tuple(mapped.get(at, A) for at in range(len(batch))))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+
+@pytest.mark.usefixtures("no_wait")
+def test_a_non_idempotent_run_settled_by_its_wrapper_counts_the_unattempted_event_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The frame-1 review's probe: the gap is reachable without an idempotent run."""
+    inner = _scripted_nats(("unattempted",), ("unattempted",))
+    outer = _PartlyItsOwn(inner, max_retries=1)
+    try:
+        delivery = _run(outer, events(2))
+    finally:
+        inner.close()
+    assert (delivery.attempts, delivery.accepted, delivery.unresolved, delivery.failed) == (
+        2,
+        1,
+        1,
+        False,
+    )
+    assert outer.log_foundry_counters.losses().failed + inner.losses().failed == 1
+    lines = [line for line in capsys.readouterr().err.splitlines() if "lost" in line]
+    assert lines == [
+        f"log-foundry: lost 1 event(s); NATSSink publish_timeout {inner.publish_timeout}s"
+    ]
+
+
+@pytest.mark.usefixtures("no_wait")
 def test_a_nats_event_left_unattempted_by_a_failed_run_is_its_catchers_alone(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -572,8 +650,8 @@ def test_a_nats_event_left_unattempted_by_a_failed_run_is_its_catchers_alone(
     assert lines == ["log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"]
 
 
-SINK_COUNTED_SITES = {"nats.py": "_round"}
-"""Every ``sink_counted`` call in ``src/log_foundry/sinks/``, by module and enclosing function.
+SINK_COUNTED_SITES = [("nats.py", "_round")]
+"""Every ``sink_counted`` call in ``src/log_foundry/sinks/``, by module and innermost function.
 
 A mark excludes its events from the engine's count and its settled line, so each site must
 itself count and announce every event it marks in every run ending the mark excludes it from —
@@ -585,19 +663,22 @@ above). A new site joins this table only after that check.
 def test_the_sink_counted_population_is_the_reviewed_one() -> None:
     """Every ``sink_counted`` call, found in the tree, is one whose registrations were checked."""
     root = Path(log_foundry.sinks.__file__).parent
-    found: dict[str, str] = {}
+    found: list[tuple[str, str]] = []
+
+    def visit(node: ast.AST, module: str, function: str) -> None:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            function = node.name
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "sink_counted"
+        ):
+            found.append((module, function))
+        for child in ast.iter_child_nodes(node):
+            visit(child, module, function)
+
     for path in sorted(root.glob("**/*.py")):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for function in ast.walk(tree):
-            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
-                continue
-            for node in ast.walk(function):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "sink_counted"
-                ):
-                    found[str(path.relative_to(root))] = function.name
+        visit(ast.parse(path.read_text(encoding="utf-8")), str(path.relative_to(root)), "")
     assert found == SINK_COUNTED_SITES
 
 
