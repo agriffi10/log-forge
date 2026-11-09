@@ -912,8 +912,10 @@ Two things worth knowing:
   back while an earlier message of its group is still being retried within `max_retries + 1`
   sends; once that one has used its sends, a later message may land first. Holding a group for
   the worker's whole budget would trade log delivery for ordering you can rebuild from
-  `timestamp`, so the sink doesn't. A message held until the run ends is counted on `.failed`,
-  named on stderr as held behind an earlier message of its group.
+  `timestamp`, so the sink doesn't. The delivery's last round holds nothing, so a waiting message
+  is sent right after the earlier one's final send. A delivery the worker ends early, or a direct
+  `deliver()` call, can leave one unsent, counted on `.failed` and named on stderr as held behind an earlier message of its
+  group.
 - **FIFO queues cap throughput** at 300 messages/second (3,000 with batching), or higher in
   high-throughput mode. That's queue-side configuration, not something the library sets.
 

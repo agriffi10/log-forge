@@ -17,7 +17,7 @@ import pytest
 from log_foundry import _diag
 from log_foundry.sinks import _engine
 from log_foundry.sinks._engine import RunContext, When, detached, one_round, run_context
-from log_foundry.sinks.verdict import Outcome, Verdict
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 from verdict_sinks import Scripted, WaitRecorder, events
 
 A, R, J = Outcome.ACCEPTED, Outcome.RETRYABLE, Outcome.REJECTED
@@ -430,3 +430,28 @@ def test_a_misspelt_owner_counter_is_absorbed_and_its_line_still_written(
     assert "absorbed a failure while counting a delivery (AttributeError)" in err
     assert "1 count(s) for Owner not counted" in err
     assert "log-foundry: lost 1 event(s); Owner, still said" in err
+
+
+def test_only_an_engine_runs_last_round_is_last() -> None:
+    seen: list[tuple[int, bool]] = []
+
+    class Probe:
+        max_retries = 2
+
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+
+        def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+            context = _engine.run_context()
+            seen.append((context.round, context.last))
+            return Verdict.uniform(Outcome.RETRYABLE, len(batch))
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            _engine.emit_via_deliver(self, batch)
+
+    _engine.run_delivery(Probe(), [{"i": 0}], worker_retries=1, stop=None)
+    assert seen == [(1, False), (2, False), (3, False), (4, False), (5, False), (6, True)]
+    seen.clear()
+    one_round(Probe().deliver, [{"i": 0}])
+    assert seen == [(1, False)], "a detached round's caller owns any later round"
+    assert run_context().last is False
