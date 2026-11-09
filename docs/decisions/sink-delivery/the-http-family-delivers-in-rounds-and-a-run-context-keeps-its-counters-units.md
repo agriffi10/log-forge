@@ -16,7 +16,7 @@ event's fate is returned by index: items map back to events by identity, then by
 position, so an `_items` override returning rebuilt events maps exactly, and an event no request
 carries is `DROPPED` only when that many were dropped and counted, else `REJECTED`, never a
 silent default, and the round announces the ones `_items` did not count itself, on a settled run,
-so the engine's settled line, which any sink line suppresses, is never their only announcement. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
+so the engine's settled line, which leaves a round's losses to any line that round registers, is not their announcement. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
 the orphan path and through `emit`. Nothing in `http.py` waits or loops, and one round has one
 wait, so a batch whose several chunks failed retryably waits once per round where 1.x waited once
 per chunk. `emit` is `_engine.emit_via_deliver(self, batch, deliver=self._round)`, the private
@@ -46,10 +46,10 @@ guard: `_exchange` classifies it as the attempt's refused exception, `REJECTED` 
 `failed`. What the faulting hook, or a faulting reader, registered on the run's context before it
 raised is discarded, so the guard's count and line are the loss's only ones.
 
-**A loss nothing announced is announced by the round.** The engine writes its settled line only for
-a run in which the sink registers no line, so a loss whose hook registered none — a 1.x bool
+**A loss nothing announced is announced by the round.** The engine's settled line leaves every loss
+of a round that registers a line to that round's lines, and one round holds every chunk, so a loss whose hook registered none — a 1.x bool
 `_handle_response` returning `False`, a third-party `_outcomes` or `_abandon_unreduced` — showed in
-`log_foundry_counters` alone whenever any other line was in the run. The round now registers a line
+`log_foundry_counters` alone whenever any other line was in the round. The round now registers a line
 for every chunk it settles `REJECTED`, `DROPPED` or `UNKNOWN` with no line registered while it was
 handled, `SETTLED` (an idempotent sink's `UNKNOWN`, which the engine resends, `LAST`). Every shipped
 hook announces its own losses, so no shipped class gains a line. The key is the chunk: a hook that
@@ -74,8 +74,15 @@ owner, `ALWAYS`, `SETTLED` only for a settled run, `LAST` only for the run's fin
 writes the lines outside every lock; a `BaseException` commits nothing. A refused request counts
 `failed` `ALWAYS`, a still-retryable one `LAST`, a drop `SETTLED`, a per-record rejection `ALWAYS`,
 and an unadjudicated chunk `ALWAYS`, or `LAST` for a sink declaring `log_foundry_idempotent`. A
-settled run whose sink will write a line of its own gets no engine line, so a loss is announced
-once. SPEC-074 extends the context for the SDK and driver sinks.
+settled run's engine line names each loss decided in a round that registered no line the run will
+write, or in one whose verdict the engine set aside (a raise, an unreadable verdict, marks that do
+not fit), and only those, so a loss is announced at most once, and always when its round wrote no
+line: the round, not the run, is the engine's key, for the reason the chunk is the HTTP round's — a
+line carries no event identity, so a round that announces some of its losses owns the rest. An event
+a round left resendable (`RETRYABLE`, or an idempotent sink's `UNKNOWN`) is a loss only because the
+run ended on that round, so only a kept `LAST` line of that round owns it. A round the engine set
+aside has what it registered discarded (`RunContext._rewind`), as the round's hook guard discards a
+faulting hook's, so its counts and lines never describe outcomes the engine decided instead. SPEC-074 extends the context for the SDK and driver sinks.
 
 **What moves**, each in the 1.2.0 release notes. A total failure is counted once per batch: a
 request refused for good is sent and counted once, and an outage counts `failed` once per
@@ -111,6 +118,22 @@ override; `_send`'s requests in `log_foundry_counters`; or the `413` budget carr
 batch. (SPEC-073 FR-001 to FR-005)
 
 ## History
+
+### 2026-11-09
+
+- **Refined** (fix/engine-announce-every-loss): the engine's settled line was written only for a run
+  in which the sink registered no line at all, so a `deliver` sink outside the HTTP family — a
+  subclass of an SDK or driver sink, or one written from scratch — that announced a loss in one
+  round and returned another silently in a later round left the second in `log_foundry_counters`
+  alone (invariant 2). The engine now keys on the round: it names each loss decided in a round that
+  registered no line the run will write. A round that announces some of its losses still owns the
+  rest, as an HTTP hook owns its chunk; the HTTP round's own line for an unlined chunk stays, because
+  the chunk is a finer key than the round, and the engine sees that round as lined, so nothing is
+  announced twice (`tests/test_engine_announces_every_loss.py`). The two diff reviews added three
+  rules: a refused round's drop is named (the refusal line counts only losses); a resendable event
+  is owned only by a kept `LAST` line, so the HTTP `emit` and worker twins name a reader's
+  `RETRYABLE` alike; and a round whose verdict the engine set aside has its registrations
+  discarded and owns nothing.
 
 ### 2026-11-08
 
