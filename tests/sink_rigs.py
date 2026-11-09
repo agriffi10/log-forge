@@ -73,7 +73,12 @@ class State:
 
 @dataclass
 class Rig:
-    """A built sink, the state its double writes to, and how to read what it delivered."""
+    """A built sink, the state its double writes to, and how to read what it delivered.
+
+    ``owner`` and ``counter`` name where the sink keeps its unencodable count: SPEC-069's
+    ``_unencodable`` on the sink, or, for a sink on the delivery engine (SPEC-074), the engine's
+    ``dropped_events`` on its ``log_foundry_counters``.
+    """
 
     sink: Any
     state: State
@@ -357,7 +362,13 @@ def kinesis(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = KinesisSink("s", client=_Kinesis(state), max_retries=0)
-    return Rig(sink, state, lambda rs: [json.loads(r["Data"]) for r in rs], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rs: [json.loads(r["Data"]) for r in rs],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Firehose:
@@ -377,7 +388,13 @@ def firehose(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = FirehoseSink("d", client=_Firehose(state), max_retries=0)
-    return Rig(sink, state, lambda rs: [json.loads(r["Data"]) for r in rs], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rs: [json.loads(r["Data"]) for r in rs],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _SNS:
@@ -397,7 +414,13 @@ def sns(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = SNSSink("arn", client=_SNS(state), max_retries=0)
-    return Rig(sink, state, lambda es: [json.loads(e["Message"]) for e in es], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda es: [json.loads(e["Message"]) for e in es],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _SQS:
@@ -416,7 +439,11 @@ def sqs(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     sink = SQSSink("https://sqs/q", client=_SQS(state), max_retries=0)
     return Rig(
-        sink, state, lambda es: [json.loads(e["MessageBody"]) for e in es], sink, "_unencodable"
+        sink,
+        state,
+        lambda es: [json.loads(e["MessageBody"]) for e in es],
+        sink.log_foundry_counters,
+        "dropped_events",
     )
 
 

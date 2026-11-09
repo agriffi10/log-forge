@@ -632,7 +632,11 @@ def _base_names(cls: ast.ClassDef) -> list[str]:
 
 
 def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.ClassDef]]:
-    """Returns every class in ``sinks/`` defining ``emit``, ``send_all`` or ``close``.
+    """Returns every class in ``sinks/`` defining ``deliver``, ``emit``, ``send_all`` or ``close``.
+
+    ``deliver`` joined the set with SPEC-074: an engine sink's I/O moved out of ``emit``, which
+    only calls the adapter, so a lock entered in ``deliver`` and the helpers it calls is what the
+    lock roster below reads first.
 
     This gate used to guess, admitting a *module* that imported something inside a function or
     whose source contained one of six hardcoded handle tokens. SPEC-028's delivery doc recorded
@@ -700,7 +704,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
             current = queue.pop()
             if any(
                 isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-                and m.name in ("emit", "send_all", "close")
+                and m.name in ("deliver", "emit", "send_all", "close")
                 for m in current.body
             ):
                 return True
@@ -713,7 +717,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
     def _owns_delivery(cls: ast.ClassDef) -> bool:
         return any(
             isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-            and m.name in ("emit", "send_all", "close")
+            and m.name in ("deliver", "emit", "send_all", "close")
             for m in cls.body
         )
 
@@ -843,7 +847,7 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
         }
         # A class inheriting its emit has no body to inspect: it runs its ancestor's, which is
         # judged on its own account, and `_decision_doc` lets it answer from that ancestor.
-        emit = helpers.get("emit") or helpers.get("send_all")
+        emit = helpers.get("deliver") or helpers.get("emit") or helpers.get("send_all")
         if emit is not None and _takes_the_transport_lock(emit, helpers, {emit.name}):
             continue
         # Whitespace-normalized, and including any ancestor whose emit/close this class runs.
@@ -1190,7 +1194,7 @@ def test_dropped_unadjudicated_is_counted_under_the_lock(
     counter, and 200 emits each spending their full 0.7 s budget would take minutes.
     """
     from log_foundry.sinks import kinesis as kinesis_mod
-    monkeypatch.setattr(kinesis_mod, "wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
     class ShortResponseClient:
         """Returns a per-record array too short to adjudicate, which is SPEC-018's case."""
@@ -1324,7 +1328,7 @@ def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
     helpers = {
         m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
     }
-    entry = helpers.get("emit") or helpers.get("send_all")
+    entry = helpers.get("deliver") or helpers.get("emit") or helpers.get("send_all")
     if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
         return "it takes a transport lock in emit, so it holds state a close releases"
     for node in ast.walk(cls):

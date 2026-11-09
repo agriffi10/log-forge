@@ -8,6 +8,7 @@ fake sockets/openers — so no test touches the network.
 from __future__ import annotations
 
 import ast
+import importlib
 import json
 
 import pytest
@@ -29,9 +30,8 @@ def _no_sleep(monkeypatch):
         "_socket", "clickhouse", "eventhubs", "firehose", "kinesis", "mongodb",
         "postgres", "rabbitmq", "redis", "sns", "sqs",
     ):
-        monkeypatch.setattr(
-            f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None
-        )
+        if hasattr(importlib.import_module(f"log_foundry.sinks.{module}"), "wait"):
+            monkeypatch.setattr(f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None)
     monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
@@ -1476,7 +1476,9 @@ def test_a_duplicate_id_in_the_failed_array_cannot_understate_what_landed() -> N
 
     sink = SQSSink("https://q/x", client=DuplicateIdClient(), max_retries=0)
     sink.emit([{"log_id": "a"}, {"log_id": "b"}])  # entry '1' landed: must not raise
-    assert sink.failed == 1
+    # Since SPEC-074 FR-002 a reply naming one Id twice adjudicates none of the chunk: both
+    # entries are counted once, as an upper bound, and nothing is resent.
+    assert sink.failed == 2
 
 
 # --- FR-004: the contract is reachable from where a caller reads it -------------------------

@@ -233,10 +233,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
-    "sinks/sqs.py": {"SQSSink": ("emit", "_chunks")},
-    "sinks/kinesis.py": {"KinesisSink": ("emit", "_records")},
-    "sinks/firehose.py": {"FirehoseSink": ("emit", "_records")},
-    "sinks/sns.py": {"SNSSink": ("emit", "_bodies")},
     "sinks/mongodb.py": {"MongoDBSink": ("emit", "_documents")},
     "sinks/eventhubs.py": {"AzureEventHubsSink": ("emit", "_send_batch")},
     "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
@@ -256,7 +252,9 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
 """The functions in each site that decide a per-event drop, by module, class and name.
 
 SPEC-058 listed the first five modules, SPEC-059 the next ten, and SPEC-069 the rest, each of
-whose ``emit`` enters a ``Deferral`` for its encode step. SPEC-073 took ``sinks/http.py`` off the
+whose ``emit`` enters a ``Deferral`` for its encode step. SPEC-074 takes each sink it puts on the
+delivery engine off the list, as SPEC-073 took ``sinks/http.py``: its drops register on the run
+context ``SETTLED``, and its counts commit in ``_engine._run``'s one ``Deferral``. SPEC-073 took ``sinks/http.py`` off the
 list: ``HTTPSink`` counts through the delivery engine's run context, whose one commit is
 ``_engine._commit``, listed below, and whose ``SETTLED`` rule for a dropped counter
 :func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it. ``SocketTransport`` is the one
@@ -273,10 +271,6 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("SQSSink", "_send"): frozenset({"failed"}),
-    ("KinesisSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
-    ("FirehoseSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
-    ("SNSSink", "_send"): frozenset({"failed"}),
     ("MongoDBSink", "emit"): frozenset({"failed"}),
     ("AzureEventHubsSink", "_send"): frozenset({"failed"}),
     ("SocketTransport", "_send_one"): frozenset({"failed"}),
@@ -316,13 +310,6 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``SQSSink._send`` / ``failed``: entries failed past the bound and sender faults, counted as they
-  happen, before ``emit`` can raise; the same upper bound, the same *Out of Scope* clause.
-- ``KinesisSink._send`` and ``FirehoseSink._send`` / ``failed``, ``dropped_unadjudicated``:
-  records failed past the bound, and records in a chunk whose response could not be paired to
-  them, which ``losses()`` folds into ``failed``; an upper bound SPEC-059 does not recount.
-- ``SNSSink._send`` / ``failed``: entries failed past the bound and, since SPEC-070, sender
-  faults, counted as they happen; the same upper bound.
 - ``MongoDBSink.emit`` / ``failed``: rejected documents and connection errors past the bound; the
   same upper bound.
 - ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper
@@ -1472,7 +1459,6 @@ DROPPED_FLOOR = frozenset(
     {
         "dropped_oversized",
         "_unrenderable",
-        "_id_failed",
         "rejected",
         "_dropped",
         "_unencodable",
@@ -1481,7 +1467,10 @@ DROPPED_FLOOR = frozenset(
 )
 """Counters the derivation must find over the tree; a floor, not the set.
 
-A new counter needs no edit here, because the set is derived. What the floor catches is the
+A new counter needs no edit here, because the set is derived. ``_id_failed`` left it with
+SPEC-074, which deleted ``SQSSink``'s counter: an id-callable drop is a ``DROPPED`` outcome the
+engine commits in ``dropped_events`` only when a run settles, which this floor still names and
+:func:`run_context_count_findings` and the engine's own tests guard. What the floor catches is the
 opposite drift: a refactor that blinds :func:`dropped_counters` — a renamed helper, a call it no
 longer recognises — would otherwise shrink the guard as silently as a deletion.
 """

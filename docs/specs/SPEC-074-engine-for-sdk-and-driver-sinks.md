@@ -291,7 +291,9 @@ once per raised publish per `emit` call, which a count of each event once per ru
       after a round that landed some events settles, counts the refused events `failed_events` once
       and writes one line.
 - [ ] A round returning all `RETRYABLE` for three events, marked `sink_counted({0, 1, 2})` and
-      registering `count(sink, "failed", 1, when=ALWAYS)` with one line, three rounds under
+      registering `count(sink.log_foundry_counters, "failed_events", 1, when=ALWAYS)` with one line
+      (never `count(sink, "failed", …)`: the commit holds the counters' lock, and the `failed`
+      setter takes it, so that count would deadlock), three rounds under
       `Worker(max_retries=2)`: `.failed == 3`, three lines then the worker's abandon line,
       `failed_batches == 1`; the same round followed by an `ACCEPTED` round leaves `.failed == 1`
       and one line; marking an index whose outcome is `REJECTED` fails the run as an escaped
@@ -375,11 +377,17 @@ from step 1:
    meaning.
 5. **SQS FIFO keeps message-group order.** SQS documents ordering within a message group as a FIFO
    guarantee, and 1.x kept it for as long as its loop retried a chunk, `max_retries + 1` sends, before
-   moving on. So in a FIFO round an event of group *g* is held (`RETRYABLE`, not sent) while an
-   earlier event of *g* has neither landed nor yet been sent `max_retries + 1` times, and the later
-   chunks are sent without the held events. The send counts are kept in `notes(self)`. No other sink
-   here promises an order across chunks (Kinesis `PutRecords` promises none across records), so
-   none holds anything.
+   moving on. The hold is decided **per chunk at send time**, from this run's replies so far: an event
+   of group *g* is held (`RETRYABLE`, not sent) only when an earlier event of *g* was sent in an
+   earlier round, or in an earlier chunk of this round, and has neither landed nor used up its
+   `max_retries + 1` sends (this round's send of it counted), or when that earlier event is itself
+   held. Same-group events not yet sent travel together in one chunk, as 1.x sent them, so a healthy
+   one-group batch is one call. A held event never sent when the run ends is counted `failed` with
+   the line `SQSSink, 0 attempt(s), held behind an earlier message of its FIFO group` (reading (a),
+   Andrew's call pending; the decision is one function, `sqs._hold`, so reading (b) — send held
+   events in the run's last round, after the predecessor's final send — is a contained change). The
+   send counts are kept in `notes(self)`. No other sink here promises an order across chunks
+   (Kinesis `PutRecords` promises none across records), so none holds anything.
 
 **SQS's chunker changes signature.** SPEC-071 FR-004 kept `_chunks(batch, pending)`, handing its
 drops to the caller's `Deferral`, which this spec removes from `SQSSink`. It becomes
@@ -387,8 +395,8 @@ drops to the caller's `Deferral`, which this spec removes from `SQSSink`. It bec
 `chunk_items`, still a list, every drop decided before the first send), `dropped: dict[int, str]`
 (each dropped position of the round's batch and its reason: oversize, id failure or unencodable) and
 `refused: Exception | None` (the first id callable's exception, set only when every event's id
-callable raised). `_Prepared` gains `index`, the event's position, so each chunk's outcomes map back
-to the verdict. `_chunks` counts and announces nothing; `deliver` turns `dropped` into `DROPPED`
+callable raised). `_Prepared` gains `position`, the event's position (named so rather than `index`,
+which would shadow `tuple.index`), so each chunk's outcomes map back to the verdict. `_chunks` counts and announces nothing; `deliver` turns `dropped` into `DROPPED`
 outcomes, writing the oversize and id-failure lines (`encode_round` registered the unencodable
 one), and `refused` into the refusal. SPEC-071's boundary corpus,
 `tests/test_sinks_sqs_chunks.py`, is kept and re-pointed at the new signature with the same cases
@@ -402,8 +410,12 @@ prepared entry (body, `MessageGroupId`, `MessageDeduplicationId` and costed size
 in `run_context().notes(self)`, keyed by event identity beside the wire forms `encode_round` keeps:
 the id callables and the random fallback run **once per event per run**, and every round of one run
 resends the identical entry. A round's `_Plan` is assembled from that cache: its chunks are re-formed
-over the events the round still holds, and each `_Prepared.index` is the event's position in that
-round's batch, so only the grouping and the index are per round.
+over the events the round still holds, and each `_Prepared.position` is the event's position in that
+round's batch, so only the grouping and the position are per round. An event identity that appears
+twice in a batch keeps one entry per occurrence, and a round hands an occurrence the first cached
+entry of its identity not yet accepted, so a resend never reuses an id of an occurrence that landed;
+each entry's batch `Id` is kept across the run's rounds too, as 1.x's loop kept it, and replaced only
+when it would clash within one call.
 
 The run's raise-or-return then is the engine's, and it is 1.x's: SQS raised exactly when nothing
 landed and a retryable loss remained; Kinesis and Firehose when nothing landed and nothing was
@@ -433,7 +445,7 @@ unadjudicated; SNS (with SPEC-070) as SQS.
       and no *A* event reaches the client before an earlier *A* event; a standard queue sends chunk 2
       whole in round one. With *A*'s chunk-1 event failing on every attempt and `max_retries=3`, the
       later *A* events are first sent in the round of its fourth send and land, as 1.x sent them
-      after abandoning it.
+      after abandoning it. A one-group FIFO batch on a healthy client is one call.
 - [ ] Kinesis and Firehose: a response whose `Records` length disagrees is counted
       `.dropped_unadjudicated` and in `losses().failed`, `.failed` excludes it, it is never resent,
       and the 1.x line text is unchanged.
@@ -453,8 +465,8 @@ unadjudicated; SNS (with SPEC-070) as SQS.
       else: no client call, `deliver` called once, the run settles, `losses().dropped == 2`,
       `.failed` unchanged, `emit` returns, and through `Worker(max_retries=2)` `failed_batches == 0`.
 - [ ] SQS FIFO ids once per run: over a client that fails one entry retryably twice and then
-      accepts it, with counting `group_id` and `dedup_id` callables (the latter returning `None`
-      for one event, so the random fallback runs), each callable is called once per event in the
+      accepts it, with counting `group_id` and `dedup_id` callables (the latter returning a blank
+      string for one event, so the random fallback runs; a `None` is an id failure), each callable is called once per event in the
       run, and every resend of the failed entry carries the same `MessageDeduplicationId` and
       `MessageGroupId` as its first send. A mutant that resolves ids per round reddens both the call
       count and the id equality.
@@ -727,7 +739,9 @@ reason: `HTTPSink`'s family (SPEC-073); SPEC-075 adds `FilteringSink`, `Transfor
 `_RedisSink`, `RabbitMQSink`, `AzureEventHubsSink`, `NATSSink`, `SocketTransport` and `SyslogSink`:
 thirteen. Each holds `log_foundry_counters` as an instance attribute holding a `SinkCounters`,
 returns `self.log_foundry_counters.losses()` from `losses()`, makes no call to `sinks._retry.wait`,
-and writes a counter only through the run context or the `.failed` setter. Each but
+and writes a counter only through the run context or the `.failed` setter, and none registers a count against `failed`, whose setter
+takes the counters' lock the commit already holds; a failed-event count is registered against
+`log_foundry_counters` as `failed_events`. Each but
 `SocketTransport` defines **`def emit(self, batch)` whose body is the one call
 `emit_via_deliver(self, batch)`** on the class that defines `deliver`, a function rather than an
 assignment so that every AST roster keyed on a `def emit` keeps finding it. `_id_failed` and, on these
@@ -885,7 +899,7 @@ def encode_round(owner: object, batch: list[dict[str, object]],
     # SPEC-069's line registered once per run with announce(..., when=SETTLED)
 
 # src/log_foundry/sinks/sqs.py
-class _Prepared(NamedTuple): index: int; body: str; group_id: str | None; dedup_id: str | None; size: int
+class _Prepared(NamedTuple): position: int; body: str; group_id: str | None; dedup_id: str | None; size: int
 class _Plan(NamedTuple):
     chunks: list[list[_Prepared]]
     dropped: dict[int, str]                  # position -> oversize | id failure | unencodable
@@ -1041,3 +1055,4 @@ other site still stating the old claim:
 - 2026-11-05, drift review: the NATS mapping gives a publish abandoned at the deadline (JetStream or an injected client) `UNKNOWN`, never resent, and names the abandoned-publish latch `_refuse_while_stuck` as a `RETRYABLE` refusal round, which keeps 1.x's worker retry of the refused batch.
 - 2026-11-05, the additive rule restored on SPEC-061's code: a NATS round in which nothing was published is `RETRYABLE` throughout, so the worker resends it `w + 1` times as 1.x does and `docs/invariants.md` 2's JetStream asymmetry stays true unrewritten; a publish that raised or an event left unattempted beside a publish that landed is `REJECTED`, counted in `failed` and never resent, as 1.x. The reason that argued for one attempt is replaced by the additive rule, and the Overview's release-notes line no longer names NATS.
 - 2026-11-05, execution-frame review: a NATS round with nothing published now registers 1.x's own counts and lines `ALWAYS` (one per raised publish, none for an unattempted event) and marks its `RETRYABLE` events `sink_counted`, a fourth run-context addition, so the engine adds no count; a differential matrix criterion holds every NATS case to values recorded by running 1.x at `93113e1b`, replacing the two hand-written NATS criteria.
+- 2026-11-08, build (plan review B1, M1, M2): the SQS FIFO hold is decided per chunk at send time, so same-group events never sent travel together and a healthy one-group batch is one call; a held event never sent is counted with a `0 attempt(s), held behind …` line (reading (a), pending Andrew's call); a repeated event identity keeps one cached entry per occurrence and entry `Id`s persist across rounds; a sink-counted loss is registered as `failed_events` on `log_foundry_counters`, never against the `failed` setter; `_Prepared.index` is `position`; the dedup-callable criterion's fallback case returns a blank string.

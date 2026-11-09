@@ -17,9 +17,8 @@ from log_foundry.sinks.sqs import DEFAULT_GROUP_ID, MAX_ID_LEN, SQSSink
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize backoff sleeps (SPEC-027 FR-003 gave SQSSink one) so retry tests run instantly."""
-    # ``wait`` is bound into each sink at import, and its Event branch never reaches
-    # ``time.sleep`` — patching either centrally would leave this fixture inert.
-    monkeypatch.setattr("log_foundry.sinks.sqs.wait", lambda _delay, _stop=None: None)
+    # Since SPEC-074 the engine waits between rounds, through ``_retry.wait`` by attribute.
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 FIFO_URL = "https://sqs.example/q.fifo"
 STD_URL = "https://sqs.example/q"

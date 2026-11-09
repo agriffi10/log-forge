@@ -30,8 +30,15 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
+from log_foundry.sinks import _engine
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_bson, repair_nul
+from log_foundry.sinks._encode import (
+    NUL_ESCAPE,
+    encode_events,
+    encode_round,
+    repair_bson,
+    repair_nul,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -179,12 +186,16 @@ def derive(
     From the resolved ``emit`` it follows every call it can resolve into a function whose module
     starts with one of ``owned``: ``self.<m>(...)`` through the class's MRO, a bare name or a
     ``module.attr`` through the calling function's globals. A call whose callee resolves to
-    ``json.dumps`` — however it was imported — is a hit. A call to ``encode_events`` has its
-    ``encode`` argument resolved the same way and walked as *guarded*; every other reach is
-    *unguarded*. A callable passed as a ``deliver=`` keyword is followed as a call too, since
+    ``json.dumps`` — however it was imported — is a hit. A call to ``encode_events``, or to its
+    engine-mode sibling ``encode_round`` (SPEC-074), has its ``encode`` argument resolved the same
+    way and walked as *guarded*; every other reach is *unguarded*. A callable passed as a
+    ``deliver=`` keyword is followed as a call too, since
     ``emit_via_deliver(self, batch, deliver=self._round)`` is how an engine sink's ``emit`` reaches
-    its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. It does not follow any other
-    callable passed uncalled, a property, or a call through another object.
+    its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. So are the two other routes an
+    engine sink's ``emit`` takes (SPEC-074): ``emit_via_deliver(self, batch)`` with no
+    ``deliver=`` reaches the class's own ``deliver``, and ``_engine.one_round(self._round, batch)``
+    its round. It does not follow any other callable passed uncalled, a property, or a call
+    through another object.
     """
     roster = Roster()
     for cls in classes:
@@ -211,10 +222,11 @@ def derive(
                 callee = _resolve(node.func, fn, cls)
                 if callee is json.dumps:
                     hits.append((fn.__qualname__, guarded))
-                elif callee is encode_events:
+                elif callee is encode_events or callee is encode_round:
+                    at = 1 if callee is encode_events else 2
                     arg = (
-                        node.args[1]
-                        if len(node.args) > 1
+                        node.args[at]
+                        if len(node.args) > at
                         else next((k.value for k in node.keywords if k.arg == "encode"), None)
                     )
                     target = _resolve(arg, fn, cls) if arg is not None else None
@@ -226,8 +238,22 @@ def derive(
                             f"{cls.__module__}: {cls.__qualname__}.emit hands encode_events an "
                             f"encode argument the roster cannot resolve: {shown}"
                         )
+                elif callee is _engine.one_round and node.args:
+                    handed = _resolve(node.args[0], fn, cls)
+                    if inspect.isfunction(handed):
+                        stack.append((handed, guarded))
                 elif inspect.isfunction(callee) and (callee.__module__ or "").startswith(owned):
                     stack.append((callee, guarded))
+                    own_deliver = inspect.getattr_static(cls, "deliver", None)
+                    if (
+                        callee is _engine.emit_via_deliver
+                        and node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id == "self"
+                        and not any(k.arg == "deliver" for k in node.keywords)
+                        and inspect.isfunction(own_deliver)
+                    ):
+                        stack.append((own_deliver, guarded))
                 for keyword in node.keywords:
                     if keyword.arg != "deliver":
                         continue

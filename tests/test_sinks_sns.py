@@ -17,7 +17,7 @@ def _no_backoff(monkeypatch):
     ``wait`` is bound into each sink at import, and its Event branch never reaches ``time.sleep``
     — patching either centrally would leave this fixture inert.
     """
-    monkeypatch.setattr("log_foundry.sinks.sns.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 class FakeSNS:
@@ -194,7 +194,9 @@ class _FaultingSNS:
 def test_a_sender_fault_is_sent_once_counted_and_named(monkeypatch, capsys) -> None:
     """FR-003 AC-1: one call, ``failed`` up by the entry count, one ``not retried`` line."""
     waits: list[float] = []
-    monkeypatch.setattr("log_foundry.sinks.sns.wait", lambda delay, stop=None: waits.append(delay))
+    monkeypatch.setattr(
+        "log_foundry.sinks._retry.wait", lambda delay, stop=None: waits.append(delay)
+    )
     client = _FaultingSNS({"0": True, "1": True})
     sink = SNSSink("arn", client=client, max_retries=3)
 

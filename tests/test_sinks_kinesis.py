@@ -20,7 +20,7 @@ def _no_backoff(monkeypatch):
     ``wait`` is bound into each sink at import, and its Event branch never reaches ``time.sleep``
     — patching either centrally would leave this fixture inert.
     """
-    monkeypatch.setattr("log_foundry.sinks.kinesis.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 class FakeKinesis:

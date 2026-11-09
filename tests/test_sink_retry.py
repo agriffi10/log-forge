@@ -10,6 +10,8 @@ import decimal
 import fractions
 import json
 import math
+import pathlib
+import sys
 import threading
 import time
 
@@ -320,65 +322,79 @@ def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
     assert missing == [], f"retry loops with no interruptible wait: {missing}"
 
 
-_RETRY_MODULES_AT_BASE = frozenset(
-    {
-        "_socket",
-        "clickhouse",
-        "eventhubs",
-        "firehose",
-        "http",
-        "kinesis",
-        "mongodb",
-        "postgres",
-        "rabbitmq",
-        "redis",
-        "sns",
-        "sqs",
-    }
+_NOT_YET_CONVERTED = frozenset(
+    {"_socket", "clickhouse", "eventhubs", "mongodb", "postgres", "rabbitmq", "redis"}
 )
-"""The twelve modules :func:`_modules_with_a_retry_loop` derived at SPEC-073's base (``c4e51fbd``)."""
+"""SPEC-074's transitional set: the modules whose retry loop a later phase of its build deletes.
+
+Each phase removes the modules it puts on the engine, so the set shrinks visibly and exactly; it
+was SPEC-073's eleven (``_RETRY_MODULES_AT_BASE`` less ``http``) and is deleted, empty, with the
+build's last phase.
+"""
+
+WAIT_EXCLUSIONS: dict[str, str] = {
+    "_engine": "the delivery engine, the one module that waits between delivery rounds",
+    "_retry": "defines wait itself",
+    "pubsub": "waits on its own futures while resolving them, which is not a retry backoff",
+}
+"""The modules :func:`_waiting_modules` may find, each with its reason (SPEC-074 FR-006)."""
 
 
-def test_the_retry_loop_modules_are_the_base_set_less_http() -> None:
-    """SPEC-073 FR-005: ``http`` leaving the derived set is asserted, never silent.
+def _waiting_modules(root: pathlib.Path) -> set[str]:
+    """Every module under ``root`` that calls ``wait`` or assigns a backoff constant.
 
-    The HTTP family's retries moved onto the delivery engine, so ``http.py`` holds no re-send
-    loop; a derivation that shrank for any other reason, or a loop restored there, reddens here.
-    """
-    assert set(_modules_with_a_retry_loop()) == _RETRY_MODULES_AT_BASE - {"http"}
-
-
-def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
-    """SPEC-073 FR-005: the engine's round loop joins the check that a retry loop waits idly.
-
-    ``_engine._run``'s ``while`` loop is the one resend loop for every sink on the engine; it
-    waits through ``_wait``, which calls ``_retry.wait`` on the stop event.
+    A call to the bare name ``wait`` or to ``_retry.wait``, and an assignment to a name ending in
+    ``BACKOFF_BASE``. ``threading.Event.wait`` on an attribute (``self._stop.wait``) is not a call
+    to the shared helper and is not counted.
     """
     import ast
-    import pathlib as _pathlib
 
+    found: set[str] = set()
+    for path in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            calls_wait = isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "wait")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "wait"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_retry"
+                )
+            )
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            backs_off = any(
+                isinstance(target, ast.Name) and target.id.endswith("BACKOFF_BASE")
+                for target in targets
+            )
+            if calls_wait or backs_off:
+                found.add(path.stem)
+                break
+    return found
+
+
+def test_the_retry_loop_modules_are_the_unconverted_set() -> None:
+    """SPEC-073 FR-005 and SPEC-074: a module leaving the derived set is asserted, never silent.
+
+    ``http`` left with SPEC-073, and each SPEC-074 phase takes its modules out; a derivation
+    that shrank for any other reason, or a loop restored, reddens here.
+    """
+    assert set(_modules_with_a_retry_loop()) == _NOT_YET_CONVERTED
+
+
+def test_only_the_engine_waits_or_backs_off() -> None:
+    """SPEC-074 FR-006: no sinks module but the named exclusions waits or holds a backoff."""
     import log_foundry
 
-    tree = ast.parse(
-        (_pathlib.Path(log_foundry.__file__).parent / "sinks" / "_engine.py").read_text()
-    )
-    functions = {
-        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
-    }
-    loops = [node for node in ast.walk(functions["_run"]) if isinstance(node, ast.While)]
-    assert len(loops) == 1, "the engine has one round loop"
-    assert any(
-        isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id == "_wait"
-        for call in ast.walk(loops[0])
-    ), "the round loop waits through _wait"
-    assert any(
-        isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "wait"
-        and isinstance(call.func.value, ast.Name)
-        and call.func.value.id == "_retry"
-        for call in ast.walk(functions["_wait"])
-    ), "and _wait waits through _retry.wait"
+    root = pathlib.Path(log_foundry.__file__).parent / "sinks"
+    found = _waiting_modules(root)
+    assert set(WAIT_EXCLUSIONS) <= found | {"_retry"}, "an exclusion no longer waits: drop it"
+    assert found - set(WAIT_EXCLUSIONS) == _NOT_YET_CONVERTED
 
 
 def test_every_module_with_a_retry_loop_declares_a_stop_signal() -> None:
@@ -595,17 +611,17 @@ def test_a_sender_fault_is_abandoned_with_no_backoff_first(monkeypatch) -> None:
 
 
 def test_the_sqs_backoff_is_interruptible() -> None:
-    import log_foundry.sinks.sqs as sqs_mod
+    from log_foundry.sinks import _engine
     from log_foundry.sinks.sqs import SQSSink
     from test_sinks_sqs_fifo import FaultingClient
 
-    original = sqs_mod._BACKOFF_BASE
-    sqs_mod._BACKOFF_BASE = 20.0
+    original = _engine.BACKOFF_BASE
+    _engine.BACKOFF_BASE = 20.0  # type: ignore[misc]
     try:
         sink = SQSSink("https://q/x", client=FaultingClient(sender_fault=False), max_retries=3)
         assert _drain_one(sink) < 6.0
     finally:
-        sqs_mod._BACKOFF_BASE = original
+        _engine.BACKOFF_BASE = original  # type: ignore[misc]
 
 
 def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> None:
@@ -924,7 +940,11 @@ def _delays_for(sink, batch, monkeypatch) -> list[float]:
     """Record the delays a sink waits between attempts, without waiting them."""
     module = type(sink).__module__
     slept: list[float] = []
-    monkeypatch.setattr(f"{module}.wait", lambda delay, _stop=None: slept.append(delay))
+    if hasattr(sys.modules[module], "wait"):
+        monkeypatch.setattr(f"{module}.wait", lambda delay, _stop=None: slept.append(delay))
+    monkeypatch.setattr(
+        "log_foundry.sinks._retry.wait", lambda delay, _stop=None: slept.append(delay)
+    )
     try:
         sink.emit(batch)
     except Exception:  # SPEC-026's raise; this test is about the waits

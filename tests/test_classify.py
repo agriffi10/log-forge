@@ -332,10 +332,101 @@ def retry_loop_findings(
     return loops, findings
 
 
+ENGINE_EXCLUSIONS: dict[str, str] = {
+    "HTTPSink": "its classification is SPEC-073's, held by http_engine_findings",
+    "NATSSink": "declares no predicate (SPEC-070); a publish that raised takes FR-004's outcome",
+    "SyslogSink": "forwards deliver to its SocketTransport, which is judged instead",
+    "FilteringSink": "SPEC-075's wrapper, named for when it gains deliver",
+    "TransformSink": "SPEC-075's wrapper, named for when it gains deliver",
+    "LogstashSink": "SPEC-075's wrapper, named for when it gains deliver",
+}
+"""Classes defining ``deliver`` that the restated loop roster passes over, each with its reason."""
+
+
+def _self_attr(node: ast.AST) -> str | None:
+    """The name of a ``self.<name>`` attribute, else ``None``."""
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return node.attr
+    return None
+
+
+def engine_round_findings(
+    root: Path, exclusions: dict[str, str] = ENGINE_EXCLUSIONS
+) -> tuple[list[str], list[str]]:
+    """Every engine round under ``root`` and every way one fails SPEC-074 FR-006's restatement.
+
+    The population is each class defining ``deliver`` in its body, less ``exclusions``. The rule
+    is SPEC-070 FR-001's, moved from the loop to the round: the class defines ``_retryable_error``
+    in its own body; some ``except`` reached from ``deliver`` — through the same class's methods,
+    called or passed as ``self.<name>`` — names its exception and asks
+    ``is_retryable(self._retryable_error, <that name>)``; and nothing there calls
+    ``self._retryable_error(...)`` directly, which bypasses the wrapper that makes it total.
+    """
+    owners: list[str] = []
+    findings: list[str] = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            methods = {
+                m.name: m
+                for m in node.body
+                if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+            }
+            if "deliver" not in methods or node.name in exclusions:
+                continue
+            owners.append(node.name)
+            where = f"{path.name}:{node.lineno} {node.name}"
+            if "_retryable_error" not in methods:
+                findings.append(f"{where}: the class defines no _retryable_error")
+            reached: list[ast.AST] = []
+            stack = ["deliver"]
+            seen: set[str] = set()
+            while stack:
+                name = stack.pop()
+                if name in seen or name not in methods:
+                    continue
+                seen.add(name)
+                reached.append(methods[name])
+                stack.extend(
+                    attr for sub in ast.walk(methods[name]) if (attr := _self_attr(sub)) in methods
+                )
+            handlers = [
+                h
+                for fn in reached
+                for t in ast.walk(fn)
+                if isinstance(t, ast.Try)
+                for h in t.handlers
+            ]
+            if not any(h.name is not None and _asks_the_predicate(h) for h in handlers):
+                findings.append(
+                    f"{where}: no handler of its round asks is_retryable(self._retryable_error, err)"
+                )
+            if any(
+                isinstance(sub, ast.Call) and _self_attr(sub.func) == "_retryable_error"
+                for fn in reached
+                for sub in ast.walk(fn)
+            ):
+                findings.append(
+                    f"{where}: its round calls self._retryable_error directly, bypassing is_retryable"
+                )
+    return owners, findings
+
+
 def test_every_retry_loop_asks_its_sinks_predicate() -> None:
-    """FR-001 AC-10, over the shipped tree."""
-    _, findings = retry_loop_findings(_SINKS)
-    assert findings == []
+    """FR-001 AC-10, over the shipped tree, and SPEC-074 FR-006's restatement over the rounds.
+
+    The floor counts loops and engine rounds together, so the population stays the eleven while
+    SPEC-074 moves each class from a loop to a round.
+    """
+    engine, engine_findings = engine_round_findings(_SINKS)
+    _, findings = retry_loop_findings(_SINKS, floor=_LOOP_FLOOR - len(engine))
+    assert findings + engine_findings == []
 
 
 _CORPUS_HEAD = '"""A fixture sink module."""\n\nfrom x import is_retryable\n\n'
@@ -635,7 +726,9 @@ def _rig(name: str) -> Callable[[pytest.MonkeyPatch, Path, int], _Built]:
         setattr(owner, attr, retries)
         waits: list[float] = []
         module = sys.modules[type(owner).__module__]
-        mp.setattr(module, "wait", lambda delay, stop=None: waits.append(delay))
+        if hasattr(module, "wait"):
+            mp.setattr(module, "wait", lambda delay, stop=None: waits.append(delay))
+        mp.setattr("log_foundry.sinks._retry.wait", lambda delay, stop=None: waits.append(delay))
 
         def set_error(error: BaseException) -> None:
             rig.state.error = error
@@ -662,8 +755,9 @@ _LOOPS: dict[str, Callable[[pytest.MonkeyPatch, Path, int], _Built]] = {
 
 
 def test_the_sweep_covers_every_retry_loop_the_roster_finds() -> None:
-    loops, _ = retry_loop_findings(_SINKS)
-    assert {loop.owner for loop in loops} == set(_LOOPS)
+    loops, _ = retry_loop_findings(_SINKS, floor=0)
+    engine, _ = engine_round_findings(_SINKS)
+    assert {loop.owner for loop in loops} | set(engine) == set(_LOOPS)
 
 
 _EVENTS = [{"log_id": "a", "level": "INFO", "message": "one"}]
@@ -1377,7 +1471,9 @@ def _stream_sink(stream: _Stream, replies: list[Any], monkeypatch) -> tuple[Any,
     client = _Scripted(replies)
     cls = KinesisSink if stream.loop == "KinesisSink" else FirehoseSink
     sink = cls("s", client=client, max_retries=1)
-    monkeypatch.setattr(sys.modules[cls.__module__], "wait", lambda *_a, **_k: None)
+    if hasattr(sys.modules[cls.__module__], "wait"):
+        monkeypatch.setattr(sys.modules[cls.__module__], "wait", lambda *_a, **_k: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda *_a, **_k: None)
     return sink, client
 
 
@@ -1574,7 +1670,9 @@ def _queue_sink(kind: str, client: _Rejecting, monkeypatch) -> Any:
         if kind == "SQSSink"
         else SNSSink("arn", client=client, max_retries=3)
     )
-    monkeypatch.setattr(sys.modules[type(sink).__module__], "wait", lambda *_a, **_k: None)
+    if hasattr(sys.modules[type(sink).__module__], "wait"):
+        monkeypatch.setattr(sys.modules[type(sink).__module__], "wait", lambda *_a, **_k: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda *_a, **_k: None)
     return sink
 
 

@@ -13,6 +13,7 @@ every send; *once* fails the first and serves the second.
 
 from __future__ import annotations
 
+import importlib
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -48,7 +49,9 @@ _MODULES = ("kinesis", "firehose", "sns", "mongodb", "eventhubs")
 def _no_backoff(monkeypatch) -> None:
     """Every sink's retry wait is a no-op, and Event Hubs packs raw bytes (no azure dependency)."""
     for module in _MODULES:
-        monkeypatch.setattr(f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None)
+        if hasattr(importlib.import_module(f"log_foundry.sinks.{module}"), "wait"):
+            monkeypatch.setattr(f"log_foundry.sinks.{module}.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
     monkeypatch.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body)
 
 

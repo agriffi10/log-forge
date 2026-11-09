@@ -727,6 +727,16 @@ GAINED_LOSSES = frozenset(
     {"StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "SQLiteSink"}
 )
 
+ENGINE_GAINED: dict[str, frozenset[str]] = {
+    name: frozenset({"deliver", "log_foundry_counters"})
+    for name in ("SQSSink", "SNSSink", "KinesisSink", "FirehoseSink")
+}
+"""SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
+
+``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
+(invariant 10), so a name appearing beyond these is still a finding.
+"""
+
 
 def _public(obj: object) -> set[str]:
     names = set(dir(type(obj))) | set(vars(obj))
@@ -749,7 +759,11 @@ def test_the_public_surface_grows_only_by_five_losses(
             seen["SocketTransport"] = _public(rig.sink._socket)
     assert set(seen) == set(BASE_PUBLIC)
     for name, names in seen.items():
-        expected = BASE_PUBLIC[name] | ({"losses"} if name in GAINED_LOSSES else set())
+        expected = (
+            BASE_PUBLIC[name]
+            | ({"losses"} if name in GAINED_LOSSES else set())
+            | ENGINE_GAINED.get(name, frozenset())
+        )
         assert names == expected, (name, sorted(names ^ expected))
 
 
