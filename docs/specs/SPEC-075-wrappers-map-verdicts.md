@@ -295,12 +295,15 @@ failure in the wrapper's `_dropped`, only when the batch did not fail, and repor
 wrapper's unchanged `losses()`. If the wrapper returned `DROPPED`, the engine would commit a
 `dropped_events` total into the shared counters. That total is part of a SPEC-074 sink's
 `losses()`, which the wrapper's `losses()` already adds to its own `_dropped`, so the event would be
-counted twice. So the verdict says `SKIPPED`, which the engine counts nowhere and never resends, and
-which counts as accepted no more than `DROPPED` does. The wrapper registers
+counted twice. So the verdict says `SKIPPED`, which the engine never resends and counts nowhere — except
+in a round it fails as raising (the inner `deliver` raised, or its marks did not fit), where
+SPEC-072's raising-round upper bound counts every event of the round in the shared `failed_events`,
+the wrapper's `SKIPPED` ones included — and which counts as accepted no more than `DROPPED` does. The wrapper registers
 `run_context().count(self, "_dropped", n, when=SETTLED)`, which SPEC-073's run context commits into
 the wrapper, under its own `_counter_lock`, only if the run settles. That is SPEC-058's count, at
-SPEC-058's moment. A declined event is `SKIPPED` with no count, as the wrappers' `losses()`
-docstrings say a declined event is not loss. Neither kind counts as accepted, so with a destination
+SPEC-058's moment. A declined event is `SKIPPED` with no count of the wrapper's, as the wrappers'
+`losses()` docstrings say a declined event is not loss; the raising-round bound above is the
+engine's one exception. Neither kind counts as accepted, so with a destination
 that fails every call a batch holding either still fails (invariant 7).
 
 **An all-failed batch fails at once, and no sink counts it.** This is the arc's one rule for caller
@@ -330,7 +333,8 @@ The wrapper reads `retry_after` only from a verdict that `outcomes_of` accepted,
 fail a run that the bare inner sink's run settles. When the inner verdict is malformed, every count,
 line and mark the inner call registered is discarded, as the engine discards them for the bare
 sink's round it sets aside, while the wrapper's own registrations, made before the call, stay; the
-forwarded events are `UNKNOWN`, and the engine announces them. When nothing is forwarded the inner
+forwarded events are `UNKNOWN`, and the engine announces them. A direct `deliver` outside any run
+sets nothing aside, since the engine's detached round never does for the bare sink either. When nothing is forwarded the inner
 sink is not called. `deliver([])` returns an empty verdict.
 
 **The inner sink's marks are moved into the wrapper's positions.** SPEC-074 lets a round mark
@@ -370,9 +374,10 @@ count is the run-context registration above, and its only other run-context call
 all-failed call. It announces a caller-code failure with one
 `_diag.absorbed` line per call, written at once. The line names the wrapper class, the first
 exception's type and how many events were not forwarded, and never a value. That line is true
-whether or not the run then settles. It is not registered with the run context, because a sink's
-registered line suppresses the engine's own settled line for the whole run (SPEC-073). That would
-leave a third-party inner sink's loss unannounced.
+whether or not the run then settles. It is not registered with the run context, because a round
+that registers a line owns the announcement of every loss its verdict decided (PR 319's per-round
+rule), so the engine would write no settled line for that round's losses. That would leave a
+third-party inner sink's loss unannounced.
 
 **The twin pair.** For a wrapper that offers `deliver`, its `deliver` and its `emit` are twins: the
 second runs whenever a caller or a `MultiSink` calls `emit`. On the same batch and the same inner
@@ -443,7 +448,8 @@ bound, and the two paths reach it by different counts.
       round and then returns a malformed verdict ends, through either wrapper, with its counters
       and stderr equal to the bare sink's apart from the sink's name — its own count and line
       discarded, the engine's settled line written — and the wrapper's own `_dropped` count for a
-      caller-code failure in that round survives.
+      caller-code failure in that round survives. A direct `deliver` of the same keeps the inner
+      sink's count and line through either wrapper, as the bare sink's detached round does.
 - [ ] A call with caller-code failures writes exactly one stderr line, which contains
       `absorbed a failure`, the wrapper's class name and the exception's type name, and does not
       contain the exception's message.
@@ -731,3 +737,7 @@ tests/
   decision for one engine run, as `TransformSink` keeps its results, so a resend never asks the
   predicate again (FR-002): a stateful predicate asked again declined its own resend and lost the
   event silently.
+- 2026-11-09, frame-2 review, the minor findings: the set-aside of a malformed inner round applies
+  only inside an engine run, as the detached round never sets one aside bare (FR-002); the line
+  rule is PR 319's per-round ownership, not a whole-run suppression; a `SKIPPED` event is counted
+  nowhere except under SPEC-072's raising-round upper bound.

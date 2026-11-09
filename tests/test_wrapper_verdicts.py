@@ -1131,6 +1131,23 @@ def test_what_a_malformed_inner_round_registered_is_set_aside_as_bare(
     ]
 
 
+@pytest.mark.parametrize("kind", ["bare", *KINDS])
+def test_a_direct_deliver_keeps_what_a_malformed_inner_round_registered_as_bare(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Frame-2 review: outside a run nothing is set aside, bare or wrapped.
+
+    A direct ``deliver`` is a detached round, and ``detached`` never sets an unreadable round
+    aside, so the bare sink's count and line commit; through a wrapper they commit too.
+    """
+    inner = _RegistersThenMalformed()
+    sink = inner if kind == "bare" else wrap(kind, inner)
+    sink.deliver(events(2))
+    assert inner._x == 2
+    written = lines(capsys.readouterr().err)
+    assert len(written) == 1 and "inner line" in written[0], written
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_the_set_aside_keeps_the_wrappers_own_count(
     kind: str, capsys: pytest.CaptureFixture[str]
@@ -1254,13 +1271,18 @@ _NESTED = {"emit", "run_delivery", "emit_via_deliver"}
 
 
 def nested_delivery_findings(source: str, cls_name: str) -> list[str]:
-    """Every call that would start a delivery of its own from inside a ``deliver``.
+    """Every reference that could start a delivery of its own from inside a ``deliver``.
 
     A round that called an inner ``emit`` — its own engine run, with its own line — and also
     reported those events in its verdict would announce them twice (PR 319's hand-over item 3),
     and FR-001 says the wrapper never calls ``run_delivery`` or ``emit`` on its inner sink from
-    ``deliver``. Any call to an attribute named ``emit``, or to ``run_delivery`` or
-    ``emit_via_deliver`` by any spelling, reachable from ``deliver`` is a finding.
+    ``deliver``. **What it checks:** in ``deliver`` and every method of the same class it reaches
+    through ``self.<name>`` (:func:`_reached`), any load of an attribute named ``emit``,
+    ``run_delivery`` or ``emit_via_deliver`` (called or not, so ``send = self._inner.emit``
+    counts), any load of a bare name ``run_delivery`` or ``emit_via_deliver``, and any
+    ``getattr`` call whose second argument is one of those names as a string constant. **What it
+    does not:** a module-level helper, a method of another class, or a name assembled at run
+    time; the walk is bounded to the class body on purpose.
     """
     cls = next(
         node
@@ -1270,12 +1292,28 @@ def nested_delivery_findings(source: str, cls_name: str) -> list[str]:
     findings = []
     for fn in _reached(cls):
         for node in ast.walk(fn):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-            if called in _NESTED:
-                findings.append(f"{cls_name}.{fn.name}:{node.lineno}: calls {ast.unparse(func)}")
+            where = f"{cls_name}.{fn.name}:{getattr(node, 'lineno', 0)}"
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and node.attr in _NESTED
+            ):
+                findings.append(f"{where}: loads {ast.unparse(node)}")
+            elif (
+                isinstance(node, ast.Name)
+                and isinstance(node.ctx, ast.Load)
+                and node.id in _NESTED - {"emit"}
+            ):
+                findings.append(f"{where}: loads {node.id}")
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "getattr"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in _NESTED
+            ):
+                findings.append(f"{where}: getattr names {node.args[1].value}")
     return findings
 
 
@@ -1289,13 +1327,31 @@ def test_no_deliver_starts_a_delivery_of_its_own(cls_name: str) -> None:
     assert nested_delivery_findings(source, cls_name) == []
 
 
-def test_the_nested_delivery_check_names_a_planted_inner_emit() -> None:
+_NESTED_PLANTS = {
+    "a direct inner emit": ("self._inner.emit(batch)", "loads self._inner.emit"),
+    "an aliased inner emit": ("send = self._inner.emit\nsend(batch)", "loads self._inner.emit"),
+    "a getattr emit": ('getattr(self._inner, "emit")(batch)', "getattr names emit"),
+    "the adapter by module": (
+        "_engine.emit_via_deliver(self._inner, batch)",
+        "loads _engine.emit_via_deliver",
+    ),
+    "a bare run_delivery": (
+        "run_delivery(self._inner, batch, worker_retries=0, stop=None)",
+        "loads run_delivery",
+    ),
+}
+
+
+@pytest.mark.parametrize("plant", sorted(_NESTED_PLANTS))
+def test_the_nested_delivery_check_names_each_planted_reference(plant: str) -> None:
+    """The check's own corpus: each plant in ``FilteringSink._round`` is named, by its reason."""
     source = (_SINKS / "filtering.py").read_text(encoding="utf-8")
     anchor = "        outcomes = [Outcome.SKIPPED] * len(batch)\n"
     assert source.count(anchor) == 1
-    planted = source.replace(anchor, "        self._inner.emit(batch)\n" + anchor)
-    findings = nested_delivery_findings(planted, "FilteringSink")
-    assert any("calls self._inner.emit" in f for f in findings), findings
+    line, reason = _NESTED_PLANTS[plant]
+    planted = "".join("        " + part + "\n" for part in line.split("\n"))
+    findings = nested_delivery_findings(source.replace(anchor, planted + anchor), "FilteringSink")
+    assert any(reason in f for f in findings), findings
 
 
 @pytest.mark.parametrize("cls_name", sorted(_WRAPPER_MODULES))

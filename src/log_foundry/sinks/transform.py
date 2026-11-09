@@ -288,23 +288,29 @@ class TransformSink:
         """Gives every event of the batch one outcome: its own decision, or the inner sink's.
 
         The 1.x per-event step runs first, each event under its own guard, through
-        :meth:`_round_step`: the function, then the check and the coercion of its result
-        (SPEC-058 FR-001). A ``None`` result declines the event, which is ``SKIPPED`` and counted
-        nowhere, since declining is the configuration working. An event the function failed on
-        is ``SKIPPED`` too, and the failures are registered against this wrapper's ``_dropped``
-        through the run context, ``SETTLED``, so they land under its own counter lock only if
-        the run settles — SPEC-058's count at SPEC-058's moment. ``SKIPPED`` rather than
-        ``DROPPED``, because the engine would commit a ``DROPPED`` into the shared counters, which
-        the inner sink's ``losses()`` reports and this wrapper's adds its own count to, so the
-        event would be counted twice.
+        :meth:`_round_step`: the function, then the check and the coercion of its result (SPEC-058
+        FR-001). A ``None`` result declines the event, which is ``SKIPPED`` and counted by this
+        wrapper nowhere, since declining is the configuration working, and by the engine nowhere
+        except in a round the engine fails as raising — the inner ``deliver`` raised, or its marks
+        did not fit — where SPEC-072's raising-round upper bound counts every event of the round in
+        the shared ``failed_events``, this one included. An event the function failed on is
+        ``SKIPPED`` too, and the failures are registered against this wrapper's ``_dropped`` through
+        the run context, ``SETTLED``, so they land under its own counter lock only if the run
+        settles — SPEC-058's count at SPEC-058's moment. ``SKIPPED`` rather than ``DROPPED``,
+        because the engine would commit a ``DROPPED`` into the shared counters, which the inner
+        sink's ``losses()`` reports and this wrapper's adds its own count to, so the event would be
+        counted twice.
 
         When the function failed on every event, nothing is forwarded and the batch is
         ``REJECTED`` with the first exception as the run context's refusal marker (SPEC-074), so
         the run fails at once and its catcher owns it, and no sink counter moves — the caller's
         code is not something any sink declared retryable. A call with any failure writes one
         ``absorbed`` line at once, naming this class, the first exception's type and how many
-        events were not forwarded, never a value; it is not registered with the run context,
-        because a registered line suppresses the engine's own settled line for the whole run.
+        events were not forwarded, never a value. It is not registered with the run context:
+        since PR 319 a round that registers a line owns the announcement of every loss its
+        verdict decided, so a registered line here would take the engine's settled line away
+        from this round's losses, a third-party inner sink's among them, and leave them
+        unannounced.
 
         The results go to the inner sink's ``deliver``, taken again on every round, as one list
         in batch order, through the run context's ``delegate``, which moves any mark the inner

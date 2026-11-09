@@ -116,7 +116,9 @@ class ReadOnlyCount[T]:
     A class that declares one stores a value in every instance it builds, since a read of a name
     with nothing stored finds this descriptor object itself. The refusal's reason says where the
     value comes from: by default the constructor, as on the SPEC-074 sinks, and on SPEC-075's
-    wrappers the sink each one wraps, whose constructors take no ``max_retries`` at all.
+    classes the sink or backend each one delivers through. ``FilteringSink`` and
+    ``TransformSink`` take no ``max_retries`` at all; ``LogstashSink`` takes one, but hands it to
+    the backend it builds and exposes the value the engine reads off that backend.
 
     Attributes:
       None.

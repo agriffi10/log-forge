@@ -768,9 +768,12 @@ class RunContext:
         wrapped sink's own count and line would survive, and its line would claim the round's
         announcement, where the bare sink's engine counts nothing of it and announces the
         events itself. Only the call's registrations go: the wrapper's own, made before it, stay.
-        The verdict is judged here, once, with ``outcomes_of``, and the judgement returned, so
-        the wrapper maps the very outcomes this judged. An immediate context keeps no marks and
-        has committed each registration already, so it only calls and judges.
+        Only inside an engine run, though: a detached round — a direct ``deliver`` outside any
+        run — never sets an unreadable round aside for the bare sink, whose count and line then
+        commit, so a wrapper's detached round keeps the call's registrations too. The verdict is
+        judged here, once, with ``outcomes_of``, and the judgement returned, so the wrapper maps
+        the very outcomes this judged. An immediate context keeps no marks and has committed each
+        registration already, so it only calls and judges.
 
         Args:
           deliver: The wrapped sink's bound ``deliver``.
@@ -789,12 +792,31 @@ class RunContext:
         verdict = deliver(forwarded)
         found = outcomes_of(verdict, len(forwarded))
         if found is None:
-            self._rewind(mark)
+            if self._in_run():
+                self._rewind(mark)
             return verdict, None
         final, counted = mark[2], mark[3]
         self._final[final:] = [_moved(index, positions) for index in self._final[final:]]
         self._counted[counted:] = [_moved(index, positions) for index in self._counted[counted:]]
         return verdict, found
+
+    def _in_run(self) -> bool:
+        """Whether this context is an engine run's, the only kind that sets a round aside.
+
+        ``_run`` records its sink's idempotence on its context before the first round
+        (:meth:`_run_sink_resends`); a detached or an immediate context has no run sink, as
+        :meth:`resends_unknown` says, and never records one.
+
+        Args:
+          None.
+
+        Returns:
+          True inside ``_run``.
+
+        Raises:
+          None.
+        """
+        return self._resends_unknown is not None
 
     def _marks(self) -> _Marks:
         """Returns the marks the round in progress registered, unvalidated.
