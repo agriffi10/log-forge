@@ -15,9 +15,10 @@ several driver closes, which is why the call expression alone cannot decide it.
 
 **"Names a sink type" is `Sink` or a class in `test_sink_concurrency`'s roster that defines or
 inherits an `emit`**, and that last clause is a correction to the criterion as written. That
-roster's trigger set is `emit` *or* `send_all` *or* `close`, because the lock and post-close
-decisions it enforces apply to a transport as much as to a sink -- so it contains
-`SocketTransport`, which has `send_all` and `close` and no `emit`. Without the clause this lint
+roster's trigger set is `deliver` *or* `emit` *or* `send_all` *or* `close`, because the lock and
+post-close decisions it enforces apply to a transport as much as to a sink -- so it contains
+`SocketTransport`, which has `deliver` (since SPEC-074; `send_all` before) and `close` and no
+`emit`. Without the clause this lint
 claims `LogstashSink`'s and `SyslogSink`'s socket closes, taking the roster to ten; both are
 transports the sink built and owns outright, which no sink-ownership record describes and which
 a forked child must still be able to release. Requiring an `emit` is what the word "sink" means
@@ -153,7 +154,7 @@ def _sink_type_names() -> set[str]:
     """Returns every type name that makes a `.close()` receiver a sink.
 
     A roster class qualifies only if it defines or inherits an `emit`. See the module docstring:
-    the roster this reuses also admits `send_all`/`close`-only transports, and treating one of
+    the roster this reuses also admits `deliver`/`close`-only transports, and treating one of
     those as a sink would put two socket closes in a roster of eight.
 
     Args:
@@ -817,7 +818,7 @@ def test_the_resolver_reaches_receivers_that_carry_no_annotation() -> None:
 
 
 def test_a_transport_that_is_not_a_sink_is_out_of_scope() -> None:
-    """`SocketTransport` has `send_all` and `close` and no `emit`, so it is not a sink here.
+    """`SocketTransport` has `deliver` and `close` and no `emit`, so it is not a sink here.
 
     The reused roster admits it, and the exclusion is derived from the same scan rather than
     carved out by name, so a future `SocketTransport` that grows an `emit` comes into scope on

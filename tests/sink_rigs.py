@@ -521,7 +521,7 @@ def syslog(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     mp.setattr(socket_mod, "_make_udp", lambda host: _Socket(state))
     sink = SyslogSink("loghost", 514, transport="udp", max_retries=0)
-    return Rig(sink, state, _syslog_event, sink._socket, "_unencodable")
+    return Rig(sink, state, _syslog_event, sink.log_foundry_counters, "dropped_events")
 
 
 def logstash(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
@@ -532,7 +532,9 @@ def logstash(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     mp.setattr(socket_mod, "_make_udp", lambda host: _Socket(state))
     sink = LogstashSink(host="ls", port=5000, transport="udp", max_retries=0)
-    return Rig(sink, state, lambda d: [json.loads(d)], sink._socket, "_unencodable")
+    return Rig(
+        sink, state, lambda d: [json.loads(d)], sink._socket.log_foundry_counters, "dropped_events"
+    )
 
 
 class _Cursor:

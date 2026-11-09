@@ -341,7 +341,7 @@ def test_the_socket_sinks_count_on_the_transport(
     rig = RIGS[name](monkeypatch, tmp_path)
     rig.sink.emit([ok("a"), unencodable()])
     transport = rig.sink._socket
-    assert transport._unencodable == 1
+    assert transport.log_foundry_counters.dropped_events == 1
     assert transport.dropped_oversized == 0
     assert rig.sink.losses() == SinkLosses(dropped=1, failed=0)
 
@@ -749,6 +749,10 @@ ENGINE_GAINED: dict[str, frozenset[str]] = {
     )
 }
 ENGINE_GAINED["RabbitMQSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+ENGINE_GAINED["SyslogSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+ENGINE_GAINED["SocketTransport"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
+"""SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
 ``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
@@ -781,7 +785,7 @@ def test_the_public_surface_grows_only_by_five_losses(
             BASE_PUBLIC[name]
             | ({"losses"} if name in GAINED_LOSSES else set())
             | ENGINE_GAINED.get(name, frozenset())
-        )
+        ) - ENGINE_LOST.get(name, frozenset())
         assert names == expected, (name, sorted(names ^ expected))
 
 

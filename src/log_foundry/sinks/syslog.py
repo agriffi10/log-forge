@@ -7,14 +7,15 @@ import os
 import socket
 from typing import TYPE_CHECKING
 
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._args import ReadOnlyCount, store_read_only
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 
 if TYPE_CHECKING:
     import threading
 
     from log_foundry.sinks.base import SinkLosses
+    from log_foundry.sinks.verdict import Verdict
 
 __all__ = ["SyslogSink"]
 
@@ -51,14 +52,24 @@ class SyslogSink:
     It takes **no** transport lock (SPEC-028 FR-002) of its own: the socket it holds is a
     :class:`~log_foundry.sinks._socket.SocketTransport`, which locks its own sends. Its
     post-close refusal comes from there too (SPEC-032 FR-004) — a batch emitted after
-    ``close()`` reaches ``send_all`` and is refused with ``SinkDeliveryError`` without the
-    socket being reopened, so a guard here would only duplicate one that already holds.
+    ``close()`` reaches the transport's round, which refuses it with ``SinkDeliveryError``
+    without the socket being reopened, so a guard here would only duplicate one that already
+    holds. It delivers through SPEC-072's engine by forwarding :meth:`deliver` to the transport
+    (SPEC-074 FR-005), one index space and nothing to map, and shares the transport's counters.
 
 
     It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` hands its bytes to the
     socket before it returns, and no client object outlives it holding data. What the *network*
     then does with a datagram is not something a flush could hurry.
+
+    Attributes:
+      log_foundry_counters: The transport's counters object, so the engine counts into the one
+        ledger both socket sinks read.
+      log_foundry_stop_signal: The shutdown event, read by the engine statically (SPEC-074).
+      max_retries: The floored constructor value, read-only (SPEC-074 FR-006).
     """
+
+    max_retries = ReadOnlyCount()
 
     def __init__(
         self,
@@ -121,24 +132,19 @@ class SyslogSink:
             timeout=timeout,
             max_retries=max_retries,
             max_datagram_bytes=max_datagram_bytes,
+            frame=self._frame,
+            sink_name="SyslogSink",
         )
-        self._stop_signal: threading.Event | None = None
+        store_read_only(self, "max_retries", self._socket.max_retries)
+        self.log_foundry_counters = self._socket.log_foundry_counters
+        self.log_foundry_stop_signal: threading.Event | None = None
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Frames each event as RFC 5424 and sends it over the socket (FR-006).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
-        This is the boundary the worker retries, so the ledger lives here: a ``Deferral`` owned by
-        the transport, which already guards its counters with the lock the commit takes, is
-        handed to ``send_all`` (SPEC-059 FR-002). A UDP frame over the datagram limit is
-        therefore counted and announced only when ``emit`` returns; a raise — the transport
-        closed, or nothing sendable reaching the socket — discards it, and the worker's retry
-        decides it afresh rather than counting it once per attempt.
-
-        Every event is framed through the encode helper before anything is handed to the
-        transport (SPEC-069 FR-001): one whose frame cannot be built is dropped, counted on the
-        transport and announced only when this call returns. A batch of nothing encodable hands
-        the transport an empty list, which settles on an open transport and is refused by a
-        closed one (FR-002).
+        A UDP frame over the datagram limit, and an event whose frame cannot be built (SPEC-069
+        FR-001), are counted and announced only when ``emit`` returns — on the engine, only when
+        the run settles — on the transport's ledger, which this sink reports.
 
         Args:
           batch: The events to ship. An empty batch is a no-op.
@@ -147,13 +153,24 @@ class SyslogSink:
           None.
 
         Raises:
-          SinkDeliveryError: If no frame reached the socket, leaving nothing counted.
+          SinkDeliveryError: If no frame reached the socket, with the engine's message and
+            nothing counted twice; when the transport is closed, its 1.x error by identity.
         """
-        if not batch:
-            return
-        with Deferral(self._socket) as pending:
-            frames = encode_events(batch, self._frame, pending, sink=type(self).__name__)
-            self._socket.send_all([frame for _, frame in frames], pending)
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Forwards the round to the socket transport: one index space, nothing to map.
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The transport's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the socket propagates.
+        """
+        return self._socket.deliver(batch)
 
     def close(self) -> None:
         """Closes the underlying socket (FR-006).
@@ -168,42 +185,6 @@ class SyslogSink:
           None.
         """
         self._socket.close()
-
-    @property
-    def log_foundry_stop_signal(self) -> threading.Event | None:
-        """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
-
-        The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
-        where the waiting happens. Without the forward the attribute is set on an object that
-        never waits, and the backoff one level down stays uninterruptible — which is the whole
-        defect, moved rather than fixed.
-
-        Args:
-          None.
-
-        Returns:
-          The stop signal, or ``None`` if none was offered.
-
-        Raises:
-          None.
-        """
-        return self._stop_signal
-
-    @log_foundry_stop_signal.setter
-    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
-        """Forwards the stop signal to the socket transport.
-
-        Args:
-          signal: The worker's shutdown event, or ``None``.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        self._stop_signal = signal
-        self._socket.log_foundry_stop_signal = signal
 
     @property
     def failed(self) -> int:
@@ -221,11 +202,11 @@ class SyslogSink:
         return self._socket.failed
 
     def losses(self) -> SinkLosses:
-        """Delegates to the socket transport (SPEC-026 FR-002).
+        """Reports the counters this sink shares with its socket transport (SPEC-026 FR-002).
 
-        The transport raises on total failure and :meth:`emit` hands it the whole batch in one
-        call, so a dead syslog destination now reaches ``health().failed_batches`` — the reading
-        SPEC-026 was written from, where ``flush()`` returned True and every frame was lost.
+        A run that delivers nothing fails, so a dead syslog destination reaches
+        ``health().failed_batches`` — the reading SPEC-026 was written from, where ``flush()``
+        returned True and every frame was lost.
 
         Args:
           None.
@@ -236,7 +217,7 @@ class SyslogSink:
         Raises:
           None.
         """
-        return self._socket.losses()
+        return self.log_foundry_counters.losses()
 
     def _frame(self, event: dict[str, object]) -> bytes:
         """Builds one RFC 5424 message, octet-counted when the transport is TCP.
@@ -254,7 +235,7 @@ class SyslogSink:
           The exact bytes to put on the wire.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).

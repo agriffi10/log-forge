@@ -233,9 +233,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
-    "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
-    "sinks/syslog.py": {"SyslogSink": ("emit",)},
-    "sinks/logstash.py": {"LogstashSink": ("emit",)},
     "sinks/kafka.py": {"KafkaSink": ("emit",)},
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
     "sinks/stdout.py": {"StdoutSink": ("emit",)},
@@ -251,10 +248,10 @@ delivery engine off the list, as SPEC-073 took ``sinks/http.py``: its drops regi
 context ``SETTLED``, and its counts commit in ``_engine._run``'s one ``Deferral``. SPEC-073 took ``sinks/http.py`` off the
 list: ``HTTPSink`` counts through the delivery engine's run context, whose one commit is
 ``_engine._commit``, listed below, and whose ``SETTLED`` rule for a dropped counter
-:func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it. ``SocketTransport`` is the one
-entry without an ``emit``: the ledger is entered by ``SyslogSink.emit`` and ``LogstashSink.emit``
-and handed to its ``send_all``, so the roster rule below, which starts from an ``emit``, cannot
-require it and it is named by hand.
+:func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it.
+``SocketTransport`` was the one entry without an ``emit``, its ledger entered by
+``SyslogSink.emit`` and ``LogstashSink.emit`` and handed to ``send_all``, until SPEC-074 put it on
+the engine and deleted ``send_all``.
 
 A class or function named here and missing from its module is a finding, not a skip: a rename
 would otherwise shrink the guard as silently as a deletion. The other direction is held too: a
@@ -265,9 +262,6 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("SocketTransport", "_send_one"): frozenset({"failed"}),
-    ("SocketTransport", "_socket"): frozenset({"_sock"}),
-    ("SocketTransport", "_reset"): frozenset({"_sock"}),
     ("GooglePubSubSink", "emit"): frozenset({"failed"}),
     ("GooglePubSubSink", "_resolve"): frozenset({"failed"}),
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
@@ -293,10 +287,6 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``SocketTransport._send_one`` / ``failed``: a message abandoned past the reconnect bound; the
-  same upper bound.
-- ``SocketTransport._socket`` and ``SocketTransport._reset`` / ``_sock``: the held socket, opened
-  and dropped as the connection comes and goes; state, not a count.
 - ``GooglePubSubSink.emit`` / ``failed``: a future orphaned by a close landing mid-batch; it was
   handed to the client and may land, so it is unconfirmed — the same upper bound.
 - ``GooglePubSubSink._resolve`` / ``failed``: a future that resolved to an error; the same upper

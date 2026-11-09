@@ -20,7 +20,7 @@ import pytest
 import log_foundry.sinks._socket as socket_mod
 from conftest import retire_process
 from log_foundry import _lifecycle
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._engine import emit_via_deliver, stop_signal_of
 from log_foundry.sinks._retry import clamp_server_delay, usable_timeout, wait
 from log_foundry.sinks.http import DEFAULT_MAX_RETRY_AFTER, HTTPSink
 from log_foundry.worker import Worker
@@ -238,8 +238,7 @@ def test_the_socket_transport_backoff_is_interruptible(monkeypatch) -> None:
 
     def send() -> None:
         try:
-            with Deferral(transport) as pending:
-                transport.send_all([b"x"], pending)
+            emit_via_deliver(transport, [{"x": 1}])
         except Exception as err:
             outcome.append(type(err).__name__)
 
@@ -322,7 +321,7 @@ def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
     assert missing == [], f"retry loops with no interruptible wait: {missing}"
 
 
-_NOT_YET_CONVERTED = frozenset({"_socket"})
+_NOT_YET_CONVERTED: frozenset[str] = frozenset()
 """SPEC-074's transitional set: the modules whose retry loop a later phase of its build deletes.
 
 Each phase removes the modules it puts on the engine, so the set shrinks visibly and exactly; it
@@ -497,7 +496,12 @@ def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
 
 
 def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch) -> None:
-    """``SyslogSink`` and ``LogstashSink`` hold the retry loop one level down."""
+    """The signal reaches what waits: the engine run over each socket-backed sink.
+
+    Since SPEC-074 the engine waits, reading the run's sink statically: ``SyslogSink`` itself,
+    which forwards ``deliver`` to its transport, and for socket-mode ``LogstashSink`` the transport
+    its ``emit`` runs the engine over, and for its HTTP mode the ``HTTPSink``.
+    """
     from log_foundry.sinks.logstash import LogstashSink
     from log_foundry.sinks.syslog import SyslogSink
     from test_sinks_syslog import FakeSocket
@@ -506,7 +510,7 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
     monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: FakeSocket())
 
     for sink, backend in (
-        (SyslogSink("h", transport="udp"), lambda s: s._socket),
+        (SyslogSink("h", transport="udp"), lambda s: s),
         (LogstashSink(host="h", port=1), lambda s: s._socket),
         (LogstashSink(url="http://x", opener=FakeOpener()), lambda s: s._http),
     ):
@@ -646,8 +650,8 @@ def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> No
             for leaf in leaves:
                 assert leaf.log_foundry_stop_signal is worker._stop, type(wrapper).__name__
             if inner in leaves:
-                assert inner._socket.log_foundry_stop_signal is worker._stop, (
-                    "and on through SyslogSink to the transport that actually waits"
+                assert stop_signal_of(inner) is worker._stop, (
+                    "and the engine, which waits for SyslogSink, reads it there (SPEC-074)"
                 )
         finally:
             worker.stop()

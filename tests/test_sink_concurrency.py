@@ -17,7 +17,7 @@ import pytest
 from conftest import run_concurrently
 from log_foundry import SinkLosses
 from log_foundry.sinks import _socket
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
 from log_foundry.sinks.sqlite import SQLiteSink
@@ -1577,9 +1577,8 @@ def _build_closable(name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             return fake
 
         monkeypatch.setattr(_socket, "_make_tcp", make)
-        transport = _socket.SocketTransport("localhost", 5140)
-        with Deferral(transport) as pending:
-            transport.send_all([b"warm up "], pending)
+        transport = _socket.SocketTransport("localhost", 5140, frame=lambda e: e["raw"])
+        emit_via_deliver(transport, [{"raw": b"warm up "}])
         return transport, lambda: len(opened)
     if name == "postgres":
         from log_foundry.sinks.postgres import PostgresSink
@@ -1696,8 +1695,7 @@ def test_a_closed_sink_refuses_a_batch_instead_of_reaching_its_driver(
 
     with pytest.raises(SinkDeliveryError):
         if name == "socket":
-            with Deferral(sink) as pending:
-                sink.send_all([b"<14>1 after close"], pending)
+            emit_via_deliver(sink, [{"raw": b"<14>1 after close"}])
         else:
             sink.emit([event(0, 0)])
 
@@ -1720,23 +1718,21 @@ def test_a_closed_sink_still_treats_an_empty_batch_as_a_no_op(
     sink.emit([])
 
 
-def test_a_closed_transport_refuses_an_empty_send_all(
+def test_a_closed_transport_refuses_a_batch_of_nothing_encodable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A closed ``SocketTransport`` refuses even an empty ``send_all`` (SPEC-069 FR-002).
+    """A closed ``SocketTransport`` refuses even a batch it would frame to nothing (SPEC-069 FR-002).
 
-    An empty ``send_all`` is how a syslog or socket-mode logstash batch of nothing but
-    unencodable events reaches the transport, and that batch must raise on a closed transport as
-    any closed sink does, so the closed check runs before the empty return. The two sinks'
-    own ``emit([])`` still returns before reaching the transport, as the test above holds.
+    Such a batch — a syslog or socket-mode logstash batch of nothing but unencodable events —
+    used to reach ``send_all`` as an empty list; since SPEC-074 the transport's round makes the
+    closed check before framing anything, so the batch raises on a closed transport as any closed
+    sink does. The two sinks' own ``emit([])`` still returns before reaching the transport, as
+    the test above holds.
     """
     sink, _ = _build_closable("socket", tmp_path, monkeypatch)
     sink.close()
-    with (
-        pytest.raises(SinkDeliveryError, match="the transport is closed"),
-        Deferral(sink) as pending,
-    ):
-        sink.send_all([], pending)
+    with pytest.raises(SinkDeliveryError, match="the transport is closed"):
+        emit_via_deliver(sink, [{"blob": b"unencodable"}])
 
 
 def test_eventhubs_sends_are_not_interleaved_by_a_concurrent_emit(
@@ -2032,7 +2028,7 @@ def test_this_roster_and_the_public_surface_roster_cover_the_same_classes() -> N
     differences are deliberate and are therefore named here rather than papered over by comparing
     loosely: `base.Sink` is the Protocol stating the contract rather than a sink satisfying it,
     which this file excludes and the other -- judging signatures -- is unbothered by; and
-    `_socket.SocketTransport` is in scope here through `send_all`/`close` while having no `emit`
+    `_socket.SocketTransport` is in scope here through `deliver`/`close` while having no `emit`
     at all, so it falls outside the other roster's remit by that roster's own definition. Any
     third difference is drift.
     """

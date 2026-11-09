@@ -16,7 +16,8 @@ import pytest
 import log_foundry
 import log_foundry.sinks._socket as socket_mod
 from conftest import install_worker
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks import _engine
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, read_losses
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.multi import MultiSink
@@ -544,11 +545,13 @@ def test_socket_transport_raises_when_nothing_was_sent(monkeypatch) -> None:
     from test_sinks_syslog import RefusingSocket
 
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
-    transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
+    transport = socket_mod.SocketTransport(
+        "h", 1, transport="udp", max_retries=0, frame=lambda e: e["raw"]
+    )
 
-    with pytest.raises(SinkDeliveryError), Deferral(transport) as pending:
-        transport.send_all([b"a", b"b"], pending)
+    with pytest.raises(SinkDeliveryError):
+        emit_via_deliver(transport, [{"raw": b"a"}, {"raw": b"b"}])
     assert transport.losses() == SinkLosses(dropped=0, failed=2)
 
 
@@ -556,11 +559,12 @@ def test_socket_transport_does_not_raise_on_a_partial_send(monkeypatch) -> None:
     """The worker's retry would re-send the message that already landed."""
     sock = _HalfDeadSocket()
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: sock)
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
-    transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
+    transport = socket_mod.SocketTransport(
+        "h", 1, transport="udp", max_retries=0, frame=lambda e: e["raw"]
+    )
 
-    with Deferral(transport) as pending:
-        transport.send_all([b"a", b"b"], pending)  # must not raise
+    emit_via_deliver(transport, [{"raw": b"a"}, {"raw": b"b"}])  # must not raise
 
     assert sock.sent == [b"a"]
     assert transport.losses() == SinkLosses(dropped=0, failed=1)
@@ -569,8 +573,7 @@ def test_socket_transport_does_not_raise_on_a_partial_send(monkeypatch) -> None:
 def test_an_empty_send_is_not_a_total_failure(monkeypatch) -> None:
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: _HalfDeadSocket())
     transport = socket_mod.SocketTransport("h", 1, transport="udp")
-    with Deferral(transport) as pending:
-        transport.send_all([], pending)  # must not raise
+    assert transport.deliver([]).outcomes == ()  # must not raise
 
 
 def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
@@ -579,7 +582,7 @@ def test_a_dead_syslog_destination_now_reports_loss(monkeypatch) -> None:
     from test_sinks_syslog import RefusingSocket
 
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
     sink = SyslogSink("loghost", transport="udp", max_retries=0)
     log_foundry.configure(service="t", sink=sink)
     worker = Worker(sink, batch_size=1, max_retries=0)
@@ -727,7 +730,7 @@ def test_logstash_losses_follow_the_active_backend(monkeypatch) -> None:
     assert http.losses() == SinkLosses(dropped=0, failed=1)
 
     monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: RefusingSocket())
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
     sock = LogstashSink(host="ls", port=5044, max_retries=0)
     with pytest.raises(SinkDeliveryError):
         sock.emit([{"a": 1}])
@@ -994,11 +997,11 @@ def test_socket_transport_floors_a_negative_max_retries(monkeypatch) -> None:
 
     sock = RefusingSocket()
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: sock)
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
     transport = socket_mod.SocketTransport("h", 1, transport="udp", max_retries=-1)
 
-    with pytest.raises(SinkDeliveryError), Deferral(transport) as pending:
-        transport.send_all([b"a"], pending)
+    with pytest.raises(SinkDeliveryError):
+        emit_via_deliver(transport, [{"a": 1}])
     assert transport.losses() == SinkLosses(dropped=0, failed=1), "abandoned without a counter"
 
 

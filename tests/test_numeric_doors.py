@@ -135,7 +135,7 @@ MAX_RETRIES_DOORS: dict[str, tuple[type, Callable[..., Any], str]] = {
     "SocketTransport": (
         SocketTransport,
         lambda **kw: SocketTransport("h", 514, **kw),
-        "_max_retries",
+        "max_retries",
     ),
     "ClickHouseSink": (
         ClickHouseSink,

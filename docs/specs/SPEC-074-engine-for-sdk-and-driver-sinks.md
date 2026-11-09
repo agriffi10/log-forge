@@ -700,8 +700,9 @@ and ownership walks still see only the sink that holds it, and
 `tests/test_sink_release_roster.py::test_a_transport_that_is_not_a_sink_is_out_of_scope` keeps
 passing on its derived check (its docstring's mention of `send_all` is updated).
 
-- **Construction** takes the caller's frame function, `frame: Callable[[dict[str, object]], bytes]`,
-  and the transport gains `log_foundry_counters` (an instance attribute), `deliver`, a read-only
+- **Construction** takes the caller's frame function, `frame: Callable[[dict[str, object]], bytes]`
+  (optional, an event's UTF-8 JSON by default, so a transport built directly still works), and the
+  owning sink's name, `sink_name`, for SPEC-069's unchanged encode line; the transport gains `log_foundry_counters` (an instance attribute), `deliver`, a read-only
   `max_retries` and a `_counter_lock` property as FR-001 describes. `send_all`, its `pending`
   parameter, `_send_one`'s loop and `_BACKOFF_BASE` are deleted.
 - **A round** frames every event through `encode_round` (FR-002; `DROPPED` with SPEC-069's line),
@@ -715,7 +716,10 @@ passing on its derived check (its docstring's mention of `send_all` is updated).
 - **`SyslogSink`** passes `self._frame`, defines a `deliver` that returns the transport's `deliver` of
   the same batch (one index space, nothing to map) and an `emit` that runs the adapter, sets
   `self.log_foundry_counters` to the transport's counters object as an instance attribute (SPEC-072
-  reads it statically, so a property would not be offered), and exposes `max_retries`.
+  reads it statically, so a property would not be offered), and exposes `max_retries`. Its
+  `log_foundry_stop_signal` becomes a plain instance attribute rather than a property forwarding
+  to the transport, for the same reason: the engine reads the stop signal of the sink it runs
+  statically, and a property reads as no signal.
 - **`LogstashSink` in socket mode** passes its line framer, and its `emit` runs the adapter over the
   transport, `emit_via_deliver(self._socket, batch)`, so its 1.x `emit` contract is the engine's. What
   `LogstashSink` offers the worker is SPEC-075's, whose `deliver` delegates to `self._socket`.
@@ -1078,3 +1082,4 @@ other site still stating the old claim:
 - 2026-11-05, execution-frame review: a NATS round with nothing published now registers 1.x's own counts and lines `ALWAYS` (one per raised publish, none for an unattempted event) and marks its `RETRYABLE` events `sink_counted`, a fourth run-context addition, so the engine adds no count; a differential matrix criterion holds every NATS case to values recorded by running 1.x at `93113e1b`, replacing the two hand-written NATS criteria.
 - 2026-11-08, build (plan review B1, M1, M2): the SQS FIFO hold is decided per chunk at send time, so same-group events never sent travel together and a healthy one-group batch is one call; a held event never sent is counted with a `0 attempt(s), held behind …` line (reading (a), pending Andrew's call); a repeated event identity keeps one cached entry per occurrence and entry `Id`s persist across rounds; a sink-counted loss is registered as `failed_events` on `log_foundry_counters`, never against the `failed` setter; `_Prepared.index` is `position`; the dedup-callable criterion's fallback case returns a blank string.
 - 2026-11-08, build (plan review Q1, Q2, Q3): `max_retries` on RabbitMQ, the socket transport and Syslog is a set-only refusing descriptor rather than a `property`, which the engine's static reader cannot see; a converted sink's total-failure message is the adapter's (listed under *What a caller sees change*); FR-004's wedged-loop backstop is a `REJECTED` refusal round, the reading the shipped NATS tests left standing when both were built and run.
+- 2026-11-08, build (FR-005): `SocketTransport` takes an optional `frame` and the owning sink's `sink_name`; `SyslogSink.log_foundry_stop_signal` is a plain attribute the engine can read statically.

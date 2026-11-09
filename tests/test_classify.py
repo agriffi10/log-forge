@@ -721,7 +721,7 @@ class _Built:
 def _rig(name: str) -> Callable[[pytest.MonkeyPatch, Path, int], _Built]:
     def build(mp: pytest.MonkeyPatch, tmp: Path, retries: int) -> _Built:
         rig = sink_rigs.RIGS[name](mp, tmp)
-        owner = rig.owner if name == "SyslogSink" else rig.sink
+        owner = rig.sink._socket if name == "SyslogSink" else rig.sink
         for target in {id(owner): owner, id(rig.sink): rig.sink}.values():
             attr = "_max_retries" if hasattr(target, "_max_retries") else "max_retries"
             if attr in vars(target):

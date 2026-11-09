@@ -3,28 +3,36 @@
 from __future__ import annotations
 
 import errno
+import json
 import socket
 import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
+from log_foundry.sinks import _engine
+from log_foundry.sinks._args import ReadOnlyCount, store_read_only
 from log_foundry.sinks._classify import is_retryable
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, run_context
 from log_foundry.sinks._retry import (
     exact_int,
     floor_count,
     require_positive,
     require_timeout,
-    wait,
 )
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from log_foundry.sinks._deferral import Deferral
+    from log_foundry.sinks._engine import _Drops
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["SocketTransport"]
-
-_BACKOFF_BASE = 0.1
 
 DEFAULT_MAX_DATAGRAM_BYTES = 65507
 """Bytes one UDP datagram may carry, the IPv4 payload maximum (SPEC-038 FR-007).
@@ -107,38 +115,56 @@ def _make_udp(host: str) -> socket.socket:
     )
 
 
+def _json_frame(event: dict[str, object]) -> bytes:
+    """Frames an event as its UTF-8 JSON text, the transport's default when a caller gives none.
+
+    Args:
+      event: The event.
+
+    Returns:
+      Its frame.
+
+    Raises:
+      TypeError: If the event is not JSON-serializable, which the encode step turns into a drop.
+    """
+    return json.dumps(event).encode("utf-8")
+
+
 class SocketTransport:
-    """Sends pre-framed messages over a TCP or UDP socket, reconnecting within a bound.
+    """Frames events and sends them over a TCP or UDP socket, one round at a time (SPEC-074).
 
-    The transport is framing-agnostic — callers hand it the exact bytes to put on the wire. For
-    TCP a single connection is opened and reused, reconnecting on error; for UDP each message is
-    an independent datagram.
+    The transport frames each event with the caller's ``frame`` function and puts the bytes on
+    the wire. For TCP a single connection is opened and reused, reconnecting on error; for UDP
+    each message is an independent datagram. It is the one engine object ``SyslogSink`` and
+    socket-mode ``LogstashSink`` run (SPEC-074 FR-005), because it owns the ledger both read, but
+    it is **not** a structural ``Sink``: it has ``deliver`` and no ``emit``, so the fork and
+    ownership walks still see only the sink that holds it.
 
-    The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per message, so a
-    100-message batch against a dead destination is roughly 70 s of backoff on the single drain
-    thread at the defaults. The wait is interruptible, so ``shutdown()`` cuts it short.
+    It delivers through SPEC-072's engine: each round sends every remaining frame once and the
+    engine resends only the frames that may land, so the worst-case delay (SPEC-027 FR-005) is
+    ``max_retries`` waits per run, each interruptible by ``shutdown()``.
 
     Sends are serialized on a lock (SPEC-028 FR-002). One TCP connection is shared by every
     caller, and ``sendall`` gives no atomicity against a concurrent one: two interleaved calls
     splice their bytes into the stream, which turns octet-counted syslog framing into a sequence
-    the receiver cannot resynchronize — it reads the next frame's length from the middle of the
-    previous frame's payload and is lost for the life of the connection. That the lock is held
-    across the backoff waits is deliberate; they are interruptible, so a ``shutdown()`` releases
-    it promptly.
+    the receiver cannot resynchronize. The lock is held for one round and never across the
+    engine's wait, so a ``close()`` during a backoff returns at once and the next round is refused.
 
     Attributes:
-      failed: Messages abandoned past the reconnect-retry bound.
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports and both
+        socket sinks share.
+      failed: Messages not confirmed, ``failed_events``; assignable.
       dropped_oversized: UDP datagrams discarded before any send for exceeding
-        ``max_datagram_bytes``, counted and announced only when ``emit`` returns — the calling
-        sink's, whose ``Deferral`` :meth:`send_all` is handed (SPEC-059 FR-002) — so a batch the
-        worker retries counts its oversized frame once, and one it abandons not at all.
-      _unencodable: Events the calling sink could not encode into a frame (SPEC-069 FR-001),
-        committed through the same ledger; private, and reported in ``losses().dropped``.
+        ``max_datagram_bytes``, counted and announced only when ``emit`` returns — on the engine,
+        only when the run settles — so a batch the worker retries counts its oversized frame
+        once, and one it abandons not at all.
+      max_retries: The floored constructor value, read-only (SPEC-074 FR-006).
 
-
-    It keeps **no** client buffer (SPEC-036 FR-002): ``send_all`` puts the bytes on the
-    socket before it returns, and no client object outlives it holding data.
+    It keeps **no** client buffer (SPEC-036 FR-002): a round puts the bytes on the socket before
+    it returns, and no client object outlives it holding data.
     """
+
+    max_retries = ReadOnlyCount()
 
     def __init__(
         self,
@@ -149,8 +175,10 @@ class SocketTransport:
         timeout: float = 5.0,
         max_retries: int = 3,
         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
+        frame: Callable[[dict[str, object]], bytes] | None = None,
+        sink_name: str = "SocketTransport",
     ) -> None:
-        """Configures the destination and retry bound without opening a socket yet.
+        """Configures the destination, framing and retry bound without opening a socket yet.
 
         Args:
           host: The destination host.
@@ -161,7 +189,7 @@ class SocketTransport:
           transport: ``"tcp"`` or ``"udp"``.
           timeout: Seconds allowed for a TCP connection. Refused at construction when it cannot
             bound anything (SPEC-049 FR-002): it reached ``create_connection`` and raised from
-            inside ``send_all`` on every message. **This is a new refusal over UDP**, where the
+            inside every send on every message. **This is a new refusal over UDP**, where the
             value was previously unused and a junk one was harmless — stated rather than
             discovered, since a UDP caller passing one has been silently fine until now.
           max_retries: Reconnect retries per message, an ``int``, floored at zero for the reason
@@ -171,6 +199,9 @@ class SocketTransport:
             it holds.
           max_datagram_bytes: The largest UDP datagram to attempt, defaulting to
             :data:`DEFAULT_MAX_DATAGRAM_BYTES`. Ignored for TCP, which is a stream.
+          frame: The caller's per-event frame function (SPEC-074 FR-005), or ``None`` for an
+            event's UTF-8 JSON text.
+          sink_name: The class name SPEC-069's encode line names: the sink that built this.
 
         Returns:
           None.
@@ -199,107 +230,176 @@ class SocketTransport:
         self._port = port
         self._transport = transport
         self._timeout = require_timeout(timeout, "timeout", "SocketTransport")
-        self._max_retries = floor_count(max_retries, 0, "max_retries", "SocketTransport")
+        store_read_only(
+            self, "max_retries", floor_count(max_retries, 0, "max_retries", "SocketTransport")
+        )
         self._max_datagram_bytes = require_positive(
             max_datagram_bytes, "max_datagram_bytes", "SocketTransport"
         )
         self._sock: socket.socket | None = None
-        self.failed = 0
+        self._frame = frame if frame is not None else _json_frame
+        self._sink_name = sink_name
+        self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._unencodable = 0
-        self._counter_lock = threading.Lock()
         self.log_foundry_stop_signal: threading.Event | None = None
         self._lock = threading.Lock()
         self._closed = False
 
-    def send_all(self, messages: list[bytes], pending: Deferral) -> None:
-        """Sends each pre-framed message, reconnecting on error (FR-005, FR-006).
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
 
-        The lock spans the whole call, not each message: it also guards ``_sock``, which a
-        reconnect rebinds, so releasing between messages would let another thread send on a
-        socket this one is about to reset (SPEC-028 FR-002).
-
-        A closed transport refuses rather than reconnecting. ``_socket`` opens a connection
-        whenever it holds none and ``close`` only drops the one it has, so without this a single
-        ``log_foundry.info()`` after ``shutdown()`` would open a TCP connection nothing will ever
-        reap — measured, and the same leak ``RabbitMQSink`` had (SPEC-028).
-
-        **The oversize drop is the calling sink's to commit** (SPEC-059 FR-002). :meth:`_sendable`
-        records it in ``pending``, the ``Deferral`` the sink's ``emit`` entered, so it is counted
-        and announced only when ``emit`` returns: a raise from here leaves nothing counted, and
-        the worker's retry decides the drop afresh. The ledger is a required parameter, never
-        defaulted, so a caller that forgets it is refused by mypy and by a ``TypeError`` rather
-        than counting at once. The commit runs after this call has released the send lock, so
-        the datagram-limit line is never written under it.
-
-        **An empty call is refused by a closed transport too** (SPEC-069 FR-002). A sink whose
-        every event was unencodable hands over an empty list, and that batch settles only if the
-        transport is open: the closed check runs first, so such a call on a closed transport
-        raises and the ledger, its unencodable count included, is discarded, as for any other
-        closed sink. The empty return used to come before the check.
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
 
         Args:
-          messages: The exact bytes to put on the wire, one call per message.
-          pending: The calling sink's ``emit``'s deferral, owned by this transport, which holds
-            the oversize drop until that ``emit`` is known not to raise.
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
 
         Returns:
           None.
 
         Raises:
-          SinkDeliveryError: When none of the messages reached the socket, so the sinks built on
-            this transport propagate a dead destination to the worker instead of reporting
-            success (SPEC-026 FR-001). A partial send does not raise, because the worker's retry
-            would re-send the messages that already landed, and an empty call on an open
-            transport is a no-op rather than a total failure. Also when the transport is already
-            closed, before anything is decided, an empty call included. Either raise leaves
-            nothing in ``pending`` counted.
+          None.
         """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-005).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the socket propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Frames the round's events and sends every remaining frame once, under the lock.
+
+        A closed transport's round is a refusal carrying the ``SinkDeliveryError`` 1.x's
+        ``send_all`` raised, decided before anything is framed, so a batch of nothing encodable
+        is still refused by a closed transport (SPEC-069 FR-002). Every event is framed once per
+        run (:func:`~log_foundry.sinks._encode.encode_round`), an unframeable one ``DROPPED`` with
+        SPEC-069's line naming the sink that built this transport. :meth:`_sendable` drops a UDP
+        frame over the datagram limit, its count and line counted and announced only when
+        ``emit`` returns — on the engine, only when the run settles. A send that raises runs
+        :meth:`_reset`; one :meth:`_retryable_error` accepts makes that frame ``RETRYABLE``, any
+        other ``REJECTED``, each line naming the type and errno as 1.x's did, and the round goes
+        on to the next frame.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the socket propagates.
+        """
+        context = run_context()
         with self._lock:
             if self._closed:
-                raise SinkDeliveryError(
-                    f"SocketTransport delivered none of {len(messages)} message(s): "
-                    f"the transport is closed"
+                context.refuse(
+                    SinkDeliveryError(
+                        f"SocketTransport delivered none of {len(batch)} message(s): "
+                        f"the transport is closed"
+                    )
                 )
-            if not messages:
-                return
-            sendable = self._sendable(messages, pending)
-            delivered = 0
-            for message in sendable:
-                if self._send_one(message):
-                    delivered += 1
-        if sendable and delivered == 0:
-            raise SinkDeliveryError(
-                f"SocketTransport delivered none of {len(sendable)} message(s)"
-            )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            fates = [Outcome.DROPPED] * len(batch)
+            pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
+            lost = Lost(self)
+            for position, message in self._sendable(pairs, context.drops(self)):
+                mark_sent(self, [batch[position]])
+                called = self._send_one(message)
+                if called.error is None:
+                    fates[position] = Outcome.ACCEPTED
+                    continue
+                fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                kind = f"{type(called.error).__name__} {_diag.errno_of(called.error)}".rstrip()
+                lost.add(
+                    [batch[position]],
+                    when=When.LAST if called.retryable else When.ALWAYS,
+                    key=kind,
+                    line=raised_line("message", "SocketTransport", kind),
+                )
+            lost.register()
+        return Verdict(outcomes=tuple(fates))
 
-    def _sendable(self, messages: list[bytes], pending: Deferral) -> list[bytes]:
+    def _sendable(
+        self, messages: list[tuple[int, bytes]], pending: Deferral | _Drops
+    ) -> list[tuple[int, bytes]]:
         """Discards UDP datagrams too large to send, before any attempt (FR-007 AC-1).
 
         A 70 KB event produced ``OSError errno=40`` (EMSGSIZE), which the retry loop treated as
         transient: four sends with backoff, counted as ``failed``, then a raise that sent the
-        worker round for three more rounds — roughly sixteen futile sends and seconds of backoff
-        on the single drain thread, never converging. The size is knowable *before* sending, and
-        every other size-limited sink here drops and counts first, so this one does too.
+        worker round for three more rounds. The size is knowable *before* sending, and every other
+        size-limited sink here drops and counts first, so this one does too. Dropping is right
+        rather than raising: the datagram is permanently unsendable on this path, so there is
+        nothing for a retry to fix.
 
-        Dropping is right rather than raising: the datagram is permanently unsendable on this
-        path, so there is nothing for a retry to fix, and reporting it as a delivery failure
-        would have the worker re-send the rest of the batch alongside it.
-
-        **The drop is counted and announced only when ``emit`` returns** — the calling sink's,
-        whose ``Deferral`` arrives here as ``pending`` (SPEC-059 FR-002). If a batch holds an
-        oversized frame *and* its sendable remainder then fails totally, :meth:`send_all` raises,
-        the sink's ``emit`` raises with it, and the ledger is discarded; the worker retries the
-        whole batch and this filter decides the same drop afresh. So one unsendable frame is
-        counted once when a later attempt returns, and not at all when the worker abandons the
-        batch, whose abandon line is then its only count. Counting it here, as it was decided,
-        counted it once per attempt — up to four times for one frame. The line keeps its shape,
-        one per call that dropped anything, carrying the count.
+        **The drop is counted and announced only when ``emit`` returns** — on the engine,
+        ``pending`` is the run context's ``SETTLED`` view, so only when the run settles (SPEC-059
+        FR-002, SPEC-074). One unsendable frame is counted once by a run that settles, and not at
+        all by one that fails, whose catcher's count is then its only one. The line keeps its
+        shape, one per round that dropped anything, carrying the count.
 
         Args:
-          messages: The framed messages, in order.
-          pending: The calling sink's ``emit``'s deferral, which holds the drop decided here
-            until that ``emit`` is known not to raise.
+          messages: Each frame's position in the round's batch with its bytes, in order.
+          pending: The run's ``SETTLED`` view, which holds the drop decided here until the run
+            is known to settle.
 
         Returns:
           Those within the datagram limit. All of them under TCP, which is a stream.
@@ -309,7 +409,7 @@ class SocketTransport:
         """
         if self._transport != "udp":
             return messages
-        sendable = [m for m in messages if len(m) <= self._max_datagram_bytes]
+        sendable = [(i, m) for i, m in messages if len(m) <= self._max_datagram_bytes]
         dropped = len(messages) - len(sendable)
         if dropped:
             pending.count("dropped_oversized", dropped)
@@ -323,10 +423,7 @@ class SocketTransport:
         return sendable
 
     def losses(self) -> SinkLosses:
-        """Reports messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
-
-        ``dropped`` is the oversized datagrams plus the events the calling sink could not encode
-        (SPEC-069 FR-001); ``dropped_oversized`` still means oversize only.
+        """Reports the engine's totals, which ``SyslogSink`` and socket-mode Logstash both read.
 
         Args:
           None.
@@ -337,10 +434,7 @@ class SocketTransport:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(
-                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
-            )
+        return self.log_foundry_counters.losses()
 
     def close(self) -> None:
         """Closes the held socket, if any (FR-005, FR-012).
@@ -363,57 +457,27 @@ class SocketTransport:
             self._closed = True
             self._reset()
 
-    def _send_one(self, message: bytes) -> bool:
-        """Sends one message within the retry bound.
-
-        The abandonment line is written through ``_diag`` (SPEC-029 FR-003): this runs on the
-        worker thread, and the bare ``sys.stderr.write`` it replaced could end delivery for good.
-        It carries an ``errno`` because an ``OSError`` type name alone does not tell "connection
-        refused" from "host unknown", and the code is an integer from the OS rather than caller
-        data.
-
-        Only what :meth:`_retryable_error` accepts is attempted again (SPEC-070 FR-001): an
-        ``OSError`` whose errno is outside ``_PERMANENT_ERRNOS``. Anything else the send raises —
-        a ``ValueError`` from a socket object closed under it, say — used to escape ``emit`` raw
-        and uncounted; it is now caught, counted and abandoned at its first attempt, with no
-        backoff wait. The held socket is reset first either way, as before.
-
-        The line carries the attempts actually made, ``attempt + 1``, as ``HTTPSink._request``
-        already did (SPEC-049 FR-006): it used to write ``max_retries + 1`` unconditionally, so a
-        message abandoned after **one** send on a permanent errno was reported as four — a count an
-        operator would use to reach the wrong conclusion, and an invariant 11 defect.
+    def _send_one(self, message: bytes) -> Called[None]:
+        """Sends one frame once (SPEC-074 FR-005); the engine resends it in a later round.
 
         Args:
           message: The exact bytes to put on the wire.
 
         Returns:
-          True when the message reached the socket, False once it is abandoned.
+          The call, with its exception when it raised, after :meth:`_reset`.
 
         Raises:
           None.
         """
-        for attempt in range(self._max_retries + 1):
-            try:
-                if self._transport == "udp":
-                    self._socket().sendto(message, (self._host, self._port))
-                else:
-                    self._socket().sendall(message)
-                return True
-            except Exception as err:
-                self._reset()
-                if attempt < self._max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += 1
-                _diag.lost(
-                    "message",
-                    1,
-                    f"SocketTransport, {attempt + 1} attempt(s), "
-                    f"{type(err).__name__} {_diag.errno_of(err)}".rstrip(),
-                )
-                return False
-        return False
+        try:
+            if self._transport == "udp":
+                self._socket().sendto(message, (self._host, self._port))
+            else:
+                self._socket().sendall(message)
+        except Exception as err:
+            self._reset()
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(None)
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether another send after this exception may succeed (SPEC-070 FR-001).

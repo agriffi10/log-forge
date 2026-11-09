@@ -194,14 +194,19 @@ def derive(
     its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. So are the two other routes an
     engine sink's ``emit`` takes (SPEC-074): ``emit_via_deliver(self, batch)`` with no
     ``deliver=`` reaches the class's own ``deliver``, and ``_engine.one_round(self._round, batch)``
-    its round. It does not follow any other callable passed uncalled, a property, or a call
-    through another object.
+    its round. A class whose ``__init__`` builds a ``SocketTransport(..., frame=<f>)`` hands the
+    transport its frame function, which the transport's round runs through ``encode_round``
+    (``test_the_socket_transport_frames_through_encode_round`` holds that half), so its
+    ``emit_via_deliver(self._socket, …)`` or ``self._socket.deliver(…)`` reaches ``<f>`` guarded
+    (SPEC-074 FR-005). It does not follow any other callable passed uncalled, a property, or a
+    call through another object.
     """
     roster = Roster()
     for cls in classes:
         emit = inspect.getattr_static(cls, "emit", None)
         if not inspect.isfunction(emit):
             continue
+        socket_frame = _socket_frame(cls)
         hits: list[tuple[str, bool]] = []
         stack: list[tuple[Callable[..., Any], bool]] = [(emit, False)]
         seen: set[tuple[int, bool]] = set()
@@ -238,6 +243,8 @@ def derive(
                             f"{cls.__module__}: {cls.__qualname__}.emit hands encode_events an "
                             f"encode argument the roster cannot resolve: {shown}"
                         )
+                elif socket_frame is not None and _hands_to_the_socket(node, callee):
+                    stack.append((socket_frame, True))
                 elif callee is _engine.one_round and node.args:
                     handed = _resolve(node.args[0], fn, cls)
                     if inspect.isfunction(handed):
@@ -276,6 +283,63 @@ def derive(
                 for where in bare
             )
     return roster
+
+
+def _socket_frame(cls: type) -> Callable[..., Any] | None:
+    """The frame function a class's ``__init__`` hands a ``SocketTransport``, resolved on it."""
+    init = inspect.getattr_static(cls, "__init__", None)
+    tree = _parse(init) if inspect.isfunction(init) else None
+    if tree is None:
+        return None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "SocketTransport"
+        ):
+            for keyword in node.keywords:
+                if keyword.arg == "frame":
+                    found = _resolve(keyword.value, init, cls)
+                    return found if inspect.isfunction(found) else None
+    return None
+
+
+def _is_self_socket(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_socket"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def _hands_to_the_socket(node: ast.Call, callee: object) -> bool:
+    """Whether a call runs the transport's round: ``emit_via_deliver(self._socket, …)``, or
+    ``self._socket.deliver(…)``."""
+    if callee is _engine.emit_via_deliver and node.args and _is_self_socket(node.args[0]):
+        return True
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "deliver"
+        and _is_self_socket(node.func.value)
+    )
+
+
+def test_the_socket_transport_frames_through_encode_round() -> None:
+    """The other half of the socket sinks' route: the transport's round guards its frame."""
+    from log_foundry.sinks._socket import SocketTransport
+
+    tree = _parse(inspect.getattr_static(SocketTransport, "_round"))
+    assert tree is not None
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "encode_round"
+    ]
+    assert len(calls) == 1
+    assert ast.unparse(calls[0].args[2]) == "self._frame"
 
 
 def _package_classes() -> list[type]:
