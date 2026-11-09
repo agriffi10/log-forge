@@ -326,10 +326,10 @@ class HTTPRecorder(HTTPSink):
 def _forget_records() -> Any:
     """Clears every recorder's records once its test has asserted on them.
 
-    Every recorder handed to the library stays in ``_lifecycle._state._owned`` for the life of
-    the process, and a later fork test's marking walk visits what that record reaches, up to
+    A recorder handed to the library stays in ``_lifecycle._state._owned`` for the life of the
+    process, and a later fork test's marking walk visits the objects that record reaches, up to
     ``_MARKING_CEILING``. :class:`HTTPRecorder` measured that hazard; the sequential driver hands
-    the library a recorder per ``configure`` and per default resolution, so every kind is cleared.
+    the library a recorder per ``configure`` and per default resolution, so both kinds are cleared.
     """
     yield
     for recorder in list(HTTPRecorder.live):

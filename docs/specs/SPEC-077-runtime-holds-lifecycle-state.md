@@ -461,10 +461,19 @@ that asserts behaviour named in `docs/invariants.md` is deleted, and none is wea
 #### Acceptance Criteria:
 
 - [ ] The test names `pytest --collect-only -q` reports at the build's base commit are all present
-  at the head, and the only additions are FR-002's, FR-003's and FR-004's.
+  at the head, and the only additions are FR-001's, FR-002's, FR-003's, FR-004's and this FR's own
+  (`tests/test_runtime_holder.py` holds FR-001's and FR-005's criteria).
 - [ ] The diff of each named test file consists only of lines whose change is a moved name's path
-  or the `Runtime` rename, with two named exceptions: the token-set reset in `conftest.py` and the
-  inverted `_skipped_names` assertion in `test_lifecycle_races.py`.
+  or the `Runtime` rename, with these named exceptions: the token-set reset in `conftest.py` (and
+  its docstring paragraph); the inverted `_skipped_names` assertion in `test_lifecycle_races.py`
+  (and the docstring sentence that said `_owned` is a module global); the `Runtime.state` rows in
+  `test_worker_predicate_roster.py` (FR-003); FR-004's rewrite of `test_invariants_model.py`; the
+  `_FORK_SKIP` assertion in `test_sink_ownership.py` (`_lifecycle._FORK_SKIP` becomes
+  `_lifecycle._state._FORK_SKIP`, the declaration having moved to `Runtime`); and the rename at
+  `test_owed_closes.py` (`_lifecycle._Lifecycle._FORK_SKIP`). The search on the build's base
+  commit also finds `test_invariants_model.py`, whose docstring named `_lifecycle._owned`, and
+  `test_sinks_broker_engine.py`, whose hit is an unrelated local helper named `_owned` and is not
+  edited.
 - [ ] `log_foundry.__all__` and `tests/test_public_surface.py` are unchanged and pass;
   `from log_foundry import Runtime` and `State` both raise `ImportError`.
 - [ ] `poetry run pytest`, `ruff`, `mypy`, `docstring-lint.py`, `spec-lint.sh` and `docs-lint.sh`
@@ -479,12 +488,13 @@ that asserts behaviour named in `docs/invariants.md` is deleted, and none is wea
 ```
 // src/log_foundry/_lifecycle.py
 
-class State(enum.Enum):
-    UNCONFIGURED = "unconfigured"   # nothing resolved, owed, built or retired
-    RUNNING      = "running"        # a live worker, or a sink resolved or owed, not retired
-    SWAPPING     = "swapping"       # _swap_sink inside its work (_swaps_running non-empty)
-    DRAINING     = "draining"       # _shutdown_worker inside its body (_stops_running non-empty)
-    CLOSED       = "closed"         # retirements > 0 and no live worker
+class State(enum.Enum):             # values are enum.auto(): nothing reads them, and a literal
+                                    # "draining" is filed by the predicate roster as a worker question
+    UNCONFIGURED = enum.auto()      # nothing resolved, owed, built or retired
+    RUNNING      = enum.auto()      # a live worker, or a sink resolved or owed, not retired
+    SWAPPING     = enum.auto()      # _swap_sink inside its work (_swaps_running non-empty)
+    DRAINING     = enum.auto()      # _shutdown_worker inside its body (_stops_running non-empty)
+    CLOSED       = enum.auto()      # retirements > 0 and no live worker
 
 class Runtime:                      # was _Lifecycle; _state: Runtime stays the one instance
     # held today
@@ -632,3 +642,18 @@ updated for the rename and for the three loose names that moved.
   `_retry_declined` before this spec builds.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
 - 2026-11-05, drift review: the inventory adds `Worker._join_owed` and `_join_taken_over` (SPEC-068 FR-006), and its child column now has `Worker._stopped`, `Worker._stop` and `Runtime._stop` reset on resume through `refresh_stop_signal`, `_exit_deadline` reset only on resume, and each retired child's case.
+- 2026-11-09, build (base `3d65cf32`): `State`'s values are `enum.auto()` rather than the Data
+  Model's strings, because `tests/test_worker_predicate_roster.py`'s sentinel vocabulary contains
+  `draining` and filed the literal as a worker question; nothing reads the values. FR-005's
+  criteria are amended to name every addition and every edit beyond a path: FR-001's and FR-005's
+  own tests in `tests/test_runtime_holder.py`, the `Runtime.state` roster rows, FR-004's rewrite of
+  the model test, the `_FORK_SKIP` assertion in `test_sink_ownership.py` and the rename in
+  `test_owed_closes.py`. FR-003 as built: the inventory keys by name, so the Data Model's line
+  numbers (measured at `fda134a`) are not load-bearing and are left as they were; the AST finds 9
+  constructions outside the pair where the line grep finds 8 (`_fork.py` builds two on one line),
+  and the floor asserts 9; the child column also takes `none` and a sequence (`walk`, then
+  `reset`); a `walk` row may hold a lock or event one hop away (`Worker._stop` is handed
+  `Runtime.refresh_stop_signal()`'s return); `reset` handlers reach their writers through a
+  closure resolved by receiver, not by bare name; and `_fork._child_handlers`, `_installed` and
+  `reacquired_in_child` stay prose here and out of the code table, since they belong to no
+  FR-003 population.
