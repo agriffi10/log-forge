@@ -789,9 +789,11 @@ fourth shipped broken (SPEC-035 FR-001) — whose own first draft then prescribe
 would have re-broken SPEC-033 in the opposite direction.
 
 Since SPEC-040 each question is **one method on `_lifecycle._state`**, and a call site *selects*
-one rather than composing a predicate. The state and the guards live in `_lifecycle.py`;
-`decorator.py` keeps the decorator and the span machinery and reaches the worker only through
-`_lifecycle._get_worker()`.
+one rather than composing a predicate. `_state` is the one instance of `Runtime`, the class that
+holds all of the lifecycle bookkeeping. SPEC-077 renamed it from `_Lifecycle` and moved onto it the
+closer roster, the in-flight-close registry, the ownership record and their locks, which had been
+module globals. The state and the guards live in `_lifecycle.py`. `decorator.py` keeps the
+decorator and the span machinery and reaches the worker only through `_lifecycle._get_worker()`.
 
 | Category | Method | What it decides |
 |---|---|---|
@@ -805,9 +807,16 @@ through all of its callers), so a non-reentrant acquire inside a question would 
 them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
 read is a single atomic reference load, and a caller needing consistency across two reads takes
 the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span. The two
-moment predicates do take the leaf `_closing_now_lock`, which is the order the shipped code
+moment predicates do take the leaf `_state._closing_now_lock`, which is the order the shipped code
 already established — `_offer_orphan_signal` reached that lock under the lifecycle lock before
 SPEC-054 folded the read into the question — and nothing acquires the lifecycle lock beneath it.
+
+**`Runtime.state` is a fourth lock-free reader, but it is not a fourth question** (SPEC-077). It
+names which of five `State` members (`UNCONFIGURED`, `RUNNING`, `SWAPPING`, `DRAINING`, `CLOSED`)
+today's flags describe. It takes no lock, for the reason the three questions take none, and
+nothing in `src/` reads it, so no guard may select it. The process still holds four locks,
+`_state._lock` and the three leaves beside it, and `docs/decisions/pipeline/` → *Lifecycle state
+has one holder, Runtime* says why they are not one.
 
 **The moment is one category with two predicates, and a transition**, and that is stated here rather than left to
 be rediscovered at a site. The transition is `worker.claim_stop(deadline)` (SPEC-062): it asks the moment as an act, setting `_stopped`, recording the deadline and taking `Worker._lock`, so it is not a third predicate. `in_flight(sink)` asks whether the worker is *draining* into it, so
@@ -1111,7 +1120,7 @@ close it.
   `_final_drain` re-reading the queue after the stop until it has taken a sentinel.
 - **A `shutdown()` called inside an orphan-path sink's `emit` closes that sink from inside its own
   emit** (SPEC-068 diff review; invariant 5). With no span active, `log_foundry.info()` emits on the
-  caller's own thread (`api.py`), and `_Lifecycle.held` asks only about the worker's thread, so the
+  caller's own thread (`api.py`), and `Runtime.held` asks only about the worker's thread, so the
   closer takes and closes the sink under the emit that called it. A sink whose `emit` and `close`
   share a non-reentrant lock never returns from `info()`. The same before SPEC-068. **Closed by** a
   per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
@@ -1935,7 +1944,7 @@ and a third copy is a fork with no merge.
      tests sink-shaped before container-shaped, so an owned *non-sink* container subclass, and a
      container-subclass sink's own members, lose reach there. Neither is a destructive close, and
      the child's marking walk compensates.
-  7. **`_marking_failed` catches an escaping fault and the visit ceiling, not a partial walk.**
+  7. **`_state._marking_failed` catches an escaping fault and the visit ceiling, not a partial walk.**
      Every read inside the walk is absorbed a level down in `_fork`, so a walk that quietly
      reached less than everything raises nothing and leaves the flag clear; the sinks it missed
      are unrecorded rather than marked.
@@ -2065,7 +2074,7 @@ and a third copy is a fork with no merge.
   first looks. A connection reachable only from a *non-surviving thread's* frame is safe: CPython
   does not clear those frames in the child, so the reference leaks rather than becoming
   collectable (measured 0/20, against 13/20 for the same connection made garbage on the main
-  thread). A sink the library was handed is safe for a second, independent reason — `_owned` in
+  thread). A sink the library was handed is safe for a second, independent reason — `_state._owned` in
   `_lifecycle.py` holds a strong reference to every one, superseded sinks included, and never
   shrinks — so a live `SQLiteSink` is never finalized in a child at all.
 

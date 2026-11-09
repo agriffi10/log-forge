@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-077
 title: "Runtime Holds Today's Lifecycle State, With No Behaviour Change, and the Model Test Drives It"
 description: "Moves the lifecycle bookkeeping that lives in module globals onto one Runtime object, adds a State read off today's flags, and extends the model test to drive every lifecycle call against a state table."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-066, SPEC-068]
 arc: stability-redesign
 arc_order: 9
