@@ -141,8 +141,10 @@ SPEC-061 specifies is re-specified here.
 - **Any public name**, or any change to `emit`'s contract, `SinkLosses`, `configure()` or `Config`.
 - **Deleting a test.** No test is deleted. Tests that read a sink's `_lock` keep working through
   FR-005's read-only aliases: eight in `tests/test_fork_lifecycle.py`, and
-  `tests/test_sinks_oversize_deferral.py:284` and `tests/test_socket_oversize_deferral.py:186`.
-  The one that assigns it, `tests/test_fork_lifecycle.py:902` (`sink._lock = inherited`), is
+  `tests/test_sinks_oversize_deferral.py:284` and `tests/test_socket_oversize_deferral.py:186`
+  (lines at `fda134a`).
+  The one that assigns it, `tests/test_fork_lifecycle.py:902` at `095ccd76` (`:898` at
+  `fda134a`; `sink._lock = inherited`), is
   re-pointed at `sink._guard._lock`. The lints change by re-deriving their population (FR-005),
   never by deleting a case.
 
@@ -321,8 +323,9 @@ returns in the client's round trip, well inside it. A round that outlives it is 
 exists to stop waiting for, and that call's outcome is still counted (below). 0.5 s is a quarter of
 `DEFAULT_CLOSER_GRACE`. That leaves room for the release inside a full grace, but it is no
 guarantee: a detached close's grace is `min(DEFAULT_CLOSER_GRACE, deadline − now)`
-(`_lifecycle.py:1244`), so with less than 0.5 s of budget left the overlap wait alone can outlast
-it. The constant is private, a module constant of `_guard.py`, with that reason in its docstring.
+(`_lifecycle.py:1244` at `fda134a`), so with less than 0.5 s of budget left the overlap wait
+alone can outlast it. The constant is private, a module constant of `_guard.py`, with that reason
+in its docstring.
 
 **A section still inside when the release runs is told so.** After its `with` block exits,
 `Section.released_during` is true when the guard reached `CLOSED` while the section was admitted. A
@@ -545,7 +548,8 @@ against. So:
       concurrent section waiting until it leaves. For a `CLOSE_ONLY` adopter, `self._close_lock` is
       the guard's `_lock`. Assigning `_closed`, `_lock` or `_close_lock` raises `AttributeError`.
       `tests/test_fork_lifecycle.py`, `tests/test_sinks_oversize_deferral.py` and
-      `tests/test_socket_oversize_deferral.py` pass with only the line-902 edit.
+      `tests/test_socket_oversize_deferral.py` pass with only the line-902 edit (the line at
+      `095ccd76`).
 - [ ] Every sink that releases nothing (the Out of Scope list) still delivers a batch after
       `close()`, and none builds a `ClosedGuard`.
 - [ ] Serves invariants 7, 5 and 6: which sinks refuse is still enforced from the code, each
@@ -701,7 +705,7 @@ tests/
 ├── test_closed_guard.py         # FR-001 to FR-003 against doubles, both modes parametrised
 ├── test_sink_concurrency.py     # FR-002's adopter cases; FR-005's re-derived lints and fixtures
 ├── test_sink_post_close.py      # FR-004 across the adopters, worker and orphan
-├── test_fork_lifecycle.py       # + FR-006; :902 re-pointed at sink._guard._lock
+├── test_fork_lifecycle.py       # + FR-006; :902 (at 095ccd76) re-pointed at sink._guard._lock
 ├── test_sinks_kafka.py          # + FR-003's window
 └── test_deferral.py             # + ("KafkaSink", "emit") in IMMEDIATE
 ```
@@ -779,4 +783,5 @@ tests/
     the `FileSink` closed before the fork, which FR-004 requires to refuse. It is read as two
     sinks: the closed one re-acquires nothing in the child, and an open one in the same parent
     still accepts after the fork (the parent is untouched, invariant 12's other half).
-  - The test that assigns `sink._lock` is at `tests/test_fork_lifecycle.py:902`, not `:898`.
+  - The test that assigns `sink._lock` is at `tests/test_fork_lifecycle.py:902` at `095ccd76`
+    (`:898` at `fda134a`); the criteria named the older line.

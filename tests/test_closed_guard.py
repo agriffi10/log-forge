@@ -22,7 +22,7 @@ from log_foundry.sinks import _guard
 from log_foundry.sinks._guard import CLOSE_OVERLAP_WAIT, ClosedGuard, GuardMode
 from test_worker_exit_budget import _measured
 
-MODES = [GuardMode.SERIAL, GuardMode.CLOSE_ONLY]
+MODES = list(GuardMode)
 LIMIT = 2.0
 
 
@@ -437,7 +437,11 @@ def test_a_serial_close_waits_for_the_one_inside_and_refuses_the_queue() -> None
 
     close_thread = threading.Thread(target=closer, daemon=True)
     close_thread.start()
-    assert not release.done.wait(0.05), "the close released under the section inside"
+    deadline = time.monotonic() + LIMIT
+    while not guard.closed:
+        assert time.monotonic() < deadline, "the close never began"
+        time.sleep(0.001)
+    assert release.calls == 0, "the close released under the section inside"
     parked.finish()
     close_thread.join(LIMIT)
     for thread in callers:

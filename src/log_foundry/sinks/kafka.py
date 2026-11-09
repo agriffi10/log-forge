@@ -287,9 +287,8 @@ class KafkaSink:
 
         Raises:
           SinkDeliveryError: When the sink is closed or closing, or when every message was
-            refused so the
-            batch reached nothing — the total failure the worker's retry exists for
-            (SPEC-026 FR-001). Either leaves no refusal counted.
+            refused so the batch reached nothing — the total failure the worker's retry exists
+            for (SPEC-026 FR-001). Either leaves no refusal counted.
         """
         if not batch:
             return

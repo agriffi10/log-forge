@@ -13,6 +13,7 @@ from __future__ import annotations
 import ast
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -30,7 +31,6 @@ from log_foundry.worker import Worker
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 LIMIT = 5.0
 
@@ -739,3 +739,95 @@ def test_a_subclass_holding_the_1x_lock_holds_off_a_section(
         leave.set()
     assert done.wait(LIMIT), "the section never ran once the subclass let go"
     assert rig.calls() > before
+
+
+def _derived_adopters() -> tuple[dict[str, tuple[str, str, bool]], dict[str, ast.ClassDef]]:
+    """Every class building a ``ClosedGuard``, from the tree: mode, module, defines ``deliver``.
+
+    Returns the parsed classes too, so a caller can find who holds or subclasses one.
+    """
+    from test_sink_concurrency import _sink_modules, guard_builder_findings
+
+    trees = {path.name: ast.parse(path.read_text(encoding="utf-8")) for path in _sink_modules()}
+    modes, _ = guard_builder_findings(trees)
+    classes: dict[str, ast.ClassDef] = {}
+    adopters: dict[str, tuple[str, str, bool]] = {}
+    for module, tree in trees.items():
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            classes[node.name] = node
+            if node.name in modes:
+                defines = {m.name for m in node.body if isinstance(m, ast.FunctionDef)}
+                adopters[node.name] = (modes[node.name], module, "deliver" in defines)
+    return adopters, classes
+
+
+def _held_as(name: str, classes: dict[str, ast.ClassDef]) -> set[str]:
+    """The sinks a caller holds for an adopter: itself, its subclasses if private, or its holders.
+
+    A private base (``_RedisSink``) is held through the classes that subclass it; a transport
+    with no ``emit`` (``SocketTransport``) through the classes that build it.
+    """
+    node = classes[name]
+    if name.startswith("_"):
+        return {
+            other.name
+            for other in classes.values()
+            if any(isinstance(b, ast.Name) and b.id == name for b in other.bases)
+        }
+    if not any(isinstance(m, ast.FunctionDef) and m.name == "emit" for m in node.body):
+        return {
+            other.name
+            for other in classes.values()
+            if any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == name
+                for call in ast.walk(other)
+            )
+        }
+    return {name}
+
+
+def test_every_hand_listed_adopter_population_is_the_derived_one() -> None:
+    """Frame-1 review SF-4: no per-adopter list in these tests can shrink, or grow, silently.
+
+    Each list is held equal to what the tree says: the classes building a ``ClosedGuard`` (and
+    ``NATSSink`` where a list covers engine sinks with closed state of their own), each mapped
+    to the sink a caller holds for it — ``_RedisSink`` through both Redis sinks,
+    ``SocketTransport`` through ``SyslogSink`` and socket-mode ``LogstashSink``.
+    """
+    from test_sink_concurrency import CLOSED_MESSAGES, SERIAL_DRIVERS, guarded_section_findings
+
+    adopters, classes = _derived_adopters()
+    assert len(adopters) >= 11, f"the adopter scan collapsed to {sorted(adopters)}"
+    engine = {name for name, (_, _, deliver) in adopters.items() if deliver}
+    emit_only = set(adopters) - engine
+
+    def subclassed(names: set[str]) -> set[str]:
+        return {held for n in names for held in (_held_as(n, classes) if n.startswith("_") else {n})}
+
+    def held(names: set[str]) -> set[str]:
+        return {h for n in names for h in _held_as(n, classes)}
+
+    assert set(ENGINE_CLOSED) == subclassed(engine) | {"NATSSink"}
+    assert set(EMIT_ONLY_CLOSED) == subclassed(emit_only)
+    assert set(ADOPTER_RIGS) == held(set(adopters))
+    assert set(ALIAS_RIGS) == set(adopters)
+    for name, (_, lock) in ALIAS_RIGS.items():
+        expected = "_lock" if adopters[name][0] == "SERIAL" else "_close_lock"
+        assert lock == expected, (name, lock)
+        assert ALIAS_RIGS[name][0] in held({name}), (name, ALIAS_RIGS[name][0])
+    serial = {name for name, (mode, _, _) in adopters.items() if mode == "SERIAL"}
+    transports = {n for n in serial if _held_as(n, classes) != {n}}
+    assert set(SERIAL_DRIVERS) - held(transports) == serial - transports
+    assert all(set(SERIAL_DRIVERS) & held({t}) for t in transports)
+    modules = {module for _, module, _ in adopters.values()}
+    assert set(CLOSED_MESSAGES) == modules
+    import log_foundry
+
+    root = Path(log_foundry.__file__).parent / "sinks"
+    for module, openings in CLOSED_MESSAGES.items():
+        sections, _ = guarded_section_findings((root / module).read_text(encoding="utf-8"))
+        assert len(openings) == sections, (module, openings, sections)

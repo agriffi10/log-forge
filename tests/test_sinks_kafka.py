@@ -384,7 +384,9 @@ class ParkingProducer:
     The first ``flush`` can be parked too, so a ``flush()`` section can be held inside the sink.
     """
 
-    def __init__(self, *, park_flush: bool = False) -> None:
+    def __init__(self, *, park_flush: bool = False, refuse_at: int | None = None) -> None:
+        self.refuse_at = refuse_at
+        self.produced = 0
         self.inside = threading.Event()
         self.release = threading.Event()
         self.flushing = threading.Event()
@@ -395,8 +397,12 @@ class ParkingProducer:
         self.flushes: list[str] = []
 
     def produce(self, topic: str, *, value: bytes, key: object, callback: object) -> None:
-        self.inside.set()
-        assert self.release.wait(10.0)
+        self.produced += 1
+        if self.produced == 1:
+            self.inside.set()
+            assert self.release.wait(10.0)
+        if self.produced == self.refuse_at:
+            raise BufferError("queue full")
         self.queued.append(value)
 
     def poll(self, timeout: float) -> int:
@@ -463,7 +469,9 @@ def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush() -> No
     emitter = _producing(sink, producer)
     closer = threading.Thread(target=sink.close, daemon=True)
     closer.start()
+    deadline = time.monotonic() + 10.0
     while not sink._guard.closed:
+        assert time.monotonic() < deadline, "the close never began"
         time.sleep(0.001)
     with pytest.raises(SinkDeliveryError, match=r"^KafkaSink cannot flush: the sink is closed$"):
         sink.flush()
@@ -482,3 +490,26 @@ def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush() -> No
     flusher.join(10.0)
     assert watch.elapsed < 0.3, watch.elapsed
     assert parked.flushes[:2] == ["enter flusher", "leave flusher"], parked.flushes
+
+
+def test_an_overtaken_emit_counts_every_message_it_handed_over(capsys) -> None:
+    """FR-003 AC-3: the count is what that call handed to the producer, not one, not the batch.
+
+    Three events, one of which ``produce`` refuses: the two it accepted are counted ``failed``
+    and named in one line, and the refused one is counted as a refusal, once, elsewhere.
+    """
+    producer = ParkingProducer(refuse_at=2)
+    sink = KafkaSink("logs", producer=producer)
+    emitter = threading.Thread(
+        target=sink.emit, args=([{"m": 1}, {"m": 2}, {"m": 3}],), daemon=True
+    )
+    emitter.start()
+    assert producer.inside.wait(10.0), "the emit never reached produce()"
+    sink.close()
+    producer.release.set()
+    emitter.join(10.0)
+    assert len(producer.queued) == 2
+    assert sink.losses().failed == 2
+    lines = capsys.readouterr().err.splitlines()
+    overtaken = "log-foundry: lost 2 message(s); KafkaSink, produced while the sink was closing"
+    assert lines.count(overtaken) == 1, lines

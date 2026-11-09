@@ -2664,6 +2664,15 @@ def deliver(self, batch):
         ),
         (
             _GOOD_REFUSE.replace(
+                '            run_context().refuse(SinkDeliveryError("closed"))\n'
+                "            return Verdict.uniform(Outcome.REJECTED, len(batch))\n",
+                "            self.client.ping()\n"
+                '            raise SinkDeliveryError("closed")\n',
+            ),
+            "the refused branch is not one raise",
+        ),
+        (
+            _GOOD_REFUSE.replace(
                 "            return Verdict.uniform(Outcome.REJECTED, len(batch))\n",
                 "            return Verdict.uniform(Outcome.REJECTED, len(batch))\n"
                 "        else:\n            pass\n",
@@ -2677,6 +2686,7 @@ def deliver(self, batch):
         "unbound",
         "captured-context",
         "another-callee",
+        "call-before-raise",
         "else-branch",
     ],
 )
@@ -2799,6 +2809,21 @@ def test_the_guard_adopters_are_the_eleven() -> None:
     assert storing == LOCAL_CLOSED_STATE
 
 
+def test_the_adopter_roster_reports_a_second_build_beside_a_canonical_one() -> None:
+    """FR-005 AC-1's corpus (frame-1 NIT-1): a canonical build does not license another one."""
+    source = textwrap.dedent(
+        """
+        class Adopter:
+            def __init__(self):
+                self._guard = ClosedGuard(GuardMode.SERIAL)
+                self._spare = ClosedGuard(GuardMode.CLOSE_ONLY)
+        """
+    )
+    modes, findings = guard_builder_findings({"m.py": ast.parse(source)})
+    assert modes == {"Adopter": "SERIAL"}
+    assert len(findings) == 1 and "outside the canonical shape" in findings[0], findings
+
+
 @pytest.mark.parametrize(
     ("plant", "finding"),
     [
@@ -2854,13 +2879,45 @@ def _refused_branches(source: str) -> list[tuple[list[str], range]]:
     return found
 
 
+def _closed_constants(tree: ast.Module) -> list[tuple[str, int]]:
+    """Every string constant carrying ``is closed`` that is not a docstring, with its line.
+
+    Args:
+      tree: The parsed module.
+
+    Returns:
+      ``(text, line)`` per constant, an f-string's pieces each counted where they sit.
+
+    Raises:
+      None.
+    """
+    docstrings: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                docstrings.add(id(first.value))
+    return [
+        (node.value, node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "is closed" in node.value
+        and id(node) not in docstrings
+    ]
+
+
 def test_no_adopter_stores_its_lock_and_each_closed_message_sits_in_a_refused_branch() -> None:
     """FR-005 AC-2: no ``_lock``/``_close_lock`` store; each of the twelve messages once, refused.
 
     Each message is found by the literal that opens it, exactly once among the literals of the
     module's refused branches (by text, never by counting grep hits per module: ``postgres.py``
-    has prose lines that match the grep). The spec's instrument, ``grep -n 'is closed"'``, is then
-    run over each refused branch's lines and must find exactly one line per message there.
+    has prose lines that match the grep). "Exactly once" is then judged over the **whole**
+    module, not only its refused branches (frame-1 review SF-2): every non-docstring string
+    constant carrying ``is closed`` must sit inside a refused branch, and there are exactly as
+    many as the module has messages, so a second copy of a closed check — a pre-check before the
+    guard, say — is reported. The spec's instrument, ``grep -n 'is closed"'``, is then run over
+    each refused branch's lines and must find exactly one line per message there.
     """
     count = 0
     for path in _sink_modules():
@@ -2876,6 +2933,12 @@ def test_no_adopter_stores_its_lock_and_each_closed_message_sits_in_a_refused_br
         ], f"{path.name} stores a 1.x lock"
         branches = _refused_branches(source)
         literals = [literal for found, _ in branches for literal in found]
+        closed = _closed_constants(ast.parse(source))
+        assert len(closed) == len(CLOSED_MESSAGES[path.name]), (path.name, closed)
+        assert all(any(line in span for _, span in branches) for _, line in closed), (
+            path.name,
+            closed,
+        )
         for opening in CLOSED_MESSAGES[path.name]:
             assert literals.count(opening) == 1, (path.name, opening, literals)
             count += 1
