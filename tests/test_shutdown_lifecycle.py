@@ -10,7 +10,7 @@ import time
 import pytest
 
 import log_foundry
-from conftest import release_after_clock
+from conftest import cpu_window, release_after_clock
 from log_foundry import _lifecycle
 
 
@@ -276,7 +276,10 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait(capsys) -> None
 
     SPEC-068 FR-003 records this as a decision — an expired shutdown is final — and pins all of
     its shape here, not only the time: the second call is idle, writes nothing, and leaves the
-    sink open for a call that finds the thread ended. Its CPU window covers only that call.
+    sink open for a call that finds the thread ended. Its CPU window covers only that call, on the
+    caller's thread: the drain thread is parked inside the sink throughout, so only the caller
+    could spin. Its wall bound is half the second call's budget, the wait a call that joined the
+    abandoned drain would make, so a CI stall cannot reach it.
     """
     sink = WedgedSink()
     log_foundry.configure(service="t", sink=sink)
@@ -290,14 +293,15 @@ def test_an_expired_first_shutdown_does_not_make_the_second_wait(capsys) -> None
         assert worker.stopped_reason == "ShutdownTimeout", "the first shutdown did not expire"
         capsys.readouterr()
 
-        cpu = time.process_time()
         start = time.monotonic()
-        log_foundry.shutdown(timeout=3.0)
+        with cpu_window() as cpu:
+            log_foundry.shutdown(timeout=3.0)
         elapsed = time.monotonic() - start
-        spent = time.process_time() - cpu
+        spent = cpu.spent
 
-        assert elapsed < 0.1, (
-            f"the second shutdown waited {elapsed:.2f}s on a drain the first one abandoned"
+        assert elapsed < 3.0 / 2, (
+            f"the second shutdown waited {elapsed:.2f}s of its 3 s budget on a drain the first "
+            "one abandoned"
         )
         assert spent < 0.05, f"the second shutdown spent {spent:.3f}s of CPU: it is not idle"
         assert capsys.readouterr().err == "", "a losing caller writes nothing"

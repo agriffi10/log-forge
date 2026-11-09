@@ -55,13 +55,6 @@ P = 0.4
 D = 0.3
 """The ``drain_timeout`` the close cells pass, so a close against a stall costs 0.3 s, not 1 s."""
 
-NEXT_BOUND = 0.1
-"""Seconds the next caller may take to be refused while another thread holds the lock.
-
-A refusal made before the lock takes microseconds; a caller that reaches the lock instead waits
-for the holder, which releases after :data:`HOLD` seconds, so the gap is more than a second.
-"""
-
 FLOOR_PONG_DELAY = 1.0
 """Seconds the floor-budget test holds the probe's PONG, the wait a refusal at the floor skips.
 
@@ -73,6 +66,25 @@ few hundred milliseconds cannot fail it (it took 123 ms against the old shared 0
 
 HOLD = 1.5
 """Seconds the lock-holding thread keeps the lock, the cost a missing pre-lock refusal pays."""
+
+NEXT_BOUND = HOLD / 2
+"""Seconds the next caller may take to be refused while another thread holds the lock.
+
+A refusal made before the lock takes microseconds; a caller that reaches the lock instead waits
+for the holder, which releases after :data:`HOLD` seconds. The bound is half of that, so a CI
+stall of a few hundred milliseconds cannot fail it while the lock wait it guards against does.
+"""
+
+CAPABILITY_BUDGET = DEFAULT_CLOSE_TIMEOUT
+"""Seconds of budget each call in the missing-capability test runs under.
+
+The test passes it as ``publish_timeout``, the budget of ``emit`` and ``flush``, and leaves
+``drain_timeout`` at its default, which is this same value, because an injected client refuses
+the option. A sink that treats a capability the client never claimed as one it must wait for (a
+pending counter it polls to zero, a PONG it waits on, a closing round trip) waits out the call's
+own budget, so each call costs this much against that defect. A sink that does not wait returns
+in milliseconds, and the test's bound is half the budget, so a CI stall cannot fail it.
+"""
 
 QUEUED_BOUND = 1.5 * P
 """Seconds a caller queued on the lock behind a stalled call may take, from its own start.
@@ -496,11 +508,13 @@ def _lost_lines(err: str) -> list[str]:
 def _refused_while_locked(sink: NATSSink) -> tuple[float, BaseException | None]:
     """Calls ``emit`` while another thread holds the sink's lock, so only a pre-lock check refuses.
 
-    Waits briefly for either latch to read held, since the probe a stalled call leaves behind is
-    aged from the start of the call whose budget it spent and holds by the call's return; a sink
-    whose latch never holds fails the call's own assertion instead, after :data:`HOLD` seconds.
+    Waits for either latch to read held, since the probe a stalled call leaves behind is aged
+    from the start of the call whose budget it spent and holds by the call's return: measured at
+    ``c810333d``, the wait returned within a millisecond on every cell, so its default bound
+    costs nothing and no CI stall can cut it short. A sink whose latch never holds fails the
+    call's own assertion instead, after :data:`HOLD` seconds.
     """
-    _wait_until(lambda: sink._latched() or sink._publish_stuck(), within=NEXT_BOUND)
+    _wait_until(lambda: sink._latched() or sink._publish_stuck())
     holding = threading.Event()
     release = threading.Event()
 
@@ -536,7 +550,9 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
             if cell.fake.get("park") and cell.fake.get("silent_after") is None:
                 assert _wait_until(lambda: sink._probe is None or sink._probe[0].done())
             else:
-                _wait_until(lambda: sink._latched() or sink._publish_stuck(), within=NEXT_BOUND)
+                assert _wait_until(lambda: sink._latched() or sink._publish_stuck()), (
+                    f"{cell_id}: the prelude left neither latch held"
+                )
         capsys.readouterr()
         pings_before = fake.calls.count("flush")
         queued: list[tuple[float, BaseException | None]] = []
@@ -687,10 +703,11 @@ def test_matrix_a_client_missing_a_capability_is_never_refused_for_it(
     # The sink does not invent a loss or a refusal for a capability the client never claimed:
     # every call returns, nothing is counted, nothing is announced, and the loop thread ends.
     if owned:
-        sink, client, _ = _build(monkeypatch, factory=factory, publish_timeout=P)
+        sink, client, _ = _build(monkeypatch, factory=factory, publish_timeout=CAPABILITY_BUDGET)
     else:
         client = factory()
-        sink = NATSSink("logs", client=client, publish_timeout=P)
+        sink = NATSSink("logs", client=client, publish_timeout=CAPABILITY_BUDGET)
+    assert sink._drain_timeout == CAPABILITY_BUDGET, "the close runs under the same budget"
     outcomes = [
         _timed(lambda: sink.emit([{"n": i} for i in range(3)])),
         _timed(sink.flush),
@@ -698,7 +715,7 @@ def test_matrix_a_client_missing_a_capability_is_never_refused_for_it(
     ]
     for elapsed, error in outcomes:
         assert error is None, error
-        assert elapsed < NEXT_BOUND, f"{elapsed:.3f}s"
+        assert elapsed < CAPABILITY_BUDGET / 2, f"{elapsed:.3f}s"
     assert client.calls.count("publish") == 3
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
     assert _lost_lines(capsys.readouterr().err) == []

@@ -8,6 +8,7 @@ import time
 
 import pytest
 
+from conftest import cpu_window
 from log_foundry import SinkLosses
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.pubsub import DEFAULT_OVERFLOW_TIMEOUT, GooglePubSubSink
@@ -464,15 +465,20 @@ def test_the_overflow_wait_is_bounded_per_emit_not_per_future() -> None:
 
     The budget is deliberately loose relative to the operation — the point is that ~10x the
     per-future timeout must NOT be reachable, so a generous ceiling still fails the old code.
+    The honest pass takes one ``overflow_timeout`` (0.2 s) and a per-future one ten (2.0 s); the
+    ceiling is half the latter. At 0.05 s the per-future pass took only 0.5 s, too short for a
+    ceiling under it to clear a CI stall.
     """
+    timeout = 0.2
+    over_the_limit = 10
     client = PollablePublisher(lambda _i: StalledFuture())
-    sink = GooglePubSubSink("t", client=client, max_pending=2, overflow_timeout=0.05)
+    sink = GooglePubSubSink("t", client=client, max_pending=2, overflow_timeout=timeout)
     start = time.monotonic()
-    sink.emit([{"i": i} for i in range(12)])
+    sink.emit([{"i": i} for i in range(2 + over_the_limit)])
     elapsed = time.monotonic() - start
-    assert elapsed < 0.05 * 4, (
-        f"one deadline covers the whole overflow pass; blocked {elapsed:.2f}s for 10 over the "
-        f"limit at a 0.05s budget"
+    assert elapsed < over_the_limit * timeout / 2, (
+        f"one deadline covers the whole overflow pass; blocked {elapsed:.2f}s for "
+        f"{over_the_limit} over the limit at a {timeout}s budget"
     )
 
 
@@ -549,9 +555,9 @@ def test_the_slice_loop_does_not_spin_when_a_bounded_wait_fails_instantly() -> N
 
     client = PollablePublisher(lambda _i: InstantlyExpiring())
     sink = GooglePubSubSink("t", client=client, max_pending=1, overflow_timeout=0.3)
-    cpu = time.process_time()
-    sink.emit([{"i": i} for i in range(4)])
-    burned = time.process_time() - cpu
+    with cpu_window() as cpu:
+        sink.emit([{"i": i} for i in range(4)])
+    burned = cpu.spent
     calls = sum(future.calls for future in client.futures)
     assert burned < 0.1, f"the slice loop spun: {burned:.3f}s of CPU for a 0.3s bounded wait"
     assert calls < 100, f"and it made {calls} result() calls where a handful should do"
@@ -604,10 +610,10 @@ def test_close_is_bounded_rather_than_running_to_the_clients_deadline() -> None:
     )
     sink.emit([{"i": i} for i in range(5)])
     wall = time.monotonic()
-    cpu = time.process_time()
-    sink.close()
+    with cpu_window() as cpu:
+        sink.close()
     elapsed = time.monotonic() - wall
-    burned = time.process_time() - cpu
+    burned = cpu.spent
 
     assert elapsed < 3.0, (
         f"close() is bounded; ran {elapsed:.2f}s against a {CLIENT_DEADLINE}s stand-in deadline"

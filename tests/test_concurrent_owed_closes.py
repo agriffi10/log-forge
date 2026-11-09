@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
+from conftest import cpu_window
 from log_foundry import _lifecycle
 
 if TYPE_CHECKING:
@@ -552,18 +553,19 @@ def test_a_worker_path_shutdown_with_no_close_in_flight_pays_no_grace() -> None:
     flight, and here there are none.
 
     **CPU as well as wall**, per invariant 3: a busy-spin would satisfy a wall-clock bound alone,
-    and this is the file where a wait is measured.
+    and this is the file where a wait is measured. The window is process-wide, because the close
+    and the drain run on threads other than the caller's.
     """
     sink = SlowCloseSink("live", seconds=0.0)
     _arm_on_the_worker_path(sink)
 
     wall = time.monotonic()
-    cpu = time.process_time()
-    log_foundry.shutdown(timeout=30.0)
-    elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+    with cpu_window("process") as cpu:
+        log_foundry.shutdown(timeout=30.0)
+    elapsed, spent = time.monotonic() - wall, cpu.spent
 
     assert sink.closes == 1, "the premise: it did the work, it just did not wait"
-    assert elapsed < 0.2, (
+    assert elapsed < _lifecycle.DEFAULT_CLOSER_GRACE / 2, (
         f"a shutdown with no close in flight waited {elapsed:.3f}s against a "
         f"{_lifecycle.DEFAULT_CLOSER_GRACE}s grace it had no reason to pay"
     )

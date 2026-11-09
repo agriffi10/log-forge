@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
-from conftest import install_worker, retire_process, run_concurrently
+from conftest import cpu_window, install_worker, retire_process, run_concurrently
 from log_foundry import _lifecycle
 from log_foundry import worker as worker_mod
 from log_foundry.worker import Worker
@@ -168,16 +168,17 @@ def _three_events() -> list[dict[str, object]]:
 def _measured(call: Callable[[], object]) -> float:
     """Runs a shutdown call and returns its wall time, asserting its CPU time.
 
-    `time.process_time()` is process-wide across threads, which is deliberate: the busy-spin
-    invariant 3 guards against would be in the drain thread's retry loop, and `thread_time()`
-    would see only the caller idling in `join`. The only threads alive in the window are this
-    test's — the caller in `join`, the drain thread inside the sink's `Event.wait` — so the
-    bound is a property of the process and needs no load allowance.
+    The window is `cpu_window("process")`, process-wide across threads, which is deliberate: the
+    busy-spin invariant 3 guards against would be in the drain thread's retry loop, and the
+    thread scope would see only the caller idling in `join`. The window pauses garbage
+    collection, whose full passes cost more than the bound on their own; a thread leaked by an
+    earlier test still counts, which only a spinning leak could make matter.
     """
-    cpu = time.process_time()
     wall = time.monotonic()
-    call()
-    elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+    with cpu_window("process") as cpu:
+        call()
+    elapsed = time.monotonic() - wall
+    spent = cpu.spent
     assert spent < _CPU_BOUND, f"the shutdown spent {spent:.3f}s of CPU: the wait is not idle"
     return elapsed
 

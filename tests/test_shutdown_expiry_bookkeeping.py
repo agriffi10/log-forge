@@ -9,9 +9,11 @@ then forked resumed a drain that exited at once (FR-005). FR-003's decision, tha
 shutdown is final, is pinned in `tests/test_shutdown_lifecycle.py`.
 
 Every bounded wait here asserts its CPU time as well as its wall time, through
-`test_worker_exit_budget._measured`, whose window is process-wide across threads, so a spinning
-drain thread is caught as well as a spinning caller. Every window covers idle waits only. A
-wedged sink is released in a `finally`, so no blocked drain thread outlives its test.
+`conftest.cpu_window`: process-wide (through `test_worker_exit_budget._measured`, or in a forked
+child) where a spinning drain thread must be caught, and on the calling thread alone where the
+drain thread is wedged inside the sink, so only the caller could spin. Every window covers idle
+waits only. A wedged sink is released in a `finally`, so no blocked drain thread outlives its
+test.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import time
 import pytest
 
 import log_foundry
-from conftest import install_worker, retire_process, run_concurrently
+from conftest import cpu_window, install_worker, retire_process, run_concurrently
 from log_foundry import _diag, _lifecycle
 from log_foundry import worker as worker_mod
 from log_foundry.worker import Worker
@@ -365,30 +367,38 @@ def test_two_concurrent_expiring_shutdowns_write_one_line(capsys) -> None:
     """FR-004 AC-1, a regression pin. Only the caller that won the gate joins and announces.
 
     Against `stop()` deciding the gate on `_drain_settled` rather than on `claim_stop`, both
-    callers see it clear, both join, and the wedged sink gets two lines.
+    callers see it clear, both join, and the wedged sink gets two lines. The CPU bound is on the
+    two callers' own threads, summed: the drain thread is parked inside the sink for the whole
+    window, so the callers are where an inline spin would be. A spin the library moved onto a
+    thread of its own, with the caller joining it, is not counted here; in
+    `test_worker_exit_budget.py`, the process-scope
+    `test_the_recording_caller_is_the_joining_caller_whichever_arrives_first` catches that
+    shape, measured by planting it.
     """
     sink = _GatedSink()
     worker = _wedged(sink)
     install_worker(worker)
     elapsed: list[float] = []
+    cpu: list[float] = []
     lock = threading.Lock()
 
     def work(_index: int, _iteration: int) -> None:
         started = time.monotonic()
-        _lifecycle._shutdown_worker(0.3)
+        with cpu_window() as window:
+            _lifecycle._shutdown_worker(0.3)
         with lock:
             elapsed.append(time.monotonic() - started)
+            cpu.append(window.spent)
 
     try:
-        cpu = time.process_time()
         errors = run_concurrently(work, threads=2)
-        spent = time.process_time() - cpu
+        spent = sum(cpu)
         err = capsys.readouterr().err
         assert not errors, errors
         assert _expiry_lines(err) == 1, err
         assert worker.stopped_reason == "ShutdownTimeout"
         assert len(elapsed) == 2 and max(elapsed) < 0.3 + _SLACK, elapsed
-        assert spent < _CPU_BOUND, f"the two calls spent {spent:.3f}s of CPU: not idle"
+        assert len(cpu) == 2 and spent < _CPU_BOUND, f"the two calls spent {spent:.3f}s of CPU"
     finally:
         _release(sink, worker)
 
@@ -421,13 +431,13 @@ def test_a_caller_parked_after_a_lost_claim_returns_at_once_after_the_expiry(
             parked.set()
             assert release.wait(10.0)
             measured["released"] = time.monotonic()
-            measured["cpu"] = time.process_time()
         real_stop(self, timeout, claimed=claimed)
 
     def lose() -> None:
-        _lifecycle._shutdown_worker(3.0)
+        with cpu_window() as window:
+            _lifecycle._shutdown_worker(3.0)
         measured["returned"] = time.monotonic()
-        measured["spent"] = time.process_time() - measured["cpu"]
+        measured["spent"] = window.spent
 
     monkeypatch.setattr(Worker, "stop", parking_stop)
     winner = _MeasuredThread(lambda: _lifecycle._shutdown_worker(0.3), name="winner")
@@ -446,7 +456,7 @@ def test_a_caller_parked_after_a_lost_claim_returns_at_once_after_the_expiry(
         loser.join(10.0)
         assert not loser.is_alive()
         took = measured["returned"] - measured["released"]
-        assert took < 0.1, f"the loser waited {took:.2f}s after its release"
+        assert took < 3.0 / 2, f"the loser waited {took:.2f}s of its 3 s budget after its release"
         assert measured["spent"] < _CPU_BOUND, measured
         assert capsys.readouterr().err == "", "the loser writes nothing"
         assert sink.closes == 0, "the drain thread is still inside the sink"
@@ -470,7 +480,7 @@ def test_a_later_shutdown_does_not_reopen_a_declined_retry(capsys) -> None:
         assert worker.stopped_reason == "ShutdownTimeout", "the premise: the first one expired"
 
         elapsed = _measured(lambda: _lifecycle._shutdown_worker(5.0))
-        assert elapsed < 0.1, f"the later caller waited {elapsed:.2f}s"
+        assert elapsed < 5.0 / 2, f"the later caller waited {elapsed:.2f}s of its 5 s budget"
         assert worker._exit_deadline == first, "the record is write-once"
     finally:
         released = time.monotonic()
@@ -545,15 +555,19 @@ class _ReentrantSink:
             self.delivered.extend(batch)
 
     def _measured_shutdown(self, timeout: float) -> tuple[float, float, str | None, int]:
-        """Runs one `shutdown()` on this thread and reports what it cost and did."""
-        cpu = time.process_time()
+        """Runs one `shutdown()` on this thread and reports what it cost and did.
+
+        The CPU window is this thread's alone: the call runs on the drain thread, which is the
+        thread the call must not leave spinning.
+        """
         wall = time.monotonic()
         raised: str | None = None
-        try:
-            log_foundry.shutdown(timeout=timeout)
-        except BaseException as exc:
-            raised = type(exc).__name__
-        return time.monotonic() - wall, time.process_time() - cpu, raised, self.closes
+        with cpu_window() as cpu:
+            try:
+                log_foundry.shutdown(timeout=timeout)
+            except BaseException as exc:
+                raised = type(exc).__name__
+        return time.monotonic() - wall, cpu.spent, raised, self.closes
 
     def close(self) -> None:
         """Counts the close."""
@@ -719,7 +733,7 @@ def test_only_one_caller_takes_the_owed_join_over(capsys) -> None:
         _handed_over(capsys, sink)
         capsys.readouterr()
         elapsed = _measured(lambda: _lifecycle._shutdown_worker(3.0))
-        assert elapsed < 0.1, f"the third call took {elapsed:.2f}s"
+        assert elapsed < 3.0 / 2, f"the third call took {elapsed:.2f}s of its 3 s budget"
         assert capsys.readouterr().err == "", "and wrote nothing"
     finally:
         sink.release.set()
@@ -735,7 +749,7 @@ def test_a_second_drain_thread_shutdown_does_not_take_the_owed_join(capsys) -> N
     try:
         worker = _reentrant(sink)
         elapsed, spent, raised, _ = _inner_result(sink, 1)
-        assert raised is None and elapsed < 0.1 and spent < _CPU_BOUND, (elapsed, spent, raised)
+        assert raised is None and elapsed < 5.0 / 2 and spent < _CPU_BOUND, (elapsed, spent, raised)
         assert worker._join_owed, "the second drain-thread call left the join owed"
         capsys.readouterr()
 
@@ -749,7 +763,7 @@ def test_a_second_drain_thread_shutdown_does_not_take_the_owed_join(capsys) -> N
         sink.release.set()
 
 
-@pytest.mark.parametrize(("main_timeout", "inner_timeout"), [(3.0, 1.0), (1.0, 5.0)])
+@pytest.mark.parametrize(("main_timeout", "inner_timeout"), [(3.0, 2.0), (2.0, 5.0)])
 def test_a_drain_thread_shutdown_that_loses_returns_at_once(
     main_timeout: float, inner_timeout: float, capsys
 ) -> None:
@@ -759,6 +773,8 @@ def test_a_drain_thread_shutdown_that_loses_returns_at_once(
     calls `shutdown()`, so the inner call provably loses. At `fda134a` it waited on
     `_drain_settled`, which only this thread's exit or the main call's expiry could set: with
     budgets 3.0 and 1.0 it blocked 1.01 s, and with 1.0 and 5.0 it made the main join expire.
+    The rows now run 2 s where those ran 1 s, so the wait the defect makes (the inner budget in
+    the first row, the main call's expiry in the second) is 2 s, and the bound is half of it.
     """
     sink = _ReentrantSink((inner_timeout,))
     sink.go.clear()
@@ -776,7 +792,8 @@ def test_a_drain_thread_shutdown_that_loses_returns_at_once(
     returned = time.monotonic()
 
     took, spent, raised, _ = _inner_result(sink)
-    assert raised is None and took < 0.1 and spent < _CPU_BOUND, (took, spent, raised)
+    defect_wait = min(main_timeout, inner_timeout)
+    assert raised is None and took < defect_wait / 2 and spent < _CPU_BOUND, (took, spent, raised)
     recorded = worker._exit_deadline
     assert recorded is not None, "the premise"
     assert called + main_timeout <= recorded <= returned + main_timeout, (
@@ -1106,10 +1123,10 @@ def test_a_directly_stopped_worker_resumes_delivering_in_a_forked_child() -> Non
         report_from_child(_STARTED)
         alive = worker._thread.is_alive()
         worker.submit(_span(1))
-        cpu = time.process_time()
         wall = time.monotonic()
-        log_foundry.shutdown(timeout=2.0)
-        elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+        with cpu_window("process") as cpu:
+            log_foundry.shutdown(timeout=2.0)
+        elapsed, spent = time.monotonic() - wall, cpu.spent
         mine = sum(n for pid, n, ok in sink.emits if pid == os.getpid() and ok)
         return (
             f"alive={alive} delivered={mine} elapsed={elapsed:.3f} cpu={spent:.4f} "
@@ -1139,10 +1156,10 @@ def test_a_resumed_child_declines_retries_against_its_own_deadline() -> None:
         captured = io.StringIO()
         sys.stderr = captured
         worker.submit(_span(1))
-        cpu = time.process_time()
         wall = time.monotonic()
-        log_foundry.shutdown(timeout=1.2)
-        elapsed, spent = time.monotonic() - wall, time.process_time() - cpu
+        with cpu_window("process") as cpu:
+            log_foundry.shutdown(timeout=1.2)
+        elapsed, spent = time.monotonic() - wall, cpu.spent
         attempts = sum(1 for pid, _, _ in sink.emits if pid == os.getpid())
         lost = _lost_lines(captured.getvalue())
         declined = sum(1 for _, _, rest in lost if "shutdown() deadline" in rest)

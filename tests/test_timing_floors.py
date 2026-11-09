@@ -1,4 +1,4 @@
-"""A lower bound on elapsed time must measure a delay that opens after the clock it is read on.
+"""A timing bound must measure what its test claims: a floor, a ceiling, or a CPU window.
 
 A floor such as ``assert elapsed >= 0.4`` holds only if the delay behind it begins **after** the
 test's ``time.monotonic()`` read. When the delay begins first, every preemption between the two is
@@ -36,6 +36,19 @@ assignment counts), the call to the duration-returning function, or the stopwatc
 - :data:`UNRESOLVED_CLOCK`: a floor whose clock the scan cannot find, such as one started on an
   attribute (``self.began``) or in a walrus. Refused rather than skipped, because a floor the gate
   counts but cannot judge would read as guarded.
+- :data:`CEILING_UNDER_STALL`: a *ceiling*, the same durations on the lesser side of a comparison,
+  whose bound resolves to a number under :data:`STALL_ALLOWANCE`. A call that returns at once took
+  123 ms on CI, so ``elapsed < 0.1`` is a coin toss there: the NATS matrix's shared 0.1 s bound
+  and the NATS liveness tests' 0.05 s latch bounds were this shape. A ceiling is half the wait
+  the defect it guards would make, with that wait raised to a second or more. The bound resolves
+  through literals, ``+ - * /`` and module-level names, followed into a sibling test module they
+  are imported from.
+- :data:`RAW_CPU_READ`: a reference under ``tests/`` to a CPU clock by name (``time.process_time``
+  and ``thread_time``, their ``_ns`` forms, ``resource.getrusage``, ``os.times``,
+  ``pthread_getcpuclockid`` and the CPU clock ids) other than in the table ``conftest.cpu_window``
+  reads from. A process-wide reading counted a full garbage collection and every leaked thread
+  against a 0.05 s bound, and flaked at 0.104 s; the helper pauses collection and makes the test
+  name its scope.
 
 **What it does not see, recorded rather than chased:**
 
@@ -61,7 +74,26 @@ assignment counts), the call to the duration-returning function, or the stopwatc
   and could fail open for the helper exemption, if one module's fake waits on the event another
   module's same-named sleeper ignores.
 
-Each is a reason to use ``release_after_clock`` in a new floor, not a hole this gate claims to close.
+- for a ceiling, a bound that does not resolve: a local (``took < budget / 2``), an attribute
+  (``_lifecycle.DEFAULT_CLOSER_GRACE / 2``), a call, or a constant from ``src/``. Those are
+  usually derived bounds, which is the point, but a small one written as a local is not judged;
+- a ceiling on a duration the scan does not recognise, by the same rules as a floor: a ``for``
+  unpack (the NATS capability test's three calls), a ``max(...)`` over a list of durations, a
+  subtraction of two recorded instants (``measured["returned"] - measured["released"]``), or a
+  tuple field of a helper that returns a duration it did not compute from a clock itself;
+- a ceiling on a nanosecond clock (``time.monotonic_ns() - start < 50_000_000``), which is
+  recognised and then judged as that many seconds, so it is never refused;
+- a ``while`` condition is not a ceiling and is skipped, so a deadline loop is never refused, and
+  neither is a ceiling a test writes as a loop condition;
+- a CPU clock reached without its name: ``os`` imported under another name (``o.times()``),
+  ``getattr(time, "process_time")``, a literal clock id passed to ``clock_gettime``, or a third
+  party's reader such as ``psutil``'s ``cpu_times()``;
+- a duration reached through ``await``, kept in a name and then indexed (``r = _timed(f); r[0]``),
+  summed by ``+=``, or returned by a helper imported under another name; a ceiling constant
+  re-exported through a second module (one import hop is followed), or written with ``//``.
+
+Each is a reason to use ``release_after_clock`` in a new floor, and to derive a new ceiling from
+the wait it guards, not a hole this gate claims to close.
 Two false positives are accepted because they fail closed: a hang-guard ``Timer`` armed before a
 helper floor is refused (move it after the ``with``), and a duration-returning helper's call line is
 taken as its clock, so a timer armed between ``began`` and that call is refused (inline the
@@ -77,6 +109,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import functools
+import gc
 import pathlib
 import threading
 import time
@@ -84,7 +117,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from conftest import release_after_clock
+from conftest import cpu_window, release_after_clock
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -105,6 +138,42 @@ SLEEP_AFTER_SIGNAL = (
     "the test waits for a fake's entry signal before a raw clock, and the fake sleeps after it"
 )
 UNRESOLVED_CLOCK = "a floor whose clock the scan cannot find, so it cannot be judged"
+RAW_CPU_READ = "a CPU-time clock read outside conftest.cpu_window, which pauses collection"
+CEILING_UNDER_STALL = "a ceiling on a duration under STALL_ALLOWANCE, which a CI stall can reach"
+
+STALL_ALLOWANCE = 0.5
+"""Seconds below which no upper bound on a measured duration may sit.
+
+CI has stalled a call that returns at once for 123 ms (PR 317's first integration run), so a
+ceiling of 0.1 s distinguishes nothing there. A ceiling is derived from the wait the defect it
+guards would make, half of it, and that wait is made at least a second long, as
+``test_sinks_nats_matrix.FLOOR_PONG_DELAY`` is; half a second is then the smallest ceiling.
+"""
+
+CPU_READERS = frozenset(
+    {
+        "process_time",
+        "process_time_ns",
+        "thread_time",
+        "thread_time_ns",
+        "getrusage",
+        "pthread_getcpuclockid",
+        "CLOCK_PROCESS_CPUTIME_ID",
+        "CLOCK_THREAD_CPUTIME_ID",
+    }
+)
+"""Names whose every reference under ``tests/`` is a CPU-time reading, or one in the making."""
+
+CPU_TABLE = ("conftest.py", "CPU_SCOPES")
+"""The one place a CPU clock may be named: the table ``conftest.cpu_window`` reads from."""
+
+CEILING_FLOOR = 85
+"""Fewest upper bounds on a duration the scan must find across ``tests/``, below today's count.
+
+Re-measure it with ``len(ceilings)`` after ``scan(TESTS, ceilings)``. The same margin as
+:data:`POPULATION_FLOOR`, for the same reason: a change that stops the scan recognising a
+duration must not pass :data:`CEILING_UNDER_STALL` by leaving it nothing to judge.
+"""
 
 POPULATION_FLOOR = 25
 """Fewest floors the scan must find across ``tests/``, below the count it finds today.
@@ -282,6 +351,10 @@ def _arming_lines(own: list[ast.AST]) -> list[int]:
 def _returned_positions(own: list[ast.AST]) -> set[int | None]:
     """Returns the tuple positions at which a function's ``return`` gives a duration.
 
+    A returned name counts when the function assigned it a duration, as
+    ``test_worker_exit_budget._measured`` does (``elapsed = ...; return elapsed``), so a ceiling
+    on such a helper's result is judged like one on an inline subtraction.
+
     Args:
       own: The function's :func:`_own_nodes`.
 
@@ -291,13 +364,27 @@ def _returned_positions(own: list[ast.AST]) -> set[int | None]:
     Raises:
       None.
     """
+    named: set[str] = set()
+    for node in own:
+        if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            pairs = [(t, node.value) for t in targets]
+            for target, value in pairs:
+                if isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
+                    pairs.extend(zip(target.elts, value.elts, strict=False))
+                elif isinstance(target, ast.Name) and _is_duration_expr(value):
+                    named.add(target.id)
+
+    def returns_duration(value: ast.AST) -> bool:
+        return _is_duration_expr(value) or (isinstance(value, ast.Name) and value.id in named)
+
     positions: set[int | None] = set()
     for node in own:
         if not isinstance(node, ast.Return) or node.value is None:
             continue
         if isinstance(node.value, ast.Tuple):
-            positions.update(i for i, v in enumerate(node.value.elts) if _is_duration_expr(v))
-        elif _is_duration_expr(node.value):
+            positions.update(i for i, v in enumerate(node.value.elts) if returns_duration(v))
+        elif returns_duration(node.value):
             positions.add(None)
     return positions
 
@@ -341,6 +428,7 @@ def _floors_in(
     own: list[ast.AST],
     path: str,
     returners: dict[str, frozenset[int | None]],
+    ceilings: list[Ceiling] | None = None,
 ) -> list[Floor]:
     """Returns every floor in ``fn``'s own body, each with the line its clock was read on.
 
@@ -349,6 +437,7 @@ def _floors_in(
       own: Its :func:`_own_nodes`.
       path: Its file, for the result.
       returners: The duration-returning functions visible to it.
+      ceilings: Where to append each upper bound on a duration the body holds, when given.
 
     Returns:
       The floors, in line order.
@@ -360,6 +449,9 @@ def _floors_in(
         (node for node in own if hasattr(node, "lineno")),
         key=lambda node: (node.lineno, node.col_offset),
     )
+    looping = {
+        id(part) for node in own if isinstance(node, ast.While) for part in ast.walk(node.test)
+    }
     clocks: dict[str, list[int]] = {}
     watches: dict[str, list[tuple[int, str | None]]] = {}
     durations: dict[str, list[tuple[int, Measured]]] = {}
@@ -435,13 +527,34 @@ def _floors_in(
                 low, high = sides[index], sides[index + 1]
                 if isinstance(op, ast.GtE | ast.Gt):
                     measured = duration_of(low, node.lineno)
+                    capped = duration_of(high, node.lineno) is not None, low
                 elif isinstance(op, ast.LtE | ast.Lt):
                     measured = duration_of(high, node.lineno)
+                    capped = duration_of(low, node.lineno) is not None, high
                 else:
-                    measured = None
+                    measured, capped = None, (False, low)
                 if measured is not None:
                     floors.append(Floor(path, node.lineno, fn.name, *measured))
+                if capped[0] and ceilings is not None and id(node) not in looping:
+                    ceilings.append(Ceiling(path, node.lineno, fn.name, capped[1]))
     return floors
+
+
+@dataclasses.dataclass(frozen=True)
+class Ceiling:
+    """One upper bound on a measured duration, with the expression that bounds it.
+
+    Attributes:
+      path: The file, relative to the scanned root.
+      line: The comparison's line.
+      function: The enclosing function's name.
+      bound: The expression on the other side of the comparison.
+    """
+
+    path: str
+    line: int
+    function: str
+    bound: ast.expr
 
 
 Measured = tuple[int | None, bool, str | None]
@@ -616,6 +729,137 @@ def _entry_waits(own: list[ast.AST]) -> list[tuple[int, str]]:
     return waits
 
 
+def _cpu_reads(path: str, tree: ast.Module) -> list[int]:
+    """Returns the lines of a module that name a CPU clock outside ``conftest.CPU_SCOPES``.
+
+    A reference, not only a call, is refused, so ``clock = time.process_time`` and ``from time
+    import process_time`` are caught where they are written, before any call can hide behind the
+    alias. ``os.times`` is refused by its receiver, because ``times`` alone names other things.
+
+    Args:
+      path: The module's path, relative to the scanned root.
+      tree: The parsed module.
+
+    Returns:
+      The lines, with repeats.
+
+    Raises:
+      None.
+    """
+    exempt: set[int] = set()
+    if path == CPU_TABLE[0]:
+        for node in tree.body:
+            targets = node.targets if isinstance(node, ast.Assign) else []
+            if isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            if any(isinstance(t, ast.Name) and t.id == CPU_TABLE[1] for t in targets):
+                exempt.update(id(child) for child in ast.walk(node))
+    lines = []
+    for node in ast.walk(tree):
+        if id(node) in exempt:
+            continue
+        if isinstance(node, ast.Attribute):
+            on_os = isinstance(node.value, ast.Name) and node.value.id == "os"
+            if node.attr in CPU_READERS or (on_os and node.attr == "times"):
+                lines.append(node.lineno)
+        elif isinstance(node, ast.Name) and node.id in CPU_READERS:
+            lines.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom):
+            lines.extend(
+                node.lineno
+                for alias in node.names
+                if alias.name in CPU_READERS or (node.module == "os" and alias.name == "times")
+            )
+    return lines
+
+
+def _constants(trees: dict[str, ast.Module]) -> dict[str, dict[str, ast.expr | tuple[str, str]]]:
+    """Maps each module to its module-level names: an expression, or a scanned module's name.
+
+    A name assigned at module level keeps its last assignment, the value it holds by the time a
+    test runs. A name imported by ``from <m> import`` from a module the scan parsed maps to that
+    module's path and the name.
+
+    Args:
+      trees: Parsed modules by path.
+
+    Returns:
+      ``{path: {name: expression or (path, name)}}``.
+
+    Raises:
+      None.
+    """
+    modules = {path.removesuffix(".py").replace("/", "."): path for path in trees}
+    table: dict[str, dict[str, ast.expr | tuple[str, str]]] = {}
+    for path, tree in trees.items():
+        names: dict[str, ast.expr | tuple[str, str]] = {}
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                target, value = node.targets[0], node.value
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                target, value = node.target, node.value
+            elif isinstance(node, ast.ImportFrom) and node.module in modules and not node.level:
+                for alias in node.names:
+                    names[alias.asname or alias.name] = (modules[node.module], alias.name)
+                continue
+            else:
+                continue
+            if isinstance(target, ast.Name):
+                names[target.id] = value
+        table[path] = names
+    return table
+
+
+def _seconds(
+    expr: ast.expr, path: str, table: dict[str, dict[str, ast.expr | tuple[str, str]]]
+) -> float | None:
+    """Returns the number an expression evaluates to from literals and module constants alone.
+
+    Literals, ``+ - * /`` and names resolved through :func:`_constants` are followed; anything
+    else (a local, an attribute, a call) is not a constant the scan can judge.
+
+    Args:
+      expr: The bound's expression.
+      path: The module it is written in.
+      table: :func:`_constants`'s result.
+
+    Returns:
+      The value, or None when it does not resolve.
+
+    Raises:
+      None.
+    """
+
+    def value(node: ast.expr, where: str, depth: int) -> float | None:
+        if depth > 20:
+            return None
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            return float(node.value)
+        arithmetic = ast.Add | ast.Sub | ast.Mult | ast.Div
+        if isinstance(node, ast.BinOp) and isinstance(node.op, arithmetic):
+            left, right = value(node.left, where, depth + 1), value(node.right, where, depth + 1)
+            if left is None or right is None or (isinstance(node.op, ast.Div) and right == 0):
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            return left * right if isinstance(node.op, ast.Mult) else left / right
+        if isinstance(node, ast.Name):
+            bound = table.get(where, {}).get(node.id)
+            if isinstance(bound, tuple):
+                other, name = bound
+                imported = table.get(other, {}).get(name)
+                if isinstance(imported, ast.expr):
+                    return value(imported, other, depth + 1)
+                return None
+            if bound is not None:
+                return value(bound, where, depth + 1)
+        return None
+
+    return value(expr, path, 0)
+
+
 def _parse(root: pathlib.Path) -> dict[str, ast.Module]:
     """Parses every ``*.py`` under ``root``, this gate included.
 
@@ -635,11 +879,14 @@ def _parse(root: pathlib.Path) -> dict[str, ast.Module]:
     return trees
 
 
-def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
+def scan(
+    root: pathlib.Path, ceilings: list[Ceiling] | None = None
+) -> tuple[list[Floor], list[Finding]]:
     """Returns every floor under ``root`` and every refusal of an unsafe timing shape.
 
     Args:
       root: The directory to scan.
+      ceilings: Where to append every upper bound on a duration the scan finds, when given.
 
     Returns:
       ``(floors, findings)``, findings sorted by path and line.
@@ -654,7 +901,10 @@ def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
     functions: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef, list[ast.AST]]] = []
     returners: dict[str, frozenset[int | None]] = {}
     findings: set[Finding] = set()
+    if ceilings is None:
+        ceilings = []
     for path, tree in trees.items():
+        findings.update(Finding(path, line, RAW_CPU_READ) for line in _cpu_reads(path, tree))
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
                 own = _own_nodes(node)
@@ -672,7 +922,7 @@ def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
     for path, fn, own in functions:
         if not any(isinstance(node, ast.Compare) for node in own):
             continue
-        found = _floors_in(fn, own, path, returners)
+        found = _floors_in(fn, own, path, returners, ceilings)
         floors.extend(found)
         if not found:
             continue
@@ -697,6 +947,11 @@ def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
                     for line, event in waits
                     if event in events and line < floor.clock_line
                 )
+    table = _constants(trees)
+    for ceiling in ceilings:
+        seconds = _seconds(ceiling.bound, ceiling.path, table)
+        if seconds is not None and seconds < STALL_ALLOWANCE:
+            findings.add(Finding(ceiling.path, ceiling.line, CEILING_UNDER_STALL))
     return floors, sorted(findings, key=lambda f: (f.path, f.line, f.reason))
 
 
@@ -720,6 +975,16 @@ def test_the_scan_sees_the_population_it_guards() -> None:
     assert any(f.path == "test_sinks_nats_liveness.py" and not f.helper for f in floors), (
         "the NATS liveness floors read through `_timed` are no longer recognised"
     )
+
+
+def test_the_scan_sees_the_ceilings_it_judges() -> None:
+    """A scan that stopped recognising a duration would find no ceiling to refuse."""
+    ceilings: list[Ceiling] = []
+    scan(TESTS, ceilings)
+    assert len(ceilings) >= CEILING_FLOOR, f"only {len(ceilings)} ceilings found"
+    table = _constants(_parse(TESTS))
+    resolved = [c for c in ceilings if _seconds(c.bound, c.path, table) is not None]
+    assert len(resolved) >= len(ceilings) // 2, f"only {len(resolved)} ceilings resolve"
 
 
 # --- The corpus: each shape the gate refuses, with its reason, and each it must leave alone ---
@@ -1076,6 +1341,239 @@ def test_it(closer):
         SLEEP_AFTER_SIGNAL,
         "sink.in_close.wait(5.0)",
     ),
+    "process-time-read-in-a-test": (
+        """
+def test_it(sink):
+    cpu = time.process_time()
+    sink.close()
+    assert cpu < 0.05
+""",
+        RAW_CPU_READ,
+        "cpu = time.process_time()",
+    ),
+    "thread-time-ns-read-in-a-helper": (
+        """
+def _spent(call):
+    call()
+    return time.thread_time_ns()
+""",
+        RAW_CPU_READ,
+        "return time.thread_time_ns()",
+    ),
+    "a-cpu-clock-aliased-before-it-is-called": (
+        """
+CLOCK = time.thread_time
+""",
+        RAW_CPU_READ,
+        "CLOCK = time.thread_time",
+    ),
+    "a-cpu-clock-imported-by-name": (
+        """
+from time import process_time_ns as cpu_now
+""",
+        RAW_CPU_READ,
+        "from time import process_time_ns as cpu_now",
+    ),
+    "a-cpu-clock-named-through-a-star-import": (
+        """
+from time import *
+
+
+def test_it(sink):
+    cpu = process_time()
+""",
+        RAW_CPU_READ,
+        "cpu = process_time()",
+    ),
+    "os-times": (
+        """
+def test_it(sink):
+    sink.close()
+    assert os.times().user < 0.05
+""",
+        RAW_CPU_READ,
+        "assert os.times().user < 0.05",
+    ),
+    "os-times-imported-by-name": (
+        """
+from os import times
+""",
+        RAW_CPU_READ,
+        "from os import times",
+    ),
+    "getrusage": (
+        """
+def test_it(sink):
+    before = resource.getrusage(resource.RUSAGE_SELF)
+""",
+        RAW_CPU_READ,
+        "before = resource.getrusage(resource.RUSAGE_SELF)",
+    ),
+    "a-cpu-clock-id-passed-to-clock-gettime": (
+        """
+def test_it(sink):
+    began = time.clock_gettime(time.CLOCK_THREAD_CPUTIME_ID)
+""",
+        RAW_CPU_READ,
+        "began = time.clock_gettime(time.CLOCK_THREAD_CPUTIME_ID)",
+    ),
+    "a-whole-call-under-a-small-literal": (
+        """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.1
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < 0.1",
+    ),
+    "a-reversed-ceiling-on-an-inline-duration": (
+        """
+def test_it(sink):
+    start = time.perf_counter()
+    sink.close()
+    assert 0.2 > time.perf_counter() - start
+""",
+        CEILING_UNDER_STALL,
+        "assert 0.2 > time.perf_counter() - start",
+    ),
+    "a-ceiling-from-a-module-constant": (
+        """
+NEXT_BOUND = 0.1
+
+
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    assert time.monotonic() - start <= NEXT_BOUND
+""",
+        CEILING_UNDER_STALL,
+        "assert time.monotonic() - start <= NEXT_BOUND",
+    ),
+    "a-ceiling-from-arithmetic-on-constants": (
+        """
+P = 0.2
+
+
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < P + 0.2
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < P + 0.2",
+    ),
+    "a-ceiling-from-a-product": (
+        """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 2 * 0.2
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < 2 * 0.2",
+    ),
+    "a-ceiling-from-a-difference": (
+        """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0 - 0.7
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < 1.0 - 0.7",
+    ),
+    "a-ceiling-from-a-quotient": (
+        """
+HOLD = 0.6
+
+
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < HOLD / 2
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < HOLD / 2",
+    ),
+    "a-ceiling-on-a-helper-that-returns-a-named-duration": (
+        """
+def _measured(call):
+    wall = time.monotonic()
+    call()
+    elapsed = time.monotonic() - wall
+    return elapsed
+
+
+def test_it(sink):
+    assert _measured(sink.close) < 0.1
+""",
+        CEILING_UNDER_STALL,
+        "assert _measured(sink.close) < 0.1",
+    ),
+    "a-cpu-clock-id-read-for-another-thread": (
+        """
+def test_it(sink, thread):
+    clock = time.pthread_getcpuclockid(thread.ident)
+""",
+        RAW_CPU_READ,
+        "clock = time.pthread_getcpuclockid(thread.ident)",
+    ),
+    "a-constant-reassigned-down-is-judged-at-its-last-value": (
+        """
+BOUND = 1.0
+BOUND = 0.1
+
+
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    assert time.monotonic() - start < BOUND
+""",
+        CEILING_UNDER_STALL,
+        "assert time.monotonic() - start < BOUND",
+    ),
+    "a-small-ceiling-chained-after-a-safe-floor": (
+        """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert 0.05 <= elapsed < 0.3
+""",
+        CEILING_UNDER_STALL,
+        "assert 0.05 <= elapsed < 0.3",
+    ),
+    "a-ceiling-on-a-returned-duration": (
+        """
+def _timed(call):
+    began = time.monotonic()
+    call()
+    return time.monotonic() - began, None
+
+
+def test_it(sink):
+    elapsed, _error = _timed(sink.close)
+    assert elapsed < 0.05
+""",
+        CEILING_UNDER_STALL,
+        "assert elapsed < 0.05",
+    ),
+    "a-ceiling-on-a-stopwatch": (
+        """
+def test_it(sink, ev):
+    with release_after_clock(1.0, ev.set) as watch:
+        sink.close()
+    assert watch.elapsed < 0.2
+""",
+        CEILING_UNDER_STALL,
+        "assert watch.elapsed < 0.2",
+    ),
 }
 
 SILENT = {
@@ -1290,7 +1788,126 @@ def test_it(sink, ev):
     elapsed = time.monotonic() - start
     assert elapsed < 1.0
 """,
+    "cpu-read-through-the-helper": """
+def test_it(sink):
+    with cpu_window("process") as cpu:
+        sink.close()
+    assert cpu.spent < 0.05
+""",
+    "a-ceiling-at-the-allowance": """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 0.5
+""",
+    "a-ceiling-derived-from-the-wait-it-guards": """
+HOLD = 1.5
+
+
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < HOLD / 2
+""",
+    "a-ceiling-from-a-difference-taken-in-order": """
+def test_it(sink):
+    start = time.monotonic()
+    sink.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0 - 0.5
+""",
+    "a-deadline-loop-is-not-a-ceiling": """
+def test_it(sink):
+    start = time.monotonic()
+    while time.monotonic() - start < 0.3 and not sink.done:
+        sink.poll()
+    began = time.perf_counter()
+    while time.perf_counter() - began < 0.2:
+        pass
+""",
+    "small-bounds-on-things-that-are-not-wall-durations": """
+def test_it(sink):
+    start = time.monotonic()
+    with cpu_window() as cpu:
+        sink.close()
+    elapsed = time.monotonic() - start
+    assert cpu.spent < 0.05
+    assert sink.closes < 0.5 * 2
+    assert elapsed >= 0.1
+""",
+    "names-that-only-resemble-a-cpu-clock": """
+def test_it(sink, frame):
+    process_timeout = 1.0
+    sink.thread_timer = None
+    frame.times()
+    times = [1, 2]
+    assert "time.process_time()" not in sink.close(timeout=process_timeout)
+""",
 }
+
+CONFTEST_CPU = {
+    "the-helper-table-is-the-one-exemption": (
+        'CPU_SCOPES = {"thread": time.thread_time, "process": time.process_time}\n',
+        [],
+    ),
+    "an-annotated-helper-table-is-exempt-too": (
+        "CPU_SCOPES: dict = {'thread': time.thread_time}\n",
+        [],
+    ),
+    "another-name-in-conftest-is-not": (
+        "CPU_SCOPES = {}\nOTHER = {'thread': time.thread_time}\n",
+        [2],
+    ),
+    "a-function-in-conftest-is-not": (
+        "CPU_SCOPES = {}\ndef cpu():\n    return time.process_time()\n",
+        [3],
+    ),
+}
+"""``conftest.py`` sources (one each) and the lines the gate must refuse in them."""
+
+
+@pytest.mark.parametrize("case", sorted(CONFTEST_CPU))
+def test_only_conftests_cpu_table_may_name_a_cpu_clock(case: str, tmp_path) -> None:
+    """The exemption is one assignment in one file: a neighbour of it is refused like any site."""
+    source, refused = CONFTEST_CPU[case]
+    (tmp_path / "conftest.py").write_text("import time\n" + source, encoding="utf-8")
+    _floors, findings = scan(tmp_path)
+    assert [(f.path, f.line, f.reason) for f in findings] == [
+        ("conftest.py", line + 1, RAW_CPU_READ) for line in refused
+    ]
+
+
+@pytest.mark.parametrize(
+    ("imported", "alias", "refused"),
+    [
+        ("BOUND = 0.1\n", "BOUND", True),
+        ("BOUND = 2.0\n", "BOUND", False),
+        ("SMALL = 0.1\n", "SMALL as BOUND", True),
+    ],
+    ids=["small", "large", "renamed"],
+)
+def test_a_ceiling_constant_is_followed_into_the_module_it_is_imported_from(
+    imported: str, alias: str, refused: bool, tmp_path
+) -> None:
+    """``_SLACK`` and its kind are imported from a sibling test module, and judged there."""
+    (tmp_path / "bounds_m.py").write_text(imported, encoding="utf-8")
+    source = (
+        f"from bounds_m import {alias}\n\n\ndef test_it(sink):\n    start = time.monotonic()\n"
+        "    sink.close()\n    assert time.monotonic() - start < BOUND\n"
+    )
+    _floors, findings = _scan_source(tmp_path, source)
+    line = (_HEAD + source).splitlines().index("    assert time.monotonic() - start < BOUND") + 1
+    expected = [("test_m.py", line, CEILING_UNDER_STALL)] if refused else []
+    assert [(f.path, f.line, f.reason) for f in findings] == expected
+
+
+def test_the_cpu_table_is_exempt_only_in_conftest(tmp_path) -> None:
+    """The same table written in a test module is a CPU read, refused on its line."""
+    source = 'CPU_SCOPES = {"process": time.process_time}\n'
+    _floors, findings = _scan_source(tmp_path, source)
+    assert [(f.line, f.reason) for f in findings] == [(_HEAD.count("\n") + 1, RAW_CPU_READ)]
 
 
 def _scan_source(tmp_path: pathlib.Path, source: str) -> tuple[list[Floor], list[Finding]]:
@@ -1393,7 +2010,7 @@ def test_the_scan_recognises_each_form_of_floor(case: str, tmp_path) -> None:
     ]
 
 
-# --- The helper the gate exempts: its two promises, pinned on the helper itself ---------------
+# --- The helpers the gate points to: their promises, pinned on the helpers themselves --------
 
 
 def test_release_after_clock_releases_once_when_the_timed_call_returns_early() -> None:
@@ -1420,3 +2037,67 @@ def test_release_after_clock_releases_once_when_its_timer_fires() -> None:
         assert released.wait(5.0)
     assert calls == [1], calls
     assert watch.elapsed >= 0.1, f"released {watch.elapsed:.4f}s after the clock"
+
+
+def _spin_for(cpu_seconds: float) -> None:
+    """Burns at least ``cpu_seconds`` of this thread's CPU, measured through the helper."""
+    burned = 0.0
+    while burned < cpu_seconds:
+        with cpu_window() as chunk:
+            sum(range(100_000))
+        burned += chunk.spent
+
+
+@pytest.mark.parametrize("scope", ["thread", "process"])
+def test_cpu_window_counts_another_threads_spin_only_in_the_process_scope(scope: str) -> None:
+    """The thread scope is the caller's alone; the process scope sees a spinner it waits on."""
+    spinner = threading.Thread(target=_spin_for, args=(0.2,))
+    with cpu_window(scope) as window:
+        spinner.start()
+        spinner.join(30.0)
+    assert not spinner.is_alive()
+    if scope == "thread":
+        assert window.spent < 0.05, f"the idle caller was charged {window.spent:.3f}s"
+    else:
+        assert window.spent >= 0.2, f"the spinner's 0.2s was not counted: {window.spent:.3f}s"
+
+
+def test_cpu_window_pauses_collection_until_the_last_concurrent_window_closes() -> None:
+    """Two windows on two threads: the first to close must not resume collection for the other."""
+    assert gc.isenabled(), "the premise: collection runs between tests"
+    opened = threading.Event()
+    close = threading.Event()
+
+    def other() -> None:
+        with cpu_window():
+            opened.set()
+            assert close.wait(10.0)
+
+    thread = threading.Thread(target=other)
+    with cpu_window():
+        thread.start()
+        assert opened.wait(10.0)
+    try:
+        assert not gc.isenabled(), "the other thread's window is still open"
+    finally:
+        close.set()
+        thread.join(10.0)
+    assert gc.isenabled(), "the last window to close resumed collection"
+
+
+def test_cpu_window_leaves_collection_off_when_it_found_it_off() -> None:
+    """A test that turned collection off itself gets it back off."""
+    gc.disable()
+    try:
+        with cpu_window():
+            assert not gc.isenabled()
+        assert not gc.isenabled()
+    finally:
+        gc.enable()
+
+
+def test_cpu_window_refuses_a_reading_taken_inside_the_block() -> None:
+    """Read while open, ``spent`` would be a zero every bound passes."""
+    with cpu_window() as window, pytest.raises(RuntimeError, match="before the window closed"):
+        _ = window.spent
+    assert window.spent >= 0.0

@@ -62,6 +62,13 @@ dropped module reads as a smaller pass count (SPEC-041). The rule is stated in
   slow thing on an Event and let the helper release it, so the delay opens after the clock by
   construction. A fake that owns its delay arms a `DelayArmedOnUse` from its first operation,
   never from `__init__`. `test_timing_floors.py` refuses the shapes that flaked here before.
+- **An upper bound on elapsed time is half the wait its defect would make**, with that wait a
+  second or more: never a small constant for "returns at once", which a CI stall reaches (one
+  took 123 ms). `test_timing_floors.py` refuses a ceiling it can resolve below 0.5 s.
+- **CPU time is read through `cpu_window`** (`conftest.py`), never a raw `process_time` or
+  `thread_time`: it pauses garbage collection, whose full passes alone cost more than the usual
+  0.05 s bound, and makes the test name its scope (`"thread"` unless the thread that could spin
+  is one the test cannot measure on). `test_timing_floors.py` refuses any other CPU clock read.
 
 ## Docstrings
 
