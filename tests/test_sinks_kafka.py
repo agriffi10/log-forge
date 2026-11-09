@@ -11,6 +11,7 @@ import pytest
 
 from conftest import release_after_clock
 from log_foundry import SinkLosses
+from log_foundry.sinks import _guard
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, KafkaSink
 from test_worker_exit_budget import _measured
@@ -427,15 +428,24 @@ def _producing(sink: KafkaSink, producer: ParkingProducer) -> threading.Thread:
     return thread
 
 
-def test_a_produce_released_during_the_close_wait_is_flushed(capsys) -> None:
-    """FR-003 AC-3, first variant: released 0.1 s after the close began, the close flushes it."""
+DEFECT_WAIT = 2.0
+"""The overlap bound these tests patch in, so a ceiling of half of it separates a close that ended
+when the call left from one that waited the whole bound (``test_timing_floors``'s rule)."""
+
+
+def test_a_produce_released_during_the_close_wait_is_flushed(capsys, monkeypatch) -> None:
+    """FR-003 AC-3, first variant: released 0.1 s after the close began, the close flushes it.
+
+    The close ends when the produce leaves, inside half the patched overlap bound.
+    """
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", DEFECT_WAIT)
     producer = ParkingProducer()
     sink = KafkaSink("logs", producer=producer)
     emitter = _producing(sink, producer)
     with release_after_clock(0.1, producer.release.set) as watch:
         sink.close()
     emitter.join(10.0)
-    assert watch.elapsed < 0.3, watch.elapsed
+    assert watch.elapsed < DEFECT_WAIT / 2, watch.elapsed
     assert producer.delivered == [b'{"m": 1}'] and producer.queued == []
     assert sink.losses().failed == 0
     assert capsys.readouterr().err == ""
@@ -462,8 +472,13 @@ def test_a_produce_released_after_close_is_counted_and_announced(capsys) -> None
     ], lines
 
 
-def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush() -> None:
-    """FR-003 AC-4: ``flush()`` is a section with the same refusal rule as ``emit``."""
+def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush(monkeypatch) -> None:
+    """FR-003 AC-4: ``flush()`` is a section with the same refusal rule as ``emit``.
+
+    The second half's close ends when the parked flush leaves, inside half the patched overlap
+    bound, and its own flush runs only after that one.
+    """
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", DEFECT_WAIT)
     producer = ParkingProducer()
     sink = KafkaSink("logs", producer=producer)
     emitter = _producing(sink, producer)
@@ -488,7 +503,7 @@ def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush() -> No
     with release_after_clock(0.1, parked.unflush.set) as watch:
         other.close()
     flusher.join(10.0)
-    assert watch.elapsed < 0.3, watch.elapsed
+    assert watch.elapsed < DEFECT_WAIT / 2, watch.elapsed
     assert parked.flushes[:2] == ["enter flusher", "leave flusher"], parked.flushes
 
 

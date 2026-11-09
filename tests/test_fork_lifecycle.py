@@ -4181,10 +4181,14 @@ def test_a_child_forked_inside_a_close_only_section_closes_at_once(
     """SPEC-076 FR-006 AC-2: a parent's section is not one the child's close waits for.
 
     Without the pid adoption the child's guard would count the parent's section inside and its
-    close would wait the whole ``CLOSE_OVERLAP_WAIT`` for a thread that does not exist there.
+    close would wait the whole ``CLOSE_OVERLAP_WAIT`` for a thread that does not exist there. The
+    bound is patched to 2 s, which the child inherits, so the ceiling is half of it (the rule
+    ``tests/test_timing_floors.py`` states, which it cannot see here through the child's output).
     """
     import sink_rigs
+    from log_foundry.sinks import _guard
 
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", 2.0)
     rig = sink_rigs.RIGS["MongoDBSink"](monkeypatch, tmp_path)
     sink = rig.sink
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
@@ -4201,7 +4205,7 @@ def test_a_child_forked_inside_a_close_only_section_closes_at_once(
         leave.set()
         holder.join(5.0)
     assert result.finished, f"the child {result.ending}: {result.output!r}"
-    assert float(result.output) < 0.25, result.output
+    assert float(result.output) < 1.0, result.output
 
 
 def test_a_child_of_a_closing_parent_admits_and_of_a_closed_one_refuses(

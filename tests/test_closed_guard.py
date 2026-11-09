@@ -3,7 +3,7 @@
 Every park is an Event wait with a limit, never a sleep, and every lower bound on a duration is
 read from a delay armed after its clock: the guard's own ``Event.wait`` inside the measured call,
 or ``conftest.release_after_clock``. CPU time is read through ``test_worker_exit_budget._measured``,
-which asserts the wait was idle. Serves invariants 1, 3, 5 and 7.
+a ``conftest.cpu_window``, which asserts the wait was idle. Serves invariants 1, 3, 5 and 7.
 """
 
 from __future__ import annotations
@@ -24,6 +24,20 @@ from test_worker_exit_budget import _measured
 
 MODES = list(GuardMode)
 LIMIT = 2.0
+DEFECT_WAIT = 2.0
+"""The wait each ceiling's defect is made to cost, at least a second (``test_timing_floors``).
+
+A ceiling is half of it: ``CLOSE_OVERLAP_WAIT`` is patched to it where the defect would wait the
+overlap bound, and a parked section is held for it where the defect would wait on that section.
+Re-derived under #323's ``STALL_ALLOWANCE`` rule; the spec's 0.05 s, 0.25 s and 0.3 s were not.
+"""
+
+
+@pytest.fixture
+def long_overlap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Makes the ``CLOSE_ONLY`` overlap bound ``DEFECT_WAIT`` for the test, so a ceiling of half
+    of it separates a close that ended early from one that waited the bound."""
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", DEFECT_WAIT)
 
 
 class Release:
@@ -451,31 +465,35 @@ def test_a_serial_close_waits_for_the_one_inside_and_refuses_the_queue() -> None
 
 
 def test_a_caller_arriving_while_a_serial_close_waits_is_refused_at_once() -> None:
-    """AC-2: refused within 0.05 s, while another thread still holds the lock."""
+    """AC-2: refused without waiting on the lock, while another thread still holds it.
+
+    The section inside holds the lock for ``DEFECT_WAIT``; a caller that blocked on the lock
+    instead of being refused would wait that long, so the ceiling is half of it.
+    """
     guard = ClosedGuard(GuardMode.SERIAL)
     parked = Parked(guard).start()
     closer = _closing(guard, Release())
-    began = time.monotonic()
-    with guard.enter() as section:
-        took = time.monotonic() - began
+    with release_after_clock(DEFECT_WAIT, parked.leave.set) as watch, guard.enter() as section:
+        took = watch.elapsed
         admitted = bool(section)
         lock_held_elsewhere = guard._lock.locked()
     assert not admitted and lock_held_elsewhere
-    assert took < 0.05, took
-    parked.finish()
+    assert took < DEFECT_WAIT / 2, took
+    parked.thread.join(LIMIT)
     closer.join(LIMIT)
 
 
 @pytest.mark.parametrize("mode", MODES, ids=lambda m: m.name)
+@pytest.mark.usefixtures("long_overlap")
 def test_a_close_with_nothing_inside_is_prompt(mode: GuardMode) -> None:
-    """AC-3: a close with no section inside returns within 0.05 s and releases once."""
+    """AC-3: a close with no section inside does not wait the overlap bound, and releases once."""
     guard = ClosedGuard(mode)
     release = Release()
     began = time.monotonic()
     guard.close(release)
     took = time.monotonic() - began
     assert release.calls == 1
-    assert took < 0.05, took
+    assert took < DEFECT_WAIT / 2, took
 
 
 def test_a_serial_section_is_never_released_during() -> None:
@@ -491,8 +509,13 @@ def test_a_serial_section_is_never_released_during() -> None:
 # -- FR-003 -------------------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("long_overlap")
 def test_a_close_only_close_waits_for_a_section_that_leaves() -> None:
-    """AC-1: the section leaves 0.2 s after the close began; the release follows it, under 0.3 s."""
+    """AC-1: the section leaves 0.2 s after the close began; the release follows it at once.
+
+    The close ends when the section leaves, well inside half the (patched) overlap bound, where
+    a close that waited the whole bound regardless would take all of it.
+    """
     guard = ClosedGuard(GuardMode.CLOSE_ONLY)
     parked = Parked(guard).start()
     release = Release()
@@ -501,7 +524,7 @@ def test_a_close_only_close_waits_for_a_section_that_leaves() -> None:
     parked.thread.join(LIMIT)
     assert release.calls == 1 and release.done_at is not None and parked.left_at is not None
     assert release.done_at >= parked.left_at, "the release ran before the section left"
-    assert watch.elapsed < 0.3, watch.elapsed
+    assert watch.elapsed < DEFECT_WAIT / 2, watch.elapsed
     assert parked.section.released_during is False
     assert not _admitted(guard)
 
@@ -519,8 +542,13 @@ def test_a_close_only_close_stops_waiting_at_the_bound() -> None:
     assert CLOSE_OVERLAP_WAIT == 0.5
 
 
+@pytest.mark.usefixtures("long_overlap")
 def test_a_close_only_close_refuses_new_sections_while_it_waits() -> None:
-    """AC-1: while the close waits on the section inside, a new ``enter()`` is refused at once."""
+    """AC-1: while the close waits on the section inside, a new ``enter()`` is refused at once.
+
+    The close waits the (patched) overlap bound, so an ``enter()`` that waited for it would take
+    that long; the ceiling is half of it.
+    """
     guard = ClosedGuard(GuardMode.CLOSE_ONLY)
     parked = Parked(guard).start()
     closer = _closing(guard, Release())
@@ -528,7 +556,7 @@ def test_a_close_only_close_refuses_new_sections_while_it_waits() -> None:
     admitted = _admitted(guard)
     took = time.monotonic() - began
     assert not admitted
-    assert took < 0.05, took
+    assert took < DEFECT_WAIT / 2, took
     parked.finish()
     closer.join(LIMIT)
 
@@ -574,9 +602,14 @@ def _as_child(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_a_child_does_not_wait_for_a_parent_section(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A guard read in another pid counts no parent section inside, so its close is prompt."""
+    """A guard read in another pid counts no parent section inside, so its close is prompt.
+
+    Without the adoption the close would wait the (patched) overlap bound for the parent's
+    section; the ceiling is half of it.
+    """
     guard = ClosedGuard(GuardMode.CLOSE_ONLY)
     parked = Parked(guard).start()
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", DEFECT_WAIT)
     _as_child(monkeypatch)
     release = Release()
     began = time.monotonic()
@@ -585,7 +618,7 @@ def test_a_child_does_not_wait_for_a_parent_section(monkeypatch: pytest.MonkeyPa
     monkeypatch.undo()
     parked.finish()
     assert release.calls == 1
-    assert took < 0.25, took
+    assert took < DEFECT_WAIT / 2, took
 
 
 def test_a_child_of_a_closing_parent_admits_and_of_a_closed_one_refuses(

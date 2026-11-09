@@ -128,7 +128,9 @@ class ClosedGuard:
     ``CLOSING``, refusing every section, and the next close runs the release. One residual is
     accepted: an interrupt landing inside a ``CLOSE_ONLY`` :meth:`enter` between registering the
     section and entering its ``try`` leaks one count, so a later close waits the whole
-    :data:`CLOSE_OVERLAP_WAIT` before it releases, which is still bounded.
+    :data:`CLOSE_OVERLAP_WAIT` before it releases, which is still bounded. An interrupt inside that
+    ``try``'s ``finally``, before the count is taken back (in the state lock's acquisition or the
+    ``_adopt`` call), leaks one count the same way, with the same bounded cost.
 
     **What it must never define** is ``emit``: ``_lifecycle`` records any object carrying both
     ``emit`` and ``close`` as a sink, and would then release the guard as one.

@@ -788,3 +788,11 @@ tests/
 - At completion: FR-003's "a call the client gives no timeout" for Redis is narrowed. The installed
   `redis-py` 8.1.0 builds a connection with a 5 s socket timeout by default, so the call is bounded
   by the client's own timeout, which the library neither sets nor sees. The rule is unchanged.
+- After rebasing onto #323 (`3835a30e`), whose timing gate refuses a ceiling under its 0.5 s
+  `STALL_ALLOWANCE`: the criteria's ceilings were re-derived by its rule, half the wait the defect
+  would make, with that wait made at least 1 s. FR-002's 0.05 s for a caller arriving while a
+  `SERIAL` close waits is now 1.0 s against a section held 2 s; FR-002's 0.05 s idle close, FR-003's
+  0.05 s refusal while a `CLOSE_ONLY` close waits and its 0.3 s close after a section leaves,
+  FR-003's two 0.3 s Kafka and `flush()` closes, and FR-006's 0.25 s child close are now 1.0 s
+  with `CLOSE_OVERLAP_WAIT` patched to 2 s in those tests. The 0.45 s to 0.75 s window on the bound
+  itself is unchanged. Each test still kills the mutant it was written for.
