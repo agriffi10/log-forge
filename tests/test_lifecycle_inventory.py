@@ -17,9 +17,9 @@ which is how a rename shrinks a roster silently.
   alias of either (``worker.py``'s ``_lifecycle_state``, derived rather than listed) anywhere.
 - *Module state in* ``_lifecycle.py``: a module-level binding is a **constant** when its name with
   leading underscores removed is upper case, no function names it in ``global``, and its value is
-  a literal, a numeric expression of literals, or a ``tuple``/``frozenset``/``set`` display or call
-  over literals, names and ``type(...)`` calls. Every other binding that is not an import, a
-  function or a class is state.
+  a literal, a numeric expression of literals, a ``tuple`` display, or a ``tuple``/``frozenset``
+  call over literals, names and ``type(...)`` calls. A ``set`` display or call is state, since a
+  set is mutable. Every other binding that is not an import, a function or a class is state.
 
 **The child column** says what a forked child does with the entry: ``walk`` (a lock or event the
 repair walk replaces), ``reset: <function>`` (a registered child handler, or a function or method

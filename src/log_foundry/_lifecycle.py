@@ -83,7 +83,7 @@ class State(enum.Enum):
 
 
 class Runtime:
-    """The process's delivery lifecycle: one owner, one lock, four questions (SPEC-040 FR-001).
+    """The process's delivery lifecycle: one owner, four locks, four questions (SPEC-040, SPEC-077).
 
     The state below lived as seven loose module globals in ``decorator.py``, and seven pieces of
     shipped work came out of that one fact — SPEC-030, SPEC-031 FR-006, SPEC-033, two SPEC-035
