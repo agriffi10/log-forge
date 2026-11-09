@@ -274,3 +274,49 @@ def test_an_http_loss_the_round_announced_is_not_announced_again_by_the_engine(
     assert capsys.readouterr().err.splitlines() == [
         "log-foundry: lost 1 event(s); Silent, refused for good; not retried"
     ]
+
+
+# --- the frame-1 review: a refused round's drop, and a round the engine set aside ---------------
+
+
+def test_a_refused_rounds_drop_is_announced_since_the_refusal_line_counts_only_losses(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A refused round's ``DROPPED`` is not in the refusal line, so the settled line names it."""
+
+    def refused(batch: list[dict[str, object]]) -> Verdict:
+        run_context().refuse(RuntimeError("never shown"))
+        return Verdict(outcomes=(A, D))
+
+    sink = Scripted([refused], max_retries=0)
+    delivery = _run(sink, events(2))
+    assert not delivery.failed
+    assert sink.log_foundry_counters.losses().dropped == 1
+    assert capsys.readouterr().err.splitlines() == [_engine_line(1, 1, "Scripted", dropped=1)]
+
+
+@pytest.mark.parametrize(
+    ("step", "terms", "absorbed"),
+    [
+        (None, {"unknown": 2}, 0),
+        (RuntimeError("never shown"), {"raised": 2}, 1),
+    ],
+    ids=["unreadable", "raised"],
+)
+def test_a_round_whose_verdict_the_engine_set_aside_owns_nothing(
+    step: object, terms: dict[str, int], absorbed: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Round two writes a line, then returns nothing readable or raises: the engine names both."""
+
+    def second(batch: list[dict[str, object]]) -> Verdict:
+        _announce_drop()
+        if isinstance(step, Exception):
+            raise step
+        return step  # type: ignore[return-value]
+
+    sink = Scripted([(A, R, R), second], max_retries=1)
+    delivery = _run(sink, events(3))
+    assert not delivery.failed
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[:2] == [_engine_line(2, 2, "Scripted", **terms), _OWN_LINE]
+    assert len(lines) == 2 + absorbed

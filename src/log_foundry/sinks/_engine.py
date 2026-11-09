@@ -1379,10 +1379,16 @@ def _run(
     term, each loss decided in a round that registered none, and leaves the rest to the sink's
     lines. The key is the round, the engine's form of the HTTP round's chunk key, because a line
     carries no event identity to count against: a round that announces some of its losses owns
-    the rest. An event the sink counted itself (:meth:`RunContext.sink_counted`) or that a
-    refused round decided has its own line and is never in this one. Before, any sink line
-    anywhere in the run silenced the whole settled line, so a loss returned silently in one round
-    went unannounced beside a line another round wrote (invariant 2).
+    the rest. A round whose verdict the engine set aside — one that raised, could not be read,
+    or marked an index its outcome does not fit — owns nothing, since the engine, not the round,
+    decided its events' fates, so no line the round wrote can have described them. An event the
+    sink counted itself (:meth:`RunContext.sink_counted`), and a lost event a refused round
+    decided, has its own line and is never in this one; a refused round's drop has none, so it
+    is. So a loss its round decided is announced by that round's lines or by this one, never
+    both, and a loss decided in a round with no line of its own, or in one the engine set aside,
+    is always in this one. Before, any sink line anywhere in the run silenced the whole settled
+    line, so a loss returned silently in one round went unannounced beside a line another round
+    wrote (invariant 2).
 
     Args:
       sink: The sink, read statically for its idempotence and predicate.
@@ -1420,6 +1426,7 @@ def _run(
         refusals: dict[int, Exception] = {}
         pending = list(range(total_events))
         escaped: list[Exception] = []
+        overridden: set[int] = set()
         attempts = 0
         longest = 0.0
         hint: float | None = None
@@ -1440,6 +1447,7 @@ def _run(
             """
             if not any(type(seen) is type(exc) for seen in escaped):
                 escaped.append(exc)
+            overridden.add(attempts)
             predicate = _predicate_of(sink) if idempotent else None
             resend = predicate is not None and is_retryable(predicate, exc)
             for index in pending:
@@ -1477,6 +1485,7 @@ def _run(
                 marks = context._marks()
                 read = None if outcomes is None else _read_marks(marks, outcomes)
                 if outcomes is None:
+                    overridden.add(attempts)
                     for index in pending:
                         fate[index] = _UNREAD
                         final_of[index] = counted_of[index] = False
@@ -1540,11 +1549,13 @@ def _run(
         owners, lines = context._committed(settled=not delivery.failed, final=attempts, skip=skip)
         shared = [entry for entry in owners if _shares_lock(entry[0], counters)]
         owners = [entry for entry in owners if not _shares_lock(entry[0], counters)]
-        lined = context._lined(settled=not delivery.failed, final=attempts)
+        lined = context._lined(settled=not delivery.failed, final=attempts) - overridden
         unlined = [
             fate[index]
             for index in range(total_events)
-            if decided_in[index] not in lined and not counted_of[index] and not refused_in[index]
+            if decided_in[index] not in lined
+            and not counted_of[index]
+            and not (refused_in[index] and fate[index] in lost_fates)
         ]
         rejected = sum(1 for one in unlined if one is Outcome.REJECTED)
         unresolved = sum(1 for one in unlined if one is Outcome.RETRYABLE)

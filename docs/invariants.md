@@ -150,7 +150,8 @@ of a failed run, SPEC-072), `tests/test_run_context.py` (the run context's commi
 `tests/test_http_rounds.py` (the HTTP family's counts on both paths and both forms, SPEC-073),
 `tests/test_engine_shipped_verdicts.py` (the refusal marker, final rejections, sink-counted rounds
 and the one-lock commit), `tests/test_engine_announces_every_loss.py` (every loss of a round that
-registered no line is in the engine's settled line, over every engine sink the roster derives), `tests/test_sinks_{queue,db,broker}_engine.py`, `tests/test_socket_engine.py`
+registered no line, or whose verdict the engine set aside, is in the engine's settled line unless
+the sink counted it or a refusal line names it, over every engine sink the roster derives), `tests/test_sinks_{queue,db,broker}_engine.py`, `tests/test_socket_engine.py`
 and `tests/test_engine_sinks_roster.py` (every engine sink's counts and the derived roster,
 SPEC-074), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
 `tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,

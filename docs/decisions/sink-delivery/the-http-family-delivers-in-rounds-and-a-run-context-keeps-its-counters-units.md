@@ -16,7 +16,7 @@ event's fate is returned by index: items map back to events by identity, then by
 position, so an `_items` override returning rebuilt events maps exactly, and an event no request
 carries is `DROPPED` only when that many were dropped and counted, else `REJECTED`, never a
 silent default, and the round announces the ones `_items` did not count itself, on a settled run,
-so the engine's settled line, which leaves a round's losses to any line that round registers, is never their only announcement. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
+so the engine's settled line, which leaves a round's losses to any line that round registers, is not their announcement. The engine (*A sink may report per event*) resends only the `RETRYABLE` ones, within the 1.x total: `(s + 1) × (w + 1)` rounds on the worker path, `s + 1` on
 the orphan path and through `emit`. Nothing in `http.py` waits or loops, and one round has one
 wait, so a batch whose several chunks failed retryably waits once per round where 1.x waited once
 per chunk. `emit` is `_engine.emit_via_deliver(self, batch, deliver=self._round)`, the private
@@ -75,8 +75,10 @@ writes the lines outside every lock; a `BaseException` commits nothing. A refuse
 `failed` `ALWAYS`, a still-retryable one `LAST`, a drop `SETTLED`, a per-record rejection `ALWAYS`,
 and an unadjudicated chunk `ALWAYS`, or `LAST` for a sink declaring `log_foundry_idempotent`. A
 settled run's engine line names each loss decided in a round that registered no line the run will
-write, and only those, so a loss is announced once: the round, not the run, is the engine's key,
-for the reason the chunk is the HTTP round's — a line carries no event identity. SPEC-074 extends the context for the SDK and driver sinks.
+write, or in one whose verdict the engine set aside (a raise, an unreadable verdict, marks that do
+not fit), and only those, so a loss is announced at most once, and always when its round wrote no
+line: the round, not the run, is the engine's key, for the reason the chunk is the HTTP round's — a
+line carries no event identity, so a round that announces some of its losses owns the rest. SPEC-074 extends the context for the SDK and driver sinks.
 
 **What moves**, each in the 1.2.0 release notes. A total failure is counted once per batch: a
 request refused for good is sent and counted once, and an outage counts `failed` once per
