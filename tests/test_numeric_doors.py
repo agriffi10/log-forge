@@ -1100,10 +1100,12 @@ class _Gated(Sink):
         self.entered = threading.Event()
         self.release = threading.Event()
         self.closed = 0
+        self.got = 0
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         self.entered.set()
         self.release.wait(10.0)
+        self.got += len(batch)
 
     def close(self) -> None:
         self.closed += 1
@@ -1129,9 +1131,13 @@ def _counters() -> tuple[object, ...]:
 
 def test_flush_with_an_infinite_timeout_waits_for_the_drain() -> None:
     """FR-004 AC-1: at `ce2e1fe` `flush(math.inf)` returned `thread-died` at 0.00 s."""
-    sink = _Slow()
+    sink = _Gated()
     _log_through(sink)
+    # The emit is held until a timer started after `started` releases it. A sink that slept
+    # instead could begin its 0.3 s on the worker's own 1.0 s interval before `flush` was called,
+    # and a clock started after that would not see the whole of it.
     started = time.monotonic()
+    threading.Timer(0.3, sink.release.set).start()
     result = log_foundry.flush(timeout=math.inf)
     elapsed = time.monotonic() - started
     assert result, f"flush(inf) reported {result!r}"

@@ -725,12 +725,13 @@ def test_a_second_closer_waits_for_a_close_it_did_not_start_even_while_taking_wo
     the first sink's buffer reaches the wire.
     """
     class _Slow:
-        def __init__(self, seconds: float) -> None:
+        def __init__(self, seconds: float | None) -> None:
             self.seconds = seconds
             self.held = 0
             self.wire = 0
             self.closed = 0
             self.in_close = threading.Event()
+            self.release = threading.Event()
             self.log_foundry_stop_signal: threading.Event | None = None
 
         def emit(self, batch: list[dict]) -> None:
@@ -738,13 +739,16 @@ def test_a_second_closer_waits_for_a_close_it_did_not_start_even_while_taking_wo
             self.held += len(batch)
 
         def close(self) -> None:
-            """Delivers after a measurable delay."""
+            """Delivers after a measurable delay, or once released when it was given none."""
             self.in_close.set()
-            time.sleep(self.seconds)
+            if self.seconds is None:
+                self.release.wait(5.0)
+            else:
+                time.sleep(self.seconds)
             self.wire, self.held = self.wire + self.held, 0
             self.closed += 1
 
-    first, second = _Slow(1.0), _Slow(0.05)
+    first, second = _Slow(None), _Slow(0.05)
     log_foundry.configure(service="test", sink=first)
     for _ in range(5):
         log_foundry.info("x")
@@ -755,7 +759,10 @@ def test_a_second_closer_waits_for_a_close_it_did_not_start_even_while_taking_wo
 
     log_foundry.configure(service="test", sink=second)
     log_foundry.info("y")
+    # The first close is released on a timer started after `start`, so its remaining second
+    # cannot have begun running before the clock did.
     start = time.monotonic()
+    threading.Timer(1.0, first.release.set).start()
     _lifecycle._close_owed()  # closes the second sink, and waits on the first
     waited = time.monotonic() - start
 
@@ -779,22 +786,25 @@ def test_a_bystander_does_not_release_the_gate_for_the_next_one(
     The close has to outlast **both** waits or the test measures the grace rather than the guard:
     with a close shorter than one grace, the first bystander waits it out legitimately and the
     second one finds it finished, which is correct behaviour and indistinguishable from the bug.
-    The grace is shortened rather than the close lengthened so this costs a second, not ten.
+    The grace is shortened rather than the close lengthened so this costs a second, not ten. The
+    close is held until a timer started after the second bystander's clock releases it, so it
+    outlasts both waits by construction rather than by a sleep that began before either.
     """
     monkeypatch.setattr(_lifecycle, "DEFAULT_CLOSER_GRACE", 0.3)
     class _Slow:
         def __init__(self) -> None:
             self.closed = 0
             self.in_close = threading.Event()
+            self.release = threading.Event()
             self.log_foundry_stop_signal: threading.Event | None = None
 
         def emit(self, batch: list[dict]) -> None:
             """Accepts a batch."""
 
         def close(self) -> None:
-            """Runs longer than two shortened bystander waits put together."""
+            """Runs until released, which is after both shortened bystander waits have begun."""
             self.in_close.set()
-            time.sleep(1.5)
+            self.release.wait(5.0)
             self.closed += 1
 
     sink = _Slow()
@@ -807,6 +817,7 @@ def test_a_bystander_does_not_release_the_gate_for_the_next_one(
 
     _lifecycle._close_owed()  # first bystander
     start = time.monotonic()
+    threading.Timer(1.0, sink.release.set).start()
     _lifecycle._close_owed()  # second: must still find the close in flight
     waited = time.monotonic() - start
 
