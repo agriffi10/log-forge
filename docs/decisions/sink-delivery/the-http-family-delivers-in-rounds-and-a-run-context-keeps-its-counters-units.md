@@ -121,6 +121,20 @@ batch. (SPEC-073 FR-001 to FR-005)
 
 ### 2026-11-09
 
+- **Refined** (fix/settled-line-fixes): the settled line named the run's total rounds for every
+  loss, so a loss decided in round one of a four-round run read `after 4 delivery round(s)`, which
+  is not when it was lost (invariant 11). It is now one line per round that decided a named loss,
+  in round order, each naming that round: per-round lines keep the one grammar and each line's
+  count still sums its terms, where one line carrying a round per term would need a new grammar.
+  The same fix closes a NATS gap the engine's exclusion opened: a `NATSSink` round that published
+  nothing marks every event sink-counted, so its catcher owns the batch as in 1.x, but its
+  `_register` counted only the raised publishes. A run that settles on such a round — reachable
+  only when an idempotent run resends an `UNKNOWN` after an earlier round landed something — has
+  no catcher, so an event the deadline left unattempted there was neither counted nor named. The
+  round now registers that remainder's count and line under a new `When.SETTLED_LAST`, kept only
+  when the run settles on the registering round, so a failed run keeps 1.x's ledger. `NATSSink` is
+  the only `sink_counted` caller, a population `tests/test_engine_announces_every_loss.py` derives
+  from the tree.
 - **Refined** (fix/engine-announce-every-loss): the engine's settled line was written only for a run
   in which the sink registered no line at all, so a `deliver` sink outside the HTTP family — a
   subclass of an SDK or driver sink, or one written from scratch — that announced a loss in one

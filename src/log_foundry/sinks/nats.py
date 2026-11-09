@@ -814,9 +814,13 @@ class NATSSink:
         """Registers, ``ALWAYS``, the counts and lines 1.x's ``emit`` made for this round.
 
         Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
-        per publish that raised, in order — 1.x counted each as it happened and then raised —
-        and nothing for an event the deadline left unattempted, whose loss is its catcher's; the
-        round's events are sink-counted, so the engine adds nothing. Something published: the
+        per publish that raised, in order — 1.x counted each as it happened and then raised. The
+        round's events are sink-counted, so the engine adds nothing, and an event the deadline
+        left unattempted is its catcher's when the run fails, as in 1.x. A run that settles has
+        no catcher, which only a run resending ``UNKNOWN`` reaches — an earlier round landed
+        something — so the unattempted remainder is counted and announced here,
+        ``SETTLED_LAST``: only when the run settles on this round, since a later round resends
+        it. Before, nothing counted or named it. Something published: the
         engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in
         1.x's order — each raised publish, the unattempted remainder, an abandoned publish
         counted where it was abandoned, and an unanswered confirmation. The last two announce
@@ -842,11 +846,24 @@ class NATSSink:
             if not landed:
                 context.count(self.log_foundry_counters, "failed_events", 1, when=When.ALWAYS)
             context.announce(_publish_line(kind), when=When.ALWAYS)
-        if not landed:
-            return
         unattempted = states.count("unattempted")
+        timeout = self.publish_timeout
+        if not landed:
+            if unattempted:
+                context.count(
+                    self.log_foundry_counters,
+                    "failed_events",
+                    unattempted,
+                    when=When.SETTLED_LAST,
+                )
+                context.announce(
+                    lambda: _diag.lost(
+                        "event", unattempted, f"NATSSink publish_timeout {timeout}s"
+                    ),
+                    when=When.SETTLED_LAST,
+                )
+            return
         if unattempted:
-            timeout = self.publish_timeout
             context.announce(
                 lambda: _diag.lost("event", unattempted, f"NATSSink publish_timeout {timeout}s"),
                 when=When.ALWAYS,

@@ -62,6 +62,16 @@ _RAISED: Final = object()
 _UNREAD: Final = object()
 """The fate of an event in a round whose verdict could not be read."""
 
+_NAMED_FATES: Final = (
+    Outcome.REJECTED,
+    Outcome.RETRYABLE,
+    _RAISED,
+    Outcome.UNKNOWN,
+    _UNREAD,
+    Outcome.DROPPED,
+)
+"""The fates the settled line names, each under one of its five terms."""
+
 _RESENDABLE_IF_IDEMPOTENT: Final = (Outcome.UNKNOWN, _UNREAD, _RAISED)
 """Fates resent only by an idempotent sink; ``_RAISED`` also asks the sink's predicate."""
 
@@ -406,12 +416,18 @@ class When(enum.Enum):
         ``PostgresSink`` and the Redis sinks counted in ``failed`` with the rest of a failed
         batch). An immediate context, which knows no run ending, and a detached one, whose
         caller owns the verdict, commit none.
+      SETTLED_LAST: Only when the run settles and the round that registered it ended it: a loss
+        of an event the sink marked counted (:meth:`RunContext.sink_counted`) because a failed
+        run's catcher owns it, and that a later round could still have delivered — ``NATSSink``'s
+        unattempted events in a round that published nothing. Committed as ``LAST`` is, and by
+        an immediate context as every rule but ``FAILED`` is.
     """
 
     ALWAYS = "always"
     SETTLED = "settled"
     LAST = "last"
     FAILED = "failed"
+    SETTLED_LAST = "settled_last"
 
 
 class _Marks(NamedTuple):
@@ -944,6 +960,8 @@ class RunContext:
             return settled
         if when is When.FAILED:
             return whole and not settled and registered == final
+        if when is When.SETTLED_LAST:
+            return settled and registered == final
         return registered == final
 
     def _committed(
@@ -1002,9 +1020,9 @@ class RunContext:
         the round-level form of the HTTP round's chunk key, since a line carries no event
         identity to count by. A line the run will not write — a ``LAST`` line of a round that
         was not the last, a ``SETTLED`` one of a failed run — announces nothing, so its round
-        owns nothing. The second set is the rounds with a kept ``LAST`` line: an event the round
-        left resendable is a loss only because the run ended there, and only a line registered
-        for that ending announces it.
+        owns nothing. The second set is the rounds with a kept ``LAST`` or ``SETTLED_LAST`` line:
+        an event the round left resendable is a loss only because the run ended there, and only a
+        line registered for that ending announces it.
 
         Args:
           settled: Whether the run settled.
@@ -1023,7 +1041,11 @@ class RunContext:
         ]
         return (
             frozenset(registered for _when, registered in kept),
-            frozenset(registered for when, registered in kept if when is When.LAST),
+            frozenset(
+                registered
+                for when, registered in kept
+                if when is When.LAST or when is When.SETTLED_LAST
+            ),
         )
 
     def _close(self) -> None:
@@ -1518,8 +1540,8 @@ def _run(
     **The commit** is one ``Deferral`` on the counters at the end: ``failed_events`` takes every
     event that ended rejected, unresolved, raised or unknown, and ``dropped_events`` the dropped
     ones only when the run settled, since a failed run's drops belong to its catcher. A settled
-    run's loss is announced in one ``_diag.lost`` line naming counts and rounds, after the
-    commit; then each distinct exception type that escaped ``deliver`` gets one ``absorbed`` line,
+    run's loss is announced in ``_diag.lost`` lines naming counts and the deciding round, one per
+    round that decided a loss, after the commit; then each distinct exception type that escaped ``deliver`` gets one ``absorbed`` line,
     record first, announce second, by type and never by text.
 
     **The run's context** (SPEC-073 FR-002) is pushed onto :data:`_RUNS` for the whole run and
@@ -1548,7 +1570,10 @@ def _run(
     both, and a loss decided in a round with no line of its own, or in one the engine set aside,
     is always in this one. Before, any sink line anywhere in the run silenced the whole settled
     line, so a loss returned silently in one round went unannounced beside a line another round
-    wrote (invariant 2).
+    wrote (invariant 2). **It is one line per round that decided a named loss**, in round order,
+    each naming the round its losses were decided in (:func:`_settled_line`): a single line
+    naming the run's total rounds said a loss decided in round one was decided after the last
+    (invariant 11), and per-round lines keep the one grammar, each count still summing its terms.
 
     Args:
       sink: The sink, read statically for its idempotence and predicate.
@@ -1716,19 +1741,16 @@ def _run(
         lined, last_lined = context._lined(settled=not delivery.failed, final=attempts)
         lined, last_lined = lined - overridden, last_lined - overridden
         resendable = (Outcome.RETRYABLE, Outcome.UNKNOWN) if idempotent else (Outcome.RETRYABLE,)
-        unlined = [
-            fate[index]
-            for index in range(total_events)
-            if decided_in[index] not in (last_lined if fate[index] in resendable else lined)
-            and not counted_of[index]
-            and not (refused_in[index] and fate[index] in lost_fates)
-        ]
-        rejected = sum(1 for one in unlined if one is Outcome.REJECTED)
-        unresolved = sum(1 for one in unlined if one is Outcome.RETRYABLE)
-        raised = sum(1 for one in unlined if one is _RAISED)
-        unknown = sum(1 for one in unlined if one is Outcome.UNKNOWN or one is _UNREAD)
-        unlined_dropped = sum(1 for one in unlined if one is Outcome.DROPPED)
-        general = rejected + unresolved + raised + unknown + unlined_dropped
+        unlined: dict[int, list[object]] = {}
+        for index in range(total_events):
+            if (
+                fate[index] in _NAMED_FATES
+                and decided_in[index] not in (last_lined if fate[index] in resendable else lined)
+                and not counted_of[index]
+                and not (refused_in[index] and fate[index] in lost_fates)
+            ):
+                unlined.setdefault(decided_in[index], []).append(fate[index])
+        general = [_settled_line(decided, unlined[decided], name) for decided in sorted(unlined)]
         refusal_kind = (
             _diag._STR_STR(_diag._STORED_NAME(type(refusals[max(refusals)]))) if refusals else ""
         )
@@ -1739,16 +1761,9 @@ def _run(
                 for owner, counts in shared:
                     for counter, amount in counts.items():
                         ledger.count_for(owner, counter, amount)
-                if not delivery.failed and general:
-                    ledger.announce(
-                        lambda: _diag.lost(
-                            "event",
-                            general,
-                            f"rejected {rejected}, unresolved {unresolved}, "
-                            f"raised {raised}, unknown {unknown}, dropped {unlined_dropped} "
-                            f"after {delivery.attempts} delivery round(s) to {name}",
-                        )
-                    )
+                if not delivery.failed:
+                    for line in general:
+                        ledger.announce(line)
                 if refused_lost:
                     ledger.announce(
                         lambda: _diag.lost(
@@ -1766,6 +1781,36 @@ def _run(
     finally:
         _RUNS.reset(token)
         context._close()
+
+
+def _settled_line(decided: int, fates: Sequence[object], name: str) -> Callable[[], None]:
+    """Builds the settled line for the losses one round decided, naming that round's number.
+
+    The round is the one the losses were decided in, not the run's total: a loss a run's first
+    round decided reads ``after 1 delivery round(s)`` even when the run went on to a fourth for
+    other events, since a line saying four would misstate when it was lost (invariant 11).
+
+    Args:
+      decided: The round that decided every loss in ``fates``.
+      fates: Their fates, each one of :data:`_NAMED_FATES`.
+      name: The sink's stored type name.
+
+    Returns:
+      The line, to write after the commit.
+
+    Raises:
+      None.
+    """
+    rejected = sum(1 for one in fates if one is Outcome.REJECTED)
+    unresolved = sum(1 for one in fates if one is Outcome.RETRYABLE)
+    raised = sum(1 for one in fates if one is _RAISED)
+    unknown = sum(1 for one in fates if one is Outcome.UNKNOWN or one is _UNREAD)
+    dropped = sum(1 for one in fates if one is Outcome.DROPPED)
+    detail = (
+        f"rejected {rejected}, unresolved {unresolved}, raised {raised}, unknown {unknown}, "
+        f"dropped {dropped} after {decided} delivery round(s) to {name}"
+    )
+    return lambda: _diag.lost("event", len(fates), detail)
 
 
 def _tally(

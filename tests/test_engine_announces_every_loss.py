@@ -13,22 +13,24 @@ roster in ``tests/test_engine_sinks_roster.py``, never listed here.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import ast
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from log_foundry import _diag
+import log_foundry.sinks
+import nats_engine_matrix_harness as nats_harness
+from log_foundry import SinkCounters, _diag, emit_via_deliver
 from log_foundry.sinks._engine import When, outcomes_of, run_context, run_delivery
 from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.nats import NATSSink, _Published, _Report
 from log_foundry.sinks.verdict import Outcome, Verdict
 from sink_rigs import ok, unencodable
 from test_engine_sinks_roster import NO_EMIT, SINKS, _build, engine_sink_findings
 from test_http_rounds import Scripted as Opener
 from test_http_rounds import _ok, _status
 from verdict_sinks import Scripted, WaitRecorder, events
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 A, R, J, D, U = (
     Outcome.ACCEPTED,
@@ -109,7 +111,7 @@ def test_a_silent_loss_in_an_earlier_round_is_announced_beside_a_later_rounds_li
     sink = Scripted([(J, R, A), second], max_retries=1)
     _run(sink, events(3))
     assert capsys.readouterr().err.splitlines() == [
-        _engine_line(1, 2, "Scripted", rejected=1),
+        _engine_line(1, 1, "Scripted", rejected=1),
         _OWN_LINE,
     ]
 
@@ -127,7 +129,7 @@ def test_a_round_whose_line_is_not_written_owns_nothing(
 
     sink = Scripted([first, A], max_retries=1)
     _run(sink, events(2))
-    assert capsys.readouterr().err.splitlines() == [_engine_line(1, 2, "Scripted", rejected=1)]
+    assert capsys.readouterr().err.splitlines() == [_engine_line(1, 1, "Scripted", rejected=1)]
 
 
 def test_a_round_that_registers_a_line_owns_every_loss_it_decided(
@@ -175,14 +177,29 @@ def test_every_loss_class_of_an_unlined_round_is_announced_beside_a_lined_one(
     assert len(lines) == 2 + (1 if "raised" in terms else 0)
 
 
-def test_a_run_with_no_sink_line_keeps_the_one_engine_line(
+def test_a_run_with_no_sink_line_names_every_loss_under_the_round_that_decided_it(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Unchanged: with no sink line anywhere, every loss is in the one engine line."""
+    """With no sink line anywhere, every loss is in an engine line, one per deciding round.
+
+    Round one decides the drop and the rejection; event 2 is resent and round two decides its
+    ``UNKNOWN``. One line naming the run's two rounds said the first two were lost after the
+    second round, which is not when they were lost (invariant 11).
+    """
     _run(Scripted([(D, J, R), U], max_retries=1), events(3))
     assert capsys.readouterr().err.splitlines() == [
-        _engine_line(3, 2, "Scripted", rejected=1, unknown=1, dropped=1)
+        _engine_line(2, 1, "Scripted", rejected=1, dropped=1),
+        _engine_line(1, 2, "Scripted", unknown=1),
     ]
+
+
+def test_a_loss_decided_in_round_one_of_a_four_round_run_reads_one(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The line names the round that decided the loss, not how many rounds the run took."""
+    delivery = _run(Scripted([(J, R), R, R, A], max_retries=3), events(2))
+    assert (delivery.attempts, delivery.rejected, delivery.failed) == (4, 1, False)
+    assert capsys.readouterr().err.splitlines() == [_engine_line(1, 1, "Scripted", rejected=1)]
 
 
 def test_a_failed_run_leaves_its_unlined_losses_to_the_catcher(
@@ -445,3 +462,160 @@ def test_an_http_retryable_outcome_is_named_alike_through_emit_and_the_worker(
     assert _engine_line(1, 1, "RetryReader", unresolved=1) in through_emit, through_emit
     assert _engine_line(1, 2, "RetryReader", unresolved=1) in through_worker, through_worker
     assert inline.log_foundry_counters.losses() == worker.log_foundry_counters.losses()
+
+
+class _Delegate:
+    """A third-party sink forwarding ``deliver`` to a ``NATSSink``, declaring itself idempotent."""
+
+    log_foundry_idempotent = True
+
+    def __init__(self, inner: Any, max_retries: int) -> None:
+        self.inner = inner
+        self.max_retries = max_retries
+        self.log_foundry_counters = SinkCounters()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        return self.inner.deliver(batch)  # type: ignore[no-any-return]
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+
+def _scripted_nats(*rounds: tuple[str, ...]) -> NATSSink:
+    """A ``NATSSink`` whose coroutine is replaced, round by round, by the publishes given.
+
+    Each round reports one fate per event: ``"ok"``, ``"abandoned"`` (counted where it was
+    abandoned, as JetStream's is), ``"raised"`` or ``"unattempted"``. Everything around the
+    coroutine — the refusal guards, :func:`~log_foundry.sinks.nats._verdict_of` and
+    ``_register`` — is the shipped code.
+    """
+    sink = NATSSink("logs", client=nats_harness.Client(nats_harness.Script([])))
+    reports = iter(rounds)
+    shipped = sink._run
+
+    def run(coro: Any, bound: float) -> Any:
+        if coro.cr_code.co_name != "_round_on_loop":
+            return shipped(coro, bound)
+        coro.close()
+        fates = [(state, "RuntimeError" if state == "raised" else "") for state in next(reports)]
+        return _Report(published=_Published(fates, True, "JetStream publish"))
+
+    sink._run = run  # type: ignore[method-assign]
+    return sink
+
+
+@pytest.fixture
+def no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
+
+
+@pytest.mark.usefixtures("no_wait")
+def test_a_nats_event_left_unattempted_by_a_settled_runs_last_round_is_counted_and_named_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Round one lands event 0 and abandons event 1, which the idempotent run resends; round two
+    publishes nothing, the deadline leaving event 1 unattempted, and the run ends there, settled.
+
+    The round marks event 1 sink-counted, as 1.x's ``emit`` raised and its catcher owned the
+    batch. But a settled run has no catcher: before, nothing counted event 1 and no line named it.
+    """
+    inner = _scripted_nats(("ok", "abandoned"), ("unattempted",))
+    outer = _Delegate(inner, max_retries=1)
+    try:
+        delivery = _run(outer, events(2))
+    finally:
+        inner.close()
+    assert (delivery.attempts, delivery.accepted, delivery.unresolved) == (2, 1, 1)
+    assert not delivery.failed
+    failed = outer.log_foundry_counters.losses().failed + inner.losses().failed
+    assert failed == 1, "event 1 is counted once, by one of the two ledgers"
+    lines = [line for line in capsys.readouterr().err.splitlines() if "lost" in line]
+    assert lines == [
+        f"log-foundry: lost 1 event(s); NATSSink publish_timeout {inner.publish_timeout}s"
+    ]
+
+
+@pytest.mark.usefixtures("no_wait")
+def test_a_nats_event_left_unattempted_before_its_resend_lands_is_counted_nowhere(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The unattempted event of a round that is not the last is resent, so it is no loss."""
+    inner = _scripted_nats(("ok", "abandoned"), ("unattempted",), ("ok",))
+    outer = _Delegate(inner, max_retries=2)
+    try:
+        delivery = _run(outer, events(2))
+    finally:
+        inner.close()
+    assert (delivery.attempts, delivery.accepted, delivery.failed) == (3, 2, False)
+    assert outer.log_foundry_counters.losses().failed + inner.losses().failed == 0
+    assert "lost" not in capsys.readouterr().err
+
+
+@pytest.mark.usefixtures("no_wait")
+def test_a_nats_event_left_unattempted_by_a_failed_run_is_its_catchers_alone(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A failed run keeps 1.x's ledger: the raised publish counts, the unattempted event does not.
+
+    The run's catcher — here the caller of ``run_delivery`` — owns the batch, as the worker's
+    abandon line and the NATS matrix's ``raise-after-the-deadline`` rows record.
+    """
+    inner = _scripted_nats(("raised", "unattempted"))
+    outer = _Delegate(inner, max_retries=0)
+    try:
+        delivery = _run(outer, events(2))
+    finally:
+        inner.close()
+    assert delivery.failed
+    assert inner.losses().failed == 1 and outer.log_foundry_counters.losses().failed == 0
+    lines = [line for line in capsys.readouterr().err.splitlines() if "lost" in line]
+    assert lines == ["log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"]
+
+
+SINK_COUNTED_SITES = {"nats.py": "_round"}
+"""Every ``sink_counted`` call in ``src/log_foundry/sinks/``, by module and enclosing function.
+
+A mark excludes its events from the engine's count and its settled line, so each site must
+itself count and announce every event it marks in every run ending the mark excludes it from —
+including a settled run's last round. ``NATSSink._round`` once did not (its unattempted events,
+above). A new site joins this table only after that check.
+"""
+
+
+def test_the_sink_counted_population_is_the_reviewed_one() -> None:
+    """Every ``sink_counted`` call, found in the tree, is one whose registrations were checked."""
+    root = Path(log_foundry.sinks.__file__).parent
+    found: dict[str, str] = {}
+    for path in sorted(root.glob("**/*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "sink_counted"
+                ):
+                    found[str(path.relative_to(root))] = function.name
+    assert found == SINK_COUNTED_SITES
+
+
+def test_a_settled_last_line_owns_the_resendable_loss_its_round_ended_the_run_on(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``SETTLED_LAST`` is written exactly when the run ends on its round, as a ``LAST`` line is.
+
+    So it owns an event the round left ``RETRYABLE``, and the engine adds no line beside it.
+    """
+
+    def last(batch: list[dict[str, object]]) -> Verdict:
+        run_context().announce(
+            lambda: _diag.lost("event", 1, "ThirdParty, out of rounds"), when=When.SETTLED_LAST
+        )
+        return Verdict(outcomes=(R, A))
+
+    _run(Scripted([last], max_retries=0), events(2))
+    assert capsys.readouterr().err.splitlines() == [
+        "log-foundry: lost 1 event(s); ThirdParty, out of rounds"
+    ]

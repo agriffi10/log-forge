@@ -541,15 +541,21 @@ def test_kafka_pubsub_and_multi_never_offer_deliver(module: str, cls: str) -> No
 def test_a_settled_runs_line_names_counts_and_rounds_never_a_value(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """FR-003 AC9: one line, counts by term and rounds and the stored type name only."""
+    """FR-003 AC9: counts by term, the deciding round and the stored type name only.
+
+    One line per round that decided a loss: round one decides the rejection, the drop and the
+    ``UNKNOWN``, and round three the rejection of the event resent twice.
+    """
     canary = "CANARY-event-value"
     sink = Scripted([[A, R, J, D, U], [R], [J]], max_retries=2)
     batch = [{"message": canary, "i": i} for i in range(5)]
     _deliver(sink, batch)
     err = capsys.readouterr().err
     assert err == (
-        "log-foundry: lost 4 event(s); rejected 2, unresolved 0, raised 0, unknown 1, "
-        "dropped 1 after 3 delivery round(s) to Scripted\n"
+        "log-foundry: lost 3 event(s); rejected 1, unresolved 0, raised 0, unknown 1, "
+        "dropped 1 after 1 delivery round(s) to Scripted\n"
+        "log-foundry: lost 1 event(s); rejected 1, unresolved 0, raised 0, unknown 0, "
+        "dropped 0 after 3 delivery round(s) to Scripted\n"
     )
     assert canary not in err
 
