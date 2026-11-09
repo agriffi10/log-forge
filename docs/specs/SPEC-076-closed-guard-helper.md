@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-076
 title: "The Closed-Guard Helper"
 description: "Gives the shipped sinks that release a transport one private helper, in two modes, for the transport lock, the idempotent close and the refusal after close, and defines what a close does when it overlaps a call still inside the sink and what a closed sink's deliver answers."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-028, SPEC-032, SPEC-061, SPEC-069, SPEC-072, SPEC-074]
 arc: stability-redesign
 arc_order: 8

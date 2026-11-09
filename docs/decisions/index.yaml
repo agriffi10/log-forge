@@ -307,6 +307,10 @@ areas:
     path: "docs/decisions/sink-lifecycle/sink-lifecycle.md"
     governs: ["src/log_foundry/sinks/**"]
     decisions:
+      - title: "A closing sink refuses at once; a SERIAL close waits for the one call inside, a CLOSE_ONLY close waits a bounded time"
+        fence: "a close sets `CLOSING` before it takes the transport lock, so every later caller is refused; a `SERIAL` close then waits for the one section holding the lock and never releases under it, and a `CLOSE_ONLY` close waits at most `CLOSE_OVERLAP_WAIT` (0.5 s) and releases, telling the section it overtook (`released_during`), which `KafkaSink` counts. Never an `RLock`; never a release handed to the call inside. (SPEC-076)"
+        status: "stable"
+        path: "docs/decisions/sink-lifecycle/a-closing-sink-refuses-at-once-a-serial-close-waits-for-the-one-call-inside-a-close-only-close-waits-a-bounded-time.md"
       - title: "A driver's liveness flag is not evidence: a sink that cannot see the wire asks the server, and never cancels a wait the server may still answer"
         fence: "`is_connected` flips only when the driver's own tasks notice, and those tasks need loop time between calls; a sink that reports delivery on the flag reports it for events that never left the process, and a PONG wait the sink cancels kills the driver's reader when the answer arrives late. (SPEC-061)"
         status: "stable"
