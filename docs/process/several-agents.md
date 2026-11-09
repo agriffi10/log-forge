@@ -75,3 +75,51 @@ one is running, it is the escalation point a briefing names, and it puts to Andr
 decide.
 
 Full protocol, configuration and the stale-entry rules: `scripts/pr-queue/PROTOCOL.md`.
+
+**Running an arc through — one build session per spec**
+
+A session told to build an arc **orchestrates** it and builds none of the specs itself: it starts a
+new build session per spec, and the instruction to build the arc is the instruction to build each of
+its specs (`spec-lifecycle.md`), so it does not ask again between them. An arc run is a multi-agent
+run from its first session. Confirm the queue is installed (the `Q=` line of `.git/hooks/pre-push`
+in the main checkout) and run `install.sh` only if it is not, never just to find out (above); then
+brief every session from `docs/templates/multi-agent-briefing.md`, queue section included.
+
+- **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec
+  is ready when it is `Draft` on `origin/main` (the status a spec takes once reviewed, `spec-lifecycle.md`),
+  `spec-lint` reports no failure for it there, and every earlier spec in `arc_order` that it is not
+  independent of has landed. With no independent specs this is one session at a time, in
+  `arc_order`. Start every ready spec before stopping to ask about one that is not.
+- **Two specs are independent** when neither needs the other's result, whether through `depends_on`
+  or through something the earlier one builds, and they touch different source files. The files every
+  completion ritual edits (the generated indexes, `CLAUDE.md`'s `## Specs`, the component inventory)
+  do not count; name them in each briefing's *Files you and a peer will both touch*. Arcs can carry
+  dependencies the frontmatter does not name, so when independence is not clear, chain them.
+- **Landed is checked, never taken from a report.** After `git fetch origin`: the spec reads
+  `Completed` on `origin/main` (`git show origin/main:<spec path>`), every PR its session named is
+  merged, `main` is green at a head that contains them, and the spec holds neither the queue lock nor
+  a ticket. A spec already `Completed` when the orchestrator starts counts as landed. A turn-end note
+  that reports progress (a plan drafted, a review running) is not a finish, so nothing starts on one.
+- **Check for a landing whenever a session it started ends a turn.** Where the harness does not
+  report that, poll `origin/main` for the spec's status rather than end the orchestrator's own turn:
+  an orchestrator that goes quiet with sessions running is the stall this rule exists to prevent.
+- **Archive each finished session in the step that verifies its landing,** wherever the harness can
+  archive sessions. That covers every session the orchestrator started, a fix or a review session as
+  much as a build. This is the orchestrator's own authority, from Andrew asking for the arc, not the
+  supervisor's; it borrows only the supervise skill's *Archiving* checklist to tell finished
+  (`.claude/skills/supervise/SKILL.md`): `done_check.py` prints `ARCHIVABLE`, or for a session with
+  no PR its tail shows its conclusion delivered and its chips resolved; the session is not running;
+  and its transcript tail is neither a question waiting on Andrew nor a background wait. A session the
+  checklist says to keep after its spec has landed (a pending chip, a dirty worktree) is left
+  unarchived and named in the arc report; it does not hold up the next spec.
+- **Stop the chain and ask Andrew** when:
+  - a session ends blocked, or ends with its spec not landed by the check above;
+  - a session is waiting on Andrew's answer: relay its question verbatim;
+  - `main` is red: start nothing until it is green again, and ask before the chain resumes. The
+    session whose merge turned it red fixes it (`CLAUDE.md`); start a fix session only if that one
+    has ended;
+  - the next spec is `In Progress` from a session this orchestrator did not start (name its branch,
+    its PR and any queue lock it holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or
+    depends on a spec outside the arc that is not `Completed`.
+- **When the arc's last spec lands,** archive its session and report the arc done to Andrew,
+  with the lessons its sessions reported.

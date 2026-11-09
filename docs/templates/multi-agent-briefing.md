@@ -25,6 +25,14 @@ and never delete or force-push a peer's branch. Rebase onto fresh `origin/main` 
 **Who else is running.** [One line per peer: session, spec, branch. "You are the only one" is also an
 answer, and a useful one.]
 
+**In an arc run.** [Delete this paragraph outside one.] The orchestrator starts the arc's next spec:
+do not start it, and do not ask whether to. A question only the human can answer is still asked here
+with the question tool, and the orchestrator relays it. What the arc's landed specs left for you: [the lessons and leftovers their
+sessions reported, or "first in its arc"]. Your spec is finished when `spec_status: Completed` and
+the regenerated indexes are merged on `origin/main`, so the completion ritual's commit rides in your
+last PR or in one of its own that you also land. End your last turn with your PR numbers and the
+lessons this spec taught.
+
 **Files you and a peer will both touch.** [List them — the always-loaded `CLAUDE.md`, an index, a
 shared module. Name them even when you think the overlap is small.] These will conflict at rebase.
 Resolve by **keeping both changes**; never resolve a conflict by discarding a peer's work, and if the
@@ -56,8 +64,9 @@ contain the remote's current `main` whether or not you hold the lock. One ticket
 release between them so the others interleave. If `turn` reports the trunk `IS RED`, stop and
 escalate; a red `main` is fixed before anything else merges.
 
-**Escalate, don't improvise — and ask, don't list.** [Name who to escalate to and how: the
-supervisor session by its `ListAgents` name, if one is running `/supervise`, else Andrew.] A
+**Escalate, don't improvise — and ask, don't list.** [Name who to escalate to and how: in an arc
+run, the orchestrator; else the supervisor session by its `ListAgents` name, if one is running
+`/supervise`; else Andrew.] A
 product-changing or ambiguous call, a conflict you cannot resolve without discarding someone's work,
 and a red `main` all stop the session — the reversible technical calls are still yours to make. When
 you do stop, ask with the question tool: the options as selections, the recommended one first, and
