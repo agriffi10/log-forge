@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-075
 title: "Wrappers Map Verdicts; MultiSink Keeps Calling Each Child's emit"
 description: "The filtering, transforming and delegating wrappers offer deliver exactly when the sink they wrap does, map its verdict back to their own batch and count only their own decisions, while MultiSink offers none and keeps calling each child's emit — so a wrapped engine sink is retried and counted as it would be alone."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-017, SPEC-058, SPEC-059, SPEC-066, SPEC-072, SPEC-073, SPEC-074, SPEC-080]
 arc: stability-redesign
 arc_order: 7
@@ -140,8 +140,8 @@ that overrides `emit` stands earlier in the MRO, so the probe does not offer it 
 
 **The offer is fixed at construction.** SPEC-072 reads `log_foundry_counters` statically, so it is
 a plain instance attribute. When `read_deliver(inner)` is not `None`, the constructor sets it to
-**the inner sink's own `SinkCounters` object**, read with `inspect.getattr_static` on the inner
-sink. Otherwise it sets it to `None`. So a wrapper over any of these is never offered, and the
+**the inner sink's own `SinkCounters` object**, read with SPEC-072's static reader
+`sinks.base._static_value` on the inner sink. Otherwise it sets it to `None`. So a wrapper over any of these is never offered, and the
 worker and the orphan path run its 1.x `emit`:
 
 - an emit-only sink;
@@ -176,6 +176,14 @@ inner sink's or `LogstashSink`'s, through `_diag._STR_STR(_diag._STORED_NAME(typ
 `type(x).__name__`. A metaclass `__name__` property cannot rename it, and SPEC-071 FR-005's guard
 holds. Each names `self` or an attribute, not a parameter, so none joins that guard's pinned door
 set.
+
+**The stop signal is readable statically.** The engine reads the run's stop signal with
+`_engine.stop_signal_of`, which uses `_static_value` and so reads a property as no signal. Each of
+the three classes in this spec today keeps `log_foundry_stop_signal` behind a property whose setter
+forwards it to the inner sink or backend, so a wrapper's own rounds would wait out their backoff
+uninterrupted. The forward stays, but the value is stored where the static reader finds it, in the
+instance's own `__dict__`, and nothing is evaluated to read it. `MultiSink` keeps the same forward
+for its children and offers no `deliver`, so the engine never reads its signal.
 
 **The retry budget is copied at construction.** The engine runs its rounds on the wrapper. So when
 the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink as
@@ -223,6 +231,10 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
       inner sink whose counters are replaced after construction makes the next round raise
       `TypeError` naming its type, and the run fails. For an inner sink class whose metaclass
       `__name__` property returns another name, the message carries the stored name.
+- [ ] After the worker sets `log_foundry_stop_signal` on a wrapper that offers `deliver`,
+      `_engine.stop_signal_of(wrapper)` is that event and the inner sink holds it too; setting the
+      event during a wrapped always-`RETRYABLE` run's backoff ends the run well before the backoff
+      would have.
 - [ ] A forked child that finds the shared counters' lock held by a parent thread completes a run
       through the wrapper within 5 s.
 - [ ] SPEC-074's engine-sink roster still finds exactly thirteen classes, and SPEC-070's restated
@@ -404,6 +416,9 @@ inside SPEC-062's per-round prediction, where 1.x saw one `emit`. SPEC-074 leave
 - [ ] Socket mode, against a peer that refuses every connect and then one that takes everything:
       `LogstashSink(host=..., port=...)` and `SyslogSink` on the same transport settings end with
       equal `losses()` and `failed_batches`, and `logstash.losses() == logstash._socket.losses()`.
+- [ ] Socket mode through a `Worker` with its default `max_retries`, against a peer that refuses
+      every connect, counts each of 2 events once: `logstash.failed == 2`, where 1.x and SPEC-074
+      count them once per worker attempt (`2 × 4 == 8` under the default `max_retries=3`).
 - [ ] Socket mode under `shutdown(timeout=0.9)` against a refusing peer with a 0.5 s connect
       timeout makes the number of rounds SPEC-062's prediction allows for the bare transport.
 - [ ] Serves invariants 2, 3 and 6: a delegated run is counted once, on the backend, a socket-mode
@@ -583,3 +598,9 @@ tests/
   this spec adds names its type through `_diag._STORED_NAME`, so SPEC-071 FR-005's guard holds. None
   is one of that guard's doors, since each names `self` or an attribute.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-09, at build start, folding in the items SPEC-072 and SPEC-074 handed to this spec: the
+  static read names `sinks.base._static_value`, not `inspect.getattr_static` (SPEC-072 replaced the
+  latter because it runs a metaclass's `__eq__` and `__hash__`); the wrappers' stop signal is stored
+  where that reader finds it, since a property reads as no signal (FR-001); and socket-mode
+  `LogstashSink` counting each event once on the worker path, a consequence of FR-003's delegation
+  that SPEC-074 recorded as owed here, gains its own criterion.

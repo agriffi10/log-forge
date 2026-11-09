@@ -498,7 +498,7 @@ specs:
   - id: "SPEC-075"
     title: "Wrappers Map Verdicts; MultiSink Keeps Calling Each Child's emit"
     description: "The filtering, transforming and delegating wrappers offer deliver exactly when the sink they wrap does, map its verdict back to their own batch and count only their own decisions, while MultiSink offers none and keeps calling each child's emit — so a wrapped engine sink is retried and counted as it would be alone."
-    spec_status: "Draft"
+    spec_status: "In Progress"
     depends_on: ["SPEC-017", "SPEC-058", "SPEC-059", "SPEC-066", "SPEC-072", "SPEC-073", "SPEC-074", "SPEC-080"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-075-wrappers-map-verdicts.md"
