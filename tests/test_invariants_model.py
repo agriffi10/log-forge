@@ -1,4 +1,4 @@
-"""The model test behind ``docs/invariants.md``: random interleavings, one accounting identity.
+"""The model tests behind ``docs/invariants.md``: random interleavings, and a sequential oracle.
 
 The lifecycle defects this repo has fixed came in two classes. One needs an injected preemption
 point — a window a few instructions wide, which `tests/test_lifecycle_races.py` pins race by race
@@ -7,18 +7,49 @@ unforced rate under ordinary concurrency: during SPEC-045 a candidate fix that r
 close was built and lost on 31 of 80 seeds of a scratch fuzz, in the second diff review, after
 the reading passes had accepted it — and that fuzz was then thrown away, with the shipped fix
 pinned by a test written from its own reproduction. This file is that second class made
-permanent. It drives random interleavings of the public lifecycle calls
-from several threads and checks the invariants that hold *regardless* of the interleaving — the
-ones ``docs/invariants.md`` numbers, cited beside each assertion. It cannot see the first class,
-and does not claim to.
+permanent, twice over.
 
-What it is not: a bound test. The timeouts here are generous on purpose, because a tight budget
+**The concurrent test** drives random interleavings of the public lifecycle calls from several
+threads and checks the invariants that hold *regardless* of the interleaving — the ones
+``docs/invariants.md`` numbers, cited beside each assertion. Under concurrency the state after a
+step is not determined, so it asserts no exact state: only that ``Runtime.state`` always answers
+a ``State`` and ends ``CLOSED`` with no token held. It cannot see the first class, and does not
+claim to.
+
+**The sequential driver** (SPEC-077 FR-004) is one thread, seeded, drawing ``configure(sink=…)``,
+an orphan ``info()``, a span, ``flush()``, ``shutdown()``, the exit drain
+(``_lifecycle._shutdown_worker()`` with no argument, what ``atexit`` calls) and a fork through
+``run_in_child``. With one caller the state after a step is determined, so it carries its own
+**state table** (:data:`TABLE`), independent of ``Runtime.state``, and checks the library against
+it after every step, together with the facts the table is keyed by — whether something is owed
+and whether the worker is live are read back from the runtime, not trusted. Every sink is a
+recorder, a default-resolved one included: ``StdoutSink`` is replaced by a factory, so the real
+``_ensure_sink`` path, stamp and all, builds one. Coverage of every cell is asserted over the seed
+range rather than left to chance (:func:`test_the_seed_range_covers_every_cell`).
+
+**What the driver checks, by invariant**: 1 (no step raises, ``BaseException`` included); 2
+(orphans balance after every step, spans after every truthy ``flush()`` and every shutdown); 3,
+the wall-clock half (each step inside its budget plus the slack); 4 (every ``span.end`` arrives on
+a drain thread and every orphan on the caller's); 5 (after each shutdown every recorder written
+to is closed, nothing is owed, no two closes overlapped, and no child closed an inherited sink);
+6 by construction, since one sequence drives both delivery paths and both drains; and 12, the
+child's half (its state, its three calls, its event in a child recorder) and the parent's ledger
+unchanged by the fork.
+
+**What it does not check, and why**: the **CPU half of 3** — a CPU measure over a hundred steps
+under ``-n 12`` is the flake ``tests/test_worker_exit_budget.py`` measures one case at a time;
+**7** needs a sink that raises, and the recorder never does (``tests/test_worker.py`` and
+``tests/test_sink_losses.py`` own it); **8** needs a hostile value and no step supplies one
+(``tests/test_sanitize_corpus.py``); **9** needs baggage or an adopted context and no step sets
+one; **10** is the public surface and ``Runtime`` is private; **11** needs a value that could leak
+into stderr and none is supplied; **13** needs a bad argument and every step is valid.
+
+What neither is: a bound test. The timeouts here are generous on purpose, because a tight budget
 fails on its setup under a loaded ``-n 12`` run (``tests/test_worker.py`` measures the bounds
-against a wedged sink, one at a time). A fork is not in the operation set either — it needs a
-subprocess harness and its own repair is covered by ``tests/test_fork_lifecycle.py``.
+against a wedged sink, one at a time).
 
-To soak locally, widen ``SEEDS`` and run this file alone with ``-n 12``; a failing seed prints
-the whole ledger so the interleaving can be replayed from the seed alone.
+To soak locally, widen ``SEEDS`` or ``SEQ_SEEDS`` and run this file alone with ``-n 12``; a
+failing seed prints its whole history so it replays from the seed alone.
 """
 
 from __future__ import annotations
@@ -38,10 +69,12 @@ import pytest
 import log_foundry
 from conftest import run_concurrently
 from log_foundry import _lifecycle
+from log_foundry._lifecycle import State
 from log_foundry.sinks import _engine
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
 
 SEEDS = range(16)
@@ -88,8 +121,10 @@ class Recorder:
     """
 
     log_foundry_stop_signal: threading.Event | None = None
+    live: weakref.WeakSet[Recorder] = weakref.WeakSet()
 
     def __init__(self, emit_delay: float) -> None:
+        Recorder.live.add(self)
         self.events: list[dict[str, object]] = []
         self.closes = 0
         self.inside = 0
@@ -116,6 +151,11 @@ class Recorder:
     def count(self, message: str) -> int:
         with self._lock:
             return sum(1 for event in self.events if event.get("message") == message)
+
+    def forget(self) -> None:
+        """Drops the kept events, for :class:`HTTPRecorder`'s reason (:func:`_forget_records`)."""
+        with self._lock:
+            self.events.clear()
 
 
 _RAISED = "raised"
@@ -284,10 +324,18 @@ class HTTPRecorder(HTTPSink):
 
 @pytest.fixture(autouse=True)
 def _forget_records() -> Any:
-    """Clears every :class:`HTTPRecorder`'s records once its test has asserted on them."""
+    """Clears every recorder's records once its test has asserted on them.
+
+    Every recorder handed to the library stays in ``_lifecycle._state._owned`` for the life of
+    the process, and a later fork test's marking walk visits what that record reaches, up to
+    ``_MARKING_CEILING``. :class:`HTTPRecorder` measured that hazard; the sequential driver hands
+    the library a recorder per ``configure`` and per default resolution, so every kind is cleared.
+    """
     yield
     for recorder in list(HTTPRecorder.live):
         recorder.forget()
+    for kept in list(Recorder.live):
+        kept.forget()
 
 
 def _draw(rng: random.Random) -> Outcome:
@@ -409,6 +457,39 @@ def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
     return runs
 
 
+class _StateSampler:
+    """Reads ``Runtime.state`` in a loop on its own thread while the actors run.
+
+    Under concurrency the state is not determined, so the only claim is that the observer always
+    answers a ``State`` and never raises (SPEC-077 FR-004).
+    """
+
+    def __init__(self) -> None:
+        self.reads = 0
+        self.wrong: list[object] = []
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="state-sampler", daemon=True)
+
+    def _run(self) -> None:
+        while not self._done.is_set():
+            try:
+                read = _lifecycle._state.state
+            except BaseException as exc:
+                self.wrong.append(exc)
+                return
+            if not isinstance(read, State):
+                self.wrong.append(read)
+            self.reads += 1
+            self._done.wait(0.001)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._done.set()
+        self._thread.join(BOUND_SLACK)
+
+
 def _stranded_markers() -> int:
     """Counts the flush markers left on the retired worker's queue after the final shutdown.
 
@@ -462,8 +543,15 @@ def test_the_accounting_identity_holds_under_every_interleaving(
     def work(index: int, _iteration: int) -> None:
         _actor(ledger, random.Random(seed * 10 + index), shutdown_in_mix=seed % 2 == 0)  # noqa: S311
 
-    escaped = run_concurrently(work, threads=THREADS)
+    sampler = _StateSampler()
+    sampler.start()
+    try:
+        escaped = run_concurrently(work, threads=THREADS)
+    finally:
+        sampler.stop()
     log_foundry.shutdown(timeout=FINAL_SHUTDOWN_TIMEOUT)
+    final_state = _lifecycle._state.state
+    tokens_left = len(_lifecycle._state._swaps_running) + len(_lifecycle._state._stops_running)
     health = log_foundry.health()
     markers = _stranded_markers()
     queued = health.queued - markers
@@ -491,6 +579,10 @@ def test_the_accounting_identity_holds_under_every_interleaving(
     )
 
     assert not escaped, f"invariant 1 (never fail the caller): {picture}"
+    assert not sampler.wrong, f"invariant 1 (state always answers a State): {sampler.wrong[:3]}"
+    assert sampler.reads, "the sampler never read the state, so it checked nothing"
+    assert final_state is State.CLOSED, f"after the final shutdown: {final_state} {picture}"
+    assert tokens_left == 0, f"a token outlived its call: {tokens_left} {picture}"
     assert health.in_span_lost == 0, f"nothing here can fail assembly: {picture}"
     if runs is None:
         assert health.failed_batches == 0, f"the recorder never raises: {picture}"
@@ -514,6 +606,382 @@ def test_the_accounting_identity_holds_under_every_interleaving(
     assert ledger.slowest_shutdown < SHUTDOWN_TIMEOUT + BOUND_SLACK, (
         f"invariant 3 (shutdown): {picture}"
     )
+
+
+# -- the sequential driver (SPEC-077 FR-004) ----------------------------------------------------
+
+SEQ_SEEDS = range(24)
+SEQ_STEPS = 40
+STEP_WEIGHTS = (
+    ("configure", 0.17),
+    ("info", 0.18),
+    ("span", 0.2),
+    ("flush", 0.1),
+    ("shutdown", 0.12),
+    ("exit", 0.1),
+    ("fork", 0.13),
+)
+"""How often each step is drawn. The fork is weighted up because it must be reached from each of
+the three resting states, ``UNCONFIGURED`` included, which only the first few steps of a seed
+are in; :func:`test_the_seed_range_covers_every_cell` is what says the weights are enough."""
+
+_U, _R, _C = State.UNCONFIGURED, State.RUNNING, State.CLOSED
+
+TABLE: dict[tuple[str, State, str], tuple[State, State | None]] = {
+    ("configure", _U, "no-swap-work"): (_R, None),
+    ("configure", _R, "swap"): (_R, State.SWAPPING),
+    ("configure", _R, "direct"): (_R, None),
+    ("configure", _C, "swap"): (_C, State.SWAPPING),
+    ("configure", _C, "direct"): (_C, None),
+    ("info", _U, ""): (_R, None),
+    ("info", _R, ""): (_R, None),
+    ("info", _C, ""): (_C, None),
+    ("span", _U, "build"): (_R, None),
+    ("span", _R, "build"): (_R, None),
+    ("span", _R, "existing"): (_R, None),
+    ("span", _C, "build"): (_R, None),
+    ("span", _C, "retired-worker"): (_C, None),
+    ("flush", _U, ""): (_U, None),
+    ("flush", _R, ""): (_R, None),
+    ("flush", _C, ""): (_C, None),
+    ("shutdown", _U, ""): (_C, State.DRAINING),
+    ("shutdown", _R, ""): (_C, State.DRAINING),
+    ("shutdown", _C, ""): (_C, State.DRAINING),
+    ("exit", _U, ""): (_C, State.DRAINING),
+    ("exit", _R, ""): (_C, State.DRAINING),
+    ("exit", _C, ""): (_C, State.DRAINING),
+    ("fork", _U, ""): (_U, None),
+    ("fork", _R, ""): (_R, None),
+    ("fork", _C, ""): (_C, None),
+}
+"""The state table: (step, state before, which variant the facts select) to (state after, the
+transient state the step passes through). Today's behaviour, not a proposal (SPEC-077 FR-004);
+for a fork, "after" is the **child's** initial state and the parent's is unchanged. ``CLOSED`` is
+not terminal — a span after a no-worker shutdown builds a live worker — and SPEC-078 decides which
+of these transitions stay."""
+
+ROWS = {(before, after) for (_, before, _), (after, _) in TABLE.items()}
+
+
+@dataclass
+class _Model:
+    """The four facts the table is keyed by, plus the retirement the state is read from.
+
+    ``owed`` is set by an orphan ``info()``, a worker's build and a swap that does work, and cleared
+    by a shutdown; it is what decides whether a ``configure(sink=…)`` has work, since ``_swap_sink``
+    returns early with no live worker and nothing owed.
+    """
+
+    resolved: bool = False
+    owed: bool = False
+    worker: bool = False
+    live: bool = False
+    retired: bool = False
+
+    def state(self) -> State:
+        if self.live:
+            return _R
+        if self.retired:
+            return _C
+        if self.owed or self.resolved:
+            return _R
+        return _U
+
+    def cell(self, step: str) -> tuple[str, State, str]:
+        """Which table cell a step taken now lands in."""
+        before = self.state()
+        variant = ""
+        if step == "configure":
+            variant = (
+                "no-swap-work" if before is _U else ("swap" if self.owed or self.live else "direct")
+            )
+        elif step == "span":
+            variant = (
+                "build" if not self.worker else ("existing" if self.live else "retired-worker")
+            )
+        return (step, before, variant)
+
+    def take(self, step: str) -> tuple[str, State, str]:
+        """Applies a step to the facts and returns the cell it was taken in."""
+        cell = self.cell(step)
+        if step == "configure":
+            self.resolved = True
+            self.owed = self.owed or cell[2] == "swap"
+        elif step == "info":
+            self.resolved = self.owed = True
+        elif step == "span":
+            self.resolved = True
+            if cell[2] == "build":
+                self.worker = self.live = self.owed = True
+        elif step in {"shutdown", "exit"}:
+            self.owed = self.live = False
+            self.retired = True
+        after = self.state() if step != "fork" else TABLE[cell][0]
+        assert after is TABLE[cell][0], f"the model and its own table disagree at {cell}"
+        return cell
+
+
+def _draws(seed: int) -> list[tuple[str, bool]]:
+    """The seed's steps, each with whether a span nests; drawn independently of any state."""
+    rng = random.Random(f"sequential:{seed}")  # noqa: S311
+    names = [name for name, _ in STEP_WEIGHTS]
+    weights = [weight for _, weight in STEP_WEIGHTS]
+    return [(rng.choices(names, weights)[0], rng.random() < 0.3) for _ in range(SEQ_STEPS)]
+
+
+def test_the_seed_range_covers_every_cell() -> None:
+    """FR-004 AC-2: over the seed range every cell of the table is visited.
+
+    Pure — no library call — because the draws do not depend on the library's state and every live
+    seed asserts, step by step, that the library is where this model says it is. So the cells the
+    model visits are the cells the live runs visit, and the coverage is asserted here once rather
+    than summed across ``-n 12`` workers.
+    """
+    visited: set[tuple[str, State, str]] = set()
+    for seed in SEQ_SEEDS:
+        model = _Model()
+        for step, _ in _draws(seed):
+            visited.add(model.take(step))
+    missing = sorted(set(TABLE) - visited, key=str)
+    assert not missing, f"no seed reaches these cells; widen SEQ_SEEDS or the weights: {missing}"
+    assert visited <= set(TABLE), (
+        f"the model reached a cell the table lacks: {visited - set(TABLE)}"
+    )
+
+
+_BRACKET: list[str | None] = [None]
+"""The step the driver is inside, set before each call and cleared after it returns."""
+
+_SAMPLES: list[tuple[str | None, str, int, bool, State]] = []
+"""(bracket, close or emit, thread, whether ``_stop`` was set, the state read) per recorder call."""
+
+
+class StateRecorder(Recorder):
+    """A :class:`Recorder` that samples the state in its own ``close()`` and ``emit()``.
+
+    It reads ``_stop`` **before** ``state``: ``_shutdown_worker`` adds its token before it sets the
+    event, in one critical section, so a sample that saw the event set was taken after the token.
+    It also notes the thread each event arrived on, for invariant 4.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(0.0)
+        self.threads: list[tuple[int, object]] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        _sample("emit")
+        with self._lock:
+            self.threads.extend((threading.get_ident(), e.get("message")) for e in batch)
+        super().emit(batch)
+
+    def close(self) -> None:
+        _sample("close")
+        super().close()
+
+    def forget(self) -> None:
+        super().forget()
+        with self._lock:
+            self.threads.clear()
+
+
+def _sample(kind: str) -> None:
+    """Records what the state read at this instant of a recorder call."""
+    stop = _lifecycle._state._stop.is_set()
+    _SAMPLES.append((_BRACKET[0], kind, threading.get_ident(), stop, _lifecycle._state.state))
+
+
+@dataclass
+class _Run:
+    """One seed's ledger and history."""
+
+    seed: int
+    sinks: list[StateRecorder] = field(default_factory=list)
+    spans: int = 0
+    orphans: int = 0
+    drains: set[int] = field(default_factory=set)
+    history: list[str] = field(default_factory=list)
+
+    def recorder(self) -> StateRecorder:
+        sink = StateRecorder()
+        self.sinks.append(sink)
+        return sink
+
+    def where(self, index: int) -> str:
+        return f"seed={self.seed} step={index} history={self.history}"
+
+
+def _budget(step: str) -> float:
+    """The budget a step is bounded by, before the slack (invariant 3)."""
+    return {
+        "configure": _lifecycle.DEFAULT_SWAP_TIMEOUT,
+        "flush": FLUSH_TIMEOUT,
+        "shutdown": SHUTDOWN_TIMEOUT,
+        "exit": _lifecycle.DEFAULT_SHUTDOWN_TIMEOUT,
+        "fork": float(CHILD_TIMEOUT),
+    }.get(step, 0.0)
+
+
+def _fork_step(run: _Run, expected: State, where: str) -> None:
+    """Forks at a step boundary and checks the child's half of invariant 12 and the parent's."""
+    before = [(len(s.events), s.closes) for s in run.sinks]
+    parent_state = _lifecycle._state.state
+    inherited = len(run.sinks)
+
+    def child() -> str:
+        closes = [s.closes for s in run.sinks]
+        initial = _lifecycle._state.state.name
+        started = time.monotonic()
+        log_foundry.info("child-orphan")
+        log_foundry.flush(timeout=FLUSH_TIMEOUT)
+        log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+        elapsed = time.monotonic() - started
+        return json.dumps(
+            {
+                "initial": initial,
+                "elapsed": elapsed,
+                "in_inherited": sum(s.count("child-orphan") for s in run.sinks[:inherited]),
+                "in_own": sum(s.count("child-orphan") for s in run.sinks[inherited:]),
+                "closed_inherited": [
+                    s.closes - c for s, c in zip(run.sinks[:inherited], closes, strict=True)
+                ],
+            }
+        )
+
+    reaped = run_in_child(child)
+    assert reaped.finished, f"invariant 12 (the child finished): {reaped.output} {where}"
+    report = json.loads(reaped.output)
+    assert report["initial"] == expected.name, f"invariant 12 (child state): {report} {where}"
+    assert report["elapsed"] < FLUSH_TIMEOUT + SHUTDOWN_TIMEOUT + BOUND_SLACK, (
+        f"invariant 12 (the child's three calls returned within a bound): {report} {where}"
+    )
+    assert report["in_inherited"] + report["in_own"] == 1, (
+        f"invariant 12 (the child's event landed in a child recorder): {report} {where}"
+    )
+    assert not any(report["closed_inherited"]), (
+        f"invariant 5 (no child closed a sink it inherited): {report} {where}"
+    )
+    assert _lifecycle._state.state is parent_state, f"invariant 12 (parent state) {where}"
+    assert [(len(s.events), s.closes) for s in run.sinks] == before, (
+        f"invariant 12 (the parent's ledger is untouched by the fork) {where}"
+    )
+
+
+def _take(run: _Run, step: str, nested: bool, label: str) -> object:
+    """Performs one step on the driver's thread, inside its bracket."""
+    _BRACKET[0] = label
+    try:
+        if step == "configure":
+            log_foundry.configure(service="model", sink=run.recorder())
+        elif step == "info":
+            log_foundry.info("orphan")
+            run.orphans += 1
+        elif step == "span":
+            _outer(nested)
+            run.spans += 2 if nested else 1
+        elif step == "flush":
+            return log_foundry.flush(timeout=FLUSH_TIMEOUT)
+        elif step == "shutdown":
+            log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+        elif step == "exit":
+            _lifecycle._shutdown_worker()
+        return None
+    finally:
+        _BRACKET[0] = None
+
+
+def _check_samples(label: str, step: str, driver: int, where: str) -> None:
+    """The transient states, asserted only where they have provably begun."""
+    for bracket, kind, thread, stop, read in _SAMPLES:
+        if bracket != label:
+            continue
+        if kind == "close" and step == "configure":
+            assert read is State.SWAPPING, f"a close inside a swap read {read} {where}"
+        if kind == "close" and step in {"shutdown", "exit"}:
+            assert read is State.DRAINING, f"a close inside a shutdown read {read} {where}"
+        if kind == "emit" and step in {"shutdown", "exit"} and stop and thread != driver:
+            assert read is State.DRAINING, f"a drain emit after the stop read {read} {where}"
+
+
+def _check_invariants(run: _Run, step: str, result: object, driver: int, where: str) -> None:
+    """Invariants 2, 4 and 5 after a step, each where it is decidable."""
+    health = log_foundry.health()
+    delivered_orphans = sum(s.count("orphan") for s in run.sinks)
+    assert delivered_orphans + health.orphan_lost == run.orphans, (
+        f"invariant 2 (orphans): delivered={delivered_orphans} lost={health.orphan_lost} "
+        f"called={run.orphans} {where}"
+    )
+    worker = _lifecycle._state.worker_exists()
+    if worker is not None and worker._thread.ident is not None:
+        run.drains.add(worker._thread.ident)
+    for sink in run.sinks:
+        for thread, message in sink.threads:
+            if message == "span.end":
+                assert thread in run.drains and thread != driver, (
+                    f"invariant 4 (a span.end arrived off the drain thread) {where}"
+                )
+            elif message == "orphan":
+                assert thread == driver, f"invariant 4 (an orphan left the caller's thread) {where}"
+    if (step == "flush" and result) or step in {"shutdown", "exit"}:
+        ends = sum(s.count("span.end") for s in run.sinks)
+        queued = health.queued - _stranded_markers()
+        assert ends + queued + health.dropped == run.spans, (
+            f"invariant 2 (spans): span.end={ends} queued={queued} dropped={health.dropped} "
+            f"started={run.spans} {where}"
+        )
+    if step in {"shutdown", "exit"}:
+        unclosed = [i for i, s in enumerate(run.sinks) if s.events and s.closes == 0]
+        overlapped = [i for i, s in enumerate(run.sinks) if s.overlapped]
+        assert not unclosed, f"invariant 5 (every sink written to is closed): {unclosed} {where}"
+        assert not _lifecycle._state._owed, f"invariant 5 (nothing owed after a shutdown) {where}"
+        assert not overlapped, f"invariant 5 (closed once, never overlapping): {overlapped} {where}"
+
+
+@pytest.mark.parametrize("seed", SEQ_SEEDS)
+def test_the_sequential_driver_holds_the_state_table(
+    seed: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-004: every step against the table, and invariants 1-6 and 12 after each.
+
+    After every step the state is the table's, both token sets are empty, the (before, after) pair
+    is a row, and the two facts the table is keyed by that the runtime holds — something owed, a
+    live worker — are read back rather than trusted to the model.
+    """
+    run = _Run(seed)
+    monkeypatch.setattr("log_foundry.sinks.stdout.StdoutSink", run.recorder)
+    _SAMPLES.clear()
+    driver = threading.get_ident()
+    model = _Model()
+    for index, (step, nested) in enumerate(_draws(seed)):
+        cell = model.cell(step)
+        expected, _transient = TABLE[cell]
+        label = f"{index}:{step}"
+        run.history.append(f"{step}@{cell[1].name}")
+        where = run.where(index)
+        if step == "fork":
+            _fork_step(run, expected, where)
+            model.take(step)
+            continue
+        started = time.monotonic()
+        try:
+            result = _take(run, step, nested, label)
+        except BaseException as exc:
+            pytest.fail(f"invariant 1 (never fail the caller): {step} raised {exc!r} {where}")
+        elapsed = time.monotonic() - started
+        model.take(step)
+        state = _lifecycle._state.state
+        assert state is expected, f"state {state.name} is not the table's {expected.name} {where}"
+        assert (cell[1], state) in ROWS, f"({cell[1].name}, {state.name}) is no row {where}"
+        assert not _lifecycle._state._swaps_running and not _lifecycle._state._stops_running, (
+            f"a token outlived its call {where}"
+        )
+        assert bool(_lifecycle._state._owed) == model.owed, f"owed is not the model's {where}"
+        assert (_lifecycle._state.live_worker() is not None) == model.live, (
+            f"liveness is not the model's {where}"
+        )
+        bound = _budget(step) + BOUND_SLACK
+        assert elapsed < bound, f"invariant 3 (bounded): {step} took {elapsed:.2f}s {where}"
+        _check_samples(label, step, driver, where)
+        _check_invariants(run, step, result, driver, where)
 
 
 def _ids(sink: Recorder, message: str) -> list[str]:
