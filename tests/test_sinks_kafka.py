@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 
 import pytest
 
+from conftest import release_after_clock
 from log_foundry import SinkLosses
+from log_foundry.sinks import _guard
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.kafka import DEFAULT_FLUSH_TIMEOUT, KafkaSink
+from test_worker_exit_budget import _measured
 
 
 class FakeProducer:
@@ -369,3 +374,157 @@ def test_an_empty_producer_config_alongside_an_injected_producer_is_still_refuse
     # caller's intent, and the next falsy shape it admits would not be a no-op.
     with pytest.raises(ValueError, match="producer_config"):
         KafkaSink("logs", producer=FakeProducer(), producer_config={})
+
+
+# -- SPEC-076 FR-003: the close waits a bounded time for a produce still inside ----------------
+
+
+class ParkingProducer:
+    """A producer whose first ``produce`` parks until released; ``flush`` drains what is queued.
+
+    The first ``flush`` can be parked too, so a ``flush()`` section can be held inside the sink.
+    """
+
+    def __init__(self, *, park_flush: bool = False, refuse_at: int | None = None) -> None:
+        self.refuse_at = refuse_at
+        self.produced = 0
+        self.inside = threading.Event()
+        self.release = threading.Event()
+        self.flushing = threading.Event()
+        self.unflush = threading.Event()
+        self.park_flush = park_flush
+        self.queued: list[bytes] = []
+        self.delivered: list[bytes] = []
+        self.flushes: list[str] = []
+
+    def produce(self, topic: str, *, value: bytes, key: object, callback: object) -> None:
+        self.produced += 1
+        if self.produced == 1:
+            self.inside.set()
+            assert self.release.wait(10.0)
+        if self.produced == self.refuse_at:
+            raise BufferError("queue full")
+        self.queued.append(value)
+
+    def poll(self, timeout: float) -> int:
+        return 0
+
+    def flush(self, timeout: float | None = None) -> int:
+        name = threading.current_thread().name
+        self.flushes.append(f"enter {name}")
+        if self.park_flush and len(self.flushes) == 1:
+            self.flushing.set()
+            assert self.unflush.wait(10.0)
+        self.delivered.extend(self.queued)
+        self.queued.clear()
+        self.flushes.append(f"leave {name}")
+        return 0
+
+
+def _producing(sink: KafkaSink, producer: ParkingProducer) -> threading.Thread:
+    thread = threading.Thread(target=sink.emit, args=([{"m": 1}],), daemon=True)
+    thread.start()
+    assert producer.inside.wait(10.0), "the emit never reached produce()"
+    return thread
+
+
+DEFECT_WAIT = 2.0
+"""The overlap bound these tests patch in, so a ceiling of half of it separates a close that ended
+when the call left from one that waited the whole bound (``test_timing_floors``'s rule)."""
+
+
+def test_a_produce_released_during_the_close_wait_is_flushed(capsys, monkeypatch) -> None:
+    """FR-003 AC-3, first variant: released 0.1 s after the close began, the close flushes it.
+
+    The close ends when the produce leaves, inside half the patched overlap bound.
+    """
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", DEFECT_WAIT)
+    producer = ParkingProducer()
+    sink = KafkaSink("logs", producer=producer)
+    emitter = _producing(sink, producer)
+    with release_after_clock(0.1, producer.release.set) as watch:
+        sink.close()
+    emitter.join(10.0)
+    assert watch.elapsed < DEFECT_WAIT / 2, watch.elapsed
+    assert producer.delivered == [b'{"m": 1}'] and producer.queued == []
+    assert sink.losses().failed == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_produce_released_after_close_is_counted_and_announced(capsys) -> None:
+    """FR-003 AC-3, second variant: the Overview's order — the release overtook the produce.
+
+    The close waits its bound, then flushes; the produce lands in the producer after that, so the
+    message is counted in ``failed`` with one line naming the count, never silently queued.
+    """
+    producer = ParkingProducer()
+    sink = KafkaSink("logs", producer=producer)
+    emitter = _producing(sink, producer)
+    elapsed = _measured(sink.close)
+    producer.release.set()
+    emitter.join(10.0)
+    assert 0.45 <= elapsed < 0.75, elapsed
+    assert producer.queued == [b'{"m": 1}'], "the message was not left behind the release's flush"
+    assert sink.losses().failed == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert lines == [
+        "log-foundry: lost 1 message(s); KafkaSink, produced while the sink was closing"
+    ], lines
+
+
+def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush(monkeypatch) -> None:
+    """FR-003 AC-4: ``flush()`` is a section with the same refusal rule as ``emit``.
+
+    The second half's close ends when the parked flush leaves, inside half the patched overlap
+    bound, and its own flush runs only after that one.
+    """
+    monkeypatch.setattr(_guard, "CLOSE_OVERLAP_WAIT", DEFECT_WAIT)
+    producer = ParkingProducer()
+    sink = KafkaSink("logs", producer=producer)
+    emitter = _producing(sink, producer)
+    closer = threading.Thread(target=sink.close, daemon=True)
+    closer.start()
+    deadline = time.monotonic() + 10.0
+    while not sink._guard.closed:
+        assert time.monotonic() < deadline, "the close never began"
+        time.sleep(0.001)
+    with pytest.raises(SinkDeliveryError, match=r"^KafkaSink cannot flush: the sink is closed$"):
+        sink.flush()
+    producer.release.set()
+    emitter.join(10.0)
+    closer.join(10.0)
+
+    parked = ParkingProducer(park_flush=True)
+    parked.release.set()
+    other = KafkaSink("logs", producer=parked)
+    flusher = threading.Thread(target=other.flush, name="flusher", daemon=True)
+    flusher.start()
+    assert parked.flushing.wait(10.0)
+    with release_after_clock(0.1, parked.unflush.set) as watch:
+        other.close()
+    flusher.join(10.0)
+    assert watch.elapsed < DEFECT_WAIT / 2, watch.elapsed
+    assert parked.flushes[:2] == ["enter flusher", "leave flusher"], parked.flushes
+
+
+def test_an_overtaken_emit_counts_every_message_it_handed_over(capsys) -> None:
+    """FR-003 AC-3: the count is what that call handed to the producer, not one, not the batch.
+
+    Three events, one of which ``produce`` refuses: the two it accepted are counted ``failed``
+    and named in one line, and the refused one is counted as a refusal, once, elsewhere.
+    """
+    producer = ParkingProducer(refuse_at=2)
+    sink = KafkaSink("logs", producer=producer)
+    emitter = threading.Thread(
+        target=sink.emit, args=([{"m": 1}, {"m": 2}, {"m": 3}],), daemon=True
+    )
+    emitter.start()
+    assert producer.inside.wait(10.0), "the emit never reached produce()"
+    sink.close()
+    producer.release.set()
+    emitter.join(10.0)
+    assert len(producer.queued) == 2
+    assert sink.losses().failed == 2
+    lines = capsys.readouterr().err.splitlines()
+    overtaken = "log-foundry: lost 2 message(s); KafkaSink, produced while the sink was closing"
+    assert lines.count(overtaken) == 1, lines

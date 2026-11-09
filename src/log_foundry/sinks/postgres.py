@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
@@ -14,12 +13,15 @@ from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_r
 from log_foundry.sinks._encode import NUL_ESCAPE, encode_round, repair_nul, unencodable_in_run
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count, require_positive
 from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
+
     from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["PostgresSink"]
@@ -173,8 +175,7 @@ class PostgresSink:
         self.max_retries = floor_count(max_retries, 0, "max_retries", "PostgresSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self.log_foundry_counters = SinkCounters()
-        self._closed = False
-        self._lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.SERIAL)
         self._owns_connection = connection is None
         self._dsn = dsn
         given_timeout = connect_timeout
@@ -197,6 +198,44 @@ class PostgresSink:
         self._insert_sql = f"INSERT INTO {self._table} ({columns}) VALUES ({placeholders})"
         if create_table:
             self._ensure_schema()
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -345,15 +384,15 @@ class PostgresSink:
         Raises:
           None. A ``BaseException`` from the driver propagates.
         """
-        context = run_context()
-        with self._lock:
-            if self._closed:
-                context.refuse(
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
                     SinkDeliveryError(
                         f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
             pairs = encode_round(self, batch, self._row, sink=type(self).__name__)
             if not pairs:
@@ -629,8 +668,11 @@ class PostgresSink:
     def close(self) -> None:
         """Commits pending work and closes only an owned connection (FR-005).
 
-        Idempotent, and takes the emit lock so the final commit never lands in the middle of
-        another thread's transaction (SPEC-028 FR-002).
+        Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
+        refused at once, the one round inside, if any, is waited for and never released under,
+        and the release runs once; a second close waits for the first's release, then returns.
+        The final commit never lands in the middle of another thread's transaction
+        (SPEC-028 FR-002).
 
         **The final commit is guarded** (SPEC-041 FR-002). It was unconditional, so a connection
         the server had closed made ``close()`` raise — reachable without any exotic timing, since
@@ -648,16 +690,29 @@ class PostgresSink:
         Raises:
           Exception: Whatever the driver raises on close. The commit no longer escapes.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            try:
-                self._conn.commit()
-            except Exception as err:
-                _diag.absorbed("PostgresSink.close commit", err)
-            if self._owns_connection:
-                self._conn.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Commits pending work, guarded, then closes the connection if the sink owns it.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the driver raises on close. The commit does not escape.
+        """
+        try:
+            self._conn.commit()
+        except Exception as err:
+            _diag.absorbed("PostgresSink.close commit", err)
+        if self._owns_connection:
+            self._conn.close()
 
     def _row(self, event: dict[str, object]) -> tuple[object, ...]:
         """Builds one row: the extracted columns, then the whole event as JSON.

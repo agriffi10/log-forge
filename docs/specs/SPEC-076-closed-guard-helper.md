@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-076
 title: "The Closed-Guard Helper"
 description: "Gives the shipped sinks that release a transport one private helper, in two modes, for the transport lock, the idempotent close and the refusal after close, and defines what a close does when it overlaps a call still inside the sink and what a closed sink's deliver answers."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-028, SPEC-032, SPEC-061, SPEC-069, SPEC-072, SPEC-074]
 arc: stability-redesign
 arc_order: 8
@@ -141,8 +141,10 @@ SPEC-061 specifies is re-specified here.
 - **Any public name**, or any change to `emit`'s contract, `SinkLosses`, `configure()` or `Config`.
 - **Deleting a test.** No test is deleted. Tests that read a sink's `_lock` keep working through
   FR-005's read-only aliases: eight in `tests/test_fork_lifecycle.py`, and
-  `tests/test_sinks_oversize_deferral.py:284` and `tests/test_socket_oversize_deferral.py:186`.
-  The one that assigns it, `tests/test_fork_lifecycle.py:898` (`sink._lock = inherited`), is
+  `tests/test_sinks_oversize_deferral.py:284` and `tests/test_socket_oversize_deferral.py:186`
+  (lines at `fda134a`).
+  The one that assigns it, `tests/test_fork_lifecycle.py:902` at `095ccd76` (`:898` at
+  `fda134a`; `sink._lock = inherited`), is
   re-pointed at `sink._guard._lock`. The lints change by re-deriving their population (FR-005),
   never by deleting a case.
 
@@ -304,13 +306,15 @@ SPEC-028 kept. Today their close does not wait at all. That is how the Kafka win
 loses a message.
 
 In `CLOSE_ONLY` mode an admitted section takes no lock across its body. It is counted in `_inside`
-under the state lock, and the `_idle` event is cleared while any section is inside. `close()` takes
-`_lock` for its whole run, so a second closer waits as FR-001 says. Then:
+under the state lock, and the `_idle` event is cleared while any section is inside. `close()`:
 
-1. It sets `CLOSING` under the state lock. From then on `enter()` refuses.
-2. If a section is inside, it waits on `_idle` for at most `CLOSE_OVERLAP_WAIT = 0.5` seconds. The
+1. Sets `CLOSING` under the state lock **before** it takes `_lock`, as FR-001 requires of both
+   modes, so a closer interrupted while it waits for the lock leaves the guard `CLOSING`. From then
+   on `enter()` refuses.
+2. Takes `_lock` for the rest of its run, so a second closer waits as FR-001 says.
+3. If a section is inside, it waits on `_idle` for at most `CLOSE_OVERLAP_WAIT = 0.5` seconds. The
    wait is an event wait, so it is idle, and it ends early when the last section leaves.
-3. It sets `CLOSED` and runs `release`, whether or not a section is still inside.
+4. It sets `CLOSED` and runs `release`, whether or not a section is still inside.
 
 **The bound** is `CLOSE_OVERLAP_WAIT` plus the release. For Kafka 0.5 s is measured headroom:
 `produce()` is a local hand-off, measured in this sink's docstring at 0.0001 s for three messages.
@@ -319,8 +323,9 @@ returns in the client's round trip, well inside it. A round that outlives it is 
 exists to stop waiting for, and that call's outcome is still counted (below). 0.5 s is a quarter of
 `DEFAULT_CLOSER_GRACE`. That leaves room for the release inside a full grace, but it is no
 guarantee: a detached close's grace is `min(DEFAULT_CLOSER_GRACE, deadline − now)`
-(`_lifecycle.py:1244`), so with less than 0.5 s of budget left the overlap wait alone can outlast
-it. The constant is private, a module constant of `_guard.py`, with that reason in its docstring.
+(`_lifecycle.py:1244` at `fda134a`), so with less than 0.5 s of budget left the overlap wait
+alone can outlast it. The constant is private, a module constant of `_guard.py`, with that reason
+in its docstring.
 
 **A section still inside when the release runs is told so.** After its `with` block exits,
 `Section.released_during` is true when the guard reached `CLOSED` while the section was admitted. A
@@ -421,8 +426,9 @@ its own from `flush`. None counts it, which is SPEC-032's rule, and SPEC-069's f
 
 - [ ] For each of the eight engine sinks above, `deliver` after `close()`, and again while a
       `close()` is `CLOSING`, calls `RunContext.refuse` with a `SinkDeliveryError` carrying the
-      sink's fda134a closed message and returns `Verdict.uniform(Outcome.REJECTED, n)`, and the
-      driver double records no call.
+      sink's fda134a message for that state — its closed message, except that a closing
+      `NATSSink` carries SPEC-061's closing one — and returns
+      `Verdict.uniform(Outcome.REJECTED, n)`, and the driver double records no call.
 - [ ] For each of those eight, after `close()`:
       - through a `Worker` the batch costs exactly one `deliver` call, `failed_batches == 1` and
         `flush()` is falsy;
@@ -542,7 +548,8 @@ against. So:
       concurrent section waiting until it leaves. For a `CLOSE_ONLY` adopter, `self._close_lock` is
       the guard's `_lock`. Assigning `_closed`, `_lock` or `_close_lock` raises `AttributeError`.
       `tests/test_fork_lifecycle.py`, `tests/test_sinks_oversize_deferral.py` and
-      `tests/test_socket_oversize_deferral.py` pass with only the line-898 edit.
+      `tests/test_socket_oversize_deferral.py` pass with only the line-902 edit (the line at
+      `095ccd76`).
 - [ ] Every sink that releases nothing (the Out of Scope list) still delivers a batch after
       `close()`, and none builds a `ClosedGuard`.
 - [ ] Serves invariants 7, 5 and 6: which sinks refuse is still enforced from the code, each
@@ -590,8 +597,8 @@ after the locks (invariant 12's order).
       0.25 s. A mutant without the pid adoption waits `CLOSE_OVERLAP_WAIT` and is killed.
 - [ ] A child forked while a parent `close()` is `CLOSING` (waiting on the lock) admits sections. A
       child forked after the parent's close set `CLOSED` refuses them.
-- [ ] A `FileSink` closed before the fork re-acquires nothing in the child, and the parent's next
-      `emit` after the fork is accepted.
+- [ ] A `FileSink` closed before the fork re-acquires nothing in the child, and an open `FileSink`
+      in the same parent accepts its next `emit` after the fork.
 - [ ] Serves invariant 12: a forked child never hangs on a guard lock its parent held, and adopts no
       caller or closer that exists only in the parent.
 
@@ -698,7 +705,7 @@ tests/
 ├── test_closed_guard.py         # FR-001 to FR-003 against doubles, both modes parametrised
 ├── test_sink_concurrency.py     # FR-002's adopter cases; FR-005's re-derived lints and fixtures
 ├── test_sink_post_close.py      # FR-004 across the adopters, worker and orphan
-├── test_fork_lifecycle.py       # + FR-006; :898 re-pointed at sink._guard._lock
+├── test_fork_lifecycle.py       # + FR-006; :902 (at 095ccd76) re-pointed at sink._guard._lock
 ├── test_sinks_kafka.py          # + FR-003's window
 └── test_deferral.py             # + ("KafkaSink", "emit") in IMMEDIATE
 ```
@@ -764,3 +771,28 @@ tests/
     claim is narrowed and the 0.5 s bound justified, Kafka's count is stated as an upper bound,
     and the AST check reads `run_context().refuse`.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-09, plan gate: FR-003's step list set `CLOSING` after taking `_lock`, which FR-001
+  forbids (a `CLOSE_ONLY` closer interrupted on the lock would leave the guard `OPEN`; an executed
+  prototype's mutant with that order fails FR-001's interrupted-closer criterion). FR-001 governs:
+  `CLOSING` is set before `_lock` in both modes, and the step list now says so.
+- 2026-11-09, build: three criteria corrected, none changing shipped behaviour.
+  - FR-004's first criterion read "the sink's fda134a closed message" for a `CLOSING` sink too,
+    but `NATSSink`'s closing state stays SPEC-061's, whose refusal carries "the sink is closing".
+    It now names each state's own message.
+  - FR-006's last criterion asked that "the parent's next `emit` after the fork is accepted" of
+    the `FileSink` closed before the fork, which FR-004 requires to refuse. It is read as two
+    sinks: the closed one re-acquires nothing in the child, and an open one in the same parent
+    still accepts after the fork (the parent is untouched, invariant 12's other half).
+  - The test that assigns `sink._lock` is at `tests/test_fork_lifecycle.py:902` at `095ccd76`
+    (`:898` at `fda134a`); the criteria named the older line.
+- At completion: FR-003's "a call the client gives no timeout" for Redis is narrowed. The installed
+  `redis-py` 8.1.0 builds a connection with a 5 s socket timeout by default, so the call is bounded
+  by the client's own timeout, which the library neither sets nor sees. The rule is unchanged.
+- After rebasing onto #323 (`3835a30e`), whose timing gate refuses a ceiling under its 0.5 s
+  `STALL_ALLOWANCE`: the criteria's ceilings were re-derived by its rule, half the wait the defect
+  would make, with that wait made at least 1 s. FR-002's 0.05 s for a caller arriving while a
+  `SERIAL` close waits is now 1.0 s against a section held 2 s; FR-002's 0.05 s idle close, FR-003's
+  0.05 s refusal while a `CLOSE_ONLY` close waits and its 0.3 s close after a section leaves,
+  FR-003's two 0.3 s Kafka and `flush()` closes, and FR-006's 0.25 s child close are now 1.0 s
+  with `CLOSE_OVERLAP_WAIT` patched to 2 s in those tests. The 0.45 s to 0.75 s window on the bound
+  itself is unchanged. Each test still kills the mutant it was written for.

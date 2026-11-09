@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry.sinks import _engine
@@ -12,12 +11,15 @@ from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_r
 from log_foundry.sinks._encode import encode_round, unencodable_in_run
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count, require_positive
 from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
+
     from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["RedisListSink", "RedisStreamsSink"]
@@ -78,8 +80,45 @@ class _RedisSink:
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None
         self.log_foundry_counters = SinkCounters()
-        self._closed = False
-        self._close_lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.CLOSE_ONLY)
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _close_lock(self) -> threading.Lock:
+        """The guard's lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        In ``CLOSE_ONLY`` mode it is held by a close for its whole run and by no section, so a
+        1.x subclass taking it serialises with the close only, as it did with the 1.x lock;
+        assigning it raises ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock the close holds.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -222,47 +261,48 @@ class _RedisSink:
         Raises:
           None. A ``BaseException`` from the client propagates.
         """
-        context = run_context()
-        if self._closed:
-            context.refuse(
-                SinkDeliveryError(
-                    f"{type(self).__name__} delivered none of {len(batch)} event(s): "
-                    "the sink is closed"
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
+                    SinkDeliveryError(
+                        f"{type(self).__name__} delivered none of {len(batch)} event(s): "
+                        "the sink is closed"
+                    )
                 )
-            )
-            return Verdict.uniform(Outcome.REJECTED, len(batch))
-        fates = [Outcome.DROPPED] * len(batch)
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
-        if not pairs:
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
+            fates = [Outcome.DROPPED] * len(batch)
+            pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+            if not pairs:
+                return Verdict(outcomes=tuple(fates))
+            positions = [position for position, _ in pairs]
+            carried = [batch[position] for position in positions]
+            mark_sent(self, carried)
+            try:
+                pipe = self.client.pipeline()
+                for _, payload in pairs:
+                    self._stage(pipe, payload)
+                pipe.execute()
+            except Exception as err:
+                retryable = is_retryable(self._retryable_error, err)
+                kind = type(err).__name__
+                whole = unencodable_in_run(self)
+                context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
+                lost = Lost(self)
+                lost.add(
+                    carried,
+                    when=When.LAST if retryable else When.ALWAYS,
+                    key=kind,
+                    line=raised_line("event", type(self).__name__, kind),
+                    whole=whole,
+                )
+                lost.register()
+                outcome = Outcome.RETRYABLE if retryable else Outcome.REJECTED
+            else:
+                outcome = Outcome.ACCEPTED
+            for position in positions:
+                fates[position] = outcome
             return Verdict(outcomes=tuple(fates))
-        positions = [position for position, _ in pairs]
-        carried = [batch[position] for position in positions]
-        mark_sent(self, carried)
-        try:
-            pipe = self.client.pipeline()
-            for _, payload in pairs:
-                self._stage(pipe, payload)
-            pipe.execute()
-        except Exception as err:
-            retryable = is_retryable(self._retryable_error, err)
-            kind = type(err).__name__
-            whole = unencodable_in_run(self)
-            context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
-            lost = Lost(self)
-            lost.add(
-                carried,
-                when=When.LAST if retryable else When.ALWAYS,
-                key=kind,
-                line=raised_line("event", type(self).__name__, kind),
-                whole=whole,
-            )
-            lost.register()
-            outcome = Outcome.RETRYABLE if retryable else Outcome.REJECTED
-        else:
-            outcome = Outcome.ACCEPTED
-        for position in positions:
-            fates[position] = outcome
-        return Verdict(outcomes=tuple(fates))
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed pipeline is worth another attempt (SPEC-070 FR-002).
@@ -307,10 +347,22 @@ class _RedisSink:
     def close(self) -> None:
         """Closes the connection only if the sink owns it (FR-005).
 
-        Idempotent, with the flag set under a lock so two concurrent calls cannot both reach
-        ``client.close()`` — ``atexit`` racing user code is the documented case. The flag is set
-        whether or not the client is owned, because it marks *this sink* as released rather than
-        the connection (SPEC-032 FR-001).
+        Idempotent through the guard, so two concurrent calls cannot both reach
+        ``client.close()`` — ``atexit`` racing user code is the documented case. The guard
+        closes whether or not the client is owned, because it marks *this sink* as
+        released rather than the connection (SPEC-032 FR-001).
+
+        **A close waits a bounded time for a round still inside** (SPEC-076 FR-003). The client
+        is thread-safe, so rounds run concurrently and take no lock; each is a ``CLOSE_ONLY``
+        section of the guard. A close refuses every later round at once, waits idle for at most
+        ``CLOSE_OVERLAP_WAIT`` for the rounds inside, then releases once whether or not one is
+        still inside; a second close waits for the first's release, then returns.
+        A round still inside after that bound meets a closed client: ``redis-py`` raises
+        ``ConnectionError``, which is ``RETRYABLE``, and the run's next round is refused,
+        so a failed run commits nothing for it and its catcher counts the batch. Such a
+        round can also reopen a connection nothing reaps, the leak SPEC-032 records for a
+        post-close emit, accepted against waiting on a call bounded only by the client's
+        own socket timeout, which the library neither sets nor sees.
 
         Args:
           None.
@@ -321,12 +373,25 @@ class _RedisSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._owns_client:
-                self.client.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Closes the client if the sink owns it.
+
+        :meth:`close` hands this to the guard, which runs it once, with its lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the client raises on close.
+        """
+        if self._owns_client:
+            self.client.close()
 
     def _encode(self, event: dict[str, object]) -> str:
         """Encodes one event as the JSON text both Redis sinks write.

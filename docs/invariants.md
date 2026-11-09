@@ -192,10 +192,16 @@ predicted to end past `shutdown()`'s deadline, as the 1.x `emit` loop does. Sinc
 module but the engine waits or holds a backoff constant (`pubsub`'s wait on its own futures is not a
 backoff): every SDK, driver and socket sink waits through the engine, and none holds its transport
 lock across a wait, so a `close()` during a backoff returns at once and the next round is refused.
+Since SPEC-076 the overlap of a `close()` with a call still inside one sink is bounded too: a
+`SERIAL` guard's close waits for at most the one section holding the transport lock when it
+began, never for a queue of callers, and a `CLOSE_ONLY` guard's close waits idly, on an event, for
+at most `CLOSE_OVERLAP_WAIT` before it releases.
 
 *Observable:* elapsed wall time ≤ the timeout plus the sink's one in-flight call; CPU time ≈ 0.
-*Recorded exceptions:* `Sink.close()` takes no timeout and is unbounded on both delivery paths;
-what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
+*Recorded exceptions:* `Sink.close()` takes no timeout and is unbounded on both delivery paths:
+the release itself is as unbounded as the driver's, and a `SERIAL` close's wait for its one
+section is bounded only by that driver call's own timeout, where it has one (SPEC-076); what
+bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
 An engine run whose stop event's `wait` raises announces it once and sleeps the rest of its waits,
 each still capped, rather than letting the exception out or skipping a wait; and an engine sink that
@@ -210,6 +216,8 @@ as a mutation-gated corpus, including the next and the queued caller's latency),
 retries fit the `shutdown()` budget, SPEC-062) and `tests/test_delivery_paths.py` (the same cases
 through `deliver`, SPEC-072); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight),
+`tests/test_closed_guard.py` and `tests/test_sinks_kafka.py` (a `CLOSE_ONLY` close's bounded wait,
+through the measuring helper, SPEC-076),
 `tests/test_worker_exit_budget.py` (each of its D/T cases' `shutdown()` over the exit drain,
 through one measuring helper), and through that helper `tests/test_delivery_engine.py` (a stop cuts
 a hinted engine wait short, idly; the 1.x schedule, the hint's bounds and a raising stop event,
@@ -240,7 +248,12 @@ reached with no worker, the swap for the sink it replaced. Ownership is recorded
 is *handed* a sink and consulted by every close, so a process releases only a transport it
 acquired here (SPEC-042). The record is a set, so arming a second sink never discards the first
 (SPEC-045); closes run concurrently and are all joined (SPEC-046); a second caller finding a
-close already running waits for it rather than returning through it (SPEC-050).
+close already running waits for it rather than returning through it (SPEC-050). Inside one sink
+the rule is the closed guard's (SPEC-076): the eleven sinks that release a transport release it
+once, a second `close()` waits for the first's release, and a close that overlaps a call still
+inside waits for it rather than releasing under it — for the one section holding a `SERIAL`
+guard's lock, or for at most `CLOSE_OVERLAP_WAIT` on a `CLOSE_ONLY` guard, after which the release
+runs and the call it overtook is counted (Kafka) or meets the closed client (MongoDB, Redis).
 
 *Observable:* after `shutdown()`, every sink that received an event has `close()` called on it,
 and no sink is closed by a process that did not open it.
@@ -253,7 +266,10 @@ rather than a double (SPEC-045).
 *Guarded:* `tests/test_owed_closes.py`, `tests/test_shutdown_lifecycle.py`,
 `tests/test_sink_ownership.py`; `tests/test_invariants_model.py` asserts the first observable;
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
-lock, its connection released once, and a forked child releases nothing (SPEC-061).
+lock, its connection released once, and a forked child releases nothing (SPEC-061);
+`tests/test_closed_guard.py`, `tests/test_sink_post_close.py` and `tests/test_sinks_kafka.py` that
+the guard releases once, waits for the call inside, and counts a call its release overtook
+(SPEC-076).
 
 ## 6. Twin paths keep the same promises
 
@@ -310,7 +326,11 @@ Total failure raises `SinkDeliveryError`, so the worker's retry engages and `fai
 moves. Partial failure returns and reports through `losses()`; a client exception costs its own
 chunk and nothing else (SPEC-026, SPEC-043, SPEC-048). A redirect is a delivery failure, not a
 route to follow (SPEC-048). A sink that released its transport refuses after `close()`; one that
-released nothing keeps accepting (SPEC-032).
+released nothing keeps accepting (SPEC-032). Since SPEC-076 the refusal starts when the `close()`
+begins, not when its release does, and comes from the closed guard: a closed or closing engine
+sink's `deliver` calls `RunContext.refuse` with its 1.x error and answers `REJECTED`, so a run
+that fails moves no sink counter and the adapter raises that error by identity; an emit-only sink
+raises it.
 
 **A sink that offers `deliver` states the same promise per event** (SPEC-072): it returns a
 `Verdict` rather than raising, and the engine applies the rule to the run. A run **fails** when no
@@ -385,7 +405,9 @@ the worker, the orphan path and the adapter, a settled one on each, SPEC-072) an
 `tests/test_http_rounds.py` (the HTTP family's total and partial failures through `emit`, the
 worker and the orphan path, and a third-party override on its 1.x path, SPEC-073), and
 `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's mapped
-verdict and refusal, and an engine child under `MultiSink`, SPEC-075).
+verdict and refusal, and an engine child under `MultiSink`, SPEC-075), and
+`tests/test_sink_post_close.py` (a closed or closing sink's refusal on every adopter and path,
+and every sink that releases nothing still delivering after `close()`, SPEC-076).
 
 ## 8. An event is safe by construction, once, at assembly
 
@@ -518,8 +540,12 @@ that is itself a container subclass of your own, is not reached, and nothing els
 namespace is read. **An unreached shape whose counters' lock a parent thread held at the fork
 hangs the child's first run that commits into it:** an `info()` on the orphan path blocks the
 caller, and on the worker path the drain thread blocks, so `flush()` times out. A registry of live
-`SinkCounters` the walk reads, rather than finds, is SPEC-079's follow-up.
-*Guarded:* `tests/test_fork_lifecycle.py` (including an engine sink's counters, SPEC-072),
+`SinkCounters` the walk reads, rather than finds, is SPEC-079's follow-up. A sink's closed guard
+(SPEC-076) is on the walk at `self._guard`, so its locks and its event are replaced, and its state
+is adopted lazily by pid: the child counts no parent section inside, turns a `CLOSING` it
+inherited back to `OPEN`, since no parent closer runs there, and keeps `CLOSED`.
+*Guarded:* `tests/test_fork_lifecycle.py` (including an engine sink's counters, SPEC-072, and
+the closed guard driven through `configure()`, SPEC-076),
 `tests/test_sink_ownership.py`,
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`).
 

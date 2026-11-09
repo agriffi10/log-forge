@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry.sinks import _engine
@@ -12,12 +11,15 @@ from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_r
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count, require_timeout
 from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
+
     from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["RabbitMQSink"]
@@ -145,8 +147,45 @@ class RabbitMQSink:
         self._channel: Any = None
         self._properties: Any = None
         self.log_foundry_counters = SinkCounters()
-        self._lock = threading.Lock()
-        self._closed = False
+        self._guard = ClosedGuard(GuardMode.SERIAL)
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -287,13 +326,12 @@ class RabbitMQSink:
         Raises:
           None. A ``BaseException`` from the driver propagates.
         """
-        context = run_context()
-        with self._lock:
-            if self._closed:
-                context.refuse(
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
                     SinkDeliveryError(
-                        f"RabbitMQSink published none of {len(batch)} message(s): the sink is "
-                        f"closed"
+                        f"RabbitMQSink published none of {len(batch)} message(s): "
+                        "the sink is closed"
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
@@ -336,7 +374,9 @@ class RabbitMQSink:
     def close(self) -> None:
         """Closes the channel and, when owned, the connection (FR-006).
 
-        Idempotent.
+        Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
+        refused at once, the one round inside, if any, is waited for and never released under,
+        and the release runs once; a second close waits for the first's release, then returns.
 
         Args:
           None.
@@ -347,16 +387,29 @@ class RabbitMQSink:
         Raises:
           None.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._channel is not None:
-                _safe_close(self._channel)
-                self._channel = None
-            if self._connection is not None:
-                _safe_close(self._connection)
-                self._connection = None
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Closes the channel, then the connection, dropping each reference.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None. ``_safe_close`` absorbs what either close raises.
+        """
+        if self._channel is not None:
+            _safe_close(self._channel)
+            self._channel = None
+        if self._connection is not None:
+            _safe_close(self._connection)
+            self._connection = None
 
     def _publish(self, body: bytes) -> Called[None]:
         """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.

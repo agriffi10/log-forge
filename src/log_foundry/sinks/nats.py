@@ -355,6 +355,14 @@ class NATSSink:
     unconfirmed and never retried. Both mean the same thing -- no ack, and the event may have been
     persisted -- so the first can duplicate and the second can lose. What closes it is the
     ``Nats-Msg-Id`` deduplication item in ``architecture.md`` section 12, which makes a retry safe.
+
+    **This sink keeps its own closed state** rather than the closed guard the other transport
+    sinks share (SPEC-076 FR-005). Its closed state is read from the event loop and from
+    SPEC-061's closing and closed flags; its pid check runs **before** its lock, because that lock
+    may be one the fork repair never reached; its wedged-loop backstop marks it closed from a
+    waiting caller; and its ``close()`` raises ``TimeoutError``. None of that is a guarded section
+    or a release, and SPEC-061 owns it. A closed or closing ``deliver`` still answers as every
+    guarded engine sink does: ``RunContext.refuse`` with its 1.x error and ``REJECTED``.
     """
 
     def __init__(

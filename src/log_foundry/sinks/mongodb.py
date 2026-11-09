@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import threading
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -17,12 +16,14 @@ from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_r
 from log_foundry.sinks._encode import encode_round, encoded_landed, repair_bson
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count, require_timeout
 from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks._deferral import Deferral
@@ -215,10 +216,47 @@ class MongoDBSink:
         self.log_foundry_stop_signal: threading.Event | None = None
         self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._closed = False
-        self._close_lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.CLOSE_ONLY)
         self._bson_resolved = False
         self._bson_encode: Callable[[Any], object] | None = None
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _close_lock(self) -> threading.Lock:
+        """The guard's lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        In ``CLOSE_ONLY`` mode it is held by a close for its whole run and by no section, so a
+        1.x subclass taking it serialises with the close only, as it did with the 1.x lock;
+        assigning it raises ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock the close holds.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -354,7 +392,8 @@ class MongoDBSink:
         ``ACCEPTED``, never resent; one it cannot pair makes the call's documents ``UNKNOWN``,
         counted once with a line. ``writeErrors`` keeps its 1.x precedence over the predicate:
         any other exception goes to ``_retryable_error``. No transport lock is taken, in 1.x or
-        here: the client is thread-safe, and ``_close_lock`` guards the close alone.
+        here: the client is thread-safe, and the round is a ``CLOSE_ONLY`` section of the guard,
+        which a close waits for at most ``CLOSE_OVERLAP_WAIT`` (SPEC-076 FR-003).
 
         Args:
           batch: The events this round is offered.
@@ -365,47 +404,49 @@ class MongoDBSink:
         Raises:
           None. A ``BaseException`` from the client propagates.
         """
-        context = run_context()
-        if self._closed:
-            context.refuse(
-                SinkDeliveryError(
-                    f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
+                    SinkDeliveryError(
+                        f"MongoDBSink inserted none of {len(batch)} document(s): "
+                        "the sink is closed"
+                    )
                 )
-            )
-            return Verdict.uniform(Outcome.REJECTED, len(batch))
-        self._resolve_bson()
-        fates = [Outcome.DROPPED] * len(batch)
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
-        documents = self._documents(pairs, context.drops(self))
-        if not documents:
-            return Verdict(outcomes=tuple(fates))
-        positions = [position for position, _ in documents]
-        carried = [batch[position] for position in positions]
-        mark_sent(self, carried)
-        try:
-            self._collection.insert_many([document for _, document in documents], ordered=False)
-        except Exception as err:
-            details = getattr(err, "details", None)
-            if isinstance(details, dict) and "writeErrors" in details:
-                self._settle_bulk(details["writeErrors"], positions, fates)
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
+            self._resolve_bson()
+            fates = [Outcome.DROPPED] * len(batch)
+            pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+            documents = self._documents(pairs, context.drops(self))
+            if not documents:
+                return Verdict(outcomes=tuple(fates))
+            positions = [position for position, _ in documents]
+            carried = [batch[position] for position in positions]
+            mark_sent(self, carried)
+            try:
+                self._collection.insert_many([document for _, document in documents], ordered=False)
+            except Exception as err:
+                details = getattr(err, "details", None)
+                if isinstance(details, dict) and "writeErrors" in details:
+                    self._settle_bulk(details["writeErrors"], positions, fates)
+                else:
+                    retryable = is_retryable(self._retryable_error, err)
+                    for position in positions:
+                        fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
+                    lost = Lost(self)
+                    kind = type(err).__name__
+                    lost.add(
+                        carried,
+                        when=When.LAST if retryable else When.ALWAYS,
+                        key=kind,
+                        line=raised_line("document", "MongoDBSink", kind),
+                    )
+                    lost.register()
             else:
-                retryable = is_retryable(self._retryable_error, err)
                 for position in positions:
-                    fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
-                lost = Lost(self)
-                kind = type(err).__name__
-                lost.add(
-                    carried,
-                    when=When.LAST if retryable else When.ALWAYS,
-                    key=kind,
-                    line=raised_line("document", "MongoDBSink", kind),
-                )
-                lost.register()
-        else:
-            for position in positions:
-                fates[position] = Outcome.ACCEPTED
-            encoded_landed(self, positions)
-        return Verdict(outcomes=tuple(fates))
+                    fates[position] = Outcome.ACCEPTED
+                encoded_landed(self, positions)
+            return Verdict(outcomes=tuple(fates))
 
     def _settle_bulk(self, errors: object, positions: list[int], fates: list[Outcome]) -> None:
         """Reads a ``BulkWriteError``'s ``writeErrors`` by ``index`` through the keyed reader.
@@ -497,18 +538,21 @@ class MongoDBSink:
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
 
-        Idempotent, with the flag set under a lock so two concurrent ``close()`` calls cannot
-        both reach ``client.close()`` — ``atexit`` racing user code is the documented case.
+        Idempotent through the guard, so two concurrent ``close()`` calls cannot both reach
+        ``client.close()`` — ``atexit`` racing user code is the documented case — and the
+        second returns only after the first's release has.
 
-        The lock does **not** make a close wait for an in-flight ``insert_many``, and saying so
-        plainly matters: ``emit`` takes no lock here because ``pymongo``'s client is thread-safe,
-        and a close that waited would have to serialize against every insert, which is the
-        parallelism SPEC-028 FR-002 declines to remove. What covers the overlap instead is
-        :meth:`emit`'s own ``_closed`` check, which refuses the batch in the library's
-        vocabulary rather than letting it reach a closed client — pymongo raises
-        ``InvalidOperation`` on any use after close. An insert that passes the check and is
-        still in flight when the close lands can still see that error; it is counted as a failed
-        batch like any other, which is a reported loss at process exit rather than a silent one.
+        **A close waits, for a bounded time, for an in-flight ``insert_many``** (SPEC-076
+        FR-003). Rounds take no lock, because ``pymongo``'s client is thread-safe and a
+        lock across every insert would remove the parallelism SPEC-028 FR-002 keeps; each
+        is a ``CLOSE_ONLY`` section of the guard instead. A close refuses every later round
+        at once, in the library's vocabulary rather than by reaching a closed client,
+        waits idle for at most ``CLOSE_OVERLAP_WAIT`` for the rounds inside, then
+        releases. A round still inside after that meets a closed client, which raises
+        ``InvalidOperation``: not a ``ConnectionFailure`` and carrying no
+        ``RetryableWriteError`` label, so it is ``REJECTED``, an attempted delivery
+        counted in ``failed`` like any other — a reported loss, never a silent one — and
+        the run's next round is refused, so no round after the release reaches it.
 
         Args:
           None.
@@ -519,12 +563,25 @@ class MongoDBSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        with self._close_lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._owns_client:
-                self._client.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Closes the client if the sink owns it.
+
+        :meth:`close` hands this to the guard, which runs it once, with its lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the client raises on close.
+        """
+        if self._owns_client:
+            self._client.close()
 
     def _resolve_bson(self) -> None:
         """Finds the driver's own ``bson.encode`` once, on the first ``emit`` that needs it.
