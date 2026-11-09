@@ -85,6 +85,11 @@ Figures re-measured at `fda134a`, each with its instrument:
 - Prose: the wrapper and `MultiSink` docstrings, `docs/invariants.md` entries 2, 6 and 7,
   `docs/architecture.md` §8's wrapper paragraph, the README's wrapper text and
   `docs/component-inventory.md`.
+- The base `deliver` docstring, on `sinks.base.Sink`, documents the detached-call contract: a
+  direct `deliver` outside any engine run is a single round with no memory of earlier calls, so a
+  caller looping it sees a sink's held or giving-up line on every call and an `SQSSink` FIFO hold
+  is never released, and a caller that wants retries uses `emit_via_deliver` (SPEC-074 handover
+  item 1a; Andrew's call: documentation, no behaviour change).
 - At completion, three changes to the decisions in `docs/decisions/sink-delivery/`:
   - `caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises`
     gains this spec's own dated History line, beside the one SPEC-074 wrote for an `SQSSink` FIFO
@@ -683,3 +688,5 @@ tests/
   and two criteria hold the cache and the twins. Also his call: a third-party subclass that assigns
   `self.max_retries` or `self.max_retry_after` now raises `AttributeError`, pinned by a criterion
   (FR-001).
+- 2026-11-09, Andrew's call on SPEC-074 handover item 1a: the detached-call contract of a direct
+  `deliver` is documented in the base `deliver` docstring, with no behaviour change (Scope).

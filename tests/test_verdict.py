@@ -433,6 +433,9 @@ def test_the_sink_docstring_states_the_deliver_contract() -> None:
         "must not call its own ``emit``",
         "emit_via_deliver",
         "read_deliver",
+        "a single round with no memory of earlier calls",
+        "FIFO hold is not released at the end",
+        "sends held events in the run's last round",
     ):
         assert clause in documented, clause
 
