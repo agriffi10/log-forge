@@ -369,7 +369,11 @@ def test_two_concurrent_expiring_shutdowns_write_one_line(capsys) -> None:
     Against `stop()` deciding the gate on `_drain_settled` rather than on `claim_stop`, both
     callers see it clear, both join, and the wedged sink gets two lines. The CPU bound is on the
     two callers' own threads, summed: the drain thread is parked inside the sink for the whole
-    window, so they are the only threads that could spin.
+    window, so the callers are where an inline spin would be. A spin the library moved onto a
+    thread of its own, with the caller joining it, is not counted here; in
+    `test_worker_exit_budget.py`, the process-scope
+    `test_the_recording_caller_is_the_joining_caller_whichever_arrives_first` catches that
+    shape, measured by planting it.
     """
     sink = _GatedSink()
     worker = _wedged(sink)

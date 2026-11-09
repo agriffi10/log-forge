@@ -85,8 +85,12 @@ assignment counts), the call to the duration-returning function, or the stopwatc
   recognised and then judged as that many seconds, so it is never refused;
 - a ``while`` condition is not a ceiling and is skipped, so a deadline loop is never refused, and
   neither is a ceiling a test writes as a loop condition;
-- a CPU clock reached without its name: ``os`` imported under another name (``o.times()``), or
-  ``getattr(time, "process_time")``.
+- a CPU clock reached without its name: ``os`` imported under another name (``o.times()``),
+  ``getattr(time, "process_time")``, a literal clock id passed to ``clock_gettime``, or a third
+  party's reader such as ``psutil``'s ``cpu_times()``;
+- a duration reached through ``await``, kept in a name and then indexed (``r = _timed(f); r[0]``),
+  summed by ``+=``, or returned by a helper imported under another name; a ceiling constant
+  re-exported through a second module (one import hop is followed), or written with ``//``.
 
 Each is a reason to use ``release_after_clock`` in a new floor, and to derive a new ceiling from
 the wait it guards, not a hole this gate claims to close.

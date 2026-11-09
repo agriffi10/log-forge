@@ -324,7 +324,9 @@ def cpu_window(scope: str = "thread"):
     at once on several threads, and restored as the first window found it when the last one
     closes. Nothing the library does depends on a collection running. A thread that never leaves
     its window leaves collection off for the rest of that worker's run, which costs memory, not
-    a result.
+    a result. Two edges are outside the count: another thread calling ``gc.enable()`` or
+    ``gc.disable()`` while a window is open (nothing under ``src/`` or ``tests/`` does), and a fork
+    while a window is open on another thread, whose child inherits collection off.
 
     **Other threads.** ``"thread"`` reads ``time.thread_time()``, so only the calling thread's CPU
     counts: a library thread leaked by an earlier test, alive at the start of many tests in an
