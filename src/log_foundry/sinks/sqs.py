@@ -5,7 +5,8 @@ best-effort past it (SPEC-074 FR-002): a message is held back while an earlier m
 group is still being retried within ``max_retries + 1`` sends, as 1.x's per-chunk loop held it,
 and once that message has used its sends a later one may land first, because holding a group for
 the worker's whole budget would trade log delivery for ordering the consumer can rebuild from
-``timestamp``.
+``timestamp``. In a run's last round nothing is held, each held message sent after its
+predecessor's final send, as 1.x sent it after giving up on that predecessor (SPEC-074 Q4).
 """
 
 from __future__ import annotations
@@ -371,10 +372,14 @@ class SQSSink:
         so they are counted and announced only when ``emit`` returns — on the engine, only when
         the run settles. When every event's id callable raised, the round is a refusal carrying
         the first exception. Otherwise each chunk is sent once through :meth:`_send`, its FIFO
-        holds decided at send time (:func:`_hold`), and each entry's outcome set from the reply:
-        a sender fault ``REJECTED`` and marked a final rejection with 1.x's line, any other failed
-        entry ``RETRYABLE``, an unreadable reply ``UNKNOWN`` with one line, and a raise
-        ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+        holds decided at send time (:func:`_hold`) in every round but the run's last
+        (:attr:`RunContext.last`), where every send is final and so nothing is held: a held
+        message then follows its predecessor's final send in the same round, chunks going out in
+        batch order, as 1.x sent it after giving up on that predecessor (SPEC-074 Q4). Each
+        entry's outcome is set from the reply: a sender fault ``REJECTED`` and marked a final
+        rejection with 1.x's line, any other failed entry ``RETRYABLE``, an unreadable reply
+        ``UNKNOWN`` with one line, and a raise ``RETRYABLE`` or ``REJECTED`` as
+        ``_retryable_error`` answers.
 
         Args:
           batch: The events this round is offered.
@@ -400,12 +405,13 @@ class SQSSink:
         blocked: set[str] = set()
         limit = self.max_retries + 1
         name = "SQSSink"
+        holding = self.fifo and not context.last
         for chunk in plan.chunks:
             held = (
                 _hold(
                     chunk, blocked, [sends_of(self, batch[item.position]) for item in chunk], limit
                 )
-                if self.fifo
+                if holding
                 else [False] * len(chunk)
             )
             sending = [item for item, hold in zip(chunk, held, strict=True) if not hold]
@@ -442,7 +448,7 @@ class SQSSink:
                 cached = entries[position]
                 if cached is not None:
                     cached.landed = True
-            if self.fifo:
+            if holding:
                 _block(sending, fates, [sends_of(self, event) for event in carried], blocked, limit)
         lost.register()
         context.final_rejections(final)

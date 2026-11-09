@@ -466,7 +466,7 @@ sender faults included — `SQSSink._send` and, since SPEC-070, `SNSSink._send` 
 > `Failed` and MongoDB `writeErrors` through `_batch.adjudicate_keyed`; a sender fault is a final
 > rejection, so a batch lost only to them still returns; a closed sink's round, a NATS latch and an
 > SQS batch whose every id callable raised are refusals counted by their catcher alone; an SQS FIFO
-> group keeps its order for `max_retries + 1` sends. Decisions: *A sink round resends only what
+> group keeps its order for `max_retries + 1` sends and holds nothing in a run's last round. Decisions: *A sink round resends only what
 > failed, and an SQS FIFO group keeps its order* and *No shipped sink declares itself idempotent*.
 
 SPEC-070 widens the first two of the original three cases. An **SNS sender fault** joins the SQS

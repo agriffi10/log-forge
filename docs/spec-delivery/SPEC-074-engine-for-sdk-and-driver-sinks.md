@@ -43,11 +43,10 @@
 
 ## Open and accepted edges
 
-- **Open, pending Andrew's call (Q4):** an SQS FIFO event still held behind a failing earlier
-  event of its group when the `emit` budget runs out. Reading (a) is built: the event is counted
-  `failed` with the line `SQSSink, 0 attempt(s), held behind an earlier message of its FIFO
-  group`. Reading (b) would send held events in the run's last round. That needs the run context
-  to tell the sink which round is last, so it would be a small follow-up confined to `sqs._hold`.
+- **Resolved after landing (Q4):** an SQS FIFO event still held behind a failing earlier event of
+  its group when the budget runs out. This spec shipped reading (a), counting it `failed` unsent;
+  Andrew chose reading (b), and a follow-up fix added `RunContext.last` so the run's last round holds
+  nothing and the event is sent after its predecessor's final send, as 1.x sent it.
 - Accepted: NATS's `_unlocked` still builds a `SinkLosses`, so that a forked child reads its
   counters without a lock (fork safety, invariant 12).
 - Accepted: `LogstashSink`'s worker path keeps 1.x per-attempt counting until SPEC-075 gives it a

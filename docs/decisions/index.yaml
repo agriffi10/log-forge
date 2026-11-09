@@ -235,7 +235,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-delivery/a-sink-may-report-per-event-deliver-returns-a-verdict-and-one-engine-resends-only-what-may-land.md"
       - title: "A sink round resends only what failed, and an SQS FIFO group keeps its order"
-        fence: "the SDK, driver and socket sinks make one attempt per chunk, message or frame per round and the delivery engine resends only what may land within 1.x's total budget, so a failed chunk is resent after its round's later ones; only an SQS FIFO message group holds a later message back, per chunk at send time, for its predecessor's `max_retries + 1` sends. (SPEC-074)"
+        fence: "the SDK, driver and socket sinks make one attempt per chunk, message or frame per round and the delivery engine resends only what may land within 1.x's total budget, so a failed chunk is resent after its round's later ones; only an SQS FIFO message group holds a later message back, per chunk at send time, for its predecessor's `max_retries + 1` sends, and in the run's last round holds nothing. (SPEC-074)"
         status: "stable"
         path: "docs/decisions/sink-delivery/a-sink-round-resends-only-what-failed-and-an-sqs-fifo-group-keeps-its-order.md"
       - title: "A sink that delivered nothing raises; one that delivered something reports"

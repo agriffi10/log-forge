@@ -426,6 +426,7 @@ class RunContext:
 
     Attributes:
       round: The 1-based number of the round in progress.
+      last: Whether the round in progress is the run's last allowed one.
     """
 
     __slots__ = (
@@ -433,6 +434,7 @@ class RunContext:
         "_entries",
         "_final",
         "_immediate",
+        "_last",
         "_lines",
         "_notes",
         "_refused",
@@ -453,6 +455,7 @@ class RunContext:
           None.
         """
         self._round = 1
+        self._last = False
         self._immediate = immediate
         self._notes: dict[int, tuple[object, dict[str, object]]] = {}
         self._entries: list[tuple[_Counted, str, int, When, int]] = []
@@ -476,6 +479,28 @@ class RunContext:
           None.
         """
         return self._round
+
+    @property
+    def last(self) -> bool:
+        """Whether the round in progress is the last its run's budget allows.
+
+        True only inside an engine run whose budget ends with this round, so a sink holding an
+        event back for a later round (``SQSSink`` FIFO, SPEC-074 Q4) knows there is none and sends
+        it. A run can still end sooner — every event final, or the worker declining before a
+        later round — and a held event is then never sent. A detached round and an immediate
+        context answer False: their caller is handed the verdict and owns any later round, so
+        holding is still the right answer there.
+
+        Args:
+          None.
+
+        Returns:
+          Whether no further round of this run can follow.
+
+        Raises:
+          None.
+        """
+        return self._last
 
     def notes(self, owner: object) -> dict[str, object]:
         """Returns the per-run, per-owner ``dict`` an owner keeps across the run's rounds.
@@ -755,11 +780,12 @@ class RunContext:
         del self._counted[mark[3] :]
         self._refused = mark[4]
 
-    def _begin(self, number: int) -> None:
+    def _begin(self, number: int, *, last: bool = False) -> None:
         """Records the round about to run.
 
         Args:
           number: Its 1-based number.
+          last: Whether the run's budget allows no round after it.
 
         Returns:
           None.
@@ -768,6 +794,7 @@ class RunContext:
           None.
         """
         self._round = number
+        self._last = last
         self._final = []
         self._counted = []
         self._refused = None
@@ -1396,7 +1423,7 @@ def _run(
             offered = batch if not attempts else [events[index] for index in pending]
             n = len(pending)
             attempts += 1
-            context._begin(attempts)
+            context._begin(attempts, last=attempts >= rounds_allowed)
             hint = None
             started = time.monotonic()
             try:

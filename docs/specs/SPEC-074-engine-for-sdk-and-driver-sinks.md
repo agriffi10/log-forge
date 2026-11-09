@@ -397,12 +397,13 @@ from step 1:
    earlier round, or in an earlier chunk of this round, and has neither landed nor used up its
    `max_retries + 1` sends (this round's send of it counted), or when that earlier event is itself
    held. Same-group events not yet sent travel together in one chunk, as 1.x sent them, so a healthy
-   one-group batch is one call. A held event never sent when the run ends is counted `failed` with
-   the line `SQSSink, 0 attempt(s), held behind an earlier message of its FIFO group` (reading (a),
-   Andrew's call pending; the decision is one function, `sqs._hold`, so reading (b) — send held
-   events in the run's last round, after the predecessor's final send — is a contained change). The
-   send counts are kept in `notes(self)`. No other sink here promises an order across chunks
-   (Kinesis `PutRecords` promises none across records), so none holds anything.
+   one-group batch is one call. In the run's last round (`RunContext.last`) nothing is held, so a
+   held event is sent right after its predecessor's final send (Q4: Andrew chose reading (b) after
+   this spec shipped reading (a), which counted it `failed` unsent). A run the worker declines before
+   its last round leaves a held event unsent, counted `failed` with the line `SQSSink, 0 attempt(s),
+   held behind an earlier message of its FIFO group`. The send counts are kept in `notes(self)`. No
+   other sink here promises an order across chunks (Kinesis `PutRecords` promises none across
+   records), so none holds anything.
 
 **SQS's chunker changes signature.** SPEC-071 FR-004 kept `_chunks(batch, pending)`, handing its
 drops to the caller's `Deferral`, which this spec removes from `SQSSink`. It becomes
@@ -1102,3 +1103,4 @@ other site still stating the old claim:
 - 2026-11-09, rebase onto #315 (`ddc78707`): every `UNKNOWN` a converted sink announces or counts itself (an unread SQS or SNS reply, an unadjudicable Kinesis or Firehose response, MongoDB's unpairable `writeErrors`, NATS's abandoned and unconfirmed lines) is `ALWAYS`, or `LAST` in a run whose sink resends an `UNKNOWN`, read from #315's `RunContext.resends_unknown`; #315's `_mark`/`_rewind` carry the three marks, so a hook its guard settles leaves none behind.
 - 2026-11-09, diff review frame 1: `PostgresSink` and the Redis sinks count a failed run's unencodable events in `failed` and name them in its line, as 1.x did (`When.FAILED`, `announce(..., failed=)`); the build had left them `DROPPED`, a change of term this spec rules out. FR-006 names `nats.py`'s fork-safe `_unlocked` as the one `SinkLosses` a converted module still builds.
 - 2026-11-09, diff review frame 2: an `emit` override's events are counted once per `emit` call, as 1.x, and the criterion says so; a detached run (a direct `deliver` outside any run) commits no `When.FAILED` count, its caller owning the verdict; the engine's one-lock commit is all or nothing.
+- 2026-11-09, after landing (Q4, Andrew's call): reading (b). `RunContext.last` tells a round it is the last its run's budget allows, and `SQSSink` holds nothing in it, so an event held behind a failing predecessor is sent after that predecessor's final send, as 1.x sent it; the held line remains only for a run the worker declines before its last round.

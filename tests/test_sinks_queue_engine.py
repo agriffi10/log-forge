@@ -23,6 +23,7 @@ from log_foundry.sinks.firehose import FirehoseSink
 from log_foundry.sinks.kinesis import KinesisSink
 from log_foundry.sinks.sns import SNSSink
 from log_foundry.sinks.sqs import SQSSink
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 from log_foundry.worker import Worker
 
 Reply = Callable[[list[dict[str, Any]], int], Any]
@@ -334,18 +335,99 @@ def test_an_always_failing_event_frees_its_group_on_its_last_send() -> None:
     assert sink.failed == 1
 
 
-def test_a_held_event_never_sent_is_counted_with_its_own_line(
+def _rounds(client: Client, sink: SQSSink) -> list[tuple[int, int]]:
+    """Wraps the client so each entry sent is recorded as ``(round, i)``, in send order."""
+    seen: list[tuple[int, int]] = []
+    send = client.send_message_batch
+
+    def recording(*, QueueUrl: str, Entries: list[dict[str, Any]]) -> Any:
+        number = _engine.run_context().round
+        seen.extend((number, json.loads(e["MessageBody"])["i"]) for e in Entries)
+        return send(QueueUrl=QueueUrl, Entries=Entries)
+
+    sink.client = type("C", (), {"send_message_batch": staticmethod(recording)})()
+    return seen
+
+
+def test_the_last_round_sends_a_held_event_after_its_predecessors_final_send(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1)), max_retries=1, chunk=1)
-    with pytest.raises(SinkDeliveryError):
-        sink.emit(_grouped("AAA"))
-    assert client.sent(2) == 0
+    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1)), max_retries=3, chunk=1)
+    seen = _rounds(client, sink)
+    sink.emit(_grouped("AAA"))
+    assert seen == [(1, 0), (2, 0), (3, 0), (4, 0), (4, 1), (4, 2)], (
+        "A1 is first sent on A0's last send; A2, held behind A1 until then, follows A1's final "
+        "send in the run's last round"
+    )
+    assert sink.failed == 2, "A2's verdict is its own send's, which landed"
+    err = lost(capsys.readouterr().err)
+    assert not any("held behind" in line for line in err), err
+
+
+def test_a_held_event_sent_in_the_last_round_is_counted_by_its_own_send(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sink, client = _fifo(
+        failing("SQSSink", lambda e: e["i"] in (0, 1, 2), sender=True), max_retries=0, chunk=1
+    )
+    sink.emit(_grouped("AAA"))
+    assert _order(client) == [[0], [1], [2]], "a one-round run is its own last: nothing is held"
+    assert sink.failed == 3
+    err = lost(capsys.readouterr().err)
+    assert not any("held behind" in line for line in err), err
+
+
+def test_no_round_before_the_last_sends_a_held_event() -> None:
+    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1, 2)), max_retries=3, chunk=1)
+    seen = _rounds(client, sink)
+    _engine.run_delivery(sink, _grouped("AAAA"), worker_retries=1, stop=None)
+    first = {i: min(r for r, j in seen if j == i) for i in range(4)}
+    assert first == {0: 1, 1: 4, 2: 7, 3: 8}, (
+        "each successor waits for its predecessor's fourth send, and A3 for the run's last "
+        "round (8 = 4 x 2), never a cycle's last round"
+    )
+    assert [j for r, j in seen if r == 8] == [0, 1, 2, 3], "the last round keeps batch order"
+
+
+def test_a_run_ending_before_its_last_round_counts_a_held_event_with_its_own_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] == 0), max_retries=3, chunk=1)
+    _engine.run_delivery(
+        sink, _grouped("AAA"), worker_retries=0, stop=None, decline=lambda _longest: True
+    )
+    assert _order(client) == [[0]], "the decline ends the run after round one"
+    assert client.sent(1) == client.sent(2) == 0
     assert sink.failed == 3
     assert (
-        "log-foundry: lost 1 message(s); SQSSink, 0 attempt(s), held behind an earlier message of its FIFO group"
+        "log-foundry: lost 2 message(s); SQSSink, 0 attempt(s), held behind an earlier message of its FIFO group"
         in lost(capsys.readouterr().err)
     )
+
+
+def test_only_an_engine_runs_last_round_is_last() -> None:
+    seen: list[tuple[int, bool]] = []
+
+    class Probe:
+        max_retries = 2
+
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+
+        def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+            context = _engine.run_context()
+            seen.append((context.round, context.last))
+            return Verdict.uniform(Outcome.RETRYABLE, len(batch))
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            _engine.emit_via_deliver(self, batch)
+
+    _engine.run_delivery(Probe(), [{"i": 0}], worker_retries=1, stop=None)
+    assert seen == [(1, False), (2, False), (3, False), (4, False), (5, False), (6, True)]
+    seen.clear()
+    _engine.one_round(Probe().deliver, [{"i": 0}])
+    assert seen == [(1, False)], "a detached round's caller owns any later round"
+    assert _engine.run_context().last is False
 
 
 # --- Kinesis and Firehose: an unreadable reply ------------------------------------------------
