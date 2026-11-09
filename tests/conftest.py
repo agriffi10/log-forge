@@ -480,7 +480,7 @@ def _reset_worker() -> None:
     later test's sink backing off not at all. SPEC-054 made it and ``retirements`` the process's
     only pair, so resetting the count to zero is what makes ``retired`` false again and what puts
     a worker built by the next test back in step with it — a count left raised makes every later
-    worker read as retired at its own build, which is a suite that delivers nothing. ``_lifecycle._closers`` is now process-global, so a
+    worker read as retired at its own build, which is a suite that delivers nothing. ``_lifecycle._state._closers`` is now process-global, so a
     hung closer from one test — the capped-grace tests create them deliberately — would
     otherwise leak a non-zero ``closing_sinks`` into the next.
 
@@ -508,6 +508,10 @@ def _reset_worker() -> None:
     a sink, and a leaked entry shows up as that sink never being closed rather than as a
     process-wide charge.
 
+    SPEC-077 adds the two token sets ``state`` reads: a test that injects an exception past a
+    ``finally`` it then bypasses, or sets a token directly, would otherwise leave every later test
+    reading ``SWAPPING`` or ``DRAINING``.
+
     SPEC-054 also merged four records into ``_state._owed``, so one ``clear()`` replaces the four
     lines that reset them, and ``retirements`` replaces the retirement flag: it is a **count**, so
     resetting it to zero is what puts a worker built by the next test back in step with it — one
@@ -527,12 +531,14 @@ def _reset_worker() -> None:
     _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
     _lifecycle._state._late_worker = None
+    _lifecycle._state._swaps_running.clear()
+    _lifecycle._state._stops_running.clear()
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
-    with _lifecycle._closers_lock:
-        _lifecycle._closers.clear()
-    with _lifecycle._closing_now_lock:
-        _lifecycle._closing_now.clear()
+    with _lifecycle._state._closers_lock:
+        _lifecycle._state._closers.clear()
+    with _lifecycle._state._closing_now_lock:
+        _lifecycle._state._closing_now.clear()
 
 
 class FakeSink:

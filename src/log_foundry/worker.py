@@ -341,7 +341,7 @@ class Worker:
     foreign-pid record the child holds for it — the parent's own stamp, or the ``_FOREIGN``
     ``_mark_inherited`` ``setdefault``s where the parent recorded nothing — leaving a child able
     to release a transport it never acquired. Nothing is lost by skipping it, for the reason
-    ``_lifecycle._owned``'s entry gives: a sink that is still *live* is reached through
+    ``_lifecycle._state._owned``'s entry gives: a sink that is still *live* is reached through
     ``self.sink`` and the config, neither of which is opted out — which is what makes skipping the
     whole list safe even though the live sink is in it.
     """
@@ -485,7 +485,7 @@ class Worker:
         delivered and never counted. Resetting ``_stopped`` alone was measured too and is not
         enough: the deadline is then recorded, but the drain thread is still dead. So the branch
         clears ``_stopped``, ``_join_owed`` and ``_join_taken_over`` and takes its event from
-        :meth:`~log_foundry._lifecycle._Lifecycle.refresh_stop_signal`, the call ``__init__``
+        :meth:`~log_foundry._lifecycle.Runtime.refresh_stop_signal`, the call ``__init__``
         makes: the owner's current event when that is unset, so a worker never stopped keeps the
         event it had and the identity with the owner and the sink is unchanged, and a fresh one
         shared with the owner when it is set. It runs before the stop signal is offered, so the
@@ -502,8 +502,8 @@ class Worker:
         close. ``_taken_markers`` goes with it: a child inherits no ``flush()`` caller to answer.
 
         The in-flight-close slot this method also cleared is gone (SPEC-054 FR-006). A close in
-        flight is registered per sink in ``_lifecycle._closing_now`` now, and the child drops the
-        whole registry in ``_lifecycle._clear_after_fork`` for the reason this slot was cleared
+        flight is registered per sink in ``_lifecycle._state._closing_now`` now, and the child drops
+        the whole registry in ``_lifecycle._clear_after_fork`` for the reason this slot was cleared
         here: it names closes running on threads that did not survive the fork, and
         ``_fork._fresh_primitive`` carries an ``Event``'s set state across, so an inherited entry
         that was already **set** would answer the child's *own* later close instantly — its first
@@ -704,7 +704,7 @@ class Worker:
         to be the moment.
 
         An abandoned drain counts as not draining. The thread is wedged and the shutdown has
-        already given up on it (:meth:`~log_foundry._lifecycle._Lifecycle.held` and SPEC-027
+        already given up on it (:meth:`~log_foundry._lifecycle.Runtime.held` and SPEC-027
         FR-004 leave the sink open
         for that reason), so nothing further will cut its backoff — where SPEC-033's tight retry
         loop would go on costing the still-running application every emit.
@@ -1064,7 +1064,7 @@ class Worker:
     def may_be_inside(self, sink: Sink) -> bool:
         """Whether this worker's thread may still be inside that sink (SPEC-054 FR-003, FR-004).
 
-        The worker's half of :meth:`~log_foundry._lifecycle._Lifecycle.held`, and one of the two
+        The worker's half of :meth:`~log_foundry._lifecycle.Runtime.held`, and one of the two
         answers about its own thread that only it can give. True while the thread is **alive** and
         the sink is one it holds: its live sink, or a sink swapped out without a confirmed fence.
 

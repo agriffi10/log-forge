@@ -413,7 +413,7 @@ def test_one_owed_sink_creates_no_thread() -> None:
 def _wait_for_the_drain_to_end(worker: Worker, timeout: float = 10.0) -> None:
     """Waits until the worker's drain thread has ended, so a stranded sink becomes takeable.
 
-    `_Lifecycle.held` answers on thread **liveness**, so a stranded sink is left open while the
+    `Runtime.held` answers on thread **liveness**, so a stranded sink is left open while the
     thread that may be inside it is alive (SPEC-027 FR-004). A test about what the closer does
     with such a sink has to get past that, and waiting is what the shipped `shutdown()` does.
 

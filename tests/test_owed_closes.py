@@ -556,7 +556,7 @@ def test_the_record_is_opted_out_of_the_repair_walk() -> None:
     log_foundry.info("arm")
 
     assert _lifecycle._state._owed, "populated, so the claim below is about real contents"
-    assert "_owed" in _lifecycle._Lifecycle._FORK_SKIP, (
+    assert "_owed" in _lifecycle.Runtime._FORK_SKIP, (
         "the record pins superseded sinks, so it is opted out of the repair walk"
     )
     assert "_owed" in _fork._skipped_names(_lifecycle._state), (
@@ -585,16 +585,16 @@ def test_health_answers_the_inherited_question_from_the_config_not_the_record() 
     log_foundry.configure(service="t", sink=configured)
     log_foundry.info("to A")
     _lifecycle._note_orphan_emit(owed_only)
-    with _lifecycle._owned_lock:
-        _lifecycle._owned[id(configured)] = (_lifecycle._FOREIGN, configured)
-        _lifecycle._owned[id(owed_only)] = (_lifecycle._FOREIGN, owed_only)
+    with _lifecycle._state._owned_lock:
+        _lifecycle._state._owned[id(configured)] = (_lifecycle._FOREIGN, configured)
+        _lifecycle._state._owned[id(owed_only)] = (_lifecycle._FOREIGN, owed_only)
 
     assert log_foundry.health().inherited_sink is True, (
         "the reader consults the configured sink, which is stamped as another process's"
     )
 
-    with _lifecycle._owned_lock:
-        _lifecycle._owned[id(configured)] = (os.getpid(), configured)
+    with _lifecycle._state._owned_lock:
+        _lifecycle._state._owned[id(configured)] = (os.getpid(), configured)
     assert log_foundry.health().inherited_sink is False, (
         "and only the configured sink: B is still owed and still stamped foreign, so a reader "
         "that consulted the record at all would answer True here"

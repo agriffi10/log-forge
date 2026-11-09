@@ -204,7 +204,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "than a per-worker flag that agreed with the process's by convention."
         ),
     ),
-    ("_Lifecycle.live_worker", "self._worker", 0): (
+    ("Runtime.live_worker", "self._worker", 0): (
         LIVENESS,
         (
             "the snapshot the helper's own test reads. A binding is classified by the question "
@@ -212,7 +212,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "because rebinding is how a guard changes category without its text changing."
         ),
     ),
-    ("_Lifecycle.live_worker", "worker is None or self.retirements > worker._epoch", 0): (
+    ("Runtime.live_worker", "worker is None or self.retirements > worker._epoch", 0): (
         LIVENESS,
         (
             "the definition of the liveness helper itself, rather than a consumer of it. "
@@ -444,7 +444,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "and take the module's count from 46 to 45 with nothing red."
         ),
     ),
-    ("_Lifecycle.in_flight", "self._worker", 0): (
+    ("Runtime.in_flight", "self._worker", 0): (
         MOMENT,
         (
             "the snapshot the question below reads, inside the question rather than at its "
@@ -454,7 +454,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "FR-001 revert."
         ),
     ),
-    ("_Lifecycle.in_flight", "worker is not None and worker.sink is sink and worker.draining", 0): (
+    ("Runtime.in_flight", "worker is not None and worker.sink is sink and worker.draining", 0): (
         MOMENT,
         (
             "the moment, for the signal refresh. It reads `draining`, so an abandoned drain "
@@ -466,11 +466,11 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "there is no ownership question left for a site to get wrong (SPEC-054 FR-002/FR-004)."
         ),
     ),
-    ("_Lifecycle.held", "self._worker", 0): (
+    ("Runtime.held", "self._worker", 0): (
         MOMENT,
         "the snapshot the question below reads, for `in_flight`'s reason.",
     ),
-    ("_Lifecycle.held", "worker is not None and worker.may_be_inside(sink)", 0): (
+    ("Runtime.held", "worker is not None and worker.may_be_inside(sink)", 0): (
         MOMENT,
         (
             "the moment, for the close. It reads thread **liveness** through the worker's own "
@@ -479,6 +479,32 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "state: SPEC-033 FR-002 closing under a live writer, SPEC-035 FR-001 the fresh event "
             "never arriving. It is not liveness in this file's sense - a *retired* worker whose "
             "thread has ended answers False here and must, because then nothing is inside it."
+        ),
+    ),
+    ("Runtime.state", "self.live_worker()", 0): (
+        LIVENESS,
+        (
+            "the observer's rule 3 (SPEC-077 FR-002): a worker that still delivers reads RUNNING, "
+            "including one built after a shutdown() returned. Liveness rather than existence "
+            "because a retired worker is still the process worker and must read CLOSED. The "
+            "observer decides nothing, so this is the question asked in order to report it."
+        ),
+    ),
+    ("Runtime.state", "self.retirements", 0): (
+        LIVENESS,
+        (
+            "the snapshot of the retirement count rule 4 reads, filed as a binding because "
+            "rebinding is how a guard changes category with its text unchanged. Reading the count "
+            "to report it is the liveness question asked for a different purpose."
+        ),
+    ),
+    ("Runtime.state", "retirements > 0", 0): (
+        LIVENESS,
+        (
+            "the observer's rule 4: retired with no live worker reads CLOSED, which is when "
+            "health().retired is true and nothing is drained. Tested after rule 3 deliberately - "
+            "the other order reads a live worker built after a shutdown() as CLOSED, the mutant "
+            "SPEC-077 FR-004's sequential driver kills."
         ),
     ),
     ("_offer_orphan_signal", "_state.in_flight(sink)", 0): (
@@ -976,8 +1002,12 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 44, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 47, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived count at SPEC-077, 44 -> 47.** The three added sites are
+`Runtime.state`'s (`self.live_worker()`, the `retirements` binding and `retirements > 0`), the
+observer's rules 3 and 4, measured with this file's `_per_module_sites` on the branch.
 
 **Raised to the derived count at SPEC-071 (FR-001), 43 -> 44.** The one added site is
 `_shutdown_worker`'s seventh, from SPEC-062 (`0aafcc18`), measured by diffing `_sites` per scope

@@ -80,13 +80,13 @@ def _clear_ownership_record() -> Iterator[None]:
     It is write-once and holds a strong reference for the life of the process, which is correct
     in an application and would otherwise carry one test's sinks into the next.
     """
-    with _lifecycle._owned_lock:
-        _lifecycle._owned.clear()
-    _lifecycle._marking_failed = False
+    with _lifecycle._state._owned_lock:
+        _lifecycle._state._owned.clear()
+    _lifecycle._state._marking_failed = False
     yield
-    with _lifecycle._owned_lock:
-        _lifecycle._owned.clear()
-    _lifecycle._marking_failed = False
+    with _lifecycle._state._owned_lock:
+        _lifecycle._state._owned.clear()
+    _lifecycle._state._marking_failed = False
 
 
 # -- FR-001: the acquisition record ------------------------------------------------------------
@@ -319,8 +319,8 @@ def test_a_child_cannot_claim_a_sink_the_parent_never_recorded(hide: object) -> 
     conn = RecordingSink()
     log_foundry.configure(service="own", sink=hide(conn))  # type: ignore[operator]
 
-    with _lifecycle._owned_lock:
-        assert id(conn) not in _lifecycle._owned, (
+    with _lifecycle._state._owned_lock:
+        assert id(conn) not in _lifecycle._state._owned, (
             "the precondition: the parent's walk genuinely cannot see this sink, so the test "
             "exercises the claiming hole rather than the ordinary recorded path"
         )
@@ -376,12 +376,12 @@ def test_a_marking_walk_that_fails_refuses_everything_unrecorded(
     monkeypatch.setattr(_lifecycle, "_inheritance_roots", exploding_roots)
     try:
         _lifecycle._mark_inherited()
-        assert _lifecycle._marking_failed is True, "the guard caught it and withdrew the default"
+        assert _lifecycle._state._marking_failed is True, "the guard caught it and withdrew the default"
         assert _lifecycle.releasable(unrecorded) is False
         assert _lifecycle.release(unrecorded) is None
         assert unrecorded.closed == 0, "and the refusal is a skip, not a raise"
     finally:
-        _lifecycle._marking_failed = False
+        _lifecycle._state._marking_failed = False
 
 
 def test_a_superseded_wrapper_still_shields_the_transport_beneath_it() -> None:
@@ -447,8 +447,8 @@ def test_a_sink_subclassing_a_builtin_container_is_still_recorded(build: object)
     wrapper = build(inner)  # type: ignore[operator]
     log_foundry.configure(service="own", sink=wrapper)
 
-    with _lifecycle._owned_lock:
-        assert id(inner) in _lifecycle._owned, "a sink that is also a container is still a sink"
+    with _lifecycle._state._owned_lock:
+        assert id(inner) in _lifecycle._state._owned, "a sink that is also a container is still a sink"
 
     wrapper.close()
     assert inner.closed == 1, "and its wrapper still closes it"
@@ -477,8 +477,8 @@ def test_the_marking_walk_does_not_escape_through_a_module_reference() -> None:
     log_foundry.configure(service="own", sink=holder)
 
     def in_child() -> str:
-        with _lifecycle._owned_lock:
-            marked = sum(1 for pid, _ref in _lifecycle._owned.values() if pid == _lifecycle._FOREIGN)
+        with _lifecycle._state._owned_lock:
+            marked = sum(1 for pid, _ref in _lifecycle._state._owned.values() if pid == _lifecycle._FOREIGN)
         return str(marked)
 
     child = run_in_child(in_child)
@@ -523,7 +523,7 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     )
 
     _lifecycle._mark_inherited()
-    assert _lifecycle._marking_failed is True, "the ceiling tripped rather than the walk running on"
+    assert _lifecycle._state._marking_failed is True, "the ceiling tripped rather than the walk running on"
     assert _lifecycle.releasable(unrecorded) is False, "and it degraded toward refusing"
 
     # Driven in-process rather than through `run_in_child`: a real child never reaches this code,
@@ -591,8 +591,8 @@ def test_the_record_holds_a_strong_reference() -> None:
         _lifecycle._state._owed.clear()
         _lifecycle._state._orphan_closed_sink = None
         gc.collect()
-        with _lifecycle._owned_lock:
-            record = _lifecycle._owned.get(sink_id)
+        with _lifecycle._state._owned_lock:
+            record = _lifecycle._state._owned.get(sink_id)
         held = "-" if record is None else type(record[1]).__name__
         return f"{record is not None},{held}"
 
@@ -604,13 +604,13 @@ def test_the_parents_records_are_untouched_by_the_child() -> None:
     """AC-8. Asserted by identity, as SPEC-039 FR-001 AC-3 requires of every fork change."""
     sink = RecordingSink()
     log_foundry.configure(service="own", sink=sink)
-    with _lifecycle._owned_lock:
-        before = dict(_lifecycle._owned)
+    with _lifecycle._state._owned_lock:
+        before = dict(_lifecycle._state._owned)
 
     run_in_child(lambda: str(_lifecycle.releasable(sink)))
 
-    with _lifecycle._owned_lock:
-        after = dict(_lifecycle._owned)
+    with _lifecycle._state._owned_lock:
+        after = dict(_lifecycle._state._owned)
     assert after == before
     assert all(after[key][1] is before[key][1] for key in before), "the same objects, not copies"
 
@@ -649,18 +649,18 @@ def test_an_orphan_log_performs_no_stamp_walk(monkeypatch: pytest.MonkeyPatch) -
 def test_the_lazy_default_is_stamped_and_the_fast_path_is_not() -> None:
     """AC-10's other half: the construction branch is an acquisition and must record one."""
     config._config = config.Config()
-    with _lifecycle._owned_lock:
-        _lifecycle._owned.clear()
+    with _lifecycle._state._owned_lock:
+        _lifecycle._state._owned.clear()
 
     default = config._ensure_sink()
     assert _lifecycle.releasable(default) is True, "the zero-config default is acquired here"
 
-    with _lifecycle._owned_lock:
-        size = len(_lifecycle._owned)
+    with _lifecycle._state._owned_lock:
+        size = len(_lifecycle._state._owned)
     for _ in range(10):
         config._ensure_sink()
-    with _lifecycle._owned_lock:
-        assert len(_lifecycle._owned) == size, "the fast path recorded nothing further"
+    with _lifecycle._state._owned_lock:
+        assert len(_lifecycle._state._owned) == size, "the fast path recorded nothing further"
 
 
 def test_the_stamp_walk_is_bounded_and_its_cost_is_stated() -> None:
@@ -731,10 +731,10 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
 
     walk(ast.parse(source), False)
     permitted = {
-        "_owned.get",
-        "_owned.setdefault",
-        "_owned.clear",
-        "_owned.values",
+        "_state._owned.get",
+        "_state._owned.setdefault",
+        "_state._owned.clear",
+        "_state._owned.values",
         "roots.extend",
         "id",
     }
@@ -744,7 +744,7 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
         "re-enters deadlocks outright, since it is a Lock and not an RLock."
     )
 
-    assert not isinstance(_lifecycle._owned_lock, type(threading.RLock())), (
+    assert not isinstance(_lifecycle._state._owned_lock, type(threading.RLock())), (
         "a non-reentrant Lock is the choice (SPEC-028): an RLock would hide the re-entry above"
     )
 
@@ -999,8 +999,8 @@ def test_the_stamp_is_taken_before_the_sink_is_published(
     def spy(**changed: object) -> None:
         published = changed.get("sink")
         if published is not None:
-            with _lifecycle._owned_lock:
-                observed.append(id(published) in _lifecycle._owned)
+            with _lifecycle._state._owned_lock:
+                observed.append(id(published) in _lifecycle._state._owned)
         original(**changed)
 
     monkeypatch.setattr(config, "_rebind", spy)
@@ -1043,9 +1043,9 @@ def test_the_fork_repair_walk_does_not_reach_a_superseded_sink() -> None:
     log_foundry.configure(service="own", sink=superseded)
     log_foundry.configure(sink=RecordingSink())
 
-    assert "_owned" in _lifecycle._FORK_SKIP
-    with _lifecycle._owned_lock:
-        assert id(superseded) in _lifecycle._owned, (
+    assert "_owned" in _lifecycle._state._FORK_SKIP
+    with _lifecycle._state._owned_lock:
+        assert id(superseded) in _lifecycle._state._owned, (
             "the record still pins it, which is the precondition that makes this test mean "
             "something -- without the pin there would be nothing for the walk to over-reach to"
         )
@@ -1336,10 +1336,10 @@ def test_a_marking_walk_that_fails_still_honours_a_re_acquisition(
 
     _lifecycle._mark_inherited()
     try:
-        assert _lifecycle._marking_failed is True, "the walk did fail"
+        assert _lifecycle._state._marking_failed is True, "the walk did fail"
         assert _lifecycle.releasable(sink) is True, "and the re-acquisition still counted"
     finally:
-        _lifecycle._marking_failed = False
+        _lifecycle._state._marking_failed = False
 
 
 def test_the_reacquired_roster_is_empty_when_the_repair_walk_starts() -> None:

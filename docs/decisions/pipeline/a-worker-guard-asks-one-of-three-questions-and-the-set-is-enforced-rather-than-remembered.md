@@ -15,6 +15,10 @@ description: "existence, liveness, and the **moment**, which carries two predica
 
 ## History
 
+### 2026-11-09
+
+- **Refined** by SPEC-077: the guards' home, `_lifecycle._Lifecycle`, is now `Runtime`, and `_state` is still its one instance, so every question is unchanged. `Runtime.state` is a fourth lock-free reader, for the same reason the three questions take no lock. It is an observer that nothing in `src/` reads, and it is not a fourth question a guard may ask. The predicate roster files three of its sites, and the `_lifecycle` floor rose from 44 to 47. See *Lifecycle state has one holder, Runtime*.
+
 ### 2026-11-03
 
 - **Clarified** by SPEC-062: `Worker.claim_stop(deadline)` is filed as the moment, asked as a transition (it sets `_stopped`, records the deadline and takes `Worker._lock`), so the category still carries two predicates and the fence says so.
