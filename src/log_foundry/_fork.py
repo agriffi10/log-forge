@@ -76,7 +76,7 @@ of date, its hook was called, and the reclaim that follows then stamped it for t
 pid, so a sink no descendant ever acquired read ``releasable``. A ratchet, not a one-off: once a
 hook-implementing sink enters a roster, every descendant's walk finds it again.
 
-Exactly the hazard ``_lifecycle._owned`` already declares an opt-out for, reached by adding a
+Exactly the hazard ``_lifecycle._state._owned`` already declares an opt-out for, reached by adding a
 second global that holds sinks. The rebind below is the belt to this brace.
 """
 
@@ -468,19 +468,20 @@ def _offers_reacquire(holder: object) -> bool:
 
 
 _SKIP_ATTRIBUTE = "_FORK_SKIP"
-"""A module's opt-out: attribute names the walk must not read or descend into.
+"""A holder's opt-out: attribute names the walk must not read or descend into.
 
-**Bookkeeping that pins objects is not live state to repair**, and the difference is invisible
-to a walk that only sees a container. ``_lifecycle._owned`` is the case: SPEC-042 FR-001 requires
+**Bookkeeping that pins objects is not live state to repair**, and the difference is invisible to a
+walk that only sees a container. ``_lifecycle._state._owned`` is the case: SPEC-042 FR-001 requires
 it to hold a **strong** reference to every sink this process ever acquired, so without an opt-out
 the walk reaches sinks the process abandoned several ``configure()`` calls ago — replacing their
 locks, which is merely wasteful, and calling their fork hooks, which is not. Measured: a forked
-child announced a buffer-discard failure for a sink that had been superseded, and a ``FileSink``
-in that state would have its file reopened on every fork for the life of the process.
+child announced a buffer-discard failure for a sink that had been superseded, and a ``FileSink`` in
+that state would have its file reopened on every fork for the life of the process.
 
-Declared by the module that owns the state rather than listed here, which keeps this module's
-rule that it imports nothing but ``_diag`` (SPEC-039 FR-006). Nothing is lost by skipping: a sink
-that is still *live* is reached through the config and the worker, which are not opted out.
+Declared by the holder of the state — a module, or a class whose instance holds it, since
+``getattr`` reads either — rather than listed here, which keeps this module's rule that it imports
+nothing but ``_diag`` (SPEC-039 FR-006). Nothing is lost by skipping: a sink that is still *live* is
+reached through the config and the worker, which are not opted out.
 """
 
 

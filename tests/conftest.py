@@ -480,7 +480,7 @@ def _reset_worker() -> None:
     later test's sink backing off not at all. SPEC-054 made it and ``retirements`` the process's
     only pair, so resetting the count to zero is what makes ``retired`` false again and what puts
     a worker built by the next test back in step with it — a count left raised makes every later
-    worker read as retired at its own build, which is a suite that delivers nothing. ``_lifecycle._closers`` is now process-global, so a
+    worker read as retired at its own build, which is a suite that delivers nothing. ``_lifecycle._state._closers`` is now process-global, so a
     hung closer from one test — the capped-grace tests create them deliberately — would
     otherwise leak a non-zero ``closing_sinks`` into the next.
 
@@ -529,10 +529,10 @@ def _reset_worker() -> None:
     _lifecycle._state._late_worker = None
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
-    with _lifecycle._closers_lock:
-        _lifecycle._closers.clear()
-    with _lifecycle._closing_now_lock:
-        _lifecycle._closing_now.clear()
+    with _lifecycle._state._closers_lock:
+        _lifecycle._state._closers.clear()
+    with _lifecycle._state._closing_now_lock:
+        _lifecycle._state._closing_now.clear()
 
 
 class FakeSink:

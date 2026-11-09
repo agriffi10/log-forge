@@ -742,8 +742,8 @@ def test_finished_closers_are_not_retained_between_swaps() -> None:
     for _ in range(50):
         _lifecycle._swap_sink(SwapSink(), timeout=5.0)
 
-    assert len(lifecycle._closers) <= 2, (
-        f"finished closers accumulated: {len(lifecycle._closers)} retained across 50 swaps"
+    assert len(lifecycle._state._closers) <= 2, (
+        f"finished closers accumulated: {len(lifecycle._state._closers)} retained across 50 swaps"
     )
 
 
@@ -883,8 +883,8 @@ def test_a_rejected_stamp_leaves_the_config_and_the_sink_unstamped() -> None:
     with pytest.raises(ValueError):
         config.configure(service="\udcff", sink=sink)
     assert config.get_config().service == "before"
-    with _lifecycle._owned_lock:
-        assert id(sink) not in _lifecycle._owned, "a refused call must not stamp the sink"
+    with _lifecycle._state._owned_lock:
+        assert id(sink) not in _lifecycle._state._owned, "a refused call must not stamp the sink"
 
 
 def test_a_str_enum_stamp_is_accepted_and_stored_plain() -> None:
@@ -1075,8 +1075,8 @@ def test_a_refused_ceiling_leaves_the_sink_unstamped() -> None:
     with pytest.raises(TypeError):
         config.configure(sink=sink, max_depth=float("nan"))  # type: ignore[arg-type]
     assert config.get_config().sink is None
-    with _lifecycle._owned_lock:
-        assert id(sink) not in _lifecycle._owned, "a refused call must not stamp the sink"
+    with _lifecycle._state._owned_lock:
+        assert id(sink) not in _lifecycle._state._owned, "a refused call must not stamp the sink"
 
 
 def test_two_bad_ceilings_raise_once_and_change_nothing() -> None:

@@ -2361,7 +2361,7 @@ def test_the_shape_lint_rejects_the_shapes_it_claims_to() -> None:
 
 
 def test_a_module_global_reassigned_inside_a_function_still_counts() -> None:
-    """``_stop`` is rebuilt as ``self._stop`` inside ``_Lifecycle.refresh_stop_signal``.
+    """``_stop`` is rebuilt as ``self._stop`` inside ``Runtime.refresh_stop_signal``.
 
     It was a ``global`` rebinding inside ``_offer_orphan_signal`` until SPEC-040 moved the state
     onto one owner, so **no live site in ``src/`` takes the ``global`` branch any more**. The
@@ -3730,12 +3730,12 @@ def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
 
         def in_child() -> str:
             """Reports the registry as the child sees it, after the handlers have run."""
-            return f"{not _lifecycle._closing_now},{_lifecycle.closing_count()}"
+            return f"{not _lifecycle._state._closing_now},{_lifecycle.closing_count()}"
 
         child = run_in_child(in_child)
     finally:
-        with _lifecycle._closing_now_lock:
-            _lifecycle._closing_now.clear()
+        with _lifecycle._state._closing_now_lock:
+            _lifecycle._state._closing_now.clear()
         _lifecycle._state._worker = None
         worker.stop(timeout=2.0)
 

@@ -944,8 +944,8 @@ def test_a_release_that_raises_still_drops_its_in_flight_registration() -> None:
     _lifecycle.stamp(sink)
     with pytest.raises(RuntimeError):
         _lifecycle.release(sink)
-    with _lifecycle._closing_now_lock:
-        registered = id(sink) in _lifecycle._closing_now
+    with _lifecycle._state._closing_now_lock:
+        registered = id(sink) in _lifecycle._state._closing_now
     assert not registered, (
         "a close that raised left its id registered — the sink is now permanently exempt from "
         "the stop-signal refresh"
@@ -960,8 +960,8 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
     once the child sets its own `_orphan_stop`, that sink is handed the set event and backs off
     not at all. Measured before `_clear_closing_after_fork` existed.
     """
-    with _lifecycle._closing_now_lock:
-        _lifecycle._closing_now[0xDEADBEEF] = threading.Event()
+    with _lifecycle._state._closing_now_lock:
+        _lifecycle._state._closing_now[0xDEADBEEF] = threading.Event()
     try:
         read_fd, write_fd = os.pipe()
         # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
@@ -970,8 +970,8 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         pid = os.fork()
         if pid == 0:  # pragma: no cover - the child never returns to pytest
             os.close(read_fd)
-            with _lifecycle._closing_now_lock:
-                remaining = len(_lifecycle._closing_now)
+            with _lifecycle._state._closing_now_lock:
+                remaining = len(_lifecycle._state._closing_now)
             os.write(write_fd, str(remaining).encode())
             os._exit(0)
         os.close(write_fd)
@@ -981,8 +981,8 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         )
         os.close(read_fd)
     finally:
-        with _lifecycle._closing_now_lock:
-            _lifecycle._closing_now.pop(0xDEADBEEF, None)
+        with _lifecycle._state._closing_now_lock:
+            _lifecycle._state._closing_now.pop(0xDEADBEEF, None)
 
 
 # --------------------------------------------------------------------------- FR-004
@@ -1133,8 +1133,10 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     The owed-close record pins a sink a swap already released, and the repair walk reached it,
     so a child called `reacquire_after_fork()` on a closed sink — a `FileSink` there would have
     its file re-opened on every fork for the life of the process. The module-level `_FORK_SKIP`
-    could not reach it: `_owned` is a module global while this slot is an attribute of `_state`,
-    and `_fork._skipped_names` asks the holder. Measured pre-fix: the child hooked both.
+    of the time could not reach it: `_owned` was then a module global while this slot is an
+    attribute of `_state`, and `_fork._skipped_names` asks the holder. Measured pre-fix: the
+    child hooked both. Both records are attributes of `_state` since SPEC-077, so one
+    `Runtime._FORK_SKIP` now names both.
     """
     _HOOKED.clear()
     superseded, live = _HookSink("superseded"), _HookSink("live")
@@ -1207,8 +1209,8 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child never returns to pytest
         os.close(read_fd)
-        with _lifecycle._owned_lock:
-            record = _lifecycle._owned.get(id(superseded))
+        with _lifecycle._state._owned_lock:
+            record = _lifecycle._state._owned.get(id(superseded))
         if record is None:
             stamped = "unrecorded"
         elif record[0] == os.getpid():
@@ -1237,15 +1239,20 @@ def test_the_fork_opt_out_is_declared_where_the_walk_reads_it() -> None:
     """FR-005 AC-3. The stale-detector: moving the slot must not silently un-skip it.
 
     `_fork._skipped_names` reads the declaration off the **holder** of the attribute, so this
-    asserts against the real reader rather than against `_Lifecycle._FORK_SKIP` directly — a
+    asserts against the real reader rather than against `Runtime._FORK_SKIP` directly — a
     declaration that stops being found is exactly the failure the behavioural test above would
     also catch, and exactly the one a `getattr` on the class would not.
     """
     assert "_owed" in _fork._skipped_names(_lifecycle._state), (
         "the record pinning superseded sinks must be opted out on the object that holds it"
     )
-    assert "_owned" in _fork._skipped_names(_lifecycle), (
-        "and the module-level declaration stays — the two together are the rule"
+    assert "_owned" in _fork._skipped_names(_lifecycle._state), (
+        "and the ownership record is opted out on the same holder, since SPEC-077 moved it there "
+        "— the walk must still never reach `_owned`"
+    )
+    assert not hasattr(_lifecycle, "_FORK_SKIP"), (
+        "the module declares no opt-out of its own any more; a second declaration is a second "
+        "home for the rule"
     )
 
 

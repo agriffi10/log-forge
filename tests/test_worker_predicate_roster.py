@@ -204,7 +204,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "than a per-worker flag that agreed with the process's by convention."
         ),
     ),
-    ("_Lifecycle.live_worker", "self._worker", 0): (
+    ("Runtime.live_worker", "self._worker", 0): (
         LIVENESS,
         (
             "the snapshot the helper's own test reads. A binding is classified by the question "
@@ -212,7 +212,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "because rebinding is how a guard changes category without its text changing."
         ),
     ),
-    ("_Lifecycle.live_worker", "worker is None or self.retirements > worker._epoch", 0): (
+    ("Runtime.live_worker", "worker is None or self.retirements > worker._epoch", 0): (
         LIVENESS,
         (
             "the definition of the liveness helper itself, rather than a consumer of it. "
@@ -444,7 +444,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "and take the module's count from 46 to 45 with nothing red."
         ),
     ),
-    ("_Lifecycle.in_flight", "self._worker", 0): (
+    ("Runtime.in_flight", "self._worker", 0): (
         MOMENT,
         (
             "the snapshot the question below reads, inside the question rather than at its "
@@ -454,7 +454,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "FR-001 revert."
         ),
     ),
-    ("_Lifecycle.in_flight", "worker is not None and worker.sink is sink and worker.draining", 0): (
+    ("Runtime.in_flight", "worker is not None and worker.sink is sink and worker.draining", 0): (
         MOMENT,
         (
             "the moment, for the signal refresh. It reads `draining`, so an abandoned drain "
@@ -466,11 +466,11 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "there is no ownership question left for a site to get wrong (SPEC-054 FR-002/FR-004)."
         ),
     ),
-    ("_Lifecycle.held", "self._worker", 0): (
+    ("Runtime.held", "self._worker", 0): (
         MOMENT,
         "the snapshot the question below reads, for `in_flight`'s reason.",
     ),
-    ("_Lifecycle.held", "worker is not None and worker.may_be_inside(sink)", 0): (
+    ("Runtime.held", "worker is not None and worker.may_be_inside(sink)", 0): (
         MOMENT,
         (
             "the moment, for the close. It reads thread **liveness** through the worker's own "
@@ -988,8 +988,8 @@ leaving the later runtime specs in this arc a site of slack.
 whole of the difference is accounted for below, measured by deriving the site list from both
 trees with this file's own `_sites` and diffing it per scope:
 
-    +2  _Lifecycle.in_flight        -2  _Lifecycle.worker_owns
-    +2  _Lifecycle.held             -2  _Lifecycle.worker_owns_now
+    +2  Runtime.in_flight        -2  Runtime.worker_owns
+    +2  Runtime.held             -2  Runtime.worker_owns_now
     +4  _close_owed                 -1  _close_orphan_sink
     +1  _inline_close_choice        -3  _flush_live_sink
     +1  _shutdown_worker            -1  _get_worker

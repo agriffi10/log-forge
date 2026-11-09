@@ -879,8 +879,8 @@ def test_an_interrupt_after_the_take_does_not_leak_a_close_registration() -> Non
     finally:
         _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
 
-    assert not _lifecycle._closing_now, (
-        f"a close registration leaked and never discharges: {_lifecycle._closing_now}"
+    assert not _lifecycle._state._closing_now, (
+        f"a close registration leaked and never discharges: {_lifecycle._state._closing_now}"
     )
 
     start = time.monotonic()
@@ -922,7 +922,7 @@ def test_an_interrupt_after_the_take_leaves_the_sinks_owed_for_a_later_shutdown(
         _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
 
     assert (first.closed, second.closed) == (0, 0), "the premise: neither close ran"
-    assert not _lifecycle._closing_now, "the registrations were discharged"
+    assert not _lifecycle._state._closing_now, "the registrations were discharged"
     assert {id(first), id(second)} <= set(_lifecycle._state._owed), (
         "and both sinks are owed again, so a later shutdown can still close them"
     )
@@ -960,9 +960,9 @@ def test_a_forks_clear_inside_a_close_leaves_the_registry_consistent() -> None:
     log_foundry.info("orphan")
     _lifecycle._close_owed()
 
-    assert not _lifecycle._closing_now, (
+    assert not _lifecycle._state._closing_now, (
         f"the clear and the late discharge left the registry inconsistent: "
-        f"{_lifecycle._closing_now}"
+        f"{_lifecycle._state._closing_now}"
     )
 
 
