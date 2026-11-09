@@ -121,7 +121,10 @@ Figures re-measured at `fda134a`, each with its instrument:
   adapter. This spec changes nothing for them.
 - **The closed-guard helper, lifecycle, owed closes and fork** (SPEC-076 to SPEC-079).
 - **Deleting a test.** No mechanism is removed. The tests this spec edits are the rosters FR-001
-  names; every other test is not edited by this spec.
+  names, `tests/test_sinks_encode.py`'s pin of the public surface each engine sink gained (which
+  gains `LogstashSink`'s new members), and the trigger sets in `tests/test_sink_concurrency.py`
+  that still name SPEC-074's deleted `send_all`, with the two docstrings that describe them; every
+  other test is not edited by this spec.
 
 ---
 
@@ -186,10 +189,11 @@ instance's own `__dict__`, and nothing is evaluated to read it. `MultiSink` keep
 for its children and offers no `deliver`, so the engine never reads its signal.
 
 **The retry budget is copied at construction.** The engine runs its rounds on the wrapper. So when
-the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink as
-plain instance attributes, with an ordinary attribute read (SPEC-074 makes some of them read-only
-properties). One the inner sink lacks, or whose read raises, is not set, and the engine uses its
-default. The copy is a pass-through, not a floor. The engine judges exactness, and SPEC-066's
+the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink,
+read with `_static_value` exactly as the engine reads them on the bare inner sink, and stores each
+value as found where the static reader finds it on the wrapper. So a budget behind a property reads
+as absent on both paths, and the wrapped sink gets the rounds it gets alone. One the inner sink
+lacks, or that cannot be read, is not set, and the engine uses its default. The copy is a pass-through, not a floor. The engine judges exactness, and SPEC-066's
 guard, which looks for a `max(...)` floor, has nothing to see. A later assignment to the inner
 sink's attribute is not seen.
 
@@ -383,13 +387,18 @@ bound, and the two paths reach it by different counts.
 `LogstashSink` decides nothing per event in either mode. Its `emit` is the backend's `emit` (HTTP,
 and socket mode after SPEC-074), so it is a **pure delegate**. Like the wrappers, it defines
 `deliver` and `emit` in its own class body. Its backend is `self._http` in HTTP mode and
-`self._socket`, SPEC-074's engine `SocketTransport`, in socket mode. When `read_deliver(backend)` is
-not `None` at construction:
+`self._socket`, SPEC-074's engine `SocketTransport`, in socket mode. The transport defines `deliver`
+and deliberately no `emit`, so SPEC-072's probe, which needs some class to define `emit`, returns
+`None` for it. Socket mode therefore offers whenever the transport's `log_foundry_counters` is
+exactly a `SinkCounters` at construction, and calls `self._socket.deliver` directly, as `SyslogSink`
+does over the same transport. In HTTP mode the backend is a sink the probe judges, and it offers when
+`read_deliver(backend)` is not `None` at construction. When it offers:
 
 - its `log_foundry_counters` attribute is **the backend's own `SinkCounters` object**, read
   statically;
-- its `deliver` takes `read_deliver(backend)` on each call and returns that `deliver`'s verdict, the
-  same object, unmapped;
+- its `deliver` takes the backend's `deliver` on each call (`read_deliver(self._http)` in HTTP mode,
+  the transport's own `deliver` in socket mode) and returns that `deliver`'s verdict, the same
+  object, unmapped;
 - it copies `max_retries` and `max_retry_after` from the backend, as FR-001 describes, and declares
   no idempotence.
 
@@ -604,3 +613,9 @@ tests/
   where that reader finds it, since a property reads as no signal (FR-001); and socket-mode
   `LogstashSink` counting each event once on the worker path, a consequence of FR-003's delegation
   that SPEC-074 recorded as owed here, gains its own criterion.
+- 2026-11-09, from the plan: `SocketTransport` defines no `emit`, so the probe never offers it and
+  socket-mode `LogstashSink` offers on the transport's counters instead, as `SyslogSink` does
+  (FR-003). The budget is copied with `_static_value`, not an ordinary read: SPEC-074 exposed
+  `max_retries` through a set-only descriptor, not a property, and an ordinary read of a
+  third-party property would give the wrapper rounds the bare sink never gets. The edited tests now
+  name the public-surface pin and the dead `send_all` trigger sets.
