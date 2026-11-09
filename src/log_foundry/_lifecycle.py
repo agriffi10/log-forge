@@ -288,11 +288,10 @@ class Runtime:
         """Guards :attr:`Runtime._owned`, and is the **last** lock in the process's order.
 
         ``_state._lock`` → ``_config_lock`` → this, never the reverse in any pair (FR-001 AC-12).
-        The three-term
-        form is the real one: ``_get_worker`` calls ``config._ensure_sink()`` while holding
-        ``_state._lock``, and ``_ensure_sink``'s construction branch takes ``_config_lock`` before
-        it can stamp. The criterion states the two-term version, which is true but skips the middle
-        term.
+        The three-term form is the real one: ``_get_worker`` calls ``config._ensure_sink()`` while
+        holding ``_state._lock``, and ``_ensure_sink``'s construction branch takes ``_config_lock``
+        before it can stamp. The criterion states the two-term version, which is true but skips the
+        middle term.
 
         The orphan logging path is the opposite constraint and takes **no** lock at all: it reaches
         ``_ensure_sink``'s fast-path return once per event, which must never stamp (AC-10).
@@ -507,8 +506,12 @@ class Runtime:
     def state(self) -> State:
         """The lifecycle state, derived from the flags the runtime keeps; takes no lock.
 
-        Each field is read **once** into a local and the rules are tested in this order, the first
-        that holds deciding (SPEC-077 FR-002):
+        Each input is read once into a local before any rule is tested — the two token sets, the
+        live worker, the retirement count, the owed record and the configured sink — and the rules
+        are then tested in this order, the first that holds deciding (SPEC-077 FR-002). The count
+        is the one field read twice: :meth:`live_worker` reads it to compare against the worker's
+        epoch, and the local is a second load, so under a concurrent ``shutdown()`` the two can
+        differ; an observer read off unlocked loads is a snapshot, not a consistent cut.
 
         1. a token in :attr:`_stops_running` is ``DRAINING`` — ``shutdown()`` or the exit drain is
            inside :func:`_shutdown_worker`;
@@ -1786,8 +1789,8 @@ def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -
 
     **The wait, and why it is on the registry rather than on the record.** A caller waits on every
     close registered in :attr:`Runtime._closing_now` that is not **its own**, for
-    :func:`closer_grace` — SPEC-050's rule that a second caller waits for a close rather than returning through it. The
-    trigger is deliberately not "an owed sink was left behind": by the time a bystander arrives,
+    :func:`closer_grace` — SPEC-050's rule that a second caller waits for a close rather than
+    returning through it. The trigger is deliberately not "an owed sink was left behind": by the time a bystander arrives,
     the caller inside the close has already **discharged** that sink from the record, so the
     record is empty and the wait would never fire. Measured on the shipped reproduction —
     ``tests/test_worker.py::test_a_second_shutdown_waits_for_an_inline_close_it_did_not_claim``,

@@ -902,6 +902,68 @@ def _check_samples(label: str, step: str, driver: int, where: str) -> None:
             assert read is State.DRAINING, f"a drain emit after the stop read {read} {where}"
 
 
+_TRANSIENTS = frozenset({State.SWAPPING, State.DRAINING})
+
+UNSAMPLED = frozenset(
+    {
+        ("shutdown", _U, ""),
+        ("exit", _U, ""),
+        ("configure", _U, "no-swap-work"),
+        ("configure", _R, "direct"),
+        ("configure", _C, "direct"),
+    }
+)
+"""Cells whose transient the driver cannot observe, so the samples do not assert their column.
+
+From ``UNCONFIGURED`` a shutdown has no sink to close and no drain thread to deliver, and a
+``configure(sink=…)`` with no swap work closes nothing and runs no drain, so no recorder runs
+inside any of them and nothing samples the state. The driver asserts only that such a step samples
+nothing, so a change that made one observable has to revisit this set rather than pass unseen. Their
+column is held instead by :func:`test_the_table_transients_follow_the_spec_rules`, and the tokens
+behind it by ``tests/test_runtime_state.py``."""
+
+
+def test_the_table_transients_follow_the_spec_rules() -> None:
+    """The transient column states SPEC-077 FR-002's rules, including for cells no recorder sees.
+
+    A ``configure(sink=…)`` passes through ``SWAPPING`` exactly when ``_swap_sink`` has work — the
+    early return for no live worker and nothing owed comes before the token — a shutdown or the exit
+    drain always passes through ``DRAINING``, and no other step passes through either.
+    """
+    for (step, _, variant), (_, transient) in TABLE.items():
+        if step == "configure":
+            expected = State.SWAPPING if variant == "swap" else None
+        elif step in {"shutdown", "exit"}:
+            expected = State.DRAINING
+        else:
+            expected = None
+        assert transient is expected, f"({step}, {variant}) reads {transient}, not {expected}"
+
+
+def _check_transient(
+    cell: tuple[str, State, str], label: str, transient: State | None, where: str
+) -> None:
+    """The table's transient column, against what the recorders sampled inside the step.
+
+    A cell with no transient must sample neither ``SWAPPING`` nor ``DRAINING``; a cell that passes
+    through one must sample it at least once whenever its bracket sampled anything. A bracket can
+    sample nothing — a swap or a shutdown of a ``CLOSED`` process with nothing owed — and then
+    the column is not decidable for that step, so it is not asserted there; a cell that can never
+    sample is in :data:`UNSAMPLED`.
+    """
+    reads = [read for bracket, _, _, _, read in _SAMPLES if bracket == label]
+    if cell in UNSAMPLED:
+        assert not reads, f"{cell} is listed as unobservable but sampled {reads} {where}"
+        return
+    if transient is None:
+        seen = sorted({r.name for r in reads if r in _TRANSIENTS})
+        assert not seen, f"a cell with no transient state sampled {seen} {where}"
+    elif reads:
+        assert transient in reads, (
+            f"a cell through {transient.name} sampled only {sorted({r.name for r in reads})} {where}"
+        )
+
+
 def _check_invariants(run: _Run, step: str, result: object, driver: int, where: str) -> None:
     """Invariants 2, 4 and 5 after a step, each where it is decidable."""
     health = log_foundry.health()
@@ -953,7 +1015,7 @@ def test_the_sequential_driver_holds_the_state_table(
     model = _Model()
     for index, (step, nested) in enumerate(_draws(seed)):
         cell = model.cell(step)
-        expected, _transient = TABLE[cell]
+        expected, transient = TABLE[cell]
         label = f"{index}:{step}"
         run.history.append(f"{step}@{cell[1].name}")
         where = run.where(index)
@@ -981,6 +1043,7 @@ def test_the_sequential_driver_holds_the_state_table(
         bound = _budget(step) + BOUND_SLACK
         assert elapsed < bound, f"invariant 3 (bounded): {step} took {elapsed:.2f}s {where}"
         _check_samples(label, step, driver, where)
+        _check_transient(cell, label, transient, where)
         _check_invariants(run, step, result, driver, where)
 
 

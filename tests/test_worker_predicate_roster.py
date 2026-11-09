@@ -1002,8 +1002,12 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 44, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 47, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived count at SPEC-077, 44 -> 47.** The three added sites are
+`Runtime.state`'s (`self.live_worker()`, the `retirements` binding and `retirements > 0`), the
+observer's rules 3 and 4, measured with this file's `_per_module_sites` on the branch.
 
 **Raised to the derived count at SPEC-071 (FR-001), 43 -> 44.** The one added site is
 `_shutdown_worker`'s seventh, from SPEC-062 (`0aafcc18`), measured by diffing `_sites` per scope
@@ -1014,8 +1018,8 @@ leaving the later runtime specs in this arc a site of slack.
 whole of the difference is accounted for below, measured by deriving the site list from both
 trees with this file's own `_sites` and diffing it per scope:
 
-    +2  Runtime.in_flight        -2  Runtime.worker_owns
-    +2  Runtime.held             -2  Runtime.worker_owns_now
+    +2  _Lifecycle.in_flight        -2  _Lifecycle.worker_owns
+    +2  _Lifecycle.held             -2  _Lifecycle.worker_owns_now
     +4  _close_owed                 -1  _close_orphan_sink
     +1  _inline_close_choice        -3  _flush_live_sink
     +1  _shutdown_worker            -1  _get_worker

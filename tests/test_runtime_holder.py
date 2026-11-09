@@ -19,6 +19,7 @@ import pytest
 
 import log_foundry
 from log_foundry import _lifecycle
+from test_lifecycle_inventory import _NESTED_BINDINGS, module_bindings, module_scope
 
 _SRC = pathlib.Path(log_foundry.__file__).resolve().parent
 
@@ -132,15 +133,7 @@ def test_runtime_replaces_the_lifecycle_class_and_has_one_instance() -> None:
 def test_no_moved_name_is_bound_at_module_level() -> None:
     """FR-001 AC-2: the seven names and ``_FORK_SKIP`` are gone from module scope, onto ``self``."""
     tree = _tree("_lifecycle.py")
-    module_bound: set[str] = set()
-    for node in tree.body:
-        targets: list[ast.expr] = []
-        if isinstance(node, ast.Assign):
-            targets = list(node.targets)
-        elif isinstance(node, ast.AnnAssign | ast.AugAssign):
-            targets = [node.target]
-        module_bound.update(t.id for t in targets if isinstance(t, ast.Name))
-    leftover = module_bound & {*MOVED, "_FORK_SKIP"}
+    leftover = _module_bound(tree) & {*MOVED, "_FORK_SKIP"}
     assert not leftover, f"still bound at module level: {sorted(leftover)}"
 
     runtime = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Runtime")
@@ -156,6 +149,35 @@ def test_no_moved_name_is_bound_at_module_level() -> None:
     }
     missing = set(MOVED) - on_self
     assert not missing, f"not assigned on self in Runtime.__init__: {sorted(missing)}"
+
+
+def _module_bound(tree: ast.Module) -> set[str]:
+    """Every name bound at module scope, compound statements and imports included.
+
+    Through ``test_lifecycle_inventory.module_scope``, the one walker both module-scope scans
+    share: reading ``tree.body`` alone, a ``try:`` block re-binding ``_closing_now`` at module level
+    survived the whole suite.
+    """
+    bound = {name for name, _ in module_bindings(tree)}
+    for statement in module_scope(tree):
+        if isinstance(statement, ast.Import | ast.ImportFrom):
+            bound |= {(a.asname or a.name).split(".")[0] for a in statement.names}
+    return bound
+
+
+@pytest.mark.parametrize("kind", sorted(_NESTED_BINDINGS))
+def test_the_module_scan_sees_a_binding_under_every_statement_kind(kind: str) -> None:
+    """The scan above is not vacuous: a moved name bound under each compound statement is found."""
+    source = _NESTED_BINDINGS[kind].replace("_cache", "_closing_now").replace("_i", "_closing_now")
+    assert "_closing_now" in _module_bound(ast.parse(source)), source
+
+
+def test_the_module_scan_sees_an_import_and_ignores_function_bodies() -> None:
+    """An import binds at module scope; a function's or class's local does not."""
+    assert "_owned" in _module_bound(ast.parse("from x import y as _owned\n"))
+    assert not _module_bound(ast.parse("def f():\n    _owned = 1\nclass C:\n    _owned = 2\n")) & {
+        "_owned"
+    }
 
 
 def test_the_fork_opt_out_lists_both_pinning_records() -> None:

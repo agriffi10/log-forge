@@ -264,7 +264,8 @@ field shrinks a roster silently. The table is the Data Model's, in code.
 - **Module-level state in `_lifecycle.py`.** A module-level binding is a **constant**, and outside
   the population, when its name with leading underscores removed is upper case, no function names
   it in a `global` statement, and its value is a literal, a numeric expression of literals, or a
-  `tuple`, `frozenset` or `set` display or call over literals, names and `type(...)` calls. Every other module-level
+  `tuple` display, or a `tuple` or `frozenset` call over a tuple or set display of literals, names
+  and `type(...)` calls — never a bare `set`, which is mutable. Every other module-level
   binding that is not an import, a function or a class is **state**. At `fda134a` that classifier
   puts the three `DEFAULT_*` values, `_FOREIGN`, `_MARKING_CEILING` and `_PLAIN_TYPES` among the
   constants, and `_state` and the seven names FR-001 moves among the state; after the move,
@@ -657,3 +658,14 @@ updated for the rename and for the three loose names that moved.
   closure resolved by receiver, not by bare name; and `_fork._child_handlers`, `_installed` and
   `reacquired_in_child` stay prose here and out of the code table, since they belong to no
   FR-003 population.
+- 2026-11-09, first diff review: the constant classifier no longer accepts a `set` display or call
+  (`_PENDING = set()` and `_SEEN = {1}` are mutable, so state); `frozenset` and tuple are kept.
+  Both module-scope scans — FR-003's module-state population and FR-001's "nothing bound at module
+  level" check — share one walker that enters every compound statement at module scope (`if`,
+  `try` with its handlers, `else` and `finally`, `try`/`except*`, `with`, `for`, `while`, `match`)
+  and no function or class body, since reading top-level statements alone let a module-level
+  `try:` re-bind `_closing_now`. The predicate roster's `_lifecycle` floor is raised 44 to 47 for
+  `Runtime.state`'s three sites. FR-004's transient column is asserted against the samples where
+  a step samples anything, and five cells that never sample (a shutdown or the exit drain from
+  `UNCONFIGURED`, and a `configure(sink=…)` with no swap work) have their column held by a check
+  of the table against FR-002's rules instead.

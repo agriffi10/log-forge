@@ -358,32 +358,117 @@ def _fields(index: _Index, pops: Populations) -> None:
 
 
 def _is_constant_value(node: ast.expr) -> bool:
-    """A literal, a numeric expression of literals, or a display or call over literal parts."""
+    """A literal, a numeric expression of literals, a tuple display, or a tuple/frozenset call.
+
+    A ``set`` is not a constant, display or call: it is mutable, so ``_PENDING = set()`` is state
+    whatever its name says. A ``frozenset`` or ``tuple`` call may take a tuple or set display of
+    literal parts, which is how ``_PLAIN_TYPES = frozenset({dict, ...})`` is written.
+    """
     if isinstance(node, ast.Constant):
         return True
     if isinstance(node, ast.UnaryOp):
         return _is_constant_value(node.operand)
     if isinstance(node, ast.BinOp):
         return _is_constant_value(node.left) and _is_constant_value(node.right)
-    if isinstance(node, ast.Tuple | ast.Set):
+    if isinstance(node, ast.Tuple):
         return all(_is_constant_part(e) for e in node.elts)
     if (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
-        and node.func.id in {"tuple", "frozenset", "set"}
+        and node.func.id in {"tuple", "frozenset"}
         and not node.keywords
     ):
-        return all(_is_constant_part(a) or _is_constant_value(a) for a in node.args)
+        return all(
+            _is_constant_part(a)
+            or (isinstance(a, ast.Tuple | ast.Set) and all(_is_constant_part(e) for e in a.elts))
+            for a in node.args
+        )
     return False
 
 
 def _is_constant_part(node: ast.expr) -> bool:
-    """An element a constant display may hold: a literal, a name, a ``type(...)`` call or a display."""
+    """An element a constant display may hold: a literal, a name, a ``type(...)`` call or a value."""
     if isinstance(node, ast.Constant | ast.Name):
         return True
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "type":
         return True
     return _is_constant_value(node)
+
+
+def module_scope(tree: ast.Module) -> list[ast.stmt]:
+    """Every statement that runs at module scope, inside compound statements included.
+
+    The one walker both module-scope scans use — this file's module-state population and
+    ``test_runtime_holder``'s check that no moved name is bound at module level. A scan of
+    ``tree.body`` alone misses a binding under ``if``, ``try`` (its handlers, ``else`` and
+    ``finally`` too), ``try``/``except*``, ``with``, ``for``, ``while`` or a ``match`` case, all
+    of which bind at module scope: measured, ``try:\n    _closing_now = _state._closing_now`` at
+    module level survived the whole suite. Function and class bodies are not module scope and
+    are not entered.
+    """
+    found: list[ast.stmt] = []
+    pending: list[ast.stmt] = list(tree.body)
+    while pending:
+        statement = pending.pop(0)
+        found.append(statement)
+        if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            continue
+        children: list[ast.stmt] = []
+        if isinstance(statement, ast.If | ast.While | ast.For | ast.AsyncFor):
+            children = statement.body + statement.orelse
+        elif isinstance(statement, ast.With | ast.AsyncWith):
+            children = statement.body
+        elif isinstance(statement, ast.Try | ast.TryStar):
+            children = statement.body + statement.orelse + statement.finalbody
+            for handler in statement.handlers:
+                children += handler.body
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                children += case.body
+        pending[:0] = children
+    return found
+
+
+def module_bindings(tree: ast.Module) -> list[tuple[str, ast.expr | None]]:
+    """Every name bound at module scope with the value it is bound to (``None`` if not one value).
+
+    Assignments of every form, ``for`` targets, ``with ... as`` targets, ``except ... as`` names
+    and ``match`` captures; imports, functions and classes are left to their own rules.
+    """
+    bound: list[tuple[str, ast.expr | None]] = []
+
+    def names(target: ast.AST) -> list[str]:
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, ast.Tuple | ast.List):
+            return [name for element in target.elts for name in names(element)]
+        if isinstance(target, ast.Starred):
+            return names(target.value)
+        return []
+
+    for statement in module_scope(tree):
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                value = statement.value if isinstance(target, ast.Name) else None
+                bound += [(name, value) for name in names(target)]
+        elif isinstance(statement, ast.AnnAssign):
+            bound += [(name, statement.value) for name in names(statement.target)]
+        elif isinstance(statement, ast.AugAssign | ast.For | ast.AsyncFor):
+            bound += [(name, None) for name in names(statement.target)]
+        elif isinstance(statement, ast.With | ast.AsyncWith):
+            for item in statement.items:
+                if item.optional_vars is not None:
+                    bound += [(name, None) for name in names(item.optional_vars)]
+        elif isinstance(statement, ast.Try | ast.TryStar):
+            bound += [(h.name, None) for h in statement.handlers if h.name]
+        elif isinstance(statement, ast.Match):
+            for case in statement.cases:
+                bound += [
+                    (n.name, None)
+                    for n in ast.walk(case.pattern)
+                    if isinstance(n, ast.MatchAs | ast.MatchStar) and n.name
+                ]
+    return bound
 
 
 def _module_state(index: _Index, pops: Populations) -> None:
@@ -393,33 +478,17 @@ def _module_state(index: _Index, pops: Populations) -> None:
         return
     module = MODULE_STATE_FILE.removesuffix(".py")
     globals_named = {n for g in ast.walk(tree) if isinstance(g, ast.Global) for n in g.names}
-    statements: list[ast.stmt] = list(tree.body)
-    while statements:
-        statement = statements.pop(0)
-        if isinstance(statement, ast.If):
-            statements.extend(statement.body + statement.orelse)
-            continue
-        if isinstance(statement, ast.Assign):
-            targets, value = list(statement.targets), statement.value
-        elif isinstance(statement, ast.AnnAssign):
-            targets, value = [statement.target], statement.value
-        elif isinstance(statement, ast.AugAssign):
-            targets, value = [statement.target], None
-        else:
-            continue
-        for target in targets:
-            if not isinstance(target, ast.Name):
-                continue
-            constant = (
-                target.id.lstrip("_").isupper()
-                and target.id not in globals_named
-                and value is not None
-                and _is_constant_value(value)
-            )
-            if not constant:
-                key = ("module", MODULE_STATE_FILE, target.id)
-                pops.homes[key] = module
-                pops.assigned.setdefault(key, []).append(_Assigned(value, _Ctx(module, None)))
+    for name, value in module_bindings(tree):
+        constant = (
+            name.lstrip("_").isupper()
+            and name not in globals_named
+            and value is not None
+            and _is_constant_value(value)
+        )
+        if not constant:
+            key = ("module", MODULE_STATE_FILE, name)
+            pops.homes[key] = module
+            pops.assigned.setdefault(key, []).append(_Assigned(value, _Ctx(module, None)))
 
 
 def derive(sources: dict[str, str]) -> tuple[_Index, Populations]:
@@ -1048,6 +1117,55 @@ REFUSED: list[tuple[str, dict[str, str], dict[Key, Row], str]] = [
     ),
 ]
 
+_NESTED_BINDINGS = {
+    "if": "if True:\n    _cache = {}\n",
+    "else": "if False:\n    pass\nelse:\n    _cache = {}\n",
+    "try-body": "try:\n    _cache = {}\nexcept Exception:\n    pass\n",
+    "try-handler": "try:\n    pass\nexcept Exception:\n    _cache = {}\n",
+    "try-else": "try:\n    pass\nexcept Exception:\n    pass\nelse:\n    _cache = {}\n",
+    "try-finally": "try:\n    pass\nfinally:\n    _cache = {}\n",
+    "try-star": "try:\n    pass\nexcept* ValueError:\n    _cache = {}\n",
+    "with": "import contextlib\nwith contextlib.nullcontext():\n    _cache = {}\n",
+    "with-as": "import contextlib\nwith contextlib.nullcontext() as _cache:\n    pass\n",
+    "for": "for _i in ():\n    pass\n_ = None\n",
+    "for-body": "for _ in ():\n    _cache = {}\n",
+    "while": "while False:\n    _cache = {}\n",
+    "match": "match 1:\n    case 1:\n        _cache = {}\n",
+    "except-as": "try:\n    pass\nexcept Exception as _cache:\n    pass\n",
+}
+"""A module-scope binding under each compound statement kind, which the walker must reach."""
+
+REFUSED += [
+    (
+        f"a-module-binding-under-{kind}",
+        {"_lifecycle.py": _RUNTIME + source},
+        _BASE_TABLE,
+        UNDECLARED_MODULE_STATE,
+    )
+    for kind, source in _NESTED_BINDINGS.items()
+    if kind != "for"
+]
+REFUSED += [
+    (
+        "a-module-binding-as-a-for-target",
+        {"_lifecycle.py": _RUNTIME + _NESTED_BINDINGS["for"]},
+        {**_BASE_TABLE, ("module", "_lifecycle.py", "_"): Row("_lifecycle", _INH, "f")},
+        UNDECLARED_MODULE_STATE,
+    ),
+    (
+        "an-upper-case-name-holding-a-set-call",
+        {"_lifecycle.py": _RUNTIME + "_PENDING = set()\n"},
+        _BASE_TABLE,
+        UNDECLARED_MODULE_STATE,
+    ),
+    (
+        "an-upper-case-name-holding-a-set-display",
+        {"_lifecycle.py": _RUNTIME + "_SEEN = {1}\n"},
+        _BASE_TABLE,
+        UNDECLARED_MODULE_STATE,
+    ),
+]
+
 SILENT: list[tuple[str, dict[str, str], dict[Key, Row]]] = [
     ("a-declared-field", {"_lifecycle.py": _RUNTIME}, _BASE_TABLE),
     (
@@ -1058,7 +1176,7 @@ SILENT: list[tuple[str, dict[str, str], dict[Key, Row]]] = [
             + _RUNTIME
             + "DEFAULT_TIMEOUT = 30.0\n_FOREIGN = -1\n_CEILING = 100_000\n_SCALED = 2 * 1024\n"
             + "_SKIP = ('_a', '_b')\n_PLAIN = frozenset({dict, list, type(None)})\n"
-            + "_SMALL = set((1, 2))\n_PAIR = tuple((1, 2))\n",
+            + "_PAIR = tuple((1, 2))\n_FROZEN = frozenset((1, 2))\n",
         },
         _BASE_TABLE,
     ),
