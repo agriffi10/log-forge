@@ -49,6 +49,29 @@ bound and the unbounded behaviour carries the claim, and a tight margin only add
 twelve xdist workers.
 """
 
+LOCK_HOLD = 5.0
+"""Seconds a test's holder thread keeps the sink's lock: what a caller queued behind it waits."""
+
+QUEUE_CEILING = LOCK_HOLD / 2
+"""The ceiling on a call the latch must refuse without queueing on the held lock.
+
+Half of :data:`LOCK_HOLD`, the wait a caller that queued instead would take, so a CI stall of a
+few hundred milliseconds cannot fail an honest refusal while a queued caller still overshoots
+the ceiling by 2.5 s.
+"""
+
+AT_ONCE_BUDGET = 1.0
+"""The ``publish_timeout`` of a test whose guarded call settles at once and whose defect waits.
+
+Each defect these tests guard spends the whole budget before the call returns: a probe waited
+out rather than settled, a confirmation waited for where none is due, a reused PING waited on
+instead of the latch refusing. A budget under 1.0 s left the defect's wait so short that a
+ceiling below it sat within reach of a CI stall (123 ms has been seen).
+"""
+
+AT_ONCE_CEILING = AT_ONCE_BUDGET / 2
+"""The ceiling on a call that must settle at once: half the budget its defect waits out."""
+
 
 class FlushTimeoutError(TimeoutError):
     """The fake's ``nats.errors.FlushTimeoutError``, a ``TimeoutError`` as the driver's is."""
@@ -862,7 +885,7 @@ def test_a_probe_that_raises_is_not_an_answer_and_the_next_call_sends_a_fresh_pi
     monkeypatch,
 ) -> None:
     # FR-002 AC-2, the raising variant (plan finding M-4): condition 1 of the answer rule.
-    sink, fake, _ = _build(monkeypatch, factory=RaisingFlushNATS, publish_timeout=0.3)
+    sink, fake, _ = _build(monkeypatch, factory=RaisingFlushNATS, publish_timeout=AT_ONCE_BUDGET)
     elapsed, error = _timed(lambda: sink.emit([{"n": 1}]))
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"n": 2}])
@@ -871,7 +894,7 @@ def test_a_probe_that_raises_is_not_an_answer_and_the_next_call_sends_a_fresh_pi
         sink.close()
 
     assert isinstance(error, SinkDeliveryError) and "PONG" in str(error)
-    assert elapsed < 0.3, "a probe that raised is settled at once, not waited for"
+    assert elapsed < AT_ONCE_CEILING, "a probe that raised is settled at once, not waited for"
     assert "publish" not in fake.calls
     assert losses == SinkLosses(dropped=0, failed=0)
     assert fake.calls[:2] == ["flush", "flush"], "a finished probe is discarded and re-sent"
@@ -1128,7 +1151,7 @@ def test_the_latch_refuses_at_once_while_the_lock_is_held(monkeypatch) -> None:
     def hold() -> None:
         with sink._lock:
             holding.set()
-            release.wait(5.0)
+            release.wait(LOCK_HOLD)
 
     holder = threading.Thread(target=hold)
     holder.start()
@@ -1143,20 +1166,41 @@ def test_the_latch_refuses_at_once_while_the_lock_is_held(monkeypatch) -> None:
 
     for elapsed, error in timings:
         assert isinstance(error, SinkDeliveryError) and "PING" in str(error)
-        assert elapsed < 0.05, f"the latch must refuse without queueing: {elapsed:.3f}s"
+        assert elapsed < QUEUE_CEILING, f"the latch must refuse without queueing: {elapsed:.3f}s"
     assert fake.calls.count("flush") == 1
 
 
-def test_the_latch_clears_on_a_pong_and_on_a_reconnect(monkeypatch) -> None:
-    # FR-002 AC-14, first half.
-    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+def test_a_healthy_call_after_a_cleared_stall_does_not_wait(monkeypatch) -> None:
+    """FR-002 AC-14, first half, the timing: once a PONG clears the latch, a call is not held.
+
+    Split from the test below so only this one pays a whole :data:`AT_ONCE_BUDGET` for its stall:
+    the call it times must not wait, and a defect that made it wait would spend that budget.
+    """
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=AT_ONCE_BUDGET)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"n": 1}])
     _pong(sink, fake)
     fake.answering = True
     sink.emit([{"n": 2}])
     elapsed, error = _timed(lambda: sink.emit([{"n": 3}]))
-    assert error is None and elapsed < 0.05, "a healthy call after the stall must not wait"
+    sink.close()
+
+    assert error is None, error
+    assert elapsed < AT_ONCE_CEILING, (
+        f"a healthy call after the stall must not wait: {elapsed:.3f}s"
+    )
+    assert fake.published == [b'{"n": 2}', b'{"n": 3}']
+
+
+def test_the_latch_clears_on_a_pong_and_on_a_reconnect(monkeypatch) -> None:
+    # FR-002 AC-14, first half; the healthy call's timing is the test above's.
+    sink, fake, _ = _build(monkeypatch, factory=StalledFakeNATS, publish_timeout=0.2)
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"n": 1}])
+    _pong(sink, fake)
+    fake.answering = True
+    sink.emit([{"n": 2}])
+    sink.emit([{"n": 3}])
 
     fake.answering = False
     with pytest.raises(SinkDeliveryError):
@@ -1262,25 +1306,44 @@ def test_an_unconfirmed_core_batch_is_counted_and_announced_once(monkeypatch, ca
     assert "lost 3 event(s)" in lines[0] and "unconfirmed" in lines[0] and "PONG" in lines[0]
 
 
+SPENT_BUDGET = 1.0
+"""The ``publish_timeout`` of the spent-deadline test; its honest emit returns at about this."""
+
+SPENT_CEILING = SPENT_BUDGET + min(SPENT_BUDGET, CALL_SLACK) / 2
+"""The ceiling on an emit whose deadline is spent before its confirmation: 1.5 s.
+
+The honest emit returns at the deadline, :data:`SPENT_BUDGET`. A defect that gave the
+confirmation PING a fresh budget would wait a second one, cut short by the backstop at
+``SPENT_BUDGET + CALL_SLACK``, so it returns at ``SPENT_BUDGET + min(SPENT_BUDGET, CALL_SLACK)``.
+The ceiling sits midway, 0.5 s clear of each.
+"""
+
+
 class SlowStallingNATS(StallsAfterFirstPublishNATS):
-    """Each publish costs real loop time, so the deadline is spent before the confirmation."""
+    """Each publish costs real loop time, so the deadline is spent before the confirmation.
+
+    Three quarters of :data:`SPENT_BUDGET` per publish: the first completes inside the budget and
+    the second is abandoned at the deadline.
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.publish_delay = 0.15
+        self.publish_delay = 0.75 * SPENT_BUDGET
 
 
 def test_a_spent_deadline_counts_without_waiting_and_leaves_the_probe_for_reuse(
     monkeypatch, capsys
 ) -> None:
-    # FR-003 AC-3. Two publishes at 0.15 s each against a 0.2 s budget: the second is abandoned at
+    # FR-003 AC-3. Two publishes at 0.75 s each against a 1.0 s budget: the second is abandoned at
     # the deadline (plan finding M-2) and the confirmation has nothing left to wait, so the emit
     # returns at about the deadline with both counted; the PING it sent is still pending for the
-    # next call, which reuses it rather than sending another.
-    sink, fake, _ = _build(monkeypatch, factory=SlowStallingNATS, publish_timeout=0.2)
+    # next call, which reuses it rather than sending another. The timing is asserted before the
+    # outcome because a confirmation waited for a fresh budget reaches the backstop, which closes
+    # the sink and raises, and the wait is the defect this test names.
+    sink, fake, _ = _build(monkeypatch, factory=SlowStallingNATS, publish_timeout=SPENT_BUDGET)
     elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}, {"n": 3}]))
+    assert elapsed < SPENT_CEILING, f"the spent deadline must not wait on the PING: {elapsed:.2f}s"
     assert error is None
-    assert elapsed < 0.2 + 0.2, f"the spent deadline must not wait on the PING: {elapsed:.2f}s"
     assert sink.losses() == SinkLosses(dropped=0, failed=3)
     assert sink._probe is not None and not sink._probe[0].done(), "the probe is left for reuse"
     flushes = fake.calls.count("flush")
@@ -1377,11 +1440,14 @@ def test_a_client_that_disconnects_after_the_publishes_is_counted_without_a_wait
     # FR-003 AC-10 (plan finding M-6): no second PING is sent to a client that reports itself
     # disconnected, since the driver's flush would return without one; and a confirmation flush
     # that does return at once while disconnected is not an answer.
-    sink, fake, _ = _build(monkeypatch, factory=DisconnectsAfterPublishNATS, publish_timeout=0.3)
+    sink, fake, _ = _build(
+        monkeypatch, factory=DisconnectsAfterPublishNATS, publish_timeout=AT_ONCE_BUDGET
+    )
     elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}]))
     losses = sink.losses()
     sink.close()
-    assert error is None and elapsed < 0.3
+    assert elapsed < AT_ONCE_CEILING, f"{elapsed:.2f}s"
+    assert error is None, error
     assert losses == SinkLosses(dropped=0, failed=2)
     assert fake.calls.count("flush") == 1, fake.calls
     assert fake._pongs == []
@@ -1399,10 +1465,11 @@ def test_an_injected_core_batch_has_no_second_round_trip_and_no_count() -> None:
     # FR-003 AC-11.
     client = LiveFakeNATS()
     client.answering = False
-    sink = NATSSink("logs", client=client, publish_timeout=0.3)
+    sink = NATSSink("logs", client=client, publish_timeout=AT_ONCE_BUDGET)
     elapsed, error = _timed(lambda: sink.emit([{"n": 1}, {"n": 2}]))
     sink.close()
-    assert error is None and elapsed < 0.3
+    assert elapsed < AT_ONCE_CEILING, f"{elapsed:.2f}s"
+    assert error is None, error
     assert "flush" not in client.calls
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
@@ -2080,7 +2147,7 @@ def test_an_abandoned_publish_refuses_later_callers_at_once_until_it_finishes(
     def hold() -> None:
         with sink._lock:
             holding.set()
-            release.wait(5.0)
+            release.wait(LOCK_HOLD)
 
     holder = threading.Thread(target=hold)
     holder.start()
@@ -2103,7 +2170,9 @@ def test_an_abandoned_publish_refuses_later_callers_at_once_until_it_finishes(
         assert isinstance(error, SinkDeliveryError) and "abandoned" in str(error), (tag, error)
     assert publishes == 1, "a queued caller published into the blocked flush"
     assert isinstance(late_error, SinkDeliveryError) and "abandoned" in str(late_error)
-    assert late_elapsed < 0.05, f"the latch must refuse without queueing: {late_elapsed:.3f}s"
+    assert late_elapsed < QUEUE_CEILING, (
+        f"the latch must refuse without queueing: {late_elapsed:.3f}s"
+    )
     assert cleared, "the latch did not clear when the abandoned publish finished"
     assert after_error is None, after_error
     assert losses == SinkLosses(dropped=0, failed=1), "the abandoned event, counted once"
@@ -2137,7 +2206,9 @@ def test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age(monkeypatch) ->
     test flaked one run in four: the next caller still waited the time the probe and the publish
     had taken.
     """
-    sink, fake, _ = _build(monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=0.3)
+    sink, fake, _ = _build(
+        monkeypatch, factory=ParkedAndStalledNATS, publish_timeout=AT_ONCE_BUDGET
+    )
     sink.emit([{"n": 1}])
     first = sink.losses()
     pings = fake.calls.count("flush")
@@ -2148,8 +2219,8 @@ def test_an_undrained_buffer_leaves_a_probe_for_the_latch_to_age(monkeypatch) ->
 
     assert first == SinkLosses(dropped=0, failed=1)
     assert pings == 2, "the pre-publish probe, then the one left for the latch"
+    assert elapsed < AT_ONCE_CEILING, f"the latch must refuse at once: {elapsed:.3f}s"
     assert isinstance(error, SinkDeliveryError) and "PING" in str(error), error
-    assert elapsed < 0.05, f"the latch must refuse at once: {elapsed:.3f}s"
     assert later == pings, "the refused call sent no PING of its own"
 
 
@@ -2200,13 +2271,25 @@ def test_a_ping_sent_before_the_buffer_drained_never_confirms_it(monkeypatch) ->
     assert pings == [0, 0, 0, 1], "the confirmation must be a fresh PING sent after the drain"
 
 
+SLOW_FIRST_PONG = 1.0
+"""Seconds :class:`SlowFirstPongParkedNATS` holds its pre-publish PONG.
+
+It is also the wait the defect in the test that uses it takes: a probe aged from when its drained
+wait began is only ``budget - SLOW_FIRST_PONG`` old when the emit returns, so the next emit
+reuses it and waits the remaining :data:`SLOW_FIRST_PONG` before refusing.
+"""
+
+SLOW_FIRST_PONG_BUDGET = 1.5 * SLOW_FIRST_PONG
+"""The ``publish_timeout`` that test runs at, so the PONG takes two thirds of it."""
+
+
 class SlowFirstPongParkedNATS(ParkedAndStalledNATS):
-    """The pre-publish PING is answered only after 0.2 s, then the server and the flusher stall."""
+    """The pre-publish PING is answered only after :data:`SLOW_FIRST_PONG`, then everything stalls."""
 
     async def flush(self, timeout: float = 10) -> None:  # noqa: ASYNC109
         if not self.calls.count("flush"):
             self.answering = False
-            asyncio.get_running_loop().call_later(0.2, self.deliver_pong)
+            asyncio.get_running_loop().call_later(SLOW_FIRST_PONG, self.deliver_pong)
         await super().flush(timeout)
 
 
@@ -2215,14 +2298,17 @@ def test_the_latch_holds_after_an_undrained_batch_however_late_the_drained_wait_
 ) -> None:
     """The left-behind probe is aged from the call's start, not from when its drained wait began.
 
-    The pre-publish PONG takes 0.2 s of the 0.3 s budget, so the drained wait begins two thirds of
+    The pre-publish PONG takes 1.0 s of the 1.5 s budget, so the drained wait begins two thirds of
     the way through it and fails at the deadline. Aged from the call's start, the probe is a whole
     budget old when the emit returns, and the next emit is refused by the latch at once, sending
-    no PING of its own. Aged from when the drained wait began, it was 0.1 s old: the next emit
-    reused it and waited the remaining 0.2 s before refusing with "no PONG", which is the shape
-    that made the latch test flake one parallel run in four.
+    no PING of its own. Aged from when the drained wait began, it was 0.5 s old: the next emit
+    reused it and waited the remaining 1.0 s before refusing with "no PONG", which is the shape
+    that made the latch test flake one parallel run in four. The ceiling is half that wait; at the
+    earlier 0.2 s of a 0.3 s budget the wait was too short to bound above a CI stall.
     """
-    sink, fake, _ = _build(monkeypatch, factory=SlowFirstPongParkedNATS, publish_timeout=0.3)
+    sink, fake, _ = _build(
+        monkeypatch, factory=SlowFirstPongParkedNATS, publish_timeout=SLOW_FIRST_PONG_BUDGET
+    )
     sink.emit([{"n": 1}])
     first = sink.losses()
     pings = fake.calls.count("flush")
@@ -2233,9 +2319,9 @@ def test_the_latch_holds_after_an_undrained_batch_however_late_the_drained_wait_
 
     assert first == SinkLosses(dropped=0, failed=1)
     assert pings == 2, "the slow pre-publish probe, then the one left for the latch"
+    assert elapsed < SLOW_FIRST_PONG / 2, f"the latch must refuse at once: {elapsed:.3f}s"
     assert isinstance(error, SinkDeliveryError), error
     assert "has not answered a PING" in str(error), (
         f"refused by a reused wait, not the latch: {error}"
     )
-    assert elapsed < 0.05, f"the latch must refuse at once: {elapsed:.3f}s"
     assert later == pings, "the refused call sent no PING of its own"

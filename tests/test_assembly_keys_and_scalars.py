@@ -9,7 +9,7 @@ reason rather than at import.
 
 The hang-shaped tests are guarded by ``test_assembly_budget``'s SIGALRM deadline, which raises a
 ``BaseException`` the coercer's ``except Exception`` cannot swallow, and assert on CPU time
-(``time.process_time()``) with a generous budget. No failure message renders a hostile key or
+(``conftest.cpu_window``, on the calling thread, where assembly runs) with a generous budget. No failure message renders a hostile key or
 value: they name a route, a type or a number.
 """
 
@@ -19,7 +19,6 @@ import ast
 import json
 import pathlib
 import sys
-import time
 import tracemalloc
 from collections.abc import Iterator, Mapping
 from decimal import Decimal
@@ -30,6 +29,7 @@ from uuid import UUID
 import pytest
 
 import log_foundry as lf
+from conftest import cpu_window
 from log_foundry import sanitize
 from log_foundry.config import Config
 from log_foundry.sanitize import (
@@ -401,10 +401,10 @@ def test_a_huge_bytes_like_key_is_never_rendered(kind: type, size: int) -> None:
     """FR-001 AC9: 64 or 16 MiB of zero bytes as a key is refused unrendered (repr: four times)."""
     key = kind(b"\x00" * size)
     tracemalloc.start()
-    started = time.process_time()
     try:
-        fields, flag = sanitize_fields({key: 1}, cfg=Config())
-        cpu = time.process_time() - started
+        with cpu_window() as window:
+            fields, flag = sanitize_fields({key: 1}, cfg=Config())
+        cpu = window.spent
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -436,9 +436,9 @@ def test_a_frozenset_dag_key_returns_on_both_paths(
     rendered by its builtin ``repr``, doubling per level, and never returned.
     """
     sink = _configure(max_depth=max_depth)
-    started = time.process_time()
-    event = _emit(route, {"v": {_DAG_40: 1}}, sink, deadline=5)
-    cpu = time.process_time() - started
+    with cpu_window() as window:
+        event = _emit(route, {"v": {_DAG_40: 1}}, sink, deadline=5)
+    cpu = window.spent
     assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
     assert event.get("truncated") is True, route
     fields = event["fields"]
@@ -455,10 +455,10 @@ def test_a_tuple_key_of_shared_megabyte_strings_is_bounded() -> None:
     shared = "x" * (1 << 20)
     key = tuple([shared] * 64)
     tracemalloc.start()
-    started = time.process_time()
     try:
-        fields, flag = sanitize_fields({"k": {key: 1}}, cfg=Config())
-        cpu = time.process_time() - started
+        with cpu_window() as window:
+            fields, flag = sanitize_fields({"k": {key: 1}}, cfg=Config())
+        cpu = window.spent
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -474,10 +474,9 @@ def test_a_tuple_key_of_shared_tuples_stops_at_the_byte_budget() -> None:
     inner = tuple([shared] * 64)
     key = tuple([inner] * 64)
     coercer = _Coercer(Config())
-    started = time.process_time()
-    with _deadline(5, "the 64 x 64 key"):
+    with cpu_window() as window, _deadline(5, "the 64 x 64 key"):
         out = coercer.mapping({key: 1}, -1)
-    cpu = time.process_time() - started
+    cpu = window.spent
     assert out == {_SIZE: _SIZE}
     assert coercer.truncated is True
     assert coercer._charged == sanitize._MAX_RENDERED_BYTES == 2048 * 8192
@@ -514,9 +513,9 @@ def test_a_real_container_claiming_a_rendered_type_is_walked(route: str, kind: t
     it never returned around the DAG and it wrote a member's ``repr``.
     """
     sink = _configure()
-    started = time.process_time()
-    event = _emit(route, {"v": kind((_DAG_40,))}, sink, deadline=5)
-    assert time.process_time() - started < 2, route
+    with cpu_window() as window:
+        event = _emit(route, {"v": kind((_DAG_40,))}, sink, deadline=5)
+    assert window.spent < 2, route
     assert event.get("truncated") is True, route
     secret = _emit(route, {"v": kind((_Secret(),))}, sink)
     assert secret["fields"] == {"v": ["<unserializable: _Secret>"]}
@@ -528,9 +527,9 @@ def test_a_real_container_claiming_a_rendered_type_is_walked(route: str, kind: t
 def test_a_container_key_claiming_a_rendered_type_is_still_walked(route: str, kind: type) -> None:
     """FR-001: the key is walked by its real type, never through the value route's ``str()``."""
     sink = _configure()
-    started = time.process_time()
-    event = _emit(route, {"v": {kind((_DAG_40,)): 1}}, sink, deadline=5)
-    assert time.process_time() - started < 2, route
+    with cpu_window() as window:
+        event = _emit(route, {"v": {kind((_DAG_40,)): 1}}, sink, deadline=5)
+    assert window.spent < 2, route
     assert event.get("truncated") is True, route
     fields = event["fields"]
     assert isinstance(fields, dict)
@@ -767,10 +766,9 @@ def test_an_int_subclass_key_claiming_bool_is_bounded(monkeypatch: pytest.Monkey
     sys.set_int_max_str_digits(0)
     try:
         key = _IntClaimsBool(10**3_000_000)
-        started = time.process_time()
-        with _deadline(5, "the int key claiming bool"):
+        with cpu_window() as window, _deadline(5, "the int key claiming bool"):
             fields, flag = sanitize_fields({"k": {key: 1}}, cfg=Config())
-        cpu = time.process_time() - started
+        cpu = window.spent
     finally:
         sys.set_int_max_str_digits(previous)
     (text,) = fields["k"]
@@ -1030,9 +1028,9 @@ def test_a_real_builtin_claiming_enum_is_routed_by_its_real_type(
 def test_a_real_tuple_claiming_enum_around_a_dag_returns(route: str) -> None:
     """FR-002: walked by its real type, a shared DAG inside it is cut, where ``str()`` hung."""
     sink = _configure()
-    started = time.process_time()
-    event = _emit(route, {"v": _TupleClaimsEnumValue((_DAG_40,))}, sink, deadline=5)
-    cpu = time.process_time() - started
+    with cpu_window() as window:
+        event = _emit(route, {"v": _TupleClaimsEnumValue((_DAG_40,))}, sink, deadline=5)
+    cpu = window.spent
     assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
     assert event.get("truncated") is True, route
 
@@ -1111,14 +1109,14 @@ def test_an_mro_forged_enum_tuple_is_written_as_its_enum_text(route: str) -> Non
 def test_an_mro_forged_enum_tuple_around_a_dag_returns(route: str) -> None:
     """FR-002: the forged member's text is computed, so the shared DAG inside it is never walked."""
     sink = _configure()
-    started = time.process_time()
-    event = _emit(
-        route,
-        {"v": _ForgedEnumTuple((_DAG_40,)), "k": {_ForgedEnumTuple((_DAG_40,)): 1}},
-        sink,
-        deadline=5,
-    )
-    cpu = time.process_time() - started
+    with cpu_window() as window:
+        event = _emit(
+            route,
+            {"v": _ForgedEnumTuple((_DAG_40,)), "k": {_ForgedEnumTuple((_DAG_40,)): 1}},
+            sink,
+            deadline=5,
+        )
+    cpu = window.spent
     assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
     assert event["fields"] == {"v": "_ForgedEnumTuple.X", "k": {"_ForgedEnumTuple.X": 1}}
 
@@ -1131,9 +1129,9 @@ def test_a_tuple_repr_enum_member_is_written_as_its_enum_text(route: str) -> Non
     returned at ``fda134a``.
     """
     sink = _configure()
-    started = time.process_time()
-    event = _emit(route, {"v": _TupleReprEnum.A, "k": {_TupleReprEnum.A: 1}}, sink, deadline=5)
-    cpu = time.process_time() - started
+    with cpu_window() as window:
+        event = _emit(route, {"v": _TupleReprEnum.A, "k": {_TupleReprEnum.A: 1}}, sink, deadline=5)
+    cpu = window.spent
     assert cpu < 2, f"{route}: {cpu:.2f} s of CPU"
     assert event["fields"] == {"v": "_TupleReprEnum.A", "k": {"_TupleReprEnum.A": 1}}
 
@@ -1146,10 +1144,10 @@ def test_a_large_bytes_repr_enum_member_is_never_rendered_by_repr() -> None:
 
     member = _BytesReprEnum.A
     tracemalloc.start()
-    started = time.process_time()
     try:
-        fields, flag = sanitize_fields({"v": member, "k": {member: 1}}, cfg=Config())
-        cpu = time.process_time() - started
+        with cpu_window() as window:
+            fields, flag = sanitize_fields({"v": member, "k": {member: 1}}, cfg=Config())
+        cpu = window.spent
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()

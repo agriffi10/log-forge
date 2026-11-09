@@ -32,6 +32,7 @@ from urllib.parse import quote, unquote
 import pytest
 
 import log_foundry
+from conftest import cpu_window
 from log_foundry import context, sanitize
 from log_foundry.config import Config
 
@@ -244,9 +245,9 @@ def test_a_shared_sublist_dag_header_returns_within_a_cpu_second(lf, route: str)
 
     def call() -> tuple[str, float]:
         lf.set_baggage(a=_fan_out())
-        start = time.thread_time()
-        header = lf.current_baggage_header()
-        return header, time.thread_time() - start
+        with cpu_window() as window:
+            header = lf.current_baggage_header()
+        return header, window.spent
 
     with _deadline(5, "current_baggage_header() on the DAG"):
         header, spent = lf.trace(call)() if route == "in_span" else call()

@@ -6,6 +6,7 @@ skipped file. See `tests/README.md` for the two things that may still legitimate
 
 import asyncio
 import contextlib
+import gc
 import sys
 import threading
 import time
@@ -217,6 +218,144 @@ class DelayArmedOnUse:
         if not self.armed:
             self.armed = True
             asyncio.get_running_loop().call_later(self.seconds, self._fire)
+
+
+CPU_SCOPES = {"thread": time.thread_time, "process": time.process_time}
+"""The CPU clocks :func:`cpu_window` reads, by the scope a test claims."""
+
+_collection_pause = threading.Lock()
+_collection_holders = [0, False]
+"""How many windows are open, and whether automatic collection was on when the first opened."""
+
+
+class CpuWindow:
+    """The CPU seconds one :func:`cpu_window` measured, readable once its block exits.
+
+    Attributes:
+      scope: ``"thread"`` or ``"process"``, the clock the window read.
+    """
+
+    def __init__(self, scope: str) -> None:
+        """Records the scope; the window sets the reading on exit.
+
+        Args:
+          scope: The key into :data:`CPU_SCOPES`.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.scope = scope
+        self._spent: float | None = None
+
+    @property
+    def spent(self) -> float:
+        """Returns the CPU seconds between the window's entry and exit.
+
+        Read inside the block it would be no reading at all, so it raises rather than returning
+        a zero that every bound passes.
+
+        Args:
+          None.
+
+        Returns:
+          The seconds.
+
+        Raises:
+          RuntimeError: When the window is still open.
+        """
+        if self._spent is None:
+            raise RuntimeError("cpu_window: spent is read before the window closed")
+        return self._spent
+
+
+def _pause_collection() -> None:
+    """Turns automatic garbage collection off for the first open window, counting the rest.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    with _collection_pause:
+        if _collection_holders[0] == 0:
+            _collection_holders[1] = gc.isenabled()
+            gc.disable()
+        _collection_holders[0] += 1
+
+
+def _resume_collection() -> None:
+    """Restores automatic garbage collection as the last open window found it.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    with _collection_pause:
+        _collection_holders[0] -= 1
+        if _collection_holders[0] == 0 and _collection_holders[1]:
+            gc.enable()
+
+
+@contextlib.contextmanager
+def cpu_window(scope: str = "thread"):
+    """Measures the CPU time a block spends, on the scope it names, with collection paused.
+
+    The shared helper for an upper bound on CPU time, the assertion invariant 3 asks for because
+    a busy-spin satisfies a wall-clock bound. Two things outside a test's claim used to count
+    against such a bound, and this removes both.
+
+    **Garbage collection.** A full collection in a pytest-xdist worker cost 0.04 to 0.16 s of CPU
+    on average, and up to 0.7 s, in one ``pytest tests -n 12`` run at ``c810333d`` with a
+    ``gc.callbacks`` probe, in which each worker ran 10 to 89 of them. CPython charges it to
+    whichever thread allocated past the threshold, and a 0.05 s bound read process-wide flaked
+    at 0.104 s on CI. Automatic collection
+    is off for the window, counted across windows open at once on several threads, and restored
+    as the first window found it when the last one closes. Nothing the library does depends on a
+    collection running.
+
+    **Other threads.** ``"thread"`` reads ``time.thread_time()``, so only the calling thread's CPU
+    counts: a worker leaked by an earlier test (2,222 of 8,576 tests started with one alive in
+    the same run) or pytest's own threads cannot reach it. Use it when every thread that could spin in
+    the window is this one: the caller, with the drain thread wedged inside a fake or not
+    involved. ``"process"`` reads ``time.process_time()``, for a window where the thread that
+    could spin is one the test cannot run the window on, such as a drain thread's retry loop. It
+    still counts every other thread in the process, so prefer ``"thread"`` wherever the claim
+    allows; in a forked child the two differ only by the threads the child started.
+
+    ``tests/test_timing_floors.py`` refuses a CPU reading anywhere else under ``tests/``.
+
+    Args:
+      scope: ``"thread"`` (the default) or ``"process"``.
+
+    Returns:
+      A context manager yielding a :class:`CpuWindow`, whose ``spent`` reads once the block exits.
+
+    Raises:
+      KeyError: When ``scope`` is not a key of :data:`CPU_SCOPES`.
+    """
+    clock = CPU_SCOPES[scope]
+    window = CpuWindow(scope)
+    _pause_collection()
+    try:
+        began = clock()
+        try:
+            yield window
+        finally:
+            window._spent = clock() - began
+    finally:
+        _resume_collection()
 
 
 def install_worker(worker) -> None:

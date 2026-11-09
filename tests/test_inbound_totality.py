@@ -25,14 +25,13 @@ import signal
 import sys
 import textwrap
 import threading
-import time
 import tracemalloc
 from typing import TYPE_CHECKING
 
 import pytest
 
 import log_foundry
-from conftest import armed, fan_out, object_probe, str_probe
+from conftest import armed, cpu_window, fan_out, object_probe, str_probe
 from log_foundry import _diag, decorator
 
 if TYPE_CHECKING:
@@ -83,13 +82,13 @@ def test_rejected_on_a_long_str_costs_a_fraction_of_its_repr(
 ) -> None:
     value = "0" * 10**8
 
-    started = time.process_time()
-    _diag.rejected("x", value)
-    echo_cost = time.process_time() - started
+    with cpu_window() as echo:
+        _diag.rejected("x", value)
+    echo_cost = echo.spent
 
-    started = time.process_time()
-    repr(value)
-    repr_cost = time.process_time() - started
+    with cpu_window() as rendered:
+        repr(value)
+    repr_cost = rendered.spent
 
     assert echo_cost < repr_cost / 10, f"rejected {echo_cost:.4f} s against repr {repr_cost:.4f} s"
     assert capsys.readouterr().err == (
@@ -102,13 +101,13 @@ def test_rejected_on_long_bytes_costs_a_fraction_of_its_repr(
 ) -> None:
     value = b"0" * 10**8
 
-    started = time.process_time()
-    _diag.rejected("x", value)
-    echo_cost = time.process_time() - started
+    with cpu_window() as echo:
+        _diag.rejected("x", value)
+    echo_cost = echo.spent
 
-    started = time.process_time()
-    repr(value)
-    repr_cost = time.process_time() - started
+    with cpu_window() as rendered:
+        repr(value)
+    repr_cost = rendered.spent
 
     assert echo_cost < repr_cost / 10, f"rejected {echo_cost:.4f} s against repr {repr_cost:.4f} s"
     assert capsys.readouterr().err == f"{_PREFIX} (x): <bytes>\n", "the line must be written"

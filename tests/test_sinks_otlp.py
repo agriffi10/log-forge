@@ -211,6 +211,13 @@ def test_every_other_status_is_abandoned_on_the_first_request(
     assert f"OTLPSink, 1 attempt(s), HTTP {status}" in capsys.readouterr().err
 
 
+STOPPED_RETRY_AFTER = 1.0
+"""The ``Retry-After`` the stop-signal test's ``503`` carries, in seconds."""
+
+STOPPED_BACKOFF = 2 * STOPPED_RETRY_AFTER
+"""What a sink that ignored its set stop signal would sleep: two backoffs of the server's delay."""
+
+
 def test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -219,6 +226,11 @@ def test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal(
     Since SPEC-073 the wait is the delivery engine's, which calls ``_retry.wait`` through the
     module; the spy keeps the real function to call, since the autouse fixture has already
     replaced the module's attribute.
+
+    The ``503`` names a ``Retry-After`` so each backoff is :data:`STOPPED_RETRY_AFTER`: the
+    exponential backoff's two waits summed to 0.3 s, too short for a ceiling on them to clear a
+    CI stall. With the signal set before the emit the honest path waits nothing, so the longer
+    delay costs no time; the ceiling is half of :data:`STOPPED_BACKOFF`.
     """
     seen: list[tuple[float, threading.Event | None]] = []
     real = _real_wait
@@ -228,15 +240,17 @@ def test_a_persistent_503_makes_three_requests_and_waits_on_the_stop_signal(
         real(delay, stop)
 
     monkeypatch.setattr("log_foundry.sinks._retry.wait", spy)
-    sink, opener = _sink(FakeResponse(503, b""), max_retries=2)
+    retry_after = {"Retry-After": str(STOPPED_RETRY_AFTER)}
+    sink, opener = _sink(FakeResponse(503, b"", retry_after), max_retries=2)
     sink.log_foundry_stop_signal = threading.Event()
     sink.log_foundry_stop_signal.set()
     started = time.perf_counter()
     with pytest.raises(SinkDeliveryError):
         sink.emit([_event()])
-    assert time.perf_counter() - started < 0.25, "a set signal cuts every backoff short"
+    elapsed = time.perf_counter() - started
+    assert elapsed < STOPPED_BACKOFF / 2, f"a set signal cuts every backoff short: {elapsed:.2f}s"
     assert len(opener.calls) == 3
-    assert [stop for _, stop in seen] == [sink.log_foundry_stop_signal] * 2
+    assert seen == [(STOPPED_RETRY_AFTER, sink.log_foundry_stop_signal)] * 2
 
 
 def test_a_413_halves_the_budget_and_resends_the_same_records() -> None:
