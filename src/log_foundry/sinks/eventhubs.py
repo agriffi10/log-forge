@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
@@ -13,12 +12,15 @@ from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_r
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count
 from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
+
     from log_foundry.sinks._deferral import Deferral
     from log_foundry.sinks._engine import _Drops
     from log_foundry.sinks.base import SinkLosses
@@ -99,8 +101,45 @@ class AzureEventHubsSink:
         self.log_foundry_stop_signal: threading.Event | None = None
         self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._lock = threading.Lock()
-        self._closed = False
+        self._guard = ClosedGuard(GuardMode.SERIAL)
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -234,15 +273,15 @@ class AzureEventHubsSink:
         Raises:
           None. A ``BaseException`` from the producer propagates.
         """
-        context = run_context()
-        with self._lock:
-            if self._closed:
-                context.refuse(
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
                     SinkDeliveryError(
                         f"AzureEventHubsSink sent none of {len(batch)} event(s): the sink is closed"
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
             pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
             if pairs:
@@ -369,8 +408,10 @@ class AzureEventHubsSink:
     def close(self) -> None:
         """Closes the producer (FR-009).
 
-        Idempotent, and takes the emit lock so the producer is never closed out from under an
-        in-flight send (SPEC-028 FR-002).
+        Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
+        refused at once, the one round inside, if any, is waited for and never released under,
+        and the release runs once; a second close waits for the first's release, then returns. The producer is never
+        closed out from under an in-flight send (SPEC-028 FR-002).
 
         Args:
           None.
@@ -381,11 +422,24 @@ class AzureEventHubsSink:
         Raises:
           Exception: Whatever the producer raises on close.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self.producer.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Closes the producer.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the producer raises on close.
+        """
+        self.producer.close()
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed send is worth another attempt (SPEC-070 FR-002).

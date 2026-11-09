@@ -551,10 +551,84 @@ def test_losses_does_not_block_behind_an_in_flight_emit(tmp_path: Path) -> None:
     assert not blocked, "losses() blocked behind an in-flight emit"
 
 
+def _guard_mode(helpers: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]) -> str | None:
+    """The ``GuardMode`` member a class's own ``__init__`` builds ``self._guard`` with (SPEC-076).
+
+    Only the canonical shape counts — ``self._guard = ClosedGuard(GuardMode.<MEMBER>)`` — since it
+    is what lets :func:`_takes_the_transport_lock` read ``with self._guard.enter()`` as entering a
+    transport lock; ``test_the_guard_adopters_are_the_eleven`` refuses any other spelling of a
+    ``ClosedGuard`` build, so a variant cannot fall outside this read unreported.
+
+    Args:
+      helpers: The class's methods, by name.
+
+    Returns:
+      ``"SERIAL"`` or ``"CLOSE_ONLY"``, or ``None`` when ``__init__`` builds no guard.
+
+    Raises:
+      None.
+    """
+    init = helpers.get("__init__")
+    if init is None:
+        return None
+    for node in ast.walk(init):
+        if not isinstance(node, ast.Assign) or not any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_guard"
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "self"
+            for target in node.targets
+        ):
+            continue
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "ClosedGuard"
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Attribute)
+            and isinstance(call.args[0].value, ast.Name)
+            and call.args[0].value.id == "GuardMode"
+        ):
+            return call.args[0].attr
+    return None
+
+
+def _enters_the_guard(expr: ast.expr) -> bool:
+    """Whether a ``with`` item is ``self._guard.enter()``.
+
+    Args:
+      expr: The item's context expression.
+
+    Returns:
+      The answer.
+
+    Raises:
+      None.
+    """
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "enter"
+        and isinstance(expr.func.value, ast.Attribute)
+        and expr.func.value.attr == "_guard"
+        and isinstance(expr.func.value.value, ast.Name)
+        and expr.func.value.value.id == "self"
+        and not expr.args
+        and not expr.keywords
+    )
+
+
 def _takes_the_transport_lock(
     node: ast.AST, helpers: dict[str, ast.FunctionDef | ast.AsyncFunctionDef], seen: set[str]
 ) -> bool:
     """True when this node, or a same-class helper it calls or hands on, enters ``self._lock``.
+
+    Or, since SPEC-076, enters ``self._guard.enter()`` in a class whose own ``__init__`` builds
+    ``self._guard`` in ``SERIAL`` mode, which holds the guard's lock across the section. A
+    ``CLOSE_ONLY`` guard's section takes no lock, so its ``enter()`` is not read as one: such a
+    sink still owes the ``**no** transport lock`` claim, as it did before it adopted the guard.
 
     Same-class helpers are followed to any depth, called or referenced (SPEC-074: an engine
     sink's ``deliver`` hands ``self._round`` to ``_engine.one_round`` rather than calling it), which matters because several sinks
@@ -588,6 +662,10 @@ def _takes_the_transport_lock(
                     and isinstance(part.value, ast.Name)
                     and part.value.id == "self"
                     for part in parts
+                ):
+                    return True
+                if _guard_mode(helpers) == "SERIAL" and any(
+                    _enters_the_guard(part) for part in parts
                 ):
                     return True
         if (
@@ -887,9 +965,31 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
     every sink class, which brought in sixteen more. None of them needs a lock — they are
     wrappers, ``urllib`` subclasses and in-memory sinks — but a class silently outside the lint
     has recorded no decision at all, which is the state the three sinks SPEC-032 fixes were in.
+
+    SPEC-076 moved the lock of eight sinks into a ``SERIAL`` guard; the judgement is
+    :func:`_undecided_concurrency`, over its input, so its red path runs against fixtures too.
+    """
+    undecided = _undecided_concurrency(_sink_classes_with_an_emit())
+    assert not undecided, (
+        "these sinks hold a driver but neither lock it in emit nor record, in the class "
+        f"docstring, why they need not: {undecided}"
+    )
+
+
+def _undecided_concurrency(entries: list[tuple[str, ast.ClassDef]]) -> list[str]:
+    """The classes that neither lock their transport in ``deliver``/``emit`` nor claim they need not.
+
+    Args:
+      entries: ``(module_stem, class node)`` pairs to judge.
+
+    Returns:
+      Their qualified names, in input order.
+
+    Raises:
+      None.
     """
     undecided: list[str] = []
-    for stem, cls in _sink_classes_with_an_emit():
+    for stem, cls in entries:
         helpers = {
             m.name: m
             for m in cls.body
@@ -905,11 +1005,7 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
         if "**no** transport lock" in documented and "SPEC-028 FR-002" in documented:
             continue
         undecided.append(f"{stem}.{cls.name}")
-
-    assert not undecided, (
-        "these sinks hold a driver but neither lock it in emit nor record, in the class "
-        f"docstring, why they need not: {undecided}"
-    )
+    return undecided
 
 
 DELIVER_LOCKERS = frozenset(
@@ -942,6 +1038,33 @@ def test_the_engine_sinks_that_lock_in_deliver_are_the_six() -> None:
         if deliver is not None and _takes_the_transport_lock(deliver, helpers, {deliver.name}):
             found.add(cls.name)
     assert found == DELIVER_LOCKERS
+
+
+EMIT_LOCKERS = frozenset({"FileSink", "RotatingFileSink", "SQLiteSink"})
+"""SPEC-076 FR-005: the local sinks whose ``emit`` enters a ``SERIAL`` guard, by name."""
+
+
+def test_the_local_sinks_that_lock_in_emit_are_the_three() -> None:
+    """SPEC-076 FR-005: the three local ``SERIAL`` adopters are found locking through ``emit``.
+
+    Their lock moved from ``with self._lock`` into the guard, so the walk must read
+    ``with self._guard.enter()`` in a ``SERIAL`` class; were it to stop, these three would fall
+    through to the docstring check and fail there, but pinning them by name says why. Equality,
+    as ``DELIVER_LOCKERS`` is: a class without ``deliver`` that locks in ``emit`` is a decision.
+    """
+    found: set[str] = set()
+    for _, cls in _sink_classes_with_an_emit():
+        helpers = {
+            m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        emit = helpers.get("emit")
+        if (
+            "deliver" not in helpers
+            and emit is not None
+            and _takes_the_transport_lock(emit, helpers, {emit.name})
+        ):
+            found.add(cls.name)
+    assert found == EMIT_LOCKERS
 
 
 def test_every_sink_records_a_client_buffering_decision() -> None:
@@ -2127,3 +2250,216 @@ def test_this_roster_and_the_public_surface_roster_cover_the_same_classes() -> N
         f"the rosters disagree; only here: {sorted(here - there)}; "
         f"only there: {sorted(there - here)}"
     )
+
+
+# -- SPEC-076 FR-002: the SERIAL adopters, through the worker and the orphan path at once --------
+
+SERIAL_DRIVERS = {
+    "ClickHouseSink": ("_ClickHouse", "insert"),
+    "PostgresSink": ("_Cursor", "executemany"),
+    "AzureEventHubsSink": ("_EHProducer", "send_batch"),
+    "RabbitMQSink": ("_Channel", "basic_publish"),
+    "SyslogSink": ("_Socket", "sendto"),
+    "FileSink": ("_Stream", "write"),
+    "RotatingFileSink": ("_Stream", "write"),
+    "SQLiteSink": ("_SQLiteProxy", "executemany"),
+}
+"""Each ``SERIAL`` adopter's rig and the one driver method a round reaches (``SyslogSink`` stands
+for ``SocketTransport``, which it holds)."""
+
+
+class Entries:
+    """Wraps one driver method and records how many callers were inside it at once, and who."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, cls: type, method: str) -> None:
+        self.inside = 0
+        self.most = 0
+        self.calls = 0
+        self.callers: set[str] = set()
+        self._lock = threading.Lock()
+        original = getattr(cls, method)
+        entries = self
+
+        def counted(double: object, *args: object, **kwargs: object) -> object:
+            with entries._lock:
+                entries.inside += 1
+                entries.calls += 1
+                entries.most = max(entries.most, entries.inside)
+                entries.callers.add(threading.current_thread().name)
+            try:
+                time.sleep(0)
+                return original(double, *args, **kwargs)
+            finally:
+                with entries._lock:
+                    entries.inside -= 1
+
+        monkeypatch.setattr(cls, method, counted)
+
+
+@pytest.mark.parametrize("name", sorted(SERIAL_DRIVERS))
+def test_no_serial_adopter_sees_two_callers_at_once(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SPEC-076 FR-002 AC-4: eight threads, 25 calls each, half traced and half orphan.
+
+    The driver double counts the callers inside its one method; the guard's lock must keep that
+    at one, whether the caller is the drain thread or an application thread's orphan ``info()``.
+    """
+    import log_foundry
+    import sink_rigs
+
+    cls_name, method = SERIAL_DRIVERS[name]
+    entries = Entries(monkeypatch, getattr(sink_rigs, cls_name), method)
+    rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+    log_foundry.configure(service="t", version="0", env="test", sink=rig.sink)
+
+    @log_foundry.trace
+    def traced(thread: int, iteration: int) -> None:
+        log_foundry.info("in-span", thread=thread, iteration=iteration)
+
+    def work(thread: int, iteration: int) -> None:
+        if (thread + iteration) % 2:
+            log_foundry.info("orphan", thread=thread, iteration=iteration)
+        else:
+            traced(thread, iteration)
+
+    errors = run_concurrently(work, THREADS, per_thread=PER_THREAD)
+    assert log_foundry.flush(timeout=15.0)
+    assert errors == []
+    assert entries.calls > THREADS, f"{name}: the driver saw {entries.calls} call(s)"
+    assert any("worker" in caller for caller in entries.callers), entries.callers
+    assert len(entries.callers) > 1, entries.callers
+    assert entries.most == 1, f"{name}: {entries.most} callers were inside the driver at once"
+
+
+ORPHAN_SINKS = ("ClickHouseSink", "RabbitMQSink", "SyslogSink")
+
+
+def _one_resend(name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Builds the sink over its rig's double with one resend allowed, and returns both."""
+    import sink_rigs
+
+    rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+    if name == "ClickHouseSink":
+        from log_foundry.sinks.clickhouse import ClickHouseSink
+
+        rig.sink = ClickHouseSink(
+            "t", client=sink_rigs._ClickHouse(rig.state), max_retries=1, chunk_size=1
+        )
+    elif name == "RabbitMQSink":
+        from log_foundry.sinks.rabbitmq import RabbitMQSink
+
+        rig.sink = RabbitMQSink(
+            exchange="x", routing_key="k", connection=sink_rigs._Connection(rig.state),
+            max_retries=1,
+        )
+    else:
+        rig.sink = SyslogSink("loghost", 514, transport="udp", max_retries=1)
+    return rig
+
+
+def _messages(rig) -> list[str]:
+    return [str(e.get("message")) for p in rig.handoffs() for e in rig.decode(p)]
+
+
+@pytest.mark.parametrize("name", ORPHAN_SINKS)
+def test_an_orphan_round_runs_during_the_drain_threads_backoff(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SPEC-076 FR-002 AC-5: the guard is not held across an engine backoff.
+
+    The drain thread's first round fails on a down double, so the engine waits; that wait is
+    parked here until the orphan call has finished. The orphan ``info()`` must run its round on
+    the same sink meanwhile, and land before the drain thread's next round.
+    """
+    import log_foundry
+    from log_foundry.sinks import _engine
+
+    rig = _one_resend(name, monkeypatch, tmp_path)
+    in_backoff, leave = threading.Event(), threading.Event()
+
+    def parked_wait(delay: float, stop: object) -> object:
+        rig.state.down = False
+        in_backoff.set()
+        assert leave.wait(10.0)
+        return stop
+
+    monkeypatch.setattr(_engine, "_wait", parked_wait)
+    log_foundry.configure(service="t", version="0", env="test", sink=rig.sink)
+    rig.state.down = True
+
+    @log_foundry.trace
+    def drain() -> None:
+        log_foundry.info("drained")
+
+    drain()
+    flusher = threading.Thread(target=lambda: log_foundry.flush(timeout=15.0), daemon=True)
+    flusher.start()
+    assert in_backoff.wait(10.0), "the drain thread never reached the engine backoff"
+    orphan_done = threading.Event()
+
+    def orphan() -> None:
+        log_foundry.info("orphan")
+        orphan_done.set()
+
+    threading.Thread(target=orphan, daemon=True).start()
+    try:
+        assert orphan_done.wait(2.0), "the orphan round waited on the guard during a backoff"
+    finally:
+        leave.set()
+        flusher.join(15.0)
+    landed = _messages(rig)
+    assert "orphan" in landed and "drained" in landed
+    assert landed.index("orphan") < landed.index("drained"), landed
+
+
+@pytest.mark.parametrize("name", ORPHAN_SINKS)
+def test_an_orphan_round_waits_for_the_drain_threads_round_and_no_longer(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SPEC-076 FR-002 AC-5: an orphan call waits for the round the drain thread is inside.
+
+    The drain thread's driver call parks; the orphan ``info()`` must not reach the driver while it
+    is parked, and must finish promptly once that round ends.
+    """
+    import log_foundry
+    import sink_rigs
+
+    cls_name, method = SERIAL_DRIVERS[name]
+    cls = getattr(sink_rigs, cls_name)
+    original = getattr(cls, method)
+    inside, release = threading.Event(), threading.Event()
+
+    def parked(double: object, *args: object, **kwargs: object) -> object:
+        if "worker" in threading.current_thread().name and not inside.is_set():
+            inside.set()
+            assert release.wait(10.0)
+        return original(double, *args, **kwargs)
+
+    monkeypatch.setattr(cls, method, parked)
+    rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+    log_foundry.configure(service="t", version="0", env="test", sink=rig.sink)
+    @log_foundry.trace
+    def drain() -> None:
+        log_foundry.info("drained")
+
+    drain()
+    flusher = threading.Thread(target=lambda: log_foundry.flush(timeout=15.0), daemon=True)
+    flusher.start()
+    assert inside.wait(10.0), "the drain thread never reached its driver"
+    orphan_done = threading.Event()
+
+    def orphan() -> None:
+        log_foundry.info("orphan")
+        orphan_done.set()
+
+    threading.Thread(target=orphan, daemon=True).start()
+    try:
+        assert not orphan_done.wait(0.2), "the orphan call ran inside the drain thread's round"
+        assert "orphan" not in _messages(rig)
+    finally:
+        release.set()
+    assert orphan_done.wait(2.0), "the orphan call kept waiting after the round ended"
+    flusher.join(15.0)
+    landed = _messages(rig)
+    assert landed.index("drained") < landed.index("orphan"), landed

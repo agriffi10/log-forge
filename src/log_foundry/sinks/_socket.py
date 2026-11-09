@@ -5,7 +5,6 @@ from __future__ import annotations
 import errno
 import json
 import socket
-import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag
@@ -15,6 +14,7 @@ from log_foundry.sinks._args import ReadOnlyCount, store_read_only
 from log_foundry.sinks._classify import is_retryable
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, run_context
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import (
     exact_int,
     floor_count,
@@ -26,6 +26,7 @@ from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Callable
 
     from log_foundry.sinks._deferral import Deferral
@@ -242,8 +243,45 @@ class SocketTransport:
         self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
         self.log_foundry_stop_signal: threading.Event | None = None
-        self._lock = threading.Lock()
-        self._closed = False
+        self._guard = ClosedGuard(GuardMode.SERIAL)
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -348,16 +386,16 @@ class SocketTransport:
         Raises:
           None. A ``BaseException`` from the socket propagates.
         """
-        context = run_context()
-        with self._lock:
-            if self._closed:
-                context.refuse(
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
                     SinkDeliveryError(
                         f"SocketTransport delivered none of {len(batch)} message(s): "
                         f"the transport is closed"
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
             pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
             lost = Lost(self)
@@ -439,8 +477,11 @@ class SocketTransport:
     def close(self) -> None:
         """Closes the held socket, if any (FR-005, FR-012).
 
-        Idempotent, and takes the send lock so it never closes the socket out from under an
-        in-flight round (SPEC-028 FR-002). ``_reset`` does not take the lock itself,
+        Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
+        refused at once, the one round inside, if any, is waited for and never released under,
+        and the release runs once; a second close waits for the first's release, then returns. It never closes the
+        socket out from under an in-flight round (SPEC-028 FR-002), and a second close no
+        longer repeats the release on the strength of ``_reset`` doing nothing twice. ``_reset`` does not take the lock itself,
         because ``_send_one`` calls it while :meth:`_round` already holds one — the lock is
         deliberately not re-entrant, so that path must stay the only unlocked caller.
 
@@ -453,9 +494,7 @@ class SocketTransport:
         Raises:
           None.
         """
-        with self._lock:
-            self._closed = True
-            self._reset()
+        self._guard.close(self._reset)
 
     def _send_one(self, message: bytes) -> Called[None]:
         """Sends one frame once (SPEC-074 FR-005); the engine resends it in a later round.

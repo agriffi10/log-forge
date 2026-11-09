@@ -11,6 +11,7 @@ from log_foundry.sinks._chunk import valid_identifier
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
 __all__ = ["SQLiteSink"]
@@ -78,13 +79,50 @@ class SQLiteSink:
             if connection is not None
             else sqlite3.connect(database, check_same_thread=False)
         )
-        self._closed = False
-        self._lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.SERIAL)
         self._unencodable = 0
         self._failed = 0
         self._counter_lock = threading.Lock()
         if create_table:
             self._ensure_schema()
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     def losses(self) -> SinkLosses | None:
         """Reports unencodable events and driver failures, once it has any (SPEC-069).
@@ -155,11 +193,11 @@ class SQLiteSink:
         with Deferral(self) as pending:
             encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
             try:
-                with self._lock:
-                    if self._closed:
+                with self._guard.enter() as section:
+                    if not section:
                         raise SinkDeliveryError(
-                            f"SQLiteSink inserted none of {len(batch)} event(s): the sink is "
-                            f"closed"
+                            f"SQLiteSink inserted none of {len(batch)} event(s): "
+                            "the sink is closed"
                         )
                     if not encoded:
                         return
@@ -216,6 +254,9 @@ class SQLiteSink:
 
         Idempotent, and takes the emit lock so it never closes the connection out from under an
         in-flight transaction (SPEC-028 FR-002).
+        The lock is the guard's (SPEC-076 FR-002): once a close begins every later ``emit`` is
+        refused at once, the one ``emit`` inside, if any, is waited for, and the release runs
+        once; a second close waits for the first's release, then returns.
 
         Args:
           None.
@@ -226,13 +267,26 @@ class SQLiteSink:
         Raises:
           sqlite3.Error: If the commit or close fails.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._conn.commit()
-            if self._owns_connection:
-                self._conn.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Commits pending work, then closes the connection if the sink owns it.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          sqlite3.Error: If the commit or close fails.
+        """
+        self._conn.commit()
+        if self._owns_connection:
+            self._conn.close()
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

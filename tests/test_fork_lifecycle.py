@@ -899,7 +899,7 @@ def test_the_same_child_blocks_when_the_inherited_lock_is_put_back(
     at_the_log_call = "at-the-log-call"
 
     def unrepair_then_log() -> str:
-        sink._lock = inherited  # type: ignore[assignment]
+        sink._guard._lock = inherited
         report_from_child(at_the_log_call)
         return _log_in_child()
 

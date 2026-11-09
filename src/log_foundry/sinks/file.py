@@ -13,6 +13,7 @@ from log_foundry.sanitize import _int_text
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count, require_positive
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -157,11 +158,48 @@ class FileSink:
         self._path = path
         self._encoding = encoding
         self._stream: TextIO = open(path, "a", encoding=encoding)
-        self._closed = False
-        self._lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.SERIAL)
         self._unencodable = 0
         self._failed = 0
         self._counter_lock = threading.Lock()
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     def losses(self) -> SinkLosses | None:
         """Reports unencodable events and driver failures, once it has any (SPEC-069).
@@ -228,8 +266,8 @@ class FileSink:
         with Deferral(self) as pending:
             lines = encode_events(batch, self._encode, pending, sink=type(self).__name__)
             try:
-                with self._lock:
-                    if self._closed:
+                with self._guard.enter() as section:
+                    if not section:
                         raise SinkDeliveryError(
                             f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
                         )
@@ -295,7 +333,7 @@ class FileSink:
           ValueError: If the stream has no usable descriptor. ``_fork`` absorbs and announces
             either, since a child that cannot strand its buffer still has working locks.
         """
-        if self._closed:
+        if self._guard.closed:
             return
         self._stream = _reopen_discarding(self._stream, self._path, self._encoding)
 
@@ -304,6 +342,9 @@ class FileSink:
 
         Taking the same lock ``emit`` takes means a close waits for an in-flight write rather
         than pulling the stream out from under it (SPEC-028 FR-002).
+        The lock is the guard's (SPEC-076 FR-002): once a close begins every later ``emit`` is
+        refused at once, the one ``emit`` inside, if any, is waited for, and the release runs
+        once; a second close waits for the first's release, then returns.
 
         Args:
           None.
@@ -314,12 +355,25 @@ class FileSink:
         Raises:
           OSError: If the flush or close fails.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._stream.flush()
-            self._stream.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Flushes and closes the active handle.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the flush or close fails.
+        """
+        self._stream.flush()
+        self._stream.close()
 
 
 class RotatingFileSink:
@@ -428,11 +482,48 @@ class RotatingFileSink:
         self._size = os.path.getsize(path) if os.path.exists(path) else 0
         self._next_rollover = self._schedule_next()
         self._rotation_failing = False
-        self._closed = False
-        self._lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.SERIAL)
         self._unencodable = 0
         self._failed = 0
         self._counter_lock = threading.Lock()
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     def losses(self) -> SinkLosses | None:
         """Reports unencodable events and driver failures, once it has any (SPEC-069).
@@ -507,11 +598,11 @@ class RotatingFileSink:
         with Deferral(self) as pending:
             lines = encode_events(batch, self._encode, pending, sink=type(self).__name__)
             try:
-                with self._lock:
-                    if self._closed:
+                with self._guard.enter() as section:
+                    if not section:
                         raise SinkDeliveryError(
-                            f"RotatingFileSink wrote none of {len(batch)} event(s): the sink is "
-                            f"closed"
+                            f"RotatingFileSink wrote none of {len(batch)} event(s): "
+                            "the sink is closed"
                         )
                     if not lines:
                         return
@@ -578,7 +669,7 @@ class RotatingFileSink:
           ValueError: If the stream has no usable descriptor. ``_fork`` absorbs and announces
             either, since a child that cannot strand its buffer still has working locks.
         """
-        if self._closed:
+        if self._guard.closed:
             return
         self._stream = _reopen_discarding(self._stream, self._path, self._encoding)
 
@@ -588,6 +679,9 @@ class RotatingFileSink:
         Taking the same lock ``emit`` takes means a close waits for an in-flight write, and in
         particular never lands between a rotation and the write it was making room for
         (SPEC-028 FR-002).
+        The lock is the guard's (SPEC-076 FR-002): once a close begins every later ``emit`` is
+        refused at once, the one ``emit`` inside, if any, is waited for, and the release runs
+        once; a second close waits for the first's release, then returns.
 
         Args:
           None.
@@ -598,12 +692,25 @@ class RotatingFileSink:
         Raises:
           OSError: If the flush or close fails.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._stream.flush()
-            self._stream.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Flushes and closes the active handle.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          OSError: If the flush or close fails.
+        """
+        self._stream.flush()
+        self._stream.close()
 
     def _ensure_open(self) -> None:
         """Reopens the active file when a failed rotation left the sink holding a closed stream.

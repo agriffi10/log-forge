@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry.sinks import _engine
@@ -13,12 +12,15 @@ from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_r
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._retry import floor_count, require_positive, require_timeout
 from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
+
     from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["ClickHouseSink"]
@@ -136,14 +138,51 @@ class ClickHouseSink:
         self.max_retries = floor_count(max_retries, 0, "max_retries", "ClickHouseSink")
         self.log_foundry_stop_signal: threading.Event | None = None
         self.log_foundry_counters = SinkCounters()
-        self._closed = False
-        self._lock = threading.Lock()
+        self._guard = ClosedGuard(GuardMode.SERIAL)
         self._owns_client = client is None
         if client is None:
             client = import_extra("clickhouse_connect", "clickhouse").get_client(dsn=dsn, **bounds)
         self.client = client
         if create_table:
             self._ensure_schema()
+
+    @property
+    def _closed(self) -> bool:
+        """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+
+        A 1.x subclass reading ``self._closed`` keeps working. It reads true from the moment a
+        close begins, while that close still waits, which is the guard's ``closed``; assigning it
+        raises ``AttributeError``, since the guard owns the state.
+
+        Args:
+          None.
+
+        Returns:
+          The guard's ``closed``.
+
+        Raises:
+          None.
+        """
+        return self._guard.closed
+
+    @property
+    def _lock(self) -> threading.Lock:
+        """The guard's transport lock under its 1.x name, read-only (SPEC-076 FR-005).
+
+        A 1.x subclass taking ``with self._lock:`` around its own work serialises with the
+        guard's sections and its close, as it did with the 1.x lock; assigning it raises
+        ``AttributeError``.
+
+        Args:
+          None.
+
+        Returns:
+          The lock each admitted section and the close hold.
+
+        Raises:
+          None.
+        """
+        return self._guard._lock
 
     @property
     def _counter_lock(self) -> threading.Lock:
@@ -284,15 +323,15 @@ class ClickHouseSink:
         Raises:
           None. A ``BaseException`` from the client propagates.
         """
-        context = run_context()
-        with self._lock:
-            if self._closed:
-                context.refuse(
+        with self._guard.enter() as section:
+            if not section:
+                run_context().refuse(
                     SinkDeliveryError(
                         f"ClickHouseSink inserted none of {len(batch)} event(s): the sink is closed"
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
             pairs = encode_round(self, batch, self._row, sink=type(self).__name__)
             if not pairs:
@@ -331,8 +370,10 @@ class ClickHouseSink:
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
 
-        Idempotent, and takes the emit lock so the client is never closed mid-insert
-        (SPEC-028 FR-002).
+        Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
+        refused at once, the one round inside, if any, is waited for and never released under,
+        and the release runs once; a second close waits for the first's release, then returns. The client is never
+        closed mid-insert (SPEC-028 FR-002).
 
         Args:
           None.
@@ -343,12 +384,25 @@ class ClickHouseSink:
         Raises:
           Exception: Whatever the client raises on close.
         """
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._owns_client:
-                self.client.close()
+        self._guard.close(self._release)
+
+    def _release(self) -> None:
+        """Closes the client if the sink owns it.
+
+        :meth:`close` hands this to the guard, which runs it once, with the lock held and
+        the state already ``CLOSED``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: Whatever the client raises on close.
+        """
+        if self._owns_client:
+            self.client.close()
 
     def _row(self, event: dict[str, object]) -> list[object]:
         """Builds one row: the extracted columns, then the whole event as JSON.
