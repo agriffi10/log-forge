@@ -1,12 +1,15 @@
-"""Shared adjudication of a positional batch response (SPEC-018)."""
+"""Shared adjudication of a positional or Id-keyed batch response (SPEC-018, SPEC-074)."""
 
 from __future__ import annotations
 
-from typing import Any, NamedTuple
+from collections.abc import Mapping, Sequence
+from typing import Any, NamedTuple, cast
 
 __all__ = [
     "ABSENT",
     "Adjudication",
+    "KeyedAdjudication",
+    "adjudicate_keyed",
     "adjudicate_positional",
     "describe_count",
     "results_rejected",
@@ -44,6 +47,67 @@ class Adjudication[T](NamedTuple):
 
     retry: list[T]
     unadjudicated: int
+
+
+class KeyedAdjudication(NamedTuple):
+    """The outcome of pairing a keyed batch response against the entries the sink sent.
+
+    ``failed`` names an entry only when ``unadjudicated`` is ``0``: the response either
+    describes the chunk or it does not.
+
+    Attributes:
+      failed: Per sent position, the failed entry that names it, or ``None``.
+      unadjudicated: ``len(keys)`` when the response cannot be read, else ``0``.
+    """
+
+    failed: list[Mapping[str, Any] | None]
+    unadjudicated: int
+
+
+def adjudicate_keyed(keys: Sequence[object], failed: object, *, key: str) -> KeyedAdjudication:
+    """Pairs a response's failed entries with the positions whose identifier each one names.
+
+    SQS and SNS report a batch's failures as a ``Failed`` list keyed by the entry ``Id`` the
+    sink assigned, and a MongoDB ``BulkWriteError`` its ``writeErrors`` keyed by ``index``. The
+    positional rule's discipline applies (*a response adjudicates all of a chunk or none of it*):
+    the response is read only when ``failed`` is a ``list``, every item is a mapping carrying
+    ``key``, every value names one of ``keys`` **of the same exact type** — so ``True`` does not
+    name ``1`` — and no two items name the same key. Anything else, including a hostile item
+    whose lookup or comparison raises, adjudicates none of the chunk, which the caller counts
+    once and never resends. A missing ``Failed`` is passed as the empty list and pairs nothing,
+    as 1.x read it.
+
+    Args:
+      keys: The identifiers the sink assigned, in sent order; each distinct, of an exact type.
+      failed: The response's failed list, of any shape.
+      key: The item key carrying the identifier: ``"Id"`` or ``"index"``.
+
+    Returns:
+      The pairing, or every position unadjudicated.
+
+    Raises:
+      None. A ``BaseException`` from a hostile item still propagates.
+    """
+    unread = KeyedAdjudication([None] * len(keys), len(keys))
+    try:
+        if not issubclass(type(failed), list):
+            return unread
+        positions = {(type(sent), sent): at for at, sent in enumerate(keys)}
+        paired: list[Mapping[str, Any] | None] = [None] * len(keys)
+        kinds = {type(sent) for sent in keys}
+        for item in list.__iter__(cast("list[object]", failed)):
+            if not isinstance(item, Mapping) or key not in item:
+                return unread
+            value = item[key]
+            if type(value) not in kinds:
+                return unread
+            at = positions.get((type(value), value))
+            if at is None or paired[at] is not None:
+                return unread
+            paired[at] = item
+    except Exception:
+        return unread
+    return KeyedAdjudication(paired, 0)
 
 
 def usable_results(results: Any) -> list[dict[str, Any]]:

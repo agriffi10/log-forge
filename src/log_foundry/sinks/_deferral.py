@@ -62,7 +62,7 @@ class Deferral:
     at all, which keeps the hot path lock-free and the existing acquisition-count tests exact.
     """
 
-    __slots__ = ("_counts", "_lines", "_owner")
+    __slots__ = ("_counts", "_lines", "_owner", "_targets")
 
     def __init__(self, owner: _Counted) -> None:
         """Starts an empty ledger for one call on ``owner``.
@@ -78,6 +78,7 @@ class Deferral:
         """
         self._owner = owner
         self._counts: dict[str, int] = {}
+        self._targets: list[tuple[object, str, int]] = []
         self._lines: list[Callable[[], None]] = []
 
     def count(self, counter: str, n: int = 1) -> None:
@@ -100,6 +101,29 @@ class Deferral:
         """
         if n:
             self._counts[counter] = self._counts.get(counter, 0) + n
+
+    def count_for(self, target: object, counter: str, n: int = 1) -> None:
+        """Adds ``n`` to ``target.counter`` in the same commit, under the owner's lock.
+
+        For an object whose counters share the owner's ``_counter_lock`` — a shipped engine sink
+        beside its ``SinkCounters`` (SPEC-074 FR-001) — so the delivery engine commits both under
+        one acquisition, and a reader holding that lock never sees one written without the
+        other. The writes are made after the owner's own, in registration order. A zero is not
+        recorded.
+
+        Args:
+          target: The object whose counter it is.
+          counter: Its attribute to increment.
+          n: How much to add.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if n:
+            self._targets.append((target, counter, n))
 
     def announce(self, line: Callable[[], None]) -> None:
         """Registers a diagnostic line to write once the counts are committed.
@@ -159,11 +183,13 @@ class Deferral:
         """
         if exc_type is not None:
             return
-        if self._counts:
+        if self._counts or self._targets:
             owner = self._owner
             with owner._counter_lock:
                 for name, n in self._counts.items():
                     setattr(owner, name, getattr(owner, name) + n)
+                for target, name, n in self._targets:
+                    setattr(target, name, getattr(target, name) + n)
         for line in self._lines:
             line()
 

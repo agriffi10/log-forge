@@ -791,3 +791,131 @@ def test_the_placeholder_sites_agree(number: int) -> None:
     assert _Coercer(Config())._bounded_int(number)[0] == expected
     assert _Coercer(Config()).integer(number) == expected
     assert _int_digits(number) == (expected, True)
+
+
+# --- SPEC-074 FR-002: encode_round, the engine-mode sibling ---------------------------------
+
+
+class _RoundOwner:
+    """A run-notes owner; ``encode_round`` stores nothing on it."""
+
+
+def _counting(calls: list[object]) -> Callable[[dict[str, object]], str]:
+    def encode(event: dict[str, object]) -> str:
+        calls.append(event)
+        return json.dumps(event)
+
+    return encode
+
+
+def test_encode_round_encodes_each_event_once_per_run(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+    from log_foundry.sinks._engine import emit_via_deliver, one_round
+    from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+    calls: list[object] = []
+    seen: list[list[int]] = []
+
+    class Sink:
+        log_foundry_stop_signal = None
+        max_retries = 2
+
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+            self.rounds = 0
+
+        def deliver(self, batch):
+            return one_round(self._round, batch)
+
+        def _round(self, batch):
+            self.rounds += 1
+            pairs = encode_round(self, batch, _counting(calls), sink="Sink")
+            seen.append([position for position, _ in pairs])
+            fates = [Outcome.DROPPED] * len(batch)
+            for position, _ in pairs:
+                fates[position] = Outcome.RETRYABLE if self.rounds < 3 else Outcome.ACCEPTED
+            return Verdict(outcomes=tuple(fates))
+
+        def emit(self, batch):
+            emit_via_deliver(self, batch)
+
+    sink = Sink()
+    batch = [{"a": 1}, {"bad": b"x"}, {"a": 3}]
+    sink.emit(batch)
+    assert sink.rounds == 3
+    assert len(calls) == 3, "encode is called len(batch) times however many rounds run"
+    assert seen == [[0, 2], [0, 1], [0, 1]], "later rounds' positions are their own batch's"
+    lines = [line for line in capsys.readouterr().err.splitlines() if "encoding raised" in line]
+    assert lines == ["log-foundry: lost 1 event(s); Sink, encoding raised TypeError"]
+    assert sink.log_foundry_counters.losses().dropped == 1
+
+
+def test_encode_round_registers_its_line_settled_only(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+    from log_foundry.sinks._engine import emit_via_deliver, one_round
+    from log_foundry.sinks.base import SinkDeliveryError
+    from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+    class Sink:
+        log_foundry_stop_signal = None
+
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+
+        def deliver(self, batch):
+            return one_round(self._round, batch)
+
+        def _round(self, batch):
+            pairs = encode_round(self, batch, _strict, sink="Sink")
+            fates = [Outcome.DROPPED] * len(batch)
+            for position, _ in pairs:
+                fates[position] = Outcome.REJECTED
+            return Verdict(outcomes=tuple(fates))
+
+        def emit(self, batch):
+            emit_via_deliver(self, batch)
+
+    with pytest.raises(SinkDeliveryError):
+        Sink().emit([{"a": 1}, {"bad": b"x"}])
+    assert "encoding raised" not in capsys.readouterr().err, "a failed run's catcher owns it"
+
+
+def test_encode_round_outside_a_run_encodes_once_and_writes_at_once(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+
+    calls: list[object] = []
+    pairs = encode_round(_RoundOwner(), [{"a": 1}, {"bad": b"x"}], _counting(calls), sink="S")
+    assert [position for position, _ in pairs] == [0]
+    assert len(calls) == 2
+    assert "S, encoding raised TypeError" in capsys.readouterr().err
+
+
+def test_encode_round_lets_a_base_exception_out_with_nothing_recorded(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+
+    def interrupt(event: dict[str, object]) -> str:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        encode_round(_RoundOwner(), [{"a": 1}], interrupt, sink="S")
+    assert capsys.readouterr().err == ""
+
+
+def test_encode_round_keeps_one_form_per_occurrence_and_skips_a_landed_one() -> None:
+    """M1: an identity twice in a batch keeps two forms; a landed one is never handed out again."""
+    from log_foundry.sinks._encode import encode_round, encoded_landed
+    from log_foundry.sinks._engine import _RUNS, RunContext
+
+    context = RunContext()
+    token = _RUNS.set((context,))
+    owner = _RoundOwner()
+    try:
+        event = {"a": 1}
+        first = encode_round(owner, [event, event], lambda e: dict(e), sink="S")
+        assert first[0][1] is not first[1][1], "each occurrence has its own form"
+        encoded_landed(owner, [0])
+        second = encode_round(owner, [event], lambda e: dict(e), sink="S")
+        assert second[0][1] is first[1][1], "the resend carries the occurrence that did not land"
+    finally:
+        _RUNS.reset(token)
+        context._close()

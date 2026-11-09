@@ -112,6 +112,40 @@ def test_a_raising_exit_commits_nothing_and_does_not_suppress(error: BaseExcepti
     assert owner._counter_lock.events == [], "nor takes the owner's lock"
 
 
+def test_count_for_commits_another_object_under_the_owners_one_acquisition() -> None:
+    """SPEC-074 FR-001: a target's counter lands in the same acquisition, after the owner's own."""
+    owner = Owner()
+
+    class Target:
+        dropped_oversized = 0
+
+    target = Target()
+    with Deferral(owner) as pending:
+        pending.count("dropped", 1)
+        pending.count_for(target, "dropped_oversized", 2)
+        pending.count_for(target, "dropped_oversized", 0)
+        assert target.dropped_oversized == 0, "nothing may land before the block exits"
+
+    assert (owner.dropped, target.dropped_oversized) == (1, 2)
+    assert owner._counter_lock.events == [("acquire", 0), ("release", 1)], "one acquisition"
+
+
+def test_count_for_alone_still_takes_the_lock_and_a_raise_discards_it() -> None:
+    owner = Owner()
+
+    class Target:
+        n = 0
+
+    target = Target()
+    with pytest.raises(ValueError), Deferral(owner) as pending:
+        pending.count_for(target, "n", 3)
+        raise ValueError
+    assert target.n == 0 and owner._counter_lock.events == []
+    with Deferral(owner) as pending:
+        pending.count_for(target, "n", 3)
+    assert target.n == 3 and len(owner._counter_lock.events) == 2
+
+
 def test_an_early_return_inside_the_block_still_commits() -> None:
     """A ``return`` from inside the ``with`` is a clean exit, which is how two sites settle."""
     owner = Owner()
