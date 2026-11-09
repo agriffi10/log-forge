@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-074
 title: "The Delivery Engine for the SDK and Driver Sinks, Including Id-Keyed Batch Results"
 description: "Puts the queue-service, database, broker and socket sinks on SPEC-072's engine through a per-event deliver, reads Id-keyed batch results in one shared function, and deletes their eleven retry loops, backoff constants and hand-built loss reports while every documented counter and losses() stays true."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-061, SPEC-066, SPEC-068, SPEC-069, SPEC-070, SPEC-071, SPEC-072, SPEC-073]
 arc: stability-redesign
 arc_order: 6
