@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, cast
 
-from log_foundry.sinks._engine import outcomes_of
-from log_foundry.sinks.base import _ABSENT, _static_value
+from log_foundry.sinks._engine import _seconds, declared_count, outcomes_of
+from log_foundry.sinks.base import _static_value
 from log_foundry.sinks.verdict import Outcome, SinkCounters, _probe
 
 if TYPE_CHECKING:
@@ -15,9 +15,6 @@ if TYPE_CHECKING:
     from log_foundry.sinks.verdict import Verdict
 
     type Deliver = Callable[[list[dict[str, object]]], Verdict]
-
-BUDGET = ("max_retries", "max_retry_after")
-"""The two members the engine sizes a run by, read on the run's sink: the wrapper."""
 
 
 class _Forwards(Protocol):
@@ -127,15 +124,19 @@ def offered_counters(inner: object) -> SinkCounters | None:
 
 
 def copy_budget(wrapper: object, inner: object | None) -> None:
-    """Stores the wrapped sink's ``max_retries`` and ``max_retry_after`` on the wrapper.
+    """Stores on the wrapper the budget the engine would read off the sink it wraps.
 
     Each is read with ``_static_value``, exactly as the engine reads it on the bare sink, and
-    stored as found in the wrapper's own ``__dict__``, past the read-only descriptor, so the
-    engine reads the same value on the wrapper and the wrapped sink gets the rounds it gets
-    alone. It is a pass-through, not a floor: the engine judges exactness. A name the wrapped
-    sink lacks, or whose read fails, and both names when ``inner`` is ``None`` (a wrapper that
-    offers nothing), are stored as ``None``, which the engine reads as absent; so a public read
-    never returns the descriptor object. A later assignment to the wrapped sink is not seen.
+    passed through the engine's own reader for that name — ``declared_count`` for
+    ``max_retries``, ``_seconds`` for ``max_retry_after`` — so what is stored is what the engine
+    would use, or ``None`` where it would use its default, and the two cannot drift. A property,
+    a ``bool``, a ``str`` or any other value the engine reads as "declared none" is stored as
+    ``None``; an exact count is stored floored, as the engine floors it; and the engine then
+    reads the stored value to the same rounds and the same ceiling, so the wrapped sink gets
+    what it gets alone. A name the wrapped sink lacks, or whose read fails, and both names when
+    ``inner`` is ``None`` (a wrapper that offers nothing), are ``None`` too. The value goes in
+    the wrapper's own ``__dict__``, past the read-only descriptor, so a public read never returns
+    the descriptor object. A later assignment to the wrapped sink is not seen.
 
     Args:
       wrapper: The wrapper being built.
@@ -147,9 +148,10 @@ def copy_budget(wrapper: object, inner: object | None) -> None:
     Raises:
       None.
     """
-    for name in BUDGET:
-        found = _ABSENT if inner is None else _static_value(inner, name)
-        vars(wrapper)[name] = None if found is _ABSENT else found
+    retries = None if inner is None else _static_value(inner, "max_retries")
+    ceiling = None if inner is None else _static_value(inner, "max_retry_after")
+    vars(wrapper)["max_retries"] = declared_count(retries)
+    vars(wrapper)["max_retry_after"] = _seconds(ceiling)
 
 
 def current_deliver(inner: object, counters: SinkCounters | None) -> Deliver | None:

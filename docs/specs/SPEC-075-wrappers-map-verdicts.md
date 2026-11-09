@@ -127,7 +127,7 @@ Figures re-measured at `fda134a`, each with its instrument:
 - **Deleting a test.** No mechanism is removed. The tests this spec edits are the rosters FR-001
   names, `tests/test_sinks_encode.py`'s pin of the public surface each engine sink gained (which
   gains `LogstashSink`'s new members), and the trigger sets in `tests/test_sink_concurrency.py`
-  that still name SPEC-074's deleted `send_all`, with the two docstrings that describe them; every
+  that still name SPEC-074's deleted `send_all`, with the docstrings that describe them; every
   other test is not edited by this spec.
 
 ---
@@ -194,14 +194,15 @@ for its children and offers no `deliver`, so the engine never reads its signal.
 
 **The retry budget is copied at construction.** The engine runs its rounds on the wrapper. So when
 the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink,
-read with `_static_value` exactly as the engine reads them on the bare inner sink, and stores each
-value as found where the static reader finds it on the wrapper. So a budget behind a property reads
-as absent on both paths, and the wrapped sink gets the rounds it gets alone. One the inner sink
-lacks, or that cannot be read, and both names on a wrapper that offers nothing, are stored as
-`None`, which the engine treats as absent and uses its default; so a public read never returns the
-descriptor object. The copy is a pass-through, not a floor. The engine judges exactness, and SPEC-066's
-guard, which looks for a `max(...)` floor, has nothing to see. A later assignment to the inner
-sink's attribute is not seen.
+read with `_static_value` exactly as the engine reads them on the bare inner sink, and stores
+what the engine would read from each — through the engine's own reader for that name, so the two
+cannot drift — where the static reader finds it on the wrapper, or `None` where the engine would
+use its default. So a budget behind a property, a `bool` or any other value the engine reads as
+declaring none is stored as `None`, an exact count is stored floored as the engine floors it, and
+the wrapped sink gets the rounds it gets alone. One the inner sink lacks, or that cannot be read,
+and both names on a wrapper that offers nothing, are stored as `None` too; so a public read never
+returns the descriptor object, nor a value outside its declared type. The floor is the engine's
+reader's, not the wrapper's. A later assignment to the inner sink's attribute is not seen.
 
 **The copied budget is read-only.** `max_retries` and `max_retry_after` are new public names on all
 three classes, so they are exposed as SPEC-074 exposed `max_retries` on `RabbitMQSink`, `SyslogSink`
@@ -249,7 +250,10 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
       wrapper.
 - [ ] Assigning `max_retries` or `max_retry_after` raises on every shipped class that defines
       `deliver` beside a 1.x `emit` (derived, not listed: the three in this spec), and
-      `_static_value(wrapper, name)` still returns the inner sink's value. A third-party subclass
+      `_static_value(wrapper, name)` still returns the inner sink's value. The refusal says the
+      value is copied from the wrapped sink (from the backend, on `LogstashSink`). An inner budget
+      that is a property or a `bool` reads as `None` on the wrapper, and the engine's rounds through
+      the wrapper equal the bare sink's. A third-party subclass
       of each of the three that assigns `self.max_retries` or `self.max_retry_after` in its own
       `__init__` raises `AttributeError` (Andrew's call; derived population as above).
 - [ ] A direct `deliver` on a non-offering wrapper raises `TypeError` naming the wrapper's class. An
@@ -403,10 +407,11 @@ bound, and the two paths reach it by different counts.
       retryably gives the same number of client calls, equal `losses()` and equal `failed_batches`
       through the wrapper and bare.
 - [ ] Through each of the two wrappers, a predicate or function that declines the first event, over a
-      real `SQSSink` whose client rejects every entry with `SenderFault: True`, settles exactly as the
-      bare `SQSSink` given only the forwarded events: equal `failed`, no extra stderr line, and the
-      run settles. The same holds over a `NATSSink` whose publish counts are marked
-      (`sink_counted`). Removing the rewrite reddens both.
+      real `SQSSink` whose client rejects every entry with `SenderFault: True`, ends exactly as the
+      bare sink given only the forwarded events: the same settled-or-failed result, equal `failed`,
+      no extra stderr line; the `SQSSink` run settles. The same holds over a `NATSSink` whose
+      publish counts are marked (`sink_counted`). Removing the rewrite reddens both. An inner mark
+      outside the forwarded list stays out of range, so the round fails as the bare sink's does.
 - [ ] An inner sink raising `ConnectionRefusedError("secret")` propagates out of the wrapper's
       `deliver` by identity. Through the engine, the run fails with the same `failed_batches` as
       the bare inner sink's, and stderr does not contain `secret`.
@@ -561,8 +566,8 @@ No new type. The members each of the three classes gains, all set at constructio
 
 ```
 log_foundry_counters: SinkCounters | None   # the inner sink's / backend's own object, or None
-max_retries: int | None                     # copied as found from the inner sink, else None; read-only
-max_retry_after: float | None               # copied as found from the inner sink, else None; read-only
+max_retries: int | None                     # what the engine reads off the inner sink, else None; read-only
+max_retry_after: float | None               # what the engine reads off the inner sink, else None; read-only
 # no log_foundry_idempotent, no _retryable_error
 ```
 
@@ -690,3 +695,8 @@ tests/
   (FR-001).
 - 2026-11-09, Andrew's call on SPEC-074 handover item 1a: the detached-call contract of a direct
   `deliver` is documented in the base `deliver` docstring, with no behaviour change (Scope).
+- 2026-11-09, from the frame-1 diff review: the copied budget is what the engine reads off the inner
+  sink, through the engine's own reader, or `None` — never a property object or a `bool` (FR-001);
+  the refusal names where the value is copied from; an out-of-range inner mark stays invalid
+  (FR-002); the marks criterion says "ends exactly as" the bare sink, since the bare `NATSSink`
+  run fails.

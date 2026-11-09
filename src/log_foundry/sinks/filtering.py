@@ -71,15 +71,16 @@ class FilteringSink:
         ``None``, fixed at construction.
       log_foundry_stop_signal: The worker's shutdown event, stored where the engine reads it
         statically and forwarded to the inner sink.
-      max_retries: The inner sink's ``max_retries`` as found at construction, read-only; ``None``
-        when this wrapper offers nothing or the inner sink has none.
-      max_retry_after: The inner sink's ``max_retry_after``, copied and read-only as
-        ``max_retries`` is.
+      max_retries: The ``max_retries`` the engine reads off the inner sink, copied at
+        construction and read-only; ``None`` when this wrapper offers nothing or the engine would
+        read the inner sink's as declaring none.
+      max_retry_after: The inner sink's ``max_retry_after`` as the engine reads it, copied and
+        read-only as ``max_retries`` is; ``None`` where the engine would use its default.
     """
 
     log_foundry_stop_signal = ForwardedStopSignal()
-    max_retries: ReadOnlyCount[int | None] = ReadOnlyCount()
-    max_retry_after = ReadOnlySeconds()
+    max_retries: ReadOnlyCount[int | None] = ReadOnlyCount("it is copied from the wrapped sink")
+    max_retry_after = ReadOnlySeconds("it is copied from the wrapped sink")
 
     def __init__(
         self,

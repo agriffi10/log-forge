@@ -108,15 +108,15 @@ class LogstashSink:
         ``None``, fixed at construction.
       log_foundry_stop_signal: The worker's shutdown event, stored where the engine reads it
         statically and forwarded to the backend.
-      max_retries: The backend's ``max_retries``, copied at construction, read-only; ``None``
-        when this sink offers nothing.
-      max_retry_after: The HTTP backend's ``max_retry_after``, copied and read-only as
-        ``max_retries`` is; ``None`` in socket mode, whose transport has none.
+      max_retries: The ``max_retries`` the engine reads off the backend, copied at
+        construction and read-only; ``None`` when this sink offers nothing.
+      max_retry_after: The HTTP backend's ``max_retry_after`` as the engine reads it, copied and
+        read-only as ``max_retries`` is; ``None`` in socket mode, whose transport has none.
     """
 
     log_foundry_stop_signal = ForwardedStopSignal()
-    max_retries: ReadOnlyCount[int | None] = ReadOnlyCount()
-    max_retry_after = ReadOnlySeconds()
+    max_retries: ReadOnlyCount[int | None] = ReadOnlyCount("it is copied from the backend")
+    max_retry_after = ReadOnlySeconds("it is copied from the backend")
 
     def __init__(
         self,

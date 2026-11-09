@@ -171,9 +171,30 @@ def _count(value: object) -> int:
     Raises:
       None.
     """
+    found = declared_count(value)
+    return 0 if found is None else found
+
+
+def declared_count(value: object) -> int | None:
+    """Reads a retry count the way :func:`_count` does, keeping "declared none" as ``None``.
+
+    The one exactness rule for ``max_retries``: an exact ``int``, floored at zero, else
+    ``None``. :func:`_count` reads ``None`` as zero; SPEC-075's wrappers store it as found, so
+    the budget they copy is what the engine would read off the wrapped sink and cannot drift
+    from it.
+
+    Args:
+      value: A ``max_retries`` as read statically.
+
+    Returns:
+      The floored count, or ``None`` when ``value`` is not an exact ``int``.
+
+    Raises:
+      None.
+    """
     if type(value) is int:
         return max(value, 0)
-    return 0
+    return None
 
 
 def _seconds(value: object) -> float | None:

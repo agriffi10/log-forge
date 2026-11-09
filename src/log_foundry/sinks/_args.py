@@ -114,13 +114,29 @@ class ReadOnlyCount[T]:
     None]`` on SPEC-075's ``FilteringSink``, ``TransformSink`` and ``LogstashSink``, which store
     the ``max_retries`` they copied from the sink they wrap, or ``None`` when they copied none.
     A class that declares one stores a value in every instance it builds, since a read of a name
-    with nothing stored finds this descriptor object itself.
+    with nothing stored finds this descriptor object itself. The refusal's reason says where the
+    value comes from: by default the constructor, as on the SPEC-074 sinks, and on SPEC-075's
+    wrappers the sink each one wraps, whose constructors take no ``max_retries`` at all.
 
     Attributes:
       None.
     """
 
-    __slots__ = ("_name",)
+    __slots__ = ("_name", "_reason")
+
+    def __init__(self, reason: str = "pass it to the constructor") -> None:
+        """Holds the reason the refusal gives, after the attribute's name.
+
+        Args:
+          reason: Where the value comes from, as the refusal states it.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._reason = reason
 
     if TYPE_CHECKING:
 
@@ -167,7 +183,7 @@ class ReadOnlyCount[T]:
         Raises:
           AttributeError: Always, naming the attribute.
         """
-        raise AttributeError(f"{self._name} is read-only; pass it to the constructor")
+        raise AttributeError(f"{self._name} is read-only; {self._reason}")
 
 
 class ReadOnlySeconds:
@@ -180,13 +196,28 @@ class ReadOnlySeconds:
     later would break a 1.x caller, so it is read-only from the start. It works as
     :class:`ReadOnlyCount` does — ``__set__`` refuses, no run-time ``__get__``, the value in the
     instance's own ``__dict__`` through :func:`store_read_only` — and differs only in what a read
-    is typed as: seconds, or ``None`` when nothing was copied.
+    is typed as: seconds, or ``None`` when nothing was copied. Its refusal says where the value
+    came from, as :class:`ReadOnlyCount`'s does.
 
     Attributes:
       None.
     """
 
-    __slots__ = ("_name",)
+    __slots__ = ("_name", "_reason")
+
+    def __init__(self, reason: str = "it is copied from the wrapped sink") -> None:
+        """Holds the reason the refusal gives, after the attribute's name.
+
+        Args:
+          reason: Where the value comes from, as the refusal states it.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._reason = reason
 
     if TYPE_CHECKING:
 
@@ -233,7 +264,7 @@ class ReadOnlySeconds:
         Raises:
           AttributeError: Always, naming the attribute.
         """
-        raise AttributeError(f"{self._name} is read-only; it is copied from the wrapped sink")
+        raise AttributeError(f"{self._name} is read-only; {self._reason}")
 
 
 def store_read_only(obj: object, name: str, value: object) -> None:

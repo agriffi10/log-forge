@@ -322,8 +322,11 @@ def test_the_copied_budget_is_read_only_on_every_class_that_copies_it(
     built.append((sock, {"max_retries": 5, "max_retry_after": None}))
     assert {type(sink).__name__ for sink, _ in built} == population
     for sink, expected in built:
+        source = "the backend" if type(sink) is LogstashSink else "the wrapped sink"
         for name, value in expected.items():
-            with pytest.raises(AttributeError, match=f"{name} is read-only"):
+            with pytest.raises(
+                AttributeError, match=f"{name} is read-only; it is copied from {source}"
+            ):
                 setattr(sink, name, 99)
             assert _static_value(sink, name) == value, (type(sink).__name__, name)
             assert getattr(sink, name) == value
@@ -362,6 +365,32 @@ def test_a_subclass_assigning_the_copied_budget_is_refused_on_every_class(attrib
         args, kwargs = _SUBCLASS_ARGS[name]
         with pytest.raises(AttributeError, match=f"{attribute} is read-only"):
             _subclass_assigning(name, attribute)(*args, **kwargs)
+
+
+class _BoolBudget(Scripted):
+    """An engine sink whose budget is a ``bool`` and a ``str``: the engine reads both as none."""
+
+    max_retries = True
+    max_retry_after = "5"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("make", [_BudgetProperty, _BoolBudget], ids=["property", "bool"])
+def test_a_budget_the_engine_reads_as_none_is_copied_as_none(kind: str, make: Any) -> None:
+    """Frame-1 ruling: the wrapper stores what the engine reads off the inner sink, or ``None``.
+
+    A property object or a ``bool`` is never stored, so the public read keeps its declared type,
+    and the engine's rounds through the wrapper equal the bare sink's.
+    """
+    calls = []
+    for wrapped in (False, True):
+        inner = make([R])
+        sink = wrap(kind, inner) if wrapped else inner
+        if wrapped:
+            assert sink.max_retries is None and sink.max_retry_after is None
+        run(sink, events(1), retries=1)
+        calls.append(inner.calls)
+    assert calls == [2, 2]
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -416,24 +445,76 @@ def test_a_metaclass_name_property_cannot_rename_either_type(kind: str) -> None:
     assert "RealWrapper" in str(raised.value) and "Claimed" not in str(raised.value)
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_the_stop_signal_is_read_statically_and_reaches_the_inner_sink(kind: str) -> None:
-    """AC7: stored where ``stop_signal_of`` reads it, and forwarded; a worker's offer lands both."""
-    inner = Scripted()
-    sink = wrap(kind, inner)
+SIGNAL_KINDS = (*KINDS, "logstash-http", "logstash-socket")
+
+
+class _SignalRig:
+    """A sink whose rounds succeed once and then fail retryably, and the backend it forwards to.
+
+    The two wrappers stand over a scripted engine sink; ``LogstashSink`` over the backend it
+    builds, an ``HTTPSink`` answering ``200`` then ``500`` or a socket transport whose peer starts
+    refusing on :meth:`fail`. ``rounds`` counts what reached the destination either way.
+    """
+
+    def __init__(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.socket: Socket | None = None
+        self.opener: FakeOpener | None = None
+        self.inner: Scripted | None = None
+        if kind == "logstash-http":
+            self.opener = FakeOpener([FakeResponse(200, b"{}"), FakeResponse(500, b"")])
+            self.sink: Any = LogstashSink(
+                url="http://logstash/in", opener=self.opener, max_retries=1
+            )
+            self.backend: Any = self.sink._http
+        elif kind == "logstash-socket":
+            self.socket = Socket()
+            install(monkeypatch, self.socket)
+            self.sink = _socket_logstash(max_retries=1)
+            self.backend = self.sink._socket
+        else:
+            self.inner = Scripted([A, R], max_retries=1)
+            self.sink = wrap(kind, self.inner)
+            self.backend = self.inner
+
+    def fail(self) -> None:
+        """Makes every later round fail retryably; the scripted and HTTP rigs already do."""
+        if self.socket is not None:
+            self.socket.refuse = REFUSED
+
+    @property
+    def rounds(self) -> int:
+        if self.opener is not None:
+            return len(self.opener.calls)
+        if self.socket is not None:
+            return len(self.socket.attempts)
+        assert self.inner is not None
+        return self.inner.calls
+
+
+@pytest.mark.parametrize("kind", SIGNAL_KINDS)
+def test_the_stop_signal_is_read_statically_and_reaches_the_inner_sink(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC7: stored where ``stop_signal_of`` reads it, and forwarded; a worker's offer lands both.
+
+    Run over ``LogstashSink`` in both modes as well as the two wrappers: its signal moved off a
+    property too, and nothing else would see it move back.
+    """
+    rig = _SignalRig(kind, monkeypatch)
+    sink, backend = rig.sink, rig.backend
     assert hasattr(sink, "log_foundry_stop_signal") and sink.log_foundry_stop_signal is None
     event = threading.Event()
     sink.log_foundry_stop_signal = event
     assert _engine.stop_signal_of(sink) is event
-    assert sink.log_foundry_stop_signal is event and inner.log_foundry_stop_signal is event
+    assert sink.log_foundry_stop_signal is event and backend.log_foundry_stop_signal is event
     worker = Worker(sink, batch_size=10, flush_interval=60.0)
     install_worker(worker)
     offered = _engine.stop_signal_of(sink)
     assert offered is not None and offered is not event
-    assert inner.log_foundry_stop_signal is offered
+    assert backend.log_foundry_stop_signal is offered
 
 
-@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("kind", SIGNAL_KINDS)
 def test_setting_the_signal_cuts_a_wrapped_backoff_short_on_the_orphan_path(
     kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -444,8 +525,8 @@ def test_setting_the_signal_cuts_a_wrapped_backoff_short_on_the_orphan_path(
     """
     monkeypatch.setattr(_retry, "wait", _REAL_WAIT)
     monkeypatch.setattr(_engine, "BACKOFF_BASE", 30.0)
-    inner = Scripted([A, R], max_retries=1)
-    sink = wrap(kind, inner)
+    rig = _SignalRig(kind, monkeypatch)
+    sink = rig.sink
     log_foundry.configure(service="t", sink=sink)
 
     @log_foundry.trace
@@ -454,7 +535,9 @@ def test_setting_the_signal_cuts_a_wrapped_backoff_short_on_the_orphan_path(
 
     build_the_worker()
     log_foundry.flush()
-    assert inner.calls == 1, "the worker is built, and has offered its own signal, first"
+    before = rig.rounds
+    assert before >= 1, "the worker is built, and has offered its own signal, first"
+    rig.fail()
     stop = threading.Event()
     sink.log_foundry_stop_signal = stop
     started = time.monotonic()
@@ -465,7 +548,7 @@ def test_setting_the_signal_cuts_a_wrapped_backoff_short_on_the_orphan_path(
     finally:
         timer.cancel()
     assert time.monotonic() - started < 10.0
-    assert inner.calls == 3, "the cut wait still let the last round run"
+    assert rig.rounds - before == 2, "the cut wait still let the last round run"
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -778,6 +861,29 @@ def test_the_inner_rounds_marks_move_into_the_wrappers_positions(
         assert results[0][0] is False, "a batch lost only to final rejections settles"
 
 
+def _marks_out_of_range(batch: list[dict[str, object]]) -> Verdict:
+    """A round that marks index 2 of its two-event batch a final rejection: out of range."""
+    _engine.run_context().final_rejections([2])
+    return Verdict.uniform(J, len(batch))
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_an_inner_mark_out_of_range_stays_invalid_through_the_wrapper(kind: str) -> None:
+    """FR-002: a mark outside the forwarded list fails the round, as the bare sink's engine does.
+
+    The wrapper declines event 0, so the inner sink's out-of-range index 2 would fall inside the
+    wrapper's three-event batch if the rewrite moved it there, and fit the ``REJECTED`` there; it
+    must stay out of range. Both runs fail as an escaped exception does, every event of the
+    round counted raised — the wrapper's ``SKIPPED`` one too, SPEC-072's raising-round bound.
+    """
+    batch = events(3)
+    bare = run(Scripted([_marks_out_of_range]), batch[1:])
+    sink = wrap(kind, Scripted([_marks_out_of_range]), Caller(declines=frozenset({0})))
+    wrapped = run(sink, batch)
+    assert (bare.failed, bare.raised) == (True, 2)
+    assert (wrapped.failed, wrapped.raised) == (True, 3)
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_an_inner_exception_propagates_and_fails_the_run_as_bare(
     kind: str, capsys: pytest.CaptureFixture[str]
@@ -960,6 +1066,53 @@ def deliver_findings(source: str, cls_name: str) -> list[str]:
 
 
 _WRAPPER_MODULES = {"FilteringSink": "filtering.py", "TransformSink": "transform.py"}
+
+_NESTED = {"emit", "run_delivery", "emit_via_deliver"}
+
+
+def nested_delivery_findings(source: str, cls_name: str) -> list[str]:
+    """Every call that would start a delivery of its own from inside a ``deliver``.
+
+    A round that called an inner ``emit`` — its own engine run, with its own line — and also
+    reported those events in its verdict would announce them twice (PR 319's hand-over item 3),
+    and FR-001 says the wrapper never calls ``run_delivery`` or ``emit`` on its inner sink from
+    ``deliver``. Any call to an attribute named ``emit``, or to ``run_delivery`` or
+    ``emit_via_deliver`` by any spelling, reachable from ``deliver`` is a finding.
+    """
+    cls = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.ClassDef) and node.name == cls_name
+    )
+    findings = []
+    for fn in _reached(cls):
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if called in _NESTED:
+                findings.append(f"{cls_name}.{fn.name}:{node.lineno}: calls {ast.unparse(func)}")
+    return findings
+
+
+_NESTED_MODULES = {**_WRAPPER_MODULES, "LogstashSink": "logstash.py"}
+
+
+@pytest.mark.parametrize("cls_name", sorted(_NESTED_MODULES))
+def test_no_deliver_starts_a_delivery_of_its_own(cls_name: str) -> None:
+    """Every ``emit`` and adapter call in the three classes sits in the 1.x ``emit``, never here."""
+    source = (_SINKS / _NESTED_MODULES[cls_name]).read_text(encoding="utf-8")
+    assert nested_delivery_findings(source, cls_name) == []
+
+
+def test_the_nested_delivery_check_names_a_planted_inner_emit() -> None:
+    source = (_SINKS / "filtering.py").read_text(encoding="utf-8")
+    anchor = "        outcomes = [Outcome.SKIPPED] * len(batch)\n"
+    assert source.count(anchor) == 1
+    planted = source.replace(anchor, "        self._inner.emit(batch)\n" + anchor)
+    findings = nested_delivery_findings(planted, "FilteringSink")
+    assert any("calls self._inner.emit" in f for f in findings), findings
 
 
 @pytest.mark.parametrize("cls_name", sorted(_WRAPPER_MODULES))
