@@ -91,7 +91,8 @@ class Runtime:
     the same thing at a different site: *who owns the worker or the sink at this instant, and what
     may this path therefore do?*
 
-    **The states.** A process is in exactly one of these, and the field that decides is named:
+    **The ownership states** (SPEC-040). A process is in exactly one of these, and the field that
+    decides is named; :class:`State` is the separate, five-member view the observer reads:
 
     - **cold** — ``_worker is None`` and ``_owed`` is empty. Nothing has been logged, no
       thread exists, no sink is owed a close. ``configure()`` alone does not leave this state:
@@ -104,9 +105,11 @@ class Runtime:
       close and the stop signal are this owner's on both paths (SPEC-054). A mixed process passes
       through orphan-only first, and one record is what keeps that exactly one ``close()``.
     - **retired** — ``retirements`` is above zero, and every worker built before the last
-      ``shutdown()`` reads as no longer live with it. ``shutdown()`` is terminal by design (SPEC-013): nothing restarts, and a later
-      log is accepted, reported, and refused at the closed sink rather than prevented
-      (SPEC-030).
+      ``shutdown()`` reads as no longer live with it. A retired worker never restarts: a later
+      log through it is accepted, reported, and refused at the closed sink rather than prevented
+      (SPEC-030). Retirement is not terminal for the process, though: a ``@trace`` after a
+      ``shutdown()`` that found no worker builds a live worker (SPEC-044 FR-001), which is why
+      :attr:`State.CLOSED` can return to :attr:`State.RUNNING`.
 
     **The transitions.** ``_get_worker`` takes cold or orphan-only to worker-backed, once, under
     the lock. ``_note_orphan_emit`` takes cold to orphan-only. ``_swap_sink`` retargets within
@@ -120,7 +123,7 @@ class Runtime:
     codebase's most repeated defect: three reviewers each named a different site, each was fixed,
     and a fourth shipped broken.
 
-    **None of the three takes the lock**, and that is load-bearing rather than an omission.
+    **None of the questions takes the lock**, and that is load-bearing rather than an omission.
     :func:`_get_worker`'s inner check, :func:`_close_owed`, :func:`_swap_sink` and
     :func:`_offer_orphan_signal`'s callers all hold ``_lock`` when they ask, so a non-reentrant
     acquire inside a question would deadlock them; and :func:`_get_worker`'s **outer** check is

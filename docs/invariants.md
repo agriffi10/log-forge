@@ -547,7 +547,9 @@ inherited back to `OPEN`, since no parent closer runs there, and keeps `CLOSED`.
 *Guarded:* `tests/test_fork_lifecycle.py` (including an engine sink's counters, SPEC-072, and
 the closed guard driven through `configure()`, SPEC-076),
 `tests/test_sink_ownership.py`,
-`tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`).
+`tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
+`tests/test_invariants_model.py` (a child forked at a step boundary of the sequential driver,
+from each lifecycle state, SPEC-077).
 
 ## 13. A bad argument is refused where it is written, never later on the drain thread
 

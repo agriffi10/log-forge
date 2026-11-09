@@ -814,7 +814,7 @@ SPEC-054 folded the read into the question — and nothing acquires the lifecycl
 **`Runtime.state` is a fourth lock-free reader, but it is not a fourth question** (SPEC-077). It
 names which of five `State` members (`UNCONFIGURED`, `RUNNING`, `SWAPPING`, `DRAINING`, `CLOSED`)
 today's flags describe. It takes no lock, for the reason the three questions take none, and
-nothing in `src/` reads it, so no guard may select it. The process still holds four locks,
+nothing in `src/` reads it, so no guard may select it. `Runtime` still holds four locks,
 `_state._lock` and the three leaves beside it, and `docs/decisions/pipeline/` → *Lifecycle state
 has one holder, Runtime* says why they are not one.
 
