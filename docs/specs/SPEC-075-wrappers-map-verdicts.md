@@ -197,6 +197,14 @@ lacks, or that cannot be read, is not set, and the engine uses its default. The 
 guard, which looks for a `max(...)` floor, has nothing to see. A later assignment to the inner
 sink's attribute is not seen.
 
+**The copied budget is read-only.** `max_retries` and `max_retry_after` are new public names on all
+three classes, so they are exposed as SPEC-074 exposed `max_retries` on `RabbitMQSink`, `SyslogSink`
+and `SocketTransport`: `max_retries` through `sinks._args.ReadOnlyCount`, and `max_retry_after`
+through a sibling descriptor in the same module. Each defines `__set__` and no run-time `__get__`,
+so an assignment raises while an ordinary read and the static reader both find the copied value in
+the instance's own `__dict__`. A writable copy would let an assignment on the wrapper move the
+engine's budget away from the inner sink's, and making it read-only later would break 1.x callers.
+
 **A wrapper declares no idempotence.** It sets no `log_foundry_idempotent` and defines no
 `_retryable_error`, so an `UNKNOWN` or a raising round is never resent through it. A resend would
 re-run the caller's code, and a non-deterministic transform would then send a different event. No
@@ -231,6 +239,9 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
 - [ ] A hint of `2.5` against the inner sink's `max_retry_after=1.0` waits `1.0`. An inner sink
       that sets `log_foundry_idempotent = True` and answers `UNKNOWN` is not resent through the
       wrapper.
+- [ ] Assigning `max_retries` or `max_retry_after` raises on every shipped class that defines
+      `deliver` beside a 1.x `emit` (derived, not listed: the three in this spec), and
+      `_static_value(wrapper, name)` still returns the inner sink's value.
 - [ ] A direct `deliver` on a non-offering wrapper raises `TypeError` naming the wrapper's class. An
       inner sink whose counters are replaced after construction makes the next round raise
       `TypeError` naming its type, and the run fails. For an inner sink class whose metaclass
@@ -507,8 +518,8 @@ No new type. The members each of the three classes gains, all set at constructio
 
 ```
 log_foundry_counters: SinkCounters | None   # the inner sink's / backend's own object, or None
-max_retries: int                            # copied from the inner sink when it has one
-max_retry_after: float                      # copied from the inner sink when it has one
+max_retries: int                            # copied from the inner sink when it has one; read-only
+max_retry_after: float                      # copied from the inner sink when it has one; read-only
 # no log_foundry_idempotent, no _retryable_error
 ```
 
@@ -619,3 +630,6 @@ tests/
   `max_retries` through a set-only descriptor, not a property, and an ordinary read of a
   third-party property would give the wrapper rounds the bare sink never gets. The edited tests now
   name the public-surface pin and the dead `send_all` trigger sets.
+- 2026-11-09, Andrew's call: the copied `max_retries` and `max_retry_after` are read-only on all
+  three classes (FR-001, Data Model), following SPEC-074's `ReadOnlyCount`, rather than writable as
+  first drafted. The wrapper-rule decision and the 1.2.0 release notes name them.
