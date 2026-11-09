@@ -748,7 +748,7 @@ class RunContext:
         deliver: Callable[[list[dict[str, object]]], object],
         forwarded: list[dict[str, object]],
         positions: Sequence[int],
-    ) -> object:
+    ) -> tuple[object, tuple[Outcome, ...] | None]:
         """Runs a wrapped sink's round for a wrapper, moving its marks into the wrapper's positions.
 
         A round marks positions of the batch it was handed (:meth:`final_rejections`,
@@ -760,7 +760,17 @@ class RunContext:
         ``int`` in range of ``positions`` stays invalid — a non-``int`` as given, any other as
         ``-1`` — so a round the bare sink's engine would fail still fails. Nothing is rewritten
         when the call raises: the engine then fails the round's events whatever its marks say.
-        An immediate context keeps no marks, so it only calls.
+
+        **A malformed verdict sets the call's registrations aside**, as the engine sets aside a
+        bare sink's round whose verdict it cannot read (PR 319): every count, line and mark the
+        call registered since just before it is discarded. The wrapper turns the forwarded events
+        ``UNKNOWN`` in a verdict of its own that the engine can read, so without this the
+        wrapped sink's own count and line would survive, and its line would claim the round's
+        announcement, where the bare sink's engine counts nothing of it and announces the
+        events itself. Only the call's registrations go: the wrapper's own, made before it, stay.
+        The verdict is judged here, once, with ``outcomes_of``, and the judgement returned, so
+        the wrapper maps the very outcomes this judged. An immediate context keeps no marks and
+        has committed each registration already, so it only calls and judges.
 
         Args:
           deliver: The wrapped sink's bound ``deliver``.
@@ -768,17 +778,23 @@ class RunContext:
           positions: For each forwarded event, its index in the wrapper's batch.
 
         Returns:
-          What ``deliver`` returned, unread.
+          What ``deliver`` returned, and its outcomes when ``outcomes_of`` accepts it for the
+          forwarded events, else ``None``.
 
         Raises:
           Exception: Whatever ``deliver`` raises, unchanged.
           BaseException: Whatever ``deliver`` raises that is not an ``Exception``.
         """
-        final, counted = len(self._final), len(self._counted)
+        mark = self._mark()
         verdict = deliver(forwarded)
+        found = outcomes_of(verdict, len(forwarded))
+        if found is None:
+            self._rewind(mark)
+            return verdict, None
+        final, counted = mark[2], mark[3]
         self._final[final:] = [_moved(index, positions) for index in self._final[final:]]
         self._counted[counted:] = [_moved(index, positions) for index in self._counted[counted:]]
-        return verdict
+        return verdict, found
 
     def _marks(self) -> _Marks:
         """Returns the marks the round in progress registered, unvalidated.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol, cast
 
-from log_foundry.sinks._engine import _seconds, declared_count, outcomes_of
+from log_foundry.sinks._engine import _seconds, declared_count
 from log_foundry.sinks.base import _static_value
 from log_foundry.sinks.verdict import Outcome, SinkCounters, _probe
 
@@ -178,18 +178,25 @@ def current_deliver(inner: object, counters: SinkCounters | None) -> Deliver | N
     return probe[0]
 
 
-def map_forwarded(verdict: object, positions: Sequence[int], outcomes: list[Outcome]) -> object:
+def map_forwarded(
+    delegated: tuple[object, tuple[Outcome, ...] | None],
+    positions: Sequence[int],
+    outcomes: list[Outcome],
+) -> object:
     """Writes a wrapped sink's verdict into the wrapper's outcomes, returning its hint.
 
-    ``outcomes_of`` is the engine's one definition of a malformed verdict. A malformed one turns
-    every forwarded position ``UNKNOWN`` and gives no hint, so the run settles as the bare sink's
-    would. A well-formed one writes each outcome at its forwarded position, and its
-    ``retry_after`` is read once more inside an ``except Exception`` that substitutes ``None``,
-    since a subclass may answer differently twice and a raise escaping ``deliver`` would fail a
-    run the bare sink's run settles. The hint is passed through as read; the engine judges it.
+    ``delegated`` is what ``RunContext.delegate`` returned: the verdict and its outcomes as
+    ``outcomes_of``, the engine's one definition of a malformed verdict, judged them once. A
+    malformed one turns every forwarded position ``UNKNOWN`` and gives no hint, so the run
+    settles as the bare sink's would — ``delegate`` has already set aside what the wrapped
+    sink registered for it. A well-formed one writes each outcome at its forwarded position,
+    and its ``retry_after`` is read once more inside an ``except Exception`` that substitutes
+    ``None``, since a subclass may answer differently twice and a raise escaping ``deliver``
+    would fail a run the bare sink's run settles. The hint is passed through as read; the
+    engine judges it.
 
     Args:
-      verdict: What the wrapped sink's ``deliver`` returned.
+      delegated: The wrapped sink's verdict, and its outcomes or ``None`` when malformed.
       positions: For each forwarded event, its index in the wrapper's batch.
       outcomes: The wrapper's outcomes, one per event of its batch, written in place.
 
@@ -199,7 +206,7 @@ def map_forwarded(verdict: object, positions: Sequence[int], outcomes: list[Outc
     Raises:
       None. A ``BaseException`` from a field propagates.
     """
-    found = outcomes_of(verdict, len(positions))
+    verdict, found = delegated
     if found is None:
         for position in positions:
             outcomes[position] = Outcome.UNKNOWN

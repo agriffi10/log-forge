@@ -327,8 +327,11 @@ upper bound. A `BaseException` propagates too.
 
 The wrapper reads `retry_after` only from a verdict that `outcomes_of` accepted, inside an
 `except Exception` that substitutes `None`. So a raising read cannot escape `deliver`, which would
-fail a run that the bare inner sink's run settles. When nothing is forwarded the inner sink is not
-called. `deliver([])` returns an empty verdict.
+fail a run that the bare inner sink's run settles. When the inner verdict is malformed, every count,
+line and mark the inner call registered is discarded, as the engine discards them for the bare
+sink's round it sets aside, while the wrapper's own registrations, made before the call, stay; the
+forwarded events are `UNKNOWN`, and the engine announces them. When nothing is forwarded the inner
+sink is not called. `deliver([])` returns an empty verdict.
 
 **The inner sink's marks are moved into the wrapper's positions.** SPEC-074 lets a round mark
 positions of the batch it was handed, through `RunContext.final_rejections` (SQS, SNS) and
@@ -419,7 +422,11 @@ bound, and the two paths reach it by different counts.
       outcomes, and lets the run settle: a returned `None`, a `dict`, a verdict one outcome short,
       a bare-string outcome, and a `Verdict` subclass whose `outcomes` raises. A verdict whose
       `retry_after` raises when read gives `retry_after=None` with nothing escaping. A
-      `KeyboardInterrupt` propagates by identity.
+      `KeyboardInterrupt` propagates by identity. An inner sink that counts and announces in its
+      round and then returns a malformed verdict ends, through either wrapper, with its counters
+      and stderr equal to the bare sink's apart from the sink's name — its own count and line
+      discarded, the engine's settled line written — and the wrapper's own `_dropped` count for a
+      caller-code failure in that round survives.
 - [ ] A call with caller-code failures writes exactly one stderr line, which contains
       `absorbed a failure`, the wrapper's class name and the exception's type name, and does not
       contain the exception's message.
@@ -700,3 +707,6 @@ tests/
   the refusal names where the value is copied from; an out-of-range inner mark stays invalid
   (FR-002); the marks criterion says "ends exactly as" the bare sink, since the bare `NATSSink`
   run fails.
+- 2026-11-09, from PR 319's set-aside rewind: a malformed inner verdict discards what the inner
+  call registered, as the engine discards a bare sink's set-aside round, keeping the wrapper's own
+  registrations (FR-002).

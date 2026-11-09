@@ -21,7 +21,7 @@ import log_foundry
 import log_foundry.sinks._socket as socket_mod
 import nats_engine_matrix_harness as harness
 from conftest import install_worker
-from log_foundry import _fork
+from log_foundry import _diag, _fork
 from log_foundry.sinks import _engine, _retry
 from log_foundry.sinks._socket import SocketTransport
 from log_foundry.sinks.base import SinkLosses, _static_value
@@ -964,6 +964,73 @@ def test_a_malformed_inner_verdict_turns_the_forwarded_events_unknown(
     assert verdict.outcomes == (S, U, S) and verdict.retry_after is None
     sink = wrap(kind, Scripted([lambda batch: returned()]), Caller(declines=frozenset({0})))
     assert not run(sink, events(2)).failed
+
+
+class _RegistersThenMalformed:
+    """An engine sink whose round counts ``_x`` and announces a line, ``ALWAYS``, then returns
+    ``None``: what it registered is the round the engine sets aside bare (PR 319)."""
+
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()
+        self.max_retries = 0
+        self._x = 0
+        self._counter_lock = threading.Lock()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Any:
+        context = _engine.run_context()
+        context.count(self, "_x", len(batch), when=_engine.When.ALWAYS)
+        context.announce(
+            lambda: _diag.absorbed("an inner round", ValueError(), "inner line"),
+            when=_engine.When.ALWAYS,
+        )
+        return None
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        _engine.emit_via_deliver(self, batch)
+
+
+@pytest.mark.parametrize("kind", ["bare", *KINDS])
+def test_what_a_malformed_inner_round_registered_is_set_aside_as_bare(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002: the inner call's count and line are discarded, and the engine announces the events.
+
+    Bare, PR 319's engine sets a round with an unreadable verdict aside, so the sink's own count
+    and line made in it never commit, and the engine's settled line names the ``UNKNOWN``
+    events. Through a wrapper the verdict the engine reads is the wrapper's, well formed, so
+    ``RunContext.delegate`` sets the inner call aside itself.
+    """
+    inner = _RegistersThenMalformed()
+    sink = inner if kind == "bare" else wrap(kind, inner)
+    delivery = run(sink, events(2))
+    assert not delivery.failed
+    assert inner._x == 0
+    assert inner.log_foundry_counters.losses() == SinkLosses(dropped=0, failed=2)
+    name = type(sink).__name__
+    assert lines(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 2 event(s); rejected 0, unresolved 0, raised 0, unknown 2, "
+            f"dropped 0 after 1 delivery round(s) to {name}"
+        )
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_the_set_aside_keeps_the_wrappers_own_count(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002: the rewind reaches back only to just before the inner call.
+
+    The wrapper registered its ``_dropped`` count for a caller-code failure before it called the
+    inner sink, so the count survives the set-aside and commits with the settled run.
+    """
+    inner = _RegistersThenMalformed()
+    sink = wrap(kind, inner, Caller(fails=frozenset({0})))
+    assert not run(sink, events(3)).failed
+    assert inner._x == 0 and sink._dropped == 1
+    written = lines(capsys.readouterr().err)
+    assert any("unknown 2" in line and type(sink).__name__ in line for line in written), written
+    assert not any("inner line" in line for line in written), written
 
 
 @pytest.mark.parametrize("kind", KINDS)

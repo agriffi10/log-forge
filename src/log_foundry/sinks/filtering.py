@@ -222,7 +222,9 @@ class FilteringSink:
         The kept events go to the inner sink's ``deliver``, taken again on every round, as one
         list in batch order, through the run context's ``delegate``, which moves any mark the
         inner round registered into this batch's positions. Its verdict is mapped back to those
-        positions: a malformed one turns them ``UNKNOWN``. An exception from it propagates
+        positions: a malformed one turns them ``UNKNOWN``, and ``delegate`` has discarded what the
+        inner call registered, as the engine discards a bare sink's set-aside round (PR 319),
+        keeping this wrapper's own registrations. An exception from it propagates
         unchanged, and so the engine applies SPEC-072's rule to it as it would to the bare inner
         sink's. When nothing is kept the inner sink is not called. Nothing here takes a lock,
         enters a ``Deferral`` or stores an attribute, so concurrent calls share nothing
