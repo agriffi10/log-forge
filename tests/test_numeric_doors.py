@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import pytest
 
 import log_foundry
+from conftest import release_after_clock
 from log_foundry.sinks._socket import SocketTransport
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.clickhouse import ClickHouseSink
@@ -1133,13 +1134,12 @@ def test_flush_with_an_infinite_timeout_waits_for_the_drain() -> None:
     """FR-004 AC-1: at `ce2e1fe` `flush(math.inf)` returned `thread-died` at 0.00 s."""
     sink = _Gated()
     _log_through(sink)
-    # The emit is held until a timer started after `started` releases it. A sink that slept
+    # The emit is held until a timer started after the clock releases it. A sink that slept
     # instead could begin its 0.3 s on the worker's own 1.0 s interval before `flush` was called,
     # and a clock started after that would not see the whole of it.
-    started = time.monotonic()
-    threading.Timer(0.3, sink.release.set).start()
-    result = log_foundry.flush(timeout=math.inf)
-    elapsed = time.monotonic() - started
+    with release_after_clock(0.3, sink.release.set) as watch:
+        result = log_foundry.flush(timeout=math.inf)
+    elapsed = watch.elapsed
     assert result, f"flush(inf) reported {result!r}"
     assert sink.got >= 3, "the sink received the events"
     assert elapsed >= 0.25, "it waited for the drain rather than returning at once"

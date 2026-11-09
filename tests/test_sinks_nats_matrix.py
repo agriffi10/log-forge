@@ -62,6 +62,15 @@ A refusal made before the lock takes microseconds; a caller that reaches the loc
 for the holder, which releases after :data:`HOLD` seconds, so the gap is more than a second.
 """
 
+FLOOR_PONG_DELAY = 1.0
+"""Seconds the floor-budget test holds the probe's PONG, the wait a refusal at the floor skips.
+
+A sink that refuses at a ``1e-9`` budget returns in well under a millisecond; one that waits for
+the probe instead returns no sooner than this. The test's bound is half of it, so a CI stall of a
+few hundred milliseconds cannot fail it (it took 123 ms against the old shared 0.1 s bound on PR
+317's first integration run, job 42575871091) while the wait it guards against still does.
+"""
+
 HOLD = 1.5
 """Seconds the lock-holding thread keeps the lock, the cost a missing pre-lock refusal pays."""
 
@@ -620,12 +629,21 @@ def test_matrix_publish_timeout_at_its_floor_refuses_and_counts_nothing(
     monkeypatch, capsys, js: bool
 ) -> None:
     # The smallest positive budget leaves no time for the probe's PONG: a refusal, reported to
-    # the worker and counted nowhere, never a publish the sink then has to guess about.
-    sink, fake, _ = _build(monkeypatch, publish_timeout=1e-9, jetstream=js)
+    # the worker and counted nowhere, never a publish the sink then has to guess about. The PONG
+    # is held for FLOOR_PONG_DELAY, so a sink that waited for the probe instead of refusing at
+    # once takes at least that long, and the bound sits half of it clear of both outcomes.
+    sink, fake, _ = _build(
+        monkeypatch,
+        factory=lambda: MatrixFake(first_pong_delay=FLOOR_PONG_DELAY),
+        publish_timeout=1e-9,
+        jetstream=js,
+    )
     try:
         elapsed, error = _timed(lambda: sink.emit([{"n": 0}]))
+        assert elapsed < FLOOR_PONG_DELAY / 2, (
+            f"the refusal took {elapsed:.3f}s: it waited for the probe's PONG"
+        )
         assert isinstance(error, SinkDeliveryError) and "wedged" not in str(error), error
-        assert elapsed < NEXT_BOUND
         assert sink.losses() == SinkLosses(dropped=0, failed=0)
         assert "publish" not in fake.calls
         assert _lost_lines(capsys.readouterr().err) == []

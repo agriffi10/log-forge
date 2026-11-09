@@ -16,7 +16,7 @@ import time
 import pytest
 
 import log_foundry as log_foundry_mod
-from conftest import install_worker, retire_process
+from conftest import install_worker, release_after_clock, retire_process
 from log_foundry import _lifecycle
 from log_foundry import worker as worker_mod
 
@@ -3101,13 +3101,12 @@ def test_the_waiting_caller_does_not_close_a_second_time(capsys) -> None:
     first.start()
     assert sink.in_close.wait(5.0)
 
-    # The close is released on a timer started after `start`, so the wait being measured cannot
+    # The close is released on a timer started after the clock, so the wait being measured cannot
     # have begun before the clock did; a close that slept from `in_close` on lost every
     # preemption between the two to `elapsed`.
-    start = time.monotonic()
-    threading.Timer(0.4, sink.may_finish.set).start()
-    retire_process(worker, timeout=5.0)
-    elapsed = time.monotonic() - start
+    with release_after_clock(0.4, sink.may_finish.set) as watch:
+        retire_process(worker, timeout=5.0)
+    elapsed = watch.elapsed
     capsys.readouterr()
 
     assert sink.closed == 1

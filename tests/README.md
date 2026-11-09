@@ -58,6 +58,10 @@ dropped module reads as a smaller pass count (SPEC-041). The rule is stated in
 - **`run_concurrently`** (`conftest.py`) is the harness for races: a spec touching lifecycle or
   concurrency gets an execution harness rather than a review, because a race is not findable by
   reading.
+- **A lower bound on elapsed time goes through `release_after_clock`** (`conftest.py`): gate the
+  slow thing on an Event and let the helper release it, so the delay opens after the clock by
+  construction. A fake that owns its delay arms a `DelayArmedOnUse` from its first operation,
+  never from `__init__`. `test_timing_floors.py` refuses the shapes that flaked here before.
 
 ## Docstrings
 

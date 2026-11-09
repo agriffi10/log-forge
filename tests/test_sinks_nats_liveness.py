@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry.sinks.nats as nats_sink_module
-from conftest import run_concurrently
+from conftest import DelayArmedOnUse, run_concurrently
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
     CALL_SLACK,
@@ -1704,18 +1704,17 @@ class SlowFlusherNATS(LiveFakeNATS):
     running before the test's clock started, and the test's ``0.2 <= elapsed`` read as low as
     0.1998 s on CI (Release run 42509770284 attempt 1, on ``458d79e6``). asyncio never fires a
     handle early by more than its clock resolution, so a window that opens after the clock does
-    is a floor load cannot break.
+    is a floor load cannot break. :class:`conftest.DelayArmedOnUse` holds the delay unarmed until
+    that publish, and ``tests/test_timing_floors.py`` refuses a fake that arms one in ``__init__``.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.flusher_parked = True
-        self.unpark_scheduled = False
+        self.unpark = DelayArmedOnUse(0.2, self._unpark)
 
     async def _enter_publish(self, payload: bytes) -> None:
-        if not self.unpark_scheduled:
-            self.unpark_scheduled = True
-            asyncio.get_running_loop().call_later(0.2, self._unpark)
+        self.unpark.arm()
         await super()._enter_publish(payload)
 
     def _unpark(self) -> None:
