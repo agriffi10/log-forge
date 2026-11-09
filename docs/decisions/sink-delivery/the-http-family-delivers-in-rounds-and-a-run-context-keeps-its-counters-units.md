@@ -78,7 +78,11 @@ settled run's engine line names each loss decided in a round that registered no 
 write, or in one whose verdict the engine set aside (a raise, an unreadable verdict, marks that do
 not fit), and only those, so a loss is announced at most once, and always when its round wrote no
 line: the round, not the run, is the engine's key, for the reason the chunk is the HTTP round's — a
-line carries no event identity, so a round that announces some of its losses owns the rest. SPEC-074 extends the context for the SDK and driver sinks.
+line carries no event identity, so a round that announces some of its losses owns the rest. An event
+a round left resendable (`RETRYABLE`, or an idempotent sink's `UNKNOWN`) is a loss only because the
+run ended on that round, so only a kept `LAST` line of that round owns it. A round the engine set
+aside has what it registered discarded (`RunContext._rewind`), as the round's hook guard discards a
+faulting hook's, so its counts and lines never describe outcomes the engine decided instead. SPEC-074 extends the context for the SDK and driver sinks.
 
 **What moves**, each in the 1.2.0 release notes. A total failure is counted once per batch: a
 request refused for good is sent and counted once, and an outage counts `failed` once per
@@ -125,7 +129,11 @@ batch. (SPEC-073 FR-001 to FR-005)
   registered no line the run will write. A round that announces some of its losses still owns the
   rest, as an HTTP hook owns its chunk; the HTTP round's own line for an unlined chunk stays, because
   the chunk is a finer key than the round, and the engine sees that round as lined, so nothing is
-  announced twice (`tests/test_engine_announces_every_loss.py`).
+  announced twice (`tests/test_engine_announces_every_loss.py`). The two diff reviews added three
+  rules: a refused round's drop is named (the refusal line counts only losses); a resendable event
+  is owned only by a kept `LAST` line, so the HTTP `emit` and worker twins name a reader's
+  `RETRYABLE` alike; and a round whose verdict the engine set aside has its registrations
+  discarded and owns nothing.
 
 ### 2026-11-08
 

@@ -24,7 +24,7 @@ from log_foundry.sinks.verdict import Outcome, Verdict
 from sink_rigs import ok, unencodable
 from test_engine_sinks_roster import NO_EMIT, SINKS, _build, engine_sink_findings
 from test_http_rounds import Scripted as Opener
-from test_http_rounds import _ok
+from test_http_rounds import _ok, _status
 from verdict_sinks import Scripted, WaitRecorder, events
 
 if TYPE_CHECKING:
@@ -306,7 +306,11 @@ def test_a_refused_rounds_drop_is_announced_since_the_refusal_line_counts_only_l
 def test_a_round_whose_verdict_the_engine_set_aside_owns_nothing(
     step: object, terms: dict[str, int], absorbed: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Round two writes a line, then returns nothing readable or raises: the engine names both."""
+    """Round two writes a line, then returns nothing readable or raises: its line is discarded.
+
+    The engine decided the round's fates, so it names both events, and the line the round wrote
+    about a drop that never became an outcome is not written beside it (frame-2 review).
+    """
 
     def second(batch: list[dict[str, object]]) -> Verdict:
         _announce_drop()
@@ -318,5 +322,126 @@ def test_a_round_whose_verdict_the_engine_set_aside_owns_nothing(
     delivery = _run(sink, events(3))
     assert not delivery.failed
     lines = capsys.readouterr().err.splitlines()
-    assert lines[:2] == [_engine_line(2, 2, "Scripted", **terms), _OWN_LINE]
-    assert len(lines) == 2 + absorbed
+    assert lines[0] == _engine_line(2, 2, "Scripted", **terms)
+    assert _OWN_LINE not in lines
+    assert len(lines) == 1 + absorbed
+
+
+def test_a_set_aside_rounds_count_is_discarded_so_a_resent_drop_counts_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An idempotent sink counts a drop and raises; the resend drops it: counted and named once."""
+    rounds: list[int] = []
+
+    def deliver(batch: list[dict[str, object]]) -> Verdict:
+        rounds.append(len(batch))
+        if len(rounds) == 1:
+            run_context().drops(sink.log_foundry_counters).count("dropped_events", 1)
+            _announce_drop()
+            raise ConnectionError("never shown")
+        return Verdict(outcomes=(D, A))
+
+    class Idempotent(Scripted):
+        log_foundry_idempotent = True
+
+        def _retryable_error(self, exc: BaseException) -> bool:
+            return isinstance(exc, ConnectionError)
+
+    sink = Idempotent([deliver], max_retries=1)
+    _run(sink, events(2))
+    assert rounds == [2, 2], "the premise: the raise was resent"
+    assert sink.log_foundry_counters.losses().dropped == 1
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == _engine_line(1, 2, "Idempotent", dropped=1)
+    assert _OWN_LINE not in lines
+
+
+def _drop_and_leave(batch: list[dict[str, object]]) -> Verdict:
+    """Drops event 0 with a ``SETTLED`` line, leaves event 1 retryable and lands event 2."""
+    _announce_drop()
+    return Verdict(outcomes=(D, R, A))
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [{"worker_retries": 0}, {"decline": True}],
+    ids=["budget", "declined"],
+)
+def test_a_retryable_event_the_run_ended_on_is_named_beside_a_non_last_line(
+    ending: dict[str, object], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The drop line does not cover event 1: it became a loss only when the run ended."""
+    sink = Scripted([_drop_and_leave], max_retries=0 if "worker_retries" in ending else 3)
+    delivery = run_delivery(
+        sink,
+        events(3),
+        worker_retries=0,
+        stop=WaitRecorder(),
+        decline=(lambda _longest: True) if "decline" in ending else None,
+    )
+    assert delivery is not None and delivery.attempts == 1 and not delivery.failed
+    assert capsys.readouterr().err.splitlines() == [
+        _engine_line(1, 1, "Scripted", unresolved=1),
+        _OWN_LINE,
+    ]
+
+
+def test_a_last_line_of_the_final_round_owns_its_retryable_events(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A sink that announces the events it leaves retryable, ``LAST``, gets no engine line."""
+
+    def leave(batch: list[dict[str, object]]) -> Verdict:
+        run_context().announce(
+            lambda: _diag.lost("event", 1, "ThirdParty, still retrying"), when=When.LAST
+        )
+        return Verdict(outcomes=(R, A))
+
+    _run(Scripted([leave], max_retries=0), events(2))
+    assert capsys.readouterr().err.splitlines() == [
+        "log-foundry: lost 1 event(s); ThirdParty, still retrying"
+    ]
+
+
+def test_an_idempotent_unknown_the_run_ended_on_is_named_beside_a_non_last_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An idempotent sink's ``UNKNOWN`` is resendable, so only a ``LAST`` line owns it."""
+
+    class Idempotent(Scripted):
+        log_foundry_idempotent = True
+
+    def unknown(batch: list[dict[str, object]]) -> Verdict:
+        _announce_drop()
+        return Verdict(outcomes=(D, U, A))
+
+    _run(Idempotent([unknown], max_retries=0), events(3))
+    assert capsys.readouterr().err.splitlines() == [
+        _engine_line(1, 1, "Idempotent", unknown=1),
+        _OWN_LINE,
+    ]
+
+
+def test_an_http_retryable_outcome_is_named_alike_through_emit_and_the_worker(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A reader's ``RETRYABLE`` beside a refused chunk is named on both twins (frame-2 review)."""
+
+    class RetryReader(HTTPSink):
+        def _outcomes(self, payload: bytes, items: list[Any]) -> tuple[Outcome, ...]:
+            return tuple(R if item.event.get("i") == 1 else A for item in items)
+
+    def build() -> RetryReader:
+        opener = Opener(_status(400), _ok(), _ok(), _ok(), _ok())
+        return RetryReader("http://h", max_batch_count=1, max_retries=0, opener=opener)
+
+    batch: list[dict[str, object]] = [{"i": 0}, {"i": 1}, {"i": 2}]
+    inline = build()
+    inline.emit(list(batch))
+    through_emit = capsys.readouterr().err.splitlines()
+    worker = build()
+    _run(worker, list(batch), worker_retries=1)
+    through_worker = capsys.readouterr().err.splitlines()
+    assert _engine_line(1, 1, "RetryReader", unresolved=1) in through_emit, through_emit
+    assert _engine_line(1, 2, "RetryReader", unresolved=1) in through_worker, through_worker
+    assert inline.log_foundry_counters.losses() == worker.log_foundry_counters.losses()

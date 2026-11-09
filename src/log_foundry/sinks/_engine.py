@@ -878,29 +878,35 @@ class RunContext:
                 lines.append(line)
         return owners, lines
 
-    def _lined(self, *, settled: bool, final: int) -> frozenset[int]:
+    def _lined(self, *, settled: bool, final: int) -> tuple[frozenset[int], frozenset[int]]:
         """Returns the rounds that registered a line this run will write, as ``_committed`` keeps.
 
         A round that registers a line owns the announcement of every loss its verdict decided,
         the round-level form of the HTTP round's chunk key, since a line carries no event
         identity to count by. A line the run will not write — a ``LAST`` line of a round that
         was not the last, a ``SETTLED`` one of a failed run — announces nothing, so its round
-        owns nothing.
+        owns nothing. The second set is the rounds with a kept ``LAST`` line: an event the round
+        left resendable is a loss only because the run ended there, and only a line registered
+        for that ending announces it.
 
         Args:
           settled: Whether the run settled.
           final: The run's last round.
 
         Returns:
-          The round numbers.
+          ``(lined, last)``: the rounds with any kept line, and those with a kept ``LAST`` line.
 
         Raises:
           None.
         """
-        return frozenset(
-            registered
+        kept = [
+            (when, registered)
             for _line, when, registered in self._lines
             if self._kept(when, registered, settled=settled, final=final)
+        ]
+        return (
+            frozenset(registered for _when, registered in kept),
+            frozenset(registered for when, registered in kept if when is When.LAST),
         )
 
     def _close(self) -> None:
@@ -1379,9 +1385,13 @@ def _run(
     term, each loss decided in a round that registered none, and leaves the rest to the sink's
     lines. The key is the round, the engine's form of the HTTP round's chunk key, because a line
     carries no event identity to count against: a round that announces some of its losses owns
-    the rest. A round whose verdict the engine set aside — one that raised, could not be read,
-    or marked an index its outcome does not fit — owns nothing, since the engine, not the round,
-    decided its events' fates, so no line the round wrote can have described them. An event the
+    the rest. An event the round left resendable — ``RETRYABLE``, or ``UNKNOWN`` for an
+    idempotent sink — is a loss only because the run ended on that round, so only a ``LAST``
+    line the round registered for that ending owns it. A round whose verdict the engine set
+    aside — one that raised, could not be read, or marked an index its outcome does not fit —
+    owns nothing, and what it registered on the run context is discarded (:meth:`RunContext._rewind`),
+    as the HTTP round's hook guard discards a faulting hook's: the engine, not the round,
+    decided its events' fates, so neither its counts nor its lines describe them. An event the
     sink counted itself (:meth:`RunContext.sink_counted`), and a lost event a refused round
     decided, has its own line and is never in this one; a refused round's drop has none, so it
     is. So a loss its round decided is announced by that round's lines or by this one, never
@@ -1472,12 +1482,14 @@ def _run(
             for index in pending:
                 decided_in[index] = attempts
             context._begin(attempts, last=attempts >= rounds_allowed)
+            begun = context._mark()
             hint = None
             started = time.monotonic()
             try:
                 result = deliver(offered)
             except Exception as exc:
                 longest = max(longest, time.monotonic() - started)
+                context._rewind(begun)
                 pending = escape(exc)
             else:
                 longest = max(longest, time.monotonic() - started)
@@ -1485,6 +1497,7 @@ def _run(
                 marks = context._marks()
                 read = None if outcomes is None else _read_marks(marks, outcomes)
                 if outcomes is None:
+                    context._rewind(begun)
                     overridden.add(attempts)
                     for index in pending:
                         fate[index] = _UNREAD
@@ -1493,6 +1506,7 @@ def _run(
                     if not idempotent:
                         pending = []
                 elif read is None:
+                    context._rewind(begun)
                     pending = escape(
                         ValueError(
                             f"{_diag._STR_STR(_diag._STORED_NAME(type(sink)))} marked an index "
@@ -1549,11 +1563,13 @@ def _run(
         owners, lines = context._committed(settled=not delivery.failed, final=attempts, skip=skip)
         shared = [entry for entry in owners if _shares_lock(entry[0], counters)]
         owners = [entry for entry in owners if not _shares_lock(entry[0], counters)]
-        lined = context._lined(settled=not delivery.failed, final=attempts) - overridden
+        lined, last_lined = context._lined(settled=not delivery.failed, final=attempts)
+        lined, last_lined = lined - overridden, last_lined - overridden
+        resendable = (Outcome.RETRYABLE, Outcome.UNKNOWN) if idempotent else (Outcome.RETRYABLE,)
         unlined = [
             fate[index]
             for index in range(total_events)
-            if decided_in[index] not in lined
+            if decided_in[index] not in (last_lined if fate[index] in resendable else lined)
             and not counted_of[index]
             and not (refused_in[index] and fate[index] in lost_fates)
         ]
