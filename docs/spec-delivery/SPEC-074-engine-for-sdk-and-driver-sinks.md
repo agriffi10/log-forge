@@ -51,5 +51,8 @@
   counters without a lock (fork safety, invariant 12).
 - Accepted: `LogstashSink`'s worker path keeps 1.x per-attempt counting until SPEC-075 gives it a
   `deliver`.
+  > **Resolved by SPEC-075:** `LogstashSink` offers `deliver` in both modes, so on the worker path
+  > it counts each lost event once per batch (*A wrapper offers `deliver` exactly when what it wraps
+  > does*, `docs/decisions/sink-delivery/`).
 - Accepted: an `emit` override on a converted sink is counted once per `emit` call, as in 1.x.
 - Accepted: the total-failure exception message changed, following SPEC-073's precedent.

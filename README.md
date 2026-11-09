@@ -674,6 +674,24 @@ lf.configure(sink=MultiSink(
 `min_level` is one of `DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL` (case-insensitive); an event whose
 level is unknown or missing fails open (is forwarded).
 
+**Wrapping a sink that reports per event.** When the sink inside `FilteringSink` or `TransformSink`
+offers `deliver`, as the HTTP family, `SyslogSink` and the SDK and driver sinks other than
+`KafkaSink` and `GooglePubSubSink` do, the wrapper offers it too. The
+library then retries the wrapped sink exactly as it would retry that sink configured alone: the
+same number of attempts, its own `max_retries` and `max_retry_after`, and only the events that can
+still land. The wrapped sink's losses are reported where they would be alone, and the wrapper adds
+only the events your own code failed on. Each wrapper copies the inner sink's `max_retries` and
+`max_retry_after` as read-only attributes when it is built, so set them on the inner sink. Within one
+delivery a `TransformSink` runs your function once per event, however many retries the delivery
+makes, so a transform with side effects sees fewer calls than it did when the worker resent whole
+batches. If your predicate or function raises on **every** event of a batch, the batch is tried
+once and counted as failed, not retried. Your first exception is still what a direct `emit`
+raises. Whenever your code raises during such a delivery, the wrapper writes one stderr line for
+that attempt naming its class and the exception's type, never its message
+(`absorbed a failure while filtering a batch (ValueError); …`). `LogstashSink` passes its HTTP or
+socket backend's verdict through unchanged. `MultiSink` still calls each child's `emit`, so a child
+that reports per event retries inside the one fan-out call.
+
 #### Standard-library `logging` bridge (zero-dependency)
 
 | Sink | Import from | Configure |
@@ -1122,8 +1140,12 @@ class MyWrapper:
         self._inner.log_foundry_stop_signal = signal   # the one line that matters
 ```
 
-Every wrapper shipped here — `MultiSink`, `FilteringSink`, `TransformSink`, `SyslogSink`,
-`LogstashSink`, `SentrySink` — does exactly this.
+`MultiSink` and `SentrySink` do exactly this. A wrapper that **also offers `deliver`** must store
+the signal as a plain instance attribute as well as forwarding it, because the delivery engine
+reads it without running a property and reads a property as no signal. `FilteringSink`,
+`TransformSink` and `LogstashSink` do that, with a descriptor that writes the value into the
+instance and then forwards it. `SyslogSink` holds the signal itself, because its own delivery runs
+the engine.
 
 ##### Reporting per event: `deliver` (optional)
 
@@ -1195,8 +1217,11 @@ class MyBatchSink:
   not offered `deliver` at all, so its override always runs, and a class attribute
   `deliver = None` opts a subclass out explicitly. `deliver` must not call its own `emit`.
 - `read_deliver(sink)` returns a sink's bound `deliver` when the library would use it and `None`
-  otherwise, for a wrapper that wants to know. No shipped sink offers `deliver` yet; nothing
-  changes for a sink that does not add it.
+  otherwise, for a wrapper that wants to know. Nothing changes for a sink that does not add it.
+- **A direct `deliver(batch)` call outside the library's delivery is one attempt with no memory.**
+  A loop of your own calling it sees a sink's still-failing or held line on every call, and an
+  `SQSSink` FIFO message held behind an earlier one is never released. To get the retries, call
+  `emit_via_deliver(sink, batch)` instead.
 
 ### Flushing and shutdown
 

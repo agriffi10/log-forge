@@ -136,11 +136,24 @@ broker and socket sinks, whose drops — an oversize, an unencodable event, an S
 — register on the run context `SETTLED`, committed with the `SinkCounters` totals under one
 acquisition, so an engine sink's drop is counted only by a run that settled, and whose sub-counts
 (`dropped_oversized`, `dropped_unadjudicated`) commit in that same acquisition. A refusal — a closed
-sink, a NATS latch, an SQS batch whose every id callable raised — is marked on the run context and
+sink, a NATS latch, an SQS batch whose every id callable raised, and since SPEC-075 a wrapper call
+whose every event's predicate or transform raised — is marked on the run context and
 counted by its catcher alone; `NATSSink` registers 1.x's own per-publish counts for a round in which
 nothing was published, so its `failed` still moves once per raised publish per call. A sink whose own counters count something other than events — `HTTPSink.failed` counts
 requests — registers them on the engine's run context, which commits them once per run through
 one `Deferral` per owner, `SETTLED` for a drop.
+**A wrapper on the engine keeps the wrapped sink's single ledger** (SPEC-075). `FilteringSink`,
+`TransformSink` and `LogstashSink` offer `deliver` exactly when what they wrap does, and then hold
+the inner sink's or backend's **own** `SinkCounters` object, so the engine commits a run through
+the wrapper into exactly the object, and through exactly the run-context counts, the bare sink's
+run would use. The wrapper counts only its own decisions: a declined event is `SKIPPED` and
+counted nowhere, and a caller-code failure beside other events is `SKIPPED` and registered on the
+wrapper's `_dropped`, `SETTLED`, so it is in `dropped` once and only if the run settles. Socket-mode
+`LogstashSink` therefore counts each lost event once per batch on the worker path, where it counted
+once per worker attempt. `MultiSink` offers no `deliver`: an engine child's `emit` is the adapter,
+which commits a failed run's events into the child's `failed_events` before raising, and
+`MultiSink`'s absorbed count takes them again — the recorded upper bound on `failed`, never a
+second count in `dropped`.
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
 `tests/test_encode.py` and `tests/test_sinks_encode.py` (the encode step over a roster derived from
 the tree, SPEC-069), `tests/test_classify.py` (every retry loop counts once at the attempt that
@@ -153,7 +166,9 @@ and the one-lock commit), `tests/test_engine_announces_every_loss.py` (every los
 registered no line, or whose verdict the engine set aside, is in the engine's settled line unless
 the sink counted it or a refusal line names it, over every engine sink the roster derives), `tests/test_sinks_{queue,db,broker}_engine.py`, `tests/test_socket_engine.py`
 and `tests/test_engine_sinks_roster.py` (every engine sink's counts and the derived roster,
-SPEC-074), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
+SPEC-074), `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's
+ledger against the bare sink's over real HTTP, SQS and NATS sinks, and an engine child's counts
+under `MultiSink`, SPEC-075), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
 `tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,
 holding each term to its exact share, and for an `HTTPSink` behind a scripted opener.
 
@@ -261,6 +276,16 @@ orphan path runs the sink's own `max_retries` on the caller's thread. A sink's `
 `emit_via_deliver` runs the same engine inline, so a wrapper calling `inner.emit(batch)` and the
 worker calling `deliver` keep one ledger in the sink's `SinkCounters`.
 
+**A wrapper on the engine and the sink it wraps are twins, and so are the wrapper's `deliver` and
+its `emit`** (SPEC-075). `FilteringSink`, `TransformSink` and `LogstashSink` offer `deliver`
+exactly when what they wrap does, hold its own `SinkCounters` and copy its `max_retries` and
+`max_retry_after` as the engine reads them, so a wrapped engine sink gets the rounds, the waits
+and the ledger it gets alone, with one engine loop rather than the worker's loop around the inner
+sink's. Each wrapper's 1.x `emit` is kept and still runs whenever a caller or a `MultiSink` calls
+it; on the same batch and inner behaviour the two forward the same events and end with the same
+`losses().dropped` and catcher term (`failed`, the upper bound, is reached by different counts).
+`MultiSink` is not a twin of anything here: it offers no `deliver` and calls each child's `emit`.
+
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
 than a hand list; `tests/test_invariants_model.py` drives both delivery paths in one run and
@@ -268,7 +293,10 @@ catches the races reached at an unforced rate — a window a few instructions wi
 injected preemption point, which is `tests/test_lifecycle_races.py`'s job, one race at a time;
 `tests/test_delivery_paths.py` sends each of six outcomes, a raising `deliver` and a malformed
 verdict as one event through the worker and through the orphan path and holds the two to the same
-`SinkLosses`, and drives `emit` and `deliver` of one sink through a real `Worker` (SPEC-072).
+`SinkLosses`, and drives `emit` and `deliver` of one sink through a real `Worker` (SPEC-072);
+`tests/test_wrapper_verdicts.py` holds each wrapper's `deliver` path to its `emit` path row by row,
+and the wrapped sink to the bare one on rounds, requests, `losses()` and `failed_batches`
+(SPEC-075).
 
 ## 7. A sink that delivered nothing raises; one that delivered something reports
 
@@ -288,6 +316,15 @@ the worker moves `failed_batches` once with no whole-batch resend, the orphan pa
 `inner.emit(batch)` sees what a 1.x `emit` showed it. A settled run moves no failed-batch counter
 and its losses are counted in `SinkCounters`; across the rounds the engine offers again only the
 events still to send, so no event a verdict called `ACCEPTED` is sent again.
+
+**A wrapper on the engine states it for its own batch** (SPEC-075). `FilteringSink` and
+`TransformSink`, when they offer `deliver`, map the inner verdict to their own indices and call a
+declined or failed event `SKIPPED`, which is not accepted, so with a destination that fails every
+call a batch holding either still fails. A call whose every event the caller's code failed on is
+`REJECTED` with the refusal marker: it fails at once, costs one attempt and is not resent by the
+worker, and the wrapper's `emit` still re-raises the first exception. `LogstashSink` returns its
+backend's verdict unmapped. `MultiSink` re-raises only when every child raised, as before
+(SPEC-017 FR-004); a child whose engine run settled raises nothing.
 
 *Observable:* with a destination that fails every call, `flush()` is falsy and a counter moved;
 with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice.
@@ -340,7 +377,9 @@ SPEC-069), `tests/test_sinks_http_body_read.py` (real sockets, every HTTP subcla
 unknown outcomes and the unreadable verdict), `tests/test_delivery_paths.py` (a failed run on
 the worker, the orphan path and the adapter, a settled one on each, SPEC-072) and
 `tests/test_http_rounds.py` (the HTTP family's total and partial failures through `emit`, the
-worker and the orphan path, and a third-party override on its 1.x path, SPEC-073).
+worker and the orphan path, and a third-party override on its 1.x path, SPEC-073), and
+`tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's mapped
+verdict and refusal, and an engine child under `MultiSink`, SPEC-075).
 
 ## 8. An event is safe by construction, once, at assembly
 
