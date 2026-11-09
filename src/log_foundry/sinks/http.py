@@ -1870,8 +1870,8 @@ def _positions(
     **It is announced here**, on ``drops``, so only by a run that settles: ``lost <n> event(s);
     <class>, _items returned no item for them; not retried``, where ``n`` is the unplaced events
     beyond the ones ``_items`` counted and announced itself, so no event is announced twice. The
-    engine's settled line used to be its only announcement, and the engine writes that line only
-    for a run in which the sink registers no line of its own, so beside any other sink line the
+    engine's settled line used to be its only announcement, and the engine leaves every loss of a
+    round that registers a line to that round's lines, so beside any other line of the round the
     loss showed in ``log_foundry_counters`` alone. A run that fails writes none of it: its
     catcher announces the batch. Neither ``ACCEPTED`` nor ``DROPPED`` is ever a default for an
     event the sink did not itself drop.
@@ -2447,7 +2447,8 @@ class HTTPSink:
         ``DROPPED`` or ``UNKNOWN`` by hooks that registered no line of their own — a 1.x bool
         ``_handle_response`` returning ``False``, or a third-party ``_outcomes`` or
         ``_abandon_unreduced`` — gets the round's line (:func:`_announce_unlined`), since the
-        engine's settled line is suppressed by any other line in the run. Every shipped hook
+        engine's settled line leaves every loss of a round that registered a line to that round,
+        and one round holds every chunk. Every shipped hook
         announces its own losses, so this adds no line for a shipped class. The key is the chunk,
         not the event: a hook that registers any line while its chunk is handled owns the
         announcement of every loss in that chunk, since a line carries no event identity to

@@ -878,6 +878,31 @@ class RunContext:
                 lines.append(line)
         return owners, lines
 
+    def _lined(self, *, settled: bool, final: int) -> frozenset[int]:
+        """Returns the rounds that registered a line this run will write, as ``_committed`` keeps.
+
+        A round that registers a line owns the announcement of every loss its verdict decided,
+        the round-level form of the HTTP round's chunk key, since a line carries no event
+        identity to count by. A line the run will not write — a ``LAST`` line of a round that
+        was not the last, a ``SETTLED`` one of a failed run — announces nothing, so its round
+        owns nothing.
+
+        Args:
+          settled: Whether the run settled.
+          final: The run's last round.
+
+        Returns:
+          The round numbers.
+
+        Raises:
+          None.
+        """
+        return frozenset(
+            registered
+            for _line, when, registered in self._lines
+            if self._kept(when, registered, settled=settled, final=final)
+        )
+
     def _close(self) -> None:
         """Drops every reference the context holds, so no owner outlives its run here.
 
@@ -1346,9 +1371,18 @@ def _run(
     a round has its own. Each round's number is recorded on it before ``deliver`` is called.
     After the engine's own commit, the counts the sink registered commit through :func:`_commit`
     as the run ended — ``ALWAYS``, ``SETTLED`` for a settled run, ``LAST`` for the final round —
-    and then their lines. A settled run whose sink will write a line of its own gets no engine
-    line, so a loss is never announced twice; that is SPEC-072 FR-003's refinement, which needs
-    this context and is added with it. A ``BaseException`` commits nothing of either.
+    and then their lines. A ``BaseException`` commits nothing of either.
+
+    **The settled line names every loss no sink line covers, and only those.** A round that
+    registers a line the run will write owns the announcement of every loss its verdict decided —
+    an event's loss is decided by the last round it was offered to — so the engine names, by
+    term, each loss decided in a round that registered none, and leaves the rest to the sink's
+    lines. The key is the round, the engine's form of the HTTP round's chunk key, because a line
+    carries no event identity to count against: a round that announces some of its losses owns
+    the rest. An event the sink counted itself (:meth:`RunContext.sink_counted`) or that a
+    refused round decided has its own line and is never in this one. Before, any sink line
+    anywhere in the run silenced the whole settled line, so a loss returned silently in one round
+    went unannounced beside a line another round wrote (invariant 2).
 
     Args:
       sink: The sink, read statically for its idempotence and predicate.
@@ -1382,6 +1416,7 @@ def _run(
         final_of = [False] * total_events
         counted_of = [False] * total_events
         refused_in = [0] * total_events
+        decided_in = [0] * total_events
         refusals: dict[int, Exception] = {}
         pending = list(range(total_events))
         escaped: list[Exception] = []
@@ -1426,6 +1461,8 @@ def _run(
             offered = batch if not attempts else [events[index] for index in pending]
             n = len(pending)
             attempts += 1
+            for index in pending:
+                decided_in[index] = attempts
             context._begin(attempts, last=attempts >= rounds_allowed)
             hint = None
             started = time.monotonic()
@@ -1503,7 +1540,18 @@ def _run(
         owners, lines = context._committed(settled=not delivery.failed, final=attempts, skip=skip)
         shared = [entry for entry in owners if _shares_lock(entry[0], counters)]
         owners = [entry for entry in owners if not _shares_lock(entry[0], counters)]
-        general = unconfirmed - refused_lost + dropped
+        lined = context._lined(settled=not delivery.failed, final=attempts)
+        unlined = [
+            fate[index]
+            for index in range(total_events)
+            if decided_in[index] not in lined and not counted_of[index] and not refused_in[index]
+        ]
+        rejected = sum(1 for one in unlined if one is Outcome.REJECTED)
+        unresolved = sum(1 for one in unlined if one is Outcome.RETRYABLE)
+        raised = sum(1 for one in unlined if one is _RAISED)
+        unknown = sum(1 for one in unlined if one is Outcome.UNKNOWN or one is _UNREAD)
+        unlined_dropped = sum(1 for one in unlined if one is Outcome.DROPPED)
+        general = rejected + unresolved + raised + unknown + unlined_dropped
         refusal_kind = (
             _diag._STR_STR(_diag._STORED_NAME(type(refusals[max(refusals)]))) if refusals else ""
         )
@@ -1514,13 +1562,13 @@ def _run(
                 for owner, counts in shared:
                     for counter, amount in counts.items():
                         ledger.count_for(owner, counter, amount)
-                if not delivery.failed and general and not lines:
+                if not delivery.failed and general:
                     ledger.announce(
                         lambda: _diag.lost(
                             "event",
                             general,
-                            f"rejected {delivery.rejected}, unresolved {delivery.unresolved}, "
-                            f"raised {delivery.raised}, unknown {delivery.unknown}, dropped {dropped} "
+                            f"rejected {rejected}, unresolved {unresolved}, "
+                            f"raised {raised}, unknown {unknown}, dropped {unlined_dropped} "
                             f"after {delivery.attempts} delivery round(s) to {name}",
                         )
                     )
