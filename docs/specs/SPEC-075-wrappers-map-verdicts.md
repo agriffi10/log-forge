@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-075
 title: "Wrappers Map Verdicts; MultiSink Keeps Calling Each Child's emit"
 description: "The filtering, transforming and delegating wrappers offer deliver exactly when the sink they wrap does, map its verdict back to their own batch and count only their own decisions, while MultiSink offers none and keeps calling each child's emit — so a wrapped engine sink is retried and counted as it would be alone."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-017, SPEC-058, SPEC-059, SPEC-066, SPEC-072, SPEC-073, SPEC-074, SPEC-080]
 arc: stability-redesign
 arc_order: 7
@@ -85,6 +85,11 @@ Figures re-measured at `fda134a`, each with its instrument:
 - Prose: the wrapper and `MultiSink` docstrings, `docs/invariants.md` entries 2, 6 and 7,
   `docs/architecture.md` §8's wrapper paragraph, the README's wrapper text and
   `docs/component-inventory.md`.
+- The base `deliver` docstring, on `sinks.base.Sink`, documents the detached-call contract: a
+  direct `deliver` outside any engine run is a single round with no memory of earlier calls, so a
+  caller looping it sees a sink's held or giving-up line on every call and an `SQSSink` FIFO hold
+  is never released, and a caller that wants retries uses `emit_via_deliver` (SPEC-074 handover
+  item 1a; Andrew's call: documentation, no behaviour change).
 - At completion, three changes to the decisions in `docs/decisions/sink-delivery/`:
   - `caller-code-that-fails-for-one-event-costs-only-that-event-a-batch-of-nothing-but-failures-re-raises`
     gains this spec's own dated History line, beside the one SPEC-074 wrote for an `SQSSink` FIFO
@@ -115,13 +120,15 @@ Figures re-measured at `fda134a`, each with its instrument:
   `HTTPSink`'s own chunk mapping is SPEC-073's.
 - **Removing the extra count in `failed` that `MultiSink` makes for an engine child.** It is
   invariant 2's recorded upper bound, and recounting it would reclassify a 1.x count (FR-004).
-- **Declaring a wrapper idempotent**, caching a transform's result across engine rounds, and
-  per-event reasons in a `Verdict`.
+- **Declaring a wrapper idempotent**, and per-event reasons in a `Verdict`.
 - **Third-party wrappers.** They call `inner.emit` and get 1.x behaviour through SPEC-072's
   adapter. This spec changes nothing for them.
 - **The closed-guard helper, lifecycle, owed closes and fork** (SPEC-076 to SPEC-079).
 - **Deleting a test.** No mechanism is removed. The tests this spec edits are the rosters FR-001
-  names; every other test is not edited by this spec.
+  names, `tests/test_sinks_encode.py`'s pin of the public surface each engine sink gained (which
+  gains `LogstashSink`'s new members), and the trigger sets in `tests/test_sink_concurrency.py`
+  that still name SPEC-074's deleted `send_all`, with the docstrings that describe them; every
+  other test is not edited by this spec.
 
 ---
 
@@ -140,8 +147,8 @@ that overrides `emit` stands earlier in the MRO, so the probe does not offer it 
 
 **The offer is fixed at construction.** SPEC-072 reads `log_foundry_counters` statically, so it is
 a plain instance attribute. When `read_deliver(inner)` is not `None`, the constructor sets it to
-**the inner sink's own `SinkCounters` object**, read with `inspect.getattr_static` on the inner
-sink. Otherwise it sets it to `None`. So a wrapper over any of these is never offered, and the
+**the inner sink's own `SinkCounters` object**, read with SPEC-072's static reader
+`sinks.base._static_value` on the inner sink. Otherwise it sets it to `None`. So a wrapper over any of these is never offered, and the
 worker and the orphan path run its 1.x `emit`:
 
 - an emit-only sink;
@@ -177,19 +184,38 @@ inner sink's or `LogstashSink`'s, through `_diag._STR_STR(_diag._STORED_NAME(typ
 holds. Each names `self` or an attribute, not a parameter, so none joins that guard's pinned door
 set.
 
+**The stop signal is readable statically.** The engine reads the run's stop signal with
+`_engine.stop_signal_of`, which uses `_static_value` and so reads a property as no signal. Each of
+the three classes in this spec today keeps `log_foundry_stop_signal` behind a property whose setter
+forwards it to the inner sink or backend, so a wrapper's own rounds would wait out their backoff
+uninterrupted. The forward stays, but the value is stored where the static reader finds it, in the
+instance's own `__dict__`, and nothing is evaluated to read it. `MultiSink` keeps the same forward
+for its children and offers no `deliver`, so the engine never reads its signal.
+
 **The retry budget is copied at construction.** The engine runs its rounds on the wrapper. So when
-the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink as
-plain instance attributes, with an ordinary attribute read (SPEC-074 makes some of them read-only
-properties). One the inner sink lacks, or whose read raises, is not set, and the engine uses its
-default. The copy is a pass-through, not a floor. The engine judges exactness, and SPEC-066's
-guard, which looks for a `max(...)` floor, has nothing to see. A later assignment to the inner
-sink's attribute is not seen.
+the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from the inner sink,
+read with `_static_value` exactly as the engine reads them on the bare inner sink, and stores
+what the engine would read from each — through the engine's own reader for that name, so the two
+cannot drift — where the static reader finds it on the wrapper, or `None` where the engine would
+use its default. So a budget behind a property, a `bool` or any other value the engine reads as
+declaring none is stored as `None`, an exact count is stored floored as the engine floors it, and
+the wrapped sink gets the rounds it gets alone. One the inner sink lacks, or that cannot be read,
+and both names on a wrapper that offers nothing, are stored as `None` too; so a public read never
+returns the descriptor object, nor a value outside its declared type. The floor is the engine's
+reader's, not the wrapper's. A later assignment to the inner sink's attribute is not seen.
+
+**The copied budget is read-only.** `max_retries` and `max_retry_after` are new public names on all
+three classes, so they are exposed as SPEC-074 exposed `max_retries` on `RabbitMQSink`, `SyslogSink`
+and `SocketTransport`: `max_retries` through `sinks._args.ReadOnlyCount`, and `max_retry_after`
+through a sibling descriptor in the same module. Each defines `__set__` and no run-time `__get__`,
+so an assignment raises while an ordinary read and the static reader both find the copied value in
+the instance's own `__dict__`. A writable copy would let an assignment on the wrapper move the
+engine's budget away from the inner sink's, and making it read-only later would break 1.x callers.
 
 **A wrapper declares no idempotence.** It sets no `log_foundry_idempotent` and defines no
-`_retryable_error`, so an `UNKNOWN` or a raising round is never resent through it. A resend would
-re-run the caller's code, and a non-deterministic transform would then send a different event. No
-shipped sink declares idempotence anyway (SPEC-074), so a wrapped shipped sink is resent exactly as
-it is alone.
+`_retryable_error`, so an `UNKNOWN` or a raising round is never resent through it: a resend would
+send again an event that may have landed. No shipped sink declares idempotence anyway (SPEC-074),
+so a wrapped shipped sink is resent exactly as it is alone.
 
 **The rosters these classes stand outside.** SPEC-074's derived roster of engine sinks requires a
 `def emit(self, batch)` whose body is the one call `emit_via_deliver(self, batch)`, `losses()`
@@ -208,9 +234,12 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
       emit-only sink, a sink with `deliver` and no counters, a `MultiSink`, a third-party emit-only
       wrapper and a `__getattr__` proxy, and for a subclass of either wrapper that overrides `emit`.
 - [ ] Over an emit-only inner sink the worker calls the wrapper's `emit`.
-      `tests/test_wrapper_failures.py`, `tests/test_transform_coercion.py`,
-      `tests/test_sinks_compose.py` and `tests/test_multi_absorbed.py` are not edited by this spec
-      and pass.
+      `tests/test_transform_coercion.py`, `tests/test_sinks_compose.py` and
+      `tests/test_multi_absorbed.py` are not edited by this spec and pass.
+      `tests/test_wrapper_failures.py` passes with one edit: its pin of each wrapper's public names
+      gains a named "gained by SPEC-075" set (`deliver`, `log_foundry_counters`, `max_retries`,
+      `max_retry_after`) beside its 1.x set, as `tests/test_sinks_encode.py`'s `ENGINE_GAINED`
+      does; invariant 10 lets the surface grow.
 - [ ] Through a real `Worker` with its default `max_retries=3`, a wrapped always-`RETRYABLE` inner
       sink with `max_retries=2` gets exactly the `deliver` calls the bare inner sink gets: 12, the
       1.x total budget `(2 + 1) × (3 + 1)`. As an orphan `info()` both get 3. An inner sink with no
@@ -219,10 +248,22 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
 - [ ] A hint of `2.5` against the inner sink's `max_retry_after=1.0` waits `1.0`. An inner sink
       that sets `log_foundry_idempotent = True` and answers `UNKNOWN` is not resent through the
       wrapper.
+- [ ] Assigning `max_retries` or `max_retry_after` raises on every shipped class that defines
+      `deliver` beside a 1.x `emit` (derived, not listed: the three in this spec), and
+      `_static_value(wrapper, name)` still returns the inner sink's value. The refusal says the
+      value is copied from the wrapped sink (from the backend, on `LogstashSink`). An inner budget
+      that is a property or a `bool` reads as `None` on the wrapper, and the engine's rounds through
+      the wrapper equal the bare sink's. A third-party subclass
+      of each of the three that assigns `self.max_retries` or `self.max_retry_after` in its own
+      `__init__` raises `AttributeError` (Andrew's call; derived population as above).
 - [ ] A direct `deliver` on a non-offering wrapper raises `TypeError` naming the wrapper's class. An
       inner sink whose counters are replaced after construction makes the next round raise
       `TypeError` naming its type, and the run fails. For an inner sink class whose metaclass
       `__name__` property returns another name, the message carries the stored name.
+- [ ] After the worker sets `log_foundry_stop_signal` on a wrapper that offers `deliver`,
+      `_engine.stop_signal_of(wrapper)` is that event and the inner sink holds it too; setting the
+      event during a wrapped always-`RETRYABLE` run's backoff ends the run well before the backoff
+      would have.
 - [ ] A forked child that finds the shared counters' lock held by a parent thread completes a run
       through the wrapper within 5 s.
 - [ ] SPEC-074's engine-sink roster still finds exactly thirteen classes, and SPEC-070's restated
@@ -254,12 +295,15 @@ failure in the wrapper's `_dropped`, only when the batch did not fail, and repor
 wrapper's unchanged `losses()`. If the wrapper returned `DROPPED`, the engine would commit a
 `dropped_events` total into the shared counters. That total is part of a SPEC-074 sink's
 `losses()`, which the wrapper's `losses()` already adds to its own `_dropped`, so the event would be
-counted twice. So the verdict says `SKIPPED`, which the engine counts nowhere and never resends, and
-which counts as accepted no more than `DROPPED` does. The wrapper registers
+counted twice. So the verdict says `SKIPPED`, which the engine never resends and counts nowhere — except
+in a round it fails as raising (the inner `deliver` raised, or its marks did not fit), where
+SPEC-072's raising-round upper bound counts every event of the round in the shared `failed_events`,
+the wrapper's `SKIPPED` ones included — and which counts as accepted no more than `DROPPED` does. The wrapper registers
 `run_context().count(self, "_dropped", n, when=SETTLED)`, which SPEC-073's run context commits into
 the wrapper, under its own `_counter_lock`, only if the run settles. That is SPEC-058's count, at
-SPEC-058's moment. A declined event is `SKIPPED` with no count, as the wrappers' `losses()`
-docstrings say a declined event is not loss. Neither kind counts as accepted, so with a destination
+SPEC-058's moment. A declined event is `SKIPPED` with no count of the wrapper's, as the wrappers'
+`losses()` docstrings say a declined event is not loss; the raising-round bound above is the
+engine's one exception. Neither kind counts as accepted, so with a destination
 that fails every call a batch holding either still fails (invariant 7).
 
 **An all-failed batch fails at once, and no sink counts it.** This is the arc's one rule for caller
@@ -286,11 +330,45 @@ upper bound. A `BaseException` propagates too.
 
 The wrapper reads `retry_after` only from a verdict that `outcomes_of` accepted, inside an
 `except Exception` that substitutes `None`. So a raising read cannot escape `deliver`, which would
-fail a run that the bare inner sink's run settles. When nothing is forwarded the inner sink is not
-called. `deliver([])` returns an empty verdict.
+fail a run that the bare inner sink's run settles. When the inner verdict is malformed, every count,
+line and mark the inner call registered is discarded, as the engine discards them for the bare
+sink's round it sets aside, while the wrapper's own registrations, made before the call, stay; the
+forwarded events are `UNKNOWN`, and the engine announces them. A direct `deliver` outside any run
+sets nothing aside, since the engine's detached round never does for the bare sink either. When nothing is forwarded the inner
+sink is not called. `deliver([])` returns an empty verdict.
 
-**The engine resends the wrapper's original events.** So on a later round the predicate or function
-runs again, once for each event still to send. That is what the worker's 1.x whole-batch retry did.
+**The inner sink's marks are moved into the wrapper's positions.** SPEC-074 lets a round mark
+positions of the batch it was handed, through `RunContext.final_rejections` (SQS, SNS) and
+`RunContext.sink_counted` (NATS), and the engine checks each mark against the run sink's verdict.
+The run sink is now the wrapper, so after the inner `deliver` returns the wrapper rewrites every mark
+the inner round registered from the inner sink's positions to its own, through the same position
+map it uses for the outcomes. An index outside the forwarded list stays invalid, so a round that
+the bare sink's engine would fail still fails. Without the rewrite, a declined event ahead of a
+marked one shifts the indices and the engine fails a round the bare sink settles.
+
+**The engine resends the wrapper's original events.** On a later round the caller's code is not
+asked again about an event the run already forwarded. `FilteringSink` keeps each forwarded event
+for the life of one engine run, in the run context's notes for the wrapper, keyed by its identity
+with the event held in the entry, and forwards it again without asking the predicate or the level
+floor. A predicate that is not a pure function of the event — one that drops duplicates, limits a
+rate or samples — asked again would decline its own resend, `SKIPPED` and counted nowhere: measured
+behind a dedupe predicate, a real `HTTPSink` answering `503` then `200` made one POST and lost the
+event silently where the `emit` path posted twice; and a predicate raising on the resend charged a
+forwarded event to the inner sink's `failed_events` with a second line. The transform's function
+is not run again either: `TransformSink` keeps each event's forwarded result for the life of one
+engine run, in the run context's notes for the wrapper, keyed by the original event's identity as
+`_encode.encode_round` keys an encoding, with the original event held in the entry so an identity
+cannot be reused within the run. A later round forwards that same object. A fresh copy per round
+would be a stranger to the inner sink's own run notes, which are keyed by identity: measured over a
+FIFO `SQSSink` whose client fails `a` twice and `b` once, a copying transform landed `[b, a]` where
+the bare sink lands `[a, b]`, and a standard queue's abandoned line said "after 1 attempt(s)" where
+the message had made four. Only a forwarded result is kept: a declined or failed event is
+`SKIPPED`, which the engine never resends; so only a forwarded decision is kept. An event object that
+appears twice in one batch shares its one result. The notes end with the run, so the next run of the
+same events asks the predicate and runs the function afresh, and a direct `deliver` outside any run
+is a run of its own. Caller code runs outside any engine run, as on the `emit` path; a `deliver()`
+it calls is its own detached run (`_engine.outside_runs`, routed for the predicate, the function and
+the check of what the function returned).
 
 **`deliver` writes nothing itself.** It enters no `Deferral`, takes no lock and assigns no
 attribute, so calls on the drain thread and on orphan threads share nothing (SPEC-028). Its only
@@ -298,15 +376,19 @@ count is the run-context registration above, and its only other run-context call
 all-failed call. It announces a caller-code failure with one
 `_diag.absorbed` line per call, written at once. The line names the wrapper class, the first
 exception's type and how many events were not forwarded, and never a value. That line is true
-whether or not the run then settles. It is not registered with the run context, because a sink's
-registered line suppresses the engine's own settled line for the whole run (SPEC-073). That would
-leave a third-party inner sink's loss unannounced.
+whether or not the run then settles. It is not registered with the run context, because a round
+that registers a line owns the announcement of every loss its verdict decided (PR 319's per-round
+rule), so the engine would write no settled line for that round's losses. That would leave a
+third-party inner sink's loss unannounced.
 
 **The twin pair.** For a wrapper that offers `deliver`, its `deliver` and its `emit` are twins: the
 second runs whenever a caller or a `MultiSink` calls `emit`. On the same batch and the same inner
 behaviour they forward the same events and end with the same `losses().dropped`, the same inner
-attributes and the same catcher term. `failed` is excluded from the comparison: it is the upper
-bound, and the two paths reach it by different counts.
+attributes and the same catcher term — a stateful predicate included, since neither path asks it
+again about an event it forwarded. `failed` is excluded from the comparison: it is the upper
+bound, and the two paths reach it by different counts. One exception: the same event object twice
+in one batch shares one predicate decision, or one transform result, on the `deliver` path, where
+`emit` asks per occurrence. A batch the library builds never repeats an identity.
 
 #### Acceptance Criteria:
 
@@ -326,8 +408,30 @@ bound, and the two paths reach it by different counts.
       `[SKIPPED, SKIPPED, SKIPPED, inner's outcome]` and settles with `_dropped == 2`. The forwarded
       event is the coerced result `tests/test_transform_coercion.py` expects.
 - [ ] Indices: over `[a declined, b, c raising, d]`, an inner verdict `[RETRYABLE, ACCEPTED]` maps
-      to `[SKIPPED, RETRYABLE, SKIPPED, ACCEPTED]`. Round two gives the wrapper exactly `[b]`, and
-      the transform's function runs once more, for `b` alone.
+      to `[SKIPPED, RETRYABLE, SKIPPED, ACCEPTED]`. Round two gives the wrapper exactly `[b]`. The
+      predicate is not asked again about `b`; the transform's function is not run again, and the
+      inner sink is handed the same object round one forwarded.
+- [ ] Caller code that delivers an event to another sink directly (`alerts.deliver([event])`, a
+      sender-fault `SQSSink`) runs as its own detached run through both wrappers, on the worker
+      path and the orphan path: `failed_batches == 0` (no orphan loss), `losses().failed == 0`, the
+      alert's own line written once, equal to the `emit` path; a retryable alert's giving-up line is
+      written likewise. A wrapper nested in a wrapper still delegates inside the one run. An AST
+      check holds every call of a stored caller callable to the helper.
+- [ ] A predicate is asked once per event per run however many rounds the run makes, and afresh on
+      the next run. Behind a dedupe predicate, a real `HTTPSink` answering `503` then `200` under a
+      `Worker` makes exactly 2 POSTs with nothing counted and no loss line, through `deliver` as
+      through the `emit` path; a predicate letting two calls through delivers both events of a
+      batch whose second is `RETRYABLE` once. A predicate that would raise if asked again is never
+      asked: the event is retried and delivered, nothing is charged to the inner sink's `failed` or
+      the wrapper's `_dropped`, and no line is written; one raising on an event in round 1 still
+      gives `_dropped == 1` and one `absorbed` line.
+- [ ] A copying transform's function runs once per event per run however many rounds the run
+      makes, each round forwarding the same objects; a second run of the same events, and a direct
+      `deliver`, run it afresh. A declined or failed result is not kept.
+- [ ] Through a copying `TransformSink`, a FIFO `SQSSink` whose client fails `a` twice and `b` once
+      lands `[a, b]` in as many client calls as the bare sink. Over a standard queue failing every
+      entry retryably with `max_retries=3`, the abandoned line equals the bare sink's and says
+      "after 4 attempt(s)"; over a FIFO queue the lines equal the bare sink's.
 - [ ] Over a real `HTTPSink` (a stub opener), `[ok, oversized]` gives
       `wrapper.losses() == bare.losses()`, both `dropped == 1`, against a bare `HTTPSink` given the
       same batch. An always-`500` destination with `max_retries=1` under a `Worker` with
@@ -337,6 +441,12 @@ bound, and the two paths reach it by different counts.
       `wrapper.losses() == bare.losses()`, both `dropped == 1`. A batch whose every entry fails
       retryably gives the same number of client calls, equal `losses()` and equal `failed_batches`
       through the wrapper and bare.
+- [ ] Through each of the two wrappers, a predicate or function that declines the first event, over a
+      real `SQSSink` whose client rejects every entry with `SenderFault: True`, ends exactly as the
+      bare sink given only the forwarded events: the same settled-or-failed result, equal `failed`,
+      no extra stderr line; the `SQSSink` run settles. The same holds over a `NATSSink` whose
+      publish counts are marked (`sink_counted`). Removing the rewrite reddens both. An inner mark
+      outside the forwarded list stays out of range, so the round fails as the bare sink's does.
 - [ ] An inner sink raising `ConnectionRefusedError("secret")` propagates out of the wrapper's
       `deliver` by identity. Through the engine, the run fails with the same `failed_batches` as
       the bare inner sink's, and stderr does not contain `secret`.
@@ -344,7 +454,12 @@ bound, and the two paths reach it by different counts.
       outcomes, and lets the run settle: a returned `None`, a `dict`, a verdict one outcome short,
       a bare-string outcome, and a `Verdict` subclass whose `outcomes` raises. A verdict whose
       `retry_after` raises when read gives `retry_after=None` with nothing escaping. A
-      `KeyboardInterrupt` propagates by identity.
+      `KeyboardInterrupt` propagates by identity. An inner sink that counts and announces in its
+      round and then returns a malformed verdict ends, through either wrapper, with its counters
+      and stderr equal to the bare sink's apart from the sink's name — its own count and line
+      discarded, the engine's settled line written — and the wrapper's own `_dropped` count for a
+      caller-code failure in that round survives. A direct `deliver` of the same keeps the inner
+      sink's count and line through either wrapper, as the bare sink's detached round does.
 - [ ] A call with caller-code failures writes exactly one stderr line, which contains
       `absorbed a failure`, the wrapper's class name and the exception's type name, and does not
       contain the exception's message.
@@ -371,13 +486,18 @@ bound, and the two paths reach it by different counts.
 `LogstashSink` decides nothing per event in either mode. Its `emit` is the backend's `emit` (HTTP,
 and socket mode after SPEC-074), so it is a **pure delegate**. Like the wrappers, it defines
 `deliver` and `emit` in its own class body. Its backend is `self._http` in HTTP mode and
-`self._socket`, SPEC-074's engine `SocketTransport`, in socket mode. When `read_deliver(backend)` is
-not `None` at construction:
+`self._socket`, SPEC-074's engine `SocketTransport`, in socket mode. The transport defines `deliver`
+and deliberately no `emit`, so SPEC-072's probe, which needs some class to define `emit`, returns
+`None` for it. Socket mode therefore offers whenever the transport's `log_foundry_counters` is
+exactly a `SinkCounters` at construction, and calls `self._socket.deliver` directly, as `SyslogSink`
+does over the same transport. In HTTP mode the backend is a sink the probe judges, and it offers when
+`read_deliver(backend)` is not `None` at construction. When it offers:
 
 - its `log_foundry_counters` attribute is **the backend's own `SinkCounters` object**, read
   statically;
-- its `deliver` takes `read_deliver(backend)` on each call and returns that `deliver`'s verdict, the
-  same object, unmapped;
+- its `deliver` takes the backend's `deliver` on each call (`read_deliver(self._http)` in HTTP mode,
+  the transport's own `deliver` in socket mode) and returns that `deliver`'s verdict, the same
+  object, unmapped;
 - it copies `max_retries` and `max_retry_after` from the backend, as FR-001 describes, and declares
   no idempotence.
 
@@ -404,6 +524,9 @@ inside SPEC-062's per-round prediction, where 1.x saw one `emit`. SPEC-074 leave
 - [ ] Socket mode, against a peer that refuses every connect and then one that takes everything:
       `LogstashSink(host=..., port=...)` and `SyslogSink` on the same transport settings end with
       equal `losses()` and `failed_batches`, and `logstash.losses() == logstash._socket.losses()`.
+- [ ] Socket mode through a `Worker` with its default `max_retries`, against a peer that refuses
+      every connect, counts each of 2 events once: `logstash.failed == 2`, where 1.x and SPEC-074
+      count them once per worker attempt (`2 × 4 == 8` under the default `max_retries=3`).
 - [ ] Socket mode under `shutdown(timeout=0.9)` against a refusing peer with a 0.5 s connect
       timeout makes the number of rounds SPEC-062's prediction allows for the bare transport.
 - [ ] Serves invariants 2, 3 and 6: a delegated run is counted once, on the backend, a socket-mode
@@ -483,8 +606,8 @@ No new type. The members each of the three classes gains, all set at constructio
 
 ```
 log_foundry_counters: SinkCounters | None   # the inner sink's / backend's own object, or None
-max_retries: int                            # copied from the inner sink when it has one
-max_retry_after: float                      # copied from the inner sink when it has one
+max_retries: int | None                     # what the engine reads off the inner sink, else None; read-only
+max_retry_after: float | None               # what the engine reads off the inner sink, else None; read-only
 # no log_foundry_idempotent, no _retryable_error
 ```
 
@@ -583,3 +706,52 @@ tests/
   this spec adds names its type through `_diag._STORED_NAME`, so SPEC-071 FR-005's guard holds. None
   is one of that guard's doors, since each names `self` or an attribute.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-09, at build start, folding in the items SPEC-072 and SPEC-074 handed to this spec: the
+  static read names `sinks.base._static_value`, not `inspect.getattr_static` (SPEC-072 replaced the
+  latter because it runs a metaclass's `__eq__` and `__hash__`); the wrappers' stop signal is stored
+  where that reader finds it, since a property reads as no signal (FR-001); and socket-mode
+  `LogstashSink` counting each event once on the worker path, a consequence of FR-003's delegation
+  that SPEC-074 recorded as owed here, gains its own criterion.
+- 2026-11-09, from the plan: `SocketTransport` defines no `emit`, so the probe never offers it and
+  socket-mode `LogstashSink` offers on the transport's counters instead, as `SyslogSink` does
+  (FR-003). The budget is copied with `_static_value`, not an ordinary read: SPEC-074 exposed
+  `max_retries` through a set-only descriptor, not a property, and an ordinary read of a
+  third-party property would give the wrapper rounds the bare sink never gets. The edited tests now
+  name the public-surface pin and the dead `send_all` trigger sets.
+- 2026-11-09, Andrew's call: the copied `max_retries` and `max_retry_after` are read-only on all
+  three classes (FR-001, Data Model), following SPEC-074's `ReadOnlyCount`, rather than writable as
+  first drafted. The wrapper-rule decision and the 1.2.0 release notes name them.
+- 2026-11-09, from the plan review, which ran each case: the inner sink's run-context marks are
+  rewritten into the wrapper's positions (FR-002), since an unmoved mark failed a run the bare `SQSSink`
+  settles; `tests/test_wrapper_failures.py`'s public-name pin gains a named SPEC-075 set rather than
+  staying unedited, since any `deliver` on the class reddens it; a budget not copied is stored as
+  `None`, so a read never returns the read-only descriptor.
+- 2026-11-09, Andrew's call on the build's held question: `TransformSink` keeps each event's
+  forwarded result for one engine run and forwards the same object on every round (FR-002), since a
+  fresh copy per round broke a FIFO `SQSSink`'s order and its attempt-count line. The Out of Scope
+  line excluding that cache is removed; the index criterion now says the function is not run again,
+  and two criteria hold the cache and the twins. Also his call: a third-party subclass that assigns
+  `self.max_retries` or `self.max_retry_after` now raises `AttributeError`, pinned by a criterion
+  (FR-001).
+- 2026-11-09, Andrew's call on SPEC-074 handover item 1a: the detached-call contract of a direct
+  `deliver` is documented in the base `deliver` docstring, with no behaviour change (Scope).
+- 2026-11-09, from the frame-1 diff review: the copied budget is what the engine reads off the inner
+  sink, through the engine's own reader, or `None` — never a property object or a `bool` (FR-001);
+  the refusal names where the value is copied from; an out-of-range inner mark stays invalid
+  (FR-002); the marks criterion says "ends exactly as" the bare sink, since the bare `NATSSink`
+  run fails.
+- 2026-11-09, from PR 319's set-aside rewind: a malformed inner verdict discards what the inner
+  call registered, as the engine discards a bare sink's set-aside round, keeping the wrapper's own
+  registrations (FR-002).
+- 2026-11-09, frame-2 review; Andrew's call: `FilteringSink` keeps each forwarded event's predicate
+  decision for one engine run, as `TransformSink` keeps its results, so a resend never asks the
+  predicate again (FR-002): a stateful predicate asked again declined its own resend and lost the
+  event silently.
+- 2026-11-09, frame-2 review, the minor findings: the set-aside of a malformed inner round applies
+  only inside an engine run, as the detached round never sets one aside bare (FR-002); the line
+  rule is PR 319's per-round ownership, not a whole-run suppression; a `SKIPPED` event is counted
+  nowhere except under SPEC-072's raising-round upper bound.
+- 2026-11-09, frame-3 review: caller code — the predicate, the transform's function and the check
+  of its result — runs outside any engine run through `_engine.outside_runs`, so a `deliver()` it
+  calls on another sink is its own detached run rather than folded into the wrapper's round
+  (FR-002), held by an AST check; the twin claim names the repeated-identity exception.

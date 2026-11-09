@@ -205,6 +205,17 @@ class Sink(Protocol):
     ``log_foundry.sinks.verdict`` — which runs the same engine inline and raises when the
     run fails, so a wrapper calling ``inner.emit(batch)`` sees what a 1.x ``emit`` showed it.
     **A ``deliver`` must not call its own ``emit``**, and must not mutate the list it is given.
+
+    **A direct ``deliver`` call outside any engine run is a single round with no memory of
+    earlier calls** (SPEC-074 handover item 1a, SPEC-075). It is a detached run of its own: the
+    run context it counts into is new and ends with the call, so what an earlier call sent or
+    held is forgotten, and the round is its own last for every count and line it registers. A
+    caller that loops it therefore sees a sink's held line or giving-up line on every call — an
+    ``SQSSink`` writes "still failing after 1 attempt(s)" each time — and an ``SQSSink`` FIFO
+    hold is not released at the end, because only a run's budgeted last round sends what is
+    held, and a detached round is never one. A caller that wants retries should use
+    ``emit_via_deliver``, which runs the engine over the sink's own budget, keeps the counts
+    across its rounds and sends held events in the run's last round.
     """
 
     @abstractmethod

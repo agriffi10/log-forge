@@ -53,11 +53,16 @@ ENGINE_SINKS = frozenset(
 )
 FLOOR = 13
 
+_WRAPPER_REASON = (
+    "SPEC-075's wrapper: its emit is a 1.x body, its losses() is a 1.x formula, and its deliver "
+    "catches nothing"
+)
+
 EXCLUSIONS: dict[str, str] = {
     "HTTPSink": "the HTTP family is SPEC-073's, its emit runs the engine over _round",
-    "FilteringSink": "SPEC-075's wrapper, named for when it gains deliver",
-    "TransformSink": "SPEC-075's wrapper, named for when it gains deliver",
-    "LogstashSink": "SPEC-075's wrapper, named for when it gains deliver",
+    "FilteringSink": _WRAPPER_REASON,
+    "TransformSink": _WRAPPER_REASON,
+    "LogstashSink": _WRAPPER_REASON,
 }
 """Classes defining ``deliver`` the roster passes over, each with its reason."""
 
@@ -190,6 +195,25 @@ def test_the_engine_sinks_are_the_thirteen() -> None:
     found, findings = engine_sink_findings(SINKS)
     assert findings == [], "\n".join(findings)
     assert found == ENGINE_SINKS
+
+
+@pytest.mark.parametrize("wrapper", ["FilteringSink", "TransformSink", "LogstashSink"])
+def test_removing_a_wrapper_exclusion_reddens_naming_it(
+    wrapper: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC-075 FR-001: each wrapper now defines ``deliver``, so its exclusion is load-bearing.
+
+    Before SPEC-075 no wrapper defined ``deliver`` and removing the entry changed nothing; now the
+    roster finds the class and names its 1.x ``emit``, and with every exclusion in place the
+    population is still exactly the thirteen.
+    """
+    monkeypatch.delitem(EXCLUSIONS, wrapper)
+    found, findings = engine_sink_findings(SINKS)
+    assert wrapper in found
+    assert any(
+        wrapper in f and "emit's body is not the one call emit_via_deliver(self, batch)" in f
+        for f in findings
+    ), findings
 
 
 _GOOD = '''

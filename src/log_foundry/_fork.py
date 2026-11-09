@@ -10,7 +10,7 @@ import types
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
-from log_foundry.sinks.base import _static_value
+from log_foundry.sinks.base import _class_member, _instance_dict, _static_value
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -319,12 +319,48 @@ def _slot_value(holder: object, name: str) -> Any | None:
         return None
 
 
+def _set_only_dict(holder: object, name: str) -> dict[str, object] | None:
+    """Returns the instance's own ``__dict__`` when its class member ``name`` is set-only.
+
+    A set-only descriptor defines ``__set__`` and no ``__get__``, so CPython and the static
+    reader read the instance's ``__dict__`` past it, and the ``__dict__`` entry is the value.
+    Every lookup is static (``_class_member``, ``_instance_dict``), so no hook of the holder or
+    its class runs.
+
+    Args:
+      holder: An instance the walk reached.
+      name: The attribute about to be rebound.
+
+    Returns:
+      The instance ``__dict__``, or ``None`` when the member is anything else, or nothing, or
+      cannot be read.
+
+    Raises:
+      None.
+    """
+    try:
+        found = _class_member(type(holder), name)
+        if found is None:
+            return None
+        kind = type(found[0])
+        if _class_member(kind, "__get__") is not None or _class_member(kind, "__set__") is None:
+            return None
+        return _instance_dict(holder)
+    except Exception:
+        return None
+
+
 def _assign(holder: Any, name: str, value: Any) -> None:
     """Puts a fresh primitive where the dead one was.
 
     Instances are written through ``object.__setattr__`` so a frozen dataclass or a custom
     ``__setattr__`` cannot refuse the repair; modules and classes take the ordinary path,
-    which is the only one they have.
+    which is the only one they have. One instance case is written straight into its own
+    ``__dict__`` instead: a name whose class member is a set-only descriptor
+    (:func:`_set_only_dict`), because ``object.__setattr__`` would run that descriptor's
+    ``__set__`` — SPEC-075's wrappers forward their stop signal there, to a sink whose setter
+    may take a lock this walk has not replaced yet — while the value it stores is the one in the
+    ``__dict__``, which every read finds.
 
     Args:
       holder: The module, class or instance carrying the attribute.
@@ -342,6 +378,8 @@ def _assign(holder: Any, name: str, value: Any) -> None:
     try:
         if isinstance(holder, types.ModuleType | type):
             setattr(holder, name, value)
+        elif (own := _set_only_dict(holder, name)) is not None:
+            own[name] = value
         else:
             object.__setattr__(holder, name, value)
     except Exception as exc:

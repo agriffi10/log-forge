@@ -630,7 +630,7 @@ def _base_names(cls: ast.ClassDef) -> list[str]:
 
 
 def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.ClassDef]]:
-    """Returns every class in ``sinks/`` defining ``deliver``, ``emit``, ``send_all`` or ``close``.
+    """Returns every class in ``sinks/`` defining ``deliver``, ``emit`` or ``close``.
 
     ``deliver`` joined the set with SPEC-074: an engine sink's I/O moved out of ``emit``, which
     only calls the adapter, so a lock entered in ``deliver`` and the helpers it calls is what the
@@ -702,7 +702,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
             current = queue.pop()
             if any(
                 isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-                and m.name in ("deliver", "emit", "send_all", "close")
+                and m.name in ("deliver", "emit", "close")
                 for m in current.body
             ):
                 return True
@@ -715,7 +715,7 @@ def _sink_classes_with_an_emit(root: Path | None = None) -> list[tuple[str, ast.
     def _owns_delivery(cls: ast.ClassDef) -> bool:
         return any(
             isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
-            and m.name in ("deliver", "emit", "send_all", "close")
+            and m.name in ("deliver", "emit", "close")
             for m in cls.body
         )
 
@@ -845,7 +845,7 @@ def test_every_driver_backed_sink_records_a_concurrency_decision() -> None:
         }
         # A class inheriting its emit has no body to inspect: it runs its ancestor's, which is
         # judged on its own account, and `_decision_doc` lets it answer from that ancestor.
-        emit = helpers.get("deliver") or helpers.get("emit") or helpers.get("send_all")
+        emit = helpers.get("deliver") or helpers.get("emit")
         if emit is not None and _takes_the_transport_lock(emit, helpers, {emit.name}):
             continue
         # Whitespace-normalized, and including any ancestor whose emit/close this class runs.
@@ -1358,7 +1358,7 @@ def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
     helpers = {
         m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
     }
-    entry = helpers.get("deliver") or helpers.get("emit") or helpers.get("send_all")
+    entry = helpers.get("deliver") or helpers.get("emit")
     if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
         return "it takes a transport lock in emit, so it holds state a close releases"
     for node in ast.walk(cls):

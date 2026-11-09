@@ -194,7 +194,9 @@ def derive(
     its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. So are the two other routes an
     engine sink's ``emit`` takes (SPEC-074): ``emit_via_deliver(self, batch)`` with no
     ``deliver=`` reaches the class's own ``deliver``, and ``_engine.one_round(self._round, batch)``
-    its round. A class whose ``__init__`` builds a ``SocketTransport(..., frame=<f>)`` hands the
+    its round. ``_engine.outside_runs(f, …)`` reaches ``f`` too, since SPEC-075 routes a wrapper's
+    caller code through it (``TransformSink._apply`` hands it ``_json_safe``). A class whose
+    ``__init__`` builds a ``SocketTransport(..., frame=<f>)`` hands the
     transport its frame function, which the transport's round runs through ``encode_round``
     (``test_the_socket_transport_frames_through_encode_round`` holds that half), so its
     ``emit_via_deliver(self._socket, …)`` or ``self._socket.deliver(…)`` reaches ``<f>`` guarded
@@ -245,7 +247,7 @@ def derive(
                         )
                 elif socket_frame is not None and _hands_to_the_socket(node, callee):
                     stack.append((socket_frame, True))
-                elif callee is _engine.one_round and node.args:
+                elif (callee is _engine.one_round or callee is _engine.outside_runs) and node.args:
                     handed = _resolve(node.args[0], fn, cls)
                     if inspect.isfunction(handed):
                         stack.append((handed, guarded))

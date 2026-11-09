@@ -812,10 +812,14 @@ ENGINE_GAINED: dict[str, frozenset[str]] = {
 ENGINE_GAINED["RabbitMQSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
 ENGINE_GAINED["SyslogSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
 ENGINE_GAINED["SocketTransport"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+ENGINE_GAINED["LogstashSink"] = frozenset(
+    {"deliver", "log_foundry_counters", "max_retries", "max_retry_after"}
+)
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
 ``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
-(invariant 10), so a name appearing beyond these is still a finding.
+(invariant 10), so a name appearing beyond these is still a finding. ``LogstashSink``'s entry is
+SPEC-075 FR-003's: it delegates ``deliver`` and copies its backend's budget, read-only.
 """
 ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
 """SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""

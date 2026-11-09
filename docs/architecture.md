@@ -522,6 +522,30 @@ exception only when the sink's `_retryable_error` accepts it. The fork repair re
 shipped sink defines `deliver` at SPEC-072. The decisions are *A raising `emit` counts nothing,
 nor does a `deliver`* and *A sink may report per event* in `docs/decisions/sink-delivery/`.
 
+**A wrapper stands on the engine when what it wraps does** (SPEC-075). `FilteringSink`,
+`TransformSink` and `LogstashSink` offer `deliver` exactly when their inner sink or backend offers
+it: socket-mode `LogstashSink` offers on the `SocketTransport`'s counters, as `SyslogSink` does,
+because the transport defines no `emit` for the probe to judge. An offering wrapper holds the
+inner sink's own `SinkCounters`, so the engine's totals for a run through it land where the bare
+sink's would. It copies the inner sink's `max_retries` and `max_retry_after` at construction, as
+the engine reads them, into new public read-only names, and stores its stop signal where the
+engine's static reader finds it while still forwarding it. So the worker runs one engine loop
+with the wrapped sink's own budget, where it used to run its whole-batch loop around the inner
+sink's inline engine. `FilteringSink` and `TransformSink` map the inner verdict back to their own
+indices and count only their own decisions: a declined event is `SKIPPED`, a caller-code failure is
+`SKIPPED` and counted on the wrapper's `_dropped` `SETTLED`, and a call whose every event failed is
+`REJECTED` with the refusal marker. `RunContext.delegate` moves the inner round's marks into the
+wrapper's positions, and for a malformed inner verdict inside a run sets aside what the inner
+call registered, as the engine does for a bare sink. Caller code runs once per event per run:
+`TransformSink` keeps each event's result and `FilteringSink` each forwarded event's decision, so a
+later round forwards the same object without asking the function or the predicate again. `LogstashSink` returns its backend's verdict unmapped. No wrapper
+declares idempotence or calls its inner sink's `emit` from `deliver`, and each wrapper's own `emit`
+keeps its 1.x body. `MultiSink` offers no `deliver`: it cannot give one verdict for an event one
+child took and another refused, so it keeps calling each child's `emit`, and an engine child's
+rounds run inside that one call. A failed engine child's events land in its own `failed` and again
+in `MultiSink`'s absorbed count, invariant 2's recorded upper bound. The decision is *A wrapper
+offers `deliver` exactly when what it wraps does, and counts only its own decisions*.
+
 Planned implementations:
 
 - **`StdoutSink`** — JSON lines to stdout. The **default**; zero-dependency, great for

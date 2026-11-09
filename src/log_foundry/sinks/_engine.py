@@ -171,9 +171,30 @@ def _count(value: object) -> int:
     Raises:
       None.
     """
+    found = declared_count(value)
+    return 0 if found is None else found
+
+
+def declared_count(value: object) -> int | None:
+    """Reads a retry count the way :func:`_count` does, keeping "declared none" as ``None``.
+
+    The one exactness rule for ``max_retries``: an exact ``int``, floored at zero, else
+    ``None``. :func:`_count` reads ``None`` as zero; SPEC-075's wrappers store it as found, so
+    the budget they copy is what the engine would read off the wrapped sink and cannot drift
+    from it.
+
+    Args:
+      value: A ``max_retries`` as read statically.
+
+    Returns:
+      The floored count, or ``None`` when ``value`` is not an exact ``int``.
+
+    Raises:
+      None.
+    """
     if type(value) is int:
         return max(value, 0)
-    return 0
+    return None
 
 
 def _seconds(value: object) -> float | None:
@@ -405,6 +426,27 @@ class _Marks(NamedTuple):
     final: tuple[object, ...]
     refused: Exception | None
     counted: tuple[object, ...]
+
+
+def _moved(index: object, positions: Sequence[int]) -> object:
+    """Moves one wrapped sink's mark into its wrapper's positions, keeping an invalid one invalid.
+
+    Args:
+      index: The mark as the wrapped sink registered it.
+      positions: For each forwarded event, its index in the wrapper's batch.
+
+    Returns:
+      ``positions[index]`` for an exact ``int`` in range; a non-``int`` as given; else ``-1``,
+      which no verdict accepts.
+
+    Raises:
+      None.
+    """
+    if type(index) is not int:
+        return index
+    if 0 <= index < len(positions):
+        return positions[index]
+    return -1
 
 
 class RunContext:
@@ -700,6 +742,81 @@ class RunContext:
         """
         if not self._immediate:
             self._counted.extend(indices)
+
+    def delegate(
+        self,
+        deliver: Callable[[list[dict[str, object]]], object],
+        forwarded: list[dict[str, object]],
+        positions: Sequence[int],
+    ) -> tuple[object, tuple[Outcome, ...] | None]:
+        """Runs a wrapped sink's round for a wrapper, moving its marks into the wrapper's positions.
+
+        A round marks positions of the batch it was handed (:meth:`final_rejections`,
+        :meth:`sink_counted`), and the engine checks each mark against the verdict of the run's
+        own sink. When a wrapper forwards part of its batch, the run's sink is the wrapper and
+        the marked positions are the wrapped sink's, so every mark the call registers is
+        rewritten through ``positions`` before the wrapper builds its verdict (SPEC-075 FR-002):
+        the wrapped sink's index ``i`` becomes ``positions[i]``. An index that is not an exact
+        ``int`` in range of ``positions`` stays invalid — a non-``int`` as given, any other as
+        ``-1`` — so a round the bare sink's engine would fail still fails. Nothing is rewritten
+        when the call raises: the engine then fails the round's events whatever its marks say.
+
+        **A malformed verdict sets the call's registrations aside**, as the engine sets aside a
+        bare sink's round whose verdict it cannot read (PR 319): every count, line and mark the
+        call registered since just before it is discarded. The wrapper turns the forwarded events
+        ``UNKNOWN`` in a verdict of its own that the engine can read, so without this the
+        wrapped sink's own count and line would survive, and its line would claim the round's
+        announcement, where the bare sink's engine counts nothing of it and announces the
+        events itself. Only the call's registrations go: the wrapper's own, made before it, stay.
+        Only inside an engine run, though: a detached round — a direct ``deliver`` outside any
+        run — never sets an unreadable round aside for the bare sink, whose count and line then
+        commit, so a wrapper's detached round keeps the call's registrations too. The verdict is
+        judged here, once, with ``outcomes_of``, and the judgement returned, so the wrapper maps
+        the very outcomes this judged. An immediate context keeps no marks and has committed each
+        registration already, so it only calls and judges.
+
+        Args:
+          deliver: The wrapped sink's bound ``deliver``.
+          forwarded: The events the wrapper forwards, in its own order.
+          positions: For each forwarded event, its index in the wrapper's batch.
+
+        Returns:
+          What ``deliver`` returned, and its outcomes when ``outcomes_of`` accepts it for the
+          forwarded events, else ``None``.
+
+        Raises:
+          Exception: Whatever ``deliver`` raises, unchanged.
+          BaseException: Whatever ``deliver`` raises that is not an ``Exception``.
+        """
+        mark = self._mark()
+        verdict = deliver(forwarded)
+        found = outcomes_of(verdict, len(forwarded))
+        if found is None:
+            if self._in_run():
+                self._rewind(mark)
+            return verdict, None
+        final, counted = mark[2], mark[3]
+        self._final[final:] = [_moved(index, positions) for index in self._final[final:]]
+        self._counted[counted:] = [_moved(index, positions) for index in self._counted[counted:]]
+        return verdict, found
+
+    def _in_run(self) -> bool:
+        """Whether this context is an engine run's, the only kind that sets a round aside.
+
+        ``_run`` records its sink's idempotence on its context before the first round
+        (:meth:`_run_sink_resends`); a detached or an immediate context has no run sink, as
+        :meth:`resends_unknown` says, and never records one.
+
+        Args:
+          None.
+
+        Returns:
+          True inside ``_run``.
+
+        Raises:
+          None.
+        """
+        return self._resends_unknown is not None
 
     def _marks(self) -> _Marks:
         """Returns the marks the round in progress registered, unvalidated.
@@ -1047,6 +1164,39 @@ A ``ContextVar`` rather than a thread-local, so an asyncio task, a thread and a 
 another run's round each see only their own; a new thread starts empty. ``_run`` pushes and pops
 it in a ``finally``, and each context is cleared when its run ends.
 """
+
+
+def outside_runs[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Runs caller-supplied code as if no engine run were in progress, as the ``emit`` path does.
+
+    A wrapper's per-event step — ``FilteringSink``'s predicate, ``TransformSink``'s function and
+    the check of what it returned — runs inside the wrapper's engine run on the ``deliver`` path,
+    where on the ``emit`` path it ran outside any. Caller code may call another sink's
+    ``deliver`` directly, which the ``Sink`` contract documents as a detached run of its own; seen
+    from inside the wrapper's run, :func:`one_round` would fold that call into the wrapper's
+    round, so the other sink's counts, lines and marks landed there, a mark fitted no position
+    and failed the round, and its loss line could be rewound unwritten (SPEC-075 FR-002, the
+    frame-3 review). So the calling context's run stack is emptied for the call and restored by
+    token in a ``finally``, whatever the call raises: the caller's code sees no run, and a
+    ``deliver`` it calls is detached. Only caller code goes through this; a wrapper's call of its
+    inner sink's ``deliver`` stays inside the run.
+
+    Args:
+      fn: The caller's callable.
+      *args: Its positional arguments.
+      **kwargs: Its keyword arguments.
+
+    Returns:
+      What ``fn`` returned.
+
+    Raises:
+      BaseException: Whatever ``fn`` raises, unchanged, after the run stack is restored.
+    """
+    token = _RUNS.set(())
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _RUNS.reset(token)
 
 
 def run_context() -> RunContext:

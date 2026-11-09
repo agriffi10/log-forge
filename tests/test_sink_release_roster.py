@@ -15,9 +15,9 @@ several driver closes, which is why the call expression alone cannot decide it.
 
 **"Names a sink type" is `Sink` or a class in `test_sink_concurrency`'s roster that defines or
 inherits an `emit`**, and that last clause is a correction to the criterion as written. That
-roster's trigger set is `deliver` *or* `emit` *or* `send_all` *or* `close`, because the lock and
+roster's trigger set is `deliver` *or* `emit` *or* `close`, because the lock and
 post-close decisions it enforces apply to a transport as much as to a sink -- so it contains
-`SocketTransport`, which has `deliver` (since SPEC-074; `send_all` before) and `close` and no
+`SocketTransport`, which has `deliver` and `close` and no
 `emit`. Without the clause this lint
 claims `LogstashSink`'s and `SyslogSink`'s socket closes, taking the roster to ten; both are
 transports the sink built and owns outright, which no sink-ownership record describes and which
