@@ -15,8 +15,8 @@ structural answer is ``conftest.release_after_clock`` and ``conftest.DelayArmedO
 ``x <= d``, ``x < d``). A duration is ``<clock>() - <name>``, a name assigned from one, a value
 returned at a fixed position by a function whose ``return`` is one (``_timed`` in the NATS tests),
 or ``watch.elapsed`` on a stopwatch from ``release_after_clock`` or ``Stopwatch()``. The clock a
-floor is measured against is the last ``<name> = <clock>()`` before it, the call to the
-duration-returning function, or the stopwatch's ``with`` line.
+floor is measured against is the last ``<name> = <clock>()`` before it (an annotated or a tuple
+assignment counts), the call to the duration-returning function, or the stopwatch's ``with`` line.
 
 **What it refuses, each with its own reason:**
 
@@ -30,18 +30,32 @@ duration-returning function, or the stopwatch's ``with`` line.
 - :data:`SLEEP_AFTER_SIGNAL`: a floor on a raw clock, in a test that waits on a fake's ``E.wait()``
   before that clock, where the test names a class (or a subclass of one) whose method sets
   ``self.E`` and later sleeps. The sleep is then already running when the clock starts. The PR 314
-  closer shape. A floor read from ``release_after_clock`` is exempt: the delay it measures is the
-  helper's release, armed after its clock by construction.
+  closer shape. A floor read from ``release_after_clock(seconds, <x>.R.set)`` is exempt when a
+  class the test names waits on ``self.R``: the delay is then the helper's release, armed after
+  its clock by construction. A helper that releases an event no named class waits on is not.
+- :data:`UNRESOLVED_CLOCK`: a floor whose clock the scan cannot find, such as one started on an
+  attribute (``self.began``) or in a walrus. Refused rather than skipped, because a floor the gate
+  counts but cannot judge would read as guarded.
 
-**What it does not see, recorded rather than chased:** control flow (order is by line, so a
-timer armed in an earlier loop iteration or a callee is invisible); a delay armed in a helper
-function or a fixture the test calls before its clock; a fake's sleep started by anything other
-than an entry signal the test waited for, such as a worker's flush interval starting a sleeping
-``emit`` before ``flush`` is called (PR 314's ``numeric_doors`` shape, which only the helper
-prevents); a duration that crosses a function boundary other than through a returned value, or is
-unpacked by a ``for`` loop; a clock started on an attribute (``self.began``) rather than a local
-name; and a thread whose target sleeps. Each is a reason to use ``release_after_clock`` in a new
-floor, not a hole this gate claims to close.
+**What it does not see, recorded rather than chased:**
+
+- control flow: order is by line, so a timer armed in an earlier loop iteration or in a callee is
+  invisible, and so is a delay armed in a helper function or a fixture the test calls first;
+- a fake's sleep started by anything other than an entry signal the test waited for, such as a
+  worker's flush interval starting a sleeping ``emit`` before ``flush`` is called (PR 314's
+  ``numeric_doors`` shape, which only the helper prevents);
+- a sleeping fake the test reaches through a fixture or a factory rather than by naming its class;
+- a duration that crosses a function boundary other than through a returned value, is unpacked by
+  a ``for`` loop, or is scaled (``(time.monotonic_ns() - start) / 1e9``), and a floor written as
+  ``== pytest.approx(...)``;
+- a delay armed indirectly, such as ``loop.call_soon_threadsafe(loop.call_later, ...)``, or a
+  thread whose target sleeps;
+- classes and duration-returning functions are matched by bare name across every file, so two
+  same-named fakes in different modules are judged as one. That fails closed for the sleep check
+  and could fail open for the helper exemption, if one module's fake waits on the event another
+  module's same-named sleeper ignores.
+
+Each is a reason to use ``release_after_clock`` in a new floor, not a hole this gate claims to close.
 
 Deadlines a sink anchors inside the measured call, such as NATS's ``time.monotonic() +
 publish_timeout`` on its loop thread, are safe and stay silent: they are read after the test's
@@ -54,8 +68,16 @@ import ast
 import dataclasses
 import functools
 import pathlib
+import threading
+import time
+from typing import TYPE_CHECKING
 
 import pytest
+
+from conftest import release_after_clock
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 TESTS = pathlib.Path(__file__).parent
 
@@ -72,13 +94,15 @@ ARMED_IN_CONSTRUCTOR = "a constructor arms a delay, so it runs before any clock 
 SLEEP_AFTER_SIGNAL = (
     "the test waits for a fake's entry signal before a raw clock, and the fake sleeps after it"
 )
+UNRESOLVED_CLOCK = "a floor whose clock the scan cannot find, so it cannot be judged"
 
 POPULATION_FLOOR = 25
 """Fewest floors the scan must find across ``tests/``, below the count it finds today.
 
-The scan found 30, five of them on the helper, at the commit that added it. The floor sits below that so a test that is
-legitimately deleted does not redden the gate, and far enough above zero that a refactor which
-stops the scan recognising a clock (renaming ``_timed``, say) cannot shrink it silently.
+Re-measure it with ``len(scan(TESTS)[0])``. The floor sits about a sixth below that count, so
+deleting a few timing tests legitimately does not redden the gate, and far enough above zero that
+a change which stops the scan recognising a clock (dropping ``monotonic`` from :data:`CLOCKS`, say)
+cannot shrink the population silently.
 """
 
 HISTORIC_SITES = {
@@ -104,6 +128,8 @@ class Floor:
       function: The enclosing function's name.
       clock_line: The line the duration's clock was read on, or None when it cannot be found.
       helper: Whether the duration came from a ``conftest`` stopwatch.
+      released: The ``R`` of a ``release_after_clock(seconds, <x>.R.set)`` the duration came from,
+        or None.
     """
 
     path: str
@@ -111,6 +137,7 @@ class Floor:
     function: str
     clock_line: int | None
     helper: bool
+    released: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,7 +147,7 @@ class Finding:
     Attributes:
       path: The file, relative to the scanned root.
       line: The offending line.
-      reason: One of the module's three reason constants.
+      reason: One of the module's four reason constants.
     """
 
     path: str
@@ -324,35 +351,59 @@ def _floors_in(
         key=lambda node: (node.lineno, node.col_offset),
     )
     clocks: dict[str, list[int]] = {}
-    watches: dict[str, list[int]] = {}
-    durations: dict[str, list[tuple[int, int | None, bool]]] = {}
+    watches: dict[str, list[tuple[int, str | None]]] = {}
+    durations: dict[str, list[tuple[int, Measured]]] = {}
 
-    def duration_of(expr: ast.AST, line: int) -> tuple[int | None, bool] | None:
+    def watch_of(name: str, line: int) -> Measured | None:
+        known = [entry for entry in watches.get(name, []) if entry[0] <= line]
+        return (known[-1][0], True, known[-1][1]) if known else None
+
+    def duration_of(expr: ast.AST, line: int) -> Measured | None:
         if isinstance(expr, ast.Name) and expr.id in durations:
             known = [entry for entry in durations[expr.id] if entry[0] <= line]
-            return (known[-1][1], known[-1][2]) if known else None
+            return known[-1][1] if known else None
+        if isinstance(expr, ast.IfExp):
+            return duration_of(expr.body, line) or duration_of(expr.orelse, line)
         if _is_duration_expr(expr):
-            sub = expr.body if isinstance(expr, ast.IfExp) else expr
-            assert isinstance(sub, ast.BinOp)
-            start = sub.right
+            assert isinstance(expr, ast.BinOp)
+            start = expr.right
             if isinstance(start, ast.Name):
-                return _last_before(clocks.get(start.id, []), line), False
-            return None, False
+                return _last_before(clocks.get(start.id, []), line), False, None
+            return None, False, None
         watch = None
         if isinstance(expr, ast.Attribute) and expr.attr == "elapsed":
             watch = expr.value
         elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
             watch = expr.func.value if expr.func.attr == "stop" else None
         if isinstance(watch, ast.Name) and watch.id in watches:
-            return _last_before(watches[watch.id], line), True
+            return watch_of(watch.id, line)
         if isinstance(expr, ast.Call) and None in returners.get(_callee(expr) or "", ()):
-            return expr.lineno, False
+            return expr.lineno, False, None
         if isinstance(expr, ast.Subscript) and isinstance(expr.value, ast.Call):
             index = expr.slice
             positions = returners.get(_callee(expr.value) or "", frozenset())
             if isinstance(index, ast.Constant) and index.value in positions:
-                return expr.lineno, False
+                return expr.lineno, False, None
         return None
+
+    def bind(target: ast.AST, value: ast.AST, line: int) -> None:
+        if isinstance(target, ast.Name):
+            if _is_clock(value):
+                clocks.setdefault(target.id, []).append(line)
+            elif isinstance(value, ast.Call) and _callee(value) in STOPWATCHES:
+                watches.setdefault(target.id, []).append((line, None))
+            found = duration_of(value, line)
+            if found is not None:
+                durations.setdefault(target.id, []).append((line, found))
+        elif isinstance(target, ast.Tuple) and isinstance(value, ast.Tuple):
+            if len(target.elts) == len(value.elts):
+                for element, part in zip(target.elts, value.elts, strict=True):
+                    bind(element, part, line)
+        elif isinstance(target, ast.Tuple) and isinstance(value, ast.Call):
+            positions = returners.get(_callee(value) or "", frozenset())
+            for index, element in enumerate(target.elts):
+                if index in positions and isinstance(element, ast.Name):
+                    durations.setdefault(element.id, []).append((line, (line, False, None)))
 
     floors = []
     for node in nodes:
@@ -361,25 +412,13 @@ def _floors_in(
                 call, name = item.context_expr, item.optional_vars
                 is_watch = isinstance(call, ast.Call) and _callee(call) in STOPWATCHES
                 if is_watch and isinstance(name, ast.Name):
-                    watches.setdefault(name.id, []).append(node.lineno)
+                    assert isinstance(call, ast.Call)
+                    watches.setdefault(name.id, []).append((node.lineno, _released(call)))
         elif isinstance(node, ast.Assign):
-            value = node.value
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    if _is_clock(value):
-                        clocks.setdefault(target.id, []).append(node.lineno)
-                    elif isinstance(value, ast.Call) and _callee(value) in STOPWATCHES:
-                        watches.setdefault(target.id, []).append(node.lineno)
-                    found = duration_of(value, node.lineno)
-                    if found is not None:
-                        durations.setdefault(target.id, []).append((node.lineno, *found))
-                elif isinstance(target, ast.Tuple) and isinstance(value, ast.Call):
-                    positions = returners.get(_callee(value) or "", frozenset())
-                    for index, element in enumerate(target.elts):
-                        if index in positions and isinstance(element, ast.Name):
-                            durations.setdefault(element.id, []).append(
-                                (node.lineno, node.lineno, False)
-                            )
+                bind(target, node.value, node.lineno)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            bind(node.target, node.value, node.lineno)
         elif isinstance(node, ast.Compare):
             sides = [node.left, *node.comparators]
             for index, op in enumerate(node.ops):
@@ -393,6 +432,35 @@ def _floors_in(
                 if measured is not None:
                     floors.append(Floor(path, node.lineno, fn.name, *measured))
     return floors
+
+
+Measured = tuple[int | None, bool, str | None]
+"""A duration's clock line, whether a ``conftest`` stopwatch read it, and the event it releases."""
+
+
+def _released(call: ast.Call) -> str | None:
+    """Returns ``R`` when a ``release_after_clock`` call's ``release`` is ``<x>.R.set``.
+
+    Args:
+      call: The ``release_after_clock(...)`` or ``Stopwatch()`` call.
+
+    Returns:
+      The event attribute released, or None for any other ``release`` or none at all.
+
+    Raises:
+      None.
+    """
+    release = call.args[1] if len(call.args) > 1 else None
+    for keyword in call.keywords:
+        if keyword.arg == "release":
+            release = keyword.value
+    if (
+        isinstance(release, ast.Attribute)
+        and release.attr == "set"
+        and isinstance(release.value, ast.Attribute)
+    ):
+        return release.value.attr
+    return None
 
 
 def _class_index(trees: dict[str, ast.Module]) -> dict[str, list[ast.ClassDef]]:
@@ -451,14 +519,45 @@ def _signals_then_sleeps(cls: ast.ClassDef) -> set[str]:
     return events
 
 
-def _sleepers(index: dict[str, list[ast.ClassDef]]) -> dict[str, set[str]]:
-    """Maps each class name to the signal-then-sleep events it has, inherited ones included.
+def _waits_on(cls: ast.ClassDef) -> set[str]:
+    """Returns the ``self.E`` events a method of ``cls`` waits on.
+
+    Args:
+      cls: A class definition.
+
+    Returns:
+      The event attribute names.
+
+    Raises:
+      None.
+    """
+    events = set()
+    for method in cls.body:
+        if isinstance(method, ast.FunctionDef | ast.AsyncFunctionDef):
+            for node in _own_nodes(method):
+                func = node.func if isinstance(node, ast.Call) else None
+                if (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "wait"
+                    and isinstance(func.value, ast.Attribute)
+                    and isinstance(func.value.value, ast.Name)
+                    and func.value.value.id == "self"
+                ):
+                    events.add(func.value.attr)
+    return events
+
+
+def _inherited(
+    index: dict[str, list[ast.ClassDef]], own: Callable[[ast.ClassDef], set[str]]
+) -> dict[str, set[str]]:
+    """Maps each class name to what ``own`` finds in it and in every base it inherits from.
 
     Bases are followed by name through the scanned root, so a subclass of a sleeping fake is a
     sleeping fake.
 
     Args:
       index: Every class definition by name.
+      own: What to collect from one class definition.
 
     Returns:
       ``{class name: events}`` for every class with at least one.
@@ -473,7 +572,7 @@ def _sleepers(index: dict[str, list[ast.ClassDef]]) -> dict[str, set[str]]:
             return memo[name]
         events: set[str] = set()
         for cls in index.get(name, []):
-            events |= _signals_then_sleeps(cls)
+            events |= own(cls)
             for base in cls.bases:
                 base_name = (
                     base.attr if isinstance(base, ast.Attribute) else getattr(base, "id", "")
@@ -539,7 +638,9 @@ def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
       None.
     """
     trees = _parse(root)
-    sleepers = _sleepers(_class_index(trees))
+    index = _class_index(trees)
+    sleepers = _inherited(index, _signals_then_sleeps)
+    waiters = _inherited(index, _waits_on)
     functions: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef, list[ast.AST]]] = []
     returners: dict[str, frozenset[int | None]] = {}
     findings: set[Finding] = set()
@@ -567,17 +668,19 @@ def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
             continue
         arming = _arming_lines(own)
         waits = _entry_waits(own)
-        named = {n.id for n in own if isinstance(n, ast.Name) and n.id in sleepers}
-        events = set().union(*(sleepers[name] for name in named))
+        named = {n.id for n in own if isinstance(n, ast.Name)}
+        events = set().union(*(sleepers[name] for name in named if name in sleepers))
+        awaited = set().union(*(waiters[name] for name in named if name in waiters))
         for floor in found:
             if floor.clock_line is None:
+                findings.add(Finding(path, floor.line, UNRESOLVED_CLOCK))
                 continue
             findings.update(
                 Finding(path, line, ARMED_BEFORE_CLOCK)
                 for line in arming
                 if line < floor.clock_line
             )
-            if not floor.helper:
+            if floor.released not in awaited:
                 findings.update(
                     Finding(path, line, SLEEP_AFTER_SIGNAL)
                     for line, event in waits
@@ -696,6 +799,142 @@ def test_it(sink, ev):
 """,
         ARMED_BEFORE_CLOCK,
         "threading.Timer(0.4, ev.set).start()",
+    ),
+    "a-timer-between-two-clock-reads": (
+        """
+def test_it(sink, ev):
+    start = time.monotonic()
+    threading.Timer(0.4, ev.set).start()
+    start = time.monotonic()
+    sink.close()
+    assert time.monotonic() - start >= 0.4
+""",
+        ARMED_BEFORE_CLOCK,
+        "threading.Timer(0.4, ev.set).start()",
+    ),
+    "an-annotated-clock": (
+        """
+def test_it(sink, ev):
+    threading.Timer(0.4, ev.set).start()
+    start: float = time.monotonic()
+    sink.close()
+    assert time.monotonic() - start >= 0.4
+""",
+        ARMED_BEFORE_CLOCK,
+        "threading.Timer(0.4, ev.set).start()",
+    ),
+    "an-annotated-duration": (
+        """
+def test_it(sink, ev):
+    threading.Timer(0.4, ev.set).start()
+    start = time.monotonic()
+    sink.close()
+    elapsed: float = time.monotonic() - start
+    assert elapsed >= 0.4
+""",
+        ARMED_BEFORE_CLOCK,
+        "threading.Timer(0.4, ev.set).start()",
+    ),
+    "a-tuple-assigned-clock": (
+        """
+def test_it(sink, ev):
+    threading.Timer(0.4, ev.set).start()
+    start, count = time.monotonic(), 0
+    sink.close()
+    assert time.monotonic() - start >= 0.4
+""",
+        ARMED_BEFORE_CLOCK,
+        "threading.Timer(0.4, ev.set).start()",
+    ),
+    "the-helper-releases-an-event-the-fake-only-reads-or-another-object-waits-on": (
+        _GATED_CLOSE
+        + """
+class _Peeks:
+    def __init__(self, peer):
+        self.peer = peer
+        self.in_close = threading.Event()
+        self.release = threading.Event()
+
+    def close(self):
+        self.in_close.set()
+        self.peer.release.wait(0.0)
+        if self.release.is_set():
+            return
+        time.sleep(1.0)
+
+
+def test_it(closer, peer):
+    sink = _Peeks(peer)
+    closer(sink)
+    assert sink.in_close.wait(5.0)
+    with release_after_clock(0.0, sink.release.set) as watch:
+        closer(sink)
+    assert watch.elapsed >= 0.9
+""",
+        SLEEP_AFTER_SIGNAL,
+        "assert sink.in_close.wait(5.0)",
+    ),
+    "a-clock-on-an-attribute": (
+        """
+def test_it(self, sink):
+    self.began = time.monotonic()
+    sink.close()
+    assert time.monotonic() - self.began >= 0.4
+""",
+        UNRESOLVED_CLOCK,
+        "assert time.monotonic() - self.began >= 0.4",
+    ),
+    "a-walrus-clock": (
+        """
+def test_it(sink):
+    if (start := time.monotonic()) > 0:
+        sink.close()
+    assert time.monotonic() - start >= 0.4
+""",
+        UNRESOLVED_CLOCK,
+        "assert time.monotonic() - start >= 0.4",
+    ),
+    "the-helper-releases-an-event-the-sleeping-fake-never-waits-on": (
+        """
+class _Slow:
+    def __init__(self):
+        self.in_close = threading.Event()
+        self.release = threading.Event()
+
+    def close(self):
+        self.in_close.set()
+        time.sleep(1.0)
+
+
+def test_it(closer):
+    sink = _Slow()
+    closer(sink)
+    assert sink.in_close.wait(5.0)
+    with release_after_clock(0.0, sink.release.set) as watch:
+        closer(sink)
+    assert watch.elapsed >= 0.9
+""",
+        SLEEP_AFTER_SIGNAL,
+        "assert sink.in_close.wait(5.0)",
+    ),
+    "call-later-in-a-post-init": (
+        """
+class Fake:
+    def __post_init__(self):
+        asyncio.get_running_loop().call_later(0.2, self.go)
+""",
+        ARMED_IN_CONSTRUCTOR,
+        "asyncio.get_running_loop().call_later(0.2, self.go)",
+    ),
+    "timer-started-in-new": (
+        """
+class Fake:
+    def __new__(cls, ev):
+        threading.Timer(0.2, ev.set).start()
+        return super().__new__(cls)
+""",
+        ARMED_IN_CONSTRUCTOR,
+        "threading.Timer(0.2, ev.set).start()",
     ),
     "call-later-in-a-fake-constructor": (
         """
@@ -818,16 +1057,48 @@ def test_it(sink, ev):
     sink.close()
     assert time.monotonic() - start >= 0.4
 """,
-    "the-helper-releases-a-fake-that-could-also-sleep": _SLOW_CLOSE
-    + """
+    "the-helper-releases-the-event-a-fake-that-could-also-sleep-waits-on": """
+class _Slow:
+    def __init__(self, seconds):
+        self.seconds = seconds
+        self.in_close = threading.Event()
+        self.release = threading.Event()
+
+    def close(self):
+        self.in_close.set()
+        if self.seconds is None:
+            self.release.wait(5.0)
+        else:
+            time.sleep(self.seconds)
+
 
 def test_it(closer):
-    sink = _Slow()
+    sink = _Slow(None)
     closer(sink)
     assert sink.in_close.wait(5.0)
     with release_after_clock(0.4, sink.release.set) as watch:
         closer(sink)
     assert watch.elapsed >= 0.1
+""",
+    "the-helper-releases-by-keyword": """
+class _Slow:
+    def __init__(self):
+        self.in_close = threading.Event()
+        self.release = threading.Event()
+
+    def close(self):
+        self.in_close.set()
+        if not self.release.wait(5.0):
+            time.sleep(1.0)
+
+
+def test_it(closer):
+    sink = _Slow()
+    closer(sink)
+    assert sink.in_close.wait(5.0)
+    with release_after_clock(0.4, release=sink.release.set) as watch:
+        closer(sink)
+    assert watch.elapsed >= 0.4
 """,
     "a-sink-deadline-anchored-after-the-clock": """
 class Sink:
@@ -896,14 +1167,52 @@ def test_it(closer):
     closer(sink)
     assert time.monotonic() - start > 0.3
 """,
-    "a-sleeping-fake-the-test-never-names": _SLOW_CLOSE
+    "a-gated-fake-sharing-a-sleepers-event-name": _SLOW_CLOSE
+    + _GATED_CLOSE
     + """
 
-def test_it(closer, other):
-    closer(other)
-    assert other.in_close.wait(5.0)
+def test_it(closer):
+    sink = _Gated()
+    closer(sink)
+    assert sink.in_close.wait(5.0)
     start = time.monotonic()
-    closer(other)
+    threading.Timer(1.0, sink.release.set).start()
+    closer(sink)
+    assert time.monotonic() - start > 0.3
+""",
+    "a-thread-started-before-the-clock": """
+def test_it(sink, work):
+    threading.Thread(target=work).start()
+    start = time.monotonic()
+    sink.close()
+    assert time.monotonic() - start >= 0.1
+""",
+    "an-event-cleared-before-the-clock": _SLOW_CLOSE
+    + """
+
+def test_it(closer):
+    sink = _Slow()
+    sink.in_close.clear()
+    start = time.monotonic()
+    closer(sink)
+    assert time.monotonic() - start > 0.3
+""",
+    "a-fake-that-clears-its-signal-then-sleeps": """
+class _Clears:
+    def __init__(self):
+        self.in_close = threading.Event()
+
+    def close(self):
+        self.in_close.clear()
+        time.sleep(1.0)
+
+
+def test_it(closer):
+    sink = _Clears()
+    closer(sink)
+    sink.in_close.wait(5.0)
+    start = time.monotonic()
+    closer(sink)
     assert time.monotonic() - start > 0.3
 """,
     "a-fake-that-sleeps-before-its-signal": """
@@ -987,6 +1296,34 @@ POPULATION = {
         [],
     ),
     "a-returned-tuple": ("d, err = _timed(x)\nassert d >= 0.1\n", [False]),
+    "a-strict-reversed-floor": (
+        "start = time.monotonic()\nd = time.monotonic() - start\nassert 0.1 < d\n",
+        [False],
+    ),
+    "a-loop-time-clock": (
+        "start = x.time()\nx()\nassert x.time() - start >= 0.1\n",
+        [False],
+    ),
+    "a-clock-call-with-arguments-is-not-a-clock": (
+        "start = time.monotonic()\nassert x.time(5) - start > 0.1\n",
+        [],
+    ),
+    "a-sum-is-not-a-duration": ("assert time.monotonic() + 0.1 > x\n", []),
+    "a-conditional-duration-in-the-body-branch": (
+        "start = time.monotonic()\nd = time.monotonic() - start if x else 0.0\nassert d >= 0.1\n",
+        [False],
+    ),
+    "a-conditional-duration-in-the-else-branch": (
+        (
+            "start = time.monotonic()\nd = float('inf') if not x else time.monotonic() - start\n"
+            "assert d >= 0.1\n"
+        ),
+        [False],
+    ),
+    "an-annotated-duration": (
+        "start = time.monotonic()\nd: float = time.monotonic() - start\nassert d >= 0.1\n",
+        [False],
+    ),
     "a-returned-scalar": ("assert _wall(x) >= 0.1\n", [False]),
     "a-conditional-duration": ("assert _until(x) >= 0.1\n", [False]),
     "a-returned-subscript": ("assert _timed(x)[0] >= 0.1\n", [False]),
@@ -1016,3 +1353,32 @@ def test_the_scan_recognises_each_form_of_floor(case: str, tmp_path) -> None:
     assert [(floor.helper, floor.clock_line is not None) for floor in got] == [
         (helper, True) for helper in expected
     ]
+
+
+# --- The helper the gate exempts: its two promises, pinned on the helper itself ---------------
+
+
+def test_release_after_clock_releases_once_when_the_timed_call_returns_early() -> None:
+    """A floor's bug is an early return: the release then runs at exit, after the stopwatch stops."""
+    calls: list[float] = []
+    with release_after_clock(5.0, lambda: calls.append(time.monotonic())) as watch:
+        pass
+    assert watch.ended is not None and len(calls) == 1, calls
+    assert watch.ended <= calls[0], "the stopwatch stops before the release runs"
+    time.sleep(0.05)
+    assert len(calls) == 1, "the cancelled timer did not release a second time"
+
+
+def test_release_after_clock_releases_once_when_its_timer_fires() -> None:
+    """The timer's release and the exit's are one release, and the floor holds from the clock."""
+    released = threading.Event()
+    calls: list[int] = []
+
+    def release() -> None:
+        calls.append(1)
+        released.set()
+
+    with release_after_clock(0.1, release) as watch:
+        assert released.wait(5.0)
+    assert calls == [1], calls
+    assert watch.elapsed >= 0.1, f"released {watch.elapsed:.4f}s after the clock"
