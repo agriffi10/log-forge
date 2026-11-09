@@ -202,8 +202,10 @@ class FilteringSink:
     def _round(self, batch: list[dict[str, object]]) -> Verdict:
         """Gives every event of the batch one outcome: its own decision, or the inner sink's.
 
-        The 1.x per-event step runs first, each event under its own guard: the predicate, then
-        the level floor. A declined event is ``SKIPPED`` and counted nowhere, since declining is
+        The 1.x per-event step runs first, each event under its own guard, through
+        :meth:`_round_step`: the predicate, then the level floor, asked once per event per run
+        — an event forwarded on an earlier round of the run is forwarded again without asking.
+        A declined event is ``SKIPPED`` and counted nowhere, since declining is
         the configuration working. An event the predicate failed on is ``SKIPPED`` too, and the
         failures are registered against this wrapper's ``_dropped`` through the run context,
         ``SETTLED``, so they land under its own counter lock only if the run settles — SPEC-058's
@@ -227,8 +229,8 @@ class FilteringSink:
         keeping this wrapper's own registrations. An exception from it propagates
         unchanged, and so the engine applies SPEC-072's rule to it as it would to the bare inner
         sink's. When nothing is kept the inner sink is not called. Nothing here takes a lock,
-        enters a ``Deferral`` or stores an attribute, so concurrent calls share nothing
-        (SPEC-028).
+        enters a ``Deferral`` or stores an attribute — the remembered decisions live in the run
+        context, which the run owns — so concurrent calls share nothing (SPEC-028).
 
         Args:
           batch: The events.
@@ -253,9 +255,11 @@ class FilteringSink:
         declined = False
         failures = 0
         first: Exception | None = None
+        context = _engine.run_context()
+        held = cast("dict[int, dict[str, object]]", context.notes(self).setdefault("forwarded", {}))
         for index, event in enumerate(batch):
             try:
-                passes = self._passes(event)
+                passes = self._round_step(event, held)
             except Exception as err:
                 failures += 1
                 first = first if first is not None else err
@@ -265,7 +269,6 @@ class FilteringSink:
                 positions.append(index)
             else:
                 declined = True
-        context = _engine.run_context()
         if first is not None:
             _diag.absorbed(
                 "filtering a batch",
@@ -281,6 +284,44 @@ class FilteringSink:
         if kept:
             hint = map_forwarded(context.delegate(deliver, kept, positions), positions, outcomes)
         return Verdict(outcomes=tuple(outcomes), retry_after=cast("float | None", hint))
+
+    def _round_step(self, event: dict[str, object], held: dict[int, dict[str, object]]) -> bool:
+        """Decides whether an event of an engine round is forwarded: once forwarded, all run.
+
+        The engine resends this wrapper's original events, so without this a later round would
+        ask the predicate again about an event it already forwarded, and a predicate that is not
+        a pure function of the event — one that drops duplicates, limits a rate or samples —
+        could now decline it: ``SKIPPED``, which the engine never resends and counts nowhere, so
+        an event the inner sink answered ``RETRYABLE`` would be lost silently, where the worker's
+        1.x retry of :meth:`emit` sent it again. A predicate raising on the resend would cost a
+        forwarded event too. So an event forwarded once is remembered for the life of one engine
+        run, in the run context's notes for this wrapper, keyed by the event's identity as
+        ``TransformSink`` keeps its results (SPEC-075 FR-002, from the frame-2 review), and a
+        later round forwards it without asking again. The entry holds the event, and a hit must
+        be that object, so an identity reused by another event within the run never takes its
+        decision. The level floor is asked through the same path; it is pure, so remembering it
+        changes nothing. The notes end with the run, so the next run asks afresh, and a direct
+        :meth:`deliver` outside any run is a run of its own.
+
+        Only a forwarded event is remembered. A declined or failed one is ``SKIPPED``, which the
+        engine never resends, so no later round asks about it.
+
+        Args:
+          event: One event of the wrapper's batch.
+          held: This run's forwarded events, by identity.
+
+        Returns:
+          True when the event is forwarded.
+
+        Raises:
+          Exception: The predicate's own exception, from :meth:`_passes`; nothing is kept.
+        """
+        if held.get(id(event)) is event:
+            return True
+        passes = self._passes(event)
+        if passes:
+            held[id(event)] = event
+        return passes
 
     def _passes(self, event: dict[str, object]) -> bool:
         """Reports whether an event clears the predicate and the minimum level.

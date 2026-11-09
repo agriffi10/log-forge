@@ -342,19 +342,27 @@ map it uses for the outcomes. An index outside the forwarded list stays invalid,
 the bare sink's engine would fail still fails. Without the rewrite, a declined event ahead of a
 marked one shifts the indices and the engine fails a round the bare sink settles.
 
-**The engine resends the wrapper's original events.** On a later round the predicate runs again,
-once for each event still to send, as the worker's 1.x whole-batch retry ran it. The transform's
-function does not: `TransformSink` keeps each event's forwarded result for the life of one engine
-run, in the run context's notes for the wrapper, keyed by the original event's identity as
+**The engine resends the wrapper's original events.** On a later round the caller's code is not
+asked again about an event the run already forwarded. `FilteringSink` keeps each forwarded event
+for the life of one engine run, in the run context's notes for the wrapper, keyed by its identity
+with the event held in the entry, and forwards it again without asking the predicate or the level
+floor. A predicate that is not a pure function of the event — one that drops duplicates, limits a
+rate or samples — asked again would decline its own resend, `SKIPPED` and counted nowhere: measured
+behind a dedupe predicate, a real `HTTPSink` answering `503` then `200` made one POST and lost the
+event silently where the `emit` path posted twice; and a predicate raising on the resend charged a
+forwarded event to the inner sink's `failed_events` with a second line. The transform's function
+is not run again either: `TransformSink` keeps each event's forwarded result for the life of one
+engine run, in the run context's notes for the wrapper, keyed by the original event's identity as
 `_encode.encode_round` keys an encoding, with the original event held in the entry so an identity
 cannot be reused within the run. A later round forwards that same object. A fresh copy per round
 would be a stranger to the inner sink's own run notes, which are keyed by identity: measured over a
 FIFO `SQSSink` whose client fails `a` twice and `b` once, a copying transform landed `[b, a]` where
 the bare sink lands `[a, b]`, and a standard queue's abandoned line said "after 1 attempt(s)" where
 the message had made four. Only a forwarded result is kept: a declined or failed event is
-`SKIPPED`, which the engine never resends. An event object that appears twice in one batch shares its
-one result. The notes end with the run, so the next run of the same events runs the function afresh,
-and a direct `deliver` outside any run is a run of its own.
+`SKIPPED`, which the engine never resends; so only a forwarded decision is kept. An event object that
+appears twice in one batch shares its one result. The notes end with the run, so the next run of the
+same events asks the predicate and runs the function afresh, and a direct `deliver` outside any run
+is a run of its own.
 
 **`deliver` writes nothing itself.** It enters no `Deferral`, takes no lock and assigns no
 attribute, so calls on the drain thread and on orphan threads share nothing (SPEC-028). Its only
@@ -369,7 +377,8 @@ leave a third-party inner sink's loss unannounced.
 **The twin pair.** For a wrapper that offers `deliver`, its `deliver` and its `emit` are twins: the
 second runs whenever a caller or a `MultiSink` calls `emit`. On the same batch and the same inner
 behaviour they forward the same events and end with the same `losses().dropped`, the same inner
-attributes and the same catcher term. `failed` is excluded from the comparison: it is the upper
+attributes and the same catcher term — a stateful predicate included, since neither path asks it
+again about an event it forwarded. `failed` is excluded from the comparison: it is the upper
 bound, and the two paths reach it by different counts.
 
 #### Acceptance Criteria:
@@ -391,8 +400,16 @@ bound, and the two paths reach it by different counts.
       event is the coerced result `tests/test_transform_coercion.py` expects.
 - [ ] Indices: over `[a declined, b, c raising, d]`, an inner verdict `[RETRYABLE, ACCEPTED]` maps
       to `[SKIPPED, RETRYABLE, SKIPPED, ACCEPTED]`. Round two gives the wrapper exactly `[b]`. The
-      predicate runs once more, for `b` alone; the transform's function is not run again, and the
+      predicate is not asked again about `b`; the transform's function is not run again, and the
       inner sink is handed the same object round one forwarded.
+- [ ] A predicate is asked once per event per run however many rounds the run makes, and afresh on
+      the next run. Behind a dedupe predicate, a real `HTTPSink` answering `503` then `200` under a
+      `Worker` makes exactly 2 POSTs with nothing counted and no loss line, through `deliver` as
+      through the `emit` path; a predicate letting two calls through delivers both events of a
+      batch whose second is `RETRYABLE` once. A predicate that would raise if asked again is never
+      asked: the event is retried and delivered, nothing is charged to the inner sink's `failed` or
+      the wrapper's `_dropped`, and no line is written; one raising on an event in round 1 still
+      gives `_dropped == 1` and one `absorbed` line.
 - [ ] A copying transform's function runs once per event per run however many rounds the run
       makes, each round forwarding the same objects; a second run of the same events, and a direct
       `deliver`, run it afresh. A declined or failed result is not kept.
@@ -710,3 +727,7 @@ tests/
 - 2026-11-09, from PR 319's set-aside rewind: a malformed inner verdict discards what the inner
   call registered, as the engine discards a bare sink's set-aside round, keeping the wrapper's own
   registrations (FR-002).
+- 2026-11-09, frame-2 review; Andrew's call: `FilteringSink` keeps each forwarded event's predicate
+  decision for one engine run, as `TransformSink` keeps its results, so a resend never asks the
+  predicate again (FR-002): a stateful predicate asked again declined its own resend and lost the
+  event silently.

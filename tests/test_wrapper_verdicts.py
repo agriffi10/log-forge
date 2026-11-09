@@ -709,9 +709,10 @@ def test_a_transform_maps_its_three_failures_and_forwards_the_coerced_result() -
 def test_indices_map_back_and_round_two_resends_only_the_retryable_event(kind: str) -> None:
     """AC5: ``[a declined, b, c raising, d]`` with ``[R, A]`` maps to ``[S, R, S, A]``.
 
-    Round two hands the wrapper exactly ``[b]``. The predicate runs again for ``b``; the
-    transform's function does not, and the inner sink is handed the very object round one
-    forwarded (Andrew's call, 2026-11-09).
+    Round two hands the wrapper exactly ``[b]``. Neither the predicate nor the transform's
+    function is asked again about ``b``, which round one forwarded, and the inner sink is handed
+    the very object round one forwarded (Andrew's call, 2026-11-09; the predicate's from the
+    frame-2 review).
     """
     sink = wrap(kind, Scripted([[R, A]]), Caller(declines=frozenset({0}), fails=frozenset({2})))
     assert sink.deliver(events(4)).outcomes == (S, R, S, A)
@@ -721,13 +722,128 @@ def test_indices_map_back_and_round_two_resends_only_the_retryable_event(kind: s
     batch = events(4)
     assert not run(sink, batch).failed
     assert [[e["i"] for e in r] for r in inner.rounds] == [[1, 3], [1]]
+    assert caller.calls == [0, 1, 2, 3], "round two did not ask the caller's code again"
     if kind == "filtering":
-        assert caller.calls == [0, 1, 2, 3, 1], "round two ran the predicate for b alone"
         assert inner.handed[1][0] is batch[1]
     else:
-        assert caller.calls == [0, 1, 2, 3], "round two did not run the function again"
         assert inner.handed[0][0] is not batch[1], "the premise: the function copies"
         assert inner.handed[1][0] is inner.handed[0][0], "the same object is forwarded"
+
+
+def test_a_predicate_is_asked_once_per_event_per_run_and_afresh_on_the_next_run() -> None:
+    """FR-002 (frame-2 review): a forwarded event is resent without asking the predicate again.
+
+    Three rounds, two events: the predicate is asked twice. The remembered decisions die with the
+    run, so the next run of the same events asks again, and so does a direct ``deliver``.
+    """
+    caller = Caller()
+    inner = Scripted([R, R, A], max_retries=2)
+    sink = FilteringSink(inner, predicate=caller.predicate)
+    batch = events(2)
+    assert not run(sink, batch).failed
+    assert caller.calls == [0, 1]
+    assert [[e["i"] for e in r] for r in inner.rounds] == [[0, 1]] * 3
+    assert not run(sink, batch).failed
+    assert caller.calls == [0, 1, 0, 1], "the next run asked the predicate afresh"
+    sink.deliver(batch)
+    assert caller.calls == [0, 1, 0, 1, 0, 1]
+
+
+class _FirstN:
+    """A rate-limit or sampling predicate: lets the first ``n`` calls through, then declines."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.seen = 0
+
+    def __call__(self, event: dict[str, object]) -> bool:
+        self.seen += 1
+        return self.seen <= self.n
+
+
+class _Dedupe:
+    """Forwards each message once: a common shape for a filter in front of a sink."""
+
+    def __init__(self) -> None:
+        self.seen: set[object] = set()
+
+    def __call__(self, event: dict[str, object]) -> bool:
+        key = event.get("message")
+        if key in self.seen:
+            return False
+        self.seen.add(key)
+        return True
+
+
+@pytest.mark.parametrize("through_emit", [False, True], ids=["deliver", "emit"])
+def test_a_stateful_predicate_cannot_drop_a_resend_and_the_paths_are_twins(
+    through_emit: bool,
+) -> None:
+    """Frame-2 review (p1): a sampling predicate that has spent its budget does not see a resend.
+
+    The inner sink accepts ``e0`` and answers ``RETRYABLE`` for ``e1``, then accepts everything.
+    A predicate letting two calls through, asked again on the resend, would decline ``e1`` and
+    lose it silently; both paths now deliver it, in the same rounds' events and the same ledger.
+    """
+    inner = Scripted([[A, R], A], max_retries=3)
+    sink = FilteringSink(inner, predicate=_FirstN(2))
+    target = ThirdPartyWrapper(sink) if through_emit else sink
+    assert worked(target, events(2), retries=0) == (0, True)
+    landed = {e["i"] for r in inner.rounds for e in r}
+    assert landed == {0, 1}
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+
+
+@pytest.mark.parametrize("through_emit", [False, True], ids=["deliver", "emit"])
+def test_a_dedupe_predicate_over_a_real_http_sink_resends_as_the_emit_path_does(
+    through_emit: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Frame-2 review (p7): ``503`` then ``200`` behind a dedupe predicate: two POSTs both ways.
+
+    Asked again on the engine's resend, the dedupe predicate declined its own event: one POST,
+    nothing counted, the message gone. The ``emit`` path's worker resend reached the inner
+    sink's engine, which never asks the predicate, and so posted twice.
+    """
+    opener = FakeOpener([FakeResponse(503, b""), FakeResponse(200, b"{}")])
+    inner = HTTPSink("http://collector/in", opener=opener, max_retries=3)
+    sink = FilteringSink(inner, predicate=_Dedupe())
+    target = ThirdPartyWrapper(sink) if through_emit else sink
+    assert worked(target, [{"message": "payment captured", "level": "INFO"}]) == (0, True)
+    assert len(opener.calls) == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert not [line for line in lines(capsys.readouterr().err) if "lost" in line]
+
+
+def test_a_predicate_cannot_fail_a_forwarded_event_on_its_resend(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Frame-2 review: a predicate that would raise on its second call is never called again.
+
+    Asked again, it raised on the resend: one more ``absorbed`` line, a refusal "after others
+    landed" and the event charged to the inner sink's ``failed_events``. Now the forwarded event
+    is resent without asking and lands.
+    """
+    calls: list[object] = []
+
+    def once(event: dict[str, object]) -> bool:
+        calls.append(event["i"])
+        if calls.count(event["i"]) > 1:
+            raise ValueError("asked twice")
+        return True
+
+    inner = Scripted([[A, R], A], max_retries=1)
+    sink = FilteringSink(inner, predicate=once)
+    assert not run(sink, events(2)).failed
+    assert calls == [0, 1]
+    assert [[e["i"] for e in r] for r in inner.rounds] == [[0, 1], [1]], "e1 retried, landed"
+    assert inner.losses() == SinkLosses(dropped=0, failed=0) and sink._dropped == 0
+    assert lines(capsys.readouterr().err) == [], "no absorbed line, no refusal line"
+
+    raising = FilteringSink(Scripted([A]), predicate=Caller(fails=frozenset({1})).predicate)
+    assert not run(raising, events(2)).failed
+    assert raising._dropped == 1, "a failure before any forward still costs only its event"
+    written = lines(capsys.readouterr().err)
+    assert len(written) == 1 and "absorbed a failure" in written[0], written
 
 
 def test_a_transform_runs_once_per_event_per_run_and_afresh_on_the_next_run() -> None:
