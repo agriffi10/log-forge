@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-074
 title: "The Delivery Engine for the SDK and Driver Sinks, Including Id-Keyed Batch Results"
 description: "Puts the queue-service, database, broker and socket sinks on SPEC-072's engine through a per-event deliver, reads Id-keyed batch results in one shared function, and deletes their eleven retry loops, backoff constants and hand-built loss reports while every documented counter and losses() stays true."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-061, SPEC-066, SPEC-068, SPEC-069, SPEC-070, SPEC-071, SPEC-072, SPEC-073]
 arc: stability-redesign
 arc_order: 6
@@ -1015,8 +1015,8 @@ other site still stating the old claim:
   fence's "re-raised unchanged and nothing is counted" stays as written.
 - `docs/invariants.md` 2 (an engine sink's drop is counted by a run that settled) and 3 (guarded by
   the engine's tests). Entry 7 already names the SNS sender fault beside the SQS one (SPEC-070), and
-  this spec does not add it again; `README.md`'s
-  sink rows that name `max_retries` per chunk or per message.
+  this spec does not add it again.
+- `README.md`'s sink rows that name `max_retries` per chunk or per message.
 
 ## Implementation Phases
 

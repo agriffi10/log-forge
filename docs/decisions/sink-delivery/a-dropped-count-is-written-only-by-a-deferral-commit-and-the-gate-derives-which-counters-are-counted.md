@@ -12,7 +12,7 @@ description: "every shipped sink's per-event drop now counts only when its `emit
 
 **No allowlist.** A `dropped` count is exact by promise (invariant 2), so a store that has to be immediate belongs to a counter that is not reported as `dropped`, and breaking the promise should mean editing the gate, deliberately. Rejected: an allowlist like `IMMEDIATE`, which would have made the exception a one-line edit. Accepted costs: an unrelated class storing a same-named attribute outside `__init__` is a finding and renames it, and a Pub/Sub refusal line can trail its refusal by up to one reap wait, which `overflow_timeout` bounds.
 
-**Do NOT** add an allowlist to the derived check; do NOT count a `dropped` attribute anywhere but in a `Deferral` commit; do NOT give `send_all` or `_sendable` a default ledger, which lets a caller count at once by omission; do NOT recount `failed`, an upper bound by design. `NullSink.dropped` and `SentrySink.skipped` are not reported as `dropped` and are not this decision. (SPEC-059 FR-002, FR-005)
+**Do NOT** add an allowlist to the derived check; do NOT count a `dropped` attribute anywhere but in a `Deferral` commit; do NOT give `_sendable` a default ledger (nor `send_all`, before SPEC-074 deleted it), which lets a caller count at once by omission; do NOT recount `failed`, an upper bound by design. `NullSink.dropped` and `SentrySink.skipped` are not reported as `dropped` and are not this decision. (SPEC-059 FR-002, FR-005)
 
 ## History
 
