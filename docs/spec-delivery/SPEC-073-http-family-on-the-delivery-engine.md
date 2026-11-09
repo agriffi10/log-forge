@@ -138,6 +138,12 @@
   escapes the round, as it escaped 1.x `emit`, and the engine fails that round's events.
   `_abandon_unreduced` keeps its 1.x signature `(chunk)` and reads the run's context through
   `run_context()`, so a third-party override written against 1.x is still called.
+
+  > **Superseded** (fix/http-round-guards, after SPEC-073): the guard now covers every hook the
+  > round reaches, a fault costing only its chunk, `DROPPED` before its request is sent and `UNKNOWN`
+  > after; and an event `_items` leaves out uncounted is announced by the round itself. The decision
+  > lives in `docs/decisions/sink-delivery/the-http-family-delivers-in-rounds-and-a-run-context-keeps-its-counters-units.md`.
+
 - **Recorded edge, `_response_limit`.** `_attempt` reads it first, inside the attempt `_exchange`
   classifies, so a raising override is that attempt's refused exception: `REJECTED`, `failed`
   moved, a `connection error, <Type>` line, whatever the status, a `2xx` included. 1.x read it

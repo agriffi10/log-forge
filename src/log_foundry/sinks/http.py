@@ -1752,9 +1752,14 @@ def _wholly_rejected(outcomes: tuple[Outcome, ...]) -> bool:
 def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
     """Runs a reader's ``_outcomes`` as a 1.x ``_handle_response`` call: committed, then a bool.
 
-    The reader runs in a one-round context of its own, committed when it returns, so a direct
-    1.x caller sees the counters move as they did; its run fails exactly when the chunk was
-    wholly rejected, which is when 1.x returned ``False``.
+    Outside any run the reader runs in a one-round context of its own, committed when it
+    returns, so a direct 1.x caller sees the counters move as they did; its run fails exactly
+    when the chunk was wholly rejected, which is when 1.x returned ``False``. Inside a run too —
+    a third-party bool ``_handle_response`` calling a shipped reader's through ``super()`` from a
+    round — it commits at once, so the override reads the counters moved as in 1.x; when that
+    detached run wrote a line, the calling run records it (``RunContext._written_elsewhere``), so
+    the round adds no line of its own for the chunk (:func:`_announce_unlined`) and the engine
+    no settled line beside it.
 
     Args:
       reader: The bound ``_outcomes`` call, with its arguments.
@@ -1765,7 +1770,26 @@ def _read_as_1x(reader: Callable[[], tuple[Outcome, ...]]) -> bool:
     Raises:
       Exception: Whatever the reader raises, after its context is committed as a failed run.
     """
-    return not _wholly_rejected(_engine.detached(reader, _wholly_rejected))
+    outer = _engine.run_context()
+
+    def read() -> tuple[tuple[Outcome, ...], int]:
+        """Runs the reader inside the detached run, and counts the lines it registered there.
+
+        Args:
+          None.
+
+        Returns:
+          The reader's outcomes, and how many lines the detached run holds.
+
+        Raises:
+          Exception: Whatever the reader raises.
+        """
+        return reader(), _engine.run_context()._mark()[1]
+
+    outcomes, lines = _engine.detached(read, lambda result: _wholly_rejected(result[0]))
+    if lines:
+        outer._written_elsewhere()
+    return not _wholly_rejected(outcomes)
 
 
 class _Tally:
@@ -1825,7 +1849,7 @@ class _Tally:
 
 
 def _positions(
-    batch: list[dict[str, object]], items: list[_Item], dropped: int
+    batch: list[dict[str, object]], items: list[_Item], dropped: int, drops: _Pending, name: str
 ) -> tuple[list[int | None], list[Outcome]]:
     """Maps each rendered item to its event's batch index, and gives every unplaced event a fate.
 
@@ -1841,15 +1865,23 @@ def _positions(
     the mapping cannot say which they are, and each is ``REJECTED``: counted in the engine's
     ``failed_events``, an upper bound, never resent, and able to fail a run that delivered
     nothing else, so the loss errs toward over-counting. It is not counted in the sink's 1.x
-    ``losses()``, which counts requests, and it is announced only by the engine's settled line,
-    which the engine writes only for a run in which the sink registers no line of its own; beside
-    a sink line it shows in ``log_foundry_counters`` alone. Neither ``ACCEPTED`` nor ``DROPPED``
-    is ever a default for an event the sink did not itself drop.
+    ``losses()``, which counts requests.
+
+    **It is announced here**, on ``drops``, so only by a run that settles: ``lost <n> event(s);
+    <class>, _items returned no item for them; not retried``, where ``n`` is the unplaced events
+    beyond the ones ``_items`` counted and announced itself, so no event is announced twice. The
+    engine's settled line used to be its only announcement, and the engine writes that line only
+    for a run in which the sink registers no line of its own, so beside any other sink line the
+    loss showed in ``log_foundry_counters`` alone. A run that fails writes none of it: its
+    catcher announces the batch. Neither ``ACCEPTED`` nor ``DROPPED`` is ever a default for an
+    event the sink did not itself drop.
 
     Args:
       batch: The round's events.
       items: What ``_items`` returned for them.
       dropped: How many events ``_items`` dropped and counted.
+      drops: The run's ``SETTLED`` view, which the announcement goes to.
+      name: The sink's class name, for the line.
 
     Returns:
       Each item's batch index, ``None`` for an item past the batch's end, and the round's
@@ -1881,6 +1913,13 @@ def _positions(
                 claimed[index] = True
     unplaced = claimed.count(False)
     fallback = Outcome.DROPPED if unplaced == dropped else Outcome.REJECTED
+    unannounced = unplaced - dropped
+    if fallback is Outcome.REJECTED and unannounced > 0:
+        drops.announce(
+            lambda: _diag.lost(
+                "event", unannounced, f"{name}, _items returned no item for them; not retried"
+            )
+        )
     return found, [Outcome.REJECTED if taken else fallback for taken in claimed]
 
 
@@ -1901,6 +1940,100 @@ def _settle(fates: list[Outcome], where: list[int | None], outcomes: tuple[Outco
     for position, outcome in zip(where, outcomes, strict=True):
         if position is not None:
             fates[position] = outcome
+
+
+def _usable_chunk(taken: list[_Item], left: int) -> list[_Item]:
+    """Returns a plain copy of what ``_take`` gave when the round can send it, else raises.
+
+    The round advances by the chunk's length and maps it to the next indices, so an empty chunk
+    would loop forever and one longer than what is left would misplace its events. The result
+    is copied once, through ``list.__iter__`` for a ``list`` (``_engine._snapshot``), and only
+    the copy is measured and used, so a ``list`` subclass whose ``__len__`` answers differently
+    on each call cannot pass the check and then loop. The raise is the round's own guard's to
+    take, as a ``_take`` that raised.
+
+    Args:
+      taken: What ``_take`` returned.
+      left: How many items the round has not yet placed.
+
+    Returns:
+      A new ``list`` of ``taken``'s items.
+
+    Raises:
+      ValueError: When ``taken`` is empty or longer than ``left``.
+      Exception: Whatever iterating a non-``list`` result raises.
+    """
+    chunk = cast("list[_Item]", _engine._snapshot(cast("list[dict[str, object]]", taken)))
+    if not 0 < len(chunk) <= left:
+        raise ValueError
+    return chunk
+
+
+def _announce_unlined(
+    context: RunContext, sink: object, where: list[int | None], outcomes: tuple[Outcome, ...]
+) -> None:
+    """Announces a chunk's losses when nothing that settled it registered a line of its own.
+
+    Every shipped hook that settles a loss announces it, but a 1.x bool ``_handle_response``
+    returning ``False``, or a third-party ``_outcomes`` or ``_abandon_unreduced``, may register
+    nothing. The engine's settled line used to be such a loss's only announcement, and the engine
+    writes that line only when the sink registers none, so beside any other line in the run the
+    loss showed in ``log_foundry_counters`` alone. ``REJECTED`` and ``DROPPED`` are final and
+    announced ``SETTLED``, so a failed run leaves them to its catcher. ``UNKNOWN`` never fails a
+    run; it is announced ``LAST`` for an idempotent sink, whose ``UNKNOWN`` the engine resends,
+    so a resent event is announced only when its round was the run's last.
+
+    Args:
+      context: The run's context.
+      sink: The sink, for its class name and, outside a run, its idempotence.
+      where: Each chunk item's batch index; an item placed past the batch (``None``) is no
+        event, so its outcome is not announced.
+      outcomes: The chunk's outcomes.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    name = type(sink).__name__
+    placed = [outcome for at, outcome in zip(where, outcomes, strict=True) if at is not None]
+    final = sum(1 for outcome in placed if outcome in (Outcome.REJECTED, Outcome.DROPPED))
+    unknown = placed.count(Outcome.UNKNOWN)
+    if final:
+        context.announce(
+            lambda: _diag.lost("event", final, f"{name}, refused for good; not retried"),
+            when=When.SETTLED,
+        )
+    if unknown:
+        when = When.LAST if context.resends_unknown(sink) else When.SETTLED
+        context.announce(
+            lambda: _diag.lost("event", unknown, f"{name}, outcome unknown; they may have landed"),
+            when=when,
+        )
+
+
+def _unbuilt(drops: _Pending, name: str, lost: int, fault: Exception) -> None:
+    """Counts the events a round could not build a request for, and registers the one line.
+
+    It is the round's render-fault record: ``_unrenderable``, ``SETTLED``, and ``lost <n>
+    event(s); <class>, rendering raised <Type>``, naming the first fault's type, never its text.
+
+    Args:
+      drops: The run's ``SETTLED`` view.
+      name: The sink's class name.
+      lost: How many events.
+      fault: The round's first such fault.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    kind = _type_name(fault)
+    drops.count("_unrenderable", lost)
+    drops.announce(lambda: _diag.lost("event", lost, f"{name}, rendering raised {kind}"))
 
 
 class HTTPSink:
@@ -2270,22 +2403,55 @@ class HTTPSink:
         budget, the smallest refused size and the reduction count live in the run's notes, so
         a later round starts from the budget already found.
 
-        **A hook fault costs its chunk.** What builds a chunk's request — :meth:`_known_refused`,
-        :meth:`_body`, :meth:`_prepare` with the :meth:`_apply_auth` it calls, and the
-        ``Request`` — runs under a guard catching ``Exception``: a raise there makes the chunk's
-        events ``DROPPED``, counted on ``_unrenderable`` and announced with the render fault's
-        line, once per round with the first exception's type, since nothing was sent and the
-        same inputs fail the same way. A ``2xx`` reader that raises sends its chunk through
-        :meth:`_unadjudicated`: the request succeeded, so its events are ``UNKNOWN``. Those
-        guards cover only those hooks. A raising third-party override of another private method
-        the round calls — ``_retryable_status`` (asked only of a non-``2xx``), ``_items``,
-        ``_take``, ``_event_ceiling``, ``_chunk_budget``, ``_drop_refused`` or
-        ``_abandon_unreduced`` — escapes the round, as it escaped 1.x ``emit``, and the engine
-        then fails that round's events and announces the exception's type. A raising
-        ``_response_limit`` does not escape: :meth:`_attempt` reads it inside the attempt, so
-        :meth:`_exchange` classifies its exception as the attempt's own, through
-        :meth:`_retryable_error` — counted in ``failed``, and for anything but a transport
-        error the chunk is ``REJECTED``.
+        **A hook fault costs its chunk** (SPEC-073 FR-001). Every method the round reaches runs
+        under a guard catching ``Exception``, never ``BaseException``, so no fault from a hook
+        escapes the round and fails events that may already have landed. Which chunk a fault
+        costs, and how, depends on whether that chunk's request had been sent:
+
+        - **Before the send** — ``_take``, :meth:`_known_refused`, :meth:`_body`,
+          :meth:`_prepare` with the :meth:`_apply_auth` it calls, the ``Request``, and the
+          :meth:`_drop_refused` a known-refused item goes to — the chunk's events are ``DROPPED``,
+          counted on ``_unrenderable`` and announced with the render fault's line, once per round
+          with the first exception's type, since nothing was sent and the same inputs fail the
+          same way. A ``_take`` fault costs the one item every chunk starts with, and so does a
+          ``_take`` result that is empty or longer than what is left, which would otherwise loop
+          forever or misplace the chunk's events.
+        - **After the send** — :meth:`_exchange` with the ``_retryable_status`` and ``_give_up``
+          it asks, a ``2xx`` reader and the :meth:`_unadjudicated` it calls, and the
+          :meth:`_drop_refused` or :meth:`_abandon_unreduced` a ``413`` goes to — the chunk is
+          given up on through the base :meth:`_unadjudicated`, its events ``UNKNOWN``, since the
+          request went out. A reader that raises keeps its own line, ``reading a 2xx response
+          raised <Type>``, from :meth:`_read`; any other fault there reads ``handling its response
+          raised <Type>``.
+        - **Inside the attempt** — :meth:`_attempt` and the ``_response_limit`` it reads, and the
+          ``_retryable_error`` asked about its exception — the fault never reaches the guard:
+          :meth:`_exchange` classifies it as the attempt's own refused exception, ``REJECTED``,
+          counted in ``failed`` with a ``connection error, <Type>`` line (``is_retryable`` reads a
+          raising predicate as a refusal, naming the attempt's exception).
+        - **Before any chunk** — :meth:`_chunk_budget`, :meth:`_items` with the
+          :meth:`_event_ceiling` it calls, and mapping its items back to events — the round has
+          nothing to send: every event is ``DROPPED`` as a request-building fault is. A
+          :meth:`_render` or :meth:`_item_size` fault is taken by ``_items``' own per-event guard
+          and costs that event alone (SPEC-058 FR-005).
+
+        What a faulting hook registered on the run's context before it raised is discarded
+        (``RunContext._rewind``; :meth:`_read` does the same for a reader), so the guard's own
+        count and line are the loss's only ones. Chunks already settled keep their outcomes, and
+        the round goes on with the next chunk. ``tests/test_http_round_guards.py`` derives the
+        hooks from this method's calls and holds every one to a fault scenario. Only a direct
+        call of this method outside any run escapes the rewind: its context commits each entry
+        at once, so a hook that counted and then raised is counted beside the guard's own;
+        :meth:`deliver` and :meth:`emit` always run it inside a run.
+
+        **A loss whose hook registered no line is announced here.** A chunk settled ``REJECTED``,
+        ``DROPPED`` or ``UNKNOWN`` by hooks that registered no line of their own — a 1.x bool
+        ``_handle_response`` returning ``False``, or a third-party ``_outcomes`` or
+        ``_abandon_unreduced`` — gets the round's line (:func:`_announce_unlined`), since the
+        engine's settled line is suppressed by any other line in the run. Every shipped hook
+        announces its own losses, so this adds no line for a shipped class. The key is the chunk,
+        not the event: a hook that registers any line while its chunk is handled owns the
+        announcement of every loss in that chunk, since a line carries no event identity to
+        count by, so a reader announcing some of its losses must announce all of them.
 
         The verdict's ``retry_after`` is the largest finite, positive ``Retry-After`` among the
         round's retryable responses, or ``None``; one round has one wait.
@@ -2302,22 +2468,35 @@ class HTTPSink:
         context = _engine.run_context()
         notes = context.notes(self)
         drops = context.drops(self)
-        budget = cast("int", notes.get("budget", self._chunk_budget()))
+        name = type(self).__name__
+        mark = context._mark()
+        try:
+            budget = cast("int", notes.get("budget", self._chunk_budget()))
+            tally = _Tally(drops)
+            items = list(self._items(batch, tally))
+            positions, fates = _positions(batch, items, tally.dropped, drops, name)
+        except Exception as err:
+            context._rewind(mark)
+            _unbuilt(drops, name, len(batch), err)
+            return Verdict(outcomes=(Outcome.DROPPED,) * len(batch))
         refused_at = cast("int | None", notes.get("refused_at"))
         reductions = cast("int", notes.get("reductions", 0))
-        tally = _Tally(drops)
-        items = self._items(batch, tally)
-        positions, fates = _positions(batch, items, tally.dropped)
         hints: list[float] = []
         faults = 0
         first: Exception | None = None
         index = 0
         while index < len(items):
-            chunk = self._take(items, index, budget)
-            where = positions[index : index + len(chunk)]
+            mark = context._mark()
+            chunk = items[index : index + 1]
+            sent = False
             try:
-                known = self._known_refused(chunk, refused_at)
-                if not known:
+                chunk = _usable_chunk(self._take(items, index, budget), len(items) - index)
+                where = positions[index : index + len(chunk)]
+                outcomes: tuple[Outcome, ...]
+                if self._known_refused(chunk, refused_at):
+                    self._drop_refused(chunk, drops)
+                    outcomes = (Outcome.DROPPED,) * len(chunk)
+                else:
                     body, content_type = self._body(chunk)
                     headers, data = self._prepare(body, content_type, {})
                     request = urllib.request.Request(  # noqa: S310
@@ -2326,55 +2505,52 @@ class HTTPSink:
                         method=self.method,
                         headers=cast("dict[str, str]", headers),
                     )
+                    sent = True
+                    answer = self._exchange(request, splittable=True, count_unexpected=True)
+                    if answer.outcome is None:
+                        refused_at = len(body) if refused_at is None else min(refused_at, len(body))
+                        if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
+                            budget = max(min(budget, len(body)) // 2, 1)
+                            reductions += 1
+                            continue
+                        if len(chunk) == 1:
+                            self._drop_refused(chunk, drops)
+                            outcomes = (Outcome.DROPPED,)
+                        else:
+                            self._abandon_unreduced(chunk)
+                            outcomes = (Outcome.REJECTED,) * len(chunk)
+                    elif answer.outcome is Outcome.ACCEPTED:
+                        outcomes = self._read(answer.payload, chunk)
+                    else:
+                        outcomes = (answer.outcome,) * len(chunk)
+                        hint = answer.retry_after
+                        if (
+                            answer.outcome is Outcome.RETRYABLE
+                            and hint is not None
+                            and math.isfinite(hint)
+                            and hint > 0
+                        ):
+                            hints.append(hint)
+                _settle(fates, where, outcomes)
+                if context._mark()[1] == mark[1]:
+                    _announce_unlined(context, self, where, outcomes)
+                index += len(chunk)
             except Exception as err:
-                faults += len(chunk)
-                first = first if first is not None else err
-                _settle(fates, where, (Outcome.DROPPED,) * len(chunk))
-                index += len(chunk)
-                continue
-            if known:
-                self._drop_refused(chunk, drops)
-                _settle(fates, where, (Outcome.DROPPED,))
-                index += 1
-                continue
-            answer = self._exchange(request, splittable=True, count_unexpected=True)
-            if answer.outcome is None:
-                refused_at = len(body) if refused_at is None else min(refused_at, len(body))
-                if len(chunk) > 1 and reductions < MAX_BUDGET_REDUCTIONS:
-                    budget = max(min(budget, len(body)) // 2, 1)
-                    reductions += 1
-                    continue
-                if len(chunk) == 1:
-                    self._drop_refused(chunk, drops)
-                    _settle(fates, where, (Outcome.DROPPED,))
+                context._rewind(mark)
+                where = positions[index : index + len(chunk)]
+                if sent:
+                    detail = f"handling its response raised {_type_name(err)}"
+                    _settle(fates, where, HTTPSink._unadjudicated(self, chunk, detail))
                 else:
-                    self._abandon_unreduced(chunk)
-                    _settle(fates, where, (Outcome.REJECTED,) * len(chunk))
+                    faults += len(chunk)
+                    first = first if first is not None else err
+                    _settle(fates, where, (Outcome.DROPPED,) * len(chunk))
                 index += len(chunk)
-                continue
-            if answer.outcome is Outcome.ACCEPTED:
-                outcomes = self._read(answer.payload, chunk)
-            else:
-                outcomes = (answer.outcome,) * len(chunk)
-                hint = answer.retry_after
-                if (
-                    answer.outcome is Outcome.RETRYABLE
-                    and hint is not None
-                    and math.isfinite(hint)
-                    and hint > 0
-                ):
-                    hints.append(hint)
-            _settle(fates, where, outcomes)
-            index += len(chunk)
         notes["budget"] = budget
         notes["refused_at"] = refused_at
         notes["reductions"] = reductions
         if first is not None:
-            kind = type(first).__name__
-            name = type(self).__name__
-            lost = faults
-            drops.count("_unrenderable", lost)
-            drops.announce(lambda: _diag.lost("event", lost, f"{name}, rendering raised {kind}"))
+            _unbuilt(drops, name, faults, first)
         return Verdict(outcomes=tuple(fates), retry_after=max(hints) if hints else None)
 
     def _read(self, payload: bytes, chunk: list[_Item]) -> tuple[Outcome, ...]:
@@ -2386,7 +2562,8 @@ class HTTPSink:
         unadjudicated with a line naming the exception's type; a result that is not one
         ``Outcome`` per event — not a sequence, the wrong length, or holding anything else — makes
         it unadjudicated with the line ``gave no outcome per event``. Either way the request
-        succeeded, so its events may have landed.
+        succeeded, so its events may have landed, and whatever the reader registered on the run's
+        context before it failed is discarded first, so the chunk is counted and announced once.
 
         Args:
           payload: The response body; an ``_UnreadBody`` when it could not be read.
@@ -2398,18 +2575,22 @@ class HTTPSink:
         Raises:
           None. A ``BaseException`` from the reader propagates.
         """
+        context = _engine.run_context()
+        mark = context._mark()
         try:
             if type(self)._READS_BOOL:
                 result = HTTPSink._outcomes(self, payload, chunk)
             else:
                 result = self._outcomes(payload, chunk)
         except Exception as err:
-            return self._unadjudicated(chunk, f"reading a 2xx response raised {type(err).__name__}")
+            context._rewind(mark)
+            return self._unadjudicated(chunk, f"reading a 2xx response raised {_type_name(err)}")
         try:
             outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
         except Exception:
             outcomes = None
         if outcomes is None:
+            context._rewind(mark)
             return self._unadjudicated(chunk, "reading a 2xx response gave no outcome per event")
         return outcomes
 
@@ -2420,7 +2601,9 @@ class HTTPSink:
         ``True`` makes every event ``ACCEPTED`` and ``False`` makes every event ``REJECTED``,
         which a chunk of nothing delivered meant in 1.x. It counts nothing; an override counts
         what it reads through the run context, and gives up on a body it cannot read through
-        :meth:`_unadjudicated`.
+        :meth:`_unadjudicated`. A loss it reports with no line of its own is announced by the
+        round (:func:`_announce_unlined`); an override that registers any line owns the
+        announcement of every loss it reports for the chunk.
 
         Args:
           payload: The response body; an ``_UnreadBody``, equal to ``b""``, when it could not be
@@ -2445,9 +2628,11 @@ class HTTPSink:
         ``failed``, since its events may have landed — announced as ``lost <n> <noun>(s);
         <class> <detail>; they may have landed; not retried``, and every event is ``UNKNOWN``,
         which never fails a run. A shipped sink is not idempotent, so its ``UNKNOWN`` is final at
-        once and this counts ``ALWAYS``. A subclass declaring ``log_foundry_idempotent = True``
-        has an ``UNKNOWN`` chunk resent, so for it this counts ``LAST``: an event is counted once
-        per run, and only when it ended the run unadjudicated.
+        once and this counts ``ALWAYS``. A run whose sink declares ``log_foundry_idempotent =
+        True`` resends an ``UNKNOWN`` chunk, so in it this counts ``LAST``: an event is counted
+        once per run, and only when it ended the run unadjudicated. It asks the run
+        (``RunContext.resends_unknown``) rather than this class, since a delegate forwarding
+        ``deliver`` to this sink is the one whose idempotence decides the resend.
 
         Args:
           items: The chunk the response describes.
@@ -2461,7 +2646,7 @@ class HTTPSink:
           None.
         """
         context = _engine.run_context()
-        when = When.LAST if _engine._idempotent(self) else When.ALWAYS
+        when = When.LAST if context.resends_unknown(self) else When.ALWAYS
         sent = len(items)
         name = type(self).__name__
         context.count(self, "dropped_unadjudicated", sent, when=when)
@@ -2689,7 +2874,7 @@ class HTTPSink:
                 )
             )
         if first is not None:
-            kind = type(first).__name__
+            kind = _type_name(first)
             pending.count("_unrenderable", failures)
             pending.announce(
                 lambda: _diag.lost(
@@ -3114,7 +3299,7 @@ class HTTPSink:
         try:
             status, payload, retry_after = self._attempt(request)
         except Exception as err:
-            reason = f"connection error, {type(err).__name__} {_diag.errno_of(err)}".rstrip()
+            reason = f"connection error, {_type_name(err)} {_diag.errno_of(err)}".rstrip()
             if is_retryable(self._retryable_error, err):
                 return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
             if not count_unexpected and not isinstance(err, SinkDeliveryError):
@@ -3309,8 +3494,8 @@ class HTTPSink:
         plain ``b""``.
 
         The guard catches ``Exception``, not the read's documented errors, for the reason
-        the readers give for their own: anything escaping here would escape the round, fail the
-        engine's run and report as undelivered a batch the destination may have accepted. It
+        the readers give for their own: anything escaping here would reach :meth:`_exchange` as
+        a failed attempt, resent or refused, for a request the destination may have accepted. It
         never catches ``BaseException``.
 
         The read takes no size argument unless :meth:`_response_limit` names a bound, and the
