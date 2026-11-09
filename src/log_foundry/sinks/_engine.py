@@ -1166,6 +1166,39 @@ it in a ``finally``, and each context is cleared when its run ends.
 """
 
 
+def outside_runs[**P, T](fn: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    """Runs caller-supplied code as if no engine run were in progress, as the ``emit`` path does.
+
+    A wrapper's per-event step — ``FilteringSink``'s predicate, ``TransformSink``'s function and
+    the check of what it returned — runs inside the wrapper's engine run on the ``deliver`` path,
+    where on the ``emit`` path it ran outside any. Caller code may call another sink's
+    ``deliver`` directly, which the ``Sink`` contract documents as a detached run of its own; seen
+    from inside the wrapper's run, :func:`one_round` would fold that call into the wrapper's
+    round, so the other sink's counts, lines and marks landed there, a mark fitted no position
+    and failed the round, and its loss line could be rewound unwritten (SPEC-075 FR-002, the
+    frame-3 review). So the calling context's run stack is emptied for the call and restored by
+    token in a ``finally``, whatever the call raises: the caller's code sees no run, and a
+    ``deliver`` it calls is detached. Only caller code goes through this; a wrapper's call of its
+    inner sink's ``deliver`` stays inside the run.
+
+    Args:
+      fn: The caller's callable.
+      *args: Its positional arguments.
+      **kwargs: Its keyword arguments.
+
+    Returns:
+      What ``fn`` returned.
+
+    Raises:
+      BaseException: Whatever ``fn`` raises, unchanged, after the run stack is restored.
+    """
+    token = _RUNS.set(())
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _RUNS.reset(token)
+
+
 def run_context() -> RunContext:
     """Returns the context of the innermost engine run on the calling context.
 

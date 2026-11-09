@@ -1667,3 +1667,236 @@ def test_a_replaced_http_backend_counter_refuses_naming_its_type() -> None:
     sink._http.log_foundry_counters = SinkCounters()
     with pytest.raises(TypeError, match="HTTPSink no longer offers deliver"):
         sink.deliver(events(1))
+
+
+# --- caller code runs outside any engine run (frame-3 review) -----------------------------------
+
+
+def _tee(kind: str, inner: Any, alerts: SQSSink, seen: list[Any] | None = None) -> Any:
+    """A wrapper whose caller code also delivers each ``ERROR`` event to an alerts sink directly.
+
+    The documented way to call a sink's ``deliver`` by hand: a detached run of its own. ``seen``
+    receives the alerts verdicts the caller's code got back.
+    """
+
+    def tee(event: dict[str, object]) -> Any:
+        fields = event.get("fields")
+        level = event.get("level")
+        if level == "ERROR" or (isinstance(fields, dict) and fields.get("alert")):
+            verdict = alerts.deliver([event])
+            if seen is not None:
+                seen.append(verdict.outcomes)
+        return True if kind == "filtering" else event
+
+    if kind == "filtering":
+        return FilteringSink(inner, predicate=tee)
+    return TransformSink(inner, tee)
+
+
+def _alerts(sender_fault: bool = True) -> SQSSink:
+    return SQSSink(
+        "https://sqs.example/alerts",
+        client=FaultingClient(sender_fault=sender_fault, code="InvalidParameterValue"),
+    )
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("path", ["worker", "orphan"])
+def test_caller_code_delivering_elsewhere_is_its_own_run_on_both_paths(
+    kind: str, path: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Frame-3 review (tee_worker): a predicate or function that tees an event to another sink.
+
+    Its ``alerts.deliver`` is a detached run of its own on the ``emit`` path. Seen from inside
+    the wrapper's run it was folded into the wrapper's round: the alert's sender-fault mark
+    fitted no position, the round failed, both delivered events were reported lost and the
+    alert's own line was rewound unwritten. Now the caller's code runs outside any run on both
+    paths, and the ``deliver`` path ends as the ``emit`` path does.
+    """
+    out = []
+    for through_emit in (False, True):
+        inner = Scripted([A], max_retries=2)
+        alerts = _alerts()
+        sink = _tee(kind, inner, alerts)
+        target = ThirdPartyWrapper(sink) if through_emit else sink
+        if path == "worker":
+            failed, _ = worked(target, [{"i": 0, "level": "INFO"}, {"i": 1, "level": "ERROR"}])
+        else:
+            log_foundry.configure(service="t", sink=target)
+            before = log_foundry.health().orphan_lost
+            log_foundry.info("fine")
+            log_foundry.info("alarm", alert=True)
+            failed = log_foundry.health().orphan_lost - before
+        written = lines(capsys.readouterr().err)
+        out.append((failed, sink.losses(), sum(len(r) for r in inner.rounds), written))
+        log_foundry.shutdown(timeout=5.0)
+    assert out[0] == out[1], out
+    failed, losses, landed, written = out[0]
+    assert failed == 0 and losses == SinkLosses(dropped=0, failed=0) and landed == 2
+    assert written == [
+        (
+            "log-foundry: lost 1 message(s); SQSSink, rejected as invalid "
+            "(first code: InvalidParameterValue); not retried"
+        )
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_a_retryable_alert_keeps_its_giving_up_line_through_a_wrapper(
+    kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Frame-3 review (tee2): the alert's detached round is its own last, so its line is written.
+
+    Folded into a wrapper round that was not the run's last, the alert's ``LAST`` line was
+    never kept. The inner sink answers ``RETRYABLE`` twice, then accepts.
+    """
+    out = []
+    for through_emit in (False, True):
+        inner = Scripted([[R, R], A], max_retries=2)
+        alerts = _alerts(sender_fault=False)
+        seen: list[Any] = []
+        sink = _tee(kind, inner, alerts, seen)
+        batch = [{"i": 0, "level": "INFO"}, {"i": 1, "level": "ERROR"}]
+        if through_emit:
+            sink.emit(batch)
+        else:
+            assert not run(sink, batch).failed
+        out.append((seen, alerts.losses(), lines(capsys.readouterr().err)))
+    assert out[0] == out[1], out
+    assert out[0][0] == [(R,)]
+    assert out[0][2] == [
+        "log-foundry: lost 1 message(s); SQSSink, still failing after 1 attempt(s); abandoned"
+    ]
+
+
+def test_a_nested_wrapper_still_delegates_inside_the_run() -> None:
+    """The helper empties the run stack for caller code only, never for an inner ``deliver``.
+
+    ``FilteringSink(TransformSink(x))``: the predicate and the function see no run; both
+    wrappers' rounds, and ``x``'s, run inside the one engine run.
+    """
+    depths: dict[str, list[int]] = {"predicate": [], "fn": [], "inner": []}
+
+    def predicate(event: dict[str, object]) -> bool:
+        depths["predicate"].append(len(_engine._RUNS.get()))
+        return True
+
+    def fn(event: dict[str, object]) -> dict[str, object]:
+        depths["fn"].append(len(_engine._RUNS.get()))
+        return event
+
+    def step(batch: list[dict[str, object]]) -> Verdict:
+        depths["inner"].append(len(_engine._RUNS.get()))
+        return Verdict.uniform(A, len(batch))
+
+    inner = Scripted([step])
+    sink = FilteringSink(TransformSink(inner, fn), predicate=predicate)
+    assert read_deliver(sink) is not None
+    assert not run(sink, events(2)).failed
+    assert depths == {"predicate": [0, 0], "fn": [0, 0], "inner": [1]}
+
+
+def caller_code_findings(
+    source: str, cls_name: str, named: frozenset[str] = frozenset()
+) -> tuple[set[str], list[str]]:
+    """The caller-supplied callables a class stores, and every call of one not made through
+    ``outside_runs``.
+
+    **Derived:** an attribute ``__init__`` assigns straight from a parameter it first hands to
+    ``require_callable`` — the constructor's own statement that the argument is code it will
+    call. ``named`` adds module functions that run caller code without being stored, each named
+    with its reason by the caller. **Checked:** in every method of the class, a call whose
+    function is ``self.<derived>`` or a ``named`` name is a finding unless it is the first
+    argument of an ``outside_runs`` call, which is not a call of it. **Not followed:** an alias
+    (``p = self._predicate; p(e)``), a call from another class or a module helper — bounded as
+    the nested-delivery check is.
+    """
+    cls = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.ClassDef) and node.name == cls_name
+    )
+    methods = {m.name: m for m in cls.body if isinstance(m, ast.FunctionDef)}
+    init = methods["__init__"]
+    callables = {
+        node.args[0].id
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "require_callable"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+    }
+    derived = {
+        target.attr
+        for node in ast.walk(init)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in callables
+        for target in node.targets
+        if isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    }
+    guarded = {f"self.{name}" for name in derived} | set(named)
+    findings = [
+        f"{cls_name}.{fn.name}:{node.lineno}: calls {ast.unparse(node.func)} outside outside_runs"
+        for fn in methods.values()
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in guarded
+    ]
+    return derived, findings
+
+
+_CALLER_CODE = {
+    "FilteringSink": ("filtering.py", frozenset(), {"_predicate"}),
+    "TransformSink": ("transform.py", frozenset({"_json_safe"}), {"_fn"}),
+}
+"""Each class, its module, the module functions named as caller code, and the derivation's floor.
+
+``_json_safe`` is named, not derived: it checks and coerces what the function returned, and that
+object's own methods (a ``dict`` subclass's ``items``) are caller code too.
+"""
+
+
+@pytest.mark.parametrize("cls_name", sorted(_CALLER_CODE))
+def test_every_call_of_caller_code_is_made_outside_the_run(cls_name: str) -> None:
+    module, named, floor = _CALLER_CODE[cls_name]
+    source = (_SINKS / module).read_text(encoding="utf-8")
+    derived, findings = caller_code_findings(source, cls_name, named)
+    assert derived == floor, "the derivation lost or gained a stored caller callable"
+    assert findings == []
+
+
+_CALLER_PLANTS = {
+    "a direct predicate": (
+        "filtering.py",
+        "FilteringSink",
+        "_engine.outside_runs(self._predicate, event)",
+        "self._predicate(event)",
+        "calls self._predicate outside outside_runs",
+    ),
+    "a direct function": (
+        "transform.py",
+        "TransformSink",
+        "_engine.outside_runs(self._fn, event)",
+        "self._fn(event)",
+        "calls self._fn outside outside_runs",
+    ),
+    "a direct check": (
+        "transform.py",
+        "TransformSink",
+        "_engine.outside_runs(_json_safe, result)",
+        "_json_safe(result)",
+        "calls _json_safe outside outside_runs",
+    ),
+}
+
+
+@pytest.mark.parametrize("plant", sorted(_CALLER_PLANTS))
+def test_the_caller_code_check_names_each_planted_direct_call(plant: str) -> None:
+    module, cls_name, old, new, reason = _CALLER_PLANTS[plant]
+    source = (_SINKS / module).read_text(encoding="utf-8")
+    assert source.count(old) == 1
+    named = _CALLER_CODE[cls_name][1]
+    _, findings = caller_code_findings(source.replace(old, new), cls_name, named)
+    assert any(reason in f for f in findings), findings

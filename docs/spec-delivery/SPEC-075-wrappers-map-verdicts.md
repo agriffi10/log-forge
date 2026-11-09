@@ -20,7 +20,9 @@
   copy per round broke a FIFO `SQSSink`'s order and its attempt-count line. `FilteringSink` keeps
   each forwarded event's decision the same way, so a resend is not put to the predicate or the
   level floor again. Asked again, a stateful predicate (dedupe, rate limit, sampling) could
-  decline its own resend and lose the event silently.
+  decline its own resend and lose the event silently. Caller code runs outside any engine run, as
+  on the `emit` path; a `deliver()` it calls is its own detached run (`_engine.outside_runs`, from
+  the frame-3 review).
 - `LogstashSink` is a pure delegate in both modes. In HTTP mode it offers when the `HTTPSink`
   does. In socket mode it offers on the `SocketTransport`'s counters and calls the transport's
   `deliver` directly, as `SyslogSink` does. Its verdict is the backend's, unmapped.

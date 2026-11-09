@@ -310,7 +310,9 @@ class FilteringSink:
         :meth:`deliver` outside any run is a run of its own.
 
         Only a forwarded event is remembered. A declined or failed one is ``SKIPPED``, which the
-        engine never resends, so no later round asks about it.
+        engine never resends, so no later round asks about it. The same event object twice in one
+        batch shares one decision, where :meth:`emit` asks per occurrence — the one exception to
+        the ``deliver``/``emit`` twin pair; a batch the library builds never repeats an identity.
 
         Args:
           event: One event of the wrapper's batch.
@@ -335,6 +337,10 @@ class FilteringSink:
         A known level below the floor is dropped, while an unknown or missing level fails open
         and is forwarded.
 
+        The predicate runs through ``_engine.outside_runs``, so it sees no engine run on the
+        ``deliver`` path, as on the ``emit`` path: a ``deliver`` it calls on another sink is a
+        detached run of its own, never folded into this wrapper's round (SPEC-075 FR-002).
+
         Args:
           event: The event to test.
 
@@ -345,7 +351,7 @@ class FilteringSink:
           Exception: The predicate's own exception, propagated so :meth:`emit` can count it as
             that one event's failure (SPEC-058 FR-002).
         """
-        if self._predicate is not None and not self._predicate(event):
+        if self._predicate is not None and not _engine.outside_runs(self._predicate, event):
             return False
         if self._min_rank is not None:
             level = event.get("level")

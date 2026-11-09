@@ -409,7 +409,9 @@ class TransformSink:
         it, and either makes the event ``SKIPPED``, which the engine never resends, so no later
         round asks for it. An identity that appears more than once in one batch shares the one
         result, and the inner sink then meets that object as often as the event appeared, as it
-        would meet the event itself bare.
+        would meet the event itself bare. That is the one exception to the ``deliver``/``emit``
+        twin pair: :meth:`emit` runs the function per occurrence. A batch the library builds
+        never repeats an identity.
 
         Args:
           event: One event of the wrapper's batch.
@@ -438,6 +440,12 @@ class TransformSink:
         and raised into :meth:`emit`'s per-event guard. Raising in a helper rather than inside
         that guard's ``try`` keeps the ``try`` body to the one call that can fail.
 
+        The function, and the check and coercion of what it returned — whose own methods are
+        caller code too — run through ``_engine.outside_runs``, so they see no engine run on the
+        ``deliver`` path, as on the ``emit`` path: a ``deliver`` the function calls on another
+        sink is a detached run of its own, never folded into this wrapper's round (SPEC-075
+        FR-002).
+
         Args:
           event: The event to transform.
 
@@ -450,14 +458,14 @@ class TransformSink:
           Exception: Whatever the function raises, or the coercion when it cannot rescue the
             result.
         """
-        result = self._fn(event)
+        result = _engine.outside_runs(self._fn, event)
         if result is None:
             return None
         if not isinstance(result, dict):
             raise TypeError(
                 f"TransformSink's function returned {type(result).__name__}, not a dict or None"
             )
-        return _json_safe(result)
+        return _engine.outside_runs(_json_safe, result)
 
     def _forward_stop_signal(self, signal: threading.Event | None) -> None:
         """Forwards the stop signal to the inner sink, which is where the waiting happens.

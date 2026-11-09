@@ -366,7 +366,9 @@ the message had made four. Only a forwarded result is kept: a declined or failed
 `SKIPPED`, which the engine never resends; so only a forwarded decision is kept. An event object that
 appears twice in one batch shares its one result. The notes end with the run, so the next run of the
 same events asks the predicate and runs the function afresh, and a direct `deliver` outside any run
-is a run of its own.
+is a run of its own. Caller code runs outside any engine run, as on the `emit` path; a `deliver()`
+it calls is its own detached run (`_engine.outside_runs`, routed for the predicate, the function and
+the check of what the function returned).
 
 **`deliver` writes nothing itself.** It enters no `Deferral`, takes no lock and assigns no
 attribute, so calls on the drain thread and on orphan threads share nothing (SPEC-028). Its only
@@ -384,7 +386,9 @@ second runs whenever a caller or a `MultiSink` calls `emit`. On the same batch a
 behaviour they forward the same events and end with the same `losses().dropped`, the same inner
 attributes and the same catcher term — a stateful predicate included, since neither path asks it
 again about an event it forwarded. `failed` is excluded from the comparison: it is the upper
-bound, and the two paths reach it by different counts.
+bound, and the two paths reach it by different counts. One exception: the same event object twice
+in one batch shares one predicate decision, or one transform result, on the `deliver` path, where
+`emit` asks per occurrence. A batch the library builds never repeats an identity.
 
 #### Acceptance Criteria:
 
@@ -407,6 +411,12 @@ bound, and the two paths reach it by different counts.
       to `[SKIPPED, RETRYABLE, SKIPPED, ACCEPTED]`. Round two gives the wrapper exactly `[b]`. The
       predicate is not asked again about `b`; the transform's function is not run again, and the
       inner sink is handed the same object round one forwarded.
+- [ ] Caller code that delivers an event to another sink directly (`alerts.deliver([event])`, a
+      sender-fault `SQSSink`) runs as its own detached run through both wrappers, on the worker
+      path and the orphan path: `failed_batches == 0` (no orphan loss), `losses().failed == 0`, the
+      alert's own line written once, equal to the `emit` path; a retryable alert's giving-up line is
+      written likewise. A wrapper nested in a wrapper still delegates inside the one run. An AST
+      check holds every call of a stored caller callable to the helper.
 - [ ] A predicate is asked once per event per run however many rounds the run makes, and afresh on
       the next run. Behind a dedupe predicate, a real `HTTPSink` answering `503` then `200` under a
       `Worker` makes exactly 2 POSTs with nothing counted and no loss line, through `deliver` as
@@ -741,3 +751,7 @@ tests/
   only inside an engine run, as the detached round never sets one aside bare (FR-002); the line
   rule is PR 319's per-round ownership, not a whole-run suppression; a `SKIPPED` event is counted
   nowhere except under SPEC-072's raising-round upper bound.
+- 2026-11-09, frame-3 review: caller code — the predicate, the transform's function and the check
+  of its result — runs outside any engine run through `_engine.outside_runs`, so a `deliver()` it
+  calls on another sink is its own detached run rather than folded into the wrapper's round
+  (FR-002), held by an AST check; the twin claim names the repeated-identity exception.

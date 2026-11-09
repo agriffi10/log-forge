@@ -79,6 +79,11 @@ then `200` made one POST where the `emit` path made two. A predicate raising on 
 a forwarded event to the inner `failed_events`. Only a forwarded event is kept, and only a
 forwarded event can be resent, so caller code never runs in a later round of a run. The all-failed
 refusal and every caller-code failure therefore arise only in the round that first sees an event.
+Caller code runs outside any engine run, as on the `emit` path; a `deliver()` it calls is its own
+detached run (`_engine.outside_runs`). Folded into the wrapper's round instead, a tee to an alerts
+sink failed a delivered batch and rewound the alert's own loss line. The one exception to the twin
+pair: the same event object twice in one batch shares one decision or result on the `deliver`
+path, where `emit` asks per occurrence; a batch the library builds never repeats an identity.
 
 **What a wrapper never does.** It declares no `log_foundry_idempotent` and defines no
 `_retryable_error`, so nothing that may have landed is resent through it. It never calls
@@ -103,6 +108,7 @@ the predicate again about a forwarded event, on a later round of one run. (SPEC-
 
 ### 2026-11-09
 
+- **Refined** the same day from the frame-3 review: caller code runs outside any engine run, so a `deliver()` it calls on another sink is its own detached run, never folded into the wrapper's round.
 - **Refined** the same day from the frame-2 diff review (Andrew's call): a `FilteringSink` keeps each forwarded event's predicate decision for the run, beside `TransformSink`'s result cache, so a stateful predicate can no longer drop its own resend; and a malformed inner verdict's registrations are set aside only inside an engine run.
 - **Settled** by SPEC-075 FR-001 to FR-004, with Andrew's calls on the read-only budget, the
   subclass-assignment break and the per-run transform cache.
