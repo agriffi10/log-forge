@@ -27,6 +27,7 @@ __all__ = [
     "Lost",
     "entry_ids",
     "mark_sent",
+    "raised_line",
     "read_keyed",
     "sends_of",
     "settle_keyed",
@@ -514,4 +515,27 @@ def settle_positional(
         line=lambda n, count: _diag.lost(
             "record", count, f"{name}, still failing after {n} attempt(s); abandoned"
         ),
+    )
+
+
+def raised_line(unit: str, name: str, kind: str, suffix: str = "") -> Callable[[int, int], None]:
+    """Returns the arc's one line for an exception, ``<Class>, N attempt(s), <Type>``.
+
+    SPEC-070's form, which SPEC-073 also writes; ``N`` is the calls that carried the events
+    (:class:`Lost`).
+
+    Args:
+      unit: What the count counts: ``row``, ``message``, ``event``.
+      name: The sink's class name.
+      kind: The exception's type name, never its text (invariant 11).
+      suffix: Anything 1.x appended, such as Postgres's borrowed-connection note.
+
+    Returns:
+      The line, given the attempt count and the event count.
+
+    Raises:
+      None.
+    """
+    return lambda attempts, count: _diag.lost(
+        unit, count, f"{name}, {attempts} attempt(s), {kind}{suffix}"
     )

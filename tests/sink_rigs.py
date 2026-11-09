@@ -247,7 +247,13 @@ def clickhouse(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = ClickHouseSink("t", client=_ClickHouse(state), max_retries=0, chunk_size=1)
-    return Rig(sink, state, lambda rows: [json.loads(r[-1]) for r in rows], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rows: [json.loads(r[-1]) for r in rows],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Channel:
@@ -472,7 +478,7 @@ def mongodb(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = MongoDBSink(client=_MongoClient(state), database="d", collection="c", max_retries=0)
-    return Rig(sink, state, lambda docs: list(docs), sink, "_unencodable")
+    return Rig(sink, state, lambda docs: list(docs), sink.log_foundry_counters, "dropped_events")
 
 
 class _Socket:
@@ -594,7 +600,13 @@ def postgres(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = PostgresSink("t", connection=_PGConnection(state), max_retries=0)
-    return Rig(sink, state, lambda rows: [json.loads(r[-1]) for r in rows], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rows: [json.loads(r[-1]) for r in rows],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Pipeline:

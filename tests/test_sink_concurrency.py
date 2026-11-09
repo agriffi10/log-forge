@@ -554,9 +554,10 @@ def test_losses_does_not_block_behind_an_in_flight_emit(tmp_path: Path) -> None:
 def _takes_the_transport_lock(
     node: ast.AST, helpers: dict[str, ast.FunctionDef | ast.AsyncFunctionDef], seen: set[str]
 ) -> bool:
-    """True when this node, or a same-class helper it calls, enters ``self._lock``.
+    """True when this node, or a same-class helper it calls or hands on, enters ``self._lock``.
 
-    Calls to same-class helpers are followed to any depth, which matters because several sinks
+    Same-class helpers are followed to any depth, called or referenced (SPEC-074: an engine
+    sink's ``deliver`` hands ``self._round`` to ``_engine.one_round`` rather than calling it), which matters because several sinks
     split the locked body out (``PostgresSink._insert_batch``, ``AzureEventHubsSink._send_batch``)
     and a check looking only at ``emit`` would read those as unlocked. ``seen`` makes self- and
     mutual recursion terminate.
@@ -590,15 +591,12 @@ def _takes_the_transport_lock(
                 ):
                     return True
         if (
-            isinstance(inner, ast.Call)
-            and isinstance(inner.func, ast.Attribute)
-            and isinstance(inner.func.value, ast.Name)
-            and inner.func.value.id == "self"
-            and inner.func.attr in helpers
-            and inner.func.attr not in seen
-            and _takes_the_transport_lock(
-                helpers[inner.func.attr], helpers, seen | {inner.func.attr}
-            )
+            isinstance(inner, ast.Attribute)
+            and isinstance(inner.value, ast.Name)
+            and inner.value.id == "self"
+            and inner.attr in helpers
+            and inner.attr not in seen
+            and _takes_the_transport_lock(helpers[inner.attr], helpers, seen | {inner.attr})
         ):
             return True
     return False

@@ -300,7 +300,8 @@ def test_encode_runs_once_per_emit_not_per_attempt(
     rig.sink.emit(batch)
     assert [kind for kind, _ in rig.state.log].count("refused") == 2, "three attempts were made"
     assert len(calls) == len(batch)
-    assert rig.delivered() == ["a", "b", "c"]
+    # Each lands once; since SPEC-074 a chunk that failed is resent after its round's later ones.
+    assert sorted(rig.delivered()) == ["a", "b", "c"]
 
 
 @pytest.mark.parametrize("name", ["StdoutSink", "HTTPSink"])
@@ -373,12 +374,17 @@ def test_multisink_all_unencodable_is_one_term(
 def test_a_spent_bound_counts_the_whole_batch_in_failed(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """``failed`` is the whole batch, the unencodable event included, as before SPEC-069."""
+    """``failed`` is the batch's encodable events; the unencodable one is its catcher's.
+
+    Before SPEC-074 the whole batch, the unencodable event included, as before SPEC-069; on the
+    engine an unencodable event is ``DROPPED``, which a failed run hands to its catcher, so the
+    upper bound is tighter by it.
+    """
     rig = RIGS[name](monkeypatch, tmp_path)
     rig.state.down = True
     with pytest.raises(SinkDeliveryError):
         rig.sink.emit([ok("a"), unencodable()])
-    assert rig.sink.failed == 2
+    assert rig.sink.failed == (1 if hasattr(rig.sink, "log_foundry_counters") else 2)
     assert rig.count() == 0
 
 
@@ -729,7 +735,15 @@ GAINED_LOSSES = frozenset(
 
 ENGINE_GAINED: dict[str, frozenset[str]] = {
     name: frozenset({"deliver", "log_foundry_counters"})
-    for name in ("SQSSink", "SNSSink", "KinesisSink", "FirehoseSink")
+    for name in (
+        "SQSSink",
+        "SNSSink",
+        "KinesisSink",
+        "FirehoseSink",
+        "ClickHouseSink",
+        "MongoDBSink",
+        "PostgresSink",
+    )
 }
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
@@ -1057,7 +1071,7 @@ def test_an_unencodable_oversized_document_counts_once(
     _install_bson(monkeypatch, refuse)
     rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
     rig.sink.emit([{"log_id": "big", "pad": "x" * (17 * 1024 * 1024), "n": 2**64}])
-    assert (rig.sink._unencodable, rig.sink.dropped_oversized) == (1, 0)
+    assert (rig.count(), rig.sink.dropped_oversized) == (1, 0)
 
 
 def test_mongo_with_a_bson_whose_import_raises_inserts_everything(

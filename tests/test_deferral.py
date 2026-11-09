@@ -233,7 +233,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
-    "sinks/mongodb.py": {"MongoDBSink": ("emit", "_documents")},
     "sinks/eventhubs.py": {"AzureEventHubsSink": ("emit", "_send_batch")},
     "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
     "sinks/syslog.py": {"SyslogSink": ("emit",)},
@@ -242,10 +241,8 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
     "sinks/stdout.py": {"StdoutSink": ("emit",)},
     "sinks/file.py": {"FileSink": ("emit",), "RotatingFileSink": ("emit",)},
-    "sinks/clickhouse.py": {"ClickHouseSink": ("emit",)},
     "sinks/rabbitmq.py": {"RabbitMQSink": ("emit",)},
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
-    "sinks/postgres.py": {"PostgresSink": ("emit",)},
     "sinks/redis.py": {"_RedisSink": ("emit",)},
     "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
@@ -271,7 +268,6 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("MongoDBSink", "emit"): frozenset({"failed"}),
     ("AzureEventHubsSink", "_send"): frozenset({"failed"}),
     ("SocketTransport", "_send_one"): frozenset({"failed"}),
     ("SocketTransport", "_socket"): frozenset({"_sock"}),
@@ -281,7 +277,6 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
     ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
     ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
-    ("ClickHouseSink", "_insert"): frozenset({"failed"}),
     ("RabbitMQSink", "_publish"): frozenset({"failed"}),
     ("RabbitMQSink", "_active_channel"): frozenset({"_connection", "_channel"}),
     ("RabbitMQSink", "_reset"): frozenset({"_connection", "_channel"}),
@@ -294,10 +289,7 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
     ("RotatingFileSink", "_ensure_open"): frozenset({"_stream", "_size"}),
-    ("PostgresSink", "_insert_batch"): frozenset({"failed"}),
-    ("PostgresSink", "_reconnect_if_broken"): frozenset({"_conn", "_reconnect_announced"}),
     ("_RedisSink", "_send"): frozenset({"failed"}),
-    ("MongoDBSink", "_resolve_bson"): frozenset({"_bson_encode", "_bson_resolved"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -310,8 +302,6 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``MongoDBSink.emit`` / ``failed``: rejected documents and connection errors past the bound; the
-  same upper bound.
 - ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper
   bound, its line still written under the emit lock as before (SPEC-059 *Out of Scope*).
 - ``SocketTransport._send_one`` / ``failed``: a message abandoned past the reconnect bound; the
@@ -326,25 +316,21 @@ counts as it happens rather than through the ``Deferral``:
   expired; the same upper bound.
 - ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
   pending list, rebound as futures settle or are put back; state, not a count.
-- ``ClickHouseSink._insert`` and ``RabbitMQSink._publish`` / ``failed``: a chunk or a message
-  abandoned past the retry bound, counted as it happens; the same upper bound. SPEC-069 put both
-  sinks on the ledger for their encode step and left these as they were.
+- ``RabbitMQSink._publish`` / ``failed``: a message abandoned past the retry bound, counted as it
+  happens; the same upper bound. SPEC-069 put the sink on the ledger for its encode step and left
+  this as it was.
 - ``RabbitMQSink._active_channel``, ``_reset`` / ``_connection``, ``_channel``, and
   ``_persistent_properties`` / ``_properties``: the held connection, channel and message
   properties, opened, dropped and built lazily; state, not a count.
 - ``RotatingFileSink.emit``, ``_rotate_or_continue``, ``_rotate`` and ``_ensure_open`` / ``_size``, ``_stream``,
   ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
   next time trigger and the once-per-outage flag; state, not a count.
-- ``PostgresSink._insert_batch`` and ``_RedisSink._send`` / ``failed``: a batch abandoned past the
-  retry bound, counted before the raise; the same upper bound. SPEC-069 moved the encode out of
-  both retry loops and left these as they were.
-- ``PostgresSink._reconnect_if_broken`` / ``_conn``, ``_reconnect_announced``: the held connection,
-  reopened when broken, and its once-per-outage flag; state, not a count.
+- ``_RedisSink._send`` / ``failed``: a batch abandoned past the retry bound, counted before the
+  raise; the same upper bound. SPEC-069 moved the encode out of the retry loop and left this as it
+  was.
 - ``FileSink.emit``, ``RotatingFileSink.emit`` and ``SQLiteSink.emit`` / ``_failed``: a batch
   whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
   an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.
-- ``MongoDBSink._resolve_bson`` / ``_bson_encode``, ``_bson_resolved``: the driver's own encoder,
-  found lazily on the first emit as the BSON detector (SPEC-069 FR-003); state, not a count.
 
 ``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
 ``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).

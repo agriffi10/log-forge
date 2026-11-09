@@ -1379,7 +1379,11 @@ def test_a_wholly_rejected_mongo_bulk_write_raises(capsys) -> None:
         def insert_many(self, documents, ordered: bool = True):
             self.inserted.append((list(documents), ordered))
             err = RuntimeError("bulk failed")
-            err.details = {"writeErrors": [{}] * len(list(documents))}  # type: ignore[attr-defined]
+            # Each entry names its document's index: since SPEC-074 FR-003 an entry naming none
+            # cannot be paired, which counts the documents as unknown rather than rejected.
+            err.details = {  # type: ignore[attr-defined]
+                "writeErrors": [{"index": i} for i in range(len(list(documents)))]
+            }
             raise err
 
     sink = make_sink(Rejecting())

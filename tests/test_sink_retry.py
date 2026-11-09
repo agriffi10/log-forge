@@ -322,9 +322,7 @@ def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
     assert missing == [], f"retry loops with no interruptible wait: {missing}"
 
 
-_NOT_YET_CONVERTED = frozenset(
-    {"_socket", "clickhouse", "eventhubs", "mongodb", "postgres", "rabbitmq", "redis"}
-)
+_NOT_YET_CONVERTED = frozenset({"_socket", "eventhubs", "rabbitmq", "redis"})
 """SPEC-074's transitional set: the modules whose retry loop a later phase of its build deletes.
 
 Each phase removes the modules it puts on the engine, so the set shrinks visibly and exactly; it
