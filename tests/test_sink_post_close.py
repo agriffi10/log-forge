@@ -42,6 +42,11 @@ ENGINE_CLOSED: dict[str, Callable[[int], str]] = {
         f"SocketTransport delivered none of {n} message(s): the transport is closed"
     ),
     "NATSSink": lambda n: f"NATSSink published none of {n} event(s): the sink is closed",
+    "MongoDBSink": lambda n: f"MongoDBSink inserted none of {n} document(s): the sink is closed",
+    "RedisListSink": lambda n: f"RedisListSink delivered none of {n} event(s): the sink is closed",
+    "RedisStreamsSink": lambda n: (
+        f"RedisStreamsSink delivered none of {n} event(s): the sink is closed"
+    ),
 }
 """Each engine adopter's closed message, fda134a's text (``SocketTransport`` counts the batch, as
 SPEC-074 made it). ``NATSSink`` keeps its own closed state (SPEC-061) and answers the same way."""
@@ -56,6 +61,7 @@ EMIT_ONLY_CLOSED: dict[str, Callable[[int], str]] = {
     "FileSink": lambda n: f"FileSink wrote none of {n} event(s): the sink is closed",
     "RotatingFileSink": lambda n: f"RotatingFileSink wrote none of {n} event(s): the sink is closed",
     "SQLiteSink": lambda n: f"SQLiteSink inserted none of {n} event(s): the sink is closed",
+    "KafkaSink": lambda n: f"KafkaSink produced none of {n} message(s): the sink is closed",
 }
 """Each emit-only adopter's 1.x refusal, raised from ``emit``."""
 
@@ -358,3 +364,107 @@ def test_the_worker_and_orphan_paths_leave_one_ledger(
         ledgers.append(built.target.losses())
         log_foundry.shutdown(timeout=LIMIT)
     assert ledgers[0] == ledgers[1] == SinkLosses(dropped=0, failed=0)
+
+
+def test_a_closed_kafka_flush_raises_its_message(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-3: ``KafkaSink.flush()`` after ``close()`` raises its own 1.x refusal."""
+    rig = sink_rigs.RIGS["KafkaSink"](monkeypatch, tmp_path)
+    rig.sink.close()
+    with pytest.raises(SinkDeliveryError) as raised:
+        rig.sink.flush()
+    assert type(raised.value) is SinkDeliveryError
+    assert str(raised.value) == "KafkaSink cannot flush: the sink is closed"
+
+
+ADOPTER_RIGS = (
+    "AzureEventHubsSink",
+    "ClickHouseSink",
+    "FileSink",
+    "KafkaSink",
+    "LogstashSink",
+    "MongoDBSink",
+    "PostgresSink",
+    "RabbitMQSink",
+    "RedisListSink",
+    "RedisStreamsSink",
+    "RotatingFileSink",
+    "SQLiteSink",
+    "SyslogSink",
+)
+"""Every adopter by the sink a caller holds: ``SocketTransport`` through its two holders."""
+
+
+@pytest.mark.parametrize("name", ADOPTER_RIGS)
+def test_an_empty_batch_returns_before_the_guard(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AC-5: ``emit([])`` returns ``None``, open and closed, and reaches no driver."""
+    rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+    assert rig.sink.emit([]) is None
+    rig.sink.close()
+    before = rig.calls()
+    assert rig.sink.emit([]) is None
+    assert rig.calls() == before
+
+
+PAST_THE_BOUND = {
+    "MongoDBSink": ("pymongo.errors", "InvalidOperation", "_Collection", "insert_many"),
+    "RedisListSink": ("redis.exceptions", "ConnectionError", "_Pipeline", "execute"),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PAST_THE_BOUND))
+def test_a_round_past_the_bound_fails_on_the_released_client(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SPEC-076 FR-003 AC-5: a round still inside after the close's bound meets a closed client.
+
+    The drain thread's round parks in the client; a close on the test's thread waits its bound,
+    then releases. The parked call then raises what that driver raises on a closed client. Nothing
+    raises into the closing thread, no later round calls the client, and the two drivers differ
+    only in what is counted: ``pymongo``'s ``InvalidOperation`` is ``REJECTED`` and counted in
+    ``.failed``; ``redis-py``'s ``ConnectionError`` is ``RETRYABLE``, the next round is refused,
+    and a failed run commits nothing for it.
+    """
+    import driver_standins
+
+    module_key, error_name, double_name, method = PAST_THE_BOUND[name]
+    errors = driver_standins.install(monkeypatch, module_key)
+    double = getattr(sink_rigs, double_name)
+    inside, let_go = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def parked(self: Any, *args: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        inside.set()
+        assert let_go.wait(LIMIT)
+        raise getattr(errors, error_name)("the client is closed")
+
+    monkeypatch.setattr(double, method, parked)
+    rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+    if name == "MongoDBSink":
+        from log_foundry.sinks.mongodb import MongoDBSink
+
+        sink: Any = MongoDBSink(
+            client=sink_rigs._MongoClient(rig.state), database="d", collection="c", max_retries=1
+        )
+    else:
+        from log_foundry.sinks.redis import RedisListSink
+
+        sink = RedisListSink("k", client=sink_rigs._Redis(rig.state), max_retries=1)
+    worker = Worker(sink, batch_size=1000, flush_interval=60.0, max_retries=0)
+    install_worker(worker)
+    worker.submit(_batch(3))
+    flushed: list[bool] = []
+    flusher = threading.Thread(target=lambda: flushed.append(worker.flush(timeout=LIMIT)))
+    flusher.start()
+    assert inside.wait(LIMIT), "the drain thread never reached the client"
+    sink.close()
+    let_go.set()
+    flusher.join(LIMIT * 2)
+    assert len(flushed) == 1 and not flushed[0], "a run that failed reported a flush success"
+    assert calls["n"] == 1, "a round after the release reached the client"
+    assert log_foundry.health().failed_batches == 1
+    assert sink.failed == (3 if name == "MongoDBSink" else 0)

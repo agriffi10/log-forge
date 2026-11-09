@@ -479,11 +479,12 @@ class SocketTransport:
 
         Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
         refused at once, the one round inside, if any, is waited for and never released under,
-        and the release runs once; a second close waits for the first's release, then returns. It never closes the
-        socket out from under an in-flight round (SPEC-028 FR-002), and a second close no
-        longer repeats the release on the strength of ``_reset`` doing nothing twice. ``_reset`` does not take the lock itself,
-        because ``_send_one`` calls it while :meth:`_round` already holds one — the lock is
-        deliberately not re-entrant, so that path must stay the only unlocked caller.
+        and the release runs once; a second close waits for the first's release, then returns.
+        It never closes the socket out from under an in-flight round (SPEC-028 FR-002), and a
+        second close no longer repeats the release on the strength of ``_reset`` doing nothing
+        twice. ``_reset`` does not take the lock itself, because ``_send_one`` calls it while
+        :meth:`_round` already holds one, and the guard runs it as the release with the lock
+        held too — the lock is deliberately not re-entrant, so neither path may take it.
 
         Args:
           None.

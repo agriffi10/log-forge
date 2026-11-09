@@ -262,6 +262,7 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
+    ("KafkaSink", "emit"): frozenset({"failed"}),
     ("GooglePubSubSink", "emit"): frozenset({"failed"}),
     ("GooglePubSubSink", "_resolve"): frozenset({"failed"}),
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
@@ -302,7 +303,11 @@ counts as it happens rather than through the ``Deferral``:
   whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
   an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.
 
-``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
+- ``KafkaSink.emit`` / ``failed``: the messages a call handed to the producer while the close's
+  release overtook it (SPEC-076 FR-003), counted beside ``_on_delivery``'s and only when the call
+  returns normally; the release's flush may have delivered some, so the same upper bound.
+
+``KafkaSink``'s delivery callback needs no entry: its ``failed`` is in ``_on_delivery``, passed to
 ``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).
 """
 

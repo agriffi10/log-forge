@@ -670,8 +670,9 @@ class PostgresSink:
 
         Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
         refused at once, the one round inside, if any, is waited for and never released under,
-        and the release runs once; a second close waits for the first's release, then returns. The final commit never
-        lands in the middle of another thread's transaction (SPEC-028 FR-002).
+        and the release runs once; a second close waits for the first's release, then returns.
+        The final commit never lands in the middle of another thread's transaction
+        (SPEC-028 FR-002).
 
         **The final commit is guarded** (SPEC-041 FR-002). It was unconditional, so a connection
         the server had closed made ``close()`` raise — reachable without any exotic timing, since

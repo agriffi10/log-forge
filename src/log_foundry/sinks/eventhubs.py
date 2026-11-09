@@ -410,8 +410,8 @@ class AzureEventHubsSink:
 
         Idempotent through the guard (SPEC-076 FR-002): once a close begins every later round is
         refused at once, the one round inside, if any, is waited for and never released under,
-        and the release runs once; a second close waits for the first's release, then returns. The producer is never
-        closed out from under an in-flight send (SPEC-028 FR-002).
+        and the release runs once; a second close waits for the first's release, then returns.
+        The producer is never closed out from under an in-flight send (SPEC-028 FR-002).
 
         Args:
           None.
