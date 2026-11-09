@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A sink declares what it retries, and anything else fails at once"
-description: "every sink retry loop asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver` (the HTTP family since SPEC-073), whose refused events are final. (SPEC-070, SPEC-073)"
+description: "every sink retry loop, and since SPEC-074 every engine sink's round, asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver` (the HTTP family since SPEC-073, the SDK, driver and socket sinks since SPEC-074), whose refused events are final. (SPEC-070, SPEC-073, SPEC-074)"
 ---
 
 **A sink declares what it retries, and anything else fails at once** — before SPEC-070 ten SDK and
@@ -25,7 +25,11 @@ exit it takes when attempts run out: the same counter, the same `_diag` line, th
 `SinkDeliveryError`, with the attempt count the truth, `attempt + 1`. The six loops that wrote a
 bare `N attempts` now write `N attempt(s)` like the rest. A failure that fails at once takes no
 backoff wait (invariant 3). `KeyboardInterrupt`, `SystemExit` and `CancelledError` are not
-`Exception` and still reach the caller.
+`Exception` and still reach the caller. Since SPEC-074 none of those eleven loops remains: each of
+those sinks makes one attempt per chunk per round in `deliver`, whose handler asks the same
+`is_retryable(self._retryable_error, err)`, an accepted exception making its events `RETRYABLE` for
+the engine and any other `REJECTED` at its first attempt (*A sink round resends only what failed,
+and an SQS FIFO group keeps its order*).
 
 **The predicate is a plain callable with one definition.** `sinks/_classify.py`, a leaf module,
 defines `ErrorPredicate` (`Callable[[Exception], bool]`, True when another attempt may succeed),
@@ -106,7 +110,9 @@ worker not to re-send it is a contract change for every sink, rejected in *A pro
 is a private predicate hook, not a second loop*; SPEC-072's verdict is where it lands. Since
 SPEC-073 the worker calls the HTTP family's `deliver` instead of its `emit`, so a refused HTTP
 request is sent once and counted once (*The HTTP family delivers in rounds on the engine*); a
-third-party subclass not offered `deliver` keeps this resend.
+third-party subclass not offered `deliver` keeps this resend. Since SPEC-074 the same holds for the
+SDK, driver and socket sinks: a refused event is sent once in total, and only a subclass that
+overrides `emit` keeps the resend, counted once per `emit` call.
 
 **Rejected: naming the transient classes in each `except` clause.** It cannot import a driver the
 caller has not installed, it gives SPEC-072's engine nothing to take as an argument, and it would
@@ -116,12 +122,20 @@ See above: a lazily imported driver would leave the set empty for good.
 **Do NOT build** a retry loop that does not ask `is_retryable(self._retryable_error, err)`, a
 predicate that imports its driver, or a cached class set. `tests/test_classify.py` holds the loops
 to the rule with a roster derived from the AST (every `for` over `range(...)` naming `retries`, a
-floor of eleven since SPEC-073, a fixture corpus), holds `http.py` to reaching `_attempt` only
+floor of eleven since SPEC-073, a fixture corpus; restated by SPEC-074 over the engine sinks'
+rounds, every class defining `deliver` less its named exclusions, floor 11), holds `http.py` to reaching `_attempt` only
 through `_exchange` inside an engine round, holds SQS and SNS to reading `SenderFault` only through
 `sender_fault`, and — on the integration workflow's extras leg — checks every class name a
 predicate resolves exists in the installed driver, so a rename cannot empty a set unnoticed.
 
 ## History
+
+### 2026-11-09
+
+- **Refined** by SPEC-074 FR-002 to FR-006: the eleven remaining retry loops are gone, each sink's
+  `deliver` round asking the predicate instead, and the worker no longer re-sends a refused batch
+  to the SDK, driver and socket sinks. `tests/test_classify.py`'s loop roster is restated over the
+  engine rounds, floor 11. The table is unchanged.
 
 ### 2026-11-08
 
