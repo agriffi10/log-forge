@@ -52,8 +52,8 @@ refused. `pymongo`'s `InvalidOperation` is `REJECTED` and counted in `.failed`. 
 - **Handing the release to the call inside**, so the close returns at once and the last section
   out releases. `close()` would then return before the release, which is the "returned through"
   shape the guard forbids: a caller would believe a producer was flushed when it was not.
-- **An unbounded `CLOSE_ONLY` wait.** `redis-py` gives a call no timeout by default, so a close could wait
-  forever on a call it cannot see, and a detached close would always spend its whole grace. The
+- **An unbounded `CLOSE_ONLY` wait.** A `redis-py` call is bounded only by the client's own socket timeout,
+  which the library neither sets nor sees, so a close could wait as long as that call, and a detached close would always spend its whole grace. The
   accepted cost is that a Redis call past the bound can reopen a connection nothing reaps, the leak
   the SPEC-032 decision records.
 

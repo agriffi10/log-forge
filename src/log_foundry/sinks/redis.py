@@ -361,8 +361,8 @@ class _RedisSink:
         ``ConnectionError``, which is ``RETRYABLE``, and the run's next round is refused,
         so a failed run commits nothing for it and its catcher counts the batch. Such a
         round can also reopen a connection nothing reaps, the leak SPEC-032 records for a
-        post-close emit, accepted against waiting without bound on a call the client
-        gives no timeout.
+        post-close emit, accepted against waiting on a call bounded only by the client's
+        own socket timeout, which the library neither sets nor sees.
 
         Args:
           None.

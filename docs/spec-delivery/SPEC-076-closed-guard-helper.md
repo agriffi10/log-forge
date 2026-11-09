@@ -63,7 +63,7 @@
 - Accepted: the release itself (`client.close()`, `producer.flush()`, a file's `close()`) stays as
   unbounded as `architecture.md` §13 records. Only the wait for a call already inside is bounded.
 - Accepted: a Redis call that outlives the bound can reopen a connection nothing reaps, the leak
-  the SPEC-032 decision records. The alternative was an unbounded wait on a call with no timeout.
+  the SPEC-032 decision records. The alternative was an unbounded wait on a call bounded only by the client's own socket timeout.
 - Accepted: Kafka's overtaken count includes messages the release's flush may have delivered. It
   is invariant 2's upper bound for `failed`, never an undercount.
 - Accepted: an interrupt landing inside a `CLOSE_ONLY` `enter()` between registering the section

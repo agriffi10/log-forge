@@ -785,3 +785,6 @@ tests/
     still accepts after the fork (the parent is untouched, invariant 12's other half).
   - The test that assigns `sink._lock` is at `tests/test_fork_lifecycle.py:902` at `095ccd76`
     (`:898` at `fda134a`); the criteria named the older line.
+- At completion: FR-003's "a call the client gives no timeout" for Redis is narrowed. The installed
+  `redis-py` 8.1.0 builds a connection with a 5 s socket timeout by default, so the call is bounded
+  by the client's own timeout, which the library neither sets nor sees. The rule is unchanged.
