@@ -486,11 +486,13 @@ class RunContext:
 
         True only inside an engine run whose budget ends with this round, so a sink holding an
         event back for a later round (``SQSSink`` FIFO, SPEC-074 Q4) knows there is none and sends
-        it. A run can still end sooner — every event final, or the worker declining before a
-        later round — and a held event is then never sent. A detached round and an immediate
-        context answer False: their caller is handed the verdict and owns any later round, so
-        holding is still the right answer there. This is the budget's last round, not
-        :attr:`When.LAST`'s sense, under which a detached round commits as its own last.
+        it. A run the worker declines before its last round never reaches it, and a held event
+        is then never sent. A detached round and an immediate context answer False, because
+        their caller is handed the verdict and only it knows whether a later round follows. A
+        detached run keeps no send counts across calls, so an ``SQSSink`` FIFO hold there does
+        not release over a caller's own loop of ``deliver`` calls. This is the budget's last
+        round, not :attr:`When.LAST`'s sense, under which a detached round commits as its own
+        last.
 
         Args:
           None.

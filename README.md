@@ -913,8 +913,8 @@ Two things worth knowing:
   sends; once that one has used its sends, a later message may land first. Holding a group for
   the worker's whole budget would trade log delivery for ordering you can rebuild from
   `timestamp`, so the sink doesn't. The delivery's last round holds nothing, so a waiting message
-  is sent right after the earlier one's final send. Only a delivery the worker ends early leaves
-  one unsent, counted on `.failed` and named on stderr as held behind an earlier message of its
+  is sent right after the earlier one's final send. A delivery the worker ends early, or a direct
+  `deliver()` call, can leave one unsent, counted on `.failed` and named on stderr as held behind an earlier message of its
   group.
 - **FIFO queues cap throughput** at 300 messages/second (3,000 with batching), or higher in
   high-throughput mode. That's queue-side configuration, not something the library sets.

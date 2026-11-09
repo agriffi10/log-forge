@@ -23,7 +23,7 @@ from log_foundry.sinks.firehose import FirehoseSink
 from log_foundry.sinks.kinesis import KinesisSink
 from log_foundry.sinks.sns import SNSSink
 from log_foundry.sinks.sqs import SQSSink
-from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+from log_foundry.sinks.verdict import SinkCounters, Verdict
 from log_foundry.worker import Worker
 
 Reply = Callable[[list[dict[str, Any]], int], Any]
@@ -396,29 +396,27 @@ def test_a_run_ending_before_its_last_round_counts_a_held_event_with_its_own_lin
     )
 
 
-def test_only_an_engine_runs_last_round_is_last() -> None:
-    seen: list[tuple[int, bool]] = []
+def test_a_forwarded_deliver_takes_last_from_the_outer_runs_budget() -> None:
+    sink, client = _fifo(failing("SQSSink", lambda e: e["i"] in (0, 1)), max_retries=3, chunk=1)
+    seen = _rounds(client, sink)
 
-    class Probe:
-        max_retries = 2
+    class Wrapper:
+        max_retries = 0
 
         def __init__(self) -> None:
             self.log_foundry_counters = SinkCounters()
 
         def deliver(self, batch: list[dict[str, object]]) -> Verdict:
-            context = _engine.run_context()
-            seen.append((context.round, context.last))
-            return Verdict.uniform(Outcome.RETRYABLE, len(batch))
+            return sink.deliver(batch)
 
         def emit(self, batch: list[dict[str, object]]) -> None:
             _engine.emit_via_deliver(self, batch)
 
-    _engine.run_delivery(Probe(), [{"i": 0}], worker_retries=1, stop=None)
-    assert seen == [(1, False), (2, False), (3, False), (4, False), (5, False), (6, True)]
-    seen.clear()
-    _engine.one_round(Probe().deliver, [{"i": 0}])
-    assert seen == [(1, False)], "a detached round's caller owns any later round"
-    assert _engine.run_context().last is False
+    delivery = _engine.run_delivery(Wrapper(), _grouped("AAA"), worker_retries=0, stop=None)
+    assert seen == [(1, 0), (1, 1), (1, 2)], (
+        "the outer run's one round is its last, though SQS's own max_retries would hold A1 and A2"
+    )
+    assert delivery is not None and not delivery.failed
 
 
 # --- Kinesis and Firehose: an unreadable reply ------------------------------------------------
