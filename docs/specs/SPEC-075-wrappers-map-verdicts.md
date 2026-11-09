@@ -193,7 +193,9 @@ the wrapper offers `deliver`, it copies `max_retries` and `max_retry_after` from
 read with `_static_value` exactly as the engine reads them on the bare inner sink, and stores each
 value as found where the static reader finds it on the wrapper. So a budget behind a property reads
 as absent on both paths, and the wrapped sink gets the rounds it gets alone. One the inner sink
-lacks, or that cannot be read, is not set, and the engine uses its default. The copy is a pass-through, not a floor. The engine judges exactness, and SPEC-066's
+lacks, or that cannot be read, and both names on a wrapper that offers nothing, are stored as
+`None`, which the engine treats as absent and uses its default; so a public read never returns the
+descriptor object. The copy is a pass-through, not a floor. The engine judges exactness, and SPEC-066's
 guard, which looks for a `max(...)` floor, has nothing to see. A later assignment to the inner
 sink's attribute is not seen.
 
@@ -228,9 +230,12 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
       emit-only sink, a sink with `deliver` and no counters, a `MultiSink`, a third-party emit-only
       wrapper and a `__getattr__` proxy, and for a subclass of either wrapper that overrides `emit`.
 - [ ] Over an emit-only inner sink the worker calls the wrapper's `emit`.
-      `tests/test_wrapper_failures.py`, `tests/test_transform_coercion.py`,
-      `tests/test_sinks_compose.py` and `tests/test_multi_absorbed.py` are not edited by this spec
-      and pass.
+      `tests/test_transform_coercion.py`, `tests/test_sinks_compose.py` and
+      `tests/test_multi_absorbed.py` are not edited by this spec and pass.
+      `tests/test_wrapper_failures.py` passes with one edit: its pin of each wrapper's public names
+      gains a named "gained by SPEC-075" set (`deliver`, `log_foundry_counters`, `max_retries`,
+      `max_retry_after`) beside its 1.x set, as `tests/test_sinks_encode.py`'s `ENGINE_GAINED`
+      does; invariant 10 lets the surface grow.
 - [ ] Through a real `Worker` with its default `max_retries=3`, a wrapped always-`RETRYABLE` inner
       sink with `max_retries=2` gets exactly the `deliver` calls the bare inner sink gets: 12, the
       1.x total budget `(2 + 1) × (3 + 1)`. As an orphan `info()` both get 3. An inner sink with no
@@ -316,6 +321,15 @@ The wrapper reads `retry_after` only from a verdict that `outcomes_of` accepted,
 fail a run that the bare inner sink's run settles. When nothing is forwarded the inner sink is not
 called. `deliver([])` returns an empty verdict.
 
+**The inner sink's marks are moved into the wrapper's positions.** SPEC-074 lets a round mark
+positions of the batch it was handed, through `RunContext.final_rejections` (SQS, SNS) and
+`RunContext.sink_counted` (NATS), and the engine checks each mark against the run sink's verdict.
+The run sink is now the wrapper, so after the inner `deliver` returns the wrapper rewrites every mark
+the inner round registered from the inner sink's positions to its own, through the same position
+map it uses for the outcomes. An index outside the forwarded list stays invalid, so a round that
+the bare sink's engine would fail still fails. Without the rewrite, a declined event ahead of a
+marked one shifts the indices and the engine fails a round the bare sink settles.
+
 **The engine resends the wrapper's original events.** So on a later round the predicate or function
 runs again, once for each event still to send. That is what the worker's 1.x whole-batch retry did.
 
@@ -364,6 +378,11 @@ bound, and the two paths reach it by different counts.
       `wrapper.losses() == bare.losses()`, both `dropped == 1`. A batch whose every entry fails
       retryably gives the same number of client calls, equal `losses()` and equal `failed_batches`
       through the wrapper and bare.
+- [ ] Through each of the two wrappers, a predicate or function that declines the first event, over a
+      real `SQSSink` whose client rejects every entry with `SenderFault: True`, settles exactly as the
+      bare `SQSSink` given only the forwarded events: equal `failed`, no extra stderr line, and the
+      run settles. The same holds over a `NATSSink` whose publish counts are marked
+      (`sink_counted`). Removing the rewrite reddens both.
 - [ ] An inner sink raising `ConnectionRefusedError("secret")` propagates out of the wrapper's
       `deliver` by identity. Through the engine, the run fails with the same `failed_batches` as
       the bare inner sink's, and stderr does not contain `secret`.
@@ -633,3 +652,8 @@ tests/
 - 2026-11-09, Andrew's call: the copied `max_retries` and `max_retry_after` are read-only on all
   three classes (FR-001, Data Model), following SPEC-074's `ReadOnlyCount`, rather than writable as
   first drafted. The wrapper-rule decision and the 1.2.0 release notes name them.
+- 2026-11-09, from the plan review, which ran each case: the inner sink's run-context marks are
+  rewritten into the wrapper's positions (FR-002), since an unmoved mark failed a run the bare `SQSSink`
+  settles; `tests/test_wrapper_failures.py`'s public-name pin gains a named SPEC-075 set rather than
+  staying unedited, since any `deliver` on the class reddens it; a budget not copied is stored as
+  `None`, so a read never returns the read-only descriptor.
