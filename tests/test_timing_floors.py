@@ -48,14 +48,24 @@ assignment counts), the call to the duration-returning function, or the stopwatc
 - a duration that crosses a function boundary other than through a returned value, is unpacked by
   a ``for`` loop, or is scaled (``(time.monotonic_ns() - start) / 1e9``), and a floor written as
   ``== pytest.approx(...)``;
-- a delay armed indirectly, such as ``loop.call_soon_threadsafe(loop.call_later, ...)``, or a
-  thread whose target sleeps;
+- a delay armed indirectly, such as ``loop.call_soon_threadsafe(loop.call_later, ...)``, a
+  thread whose target sleeps, or a constructor that starts an asyncio task which sleeps (as
+  ``ReconnectingFakeNATS.__init__`` does; refusing it would refuse that fake, which no floor uses);
+- a floor written without a ``<clock>() - <start>`` subtraction, such as ``end - start`` with both
+  read from a clock, or ``time.monotonic() >= start + 0.4``;
+- a fake that lingers by any means other than a call named ``sleep`` (a timed
+  ``self.never.wait(0.4)``, or a sleep inside a helper method it calls), and a test that polls the
+  entry signal with ``is_set()`` instead of waiting on it;
 - classes and duration-returning functions are matched by bare name across every file, so two
   same-named fakes in different modules are judged as one. That fails closed for the sleep check
   and could fail open for the helper exemption, if one module's fake waits on the event another
   module's same-named sleeper ignores.
 
 Each is a reason to use ``release_after_clock`` in a new floor, not a hole this gate claims to close.
+Two false positives are accepted because they fail closed: a hang-guard ``Timer`` armed before a
+helper floor is refused (move it after the ``with``), and a duration-returning helper's call line is
+taken as its clock, so a timer armed between ``began`` and that call is refused (inline the
+subtraction).
 
 Deadlines a sink anchors inside the measured call, such as NATS's ``time.monotonic() +
 publish_timeout`` on its loop thread, are safe and stay silent: they are read after the test's
@@ -250,10 +260,10 @@ def _arming_lines(own: list[ast.AST]) -> list[int]:
     timers = {
         ast.unparse(target)
         for node in own
-        if isinstance(node, ast.Assign)
+        if isinstance(node, ast.Assign | ast.AnnAssign)
         and isinstance(node.value, ast.Call)
         and _callee(node.value) == "Timer"
-        for target in node.targets
+        for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
     }
     lines = []
     for node in own:
@@ -669,6 +679,7 @@ def scan(root: pathlib.Path) -> tuple[list[Floor], list[Finding]]:
         arming = _arming_lines(own)
         waits = _entry_waits(own)
         named = {n.id for n in own if isinstance(n, ast.Name)}
+        named |= {n.attr for n in own if isinstance(n, ast.Attribute)}
         events = set().union(*(sleepers[name] for name in named if name in sleepers))
         awaited = set().union(*(waiters[name] for name in named if name in waiters))
         for floor in found:
@@ -870,6 +881,33 @@ def test_it(closer, peer):
     with release_after_clock(0.0, sink.release.set) as watch:
         closer(sink)
     assert watch.elapsed >= 0.9
+""",
+        SLEEP_AFTER_SIGNAL,
+        "assert sink.in_close.wait(5.0)",
+    ),
+    "an-annotated-timer-started-before-the-clock": (
+        """
+def test_it(sink, ev):
+    timer: threading.Timer = threading.Timer(0.4, ev.set)
+    timer.start()
+    start = time.monotonic()
+    sink.close()
+    assert time.monotonic() - start >= 0.4
+""",
+        ARMED_BEFORE_CLOCK,
+        "timer.start()",
+    ),
+    "a-sleeping-fake-named-through-its-module": (
+        _SLOW_CLOSE
+        + """
+
+def test_it(closer, fakes):
+    sink = fakes._Slow()
+    closer(sink)
+    assert sink.in_close.wait(5.0)
+    start = time.monotonic()
+    closer(sink)
+    assert time.monotonic() - start > 0.3
 """,
         SLEEP_AFTER_SIGNAL,
         "assert sink.in_close.wait(5.0)",
