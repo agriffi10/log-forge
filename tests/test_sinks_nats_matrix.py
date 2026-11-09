@@ -320,7 +320,7 @@ def _cells() -> dict[str, Cell]:
                 call="emit1",
                 fake={"starve": True},
                 raises=SinkDeliveryError,
-                match="published none of 1",
+                match="delivered none of 1",
                 failed=1,
                 lines=((1, ACK_RAISED),),
             )
@@ -332,7 +332,7 @@ def _cells() -> dict[str, Cell]:
                 fake={"starve": True},
                 ceiling=0.05,
                 raises=SinkDeliveryError,
-                match="published none of 3",
+                match="delivered none of 3",
                 failed=3,
                 lines=((1, ACK_RAISED), (1, ACK_RAISED), (1, ACK_RAISED)),
             )

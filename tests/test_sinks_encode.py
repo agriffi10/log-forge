@@ -384,7 +384,7 @@ def test_a_spent_bound_counts_the_whole_batch_in_failed(
     rig.state.down = True
     with pytest.raises(SinkDeliveryError):
         rig.sink.emit([ok("a"), unencodable()])
-    assert rig.sink.failed == (1 if hasattr(rig.sink, "log_foundry_counters") else 2)
+    assert rig.sink.failed == 1
     assert rig.count() == 0
 
 
@@ -743,8 +743,12 @@ ENGINE_GAINED: dict[str, frozenset[str]] = {
         "ClickHouseSink",
         "MongoDBSink",
         "PostgresSink",
+        "RedisStreamsSink",
+        "RedisListSink",
+        "AzureEventHubsSink",
     )
 }
+ENGINE_GAINED["RabbitMQSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
 ``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows

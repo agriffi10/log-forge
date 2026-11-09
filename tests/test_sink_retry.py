@@ -322,7 +322,7 @@ def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
     assert missing == [], f"retry loops with no interruptible wait: {missing}"
 
 
-_NOT_YET_CONVERTED = frozenset({"_socket", "eventhubs", "rabbitmq", "redis"})
+_NOT_YET_CONVERTED = frozenset({"_socket"})
 """SPEC-074's transitional set: the modules whose retry loop a later phase of its build deletes.
 
 Each phase removes the modules it puts on the engine, so the set shrinks visibly and exactly; it
@@ -540,17 +540,17 @@ def _drain_one(sink) -> float:
 
 def test_a_long_sink_backoff_does_not_hold_shutdown() -> None:
     """One drain thread, so a sink's backoff is a global pause — and it spans shutdown()."""
-    import log_foundry.sinks.redis as redis_mod
+    from log_foundry.sinks import _engine
     from log_foundry.sinks.redis import RedisStreamsSink
     from test_sinks_redis import FakeRedis
 
-    original = redis_mod._BACKOFF_BASE
-    redis_mod._BACKOFF_BASE = 20.0  # one attempt's backoff far exceeds the bound
+    original = _engine.BACKOFF_BASE
+    _engine.BACKOFF_BASE = 20.0  # type: ignore[misc]  # one backoff far exceeds the bound
     try:
         sink = RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=3)
         assert _drain_one(sink) < 6.0, "shutdown waited out the sink's backoff"
     finally:
-        redis_mod._BACKOFF_BASE = original
+        _engine.BACKOFF_BASE = original  # type: ignore[misc]
 
 
 def test_a_standalone_sink_backs_off_exactly_as_before(monkeypatch) -> None:

@@ -67,6 +67,10 @@ often as before.
 - A message, frame or chunk that failed is resent in the next round, after the later ones of its
   round, where the 1.x loop retried it before sending the next. Only an SQS FIFO message group,
   whose order SQS documents as a guarantee, keeps 1.x order (FR-002).
+- A converted sink's `emit` that fails raises the engine adapter's `SinkDeliveryError`, whose
+  message is "delivered none of N event(s): …", where 1.x raised each sink's own text ("inserted
+  none of …", "published none of …"), as SPEC-073 FR-002 changed the HTTP family's. A refusal —
+  a closed sink, a NATS latch, a produced-no-chunk branch — still raises its 1.x error by identity.
 - A `close()` that arrives while `ClickHouseSink`, `PostgresSink`, `RabbitMQSink`,
   `AzureEventHubsSink` or the socket transport waits between retries now returns at once, because
   the lock is no longer held across the wait; the rest of that batch is refused, counted where 1.x
@@ -229,7 +233,9 @@ verdict raises `ValueError` there, a sink bug that SPEC-072's escaped-exception 
 SPEC-072's `outcomes_of` stays the one definition of a malformed verdict.
 
 **The refusal marker (addition 3).** `RunContext.refuse(error)` is how a shipped `deliver` that
-handed no event of the round to its transport says the round was a refusal. It returns an ordinary
+handed no event of the round to its transport says the round was a refusal. `NATSSink`'s
+wedged-loop backstop is the one use after events may have reached the transport: the sink has
+closed itself, so the round is refused like a closed sink's (FR-004's adjudication). It returns an ordinary
 verdict, `REJECTED` for a refusal a resend cannot change and `RETRYABLE` for one a later round can
 pass, and calls `refuse` with the exception a 1.x `emit` raised for it. Nothing escapes `deliver`,
 so SPEC-072's rule for an escaped exception is untouched. The engine reads the marker at the end of
@@ -582,8 +588,19 @@ the close alone.
   counts as unconfirmed where it is abandoned, is `UNKNOWN` with SPEC-061's `unconfirmed, ...
   abandoned` line, never resent, since `NATSSink` declares no idempotence (SPEC-072 FR-004); on the
   sink's own core client the confirming round trip judges it, as the row before says.
-  The wedged-loop backstop raises SPEC-061's `SinkDeliveryError` unchanged, which SPEC-072 counts as
-  an escaped exception, as 1.x's worker counted its raise. JetStream and an injected client keep
+  The wedged-loop backstop is a `REJECTED` refusal round carrying SPEC-061's `SinkDeliveryError`
+  (`refuse(err)`): the sink has just closed itself, so no later round can pass, the adapter raises
+  that error by identity, and nothing is counted on the sink, as 1.x's raise counted nothing.
+  **Adjudicated at build** (the reviewer contract's method for two requirements that cannot both
+  hold): this spec first made the backstop an escaped exception, which the engine answers with the
+  adapter's own `SinkDeliveryError`, while this FR's criterion holds `tests/test_sinks_nats.py`
+  unedited. Both readings were built and the NATS suites and the full suite run on each. The
+  escaped-exception reading fails two shipped tests,
+  `tests/test_sinks_nats.py::test_the_unbounded_implementation_fails_that_bound`
+  (`match="wedged"`) and
+  `tests/test_sinks_nats_liveness.py::test_the_backstop_closes_the_sink_when_a_publish_never_returns`;
+  the refusal reading fails neither, so it stands. It is the one use of the refusal marker after
+  events may have reached the transport (FR-001's marker is defined for a round that handed none). JetStream and an injected client keep
   SPEC-061's behaviour, and a JetStream publish that raised takes the rule below.
 
   After the first publish, the round's outcome follows the one fact 1.x's `emit` acts on: whether
@@ -746,7 +763,10 @@ takes the counters' lock the commit already holds; a failed-event count is regis
 `emit_via_deliver(self, batch)`** on the class that defines `deliver`, a function rather than an
 assignment so that every AST roster keyed on a `def emit` keeps finding it. `_id_failed` and, on these
 sinks, SPEC-069's `_unencodable` are deleted, folded into `dropped_events`. `RabbitMQSink`,
-`SocketTransport` and `SyslogSink` expose `max_retries` read-only. Eleven of the thirteen define
+`SocketTransport` and `SyslogSink` expose `max_retries` read-only, through `_args.ReadOnlyCount`: a
+data descriptor with a refusing `__set__` and no `__get__`, so both ordinary access and
+`base._static_value` read the instance's own value while an assignment is refused (a `property`
+reads as the property object to the static reader, so the engine would give the sink one round). Eleven of the thirteen define
 `_retryable_error` (SPEC-070); `NATSSink` defines none, and `SyslogSink` forwards.
 
 **The deletions.** The eleven `for attempt in range` loops, the eleven `_BACKOFF_BASE` constants,
@@ -923,8 +943,9 @@ class SQSSink:                                   # and the other engine sinks
     dropped_oversized: int                       # plain attribute, written only by the run context
 
 class RabbitMQSink:                              # also SocketTransport, SyslogSink
-    @property
-    def max_retries(self) -> int: ...            # the floored constructor value
+    max_retries = ReadOnlyCount()                # the floored constructor value, read-only:
+    # a data descriptor defining only a refusing __set__, the value in the instance __dict__;
+    # a property would read as the property object to the engine's static reader, one round
 ```
 
 ## File & Folder Structure
@@ -1056,3 +1077,4 @@ other site still stating the old claim:
 - 2026-11-05, the additive rule restored on SPEC-061's code: a NATS round in which nothing was published is `RETRYABLE` throughout, so the worker resends it `w + 1` times as 1.x does and `docs/invariants.md` 2's JetStream asymmetry stays true unrewritten; a publish that raised or an event left unattempted beside a publish that landed is `REJECTED`, counted in `failed` and never resent, as 1.x. The reason that argued for one attempt is replaced by the additive rule, and the Overview's release-notes line no longer names NATS.
 - 2026-11-05, execution-frame review: a NATS round with nothing published now registers 1.x's own counts and lines `ALWAYS` (one per raised publish, none for an unattempted event) and marks its `RETRYABLE` events `sink_counted`, a fourth run-context addition, so the engine adds no count; a differential matrix criterion holds every NATS case to values recorded by running 1.x at `93113e1b`, replacing the two hand-written NATS criteria.
 - 2026-11-08, build (plan review B1, M1, M2): the SQS FIFO hold is decided per chunk at send time, so same-group events never sent travel together and a healthy one-group batch is one call; a held event never sent is counted with a `0 attempt(s), held behind …` line (reading (a), pending Andrew's call); a repeated event identity keeps one cached entry per occurrence and entry `Id`s persist across rounds; a sink-counted loss is registered as `failed_events` on `log_foundry_counters`, never against the `failed` setter; `_Prepared.index` is `position`; the dedup-callable criterion's fallback case returns a blank string.
+- 2026-11-08, build (plan review Q1, Q2, Q3): `max_retries` on RabbitMQ, the socket transport and Syslog is a set-only refusing descriptor rather than a `property`, which the engine's static reader cannot see; a converted sink's total-failure message is the adapter's (listed under *What a caller sees change*); FR-004's wedged-loop backstop is a `REJECTED` refusal round, the reading the shipped NATS tests left standing when both were built and run.

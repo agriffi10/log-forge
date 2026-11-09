@@ -722,8 +722,10 @@ def _rig(name: str) -> Callable[[pytest.MonkeyPatch, Path, int], _Built]:
     def build(mp: pytest.MonkeyPatch, tmp: Path, retries: int) -> _Built:
         rig = sink_rigs.RIGS[name](mp, tmp)
         owner = rig.owner if name == "SyslogSink" else rig.sink
-        attr = "_max_retries" if hasattr(owner, "_max_retries") else "max_retries"
-        setattr(owner, attr, retries)
+        for target in {id(owner): owner, id(rig.sink): rig.sink}.values():
+            attr = "_max_retries" if hasattr(target, "_max_retries") else "max_retries"
+            if attr in vars(target):
+                vars(target)[attr] = retries
         waits: list[float] = []
         module = sys.modules[type(owner).__module__]
         if hasattr(module, "wait"):
@@ -991,8 +993,12 @@ def test_sentry_still_retries_and_counts_a_transport_error(monkeypatch) -> None:
 def test_the_worker_and_the_orphan_path_each_make_one_call_per_attempt(
     monkeypatch, tmp_path
 ) -> None:
-    """FR-001 AC-9 (invariant 6): a Redis ``TypeError`` is 3 calls through ``Worker(max_retries=2)``,
-    one per worker attempt — not 3 x 4 — and 1 call outside a span."""
+    """FR-001 AC-9 (invariant 6): a Redis ``TypeError`` is one call through ``Worker(max_retries=2)``
+    and one outside a span.
+
+    SPEC-074 FR-002 supersedes the worker half on the engine: it was 3 calls, one per worker
+    attempt, and a ``REJECTED`` event is never resent, so it is now 1 and ``failed`` moves once.
+    """
     through_worker = _LOOPS["_RedisSink"](monkeypatch, tmp_path, 3)
     through_worker.set_error(TypeError("x"))
     worker = Worker(through_worker.sink, batch_size=1, max_retries=2)
@@ -1001,8 +1007,8 @@ def test_the_worker_and_the_orphan_path_each_make_one_call_per_attempt(
         assert not worker.flush(timeout=30.0)
     finally:
         worker.stop()
-    assert through_worker.calls() == 3
-    assert through_worker.sink.losses().failed == 3, "one per worker attempt"
+    assert through_worker.calls() == 1
+    assert through_worker.sink.losses().failed == 1, "once for the batch"
 
     orphan = _LOOPS["_RedisSink"](monkeypatch, tmp_path, 3)
     orphan.set_error(TypeError("x"))

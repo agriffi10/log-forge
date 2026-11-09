@@ -175,7 +175,7 @@ MAX_RETRIES_DOORS: dict[str, tuple[type, Callable[..., Any], str]] = {
     "RabbitMQSink": (
         RabbitMQSink,
         lambda **kw: RabbitMQSink(exchange="e", routing_key="r", connection=object(), **kw),
-        "_max_retries",
+        "max_retries",
     ),
     "RedisStreamsSink": (
         RedisStreamsSink,

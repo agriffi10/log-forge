@@ -111,7 +111,9 @@ class _NumberedProducer(FakeProducer):
         if self.error is not None:
             raise self.error
         if self.calls in self.fail_on:
-            raise RuntimeError("the hub could not be reached")
+            # Retryable, so the worker's budget offers the batch again: since SPEC-074 an error
+            # the sink's predicate refuses costs one attempt in total, never the probe's four.
+            raise ConnectionError("the hub could not be reached")
         self.sent.append(list(batch.items))
 
 

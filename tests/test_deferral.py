@@ -233,7 +233,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
-    "sinks/eventhubs.py": {"AzureEventHubsSink": ("emit", "_send_batch")},
     "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
     "sinks/syslog.py": {"SyslogSink": ("emit",)},
     "sinks/logstash.py": {"LogstashSink": ("emit",)},
@@ -241,9 +240,7 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
     "sinks/stdout.py": {"StdoutSink": ("emit",)},
     "sinks/file.py": {"FileSink": ("emit",), "RotatingFileSink": ("emit",)},
-    "sinks/rabbitmq.py": {"RabbitMQSink": ("emit",)},
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
-    "sinks/redis.py": {"_RedisSink": ("emit",)},
     "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
@@ -268,7 +265,6 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("AzureEventHubsSink", "_send"): frozenset({"failed"}),
     ("SocketTransport", "_send_one"): frozenset({"failed"}),
     ("SocketTransport", "_socket"): frozenset({"_sock"}),
     ("SocketTransport", "_reset"): frozenset({"_sock"}),
@@ -277,10 +273,6 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
     ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
     ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
-    ("RabbitMQSink", "_publish"): frozenset({"failed"}),
-    ("RabbitMQSink", "_active_channel"): frozenset({"_connection", "_channel"}),
-    ("RabbitMQSink", "_reset"): frozenset({"_connection", "_channel"}),
-    ("RabbitMQSink", "_persistent_properties"): frozenset({"_properties"}),
     ("RotatingFileSink", "emit"): frozenset({"_size", "_failed"}),
     ("FileSink", "emit"): frozenset({"_failed"}),
     ("SQLiteSink", "emit"): frozenset({"_failed"}),
@@ -289,7 +281,6 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
     ("RotatingFileSink", "_ensure_open"): frozenset({"_stream", "_size"}),
-    ("_RedisSink", "_send"): frozenset({"failed"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -302,8 +293,6 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper
-  bound, its line still written under the emit lock as before (SPEC-059 *Out of Scope*).
 - ``SocketTransport._send_one`` / ``failed``: a message abandoned past the reconnect bound; the
   same upper bound.
 - ``SocketTransport._socket`` and ``SocketTransport._reset`` / ``_sock``: the held socket, opened
@@ -316,18 +305,9 @@ counts as it happens rather than through the ``Deferral``:
   expired; the same upper bound.
 - ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
   pending list, rebound as futures settle or are put back; state, not a count.
-- ``RabbitMQSink._publish`` / ``failed``: a message abandoned past the retry bound, counted as it
-  happens; the same upper bound. SPEC-069 put the sink on the ledger for its encode step and left
-  this as it was.
-- ``RabbitMQSink._active_channel``, ``_reset`` / ``_connection``, ``_channel``, and
-  ``_persistent_properties`` / ``_properties``: the held connection, channel and message
-  properties, opened, dropped and built lazily; state, not a count.
 - ``RotatingFileSink.emit``, ``_rotate_or_continue``, ``_rotate`` and ``_ensure_open`` / ``_size``, ``_stream``,
   ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
   next time trigger and the once-per-outage flag; state, not a count.
-- ``_RedisSink._send`` / ``failed``: a batch abandoned past the retry bound, counted before the
-  raise; the same upper bound. SPEC-069 moved the encode out of the retry loop and left this as it
-  was.
 - ``FileSink.emit``, ``RotatingFileSink.emit`` and ``SQLiteSink.emit`` / ``_failed``: a batch
   whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
   an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.

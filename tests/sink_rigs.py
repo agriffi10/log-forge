@@ -286,7 +286,9 @@ def rabbitmq(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = RabbitMQSink(exchange="x", routing_key="k", connection=_Connection(state), max_retries=0)
-    return Rig(sink, state, lambda body: [json.loads(body)], sink, "_unencodable")
+    return Rig(
+        sink, state, lambda body: [json.loads(body)], sink.log_foundry_counters, "dropped_events"
+    )
 
 
 class _Producer:
@@ -350,7 +352,13 @@ def eventhubs(mp: pytest.MonkeyPatch, tmp: Path, capacity: int = 1) -> Rig:
     mp.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body)
     state = State()
     sink = AzureEventHubsSink(producer=_EHProducer(state, capacity), max_retries=0)
-    return Rig(sink, state, lambda items: [json.loads(b) for b in items], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda items: [json.loads(b) for b in items],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Kinesis:
@@ -645,7 +653,13 @@ def _redis(mp: pytest.MonkeyPatch, cls_name: str) -> Rig:
     _no_wait(mp)
     state = State()
     sink = getattr(mod, cls_name)("k", client=_Redis(state), max_retries=0)
-    return Rig(sink, state, lambda ops: [json.loads(o) for o in ops], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda ops: [json.loads(o) for o in ops],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 def redis_streams(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
