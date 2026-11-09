@@ -150,9 +150,10 @@ class TransformSink:
     inner sink's own ``SinkCounters`` object, so the engine's totals for a run through this
     wrapper land exactly where the bare inner sink's would, and ``max_retries`` and
     ``max_retry_after`` are the inner sink's, copied statically, so a wrapped engine sink gets
-    the rounds it gets alone. It declares no idempotence, so nothing is resent through it: a
-    resend would run the function again, and a function that is not deterministic would then
-    send a different event. Over an emit-only inner sink, a ``MultiSink``, a third-party wrapper
+    the rounds it gets alone. It declares no idempotence, so nothing that may have landed is
+    resent through it. Within one engine run each event is transformed once: a later round
+    forwards the very object the function returned the first time (SPEC-075 FR-002), so the
+    inner sink recognises it as the event it already holds notes for. Over an emit-only inner sink, a ``MultiSink``, a third-party wrapper
     or a ``__getattr__`` proxy it offers nothing and the worker calls :meth:`emit`, its 1.x body,
     unchanged. A subclass that overrides ``emit`` is not offered ``deliver`` either, so its
     ``emit`` runs.
@@ -310,10 +311,11 @@ class TransformSink:
         positions: a malformed one turns them ``UNKNOWN``. An exception from it propagates
         unchanged, and so the engine applies SPEC-072's rule to it as it would to the bare inner
         sink's. When nothing is forwarded the inner sink is not called. The engine resends this
-        wrapper's original events, so on a later round the function runs again, once for each
-        event still to send, as the worker's 1.x whole-batch retry ran it. Nothing here takes a
-        lock, enters a ``Deferral`` or stores an attribute, so concurrent calls share nothing
-        (SPEC-028).
+        wrapper's original events, and a later round of the same run forwards the result the
+        function made for each of them the first time, the same object, rather than running it
+        again (:meth:`_round_step`). Nothing here takes a lock, enters a ``Deferral`` or stores
+        an attribute — the kept results live in the run context, which the run owns — so
+        concurrent calls share nothing (SPEC-028).
 
         Args:
           batch: The events.
@@ -338,9 +340,14 @@ class TransformSink:
         declined = False
         failures = 0
         first: Exception | None = None
+        context = _engine.run_context()
+        held = cast(
+            "dict[int, tuple[dict[str, object], dict[str, object]]]",
+            context.notes(self).setdefault("transformed", {}),
+        )
         for index, event in enumerate(batch):
             try:
-                result = self._round_step(event)
+                result = self._round_step(event, held)
             except Exception as err:
                 failures += 1
                 first = first if first is not None else err
@@ -350,7 +357,6 @@ class TransformSink:
             else:
                 forwarded.append(result)
                 positions.append(index)
-        context = _engine.run_context()
         if first is not None:
             _diag.absorbed(
                 "transforming a batch",
@@ -369,24 +375,51 @@ class TransformSink:
             )
         return Verdict(outcomes=tuple(outcomes), retry_after=cast("float | None", hint))
 
-    def _round_step(self, event: dict[str, object]) -> dict[str, object] | None:
-        """Makes one event of an engine round into what is forwarded: the round's per-event step.
+    def _round_step(
+        self,
+        event: dict[str, object],
+        held: dict[int, tuple[dict[str, object], dict[str, object]]],
+    ) -> dict[str, object] | None:
+        """Returns what an event of an engine round forwards: once made, the same object all run.
 
-        It is :meth:`_apply`, the step :meth:`emit` takes too, kept as its own method so the
-        engine path's per-event step is one place: whether a later round of one engine run
-        reuses the result an earlier round made for the same event, or runs the function again,
-        is decided here and nowhere else.
+        The engine resends this wrapper's original events, so without this a later round would
+        run the function again and forward a new object for an event already offered. A
+        transform that copies before it mutates, as this class asks, then hands the inner sink a
+        stranger on every round: its run notes, keyed by event identity, no longer recognise the
+        event, so ``SQSSink`` lands a FIFO group out of order and its abandoned line counts one
+        attempt where the message made four. So the result of :meth:`_apply` — the step
+        :meth:`emit` takes too — is kept for the life of one engine run in the run context's
+        notes for this wrapper, keyed by the original event's identity as ``encode_round`` keys
+        an encoding, and a later round forwards that very object (SPEC-075 FR-002, Andrew's call
+        of 2026-11-09). The entry holds the original event, and a hit must be that object, so an
+        identity reused by another event within the run can never take its result. The notes
+        end with the run, so the next run of the same event runs the function afresh, and a
+        direct :meth:`deliver` outside any run is a run of its own.
+
+        Only a result that is forwarded is kept. A ``None`` declines its event and a raise fails
+        it, and either makes the event ``SKIPPED``, which the engine never resends, so no later
+        round asks for it. An identity that appears more than once in one batch shares the one
+        result, and the inner sink then meets that object as often as the event appeared, as it
+        would meet the event itself bare.
 
         Args:
           event: One event of the wrapper's batch.
+          held: This run's kept results: the original event and its result, by the event's
+            identity.
 
         Returns:
           ``None`` when the function declined the event, else what is forwarded.
 
         Raises:
-          Exception: Whatever :meth:`_apply` raises.
+          Exception: Whatever :meth:`_apply` raises; nothing is kept for it.
         """
-        return self._apply(event)
+        found = held.get(id(event))
+        if found is not None and found[0] is event:
+            return found[1]
+        result = self._apply(event)
+        if result is not None:
+            held[id(event)] = (event, result)
+        return result
 
     def _apply(self, event: dict[str, object]) -> dict[str, object] | None:
         """Runs the function on one event and makes its result safe to forward (SPEC-058).

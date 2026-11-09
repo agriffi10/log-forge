@@ -331,6 +331,39 @@ def test_the_copied_budget_is_read_only_on_every_class_that_copies_it(
     assert _static_value(sock, "max_retries") == sock._socket.max_retries
 
 
+def _subclass_assigning(name: str, attribute: str) -> Any:
+    """A third-party subclass of the named class that assigns ``attribute`` in its ``__init__``."""
+    base = {"FilteringSink": FilteringSink, "TransformSink": TransformSink}.get(name, LogstashSink)
+
+    def init(self: Any, *args: Any, **kwargs: Any) -> None:
+        base.__init__(self, *args, **kwargs)
+        setattr(self, attribute, 5)
+
+    return type(f"Assigning{name}", (base,), {"__init__": init})
+
+
+_SUBCLASS_ARGS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
+    "FilteringSink": ((Scripted(),), {}),
+    "TransformSink": ((Scripted(), lambda e: e), {}),
+    "LogstashSink": ((), {"url": "https://logstash.example/in"}),
+}
+
+
+@pytest.mark.parametrize("attribute", ["max_retries", "max_retry_after"])
+def test_a_subclass_assigning_the_copied_budget_is_refused_on_every_class(attribute: str) -> None:
+    """Andrew's call (Q2): a third-party subclass that assigns either name now raises.
+
+    The population is derived as the read-only test derives it, and held to the three, so a
+    later change that loosens the descriptor on any one class reddens here by name.
+    """
+    population = _deliver_beside_a_1x_emit()
+    assert population == set(_SUBCLASS_ARGS)
+    for name in sorted(population):
+        args, kwargs = _SUBCLASS_ARGS[name]
+        with pytest.raises(AttributeError, match=f"{attribute} is read-only"):
+            _subclass_assigning(name, attribute)(*args, **kwargs)
+
+
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_wrapper_that_offers_nothing_reads_none_for_its_budget(kind: str) -> None:
     """A budget not copied is ``None``, never the read-only descriptor object."""
@@ -591,16 +624,63 @@ def test_a_transform_maps_its_three_failures_and_forwards_the_coerced_result() -
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_indices_map_back_and_round_two_resends_only_the_retryable_event(kind: str) -> None:
-    """AC5: ``[a declined, b, c raising, d]`` with ``[R, A]`` maps to ``[S, R, S, A]``."""
+    """AC5: ``[a declined, b, c raising, d]`` with ``[R, A]`` maps to ``[S, R, S, A]``.
+
+    Round two hands the wrapper exactly ``[b]``. The predicate runs again for ``b``; the
+    transform's function does not, and the inner sink is handed the very object round one
+    forwarded (Andrew's call, 2026-11-09).
+    """
     sink = wrap(kind, Scripted([[R, A]]), Caller(declines=frozenset({0}), fails=frozenset({2})))
     assert sink.deliver(events(4)).outcomes == (S, R, S, A)
-    caller = Caller(declines=frozenset({0}), fails=frozenset({2}))
+    caller = Caller(declines=frozenset({0}), fails=frozenset({2}), copies=True)
     inner = Scripted([[R, A], A], max_retries=1)
     sink = wrap(kind, inner, caller)
     batch = events(4)
     assert not run(sink, batch).failed
     assert [[e["i"] for e in r] for r in inner.rounds] == [[1, 3], [1]]
-    assert caller.calls == [0, 1, 2, 3, 1], "round two ran the caller's code for b alone"
+    if kind == "filtering":
+        assert caller.calls == [0, 1, 2, 3, 1], "round two ran the predicate for b alone"
+        assert inner.handed[1][0] is batch[1]
+    else:
+        assert caller.calls == [0, 1, 2, 3], "round two did not run the function again"
+        assert inner.handed[0][0] is not batch[1], "the premise: the function copies"
+        assert inner.handed[1][0] is inner.handed[0][0], "the same object is forwarded"
+
+
+def test_a_transform_runs_once_per_event_per_run_and_afresh_on_the_next_run() -> None:
+    """FR-002: every round of one run forwards one object per event; a new run makes new ones.
+
+    Three rounds, two events: the function runs twice, and each round hands the inner sink the
+    same two objects. The kept results die with the run, so delivering the same events again
+    runs the function again and forwards new objects; so does a direct ``deliver``, which is a
+    run of its own.
+    """
+    caller = Caller(copies=True)
+    inner = Scripted([R, R, A], max_retries=2)
+    sink = TransformSink(inner, caller.fn)
+    batch = events(2)
+    assert not run(sink, batch).failed
+    assert caller.calls == [0, 1]
+    first = inner.handed[0]
+    assert all(r[i] is first[i] for r in inner.handed for i in range(2))
+    assert not run(sink, batch).failed
+    assert caller.calls == [0, 1, 0, 1], "the next run ran the function afresh"
+    assert all(inner.handed[3][i] is not first[i] for i in range(2))
+    sink.deliver(batch)
+    assert caller.calls == [0, 1, 0, 1, 0, 1]
+
+
+def test_a_declined_or_failed_result_is_not_kept() -> None:
+    """Only a forwarded result is kept: a ``None`` or a raise leaves the event uncached.
+
+    Both make the event ``SKIPPED``, which the engine never resends, so nothing asks again
+    within the run; a fresh run asks the function again.
+    """
+    caller = Caller(declines=frozenset({0}), fails=frozenset({1}), copies=True)
+    inner = Scripted([[R], A], max_retries=1)
+    sink = TransformSink(inner, caller.fn)
+    assert not run(sink, events(3)).failed
+    assert caller.calls == [0, 1, 2]
 
 
 def _http(responses: list[Any] | None, **kwargs: Any) -> tuple[HTTPSink, FakeOpener]:
@@ -967,7 +1047,7 @@ def test_rounds_run_on_the_drain_thread_in_a_span_and_the_callers_outside(kind: 
     assert inner.threads[seen:] == [caller]
 
 
-# --- the TransformSink identity question (plan review MAJOR), pending Andrew's ruling ------------
+# --- a transform keeps one object per event across a run's rounds (Andrew's call, 2026-11-09) ----
 
 
 class _FirstFailsOnce:
@@ -994,16 +1074,13 @@ class _FirstFailsOnce:
         return {"Successful": ok, "Failed": failed}
 
 
-_PENDING = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="pending Andrew's ruling on TransformSink identity across engine rounds (plan §9)",
-)
-
-
-@_PENDING
 def test_a_copying_transform_keeps_a_fifo_queues_order_as_bare() -> None:
-    """A transform that copies before it returns lands a FIFO group in the bare sink's order."""
+    """A transform that copies before it returns lands a FIFO group in the bare sink's order.
+
+    ``a`` fails twice and ``b`` once. Bare, ``SQSSink`` holds ``b`` behind ``a`` in its group and
+    lands ``[a, b]``; through the wrapper it must recognise the forwarded object as the event it
+    holds notes for, which a fresh copy per round defeated (``[b, a]`` in three calls).
+    """
     out = []
     for wrapped in (False, True):
         client = _FirstFailsOnce()
@@ -1018,9 +1095,9 @@ def test_a_copying_transform_keeps_a_fifo_queues_order_as_bare() -> None:
         run(sink, [{"k": "a", "i": 0}, {"k": "b", "i": 1}])
         out.append((client.landed, client.calls))
     assert out[0] == out[1], out
+    assert out[1][0] == ["a", "b"]
 
 
-@_PENDING
 @pytest.mark.parametrize("fifo", [False, True], ids=["standard", "fifo"])
 def test_a_copying_transform_keeps_the_bare_sinks_attempt_count_line(
     fifo: bool, capsys: pytest.CaptureFixture[str]
@@ -1040,6 +1117,10 @@ def test_a_copying_transform_keeps_the_bare_sinks_attempt_count_line(
         run(sink, events(2))
         out.append(lines(capsys.readouterr().err))
     assert out[0] == out[1], out
+    if not fifo:
+        assert out[1] == [
+            "log-foundry: lost 2 message(s); SQSSink, still failing after 4 attempt(s); abandoned"
+        ]
 
 
 # --- FR-003: LogstashSink delegates ---------------------------------------------------------------

@@ -115,8 +115,7 @@ Figures re-measured at `fda134a`, each with its instrument:
   `HTTPSink`'s own chunk mapping is SPEC-073's.
 - **Removing the extra count in `failed` that `MultiSink` makes for an engine child.** It is
   invariant 2's recorded upper bound, and recounting it would reclassify a 1.x count (FR-004).
-- **Declaring a wrapper idempotent**, caching a transform's result across engine rounds, and
-  per-event reasons in a `Verdict`.
+- **Declaring a wrapper idempotent**, and per-event reasons in a `Verdict`.
 - **Third-party wrappers.** They call `inner.emit` and get 1.x behaviour through SPEC-072's
   adapter. This spec changes nothing for them.
 - **The closed-guard helper, lifecycle, owed closes and fork** (SPEC-076 to SPEC-079).
@@ -208,10 +207,9 @@ the instance's own `__dict__`. A writable copy would let an assignment on the wr
 engine's budget away from the inner sink's, and making it read-only later would break 1.x callers.
 
 **A wrapper declares no idempotence.** It sets no `log_foundry_idempotent` and defines no
-`_retryable_error`, so an `UNKNOWN` or a raising round is never resent through it. A resend would
-re-run the caller's code, and a non-deterministic transform would then send a different event. No
-shipped sink declares idempotence anyway (SPEC-074), so a wrapped shipped sink is resent exactly as
-it is alone.
+`_retryable_error`, so an `UNKNOWN` or a raising round is never resent through it: a resend would
+send again an event that may have landed. No shipped sink declares idempotence anyway (SPEC-074),
+so a wrapped shipped sink is resent exactly as it is alone.
 
 **The rosters these classes stand outside.** SPEC-074's derived roster of engine sinks requires a
 `def emit(self, batch)` whose body is the one call `emit_via_deliver(self, batch)`, `losses()`
@@ -246,7 +244,9 @@ under `sinks/` defines `log_foundry_idempotent` stays green, because none of the
       wrapper.
 - [ ] Assigning `max_retries` or `max_retry_after` raises on every shipped class that defines
       `deliver` beside a 1.x `emit` (derived, not listed: the three in this spec), and
-      `_static_value(wrapper, name)` still returns the inner sink's value.
+      `_static_value(wrapper, name)` still returns the inner sink's value. A third-party subclass
+      of each of the three that assigns `self.max_retries` or `self.max_retry_after` in its own
+      `__init__` raises `AttributeError` (Andrew's call; derived population as above).
 - [ ] A direct `deliver` on a non-offering wrapper raises `TypeError` naming the wrapper's class. An
       inner sink whose counters are replaced after construction makes the next round raise
       `TypeError` naming its type, and the run fails. For an inner sink class whose metaclass
@@ -330,8 +330,19 @@ map it uses for the outcomes. An index outside the forwarded list stays invalid,
 the bare sink's engine would fail still fails. Without the rewrite, a declined event ahead of a
 marked one shifts the indices and the engine fails a round the bare sink settles.
 
-**The engine resends the wrapper's original events.** So on a later round the predicate or function
-runs again, once for each event still to send. That is what the worker's 1.x whole-batch retry did.
+**The engine resends the wrapper's original events.** On a later round the predicate runs again,
+once for each event still to send, as the worker's 1.x whole-batch retry ran it. The transform's
+function does not: `TransformSink` keeps each event's forwarded result for the life of one engine
+run, in the run context's notes for the wrapper, keyed by the original event's identity as
+`_encode.encode_round` keys an encoding, with the original event held in the entry so an identity
+cannot be reused within the run. A later round forwards that same object. A fresh copy per round
+would be a stranger to the inner sink's own run notes, which are keyed by identity: measured over a
+FIFO `SQSSink` whose client fails `a` twice and `b` once, a copying transform landed `[b, a]` where
+the bare sink lands `[a, b]`, and a standard queue's abandoned line said "after 1 attempt(s)" where
+the message had made four. Only a forwarded result is kept: a declined or failed event is
+`SKIPPED`, which the engine never resends. An event object that appears twice in one batch shares its
+one result. The notes end with the run, so the next run of the same events runs the function afresh,
+and a direct `deliver` outside any run is a run of its own.
 
 **`deliver` writes nothing itself.** It enters no `Deferral`, takes no lock and assigns no
 attribute, so calls on the drain thread and on orphan threads share nothing (SPEC-028). Its only
@@ -367,8 +378,16 @@ bound, and the two paths reach it by different counts.
       `[SKIPPED, SKIPPED, SKIPPED, inner's outcome]` and settles with `_dropped == 2`. The forwarded
       event is the coerced result `tests/test_transform_coercion.py` expects.
 - [ ] Indices: over `[a declined, b, c raising, d]`, an inner verdict `[RETRYABLE, ACCEPTED]` maps
-      to `[SKIPPED, RETRYABLE, SKIPPED, ACCEPTED]`. Round two gives the wrapper exactly `[b]`, and
-      the transform's function runs once more, for `b` alone.
+      to `[SKIPPED, RETRYABLE, SKIPPED, ACCEPTED]`. Round two gives the wrapper exactly `[b]`. The
+      predicate runs once more, for `b` alone; the transform's function is not run again, and the
+      inner sink is handed the same object round one forwarded.
+- [ ] A copying transform's function runs once per event per run however many rounds the run
+      makes, each round forwarding the same objects; a second run of the same events, and a direct
+      `deliver`, run it afresh. A declined or failed result is not kept.
+- [ ] Through a copying `TransformSink`, a FIFO `SQSSink` whose client fails `a` twice and `b` once
+      lands `[a, b]` in as many client calls as the bare sink. Over a standard queue failing every
+      entry retryably with `max_retries=3`, the abandoned line equals the bare sink's and says
+      "after 4 attempt(s)"; over a FIFO queue the lines equal the bare sink's.
 - [ ] Over a real `HTTPSink` (a stub opener), `[ok, oversized]` gives
       `wrapper.losses() == bare.losses()`, both `dropped == 1`, against a bare `HTTPSink` given the
       same batch. An always-`500` destination with `max_retries=1` under a `Worker` with
@@ -657,3 +676,10 @@ tests/
   settles; `tests/test_wrapper_failures.py`'s public-name pin gains a named SPEC-075 set rather than
   staying unedited, since any `deliver` on the class reddens it; a budget not copied is stored as
   `None`, so a read never returns the read-only descriptor.
+- 2026-11-09, Andrew's call on the build's held question: `TransformSink` keeps each event's
+  forwarded result for one engine run and forwards the same object on every round (FR-002), since a
+  fresh copy per round broke a FIFO `SQSSink`'s order and its attempt-count line. The Out of Scope
+  line excluding that cache is removed; the index criterion now says the function is not run again,
+  and two criteria hold the cache and the twins. Also his call: a third-party subclass that assigns
+  `self.max_retries` or `self.max_retry_after` now raises `AttributeError`, pinned by a criterion
+  (FR-001).
