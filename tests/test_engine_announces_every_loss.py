@@ -682,21 +682,48 @@ def test_the_sink_counted_population_is_the_reviewed_one() -> None:
     assert found == SINK_COUNTED_SITES
 
 
-def test_a_settled_last_line_owns_the_resendable_loss_its_round_ended_the_run_on(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """``SETTLED_LAST`` is written exactly when the run ends on its round, as a ``LAST`` line is.
-
-    So it owns an event the round left ``RETRYABLE``, and the engine adds no line beside it.
+class _OwnLossesBesideNats:
+    """A wrapper that accepts event 0, rejects event 1 and leaves event 2 retryable itself, and
+    forwards event 3 to a ``NATSSink`` that leaves it unattempted, all in one round.
     """
 
-    def last(batch: list[dict[str, object]]) -> Verdict:
-        run_context().announce(
-            lambda: _diag.lost("event", 1, "ThirdParty, out of rounds"), when=When.SETTLED_LAST
-        )
-        return Verdict(outcomes=(R, A))
+    def __init__(self, inner: NATSSink) -> None:
+        self.inner = inner
+        self.max_retries = 0
+        self.log_foundry_counters = SinkCounters()
 
-    _run(Scripted([last], max_retries=0), events(2))
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        _result, outcomes = run_context().delegate(self.inner.deliver, batch[3:], [3])
+        assert outcomes is not None
+        return Verdict(outcomes=(A, J, R, *outcomes))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+
+def test_a_settled_last_line_owns_no_other_loss_of_its_round(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The frame-2 review's probe: a ``SETTLED_LAST`` line announces only events its sink counted.
+
+    Written only when the run settles on its round, it is no line a wrapper sharing the round can
+    know it has, so the wrapper's own rejection and retryable event are still the engine's to
+    name. Before, the NATS line made the round lined, and both were counted with no line.
+    """
+    inner = _scripted_nats(("unattempted",))
+    outer = _OwnLossesBesideNats(inner)
+    try:
+        delivery = _run(outer, events(4))
+    finally:
+        inner.close()
+    assert (delivery.accepted, delivery.rejected, delivery.unresolved, delivery.failed) == (
+        1,
+        1,
+        2,
+        False,
+    )
+    assert (outer.log_foundry_counters.losses().failed, inner.losses().failed) == (2, 1)
     assert capsys.readouterr().err.splitlines() == [
-        "log-foundry: lost 1 event(s); ThirdParty, out of rounds"
+        _engine_line(2, 1, "_OwnLossesBesideNats", rejected=1, unresolved=1),
+        f"log-foundry: lost 1 event(s); NATSSink publish_timeout {inner.publish_timeout}s",
     ]

@@ -132,7 +132,10 @@ batch. (SPEC-073 FR-001 to FR-005)
   resending an `UNKNOWN` after an earlier round landed something, or a wrapper accepting part of
   its batch itself (found by the frame-1 review) — has no catcher, so an event the deadline left unattempted there was neither counted nor named. The
   round now registers that remainder's count and line under a new `When.SETTLED_LAST`, kept only
-  when the run settles on the registering round, so a failed run keeps 1.x's ledger. `NATSSink` is
+  when the run settles on the registering round, so a failed run keeps 1.x's ledger. Such a line
+  owns no other loss of its round: it announces only sink-counted events, and a wrapper sharing
+  the round cannot know it will be written, so the frame-2 review's wrapper — its own rejection
+  beside a wrapped `NATSSink`'s unattempted event — would otherwise have lost the rejection's line. `NATSSink` is
   the only `sink_counted` caller, a population `tests/test_engine_announces_every_loss.py` derives
   from the tree.
 - **Refined** (fix/engine-announce-every-loss): the engine's settled line was written only for a run

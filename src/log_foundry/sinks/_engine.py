@@ -419,9 +419,9 @@ class When(enum.Enum):
       SETTLED_LAST: Only when the run settles and the round that registered it ended it: a loss
         of an event the sink marked counted (:meth:`RunContext.sink_counted`) because a failed
         run's catcher owns it, and that a later round could still have delivered — ``NATSSink``'s
-        unattempted events in a round that published nothing. A line under it owns the round's
-        resendable losses as a ``LAST`` line does; an immediate context commits it at once, as
-        every rule but ``FAILED``.
+        unattempted events in a round that published nothing. A line under it is for those
+        sink-counted events only and owns no other loss of its round (:meth:`RunContext._lined`);
+        an immediate context commits it at once, as every rule but ``FAILED``.
     """
 
     ALWAYS = "always"
@@ -1021,9 +1021,13 @@ class RunContext:
         the round-level form of the HTTP round's chunk key, since a line carries no event
         identity to count by. A line the run will not write — a ``LAST`` line of a round that
         was not the last, a ``SETTLED`` one of a failed run — announces nothing, so its round
-        owns nothing. The second set is the rounds with a kept ``LAST`` or ``SETTLED_LAST`` line:
-        an event the round left resendable is a loss only because the run ended there, and only a
-        line registered for that ending announces it.
+        owns nothing. The second set is the rounds with a kept ``LAST`` line: an event the round
+        left resendable is a loss only because the run ended there, and only a line registered for
+        that ending announces it. A ``SETTLED_LAST`` line is in neither: it announces only events
+        its sink counted (:meth:`sink_counted`), which the settled line never names anyway, and a
+        round sharing it — a wrapper's own events beside a wrapped sink's — cannot know the line
+        will be written, so it owns none of their losses (the frame-2 review of
+        fix/settled-line-fixes).
 
         Args:
           settled: Whether the run settled.
@@ -1038,15 +1042,12 @@ class RunContext:
         kept = [
             (when, registered)
             for _line, when, registered in self._lines
-            if self._kept(when, registered, settled=settled, final=final)
+            if when is not When.SETTLED_LAST
+            and self._kept(when, registered, settled=settled, final=final)
         ]
         return (
             frozenset(registered for _when, registered in kept),
-            frozenset(
-                registered
-                for when, registered in kept
-                if when is When.LAST or when is When.SETTLED_LAST
-            ),
+            frozenset(registered for when, registered in kept if when is When.LAST),
         )
 
     def _close(self) -> None:
