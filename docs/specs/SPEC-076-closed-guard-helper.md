@@ -142,7 +142,7 @@ SPEC-061 specifies is re-specified here.
 - **Deleting a test.** No test is deleted. Tests that read a sink's `_lock` keep working through
   FR-005's read-only aliases: eight in `tests/test_fork_lifecycle.py`, and
   `tests/test_sinks_oversize_deferral.py:284` and `tests/test_socket_oversize_deferral.py:186`.
-  The one that assigns it, `tests/test_fork_lifecycle.py:898` (`sink._lock = inherited`), is
+  The one that assigns it, `tests/test_fork_lifecycle.py:902` (`sink._lock = inherited`), is
   re-pointed at `sink._guard._lock`. The lints change by re-deriving their population (FR-005),
   never by deleting a case.
 
@@ -423,8 +423,9 @@ its own from `flush`. None counts it, which is SPEC-032's rule, and SPEC-069's f
 
 - [ ] For each of the eight engine sinks above, `deliver` after `close()`, and again while a
       `close()` is `CLOSING`, calls `RunContext.refuse` with a `SinkDeliveryError` carrying the
-      sink's fda134a closed message and returns `Verdict.uniform(Outcome.REJECTED, n)`, and the
-      driver double records no call.
+      sink's fda134a message for that state — its closed message, except that a closing
+      `NATSSink` carries SPEC-061's closing one — and returns
+      `Verdict.uniform(Outcome.REJECTED, n)`, and the driver double records no call.
 - [ ] For each of those eight, after `close()`:
       - through a `Worker` the batch costs exactly one `deliver` call, `failed_batches == 1` and
         `flush()` is falsy;
@@ -544,7 +545,7 @@ against. So:
       concurrent section waiting until it leaves. For a `CLOSE_ONLY` adopter, `self._close_lock` is
       the guard's `_lock`. Assigning `_closed`, `_lock` or `_close_lock` raises `AttributeError`.
       `tests/test_fork_lifecycle.py`, `tests/test_sinks_oversize_deferral.py` and
-      `tests/test_socket_oversize_deferral.py` pass with only the line-898 edit.
+      `tests/test_socket_oversize_deferral.py` pass with only the line-902 edit.
 - [ ] Every sink that releases nothing (the Out of Scope list) still delivers a batch after
       `close()`, and none builds a `ClosedGuard`.
 - [ ] Serves invariants 7, 5 and 6: which sinks refuse is still enforced from the code, each
@@ -592,8 +593,8 @@ after the locks (invariant 12's order).
       0.25 s. A mutant without the pid adoption waits `CLOSE_OVERLAP_WAIT` and is killed.
 - [ ] A child forked while a parent `close()` is `CLOSING` (waiting on the lock) admits sections. A
       child forked after the parent's close set `CLOSED` refuses them.
-- [ ] A `FileSink` closed before the fork re-acquires nothing in the child, and the parent's next
-      `emit` after the fork is accepted.
+- [ ] A `FileSink` closed before the fork re-acquires nothing in the child, and an open `FileSink`
+      in the same parent accepts its next `emit` after the fork.
 - [ ] Serves invariant 12: a forked child never hangs on a guard lock its parent held, and adopts no
       caller or closer that exists only in the parent.
 
@@ -700,7 +701,7 @@ tests/
 ├── test_closed_guard.py         # FR-001 to FR-003 against doubles, both modes parametrised
 ├── test_sink_concurrency.py     # FR-002's adopter cases; FR-005's re-derived lints and fixtures
 ├── test_sink_post_close.py      # FR-004 across the adopters, worker and orphan
-├── test_fork_lifecycle.py       # + FR-006; :898 re-pointed at sink._guard._lock
+├── test_fork_lifecycle.py       # + FR-006; :902 re-pointed at sink._guard._lock
 ├── test_sinks_kafka.py          # + FR-003's window
 └── test_deferral.py             # + ("KafkaSink", "emit") in IMMEDIATE
 ```
@@ -770,3 +771,12 @@ tests/
   forbids (a `CLOSE_ONLY` closer interrupted on the lock would leave the guard `OPEN`; an executed
   prototype's mutant with that order fails FR-001's interrupted-closer criterion). FR-001 governs:
   `CLOSING` is set before `_lock` in both modes, and the step list now says so.
+- 2026-11-09, build: three criteria corrected, none changing shipped behaviour.
+  - FR-004's first criterion read "the sink's fda134a closed message" for a `CLOSING` sink too,
+    but `NATSSink`'s closing state stays SPEC-061's, whose refusal carries "the sink is closing".
+    It now names each state's own message.
+  - FR-006's last criterion asked that "the parent's next `emit` after the fork is accepted" of
+    the `FileSink` closed before the fork, which FR-004 requires to refuse. It is read as two
+    sinks: the closed one re-acquires nothing in the child, and an open one in the same parent
+    still accepts after the fork (the parent is untouched, invariant 12's other half).
+  - The test that assigns `sink._lock` is at `tests/test_fork_lifecycle.py:902`, not `:898`.

@@ -95,6 +95,12 @@ class GooglePubSubSink:
     discarding it. What the bound rules out is growth with the total number of events a *healthy*
     process has logged, which is what FR-004 is about.
 
+    **This sink keeps its own closed state** rather than the closed guard the other transport
+    sinks share (SPEC-076 FR-005). It is not an engine sink, and its close is deliberately absorbed
+    mid-batch: a publish whose hand-off finds the sink closed is counted under ``_futures_lock``
+    as an orphaned future, and :meth:`close` drains what is pending. That count is its rule for a
+    close that overlaps a call still inside, a documented difference from the guard's wait.
+
     Attributes:
       max_pending: Outstanding futures held between emits before ``emit`` waits on the oldest.
       overflow_timeout: Seconds one over-bound publish is waited on before being put back.

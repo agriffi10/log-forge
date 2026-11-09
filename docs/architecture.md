@@ -1581,6 +1581,14 @@ and a third copy is a fork with no merge.
   wants the orphan path off the critical path should open a span; that is what the
   buffer-then-flush pipeline is for.
 
+  **Since SPEC-074 and SPEC-076 the wait is one round, never a backoff, and the lock is the
+  closed guard's.** An engine sink holds its transport lock for one round inside `deliver` and
+  waits between rounds with no lock held, so an orphan caller waits for at most the round the
+  drain thread is inside. A `SERIAL` guard (the five engine sinks that cannot share their
+  transport, and `FileSink`, `RotatingFileSink` and `SQLiteSink`) holds its lock across each
+  section; a `CLOSE_ONLY` guard (`MongoDBSink`, the Redis sinks, `KafkaSink`) takes none, so on
+  those an orphan call does not wait at all.
+
 - ~~**A process that only ever used the orphan path never closes its sink**, and a sink
   adopted after `shutdown()` is closed by nothing.~~ — **fixed by SPEC-031 FR-006 and
   SPEC-033.** The reasoning is in `docs/decisions/pipeline/` ("The close is once-only across
@@ -1703,6 +1711,16 @@ and a third copy is a fork with no merge.
   stuck one, so it reported `ShutdownTimeout` and "left open" for closes that had completed.
   A wrong signal is worse than a slow one. Bounding this properly needs the sink's `close()` to
   be interruptible, which is a change to the sink contract rather than to the worker.
+
+  **SPEC-076 narrows what the close waits for, not the release.** A close on a sink's closed
+  guard refuses every later caller from the moment it begins, so it waits behind at most one
+  section: for a `SERIAL` guard the one holding the lock when the close began — one round of an
+  engine sink, bounded by the driver call's own timeout where it has one, or one batch's write —
+  rather than any number of callers queued on a lock that is not FIFO; for a `CLOSE_ONLY` guard at
+  most `CLOSE_OVERLAP_WAIT` (0.5 s), after which it releases and a call still inside is counted or
+  meets the closed client. The release itself — `client.close()`, `producer.flush()`, a file's
+  `close()` — stays as unbounded as above, and what bounds the exit is still
+  `DEFAULT_CLOSER_GRACE` for a detached close.
 
   ~~**The same gap reaches `configure(sink=...)`**~~ — **closed by SPEC-030's follow-up.** It did:
   a late sink swap closed the previous sink inline on the caller's thread, so a `KafkaSink` whose

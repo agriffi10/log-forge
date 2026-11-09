@@ -7,6 +7,7 @@ covers ever surfaced. Every test here fails against the pre-SPEC-028 sinks and p
 import ast
 import asyncio
 import json
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -1536,6 +1537,8 @@ def _may_not_claim_it_accepts(cls: ast.ClassDef) -> str | None:
     entry = helpers.get("deliver") or helpers.get("emit")
     if entry is not None and _takes_the_transport_lock(entry, helpers, {entry.name}):
         return "it takes a transport lock in emit, so it holds state a close releases"
+    if _guard_mode(helpers) is not None:
+        return "it builds a ClosedGuard, which is what a refusing sink does"
     for node in ast.walk(cls):
         if (
             isinstance(node, ast.Attribute)
@@ -2463,3 +2466,425 @@ def test_an_orphan_round_waits_for_the_drain_threads_round_and_no_longer(
     flusher.join(15.0)
     landed = _messages(rig)
     assert landed.index("drained") < landed.index("orphan"), landed
+
+
+# -- SPEC-076 FR-005: the lints that derive from the guard, and their fixtures ----------------
+
+
+def _fixture_class(source: str) -> tuple[str, ast.ClassDef]:
+    """Parses one fixture class, shaped like an entry of the package scan.
+
+    Args:
+      source: The module source holding the class first.
+
+    Returns:
+      A ``(module_stem, class node)`` pair.
+
+    Raises:
+      None.
+    """
+    tree = ast.parse(textwrap.dedent(source))
+    cls = tree.body[0]
+    assert isinstance(cls, ast.ClassDef)
+    return ("fixture", cls)
+
+
+_SERIAL_FIXTURE = """
+    class Adopter:
+        \"\"\"A fixture adopter.\"\"\"
+
+        def __init__(self):
+            self._guard = ClosedGuard(GuardMode.{mode})
+
+        def deliver(self, batch):
+            {body}
+
+        def close(self):
+            self._guard.close(self._release)
+"""
+
+_ENTERS = "with self._guard.enter() as section:\n                if not section:\n                    raise E()"
+
+
+def test_a_serial_adopter_that_lost_its_enter_is_reported() -> None:
+    """FR-005 AC-3: a ``SERIAL`` adopter whose ``deliver`` no longer enters its guard is reported.
+
+    Its silent twin enters the guard and is accepted without any docstring claim, which is what
+    proves the re-derived lint reads the guard as the transport lock.
+    """
+    lost = _fixture_class(_SERIAL_FIXTURE.format(mode="SERIAL", body="return None"))
+    kept = _fixture_class(_SERIAL_FIXTURE.format(mode="SERIAL", body=_ENTERS))
+    assert _undecided_concurrency([lost]) == ["fixture.Adopter"]
+    assert _undecided_concurrency([kept]) == []
+
+
+def test_a_close_only_adopter_without_its_claim_is_reported() -> None:
+    """FR-005 AC-3: a ``CLOSE_ONLY`` guard takes no transport lock, so its claim is still owed."""
+    unclaimed = _fixture_class(_SERIAL_FIXTURE.format(mode="CLOSE_ONLY", body=_ENTERS))
+    claimed_source = _SERIAL_FIXTURE.format(mode="CLOSE_ONLY", body=_ENTERS).replace(
+        "A fixture adopter.", "Takes **no** transport lock (SPEC-028 FR-002)."
+    )
+    claimed = _fixture_class(claimed_source)
+    assert _undecided_concurrency([unclaimed]) == ["fixture.Adopter"]
+    assert _undecided_concurrency([claimed]) == []
+
+
+def test_a_guard_builder_cannot_claim_it_accepts() -> None:
+    """FR-005 AC-4: building a ``ClosedGuard`` bars the ``adds no post-close guard`` claim."""
+    claim = f"This sink {ACCEPTS_AFTER_CLOSE} (SPEC-032 FR-003)."
+    source = _SERIAL_FIXTURE.format(mode="CLOSE_ONLY", body="return None").replace(
+        "A fixture adopter.", claim
+    )
+    guarded = _fixture_class(source)
+    unguarded = _fixture_class(
+        source.replace("self._guard = ClosedGuard(GuardMode.CLOSE_ONLY)", "self.n = 0")
+    )
+    assert _undecided_post_close([guarded]) == [
+        "fixture.Adopter (it builds a ClosedGuard, which is what a refusing sink does)"
+    ]
+    assert _undecided_post_close([unguarded]) == []
+
+
+def _is_guard_enter(item: ast.withitem) -> bool:
+    expr = item.context_expr
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "enter"
+        and isinstance(expr.func.value, ast.Attribute)
+        and expr.func.value.attr == "_guard"
+    )
+
+
+def _is_run_context_refuse(stmt: ast.stmt) -> bool:
+    if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+        return False
+    func = stmt.value.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "refuse"
+        and isinstance(func.value, ast.Call)
+        and isinstance(func.value.func, ast.Name)
+        and func.value.func.id == "run_context"
+        and not func.value.args
+    )
+
+
+def guarded_section_findings(source: str) -> tuple[int, list[str]]:
+    """Every ``with ..._guard.enter()`` in a module, and every way one breaks FR-004's opening.
+
+    The rule (SPEC-076 FR-004, FR-005 AC-5): the item binds ``as section``; the block's first
+    statement is ``if not section:`` with no ``else``; that body is exactly one ``raise``, or
+    exactly one ``run_context().refuse(...)`` call followed by exactly one ``return``. So a
+    refused call does no I/O before its answer and none inside it.
+
+    Args:
+      source: The module source.
+
+    Returns:
+      How many guarded sections the module holds, and one finding per broken one.
+
+    Raises:
+      None.
+    """
+    sections = 0
+    findings: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.With | ast.AsyncWith):
+            continue
+        items = [item for item in node.items if _is_guard_enter(item)]
+        if not items:
+            continue
+        sections += 1
+        where = f"line {node.lineno}"
+        target = items[0].optional_vars
+        if not (isinstance(target, ast.Name) and target.id == "section"):
+            findings.append(f"{where}: the guard's section is not bound as `section`")
+            continue
+        first = node.body[0]
+        if not (
+            isinstance(first, ast.If)
+            and isinstance(first.test, ast.UnaryOp)
+            and isinstance(first.test.op, ast.Not)
+            and isinstance(first.test.operand, ast.Name)
+            and first.test.operand.id == "section"
+            and not first.orelse
+        ):
+            findings.append(f"{where}: the first statement is not `if not section:`")
+            continue
+        body = first.body
+        raises = len(body) == 1 and isinstance(body[0], ast.Raise)
+        refuses = (
+            len(body) == 2 and _is_run_context_refuse(body[0]) and isinstance(body[1], ast.Return)
+        )
+        if not (raises or refuses):
+            findings.append(
+                f"{where}: the refused branch is not one raise, or run_context().refuse(...) "
+                "then return"
+            )
+    return sections, findings
+
+
+_GOOD_REFUSE = """
+def deliver(self, batch):
+    with self._guard.enter() as section:
+        if not section:
+            run_context().refuse(SinkDeliveryError("closed"))
+            return Verdict.uniform(Outcome.REJECTED, len(batch))
+        self.client.insert(batch)
+"""
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        (
+            _GOOD_REFUSE.replace(
+                "        if not section:", "        self.client.ping()\n        if not section:"
+            ),
+            "the first statement is not `if not section:`",
+        ),
+        (
+            _GOOD_REFUSE.replace(
+                "            return Verdict", "            self.client.ping()\n            return Verdict"
+            ),
+            "the refused branch is not one raise",
+        ),
+        (
+            _GOOD_REFUSE.replace("as section:", "as s:"),
+            "the guard's section is not bound as `section`",
+        ),
+        (
+            _GOOD_REFUSE.replace("run_context().refuse(", "context.refuse("),
+            "the refused branch is not one raise",
+        ),
+        (
+            _GOOD_REFUSE.replace("run_context().refuse(", "outer_context().refuse("),
+            "the refused branch is not one raise",
+        ),
+        (
+            _GOOD_REFUSE.replace(
+                "            return Verdict.uniform(Outcome.REJECTED, len(batch))\n",
+                "            return Verdict.uniform(Outcome.REJECTED, len(batch))\n"
+                "        else:\n            pass\n",
+            ),
+            "the first statement is not `if not section:`",
+        ),
+    ],
+    ids=[
+        "call-before-check",
+        "call-in-branch",
+        "unbound",
+        "captured-context",
+        "another-callee",
+        "else-branch",
+    ],
+)
+def test_the_opening_rule_reports_each_plant(source: str, reason: str) -> None:
+    """FR-005 AC-5's corpus: each plant is reported with its reason; the good shapes are silent."""
+    sections, findings = guarded_section_findings(source)
+    assert sections == 1 and len(findings) == 1 and reason in findings[0], findings
+    assert guarded_section_findings(_GOOD_REFUSE) == (1, [])
+    raising = _GOOD_REFUSE.replace(
+        '            run_context().refuse(SinkDeliveryError("closed"))\n'
+        "            return Verdict.uniform(Outcome.REJECTED, len(batch))\n",
+        '            raise SinkDeliveryError("closed")\n',
+    )
+    assert guarded_section_findings(raising) == (1, [])
+
+
+def _sink_modules() -> list[Path]:
+    import log_foundry
+
+    return sorted((Path(log_foundry.__file__).parent / "sinks").glob("*.py"))
+
+
+def test_every_guarded_section_opens_with_its_answer() -> None:
+    """FR-005 AC-5: every guarded section in ``sinks/`` opens as FR-004 writes it.
+
+    A floor of twelve — the eleven adopters, Kafka twice (``emit`` and ``flush``) — so a scan
+    that stopped recognising the guard cannot pass by finding nothing to judge.
+    """
+    total = 0
+    findings: list[str] = []
+    for path in _sink_modules():
+        sections, found = guarded_section_findings(path.read_text(encoding="utf-8"))
+        total += sections
+        findings.extend(f"{path.name} {finding}" for finding in found)
+    assert findings == []
+    assert total >= 12, f"the scan found {total} guarded sections, under its floor of 12"
+
+
+SERIAL_ADOPTERS = frozenset(
+    {
+        "AzureEventHubsSink",
+        "ClickHouseSink",
+        "FileSink",
+        "PostgresSink",
+        "RabbitMQSink",
+        "RotatingFileSink",
+        "SQLiteSink",
+        "SocketTransport",
+    }
+)
+CLOSE_ONLY_ADOPTERS = frozenset({"KafkaSink", "MongoDBSink", "_RedisSink"})
+LOCAL_CLOSED_STATE = frozenset({"NATSSink", "GooglePubSubSink"})
+"""The two sinks that keep closed state of their own, each with its reason in its docstring."""
+LOCAL_REASON = "keeps its own closed state"
+
+
+def guard_builder_findings(trees: dict[str, ast.Module]) -> tuple[dict[str, str], list[str]]:
+    """Every class building a ``ClosedGuard``, by mode, and every non-canonical build.
+
+    Any call whose callee is named ``ClosedGuard`` — a bare name or an attribute such as
+    ``_guard.ClosedGuard`` — is found, so a spelling ``_guard_mode`` would not read cannot hide;
+    each must be the statement ``self._guard = ClosedGuard(GuardMode.<MEMBER>)`` in ``__init__``.
+
+    Args:
+      trees: Parsed modules by file name.
+
+    Returns:
+      ``{class name: mode}`` for the canonical builds, and one finding per other build.
+
+    Raises:
+      None.
+    """
+    modes: dict[str, str] = {}
+    findings: list[str] = []
+    for name, tree in trees.items():
+        for cls in [node for node in tree.body if isinstance(node, ast.ClassDef)]:
+            helpers = {
+                m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)
+            }
+            mode = _guard_mode(helpers)
+            builds = [
+                call
+                for call in ast.walk(cls)
+                if isinstance(call, ast.Call)
+                and (
+                    (isinstance(call.func, ast.Name) and call.func.id == "ClosedGuard")
+                    or (isinstance(call.func, ast.Attribute) and call.func.attr == "ClosedGuard")
+                )
+            ]
+            if mode is not None:
+                modes[cls.name] = mode
+            if len(builds) != (1 if mode is not None else 0):
+                findings.append(f"{name} {cls.name}: builds a ClosedGuard outside the canonical shape")
+    return modes, findings
+
+
+def test_the_guard_adopters_are_the_eleven() -> None:
+    """FR-005 AC-1: exactly the eleven build a guard, by mode; no other class stores a flag.
+
+    ``_closed`` and ``_closing`` are stored only by ``NATSSink`` and ``GooglePubSubSink``, and each
+    says in its class docstring why it keeps its own closed state.
+    """
+    trees = {path.name: ast.parse(path.read_text(encoding="utf-8")) for path in _sink_modules()}
+    modes, findings = guard_builder_findings(trees)
+    assert findings == []
+    assert {n for n, m in modes.items() if m == "SERIAL"} == SERIAL_ADOPTERS
+    assert {n for n, m in modes.items() if m == "CLOSE_ONLY"} == CLOSE_ONLY_ADOPTERS
+    storing: set[str] = set()
+    for tree in trees.values():
+        for cls in [node for node in tree.body if isinstance(node, ast.ClassDef)]:
+            if any(
+                isinstance(node, ast.Attribute)
+                and node.attr in ("_closed", "_closing")
+                and isinstance(node.ctx, ast.Store)
+                for node in ast.walk(cls)
+            ):
+                storing.add(cls.name)
+                doc = " ".join((ast.get_docstring(cls) or "").split())
+                assert LOCAL_REASON in doc and "SPEC-076" in doc, cls.name
+    assert storing == LOCAL_CLOSED_STATE
+
+
+@pytest.mark.parametrize(
+    ("plant", "finding"),
+    [
+        ("self._guard = _guard.ClosedGuard(GuardMode.SERIAL)", "outside the canonical shape"),
+        ("self._g = ClosedGuard(GuardMode.SERIAL)", "outside the canonical shape"),
+        ("self._guard = ClosedGuard(mode)", "outside the canonical shape"),
+    ],
+    ids=["qualified", "other-attribute", "variable-mode"],
+)
+def test_the_adopter_roster_reports_a_non_canonical_build(plant: str, finding: str) -> None:
+    """FR-005 AC-1's corpus (plan review NIT-6): a build the mode reader cannot see is reported."""
+    source = textwrap.dedent(
+        f"""
+        class Adopter:
+            def __init__(self, mode):
+                {plant}
+        """
+    )
+    modes, findings = guard_builder_findings({"m.py": ast.parse(source)})
+    assert modes == {} and len(findings) == 1 and finding in findings[0], findings
+    canonical = source.replace(plant, "self._guard = ClosedGuard(GuardMode.SERIAL)")
+    assert guard_builder_findings({"m.py": ast.parse(canonical)}) == ({"Adopter": "SERIAL"}, [])
+
+
+CLOSED_MESSAGES = {
+    "_socket.py": ["SocketTransport delivered none of "],
+    "clickhouse.py": ["ClickHouseSink inserted none of "],
+    "eventhubs.py": ["AzureEventHubsSink sent none of "],
+    "file.py": ["FileSink wrote none of ", "RotatingFileSink wrote none of "],
+    "kafka.py": ["KafkaSink produced none of ", "KafkaSink cannot flush: the sink is closed"],
+    "mongodb.py": ["MongoDBSink inserted none of "],
+    "postgres.py": ["PostgresSink inserted none of "],
+    "rabbitmq.py": ["RabbitMQSink published none of "],
+    "redis.py": [" delivered none of "],
+    "sqlite.py": ["SQLiteSink inserted none of "],
+}
+"""Each adopter's closed message, by the literal that opens it (plan review NIT-3: by text)."""
+
+
+def _refused_branches(source: str) -> list[tuple[list[str], range]]:
+    """Each guarded section's ``if not section:`` body: its string literals and its line span."""
+    found: list[tuple[list[str], range]] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.With) and any(_is_guard_enter(i) for i in node.items):
+            first = node.body[0]
+            if isinstance(first, ast.If):
+                literals = [
+                    inner.value
+                    for inner in ast.walk(first)
+                    if isinstance(inner, ast.Constant) and isinstance(inner.value, str)
+                ]
+                found.append((literals, range(first.lineno, (first.end_lineno or 0) + 1)))
+    return found
+
+
+def test_no_adopter_stores_its_lock_and_each_closed_message_sits_in_a_refused_branch() -> None:
+    """FR-005 AC-2: no ``_lock``/``_close_lock`` store; each of the twelve messages once, refused.
+
+    Each message is found by the literal that opens it, exactly once among the literals of the
+    module's refused branches (by text, never by counting grep hits per module: ``postgres.py``
+    has prose lines that match the grep). The spec's instrument, ``grep -n 'is closed"'``, is then
+    run over each refused branch's lines and must find exactly one line per message there.
+    """
+    count = 0
+    for path in _sink_modules():
+        if path.name not in CLOSED_MESSAGES:
+            continue
+        source = path.read_text(encoding="utf-8")
+        assert not [
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Attribute)
+            and node.attr in ("_lock", "_close_lock")
+            and isinstance(node.ctx, ast.Store)
+        ], f"{path.name} stores a 1.x lock"
+        branches = _refused_branches(source)
+        literals = [literal for found, _ in branches for literal in found]
+        for opening in CLOSED_MESSAGES[path.name]:
+            assert literals.count(opening) == 1, (path.name, opening, literals)
+            count += 1
+        lines = source.splitlines()
+        grep_hits = [
+            number
+            for _, span in branches
+            for number in span
+            if 'is closed"' in lines[number - 1]
+        ]
+        assert len(grep_hits) == len(CLOSED_MESSAGES[path.name]), (path.name, grep_hits)
+    assert count == 12

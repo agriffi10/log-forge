@@ -4114,3 +4114,157 @@ def test_the_counters_type_is_read_without_an_import(monkeypatch: pytest.MonkeyP
 def test_the_counters_reach_refuses_everything_but_exact_counters(value: object) -> None:
     """Only an exact ``SinkCounters`` is handed back; a property is never called."""
     assert _fork._counters_reach(value, SinkCounters) is None
+
+
+# -- SPEC-076 FR-006: the closed guard in a forked child ------------------------------------------
+
+
+def _parked_section(guard: Any) -> tuple[threading.Event, threading.Thread]:
+    """Holds one admitted section of ``guard`` on a parent thread until the event is set."""
+    inside, leave = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with guard.enter():
+            inside.set()
+            leave.wait(5.0)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert inside.wait(5.0)
+    return leave, holder
+
+
+@pytest.mark.parametrize("held", ["_lock", "_state_lock"])
+def test_a_child_delivers_while_a_parent_thread_holds_a_guard_lock(
+    tmp_path: pathlib.Path, held: str
+) -> None:
+    """SPEC-076 FR-006 AC-1: the guard's locks are on the walk, reached from ``configure()``.
+
+    A parent thread holds the guard's transport lock — the drain thread parked inside a
+    ``FileSink`` write, which is a section — or its state lock, at the fork. The child's
+    ``info()`` lands in the file, its ``close()`` returns, and the lock it would have taken is a
+    different object from the parent's. Driven through ``configure()``, so a walk from the
+    runtime's roots that stops at the sink instead of entering its ``_guard`` reddens this.
+    """
+    path = tmp_path / "events.ndjson"
+    sink, stream = _gated_file_sink(tmp_path)
+    released: threading.Event | None = None
+    gate = None
+    if held == "_lock":
+        worker = Worker(sink, batch_size=1, flush_interval=0.01)
+        _lifecycle._state._worker = worker
+        gate = _park_the_drain_thread(stream, worker, 0)
+    else:
+        released, _ = _held_by_a_parent_thread(sink._guard._state_lock)
+    before = id(getattr(sink._guard, held))
+
+    def child() -> str:
+        log_foundry.info("child-line")
+        landed = "child-line" in path.read_text(encoding="utf-8")
+        sink.close()
+        return f"{landed},{id(getattr(sink._guard, held)) != before}"
+
+    try:
+        result = run_in_child(child, timeout=5)
+    finally:
+        if gate is not None:
+            gate.release.set()
+        if released is not None:
+            released.set()
+    assert result.finished, f"the child {result.ending}: {result.output!r}"
+    assert result.output == "True,True", result.output
+
+
+def test_a_child_forked_inside_a_close_only_section_closes_at_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """SPEC-076 FR-006 AC-2: a parent's section is not one the child's close waits for.
+
+    Without the pid adoption the child's guard would count the parent's section inside and its
+    close would wait the whole ``CLOSE_OVERLAP_WAIT`` for a thread that does not exist there.
+    """
+    import sink_rigs
+
+    rig = sink_rigs.RIGS["MongoDBSink"](monkeypatch, tmp_path)
+    sink = rig.sink
+    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
+    leave, holder = _parked_section(sink._guard)
+
+    def child() -> str:
+        began = time.monotonic()
+        sink.close()
+        return f"{time.monotonic() - began:.3f}"
+
+    try:
+        result = run_in_child(child)
+    finally:
+        leave.set()
+        holder.join(5.0)
+    assert result.finished, f"the child {result.ending}: {result.output!r}"
+    assert float(result.output) < 0.25, result.output
+
+
+def test_a_child_of_a_closing_parent_admits_and_of_a_closed_one_refuses(
+    tmp_path: pathlib.Path,
+) -> None:
+    """SPEC-076 FR-006 AC-3: ``CLOSING`` in the parent is ``OPEN`` in the child; ``CLOSED`` stays.
+
+    A close still waiting for the lock had not begun its release, and no parent closer runs in
+    the child, so the child admits sections, as it did in 1.x, where the flag was set only inside
+    the lock. A sink whose release began in the parent refuses in the child.
+    """
+    closing, _ = _gated_file_sink(tmp_path, name="closing.ndjson")
+    closed = FileSink(str(tmp_path / "closed.ndjson"))
+    closed.close()
+    leave, holder = _parked_section(closing._guard)
+    closer = threading.Thread(target=closing.close, daemon=True)
+    closer.start()
+    deadline = time.monotonic() + 5.0
+    while not closing._guard.closed:
+        assert time.monotonic() < deadline, "the parent's close never began"
+        time.sleep(0.001)
+
+    def child() -> str:
+        with closing._guard.enter() as open_section:
+            admitted = bool(open_section)
+        with closed._guard.enter() as closed_section:
+            refused = not closed_section
+        return f"{admitted},{refused}"
+
+    try:
+        result = run_in_child(child)
+    finally:
+        leave.set()
+        holder.join(5.0)
+        closer.join(5.0)
+    assert result.finished, f"the child {result.ending}: {result.output!r}"
+    assert result.output == "True,True", result.output
+
+
+def test_a_closed_file_sink_reacquires_nothing_and_an_open_one_accepts_after_the_fork(
+    tmp_path: pathlib.Path,
+) -> None:
+    """SPEC-076 FR-006 AC-4, read as two sinks (the spec's revision history records why).
+
+    Both are reachable by the walk through a configured ``MultiSink``. In the child the closed
+    one's ``reacquire_after_fork`` reads the guard's ``closed`` and keeps its stream, while the
+    open one re-opens its own; in the parent, untouched by the fork, the open one's next ``emit``
+    is accepted.
+    """
+    open_path = tmp_path / "open.ndjson"
+    still_open = FileSink(str(open_path))
+    closed = FileSink(str(tmp_path / "closed.ndjson"))
+    closed.close()
+    log_foundry.configure(
+        service="fork", version="0", env="test", sink=MultiSink(still_open, closed)
+    )
+    closed_stream, open_stream = id(closed._stream), id(still_open._stream)
+
+    def child() -> str:
+        return f"{id(closed._stream) == closed_stream},{id(still_open._stream) != open_stream}"
+
+    result = run_in_child(child)
+    assert result.finished, f"the child {result.ending}: {result.output!r}"
+    assert result.output == "True,True", result.output
+    still_open.emit([{"marker": "after-fork"}])
+    assert "after-fork" in open_path.read_text(encoding="utf-8")

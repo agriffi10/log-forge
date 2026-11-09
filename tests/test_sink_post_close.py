@@ -10,6 +10,7 @@ for ``NATSSink``. Serves invariants 2, 6 and 7.
 
 from __future__ import annotations
 
+import ast
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -468,3 +469,273 @@ def test_a_round_past_the_bound_fails_on_the_released_client(
     assert calls["n"] == 1, "a round after the release reached the client"
     assert log_foundry.health().failed_batches == 1
     assert sink.failed == (3 if name == "MongoDBSink" else 0)
+
+
+def _opener_built(make: Callable[[Any], Any]) -> Callable[[pytest.MonkeyPatch, Path], Any]:
+    """A builder for an HTTP-family sink over ``test_sinks_http.FakeOpener``."""
+
+    def build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+        from test_sinks_http import FakeOpener
+
+        opener = FakeOpener()
+        return make(opener), lambda: len(opener.calls)
+
+    return build
+
+
+def _rig_built(name: str) -> Callable[[pytest.MonkeyPatch, Path], Any]:
+    def build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+        rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+        return rig.sink, rig.calls
+
+    return build
+
+
+def _inner_built(wrap: Callable[[Any], Any]) -> Callable[[pytest.MonkeyPatch, Path], Any]:
+    def build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+        from log_foundry.sinks.memory import MemorySink
+
+        inner = MemorySink()
+        return wrap(inner), lambda: len(inner.events)
+
+    return build
+
+
+def _http(cls_name: str, *args: Any, **kwargs: Any) -> Callable[[pytest.MonkeyPatch, Path], Any]:
+    def make(opener: Any) -> Any:
+        import importlib
+
+        module = {
+            "HTTPSink": "http", "DatadogSink": "datadog", "SplunkHECSink": "splunk",
+            "NewRelicSink": "newrelic", "HoneycombSink": "honeycomb", "LokiSink": "loki",
+            "ElasticsearchSink": "elasticsearch", "OpenSearchSink": "elasticsearch",
+            "OTLPSink": "otlp", "SentrySink": "sentry",
+        }[cls_name]
+        cls = getattr(importlib.import_module(f"log_foundry.sinks.{module}"), cls_name)
+        return cls(*args, opener=opener, **kwargs)
+
+    return _opener_built(make)
+
+
+def _callback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+    from log_foundry.sinks.callback import CallbackSink
+
+    batches: list[object] = []
+    return CallbackSink(batches.append), lambda: len(batches)
+
+
+def _logging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+    import logging
+
+    from log_foundry.sinks.logging_sink import LoggingSink
+
+    records: list[logging.LogRecord] = []
+
+    class Keep(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    logger = logging.getLogger(f"spec076.{tmp_path.name}")
+    logger.propagate = False
+    logger.addHandler(Keep())
+    logger.setLevel(logging.DEBUG)
+    return LoggingSink(logger), lambda: len(records)
+
+
+def _null(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+    from log_foundry.sinks.null import NullSink
+
+    return NullSink(), lambda: 0
+
+
+def _memory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+    from log_foundry.sinks.memory import MemorySink
+
+    sink = MemorySink()
+    return sink, lambda: len(sink.events)
+
+
+def _multi(inner: Any) -> Any:
+    from log_foundry.sinks.multi import MultiSink
+
+    return MultiSink(inner)
+
+
+def _filtering(inner: Any) -> Any:
+    from log_foundry.sinks.filtering import FilteringSink
+
+    return FilteringSink(inner)
+
+
+def _transform(inner: Any) -> Any:
+    from log_foundry.sinks.transform import TransformSink
+
+    return TransformSink(inner, lambda event: event)
+
+
+def _sentry(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Callable[[], int]]:
+    """``SentrySink`` over an SDK that cannot deliver, so it sends through its HTTP fallback."""
+    from log_foundry.sinks.sentry import SentrySink
+    from test_sentry_backend import DSN, FakeModule, InactiveClient
+    from test_sinks_http import FakeOpener
+
+    opener = FakeOpener()
+    sink = SentrySink(DSN, opener=opener, client=FakeModule(InactiveClient()))
+    return sink, lambda: len(opener.calls)
+
+ACCEPTING_BUILDERS: dict[str, Callable[[pytest.MonkeyPatch, Path], Any]] = {
+    "callback.CallbackSink": _callback,
+    "datadog.DatadogSink": _http("DatadogSink", "k", max_retries=0),
+    "elasticsearch.ElasticsearchSink": _http("ElasticsearchSink", "http://x", index="i", max_retries=0),
+    "elasticsearch.OpenSearchSink": _http("OpenSearchSink", "http://x", index="i", max_retries=0),
+    "filtering.FilteringSink": _inner_built(_filtering),
+    "firehose.FirehoseSink": _rig_built("FirehoseSink"),
+    "honeycomb.HoneycombSink": _http("HoneycombSink", "k", "d", max_retries=0),
+    "http.HTTPSink": _http("HTTPSink", "http://x", max_retries=0),
+    "kinesis.KinesisSink": _rig_built("KinesisSink"),
+    "logging_sink.LoggingSink": _logging,
+    "loki.LokiSink": _http("LokiSink", "http://x", max_retries=0),
+    "memory.MemorySink": _memory,
+    "multi.MultiSink": _inner_built(_multi),
+    "newrelic.NewRelicSink": _http("NewRelicSink", "k", max_retries=0),
+    "null.NullSink": _null,
+    "otlp.OTLPSink": _http("OTLPSink", max_retries=0),
+    "sentry.SentrySink": _sentry,
+    "sns.SNSSink": _rig_built("SNSSink"),
+    "splunk.SplunkHECSink": _http("SplunkHECSink", "http://x", "t", max_retries=0),
+    "sqs.SQSSink": _rig_built("SQSSink"),
+    "stdout.StdoutSink": _rig_built("StdoutSink"),
+    "stdout.StderrSink": _rig_built("StderrSink"),
+    "transform.TransformSink": _inner_built(_transform),
+}
+"""A builder per sink that records it accepts after close, each over a double it already has.
+
+Which sinks belong here is derived (``_accepting``), never read from this map: a key the
+derivation does not produce, or a derived sink with no key, fails the test below."""
+
+
+def _accepting() -> list[tuple[str, Any]]:
+    """Every sink class whose recorded decision is that it accepts after ``close()``."""
+    from test_sink_concurrency import (
+        ACCEPTS_AFTER_CLOSE,
+        _decision_doc,
+        _sink_classes_with_an_emit,
+    )
+
+    return [
+        (f"{stem}.{cls.name}", cls)
+        for stem, cls in _sink_classes_with_an_emit()
+        if ACCEPTS_AFTER_CLOSE in _decision_doc(cls)
+    ]
+
+
+def test_the_accepting_builders_cover_exactly_the_derived_population() -> None:
+    """FR-005 AC-8: the builder map neither misses a derived sink nor names a stale one."""
+    derived = {name for name, _ in _accepting()}
+    assert derived == set(ACCEPTING_BUILDERS), (
+        f"missing: {sorted(derived - set(ACCEPTING_BUILDERS))}; "
+        f"stale: {sorted(set(ACCEPTING_BUILDERS) - derived)}"
+    )
+    assert len(derived) >= 20, f"the accepting roster collapsed to {len(derived)}"
+
+
+@pytest.mark.parametrize("qualified", sorted(ACCEPTING_BUILDERS))
+def test_a_sink_that_releases_nothing_still_delivers_after_close(
+    qualified: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-005 AC-8: it builds no guard, and a batch after ``close()`` still reaches its double."""
+    from test_sink_concurrency import _guard_mode
+
+    cls = dict(_accepting())[qualified]
+    helpers = {m.name: m for m in cls.body if isinstance(m, ast.FunctionDef | ast.AsyncFunctionDef)}
+    assert _guard_mode(helpers) is None and "ClosedGuard" not in ast.unparse(cls)
+    sink, delivered = ACCEPTING_BUILDERS[qualified](monkeypatch, tmp_path)
+    sink.close()
+    before = delivered()
+    sink.emit([{**sink_rigs.ok("after"), "level": "ERROR"}])
+    if qualified != "null.NullSink":
+        assert delivered() > before, f"{qualified} did not deliver after close()"
+
+
+ALIAS_RIGS = {
+    "AzureEventHubsSink": ("AzureEventHubsSink", "_lock"),
+    "ClickHouseSink": ("ClickHouseSink", "_lock"),
+    "FileSink": ("FileSink", "_lock"),
+    "PostgresSink": ("PostgresSink", "_lock"),
+    "RabbitMQSink": ("RabbitMQSink", "_lock"),
+    "RotatingFileSink": ("RotatingFileSink", "_lock"),
+    "SQLiteSink": ("SQLiteSink", "_lock"),
+    "SocketTransport": ("SyslogSink", "_lock"),
+    "KafkaSink": ("KafkaSink", "_close_lock"),
+    "MongoDBSink": ("MongoDBSink", "_close_lock"),
+    "_RedisSink": ("RedisListSink", "_close_lock"),
+}
+"""Each adopter, the rig that builds it, and its 1.x lock name at fda134a."""
+
+
+def _adopter(name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Any]:
+    rig = sink_rigs.RIGS[ALIAS_RIGS[name][0]](monkeypatch, tmp_path)
+    return (rig.sink._socket if name == "SocketTransport" else rig.sink), rig
+
+
+@pytest.mark.parametrize("name", sorted(ALIAS_RIGS))
+def test_each_adopter_keeps_its_1x_names_read_only(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-005 AC-7: ``_closed`` and the 1.x lock name read through, and refuse assignment."""
+    sink, _ = _adopter(name, monkeypatch, tmp_path)
+    lock_name = ALIAS_RIGS[name][1]
+
+    class Legacy(type(sink)):  # type: ignore[misc]
+        def closed_as_1x_read_it(self) -> bool:
+            return bool(self._closed)
+
+    sink.__class__ = Legacy
+    assert sink.closed_as_1x_read_it() is False
+    assert getattr(sink, lock_name) is sink._guard._lock
+    for alias in ("_closed", lock_name):
+        with pytest.raises(AttributeError):
+            setattr(sink, alias, None)
+    sink.close()
+    assert sink.closed_as_1x_read_it() is True
+
+
+SERIAL_ALIAS = sorted(n for n, (_, lock) in ALIAS_RIGS.items() if lock == "_lock")
+
+
+@pytest.mark.parametrize("name", SERIAL_ALIAS)
+def test_a_subclass_holding_the_1x_lock_holds_off_a_section(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FR-005 AC-7: ``with self._lock:`` in a ``SERIAL`` subclass serialises with a section."""
+    sink, rig = _adopter(name, monkeypatch, tmp_path)
+    holding, leave = threading.Event(), threading.Event()
+
+    class Legacy(type(sink)):  # type: ignore[misc]
+        def hold(self) -> None:
+            with self._lock:
+                holding.set()
+                leave.wait(LIMIT)
+
+    sink.__class__ = Legacy
+    holder = threading.Thread(target=sink.hold, daemon=True)
+    holder.start()
+    assert holding.wait(LIMIT)
+    before = rig.calls()
+    done = threading.Event()
+
+    def deliver() -> None:
+        if name == "SocketTransport":
+            rig.sink.emit(_batch(1))
+        else:
+            sink.emit(_batch(1))
+        done.set()
+
+    threading.Thread(target=deliver, daemon=True).start()
+    try:
+        assert not done.wait(0.2), "a section ran while a subclass held the 1x lock"
+        assert rig.calls() == before
+    finally:
+        leave.set()
+    assert done.wait(LIMIT), "the section never ran once the subclass let go"
+    assert rig.calls() > before
