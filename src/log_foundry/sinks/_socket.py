@@ -440,8 +440,8 @@ class SocketTransport:
         """Closes the held socket, if any (FR-005, FR-012).
 
         Idempotent, and takes the send lock so it never closes the socket out from under an
-        in-flight ``send_all`` (SPEC-028 FR-002). ``_reset`` does not take the lock itself,
-        because ``_send_one`` calls it while ``send_all`` already holds one — the lock is
+        in-flight round (SPEC-028 FR-002). ``_reset`` does not take the lock itself,
+        because ``_send_one`` calls it while :meth:`_round` already holds one — the lock is
         deliberately not re-entrant, so that path must stay the only unlocked caller.
 
         Args:
