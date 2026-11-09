@@ -4,24 +4,34 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, require_positive, require_timeout, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count, require_positive, require_timeout
+from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["ClickHouseSink"]
 
-_BACKOFF_BASE = 0.1
-
 _COLUMNS = (
-    "timestamp", "level", "trace_id", "span_id", "function", "service", "duration_ms", "status"
+    "timestamp",
+    "level",
+    "trace_id",
+    "span_id",
+    "function",
+    "service",
+    "duration_ms",
+    "status",
 )
 _COLUMN_NAMES = [*_COLUMNS, "event"]
 
@@ -43,8 +53,11 @@ class ClickHouseSink:
     ClickHouse is the columnar, observability-scale favorite. ``clickhouse-connect`` is the
     optional ``clickhouse`` extra, imported lazily. Each event maps to a row of extracted typed
     columns plus the full event as a ``String`` column, inserted in a single call per chunk. The
-    sink is write-only, and the worst-case delay (SPEC-027 FR-005) is ``max_retries``
-    interruptible waits per chunk, 0.7 s at the defaults.
+    sink is write-only and delivers through SPEC-072's engine (SPEC-074 FR-003): each round
+    inserts every remaining chunk once and the engine resends only the chunks that may land, so
+    the worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run, 0.7 s
+    at the defaults. The lock is held for one round, never across the engine's wait, so a
+    ``close()`` arriving during a backoff takes it between rounds and the next round is refused.
 
     The driver requirement satisfied (SPEC-028 FR-002): ``clickhouse-connect`` states that a
     client is **not** thread-safe when using session ids, and that concurrent queries in one
@@ -56,6 +69,9 @@ class ClickHouseSink:
 
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
+
+    Attributes:
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
     """
 
     def __init__(
@@ -119,11 +135,9 @@ class ClickHouseSink:
         self._chunk_size = require_positive(chunk_size, "chunk_size", "ClickHouseSink")
         self.max_retries = floor_count(max_retries, 0, "max_retries", "ClickHouseSink")
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
-        self._unencodable = 0
+        self.log_foundry_counters = SinkCounters()
         self._closed = False
         self._lock = threading.Lock()
-        self._counter_lock = threading.Lock()
         self._owns_client = client is None
         if client is None:
             client = import_extra("clickhouse_connect", "clickhouse").get_client(dsn=dsn, **bounds)
@@ -131,15 +145,80 @@ class ClickHouseSink:
         if create_table:
             self._ensure_schema()
 
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
     def losses(self) -> SinkLosses:
-        """Reports unencodable events, and rows in a chunk abandoned past the retry bound.
+        """Reports the engine's totals: unencodable events, and rows never confirmed.
 
-        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        rows of a chunk abandoned past the retry bound or, for a failure not worth retrying, at
-        its first attempt (SPEC-026 FR-002, SPEC-070).
-
-        Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
-        never waits on an in-flight insert and its backoff.
+        ``dropped`` is the events the encode step could not encode (SPEC-069 FR-001), counted only
+        by a run that settled; ``failed`` the rows of a chunk still failing when the run's rounds
+        ran out or, for a failure not worth retrying, refused at its first attempt (SPEC-026
+        FR-002, SPEC-070), each once per run (SPEC-074). Read under the counters' lock, never the
+        transport lock (SPEC-028 FR-003), so a poll never waits on an in-flight insert.
 
         Args:
           None.
@@ -150,18 +229,10 @@ class ClickHouseSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(dropped=self._unencodable, failed=self.failed)
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Inserts each chunk as one columnar call, retrying on failure (FR-002).
-
-        Every event is encoded into its row before the lock is taken and before the first insert
-        (SPEC-069 FR-001), so the rows are built once per call rather than once per chunk inside
-        the lock. One that cannot be encoded is dropped, counted and announced only when this
-        call returns, through the deferral helper; before, the chunks ahead of it were already
-        inserted when its row raised, and the worker's retry inserted them again. A batch of
-        nothing encodable inserts nothing and returns, once the closed check has passed (FR-002).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         Args:
           batch: The events to insert. An empty batch is a no-op.
@@ -170,36 +241,92 @@ class ClickHouseSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every chunk failed (SPEC-026 FR-001), which is the whole batch
-            for any batch that fits one chunk, the ordinary case. A partially-inserted batch does
-            not raise: the chunks that landed are committed, and the worker's retry would
-            duplicate them. **Also when a non-empty batch produced no chunk at all** — that
-            returned normally, having sent nothing, with no counter moved (SPEC-049 FR-002).
-            Refusing a non-positive ``chunk_size`` closes the only known route in; this closes the
-            *branch*, so a future chunker change cannot walk back into it.
+          SinkDeliveryError: When the run failed — no chunk inserted (SPEC-026 FR-001) — with the
+            engine's message. A partially-inserted batch returns: the chunks that landed are
+            committed. When the sink is closed, or a non-empty batch produced no chunk at all
+            (SPEC-049 FR-002), the round is a refusal and this raises the 1.x
+            ``SinkDeliveryError`` by identity, with nothing counted.
         """
-        if not batch:
-            return
-        chunks = inserted = 0
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
-            rows = [row for _, row in encoded]
-            with self._lock:
-                if self._closed:
-                    raise SinkDeliveryError(
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-003).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Inserts every remaining chunk once, under the transport lock for this round only.
+
+        A closed sink's round is a refusal carrying 1.x's closed error, decided before any encode
+        or client call. Every event is encoded once per run
+        (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one ``DROPPED`` with
+        SPEC-069's line; the rows are chunked with ``chunk_list`` and each chunk inserted once by
+        :meth:`_insert`, ``ACCEPTED`` when it lands and ``RETRYABLE`` or ``REJECTED`` as
+        ``_retryable_error`` answers, its line ``ClickHouseSink, N attempt(s), <Type>`` naming the
+        calls that carried it. A non-empty round that produced no chunk is a refusal carrying
+        1.x's error (SPEC-049 FR-002): it sent nothing.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        context = run_context()
+        with self._lock:
+            if self._closed:
+                context.refuse(
+                    SinkDeliveryError(
                         f"ClickHouseSink inserted none of {len(batch)} event(s): the sink is closed"
                     )
-                if not rows:
-                    return
-                for chunk in chunk_list(rows, self._chunk_size):
-                    chunks += 1
-                    inserted += self._insert(chunk)
-            if not chunks:
-                raise SinkDeliveryError(
-                    f"ClickHouseSink produced no chunk for {len(batch)} event(s); nothing was sent"
                 )
-            if not inserted:
-                raise SinkDeliveryError(f"ClickHouseSink inserted none of {chunks} chunk(s)")
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            fates = [Outcome.DROPPED] * len(batch)
+            pairs = encode_round(self, batch, self._row, sink=type(self).__name__)
+            if not pairs:
+                return Verdict(outcomes=tuple(fates))
+            lost = Lost(self)
+            chunks = 0
+            for chunk in chunk_list(pairs, self._chunk_size):
+                chunks += 1
+                carried = [batch[position] for position, _ in chunk]
+                mark_sent(self, carried)
+                called = self._insert([row for _, row in chunk])
+                if called.error is None:
+                    outcome = Outcome.ACCEPTED
+                else:
+                    outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                    kind = type(called.error).__name__
+                    lost.add(
+                        carried,
+                        when=When.LAST if called.retryable else When.ALWAYS,
+                        key=kind,
+                        line=raised_line("row", "ClickHouseSink", kind),
+                    )
+                for position, _ in chunk:
+                    fates[position] = outcome
+            if not chunks:
+                context.refuse(
+                    SinkDeliveryError(
+                        f"ClickHouseSink produced no chunk for {len(batch)} event(s); nothing was "
+                        "sent"
+                    )
+                )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            lost.register()
+        return Verdict(outcomes=tuple(fates))
 
     def close(self) -> None:
         """Closes the client only if the sink owns it (FR-005).
@@ -233,42 +360,30 @@ class ClickHouseSink:
           The row values, in column order.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
         """
         return [*(event.get(col) for col in _COLUMNS), json.dumps(event)]
 
-    def _insert(self, rows: list[list[object]]) -> int:
-        """Inserts one chunk within the retry bound (FR-006).
+    def _insert(self, rows: list[list[object]]) -> Called[None]:
+        """Inserts one chunk once (SPEC-074 FR-003); the engine resends it in a later round.
 
         Args:
           rows: The chunk's rows.
 
         Returns:
-          1 when the chunk landed, 0 once it is abandoned.
+          The call, with its exception when it raised.
 
         Raises:
           None. This is an isolation boundary: a driver fault must never crash the worker.
         """
-        for attempt in range(self.max_retries + 1):
-            try:
-                self.client.insert(self._table, data=rows, column_names=_COLUMN_NAMES)
-                return 1
-            except Exception as err:
-                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += len(rows)
-                _diag.lost(
-                    "row",
-                    len(rows),
-                    f"ClickHouseSink, {attempt + 1} attempt(s), {type(err).__name__}",
-                )
-                return 0
-        return 0
+        try:
+            self.client.insert(self._table, data=rows, column_names=_COLUMN_NAMES)
+        except Exception as err:
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(None)
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed insert is worth another attempt (SPEC-070 FR-002).

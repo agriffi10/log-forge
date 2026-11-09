@@ -1,30 +1,47 @@
 """SQSSink — ship batches to an SQS queue (arch §8, §9.1, guide Phase 10).
 
-Ordering on a FIFO queue is best-effort across a retry boundary: an entry that fails while a
-same-group entry ahead of it succeeded lands after it, because holding a whole group back on one
-failure would trade log delivery for ordering the consumer can rebuild from ``timestamp``.
+Ordering on a FIFO queue is kept within a message group for the sink's own retry budget and is
+best-effort past it (SPEC-074 FR-002): a message is held back while an earlier message of its
+group is still being retried within ``max_retries + 1`` sends, as 1.x's per-chunk loop held it,
+and once that message has used its sends a later one may land first, because holding a group for
+the worker's whole budget would trade log delivery for ordering the consumer can rebuild from
+``timestamp``.
 """
 
 from __future__ import annotations
 
 import json
-import threading
 from collections.abc import Callable, Mapping
-from typing import Any, NamedTuple, cast
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count
+from log_foundry.sinks._rounds import (
+    Called,
+    KeyedReply,
+    Lost,
+    entry_ids,
+    mark_sent,
+    read_keyed,
+    sends_of,
+    settle_keyed,
+)
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    import threading
+
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["DedupIdSource", "GroupIdSource", "SQSSink"]
-
-_BACKOFF_BASE = 0.1
 
 DEFAULT_GROUP_ID = "log-foundry"
 """Fallback group for an event carrying no usable ``trace_id`` — never send an empty group id."""
@@ -40,13 +57,16 @@ DedupIdSource = Callable[[dict[str, object]], str] | None
 
 
 class _Prepared(NamedTuple):
-    """One event serialized and costed, with its FIFO ids resolved.
+    """One event serialized and costed, with its FIFO ids resolved, at its place in the round.
 
-    The ids are ``None`` on a standard queue, and are derived once here rather than again at
-    send time: the deduplication fallback mints a fresh UUID, so deriving twice would bill the
-    byte budget for one value and put a different one on the wire.
+    The ids are ``None`` on a standard queue, and are derived once per run rather than again at
+    send time or in a later round: the deduplication fallback mints a fresh UUID, so deriving
+    twice would bill the byte budget for one value and put a different one on the wire, and a
+    resend with a new id would lose SQS's five-minute de-duplication of it (SPEC-074 FR-002).
 
     Attributes:
+      position: The event's position in the batch the round was handed, so each chunk's outcomes
+        map back to the verdict.
       body: The serialized event.
       group_id: The resolved ``MessageGroupId``, or ``None``.
       dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
@@ -55,10 +75,50 @@ class _Prepared(NamedTuple):
         it (SPEC-071 FR-004).
     """
 
+    position: int
     body: str
     group_id: str | None
     dedup_id: str | None
     size: int
+
+
+class _Plan(NamedTuple):
+    """One round's sends and drops, every drop decided before the first send (SPEC-074 FR-002).
+
+    Attributes:
+      chunks: The round's chunks, each valid for one request, built with ``chunk_items``.
+      dropped: Each dropped position of the round's batch and its reason: ``"oversize"``,
+        ``"id failure"`` or ``"unencodable"``.
+      refused: The first id callable's exception, set only when every event's id callable
+        raised; the round is then a refusal.
+    """
+
+    chunks: list[list[_Prepared]]
+    dropped: dict[int, str]
+    refused: Exception | None
+
+
+@dataclass(slots=True)
+class _Entry:
+    """One event occurrence's prepared entry or drop reason, kept for its delivery run.
+
+    Attributes:
+      body: The serialized event, or ``""`` for a drop.
+      group_id: The resolved ``MessageGroupId``, or ``None``.
+      dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
+      size: The costed bytes.
+      drop: The drop reason, or ``None`` for an entry that can be sent.
+      error: The id callable's exception, for an id failure.
+      landed: Whether SQS has accepted this occurrence.
+    """
+
+    body: str = ""
+    group_id: str | None = None
+    dedup_id: str | None = None
+    size: int = 0
+    drop: str | None = None
+    error: Exception | None = None
+    landed: bool = False
 
 
 def _bounded(raw: str, fallback: str) -> str:
@@ -95,8 +155,11 @@ class SQSSink:
     whose events should stay ordered while keeping traces independent. Standard queues are
     untouched, their entries carrying ``Id`` and ``MessageBody`` and nothing else.
 
-    The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per chunk, 0.7 s at the
-    defaults. The waits are interruptible, so ``shutdown()`` cuts one short.
+    **It delivers through SPEC-072's engine** (SPEC-074 FR-002). :meth:`deliver` is one round:
+    every chunk is sent once, its reply read per entry through the keyed reader, and the engine
+    resends only the entries that may land, waiting the 1.x backoff between rounds. The
+    worst-case delay (SPEC-027 FR-005) is therefore ``max_retries`` waits per run, 0.7 s at the
+    defaults, every one interruptible by ``shutdown()``.
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``boto3`` documents that clients — unlike Sessions and Resources — are
@@ -109,9 +172,13 @@ class SQSSink:
     because the client is the caller's to release or the SDK's to reap, so a batch emitted
     afterwards still reaches the queue.
 
-
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
+
+    Attributes:
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      dropped_oversized: Events dropped for exceeding the message limit, counted only by a run
+        that settled.
     """
 
     MAX_BATCH = 10
@@ -132,9 +199,9 @@ class SQSSink:
         Args:
           queue_url: The queue to send to.
           client: A boto3-shaped SQS client, or ``None`` to build one lazily.
-          max_retries: Retries for the failed entries of a chunk, floored at zero as
-            ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
-            having sent nothing, and reported success. Anything but an ``int`` is refused
+          max_retries: Further rounds the engine gives the entries still failing, floored at
+            zero as ``Worker._emit`` floors its own (SPEC-021); a FIFO group keeps its order for
+            ``max_retries + 1`` sends of a message. Anything but an ``int`` is refused
             with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
             ``int`` subclass is read as the ``int`` it holds.
           fifo: Overrides the queue type. AWS requires every FIFO queue name to end in
@@ -175,14 +242,77 @@ class SQSSink:
         self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
         self.message_group_id = message_group_id
         self.message_deduplication_id = message_deduplication_id
+        self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._unencodable = 0
-        self.failed = 0
-        self._id_failed = 0
-        self._counter_lock = threading.Lock()
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Entries not confirmed: sender faults, entries still failing and chunks lost to a raise.
+
+        The engine's ``failed_events``, each lost entry once per run (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
 
     def losses(self) -> SinkLosses:
-        """Reports oversized drops and entries still failing past the retry bound (FR-002).
+        """Reports the engine's totals: drops of a settled run, and entries never confirmed.
 
         Args:
           None.
@@ -192,31 +322,16 @@ class SQSSink:
           SQS rejected the request itself, so the entry is as lost as one that timed out, and
           SPEC-016 settled that it must not be re-sent byte-identical. An event dropped because
           a FIFO id callable raised for it is in ``dropped`` beside the oversized ones, and so is
-          one :meth:`emit` could not encode (SPEC-069 FR-001), while ``dropped_oversized`` keeps
-          meaning oversize only (SPEC-058 FR-004).
+          one the encode step could not encode (SPEC-069 FR-001), while ``dropped_oversized``
+          keeps meaning oversize only (SPEC-058 FR-004).
 
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(
-                dropped=self.dropped_oversized + self._id_failed + self._unencodable,
-                failed=self.failed,
-            )
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunks the batch to SQS limits and sends each chunk (FR-001, FR-002).
-
-        The per-event drops :meth:`_chunks` decides — oversize, and on a FIFO queue a failed id
-        callable — are counted and announced through the deferral helper, so they land only if
-        this call returns normally (SPEC-058 FR-004). They are decided before any send, and this
-        call can still raise afterwards and be retried whole; counting them first counted one
-        oversized event once per attempt.
-
-        Every event's body is encoded before any id is resolved or anything is sent (SPEC-069
-        FR-001), through :meth:`_encode` and the encode helper: one that cannot be encoded is
-        dropped, counted and announced only when this call returns, through the same ledger, and
-        a batch of nothing encodable sends nothing and returns (FR-002).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         Args:
           batch: The events to ship.
@@ -225,32 +340,154 @@ class SQSSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every chunk failed, at least one was sent, and something was
-            lost for a retryable reason (SPEC-026 FR-001). An event dropped for exceeding the
-            message limit is not a send failure — it can never fit — so a batch of nothing but
-            oversized events produces no chunks and does not raise. Nor does one whose chunks SQS
-            rejected entirely as sender faults: those entries are lost, but re-sending them
-            byte-identical can only fail the same way, and SPEC-016 FR-006 settled that they are
-            abandoned rather than retried. That suppression is conditional rather than
-            batch-wide, so a chunk lost to a throttle or an internal error still raises, at the
-            cost of the sender-fault chunk being re-sent and re-rejected alongside it — futile
-            but harmless, where silently dropping recoverable events would be the failure
-            SPEC-026 exists to remove.
-          Exception: The first id callable's own exception, unchanged, when every event's id
-            callable failed and nothing reached a chunk or was dropped as oversized or as
-            unencodable (SPEC-058 FR-004, SPEC-069 FR-001). A raise of either kind leaves nothing from :meth:`_chunks` counted.
+          SinkDeliveryError: When the run failed: nothing landed and an entry was still failing
+            retryably or refused for a reason other than a sender fault. A batch lost only to
+            sender faults returns, the entries counted, because a byte-identical resend can only
+            fail the same way (SPEC-016 FR-006); so does one of nothing but drops.
+          Exception: The first id callable's own exception, by identity, when every event's id
+            callable failed (SPEC-058 FR-004): the batch is refused, costs one attempt, and
+            nothing is counted.
         """
-        chunks = delivered = 0
-        recoverable_loss = False
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            for chunk in self._chunks(encoded, pending, unencodable=len(batch) - len(encoded)):
-                chunks += 1
-                accepted, retryable_lost = self._send(chunk)
-                delivered += accepted
-                recoverable_loss = recoverable_loss or retryable_lost
-            if chunks and not delivered and recoverable_loss:
-                raise SinkDeliveryError(f"SQSSink delivered none of {chunks} chunk(s)")
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-002).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the client or a caller's callable propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Sends every remaining chunk once and classifies every event of the round.
+
+        The drops :meth:`_chunks` decides are ``DROPPED`` and their lines registered ``SETTLED``,
+        so they are counted and announced only when ``emit`` returns — on the engine, only when
+        the run settles. When every event's id callable raised, the round is a refusal carrying
+        the first exception. Otherwise each chunk is sent once through :meth:`_send`, its FIFO
+        holds decided at send time (:func:`_hold`), and each entry's outcome set from the reply:
+        a sender fault ``REJECTED`` and marked a final rejection with 1.x's line, any other failed
+        entry ``RETRYABLE``, an unreadable reply ``UNKNOWN`` with one line, and a raise
+        ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the client or a caller's callable propagates.
+        """
+        context = run_context()
+        plan = self._chunks(batch)
+        if plan.refused is not None:
+            context.refuse(plan.refused)
+            return Verdict.uniform(Outcome.REJECTED, len(batch))
+        fates = [Outcome.RETRYABLE] * len(batch)
+        self._register_drops(batch, plan)
+        for position in plan.dropped:
+            fates[position] = Outcome.DROPPED
+        entries = cast("list[_Entry | None]", context.notes(self)["prepared_round"])
+        lost = Lost(self)
+        final: list[int] = []
+        blocked: set[str] = set()
+        limit = self.max_retries + 1
+        name = "SQSSink"
+        for chunk in plan.chunks:
+            held = (
+                _hold(
+                    chunk, blocked, [sends_of(self, batch[item.position]) for item in chunk], limit
+                )
+                if self.fifo
+                else [False] * len(chunk)
+            )
+            sending = [item for item, hold in zip(chunk, held, strict=True) if not hold]
+            waiting = [batch[item.position] for item, hold in zip(chunk, held, strict=True) if hold]
+            lost.add(
+                waiting,
+                when=When.LAST,
+                key="held",
+                line=lambda n, count: _diag.lost(
+                    "message",
+                    count,
+                    f"{name}, {n} attempt(s), held behind an earlier message of its FIFO group",
+                ),
+            )
+            if not sending:
+                continue
+            carried = [batch[item.position] for item in sending]
+            mark_sent(self, carried)
+            sent = self._send(sending, entry_ids(self, carried))
+            landed = settle_keyed(
+                self,
+                positions=[item.position for item in sending],
+                carried=carried,
+                error=sent.error,
+                retryable=sent.retryable,
+                reply=sent.result,
+                call="send_message_batch",
+                name="SQSSink",
+                fates=fates,
+                final=final,
+                lost=lost,
+            )
+            for position in landed:
+                cached = entries[position]
+                if cached is not None:
+                    cached.landed = True
+            if self.fifo:
+                _block(sending, fates, [sends_of(self, event) for event in carried], blocked, limit)
+        lost.register()
+        context.final_rejections(final)
+        return Verdict(outcomes=tuple(fates))
+
+    def _register_drops(self, batch: list[dict[str, object]], plan: _Plan) -> None:
+        """Counts and announces the round's oversize and id-failure drops, ``SETTLED``.
+
+        The unencodable drop's line is the encode step's own (:func:`encode_round`). The oversize
+        lines keep their one-per-event shape and the id failures are announced once per round,
+        naming the first exception's type (SPEC-058 FR-004), all counted and announced only when
+        ``emit`` returns — on the engine, only when the run settles.
+
+        Args:
+          batch: The round's events.
+          plan: The round's plan.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        context = run_context()
+        entries = cast("list[_Entry | None]", context.notes(self)["prepared_round"])
+        sizes = [
+            cached.size
+            for position, reason in sorted(plan.dropped.items())
+            if reason == "oversize" and (cached := entries[position]) is not None
+        ]
+        failures = [
+            cached.error
+            for position, reason in sorted(plan.dropped.items())
+            if reason == "id failure" and (cached := entries[position]) is not None
+        ]
+        if sizes:
+            context.count(self, "dropped_oversized", len(sizes), when=When.SETTLED)
+            context.announce(lambda: self._announce_oversized(sizes), when=When.SETTLED)
+        if failures:
+            kind = type(failures[0]).__name__
+            count = len(failures)
+            context.announce(
+                lambda: _diag.lost("event", count, f"SQSSink, a FIFO id callable raised {kind}"),
+                when=When.SETTLED,
+            )
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-005).
@@ -330,81 +567,84 @@ class SQSSink:
           The JSON text.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
         """
         return json.dumps(event)
 
-    def _chunks(
-        self,
-        encoded: list[tuple[dict[str, object], str]],
-        pending: Deferral,
-        *,
-        unencodable: int = 0,
-    ) -> list[list[_Prepared]]:
-        """Splits the batch into sends within both the entry-count and byte limits.
+    def _chunks(self, batch: list[dict[str, object]]) -> _Plan:
+        """Splits the round's batch into sends within both the entry-count and byte limits.
 
-        The boundaries are :func:`~log_foundry.sinks._chunk.chunk_items`' (SPEC-071 FR-004), the
-        rule this method used to carry inline: every per-event drop is decided first, so an event
-        that can never fit is filtered out before any boundary is drawn, and the chunks are
-        materialised as a list, so all of them are known before the first send.
+        The boundaries are :func:`~log_foundry.sinks._chunk.chunk_items`' (SPEC-071 FR-004): every
+        per-event drop is decided first, so an event that can never fit is filtered out before any
+        boundary is drawn, and the chunks are materialised as a list, so all of them are known
+        before the first send.
 
-        Each event is serialized once, and on a FIFO queue its ids are resolved once here too
-        (SPEC-016 FR-005), because they travel in the same request. An entry whose costed size
-        exceeds the limit can never fit a message, so it is dropped with a counted warning
-        (FR-004) instead of stalling the batch — and the check is made on everything that
-        travels, not the body alone: a body just under the limit plus its FIFO ids would
-        otherwise ship as a lone over-budget request that SQS rejects as a sender fault, losing
-        the event as an opaque failure instead of a labelled oversize drop.
+        **Each entry is prepared once per run** (SPEC-074 FR-002). Its body comes from the encode
+        step (:func:`~log_foundry.sinks._encode.encode_round`), and on a FIFO queue its ids are
+        resolved once (SPEC-016 FR-005), because they travel in the same request; the prepared
+        entry — body, ``MessageGroupId``, ``MessageDeduplicationId`` and costed size — or its drop
+        reason is kept in the run's notes keyed by event identity, so the id callables and the
+        random fallback run **once per event per run** and every round resends the identical
+        entry. Only the grouping and each entry's index are per round. An identity that appears
+        twice keeps one entry per occurrence, and a round hands an occurrence the first entry of
+        its identity that has not landed. An entry whose costed size exceeds the limit can never
+        fit a message, so it is dropped with a counted warning (FR-004) — and the check is made
+        on everything that travels, not the body alone.
 
         **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
-        under the wrappers' ledger rule: when every event failed and nothing reached a chunk or
-        was dropped as oversized or as unencodable, the first exception is re-raised unchanged
-        and nothing is counted; otherwise the failed events are set aside. Both drops — oversize and id failure
-        — go to ``pending`` rather than to the counters, so they are counted and announced only
-        when the calling ``emit`` returns normally; the oversize lines keep their one-per-event
-        shape, and the id failures are announced once per batch, naming the exception's type.
-
-        It takes the bodies :meth:`_encode` built (SPEC-069 FR-001). An event dropped there as
-        unencodable counts as something deliberately dropped, so a batch of one id failure and
-        one unencodable event returns, counting both, rather than re-raising.
+        under the wrappers' ledger rule: when every event of the round failed in its id callable,
+        ``refused`` carries the first exception; otherwise the failed events are dropped. This
+        counts and announces nothing: :meth:`_round` turns the drops into ``DROPPED`` outcomes
+        and their lines, counted and announced only when ``emit`` returns — on the engine, only
+        when the run settles.
 
         Args:
-          encoded: Each encodable event with its JSON body.
-          pending: The calling ``emit``'s deferral, which holds every drop decided here until
-            that ``emit`` is known not to raise (SPEC-058 FR-004).
-          unencodable: How many events of the call the encode step already dropped.
+          batch: The events the round was handed.
 
         Returns:
-          The chunks, each valid for one request.
+          The round's plan.
 
         Raises:
-          Exception: The first id callable's own exception, when every event's id callable
-            failed and nothing reached a chunk or was dropped as oversized or unencodable.
+          None. A ``BaseException`` from a caller's callable propagates.
         """
+        notes = run_context().notes(self)
+        cache = cast(
+            "dict[int, tuple[dict[str, object], list[_Entry]]]", notes.setdefault("prepared", {})
+        )
+        round_entries: list[_Entry | None] = [None] * len(batch)
+        notes["prepared_round"] = round_entries
+        bodies = dict(encode_round(self, batch, self._encode, sink=type(self).__name__))
+        taken: dict[int, int] = {}
         prepared: list[_Prepared] = []
-        oversized: list[int] = []
+        dropped: dict[int, str] = {}
         failures = 0
         first: Exception | None = None
-        for event, body in encoded:
-            size = len(body.encode("utf-8"))
-            group_id: str | None = None
-            dedup_id: str | None = None
-            if self.fifo:
-                try:
-                    group_id = self._group_id(event)
-                    dedup_id = self._dedup_id(event)
-                except Exception as err:
+        for position, event in enumerate(batch):
+            held = cache.get(id(event))
+            if held is None or held[0] is not event:
+                held = (event, [])
+                cache[id(event)] = held
+            live = [cached for cached in held[1] if not cached.landed]
+            skip = taken.get(id(event), 0)
+            taken[id(event)] = skip + 1
+            if skip < len(live):
+                entry = live[skip]
+            else:
+                entry = self._prepare(event, bodies.get(position))
+                held[1].append(entry)
+            round_entries[position] = entry
+            if entry.drop is not None:
+                dropped[position] = entry.drop
+                if entry.drop == "id failure":
                     failures += 1
-                    first = first if first is not None else err
-                    continue
-                size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
-            if size > self.MAX_BYTES:
-                oversized.append(size)
+                    first = first if first is not None else entry.error
                 continue
-            prepared.append(_Prepared(body, group_id, dedup_id, size))
+            prepared.append(
+                _Prepared(position, entry.body, entry.group_id, entry.dedup_id, entry.size)
+            )
         chunks = list(
             chunk_items(
                 prepared,
@@ -413,25 +653,44 @@ class SQSSink:
                 size_of=lambda item: item.size,
             )
         )
-        if first is not None:
-            if not chunks and not oversized and not unencodable:
-                raise first
-            kind = type(first).__name__
-            pending.count("_id_failed", failures)
-            pending.announce(
-                lambda: _diag.lost("event", failures, f"SQSSink, a FIFO id callable raised {kind}")
-            )
-        if oversized:
-            pending.count("dropped_oversized", len(oversized))
-            pending.announce(lambda: self._announce_oversized(oversized))
-        return chunks
+        refused = first if batch and failures == len(batch) else None
+        return _Plan(chunks, dropped, refused)
+
+    def _prepare(self, event: dict[str, object], body: str | None) -> _Entry:
+        """Prepares one event occurrence's entry, or decides its drop.
+
+        Args:
+          event: The event.
+          body: Its encoded body, or ``None`` when the encode step could not encode it.
+
+        Returns:
+          The entry.
+
+        Raises:
+          None. A ``BaseException`` from a caller's callable propagates.
+        """
+        if body is None:
+            return _Entry(drop="unencodable")
+        size = len(body.encode("utf-8"))
+        group_id: str | None = None
+        dedup_id: str | None = None
+        if self.fifo:
+            try:
+                group_id = self._group_id(event)
+                dedup_id = self._dedup_id(event)
+            except Exception as err:
+                return _Entry(drop="id failure", error=err)
+            size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
+        if size > self.MAX_BYTES:
+            return _Entry(size=size, drop="oversize")
+        return _Entry(body=body, group_id=group_id, dedup_id=dedup_id, size=size)
 
     def _announce_oversized(self, sizes: list[int]) -> None:
         """Writes one line per event dropped for exceeding the message limit (FR-004).
 
         One line per event is today's shape, kept on purpose; what SPEC-058 FR-004 changed is
-        only *when* the lines are written — through the calling ``emit``'s deferral, after the
-        count, and only when that ``emit`` returned normally.
+        only *when* the lines are written — after the count, and only by a run that settled
+        (SPEC-074).
 
         Args:
           sizes: The costed size of each dropped event, in the order they were met.
@@ -482,111 +741,111 @@ class SQSSink:
           False for a sender fault, True otherwise.
 
         Raises:
-          AttributeError: When the entry is not a mapping, as before.
+          AttributeError: When the entry is not a mapping; the keyed reader refuses such a reply
+            before this is asked (SPEC-074 FR-002).
         """
         return not sender_fault(entry)
 
-    def _send(self, prepared: list[_Prepared]) -> tuple[int, bool]:
-        """Sends one valid chunk, retrying only the failed entries within a bounded count.
+    def _send(self, prepared: list[_Prepared], ids: list[str]) -> Called[KeyedReply]:
+        """Sends one chunk once and reads the reply per entry (SPEC-074 FR-002).
 
-        Successfully-sent entries are never re-sent, and entries still failing past the bound
-        are counted and logged rather than silently dropped (FR-003). Acceptance is matched by
-        ``Id`` rather than counted, so a ``Failed`` array carrying a duplicate or an unknown id
-        cannot understate the total and turn a partial success into a false "nothing landed".
-        The FIFO parameters are attached only on a FIFO queue (SPEC-016 FR-004).
+        Nothing here waits or retries: the engine resends a ``RETRYABLE`` entry in a later round.
+        The reply's ``Failed`` list is read through
+        :func:`~log_foundry.sinks._batch.adjudicate_keyed` against the ``Id`` each entry was
+        given, so a malformed list — not a list, an item that is not a mapping, an unknown or
+        repeated ``Id`` — adjudicates none of the chunk rather than escaping ``emit`` raw, and a
+        missing ``Failed`` pairs nothing, as 1.x read it. Entries SQS marks ``SenderFault`` are
+        ``REJECTED`` (SPEC-016 FR-006), since a retry re-sends them byte-identical; a missing flag
+        is treated as retryable, so an unfamiliar response shape degrades to a resend rather than
+        a drop. The FIFO parameters are attached only on a FIFO queue (SPEC-016 FR-004).
 
-        Entries SQS marks ``SenderFault`` are abandoned rather than retried (SPEC-016 FR-006),
-        since a retry re-sends them byte-identical; a missing flag is treated as retryable, so an
-        unfamiliar response shape degrades to the old behaviour rather than dropping. Attempts
-        are separated by interruptible exponential backoff (SPEC-027 FR-003) — this sink was
-        alone in re-sending immediately, while its own docstring named throttling as the
-        retryable case, which is exactly what an instant retry makes worse.
-
-        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002). It used to
-        propagate out of :meth:`emit`, so a failure on chunk N after chunks 1..N-1 had landed made
-        the worker re-send the whole batch and duplicate everything already in the queue — the
-        exit drain, one large batch by construction, is exactly that shape. The guard sits around
-        the client call *inside* this loop rather than around ``_send`` in ``emit``, because by
-        the time an exception is raised ``accepted`` may already be non-zero and ``entries``
-        narrowed to the retryable subset: charging the whole chunk outside would report a partial
-        success as "nothing delivered" and provoke the very retry this removes.
-
-        A client exception is treated as **provable non-delivery** for the chunk, so it feeds the
-        recoverable term and a wholly-failed batch still raises. That is not free — a read timeout
-        means the request went out and the *response* was lost, so entries may have landed and a
-        re-send duplicates them, which is SPEC-018's "cannot prove nothing landed". It is taken on
-        expected cost: an unreachable or refused endpoint is the common client exception and is
-        exactly what the worker's retry exists for, and suppressing the raise for it would lose
-        every event of every batch for the whole outage, silently. ``boto3``'s own ``max_attempts``
-        retry already carries the duplication property, so this does not introduce it.
+        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002), and it is
+        treated as **provable non-delivery** for the chunk: a retryable one leaves the chunk
+        ``RETRYABLE``, which the engine resends, and one :meth:`_retryable_error` refuses is
+        ``REJECTED`` at its first attempt. A read timeout means the request went out and the
+        *response* was lost, so entries may have landed and a resend duplicates them, which is
+        SPEC-018's "cannot prove nothing landed"; it is taken on expected cost, as before.
 
         Args:
           prepared: One chunk's serialized, costed entries.
+          ids: Each entry's ``Id``, kept across the run's rounds (:func:`entry_ids`).
 
         Returns:
-          How many entries were accepted, letting :meth:`emit` tell "nothing landed" from a
-          partial success, and whether anything was given up on that a re-send could plausibly
-          recover. A chunk SQS rejected wholesale as invalid reports False there.
+          The reply, per entry.
 
         Raises:
           None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
             or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
         entries: list[dict[str, str]] = []
-        for i, item in enumerate(prepared):
-            entry = {"Id": str(i), "MessageBody": item.body}
+        for entry_id, item in zip(ids, prepared, strict=True):
+            entry = {"Id": entry_id, "MessageBody": item.body}
             if item.group_id is not None:
                 entry["MessageGroupId"] = item.group_id
             if item.dedup_id is not None:
                 entry["MessageDeduplicationId"] = item.dedup_id
             entries.append(entry)
-        accepted = 0
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.client.send_message_batch(
-                    QueueUrl=self.queue_url, Entries=entries
-                )
-            except Exception as err:
-                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += len(entries)
-                _diag.lost(
-                    "message",
-                    len(entries),
-                    f"SQSSink, {attempt + 1} attempt(s), {type(err).__name__}",
-                )
-                return accepted, True
-            failed = response.get("Failed", [])
-            failed_ids = {item.get("Id") for item in failed}
-            accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)
-            if not failed:
-                return accepted, False
-            sender_faults = [item for item in failed if not self._retryable_entry(item)]
-            if sender_faults:
-                with self._counter_lock:
-                    self.failed += len(sender_faults)
-                _diag.lost(
-                    "message",
-                    len(sender_faults),
-                    f"SQSSink, rejected as invalid (first code: "
-                    f"{sender_faults[0].get('Code', 'unknown')}); not retried",
-                )
+        try:
+            response = self.client.send_message_batch(QueueUrl=self.queue_url, Entries=entries)
+        except Exception as err:
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(read_keyed(self._retryable_entry, ids, response))
 
-            retryable_ids = {item["Id"] for item in failed if self._retryable_entry(item)}
-            if not retryable_ids:
-                return accepted, False
-            entries = [entry for entry in entries if entry["Id"] in retryable_ids]
-            if attempt < self.max_retries:
-                wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-            if attempt >= self.max_retries:
-                with self._counter_lock:
-                    self.failed += len(entries)
-                _diag.lost(
-                    "message",
-                    len(entries),
-                    f"SQSSink, still failing after {self.max_retries + 1} attempt(s); abandoned",
-                )
-                return accepted, True
-        return accepted, False
+
+def _hold(chunk: list[_Prepared], blocked: set[str], sends: list[int], limit: int) -> list[bool]:
+    """Decides, at send time, which entries of a FIFO chunk wait behind their group.
+
+    SQS documents ordering within a message group as a FIFO guarantee, and 1.x kept it for as
+    long as its loop retried a chunk, ``max_retries + 1`` sends. So an entry is held when its
+    group is ``blocked`` — an earlier message of it, sent in an earlier chunk of this round or
+    held itself, has neither landed nor used its sends — or when an earlier entry of its group in
+    this chunk was already sent in an earlier round and this send will not be its last. Entries
+    of a group never sent before travel together in one chunk, as 1.x sent them, so a healthy
+    one-group batch is one call. A held entry blocks its group for the rest of the round. This is
+    the one function deciding a hold, so another reading of it is a change here alone.
+
+    Args:
+      chunk: The chunk's entries, in batch order.
+      blocked: Groups blocked so far this round, updated in place.
+      sends: Each entry's sends so far this run.
+      limit: ``max_retries + 1``.
+
+    Returns:
+      Per entry, whether it is held.
+
+    Raises:
+      None.
+    """
+    held: list[bool] = []
+    for item, count in zip(chunk, sends, strict=True):
+        group = item.group_id or ""
+        if group in blocked:
+            held.append(True)
+            continue
+        held.append(False)
+        if count and count + 1 < limit:
+            blocked.add(group)
+    return held
+
+
+def _block(
+    sent: list[_Prepared], fates: list[Outcome], sends: list[int], blocked: set[str], limit: int
+) -> None:
+    """Blocks the group of every sent entry that neither landed nor used its sends.
+
+    Args:
+      sent: The entries a call carried.
+      fates: The round's outcomes, by position.
+      sends: Each sent entry's sends so far this run, this call's included.
+      blocked: Groups blocked so far this round, updated in place.
+      limit: ``max_retries + 1``.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    for item, count in zip(sent, sends, strict=True):
+        if fates[item.position] is not Outcome.ACCEPTED and count < limit:
+            blocked.add(item.group_id or "")

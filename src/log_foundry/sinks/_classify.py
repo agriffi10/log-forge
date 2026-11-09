@@ -177,7 +177,8 @@ def sender_fault(entry: Mapping[str, object]) -> bool:
       True when the entry is a sender fault, which a byte-identical resend fails again.
 
     Raises:
-      AttributeError: When the entry is not a mapping; a malformed ``Failed`` item still escapes
-        ``emit``, as the SQS and SNS docstrings say.
+      AttributeError: When the entry is not a mapping. The SQS and SNS sinks never ask it about
+        one: their keyed reader reads a ``Failed`` list holding a non-mapping as adjudicating none
+        of the chunk, counted once and never resent (SPEC-074 FR-002).
     """
     return bool(entry.get("SenderFault"))

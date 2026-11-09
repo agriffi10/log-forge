@@ -7,7 +7,7 @@ import errno
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._socket import SocketTransport
 from log_foundry.sinks.base import SinkDeliveryError
 
@@ -15,7 +15,7 @@ from log_foundry.sinks.base import SinkDeliveryError
 @pytest.mark.parametrize("transport", ["tcp", "udp"])
 @pytest.mark.parametrize("bad", [-1.0, 0.0, float("nan"), float("inf")])
 def test_an_unusable_timeout_is_refused_for_both_transports(transport: str, bad: float) -> None:
-    """Over TCP it reached `create_connection` and raised from inside `send_all` on every message.
+    """Over TCP it reached `create_connection` and raised from inside each send on every message.
 
     Over UDP the value was never used, so this is a **new** refusal of a previously harmless call
     — stated in the spec rather than discovered, and pinned here so it does not read as a slip.
@@ -60,14 +60,11 @@ def test_a_permanent_errno_reports_the_one_attempt_it_made(monkeypatch, capsys) 
     """
     sock = _RaisingSocket(errno.EMSGSIZE)
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: sock)
-    monkeypatch.setattr(socket_mod, "wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
     transport = SocketTransport("h", 9, transport="udp", max_retries=3, max_datagram_bytes=1000)
 
-    with (
-        pytest.raises(SinkDeliveryError, match="delivered none of 1"),
-        Deferral(transport) as pending,
-    ):
-        transport.send_all([b"x" * 10], pending)
+    with pytest.raises(SinkDeliveryError, match="delivered none of 1"):
+        emit_via_deliver(transport, [{"x": 1}])
     assert sock.attempts == 1
     lines = _abandonment_lines(capsys)
     assert len(lines) == 1 and "1 attempt(s)" in lines[0], lines
@@ -77,14 +74,11 @@ def test_a_retryable_errno_still_reports_every_attempt(monkeypatch, capsys) -> N
     """Same `max_retries`, so a change collapsing the two cases fails one of them."""
     sock = _RaisingSocket(errno.ECONNREFUSED)
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: sock)
-    monkeypatch.setattr(socket_mod, "wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
     transport = SocketTransport("h", 9, transport="udp", max_retries=3, max_datagram_bytes=1000)
 
-    with (
-        pytest.raises(SinkDeliveryError, match="delivered none of 1"),
-        Deferral(transport) as pending,
-    ):
-        transport.send_all([b"x" * 10], pending)
+    with pytest.raises(SinkDeliveryError, match="delivered none of 1"):
+        emit_via_deliver(transport, [{"x": 1}])
     assert sock.attempts == 4
     lines = _abandonment_lines(capsys)
     assert len(lines) == 1 and "4 attempt(s)" in lines[0], lines

@@ -29,7 +29,7 @@ _ON_RETURN = "counted and announced only when ``emit`` returns"
 
 _LISTED = [
     ("_socket.py", "SocketTransport"),
-    ("_socket.py", "SocketTransport.send_all"),
+    ("_socket.py", "SocketTransport._round"),
     ("_socket.py", "SocketTransport._sendable"),
     ("http.py", "HTTPSink.emit"),
     ("http.py", "HTTPSink._drop_refused"),

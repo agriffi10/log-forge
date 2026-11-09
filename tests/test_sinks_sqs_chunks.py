@@ -2,15 +2,17 @@
 
 Recorded in Phase 1 against the unmodified `_chunks` of `2368ade3` (its own accumulator), and not
 edited by the commit that moves it onto `chunk_items`. Each case asserts the literal lengths of
-the chunks returned and what the call's deferral committed, never a recomputation of the rule, so
-the check cannot mirror the code it checks.
+the chunks returned and the drops it decided, never a recomputation of the rule, so the check
+cannot mirror the code it checks. SPEC-074 FR-002 re-pointed it at `_chunks(batch) -> _Plan`, with
+the same batches and the same literal lengths: a drop once read from the call's deferral is read
+as that position in `_Plan.dropped`, and the all-id-failed case reads `_Plan.refused`.
 
 The bodies are written to a byte size directly: `_chunks` costs each event as its body's UTF-8
 length plus, on a FIFO queue, both ids' lengths. The FIFO cases use a one-byte group id and a
 one-byte deduplication id, so every FIFO event costs its body plus two.
 
-Serves invariants 2 and 7: every drop `_chunks` decides is counted once, only when the calling
-`emit` returns, and a batch of nothing sendable settles counted without raising.
+Serves invariants 2 and 7: every drop `_chunks` decides is decided before the first send and
+counted once, only by a run that settles, and a batch of nothing sendable settles counted.
 """
 
 from __future__ import annotations
@@ -19,10 +21,8 @@ from typing import Any
 
 import pytest
 
-from log_foundry.sinks import sqs as sqs_mod
-from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks.base import SinkDeliveryError
-from log_foundry.sinks.sqs import SQSSink
+from log_foundry.sinks.sqs import SQSSink, _Plan
 
 MAX = SQSSink.MAX_BYTES
 
@@ -73,7 +73,7 @@ class _Client:
 
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sqs_mod, "wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def _sink(fifo: bool = False, **kw: Any) -> SQSSink:
@@ -87,19 +87,39 @@ def _encoded(*sizes: int, char: str = "x") -> list[tuple[dict[str, object], str]
     return [({"log_id": f"l{i}", "trace_id": "t"}, char * size) for i, size in enumerate(sizes)]
 
 
+_PLANS: dict[int, _Plan] = {}
+"""The last plan :func:`_run` built for each sink, by identity, for :func:`_drops` to read."""
+
+
 def _run(
     sink: SQSSink, encoded: list[tuple[dict[str, object], str]], unencodable: int = 0
 ) -> list[int]:
-    with Deferral(sink) as pending:
-        chunks = sink._chunks(encoded, pending, unencodable=unencodable)
-    assert type(chunks) is list, (
+    """Plans one round over the events, each encoding to the body given beside it.
+
+    ``unencodable`` events are added after them, each one the encode step refuses, as the old
+    signature's count of events the encode step had already dropped.
+    """
+    bodies = {id(event): body for event, body in encoded}
+    batch = [event for event, _ in encoded] + [{"unencodable": i} for i in range(unencodable)]
+
+    def encode(event: dict[str, object]) -> str:
+        if id(event) not in bodies:
+            raise TypeError("unencodable")
+        return bodies[id(event)]
+
+    sink._encode = encode  # type: ignore[method-assign]
+    plan = sink._chunks(batch)
+    _PLANS[id(sink)] = plan
+    assert type(plan.chunks) is list, (
         "every drop is decided before the first send: a list, not a generator"
     )
-    return [len(chunk) for chunk in chunks]
+    return [len(chunk) for chunk in plan.chunks]
 
 
 def _drops(sink: SQSSink) -> tuple[int, int]:
-    return (sink.dropped_oversized, sink._id_failed)
+    """``(oversize, id failure)`` drops the last plan decided."""
+    reasons = list(_PLANS[id(sink)].dropped.values())
+    return (reasons.count("oversize"), reasons.count("id failure"))
 
 
 def test_exactly_the_count_limit_is_one_chunk() -> None:
@@ -181,10 +201,9 @@ def test_every_id_callable_raising_reraises_the_first_unchanged_and_counts_nothi
         raise error
 
     sink = _sink(fifo=True, message_deduplication_id=dedup)
-    with pytest.raises(ValueError) as info:
-        _run(sink, _encoded(10, 10, 10))
-    assert info.value is raised[0]
-    assert _drops(sink) == (0, 0)
+    assert _run(sink, _encoded(10, 10, 10)) == []
+    assert _PLANS[id(sink)].refused is raised[0]
+    assert sink.losses().dropped == 0 and sink.dropped_oversized == 0
 
 
 def test_id_failures_beside_an_unencodable_event_settle_counted() -> None:
@@ -203,7 +222,7 @@ def test_an_id_failure_beside_an_oversize_event_settles_counted() -> None:
 def test_an_unencodable_event_and_an_id_failure_through_emit_settle_counted() -> None:
     sink = _sink(fifo=True, message_deduplication_id=lambda e: str(e["missing"]))
     sink.emit([{"log_id": "a", "trace_id": "t"}, {"log_id": "b", "bad": b"\x00"}])
-    assert (sink._unencodable, sink._id_failed, sink.dropped_oversized) == (1, 1, 0)
+    assert (sink.losses().dropped, sink.dropped_oversized) == (2, 0)
     assert sink.client.calls == []
 
 

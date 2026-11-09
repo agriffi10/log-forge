@@ -4,20 +4,26 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count
+from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    from log_foundry.sinks._deferral import Deferral
+    from log_foundry.sinks._engine import _Drops
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["AzureEventHubsSink"]
-
-_BACKOFF_BASE = 0.1
 
 
 class AzureEventHubsSink:
@@ -25,9 +31,11 @@ class AzureEventHubsSink:
 
     This is a durable-buffer sink on ``azure-eventhub``, the optional ``azure-eventhubs`` extra,
     imported lazily. Events are packed into one or more ``EventDataBatch`` objects respecting the
-    1 MB per-batch limit, which the SDK signals by raising ``ValueError`` from ``add``. The
-    worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per batch, 0.7 s at
-    the defaults.
+    1 MB per-batch limit, which the SDK signals by raising ``ValueError`` from ``add``. It delivers
+    through SPEC-072's engine (SPEC-074 FR-004): each round packs the events still to send and
+    sends every pack once, under the lock for that round only, so the worst-case delay (SPEC-027
+    FR-005) is ``max_retries`` interruptible waits per run, 0.7 s at the defaults, taken with no
+    lock held.
 
 
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
@@ -89,17 +97,81 @@ class AzureEventHubsSink:
             producer = client_cls.from_connection_string(connection_str, eventhub_name=eventhub)
         self.producer = producer
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
+        self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._unencodable = 0
-        self._counter_lock = threading.Lock()
         self._lock = threading.Lock()
         self._closed = False
 
-    def losses(self) -> SinkLosses:
-        """Reports oversized and unencodable drops, and events abandoned past the bound (FR-002).
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
 
-        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001), which
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
+    def losses(self) -> SinkLosses:
+        """Reports the engine's totals: oversized and unencodable drops, events never confirmed.
+
+        ``dropped`` folds in the events the encode step could not encode (SPEC-069 FR-001), which
         ``dropped_oversized`` does not: that attribute still means oversize only.
 
         Args:
@@ -111,34 +183,10 @@ class AzureEventHubsSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(
-                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
-            )
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Packs events into batches within the size limit and sends each (FR-009).
-
-        A full batch is sent and a fresh one started, guarded on emptiness because the add also
-        fails against a fresh batch when the event is oversized — and the SDK short-circuits an
-        empty send and returns, a phantom success that counted as delivery and suppressed the
-        raise for everything else in the emit.
-
-        An oversize drop :meth:`_send_batch` decides is counted and announced only when
-        ``emit`` returns, through the deferral helper (SPEC-059 FR-001): a send failure on every
-        attempted batch, or ``create_batch`` raising, discards it, and the worker's retry
-        decides it afresh. The ledger is entered **outside** the emit lock — the ``Deferral``
-        first, ``_lock`` inside it — so the lock is released before the commit takes the counter
-        lock and writes the oversize line, which therefore never runs under the transport lock
-        (SPEC-028's two-lock decision). The failed-send count and line :meth:`_send` writes stay
-        where they are, under the lock (SPEC-059 *Out of Scope*).
-
-        Every event is encoded inside the ledger but **before** the emit lock is taken, and
-        before the first ``create_batch`` (SPEC-069 FR-001). One that cannot be encoded is
-        dropped, counted and announced only when this call returns; before, an
-        ``EventDataBatch`` that filled ahead of it was already sent when its encode raised, and
-        the worker's retry sent it again. A batch of nothing encodable touches the producer not
-        at all and returns, once the closed check has passed (FR-002).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         Args:
           batch: The events to send. An empty batch is a no-op.
@@ -147,23 +195,59 @@ class AzureEventHubsSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every batch failed to send and at least one was attempted
-            (SPEC-026 FR-001). An event dropped for being too large is not a send failure — it
-            can never fit — so a batch of nothing but oversized events has nothing to retry and
-            is reported through :meth:`losses` instead; a raise leaves none of them counted.
+          SinkDeliveryError: When the run failed — every pack failed to send (SPEC-026 FR-001) —
+            with the engine's message. An event too large for an empty batch is not a send
+            failure, so a batch of nothing but oversized events returns, reported through
+            :meth:`losses`; the drop is counted and announced only when ``emit`` returns — on the
+            engine, only when the run settles. When the sink is closed, its 1.x error by identity,
+            nothing counted.
         """
-        if not batch:
-            return
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            with self._lock:
-                if self._closed:
-                    raise SinkDeliveryError(
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-004).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the producer propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Packs the round's events and sends every pack once, under the lock for this round.
+
+        A closed sink's round is a refusal carrying 1.x's closed error. Every event is encoded
+        once per run (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one
+        ``DROPPED`` with SPEC-069's line; :meth:`_send_batch` packs and sends the rest.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the producer propagates.
+        """
+        context = run_context()
+        with self._lock:
+            if self._closed:
+                context.refuse(
+                    SinkDeliveryError(
                         f"AzureEventHubsSink sent none of {len(batch)} event(s): the sink is closed"
                     )
-                if not encoded:
-                    return
-                self._send_batch([body for _, body in encoded], pending)
+                )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            fates = [Outcome.DROPPED] * len(batch)
+            pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+            if pairs:
+                self._send_batch(batch, pairs, fates, context.drops(self))
+        return Verdict(outcomes=tuple(fates))
 
     def _encode(self, event: dict[str, object]) -> bytes:
         """Encodes one event as the UTF-8 JSON body of its ``EventData``.
@@ -175,65 +259,112 @@ class AzureEventHubsSink:
           The event's body.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
         """
         return json.dumps(event).encode("utf-8")
 
-    def _send_batch(self, bodies: list[bytes], pending: Deferral) -> None:
-        """Packs and sends the batch, with the emit lock already held.
+    def _send_batch(
+        self,
+        batch: list[dict[str, object]],
+        pairs: list[tuple[int, bytes]],
+        fates: list[Outcome],
+        pending: Deferral | _Drops,
+    ) -> None:
+        """Packs the round's events and sends each pack once, with the lock already held.
 
-        Split out so the lock's extent is one line in :meth:`emit`. The driver requirement
-        satisfied (SPEC-028 FR-002): Microsoft affirmatively states that the
-        ``EventHubProducerClient`` is not thread-safe and recommends guarding it with a
+        The driver requirement satisfied (SPEC-028 FR-002): Microsoft affirmatively states that
+        the ``EventHubProducerClient`` is not thread-safe and recommends guarding it with a
         ``threading.Lock``; the ``EventDataBatch`` this builds up across the loop is single-owner
         state besides — two threads packing into batches from one producer interleave
         ``create_batch``/``add``/``send`` on it.
 
-        An event too large for an empty batch goes to ``pending`` rather than to the counter, so
-        it is counted and announced only when ``emit`` returns (SPEC-059 FR-001), and its line is
-        written after the emit lock is released rather than under it. The line names no
-        per-event value, so each drop registers its own count and its own line, one per event as
-        before.
+        An event too large for an empty batch is ``DROPPED`` and goes to ``pending`` rather than
+        to the counter, so it is counted and announced only when ``emit`` returns (SPEC-059
+        FR-001) — on the engine, ``pending`` is the run context's ``SETTLED`` view, so only when
+        the run settles (SPEC-074) — and its line is written after the lock is released. A pack's
+        failure makes its events ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers,
+        and the round goes on to the next pack.
 
         Args:
-          bodies: The encoded events to send, known non-empty.
-          pending: The calling ``emit``'s deferral, which holds every drop decided here until
-            that ``emit`` is known not to raise.
+          batch: The round's events.
+          pairs: Each encodable event's position with its body, known non-empty.
+          fates: The round's outcomes, updated in place.
+          pending: The run's ``SETTLED`` view, which holds every drop decided here until the run
+            is known to settle.
 
         Returns:
           None.
 
         Raises:
-          SinkDeliveryError: When every attempted send failed.
+          None. A ``BaseException`` from the producer propagates.
         """
         event_data_cls = _event_data_cls()
+        lost = Lost(self)
         current = self.producer.create_batch()
-        attempted = delivered = 0
-        for body in bodies:
+        packed: list[int] = []
+        for position, body in pairs:
             data = event_data_cls(body)
             if _try_add(current, data):
+                packed.append(position)
                 continue
             if len(current) > 0:
-                attempted += 1
-                delivered += self._send(current)
+                self._settle(batch, packed, self._send(current), fates, lost)
             current = self.producer.create_batch()
-            if not _try_add(current, data):
-                pending.count("dropped_oversized")
-                pending.announce(
-                    lambda: _diag.lost(
-                        "event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch"
-                    )
+            packed = []
+            if _try_add(current, data):
+                packed.append(position)
+                continue
+            pending.count("dropped_oversized")
+            pending.announce(
+                lambda: _diag.lost(
+                    "event", 1, "AzureEventHubsSink, too large for an empty 1 MB batch"
                 )
-        if len(current) > 0:
-            attempted += 1
-            delivered += self._send(current)
-        if attempted and not delivered:
-            raise SinkDeliveryError(
-                f"AzureEventHubsSink sent none of {attempted} EventDataBatch(es)"
             )
+        if len(current) > 0:
+            self._settle(batch, packed, self._send(current), fates, lost)
+        lost.register()
+
+    def _settle(
+        self,
+        batch: list[dict[str, object]],
+        packed: list[int],
+        called: Called[None],
+        fates: list[Outcome],
+        lost: Lost,
+    ) -> None:
+        """Sets one pack's outcomes from its send.
+
+        Args:
+          batch: The round's events.
+          packed: The pack's positions in the round's batch.
+          called: The send.
+          fates: The round's outcomes, updated in place.
+          lost: The round's lost events.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        carried = [batch[position] for position in packed]
+        mark_sent(self, carried)
+        if called.error is None:
+            outcome = Outcome.ACCEPTED
+        else:
+            outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+            kind = type(called.error).__name__
+            lost.add(
+                carried,
+                when=When.LAST if called.retryable else When.ALWAYS,
+                key=kind,
+                line=raised_line("event", "AzureEventHubsSink, one batch", kind),
+            )
+        for position in packed:
+            fates[position] = outcome
 
     def close(self) -> None:
         """Closes the producer (FR-009).
@@ -287,8 +418,8 @@ class AzureEventHubsSink:
         )
         return isinstance(err, retried)
 
-    def _send(self, event_batch: Any) -> int:
-        """Sends one ``EventDataBatch``, retrying failures (FR-009, FR-011).
+    def _send(self, event_batch: Any) -> Called[None]:
+        """Sends one ``EventDataBatch`` once (SPEC-074 FR-004); the engine resends it later.
 
         Callers only reach this with a non-empty batch — both call sites check — because an empty
         one must never be sent: the SDK returns immediately without contacting the hub, which
@@ -298,30 +429,16 @@ class AzureEventHubsSink:
           event_batch: The packed batch to send.
 
         Returns:
-          1 when it landed, 0 once it is abandoned. The "did anything land" question in
-          :meth:`emit` cannot be answered by a method that returns nothing.
+          The call, with its exception when it raised.
 
         Raises:
           None. This is an isolation boundary: a driver fault must never crash the worker.
         """
-        for attempt in range(self.max_retries + 1):
-            try:
-                self.producer.send_batch(event_batch)
-                return 1
-            except Exception as err:
-                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += len(event_batch)
-                _diag.lost(
-                    "event",
-                    len(event_batch),
-                    f"AzureEventHubsSink, one batch, {attempt + 1} attempt(s), "
-                    f"{type(err).__name__}",
-                )
-                return 0
-        return 0
+        try:
+            self.producer.send_batch(event_batch)
+        except Exception as err:
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(None)
 
 
 def _try_add(event_batch: Any, data: Any) -> bool:

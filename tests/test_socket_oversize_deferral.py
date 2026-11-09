@@ -3,8 +3,9 @@
 ``SocketTransport._sendable`` discarded a UDP datagram over ``max_datagram_bytes`` and counted it at
 once, so when the sendable remainder then failed totally ``send_all`` raised, the worker retried
 the batch and the same frame was counted again (Probe A: four for one frame when the destination
-is down). ``SyslogSink.emit`` and ``LogstashSink.emit``'s socket branch now enter a ``Deferral``
-owned by the transport and hand it to ``send_all``, so the drop commits only when ``emit`` returns.
+is down). SPEC-059 made ``SyslogSink.emit`` and ``LogstashSink.emit``'s socket branch enter a
+``Deferral`` owned by the transport; since SPEC-074 the transport's round hands the drop to the run
+context's ``SETTLED`` view, so it still commits only when ``emit`` returns — a run that settles.
 
 Each case runs for both sinks over UDP with ``max_datagram_bytes=600`` and a 2,000-byte event, the
 sink's own ``max_retries=0``, through the real ``Worker(sink, batch_size=len(batch),
@@ -20,7 +21,7 @@ import pytest
 import log_foundry
 import log_foundry.sinks._socket as socket_mod
 from log_foundry import _diag
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.memory import MemorySink
@@ -64,7 +65,7 @@ def sock(monkeypatch) -> _NumberedSocket:
     fake = _NumberedSocket(set())
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: fake)
     monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: fake)
-    monkeypatch.setattr(socket_mod, "wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
     return fake
 
 
@@ -175,7 +176,7 @@ def test_a_closed_transport_raises_and_counts_nothing(name: str, sock, capsys) -
 
 @pytest.mark.parametrize("name", _SINKS)
 def test_the_datagram_line_is_written_outside_the_send_lock(name: str, sock, monkeypatch) -> None:
-    """The commit runs when the sink's emit returns, after ``send_all`` released its lock."""
+    """The commit runs when the run ends, after the transport's round released its lock."""
     sink = _build(name)
     transport = sink._socket
     real = _diag.lost
@@ -193,20 +194,20 @@ def test_the_datagram_line_is_written_outside_the_send_lock(name: str, sock, mon
     assert held == [False], "the datagram-limit line was written while the send lock was held"
 
 
-def test_send_all_and_sendable_refuse_a_call_without_a_ledger(sock) -> None:
-    """The ledger is required, never defaulted: a caller that forgets it cannot count at once."""
+def test_sendable_refuses_a_call_without_a_ledger(sock) -> None:
+    """The ledger is required, never defaulted: a caller that forgets it cannot count at once.
+
+    SPEC-074 deleted ``send_all``; the transport's round hands ``_sendable`` the run's view.
+    """
     transport = socket_mod.SocketTransport(
         "loghost", 514, transport="udp", max_datagram_bytes=_LIMIT
     )
 
     with pytest.raises(TypeError, match="pending"):
-        transport.send_all([b"x" * _BIG])
-    with pytest.raises(TypeError, match="pending"):
-        transport._sendable([b"x" * _BIG])
+        transport._sendable([(0, b"x" * _BIG)])  # type: ignore[call-arg]
 
     assert transport.dropped_oversized == 0
-    with Deferral(transport) as pending:
-        transport.send_all([b"x" * _BIG], pending)
+    emit_via_deliver(transport, [{"big": "x" * _BIG}])
     assert transport.dropped_oversized == 1, "the premise: with a ledger the frame is dropped"
 
 

@@ -1,0 +1,825 @@
+{
+  "cases": {
+    "an-abandoned-publish-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 2,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s",
+          "log-foundry: lost 1 event(s); NATSSink unconfirmed, publish abandoned"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 2,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s",
+          "log-foundry: lost 1 event(s); NATSSink unconfirmed, publish abandoned"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "an-abandoned-publish-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "an-abandoned-publish-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 2,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s",
+          "log-foundry: lost 1 event(s); NATSSink unconfirmed, JetStream publish abandoned"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 2,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s",
+          "log-foundry: lost 1 event(s); NATSSink unconfirmed, JetStream publish abandoned"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "an-abandoned-publish-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 2,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s",
+          "log-foundry: lost 1 event(s); NATSSink unconfirmed, JetStream publish abandoned"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 2,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish_timeout 0.2s",
+          "log-foundry: lost 1 event(s); NATSSink unconfirmed, JetStream publish abandoned"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "every-ack-wait-expiring-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError"
+        ],
+        "publishes": 3,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 9,
+        "raised": null
+      }
+    },
+    "every-ack-wait-expiring-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError"
+        ],
+        "publishes": 3,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TimeoutError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 9,
+        "raised": null
+      }
+    },
+    "every-event-unencodable-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "every-event-unencodable-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "every-event-unencodable-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "every-event-unencodable-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "every-publish-raising-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 9,
+        "raised": null
+      }
+    },
+    "every-publish-raising-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 9,
+        "raised": null
+      }
+    },
+    "every-publish-raising-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 9,
+        "raised": null
+      }
+    },
+    "every-publish-raising-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 3,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 9,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 9,
+        "raised": null
+      }
+    },
+    "landed-beside-a-raise-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      }
+    },
+    "landed-beside-a-raise-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      }
+    },
+    "landed-beside-a-raise-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      }
+    },
+    "landed-beside-a-raise-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 3,
+        "raised": null
+      }
+    },
+    "landed-beside-an-unencodable-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "landed-beside-an-unencodable-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "landed-beside-an-unencodable-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "landed-beside-an-unencodable-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, TypeError"
+        ],
+        "publishes": 2,
+        "raised": null
+      }
+    },
+    "landed-beside-the-unattempted-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      }
+    },
+    "landed-beside-the-unattempted-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      }
+    },
+    "landed-beside-the-unattempted-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      }
+    },
+    "landed-beside-the-unattempted-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      },
+      "worker": {
+        "calls": 1,
+        "failed": 4,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 4 event(s); NATSSink publish_timeout 0.2s"
+        ],
+        "publishes": 1,
+        "raised": null
+      }
+    },
+    "raise-after-the-deadline-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 1,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 3,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 5 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 3,
+        "raised": null
+      }
+    },
+    "raise-after-the-deadline-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError"
+        ],
+        "publishes": 1,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 3,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 1 event(s); NATSSink publish, RuntimeError",
+          "log-foundry: lost 5 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 3,
+        "raised": null
+      }
+    },
+    "refuse-while-stuck-core-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 1,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "refuse-while-stuck-core-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 0,
+        "failed_batches": 0,
+        "lines": [],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 0,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "refuse-while-stuck-js-injected": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 1,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    },
+    "refuse-while-stuck-js-owned": {
+      "emit": {
+        "calls": 1,
+        "failed": 1,
+        "failed_batches": 0,
+        "lines": [],
+        "publishes": 0,
+        "raised": "SinkDeliveryError"
+      },
+      "worker": {
+        "calls": 3,
+        "failed": 1,
+        "failed_batches": 1,
+        "lines": [
+          "log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts"
+        ],
+        "publishes": 0,
+        "raised": null
+      }
+    }
+  },
+  "command": "poetry run python scripts/record_nats_engine_matrix.py --worktree <scratch>/wt-93113e1b",
+  "commit": "93113e1b1847187b89a1221d1dc271de92f71d17",
+  "python": "3.13.1"
+}

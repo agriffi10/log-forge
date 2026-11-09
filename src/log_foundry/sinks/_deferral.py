@@ -62,7 +62,7 @@ class Deferral:
     at all, which keeps the hot path lock-free and the existing acquisition-count tests exact.
     """
 
-    __slots__ = ("_counts", "_lines", "_owner")
+    __slots__ = ("_counts", "_lines", "_owner", "_targets")
 
     def __init__(self, owner: _Counted) -> None:
         """Starts an empty ledger for one call on ``owner``.
@@ -78,6 +78,7 @@ class Deferral:
         """
         self._owner = owner
         self._counts: dict[str, int] = {}
+        self._targets: list[tuple[object, str, int]] = []
         self._lines: list[Callable[[], None]] = []
 
     def count(self, counter: str, n: int = 1) -> None:
@@ -100,6 +101,29 @@ class Deferral:
         """
         if n:
             self._counts[counter] = self._counts.get(counter, 0) + n
+
+    def count_for(self, target: object, counter: str, n: int = 1) -> None:
+        """Adds ``n`` to ``target.counter`` in the same commit, under the owner's lock.
+
+        For an object whose counters share the owner's ``_counter_lock`` — a shipped engine sink
+        beside its ``SinkCounters`` (SPEC-074 FR-001) — so the delivery engine commits both under
+        one acquisition, and a reader holding that lock never sees one written without the
+        other. The writes are made after the owner's own, in registration order. A zero is not
+        recorded.
+
+        Args:
+          target: The object whose counter it is.
+          counter: Its attribute to increment.
+          n: How much to add.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if n:
+            self._targets.append((target, counter, n))
 
     def announce(self, line: Callable[[], None]) -> None:
         """Registers a diagnostic line to write once the counts are committed.
@@ -146,6 +170,12 @@ class Deferral:
         ``BaseException`` included — commits nothing and is never suppressed, so the exception
         propagates by identity with its own traceback.
 
+        The commit is all or nothing: under the lock every new value is read first, the owner's
+        and each target's, summed per object and counter, and only then is any written. A
+        counter that is not an attribute raises before anything is stored, so a caller reporting
+        the raise as nothing counted is telling the truth (invariant 11; the engine's one-lock
+        commit hands a sink's sub-counts in beside its totals, SPEC-074).
+
         Args:
           exc_type: The type of the exception leaving the block, or ``None``.
           exc: The exception itself, or ``None``.
@@ -159,11 +189,21 @@ class Deferral:
         """
         if exc_type is not None:
             return
-        if self._counts:
+        if self._counts or self._targets:
             owner = self._owner
             with owner._counter_lock:
-                for name, n in self._counts.items():
-                    setattr(owner, name, getattr(owner, name) + n)
+                values: dict[tuple[int, str], tuple[object, int]] = {}
+                pending: list[tuple[object, str, int]] = [
+                    (owner, name, n) for name, n in self._counts.items()
+                ]
+                pending.extend(self._targets)
+                for counted, name, n in pending:
+                    key = (id(counted), name)
+                    held = values.get(key)
+                    base = getattr(counted, name) if held is None else held[1]
+                    values[key] = (counted, base + n)
+                for (_, name), (counted, value) in values.items():
+                    setattr(counted, name, value)
         for line in self._lines:
             line()
 

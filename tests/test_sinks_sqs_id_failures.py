@@ -27,7 +27,7 @@ ID_LINE = "log-foundry: lost 1 event(s); SQSSink, a FIFO id callable raised Valu
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """Neutralize the SQS backoff so retry tests run instantly."""
-    monkeypatch.setattr("log_foundry.sinks.sqs.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 class Accepting:
@@ -254,14 +254,15 @@ def test_an_id_failure_beside_an_unencodable_event_returns(capsys) -> None:
 
     Given one event whose id callable raises and one ``json.dumps`` cannot encode, and nothing
     else, the all-failed re-raise does not fire: ``emit`` returns, the client is never called,
-    and both are in ``dropped`` — one in each of the two counters behind it.
+    and both are in ``dropped`` — since SPEC-074 both in the engine's ``dropped_events``, the
+    two private counters behind it gone, so neither is the oversize sub-count.
     """
     sink = SQSSink(FIFO_URL, client=Refuses(), message_group_id=_fails_for(0))
 
     sink.emit([_ev(0), _ev(1, blob=b"raw")])
 
     assert sink.losses() == SinkLosses(dropped=2, failed=0)
-    assert (sink._id_failed, sink._unencodable) == (1, 1)
+    assert sink.dropped_oversized == 0
     err = capsys.readouterr().err
     assert _id_lines(err) == [ID_LINE]
     assert "SQSSink, encoding raised TypeError" in err

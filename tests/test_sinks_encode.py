@@ -300,7 +300,12 @@ def test_encode_runs_once_per_emit_not_per_attempt(
     rig.sink.emit(batch)
     assert [kind for kind, _ in rig.state.log].count("refused") == 2, "three attempts were made"
     assert len(calls) == len(batch)
-    assert rig.delivered() == ["a", "b", "c"]
+    delivered = rig.delivered()
+    if name == "ClickHouseSink":
+        # One insert per chunk since SPEC-074: a chunk that failed is resent after the round's
+        # later ones, so only the set is fixed. The other rigs send the batch in one call.
+        delivered = sorted(delivered)
+    assert delivered == ["a", "b", "c"]
 
 
 @pytest.mark.parametrize("name", ["StdoutSink", "HTTPSink"])
@@ -340,7 +345,7 @@ def test_the_socket_sinks_count_on_the_transport(
     rig = RIGS[name](monkeypatch, tmp_path)
     rig.sink.emit([ok("a"), unencodable()])
     transport = rig.sink._socket
-    assert transport._unencodable == 1
+    assert transport.log_foundry_counters.dropped_events == 1
     assert transport.dropped_oversized == 0
     assert rig.sink.losses() == SinkLosses(dropped=1, failed=0)
 
@@ -380,6 +385,68 @@ def test_a_spent_bound_counts_the_whole_batch_in_failed(
         rig.sink.emit([ok("a"), unencodable()])
     assert rig.sink.failed == 2
     assert rig.count() == 0
+
+
+@pytest.mark.parametrize("name", ["PostgresSink", "RedisStreamsSink", "RedisListSink"])
+def test_a_failed_run_counts_the_whole_batch_once_and_a_settled_one_drops(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-074 keeps 1.x's whole-batch ``failed`` on the engine, once per run, in one line.
+
+    Under a worker the run spans every attempt, so the batch is counted once and its one line
+    names both events; when a later round lands, the unencodable event is ``DROPPED`` instead and
+    nothing is counted in ``failed``.
+    """
+    from conftest import install_worker
+    from log_foundry.worker import Worker
+
+    def through_a_worker(rig: Any) -> int:
+        worker = Worker(rig.sink, batch_size=1000, flush_interval=60.0, max_retries=1)
+        install_worker(worker)
+        worker.submit([ok("a"), unencodable()])
+        worker.flush(timeout=30.0)
+        return worker.health().failed_batches
+
+    failed = RIGS[name](monkeypatch, tmp_path)
+    failed.state.down = True
+    assert through_a_worker(failed) == 1
+    assert len([kind for kind, _ in failed.state.log if kind == "refused"]) == 2, "one run"
+    assert failed.sink.failed == 2
+    sink_lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("log-foundry: lost") and f"; {name}, " in line
+    ]
+    assert len(sink_lines) == 1, sink_lines
+    assert sink_lines[0].startswith(f"log-foundry: lost 2 event(s); {name}, 2 attempt(s), ")
+
+    settled = RIGS[name](monkeypatch, tmp_path)
+    settled.state.fail_next = 1
+    assert through_a_worker(settled) == 0
+    assert settled.sink.failed == 0
+    assert read_losses(settled.sink) == SinkLosses(dropped=1, failed=0)
+    assert settled.delivered() == ["a"]
+
+
+@pytest.mark.parametrize("name", ["PostgresSink", "RedisStreamsSink", "RedisListSink"])
+def test_a_direct_deliver_counts_no_dropped_event_in_failed(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``deliver`` outside any run hands its caller the verdict, so the whole-batch count is off.
+
+    The verdict calls the unencodable event ``DROPPED``; counting it ``failed`` behind that, as
+    a run that fails does for 1.x's sake, would count an event its caller was told was dropped
+    (frame-2 review). The sink's line names the two it tried.
+    """
+    from log_foundry.sinks.verdict import Outcome
+
+    rig = RIGS[name](monkeypatch, tmp_path)
+    rig.state.down = True
+    verdict = rig.sink.deliver([ok("a"), ok("b"), unencodable()])
+    assert verdict.outcomes == (Outcome.RETRYABLE, Outcome.RETRYABLE, Outcome.DROPPED)
+    assert read_losses(rig.sink) == SinkLosses(dropped=0, failed=0)
+    lost = [line for line in capsys.readouterr().err.splitlines() if f"; {name}, " in line]
+    assert len(lost) == 1 and lost[0].startswith(f"log-foundry: lost 2 event(s); {name}, "), lost
 
 
 def test_a_failing_remainder_raises_and_counts_nothing_until_a_retry_returns(
@@ -727,6 +794,32 @@ GAINED_LOSSES = frozenset(
     {"StdoutSink", "StderrSink", "FileSink", "RotatingFileSink", "SQLiteSink"}
 )
 
+ENGINE_GAINED: dict[str, frozenset[str]] = {
+    name: frozenset({"deliver", "log_foundry_counters"})
+    for name in (
+        "SQSSink",
+        "SNSSink",
+        "KinesisSink",
+        "FirehoseSink",
+        "ClickHouseSink",
+        "MongoDBSink",
+        "PostgresSink",
+        "RedisStreamsSink",
+        "RedisListSink",
+        "AzureEventHubsSink",
+    )
+}
+ENGINE_GAINED["RabbitMQSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+ENGINE_GAINED["SyslogSink"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+ENGINE_GAINED["SocketTransport"] = frozenset({"deliver", "log_foundry_counters", "max_retries"})
+"""SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
+
+``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
+(invariant 10), so a name appearing beyond these is still a finding.
+"""
+ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
+"""SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""
+
 
 def _public(obj: object) -> set[str]:
     names = set(dir(type(obj))) | set(vars(obj))
@@ -749,7 +842,11 @@ def test_the_public_surface_grows_only_by_five_losses(
             seen["SocketTransport"] = _public(rig.sink._socket)
     assert set(seen) == set(BASE_PUBLIC)
     for name, names in seen.items():
-        expected = BASE_PUBLIC[name] | ({"losses"} if name in GAINED_LOSSES else set())
+        expected = (
+            BASE_PUBLIC[name]
+            | ({"losses"} if name in GAINED_LOSSES else set())
+            | ENGINE_GAINED.get(name, frozenset())
+        ) - ENGINE_LOST.get(name, frozenset())
         assert names == expected, (name, sorted(names ^ expected))
 
 
@@ -1043,7 +1140,7 @@ def test_an_unencodable_oversized_document_counts_once(
     _install_bson(monkeypatch, refuse)
     rig = RIGS["MongoDBSink"](monkeypatch, tmp_path)
     rig.sink.emit([{"log_id": "big", "pad": "x" * (17 * 1024 * 1024), "n": 2**64}])
-    assert (rig.sink._unencodable, rig.sink.dropped_oversized) == (1, 0)
+    assert (rig.count(), rig.sink.dropped_oversized) == (1, 0)
 
 
 def test_mongo_with_a_bson_whose_import_raises_inserts_everything(

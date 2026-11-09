@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import log_foundry.sinks._socket as socket_mod
+from log_foundry.sinks import _engine
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.syslog import SyslogSink
 from test_sinks_logstash import FakeSocket
@@ -186,7 +187,7 @@ def test_a_resolution_with_no_families_raises_an_oserror(monkeypatch, capsys) ->
     import socket as socket_lib
 
     monkeypatch.setattr(socket_lib, "getaddrinfo", lambda *a, **k: [])
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
 
     with pytest.raises(OSError) as caught:
         socket_mod._make_udp("nothing.example")
@@ -248,7 +249,7 @@ def test_a_host_resolving_to_neither_family_is_counted_and_announced(
         raise socket_lib.gaierror(-2, "Name or service not known")
 
     monkeypatch.setattr(socket_lib, "getaddrinfo", unresolvable)
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)
     sink = SyslogSink("nowhere.invalid", transport="udp", max_retries=0)
 
     with pytest.raises(SinkDeliveryError):  # SPEC-026 FR-001, not the gaierror itself
@@ -314,7 +315,7 @@ class RaisingStderr:
 
 def _refusing_sink(monkeypatch) -> SyslogSink:
     monkeypatch.setattr(socket_mod, "_make_udp", lambda host: RefusingSocket())
-    monkeypatch.setattr(socket_mod, "_BACKOFF_BASE", 0.0)  # no real sleeping in the retry loop
+    monkeypatch.setattr(_engine, "BACKOFF_BASE", 0.0)  # no real sleeping in the retry loop
     return SyslogSink("loghost", transport="udp", max_retries=1)
 
 

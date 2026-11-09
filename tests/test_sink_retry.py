@@ -10,6 +10,8 @@ import decimal
 import fractions
 import json
 import math
+import pathlib
+import sys
 import threading
 import time
 
@@ -18,7 +20,7 @@ import pytest
 import log_foundry.sinks._socket as socket_mod
 from conftest import retire_process
 from log_foundry import _lifecycle
-from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._engine import emit_via_deliver, stop_signal_of
 from log_foundry.sinks._retry import clamp_server_delay, usable_timeout, wait
 from log_foundry.sinks.http import DEFAULT_MAX_RETRY_AFTER, HTTPSink
 from log_foundry.worker import Worker
@@ -236,8 +238,7 @@ def test_the_socket_transport_backoff_is_interruptible(monkeypatch) -> None:
 
     def send() -> None:
         try:
-            with Deferral(transport) as pending:
-                transport.send_all([b"x"], pending)
+            emit_via_deliver(transport, [{"x": 1}])
         except Exception as err:
             outcome.append(type(err).__name__)
 
@@ -262,90 +263,83 @@ def test_shutdown_is_not_held_by_a_sink_mid_backoff() -> None:
 
 
 # --- FR-002 (Phase 2): every retrying sink waits through the shared helper ------------------
+#
+# SPEC-027's derived roster of modules holding a ``for attempt in range`` loop found eleven, then
+# none once SPEC-073 and SPEC-074 put every retrying sink on the delivery engine. Its pin and its
+# two tests are replaced by the derived check below — only the engine waits — and the engine's
+# own loop is checked to wait through the shared helper.
+
+WAIT_EXCLUSIONS: dict[str, str] = {
+    "_engine": "the delivery engine, the one module that waits between delivery rounds",
+    "_retry": "defines wait itself",
+    "pubsub": "waits on its own futures while resolving them, which is not a retry backoff",
+}
+"""The modules :func:`_waiting_modules` may find, each with its reason (SPEC-074 FR-006)."""
 
 
-def _modules_with_a_retry_loop() -> list[str]:
-    """Every sinks module containing a ``for attempt in range(...)`` re-send loop.
+def _waiting_modules(root: pathlib.Path) -> set[str]:
+    """Every module under ``root`` that calls ``wait`` or assigns a backoff constant.
 
-    Derived, not listed: a hand-written roster is exactly how ``KinesisSink``, ``FirehoseSink``
-    and ``SNSSink`` shipped with a re-send loop, no wait and no stop signal while two tests
-    claimed to cover "every retrying sink". A new sink with a retry loop joins this set the day
-    it is written.
+    A call to the bare name ``wait`` or to ``_retry.wait``, and an assignment to a name ending in
+    ``BACKOFF_BASE``. ``threading.Event.wait`` on an attribute (``self._stop.wait``) is not a call
+    to the shared helper and is not counted.
     """
     import ast
-    import pathlib as _pathlib
 
-    import log_foundry
-
-    found: list[str] = []
-    for path in sorted((_pathlib.Path(log_foundry.__file__).parent / "sinks").glob("*.py")):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.For)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "attempt"
-            ):
-                found.append(path.stem)
+    found: set[str] = set()
+    for path in sorted(root.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            calls_wait = isinstance(node, ast.Call) and (
+                (isinstance(node.func, ast.Name) and node.func.id == "wait")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "wait"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "_retry"
+                )
+            )
+            targets = (
+                node.targets
+                if isinstance(node, ast.Assign)
+                else [node.target]
+                if isinstance(node, ast.AnnAssign)
+                else []
+            )
+            backs_off = any(
+                isinstance(target, ast.Name) and target.id.endswith("BACKOFF_BASE")
+                for target in targets
+            )
+            if calls_wait or backs_off:
+                found.add(path.stem)
                 break
     return found
 
 
-def test_every_module_with_a_retry_loop_waits_between_attempts() -> None:
-    """A re-send loop with no wait is the SQSSink defect, in a sink nobody listed."""
-    import ast
-    import pathlib as _pathlib
-
+def test_only_the_engine_waits_or_backs_off() -> None:
+    """SPEC-074 FR-006: no sinks module but the named exclusions waits or holds a backoff."""
     import log_foundry
 
-    root = _pathlib.Path(log_foundry.__file__).parent / "sinks"
-    missing: list[str] = []
-    for name in _modules_with_a_retry_loop():
-        source = (root / f"{name}.py").read_text()
-        missing.extend(
-            f"{name}.py:{node.lineno}"
-            for node in ast.walk(ast.parse(source))
-            if (
-                isinstance(node, ast.For)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "attempt"
-                and not any(
-                    isinstance(inner, ast.Call)
-                    and isinstance(inner.func, ast.Name)
-                    and inner.func.id == "wait"
-                    for inner in ast.walk(node)
-                )
-            )
-        )
-    assert missing == [], f"retry loops with no interruptible wait: {missing}"
+    root = pathlib.Path(log_foundry.__file__).parent / "sinks"
+    found = _waiting_modules(root)
+    assert set(WAIT_EXCLUSIONS) <= found | {"_retry"}, "an exclusion no longer waits: drop it"
+    assert found - set(WAIT_EXCLUSIONS) == set()
 
 
-_RETRY_MODULES_AT_BASE = frozenset(
-    {
-        "_socket",
-        "clickhouse",
-        "eventhubs",
-        "firehose",
-        "http",
-        "kinesis",
-        "mongodb",
-        "postgres",
-        "rabbitmq",
-        "redis",
-        "sns",
-        "sqs",
-    }
+@pytest.mark.parametrize(
+    ("source", "found"),
+    [
+        ("from x import wait\ndef f():\n    wait(1.0)\n", True),
+        ("from x import _retry\ndef f():\n    _retry.wait(1.0, None)\n", True),
+        ("_BACKOFF_BASE = 0.1\n", True),
+        ("BACKOFF_BASE: float = 0.1\n", True),
+        ("def f(self):\n    self._stop.wait(1.0)\n", False),
+        ("def f():\n    sleep_less = 1\n", False),
+    ],
+    ids=["bare-wait", "retry-wait", "backoff", "annotated-backoff", "event-wait", "silent"],
 )
-"""The twelve modules :func:`_modules_with_a_retry_loop` derived at SPEC-073's base (``c4e51fbd``)."""
-
-
-def test_the_retry_loop_modules_are_the_base_set_less_http() -> None:
-    """SPEC-073 FR-005: ``http`` leaving the derived set is asserted, never silent.
-
-    The HTTP family's retries moved onto the delivery engine, so ``http.py`` holds no re-send
-    loop; a derivation that shrank for any other reason, or a loop restored there, reddens here.
-    """
-    assert set(_modules_with_a_retry_loop()) == _RETRY_MODULES_AT_BASE - {"http"}
+def test_the_wait_scan_finds_each_plant(source: str, found: bool, tmp_path) -> None:
+    (tmp_path / "m.py").write_text(source, encoding="utf-8")
+    assert (_waiting_modules(tmp_path) == {"m"}) is found
 
 
 def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
@@ -381,17 +375,26 @@ def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
     ), "and _wait waits through _retry.wait"
 
 
-def test_every_module_with_a_retry_loop_declares_a_stop_signal() -> None:
-    import pathlib as _pathlib
 
-    import log_foundry
+def test_every_engine_sink_declares_a_stop_signal() -> None:
+    """SPEC-027's rule restated over the engine sinks: each offers the engine a stop signal.
 
-    root = _pathlib.Path(log_foundry.__file__).parent / "sinks"
-    missing = [
-        name
-        for name in _modules_with_a_retry_loop()
-        if "self.log_foundry_stop_signal" not in (root / f"{name}.py").read_text()
-    ]
+    The engine waits on the sink's ``log_foundry_stop_signal`` when it runs one inline (the
+    adapter, the orphan path), so a sink without it backs off uninterruptibly there. ``NATSSink``
+    is named: it takes no ``max_retries``, so the adapter gives it one round and no wait.
+    """
+    import ast
+
+    from test_engine_sinks_roster import SINKS, engine_sink_findings
+
+    sinks, _ = engine_sink_findings(SINKS)
+    missing = []
+    for path in sorted(SINKS.glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.ClassDef) or node.name not in sinks - {"NATSSink"}:
+                continue
+            if "self.log_foundry_stop_signal" not in ast.unparse(node):
+                missing.append(node.name)
     assert missing == [], f"no log_foundry_stop_signal: {missing}"
 
 
@@ -483,7 +486,12 @@ def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
 
 
 def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch) -> None:
-    """``SyslogSink`` and ``LogstashSink`` hold the retry loop one level down."""
+    """The signal reaches what waits: the engine run over each socket-backed sink.
+
+    Since SPEC-074 the engine waits, reading the run's sink statically: ``SyslogSink`` itself,
+    which forwards ``deliver`` to its transport, and for socket-mode ``LogstashSink`` the transport
+    its ``emit`` runs the engine over, and for its HTTP mode the ``HTTPSink``.
+    """
     from log_foundry.sinks.logstash import LogstashSink
     from log_foundry.sinks.syslog import SyslogSink
     from test_sinks_syslog import FakeSocket
@@ -492,7 +500,7 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
     monkeypatch.setattr(socket_mod, "_make_tcp", lambda host, port, timeout: FakeSocket())
 
     for sink, backend in (
-        (SyslogSink("h", transport="udp"), lambda s: s._socket),
+        (SyslogSink("h", transport="udp"), lambda s: s),
         (LogstashSink(host="h", port=1), lambda s: s._socket),
         (LogstashSink(url="http://x", opener=FakeOpener()), lambda s: s._http),
     ):
@@ -526,17 +534,17 @@ def _drain_one(sink) -> float:
 
 def test_a_long_sink_backoff_does_not_hold_shutdown() -> None:
     """One drain thread, so a sink's backoff is a global pause — and it spans shutdown()."""
-    import log_foundry.sinks.redis as redis_mod
+    from log_foundry.sinks import _engine
     from log_foundry.sinks.redis import RedisStreamsSink
     from test_sinks_redis import FakeRedis
 
-    original = redis_mod._BACKOFF_BASE
-    redis_mod._BACKOFF_BASE = 20.0  # one attempt's backoff far exceeds the bound
+    original = _engine.BACKOFF_BASE
+    _engine.BACKOFF_BASE = 20.0  # type: ignore[misc]  # one backoff far exceeds the bound
     try:
         sink = RedisStreamsSink("s", client=FakeRedis(fail=True), max_retries=3)
         assert _drain_one(sink) < 6.0, "shutdown waited out the sink's backoff"
     finally:
-        redis_mod._BACKOFF_BASE = original
+        _engine.BACKOFF_BASE = original  # type: ignore[misc]
 
 
 def test_a_standalone_sink_backs_off_exactly_as_before(monkeypatch) -> None:
@@ -595,17 +603,17 @@ def test_a_sender_fault_is_abandoned_with_no_backoff_first(monkeypatch) -> None:
 
 
 def test_the_sqs_backoff_is_interruptible() -> None:
-    import log_foundry.sinks.sqs as sqs_mod
+    from log_foundry.sinks import _engine
     from log_foundry.sinks.sqs import SQSSink
     from test_sinks_sqs_fifo import FaultingClient
 
-    original = sqs_mod._BACKOFF_BASE
-    sqs_mod._BACKOFF_BASE = 20.0
+    original = _engine.BACKOFF_BASE
+    _engine.BACKOFF_BASE = 20.0  # type: ignore[misc]
     try:
         sink = SQSSink("https://q/x", client=FaultingClient(sender_fault=False), max_retries=3)
         assert _drain_one(sink) < 6.0
     finally:
-        sqs_mod._BACKOFF_BASE = original
+        _engine.BACKOFF_BASE = original  # type: ignore[misc]
 
 
 def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> None:
@@ -632,8 +640,8 @@ def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> No
             for leaf in leaves:
                 assert leaf.log_foundry_stop_signal is worker._stop, type(wrapper).__name__
             if inner in leaves:
-                assert inner._socket.log_foundry_stop_signal is worker._stop, (
-                    "and on through SyslogSink to the transport that actually waits"
+                assert stop_signal_of(inner) is worker._stop, (
+                    "and the engine, which waits for SyslogSink, reads it there (SPEC-074)"
                 )
         finally:
             worker.stop()
@@ -924,7 +932,11 @@ def _delays_for(sink, batch, monkeypatch) -> list[float]:
     """Record the delays a sink waits between attempts, without waiting them."""
     module = type(sink).__module__
     slept: list[float] = []
-    monkeypatch.setattr(f"{module}.wait", lambda delay, _stop=None: slept.append(delay))
+    if hasattr(sys.modules[module], "wait"):
+        monkeypatch.setattr(f"{module}.wait", lambda delay, _stop=None: slept.append(delay))
+    monkeypatch.setattr(
+        "log_foundry.sinks._retry.wait", lambda delay, _stop=None: slept.append(delay)
+    )
     try:
         sink.emit(batch)
     except Exception:  # SPEC-026's raise; this test is about the waits

@@ -95,3 +95,88 @@ def require_callable(
     raise TypeError(
         f"{owner} {name} must be {wanted}, not {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
     )
+
+
+class ReadOnlyCount:
+    """A constructor's exact ``int`` exposed read-only: assignment refuses, reading finds it.
+
+    SPEC-074 FR-006 exposes ``max_retries`` on ``RabbitMQSink``, ``SocketTransport`` and
+    ``SyslogSink``, which kept it private in 1.x, because the delivery engine reads it by name to
+    size a run. The engine reads it statically (``base._static_value``), so a ``property`` would
+    read as the property object and give the sink one round. This descriptor defines ``__set__``
+    and no ``__get__``: CPython's lookup — and the static reader, which follows it — passes over
+    a descriptor without ``__get__`` to the instance's own ``__dict__``, where :meth:`store`
+    writes the value (:func:`store_read_only`), while an assignment reaches ``__set__`` and is
+    refused. The ``__get__`` below exists for the type checker only.
+
+    Attributes:
+      None.
+    """
+
+    __slots__ = ("_name",)
+
+    if TYPE_CHECKING:
+
+        def __get__(self, obj: object, owner: type | None = None) -> int:
+            """Types a read as the stored ``int``; never defined at run time.
+
+            Args:
+              obj: The instance.
+              owner: Its class.
+
+            Returns:
+              The stored value.
+
+            Raises:
+              None.
+            """
+            ...
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Records the attribute's name, for the refusal's message.
+
+        Args:
+          owner: The class the descriptor is assigned in.
+          name: The attribute's name.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._name = name
+
+    def __set__(self, obj: object, value: object) -> None:
+        """Refuses an assignment: the value is the constructor's.
+
+        Args:
+          obj: The instance.
+          value: The value assigned, never read.
+
+        Returns:
+          None.
+
+        Raises:
+          AttributeError: Always, naming the attribute.
+        """
+        raise AttributeError(f"{self._name} is read-only; pass it to the constructor")
+
+
+def store_read_only(obj: object, name: str, value: int) -> None:
+    """Writes a :class:`ReadOnlyCount`'s value into the instance's own ``__dict__``.
+
+    The one write past the refusing ``__set__``, made by the constructor that judged the value.
+
+    Args:
+      obj: The instance.
+      name: The attribute's name.
+      value: The value, already judged by the constructor.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    vars(obj)[name] = value

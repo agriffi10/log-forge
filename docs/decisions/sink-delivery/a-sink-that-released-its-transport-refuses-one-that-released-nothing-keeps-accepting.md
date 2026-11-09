@@ -10,6 +10,10 @@ description: "both halves bind — three shipped sinks lost every post-`close()`
 
 ## History
 
+### 2026-11-09
+
+- **Kept on the engine** by SPEC-074 FR-001, fence unchanged: a closed engine sink's round is a refusal marked with `RunContext.refuse`, carrying the `SinkDeliveryError` its 1.x `emit` raised; a failed run commits nothing for it, so the catcher's term is its only count, and the inline adapter raises that error by identity.
+
 ### 2026-11-07
 
 - **Refined** by SPEC-070 FR-005: names `GooglePubSubSink`'s mid-batch close as the declared departure from this rule, and the test that proves it.

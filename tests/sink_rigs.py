@@ -73,7 +73,12 @@ class State:
 
 @dataclass
 class Rig:
-    """A built sink, the state its double writes to, and how to read what it delivered."""
+    """A built sink, the state its double writes to, and how to read what it delivered.
+
+    ``owner`` and ``counter`` name where the sink keeps its unencodable count: SPEC-069's
+    ``_unencodable`` on the sink, or, for a sink on the delivery engine (SPEC-074), the engine's
+    ``dropped_events`` on its ``log_foundry_counters``.
+    """
 
     sink: Any
     state: State
@@ -242,7 +247,13 @@ def clickhouse(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = ClickHouseSink("t", client=_ClickHouse(state), max_retries=0, chunk_size=1)
-    return Rig(sink, state, lambda rows: [json.loads(r[-1]) for r in rows], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rows: [json.loads(r[-1]) for r in rows],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Channel:
@@ -275,7 +286,9 @@ def rabbitmq(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = RabbitMQSink(exchange="x", routing_key="k", connection=_Connection(state), max_retries=0)
-    return Rig(sink, state, lambda body: [json.loads(body)], sink, "_unencodable")
+    return Rig(
+        sink, state, lambda body: [json.loads(body)], sink.log_foundry_counters, "dropped_events"
+    )
 
 
 class _Producer:
@@ -339,7 +352,13 @@ def eventhubs(mp: pytest.MonkeyPatch, tmp: Path, capacity: int = 1) -> Rig:
     mp.setattr("log_foundry.sinks.eventhubs._event_data_cls", lambda: lambda body: body)
     state = State()
     sink = AzureEventHubsSink(producer=_EHProducer(state, capacity), max_retries=0)
-    return Rig(sink, state, lambda items: [json.loads(b) for b in items], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda items: [json.loads(b) for b in items],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Kinesis:
@@ -357,7 +376,13 @@ def kinesis(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = KinesisSink("s", client=_Kinesis(state), max_retries=0)
-    return Rig(sink, state, lambda rs: [json.loads(r["Data"]) for r in rs], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rs: [json.loads(r["Data"]) for r in rs],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Firehose:
@@ -377,7 +402,13 @@ def firehose(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = FirehoseSink("d", client=_Firehose(state), max_retries=0)
-    return Rig(sink, state, lambda rs: [json.loads(r["Data"]) for r in rs], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rs: [json.loads(r["Data"]) for r in rs],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _SNS:
@@ -397,7 +428,13 @@ def sns(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = SNSSink("arn", client=_SNS(state), max_retries=0)
-    return Rig(sink, state, lambda es: [json.loads(e["Message"]) for e in es], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda es: [json.loads(e["Message"]) for e in es],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _SQS:
@@ -416,7 +453,11 @@ def sqs(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     sink = SQSSink("https://sqs/q", client=_SQS(state), max_retries=0)
     return Rig(
-        sink, state, lambda es: [json.loads(e["MessageBody"]) for e in es], sink, "_unencodable"
+        sink,
+        state,
+        lambda es: [json.loads(e["MessageBody"]) for e in es],
+        sink.log_foundry_counters,
+        "dropped_events",
     )
 
 
@@ -445,7 +486,7 @@ def mongodb(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = MongoDBSink(client=_MongoClient(state), database="d", collection="c", max_retries=0)
-    return Rig(sink, state, lambda docs: list(docs), sink, "_unencodable")
+    return Rig(sink, state, lambda docs: list(docs), sink.log_foundry_counters, "dropped_events")
 
 
 class _Socket:
@@ -480,7 +521,7 @@ def syslog(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     mp.setattr(socket_mod, "_make_udp", lambda host: _Socket(state))
     sink = SyslogSink("loghost", 514, transport="udp", max_retries=0)
-    return Rig(sink, state, _syslog_event, sink._socket, "_unencodable")
+    return Rig(sink, state, _syslog_event, sink.log_foundry_counters, "dropped_events")
 
 
 def logstash(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
@@ -491,7 +532,9 @@ def logstash(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     mp.setattr(socket_mod, "_make_udp", lambda host: _Socket(state))
     sink = LogstashSink(host="ls", port=5000, transport="udp", max_retries=0)
-    return Rig(sink, state, lambda d: [json.loads(d)], sink._socket, "_unencodable")
+    return Rig(
+        sink, state, lambda d: [json.loads(d)], sink._socket.log_foundry_counters, "dropped_events"
+    )
 
 
 class _Cursor:
@@ -567,7 +610,13 @@ def postgres(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     _no_wait(mp)
     state = State()
     sink = PostgresSink("t", connection=_PGConnection(state), max_retries=0)
-    return Rig(sink, state, lambda rows: [json.loads(r[-1]) for r in rows], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda rows: [json.loads(r[-1]) for r in rows],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 class _Pipeline:
@@ -606,7 +655,13 @@ def _redis(mp: pytest.MonkeyPatch, cls_name: str) -> Rig:
     _no_wait(mp)
     state = State()
     sink = getattr(mod, cls_name)("k", client=_Redis(state), max_retries=0)
-    return Rig(sink, state, lambda ops: [json.loads(o) for o in ops], sink, "_unencodable")
+    return Rig(
+        sink,
+        state,
+        lambda ops: [json.loads(o) for o in ops],
+        sink.log_foundry_counters,
+        "dropped_events",
+    )
 
 
 def redis_streams(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:

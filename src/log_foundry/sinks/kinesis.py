@@ -3,31 +3,28 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
-from log_foundry.sinks._batch import (
-    ABSENT,
-    adjudicate_positional,
-    describe_count,
-    results_rejected,
-    usable_results,
-)
+from log_foundry.sinks import _engine
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._classify import aws_retryable, is_retryable
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count
+from log_foundry.sinks._rounds import Called, Lost, mark_sent, settle_positional
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Mapping
 
-__all__ = ["KinesisSink"]
+    from log_foundry.sinks._deferral import Deferral
+    from log_foundry.sinks._engine import _Drops
+    from log_foundry.sinks.base import SinkLosses
 
-_BACKOFF_BASE = 0.1
+__all__ = ["KinesisSink"]
 
 
 class KinesisSink:
@@ -36,11 +33,16 @@ class KinesisSink:
     This extends the durable-buffer path ``SQSSink`` established: a stream absorbs spikes and
     outages while a separate consumer drains it into ELK. ``boto3`` is the optional ``aws``
     extra, imported lazily inside the sink. The worst-case delay (SPEC-027 FR-005) is
-    ``max_retries`` interruptible waits per chunk, 0.7 s at the defaults.
+    ``max_retries`` interruptible waits per run, 0.7 s at the defaults: it delivers through
+    SPEC-072's engine (SPEC-074 FR-002), one call per chunk per round, the engine resending only
+    the records the reply codes as failed.
 
     Attributes:
-      failed: Records the stream said failed, which still failed after every retry.
-      dropped_oversized: Records too large for the per-record limit to ever accept.
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      failed: Records the stream said failed or never answered for, ``failed_events`` less
+        ``dropped_unadjudicated``, as 1.x kept the two apart; assignable.
+      dropped_oversized: Records too large for the per-record limit to ever accept, counted
+        only by a run that settled.
       dropped_unadjudicated: Records in a ``put_records`` response whose results array did not
         describe the chunk sent, so none could be paired to an outcome. A non-zero count means
         those records were abandoned without the stream ever confirming them — treat it as loss,
@@ -77,9 +79,8 @@ class KinesisSink:
           stream_name: The stream to write to.
           client: A boto3-shaped Kinesis client, or ``None`` to build one lazily.
           partition_key_field: The event key used as the record's partition key.
-          max_retries: Retries for the failed records of a chunk, floored at zero as
-            ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
-            having sent nothing, and reported success. Anything but an ``int`` is refused
+          max_retries: Further rounds the engine gives the records still failing, floored at
+            zero as ``Worker._emit`` floors its own (SPEC-021). Anything but an ``int`` is refused
             with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
             ``int`` subclass is read as the ``int`` it holds.
 
@@ -97,36 +98,87 @@ class KinesisSink:
         self.client = client
         self.partition_key_field = partition_key_field
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
+        self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._unencodable = 0
         self.dropped_unadjudicated = 0
-        self._counter_lock = threading.Lock()
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Records lost to an exhausted retry, a refused call or a raise, never the unadjudicated.
+
+        The engine's ``failed_events`` less ``dropped_unadjudicated``: 1.x kept the two apart on
+        the instance and summed them in ``losses().failed`` (SPEC-074 FR-001). Both are read
+        under the counter lock, which the engine's one commit holds while it moves both, so a
+        read never sees one moved and not the other.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            return self.log_foundry_counters.failed_events - self.dropped_unadjudicated
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count under the counter lock, keeping the unadjudicated in ``losses()``.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value + self.dropped_unadjudicated
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunks to the request limits and sends each chunk, retrying failures (FR-003).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         An unadjudicable chunk is unknown, not nothing, and suppresses the raise: SPEC-018
-        settled that such a chunk is abandoned rather than re-sent, because the API reported a
-        failure count, so some of it landed and the worker's retry would duplicate that
-        downstream forever.
-
-        That suppression is batch-wide, unlike ``SQSSink``'s. A sender fault is a rejection, so
-        re-sending is futile rather than harmful, while "unadjudicable" means this sink cannot
-        tell whether the records landed — once any chunk is in that state the emit can no longer
-        prove nothing was delivered, so the events in a plainly-failed sibling chunk stay a
-        counted loss rather than a duplicated delivery.
-
-        An oversize drop :meth:`_records` decides is counted and announced only when ``emit``
-        returns, through the deferral helper whose ``with`` is the outermost block of the work
-        (SPEC-059 FR-001). The drop is decided before any send, and this call can still raise
-        afterwards — the total-failure raise below, a ``BaseException`` from the client — and be
-        retried whole; counting it at once counted one oversized event once per attempt.
-
-        Every event is encoded before any record is sized or sent (SPEC-069 FR-001), through
-        :meth:`_encode` and the encode helper: one that cannot be encoded is dropped, counted and
-        announced only when ``emit`` returns, through the same ledger, and a batch of nothing
-        encodable sends nothing and returns (FR-002).
+        settled that such a chunk is abandoned rather than resent, because some of it may have
+        landed. Every drop — oversize, unencodable — is counted and announced only when ``emit``
+        returns; on the engine, only when the run settles.
 
         Args:
           batch: The events to write.
@@ -135,36 +187,16 @@ class KinesisSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every chunk failed, at least one was sent, and none was
-            unadjudicable (SPEC-026 FR-001). Records dropped before sending are not a send
-            failure and are reported through :meth:`losses`; a raise leaves none of them
-            counted.
+          SinkDeliveryError: When the run failed: nothing landed, something was still failing or
+            refused, and nothing was unadjudicable (SPEC-026 FR-001).
         """
-        chunks = delivered = 0
-        unknown = False
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            records = self._records(encoded, pending)
-            for chunk in chunk_items(
-                records,
-                max_count=self.MAX_RECORDS,
-                max_bytes=self.MAX_REQUEST_BYTES,
-                size_of=_record_size,
-            ):
-                chunks += 1
-                outcome = self._send(chunk)
-                if outcome is None:
-                    unknown = True
-                else:
-                    delivered += outcome
-            if chunks and not delivered and not unknown:
-                raise SinkDeliveryError(f"KinesisSink delivered none of {chunks} chunk(s)")
+        emit_via_deliver(self, batch)
 
     def losses(self) -> SinkLosses:
         """Reports oversized and unencodable drops, abandoned records and unadjudicable chunks.
 
-        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001);
-        ``dropped_oversized`` still means oversize only.
+        The engine's totals (SPEC-074 FR-001): ``dropped`` folds in the events the encode step
+        could not encode (SPEC-069 FR-001), and ``dropped_oversized`` still means oversize only.
 
         Args:
           None.
@@ -178,11 +210,72 @@ class KinesisSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(
-                dropped=self.dropped_oversized + self._unencodable,
-                failed=self.failed + self.dropped_unadjudicated,
+        return self.log_foundry_counters.losses()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-002).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Sends every remaining chunk once and classifies every event of the round.
+
+        Every event is encoded once per run (:func:`~log_foundry.sinks._encode.encode_round`),
+        an unencodable one ``DROPPED`` with SPEC-069's line; :meth:`_records` drops an oversized
+        one; the rest are chunked with ``chunk_items`` and each chunk sent once through
+        :meth:`_send`, its reply settled positionally (:func:`settle_positional`).
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        context = run_context()
+        fates = [Outcome.DROPPED] * len(batch)
+        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        records = self._records(pairs, context.drops(self))
+        lost = Lost(self)
+        for chunk in chunk_items(
+            records,
+            max_count=self.MAX_RECORDS,
+            max_bytes=self.MAX_REQUEST_BYTES,
+            size_of=lambda pair: _record_size(pair[1]),
+        ):
+            positions = [position for position, _ in chunk]
+            carried = [batch[position] for position in positions]
+            sending = [record for _, record in chunk]
+            mark_sent(self, carried)
+            sent = self._send(sending)
+            settle_positional(
+                self,
+                positions=positions,
+                carried=carried,
+                records=sending,
+                error=sent.error,
+                retryable=sent.retryable,
+                response=sent.result,
+                call="put_records",
+                name="KinesisSink",
+                count_key="FailedRecordCount",
+                results_key="Records",
+                fates=fates,
+                lost=lost,
             )
+        lost.register()
+        return Verdict(outcomes=tuple(fates))
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-001).
@@ -207,7 +300,7 @@ class KinesisSink:
           The UTF-8 JSON data and the partition key.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
@@ -216,38 +309,38 @@ class KinesisSink:
         return data, _partition_key(str(event.get(self.partition_key_field) or "log-foundry"))
 
     def _records(
-        self, encoded: list[tuple[dict[str, object], tuple[bytes, str]]], pending: Deferral
-    ) -> list[dict[str, Any]]:
+        self, encoded: list[tuple[int, tuple[bytes, str]]], pending: Deferral | _Drops
+    ) -> list[tuple[int, dict[str, Any]]]:
         """Builds the request entries, dropping any record too large to ever fit (FR-011).
 
         It takes what :meth:`_encode` built (SPEC-069 FR-001), so sizing and the oversize drop
         run over encoded forms and nothing here can fail on an event.
 
         A drop goes to ``pending`` rather than to the counter, so it is counted and announced
-        only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
-        discards it, and the worker's retry decides it afresh. Each dropped record's charged size
+        only when ``emit`` returns (SPEC-059 FR-001) — on the engine, ``pending`` is the run
+        context's ``SETTLED`` view, so only when the run settles (SPEC-074). Each dropped record's charged size
         is collected here, as the drop is decided, and the announcer writes one line per size —
         today's shape, each line naming its own record rather than the last one met.
 
         Args:
-          encoded: Each encodable event with its data and partition key.
-          pending: The calling ``emit``'s deferral, which holds every drop decided here until
-            that ``emit`` is known not to raise.
+          encoded: Each encodable event's position in the round's batch with its data and partition key.
+          pending: The run's ``SETTLED`` view, which holds every drop decided here until the run
+            is known to settle.
 
         Returns:
-          The records that can be sent.
+          The position and request entry of each record that can be sent.
 
         Raises:
           None.
         """
-        records: list[dict[str, Any]] = []
+        records: list[tuple[int, dict[str, Any]]] = []
         oversized: list[int] = []
-        for _, (data, key) in encoded:
+        for position, (data, key) in encoded:
             charged = len(data) + len(key.encode("utf-8"))
             if charged > self.MAX_RECORD_BYTES:
                 oversized.append(charged)
                 continue
-            records.append({"Data": data, "PartitionKey": key})
+            records.append((position, {"Data": data, "PartitionKey": key}))
         if oversized:
             pending.count("dropped_oversized", len(oversized))
             pending.announce(lambda: self._announce_oversized(oversized))
@@ -256,8 +349,8 @@ class KinesisSink:
     def _announce_oversized(self, sizes: list[int]) -> None:
         """Writes one line per record dropped for exceeding the per-record limit (FR-011).
 
-        Called by the calling ``emit``'s deferral after the count is committed, outside the
-        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-001).
+        Called after the count is committed, outside the counter lock, and only by a run that
+        settled (SPEC-059 FR-001, SPEC-074).
 
         Args:
           sizes: The charged size of each dropped record, partition key included, in the order
@@ -312,7 +405,8 @@ class KinesisSink:
 
         It is asked only about a record the response marks failed, by a truthy ``ErrorCode``, and
         :meth:`_send` does not ask it: with every answer True the branch for False would be dead
-        code. It is declared for SPEC-072's engine, which takes it as an argument.
+        code. SPEC-072's engine takes no entry predicate, so nothing calls it; it is declared so the
+        rule is written down where the sink's other predicate is.
 
         Args:
           entry: The failed record's result entry.
@@ -325,111 +419,33 @@ class KinesisSink:
         """
         return True
 
-    def _send(self, records: list[dict[str, Any]]) -> int | None:
-        """Sends one chunk, retrying only the records the response flags as failed (FR-003).
+    def _send(self, records: list[dict[str, Any]]) -> Called[object]:
+        """Sends one chunk once (SPEC-074 FR-002); the reply is read by the round.
 
-        The wait comes before the next attempt and never before abandoning (SPEC-027 FR-003):
-        this loop re-sends the records the destination flagged, and the canonical reason it flags
-        them is throttling, which an immediate re-send makes worse.
-
-        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002). It used to
-        propagate out of :meth:`emit`, so a failure on chunk N after chunks 1..N-1 had landed made
-        the worker re-send the whole batch and duplicate everything already delivered — the exit
-        drain, one large batch by construction, is exactly that shape. The guard sits around the
-        client call *inside* this loop rather than around ``_send`` in ``emit``, so only the
-        records still outstanding at the failing attempt are charged and the ones already accepted
-        still count toward the return.
-
-        A client exception is treated as **provable non-delivery** for the chunk, so a wholly
-        failed batch still raises and ``unknown`` is untouched: SPEC-018's "unadjudicable" is a
-        property of a *response*, and an exception is not a response. The cost is written down —
-        a read timeout means the request went out and the reply was lost, so a re-send may
-        duplicate — and taken because an unreachable endpoint is the common case and is exactly
-        what the worker's retry exists for, while suppressing the raise would lose every event of
-        every batch for a whole outage, silently.
-
-        **The failed count and the coded records must agree** (SPEC-070 FR-003). This used to
-        read the count first and return the chunk as sent when it was ``0`` or missing, so a
-        reply saying ``0`` beside coded records, or no count beside them, counted nothing; and a
-        positive count beside no coded record retried nothing and counted the chunk as sent. The
-        reply now goes whole to ``adjudicate_positional`` with its count: only a ``0`` or absent
-        count with no coded record is delivered, only a positive count matched by exactly that
-        many coded records is retried, and every other combination is unadjudicated — counted on
-        ``dropped_unadjudicated``, announced once with the count named, never resent — because
-        the reply's two halves disagree about which records landed.
+        Nothing here waits or retries: the engine resends a record the reply codes as failed in a
+        later round. **A client exception costs this chunk, never the batch** (SPEC-048 FR-002),
+        and is treated as **provable non-delivery** for it: SPEC-018's "unadjudicable" is a
+        property of a *response*, and an exception is not one. A read timeout means the request
+        went out and the reply was lost, so a resend may duplicate — taken because an unreachable
+        endpoint is the common case. **The failed count and the coded records must agree**
+        (SPEC-070 FR-003): the round passes the reply whole to ``adjudicate_positional`` with its
+        count, and every disagreement is unadjudicated, never resent.
 
         Args:
           records: One chunk's request entries.
 
         Returns:
-          How many records the stream accepted, so :meth:`emit` can tell "nothing landed" from a
-          partial success, or ``None`` when the response could not be adjudicated, which is
-          neither. "The stream did not say" must not be read as "the stream took nothing": that
-          reading would make :meth:`emit` raise, and the worker's retry would re-send a chunk
-          SPEC-018 settled must never be re-sent.
+          The call's reply or its exception.
 
         Raises:
           None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
             or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
-        sent = len(records)
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.client.put_records(
-                    StreamName=self.stream_name, Records=records
-                )
-            except Exception as err:
-                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += len(records)
-                _diag.lost(
-                    "record",
-                    len(records),
-                    f"KinesisSink, {attempt + 1} attempt(s), {type(err).__name__}",
-                )
-                return sent - len(records)
-            failed_count = response.get("FailedRecordCount", ABSENT)
-            raw = response.get("Records")
-            results = usable_results(raw)
-            rejected = results_rejected(raw)
-            verdict = adjudicate_positional(
-                records, results, failed_count=failed_count, rejected=rejected
-            )
-            if verdict.unadjudicated:
-                coded = sum(1 for result in results if result.get("ErrorCode"))
-                returned = (
-                    "an unreadable result array"
-                    if rejected
-                    else f"{len(results)} result(s) returned"
-                )
-                with self._counter_lock:
-                    self.dropped_unadjudicated += verdict.unadjudicated
-                _diag.lost(
-                    "record",
-                    verdict.unadjudicated,
-                    f"KinesisSink could not adjudicate a put_records response ({len(records)} "
-                    f"record(s) sent, {returned}, {coded} coded, "
-                    f"{describe_count(failed_count)}); abandoned, not retried",
-                )
-                return None
-            records = verdict.retry
-            if not records:
-                return sent
-            if attempt < self.max_retries:
-                wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-            if attempt >= self.max_retries:
-                with self._counter_lock:
-                    self.failed += len(records)
-                _diag.lost(
-                    "record",
-                    len(records),
-                    f"KinesisSink, still failing after {self.max_retries + 1} attempt(s); "
-                    "abandoned",
-                )
-                return sent - len(records)
-        return 0
+        try:
+            response = self.client.put_records(StreamName=self.stream_name, Records=records)
+        except Exception as err:
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(response)
 
 
 MAX_PARTITION_KEY_BYTES = 256

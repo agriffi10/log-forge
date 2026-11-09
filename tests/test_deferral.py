@@ -112,6 +112,40 @@ def test_a_raising_exit_commits_nothing_and_does_not_suppress(error: BaseExcepti
     assert owner._counter_lock.events == [], "nor takes the owner's lock"
 
 
+def test_count_for_commits_another_object_under_the_owners_one_acquisition() -> None:
+    """SPEC-074 FR-001: a target's counter lands in the same acquisition, after the owner's own."""
+    owner = Owner()
+
+    class Target:
+        dropped_oversized = 0
+
+    target = Target()
+    with Deferral(owner) as pending:
+        pending.count("dropped", 1)
+        pending.count_for(target, "dropped_oversized", 2)
+        pending.count_for(target, "dropped_oversized", 0)
+        assert target.dropped_oversized == 0, "nothing may land before the block exits"
+
+    assert (owner.dropped, target.dropped_oversized) == (1, 2)
+    assert owner._counter_lock.events == [("acquire", 0), ("release", 1)], "one acquisition"
+
+
+def test_count_for_alone_still_takes_the_lock_and_a_raise_discards_it() -> None:
+    owner = Owner()
+
+    class Target:
+        n = 0
+
+    target = Target()
+    with pytest.raises(ValueError), Deferral(owner) as pending:
+        pending.count_for(target, "n", 3)
+        raise ValueError
+    assert target.n == 0 and owner._counter_lock.events == []
+    with Deferral(owner) as pending:
+        pending.count_for(target, "n", 3)
+    assert target.n == 3 and len(owner._counter_lock.events) == 2
+
+
 def test_an_early_return_inside_the_block_still_commits() -> None:
     """A ``return`` from inside the ``with`` is a clean exit, which is how two sites settle."""
     owner = Owner()
@@ -199,36 +233,25 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
-    "sinks/sqs.py": {"SQSSink": ("emit", "_chunks")},
-    "sinks/kinesis.py": {"KinesisSink": ("emit", "_records")},
-    "sinks/firehose.py": {"FirehoseSink": ("emit", "_records")},
-    "sinks/sns.py": {"SNSSink": ("emit", "_bodies")},
-    "sinks/mongodb.py": {"MongoDBSink": ("emit", "_documents")},
-    "sinks/eventhubs.py": {"AzureEventHubsSink": ("emit", "_send_batch")},
-    "sinks/_socket.py": {"SocketTransport": ("send_all", "_sendable")},
-    "sinks/syslog.py": {"SyslogSink": ("emit",)},
-    "sinks/logstash.py": {"LogstashSink": ("emit",)},
     "sinks/kafka.py": {"KafkaSink": ("emit",)},
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
     "sinks/stdout.py": {"StdoutSink": ("emit",)},
     "sinks/file.py": {"FileSink": ("emit",), "RotatingFileSink": ("emit",)},
-    "sinks/clickhouse.py": {"ClickHouseSink": ("emit",)},
-    "sinks/rabbitmq.py": {"RabbitMQSink": ("emit",)},
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
-    "sinks/postgres.py": {"PostgresSink": ("emit",)},
-    "sinks/redis.py": {"_RedisSink": ("emit",)},
     "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
 
 SPEC-058 listed the first five modules, SPEC-059 the next ten, and SPEC-069 the rest, each of
-whose ``emit`` enters a ``Deferral`` for its encode step. SPEC-073 took ``sinks/http.py`` off the
+whose ``emit`` enters a ``Deferral`` for its encode step. SPEC-074 takes each sink it puts on the
+delivery engine off the list, as SPEC-073 took ``sinks/http.py``: its drops register on the run
+context ``SETTLED``, and its counts commit in ``_engine._run``'s one ``Deferral``. SPEC-073 took ``sinks/http.py`` off the
 list: ``HTTPSink`` counts through the delivery engine's run context, whose one commit is
 ``_engine._commit``, listed below, and whose ``SETTLED`` rule for a dropped counter
-:func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it. ``SocketTransport`` is the one
-entry without an ``emit``: the ledger is entered by ``SyslogSink.emit`` and ``LogstashSink.emit``
-and handed to its ``send_all``, so the roster rule below, which starts from an ``emit``, cannot
-require it and it is named by hand.
+:func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it.
+``SocketTransport`` was the one entry without an ``emit``, its ledger entered by
+``SyslogSink.emit`` and ``LogstashSink.emit`` and handed to ``send_all``, until SPEC-074 put it on
+the engine and deleted ``send_all``.
 
 A class or function named here and missing from its module is a finding, not a skip: a rename
 would otherwise shrink the guard as silently as a deletion. The other direction is held too: a
@@ -239,25 +262,11 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("SQSSink", "_send"): frozenset({"failed"}),
-    ("KinesisSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
-    ("FirehoseSink", "_send"): frozenset({"failed", "dropped_unadjudicated"}),
-    ("SNSSink", "_send"): frozenset({"failed"}),
-    ("MongoDBSink", "emit"): frozenset({"failed"}),
-    ("AzureEventHubsSink", "_send"): frozenset({"failed"}),
-    ("SocketTransport", "_send_one"): frozenset({"failed"}),
-    ("SocketTransport", "_socket"): frozenset({"_sock"}),
-    ("SocketTransport", "_reset"): frozenset({"_sock"}),
     ("GooglePubSubSink", "emit"): frozenset({"failed"}),
     ("GooglePubSubSink", "_resolve"): frozenset({"failed"}),
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
     ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
     ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
-    ("ClickHouseSink", "_insert"): frozenset({"failed"}),
-    ("RabbitMQSink", "_publish"): frozenset({"failed"}),
-    ("RabbitMQSink", "_active_channel"): frozenset({"_connection", "_channel"}),
-    ("RabbitMQSink", "_reset"): frozenset({"_connection", "_channel"}),
-    ("RabbitMQSink", "_persistent_properties"): frozenset({"_properties"}),
     ("RotatingFileSink", "emit"): frozenset({"_size", "_failed"}),
     ("FileSink", "emit"): frozenset({"_failed"}),
     ("SQLiteSink", "emit"): frozenset({"_failed"}),
@@ -266,10 +275,6 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ),
     ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
     ("RotatingFileSink", "_ensure_open"): frozenset({"_stream", "_size"}),
-    ("PostgresSink", "_insert_batch"): frozenset({"failed"}),
-    ("PostgresSink", "_reconnect_if_broken"): frozenset({"_conn", "_reconnect_announced"}),
-    ("_RedisSink", "_send"): frozenset({"failed"}),
-    ("MongoDBSink", "_resolve_bson"): frozenset({"_bson_encode", "_bson_resolved"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -282,21 +287,6 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``SQSSink._send`` / ``failed``: entries failed past the bound and sender faults, counted as they
-  happen, before ``emit`` can raise; the same upper bound, the same *Out of Scope* clause.
-- ``KinesisSink._send`` and ``FirehoseSink._send`` / ``failed``, ``dropped_unadjudicated``:
-  records failed past the bound, and records in a chunk whose response could not be paired to
-  them, which ``losses()`` folds into ``failed``; an upper bound SPEC-059 does not recount.
-- ``SNSSink._send`` / ``failed``: entries failed past the bound and, since SPEC-070, sender
-  faults, counted as they happen; the same upper bound.
-- ``MongoDBSink.emit`` / ``failed``: rejected documents and connection errors past the bound; the
-  same upper bound.
-- ``AzureEventHubsSink._send`` / ``failed``: a batch abandoned past the bound; the same upper
-  bound, its line still written under the emit lock as before (SPEC-059 *Out of Scope*).
-- ``SocketTransport._send_one`` / ``failed``: a message abandoned past the reconnect bound; the
-  same upper bound.
-- ``SocketTransport._socket`` and ``SocketTransport._reset`` / ``_sock``: the held socket, opened
-  and dropped as the connection comes and goes; state, not a count.
 - ``GooglePubSubSink.emit`` / ``failed``: a future orphaned by a close landing mid-batch; it was
   handed to the client and may land, so it is unconfirmed — the same upper bound.
 - ``GooglePubSubSink._resolve`` / ``failed``: a future that resolved to an error; the same upper
@@ -305,25 +295,12 @@ counts as it happens rather than through the ``Deferral``:
   expired; the same upper bound.
 - ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
   pending list, rebound as futures settle or are put back; state, not a count.
-- ``ClickHouseSink._insert`` and ``RabbitMQSink._publish`` / ``failed``: a chunk or a message
-  abandoned past the retry bound, counted as it happens; the same upper bound. SPEC-069 put both
-  sinks on the ledger for their encode step and left these as they were.
-- ``RabbitMQSink._active_channel``, ``_reset`` / ``_connection``, ``_channel``, and
-  ``_persistent_properties`` / ``_properties``: the held connection, channel and message
-  properties, opened, dropped and built lazily; state, not a count.
 - ``RotatingFileSink.emit``, ``_rotate_or_continue``, ``_rotate`` and ``_ensure_open`` / ``_size``, ``_stream``,
   ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
   next time trigger and the once-per-outage flag; state, not a count.
-- ``PostgresSink._insert_batch`` and ``_RedisSink._send`` / ``failed``: a batch abandoned past the
-  retry bound, counted before the raise; the same upper bound. SPEC-069 moved the encode out of
-  both retry loops and left these as they were.
-- ``PostgresSink._reconnect_if_broken`` / ``_conn``, ``_reconnect_announced``: the held connection,
-  reopened when broken, and its once-per-outage flag; state, not a count.
 - ``FileSink.emit``, ``RotatingFileSink.emit`` and ``SQLiteSink.emit`` / ``_failed``: a batch
   whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
   an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.
-- ``MongoDBSink._resolve_bson`` / ``_bson_encode``, ``_bson_resolved``: the driver's own encoder,
-  found lazily on the first emit as the BSON detector (SPEC-069 FR-003); state, not a count.
 
 ``KafkaSink`` needs no entry: its delivery callback's ``failed`` is in ``_on_delivery``, passed to
 ``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).
@@ -1438,7 +1415,6 @@ DROPPED_FLOOR = frozenset(
     {
         "dropped_oversized",
         "_unrenderable",
-        "_id_failed",
         "rejected",
         "_dropped",
         "_unencodable",
@@ -1447,7 +1423,10 @@ DROPPED_FLOOR = frozenset(
 )
 """Counters the derivation must find over the tree; a floor, not the set.
 
-A new counter needs no edit here, because the set is derived. What the floor catches is the
+A new counter needs no edit here, because the set is derived. ``_id_failed`` left it with
+SPEC-074, which deleted ``SQSSink``'s counter: an id-callable drop is a ``DROPPED`` outcome the
+engine commits in ``dropped_events`` only when a run settles, which this floor still names and
+:func:`run_context_count_findings` and the engine's own tests guard. What the floor catches is the
 opposite drift: a refactor that blinds :func:`dropped_counters` — a renamed helper, a call it no
 longer recognises — would otherwise shrink the guard as silently as a deletion.
 """

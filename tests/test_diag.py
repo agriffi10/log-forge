@@ -669,8 +669,9 @@ def test_the_engines_diagnostics_are_on_the_roster() -> None:
         if isinstance(call.func, ast.Attribute)
         and call.func.attr in {"lost", "absorbed", "pending"}
     )
-    assert writers == ["absorbed", "absorbed", "absorbed", "lost"], (
-        f"the engine writes three absorbed lines and one lost line, as _diag calls: {writers}"
+    assert writers == ["absorbed", "absorbed", "absorbed", "lost", "lost"], (
+        "the engine writes three absorbed lines and two lost lines — a settled run's loss and, "
+        f"since SPEC-074, a settled run's refused events — as _diag calls: {writers}"
     )
 
 

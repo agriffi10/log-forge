@@ -7,18 +7,21 @@ import json
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._retry import exact_int, usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
     import concurrent.futures
-    from collections.abc import Coroutine
+    from collections.abc import Callable, Coroutine
 
 __all__ = ["NATSSink"]
 
@@ -201,6 +204,78 @@ class _LoopWedgedError(TimeoutError):
     ``TimeoutError`` a driver raised inside the coroutine, which the future carries and which is
     not evidence of a wedged loop.
     """
+
+
+class _Published(NamedTuple):
+    """What one round's publishes did, per event, as :meth:`NATSSink._publish_all` saw them.
+
+    Attributes:
+      fates: Per event, ``("ok", "")``, ``("raised", <type name>)``, ``("abandoned", "")`` or
+        ``("unattempted", "")``.
+      abandoned_counted: Whether an abandoned publish is unconfirmed where it was abandoned —
+        JetStream, an injected client, a client without ``flush`` — rather than judged by the
+        confirming round trip (SPEC-061 FR-001).
+      kind: ``"JetStream publish"`` or ``"publish"``, for the abandoned line.
+    """
+
+    fates: list[tuple[str, str]]
+    abandoned_counted: bool
+    kind: str
+
+
+class _Report(NamedTuple):
+    """What one round's coroutine learnt, for :meth:`NATSSink._round` to map (SPEC-074 FR-004).
+
+    Attributes:
+      refused: The refusal before the first publish — a disconnected client, an unanswered
+        probe — or ``None``.
+      published: The publishes, when there was no refusal.
+      unconfirmed: Whether a core batch's confirming round trip went unanswered.
+    """
+
+    refused: SinkDeliveryError | None = None
+    published: _Published | None = None
+    unconfirmed: bool = False
+
+
+def _verdict_of(
+    published: _Published, unconfirmed: bool
+) -> tuple[tuple[Outcome, ...], frozenset[int]]:
+    """Maps one round's publishes to outcomes and its sink-counted indices; pure (SPEC-074 FR-004).
+
+    The round's outcome follows the one fact 1.x's ``emit`` acted on: whether anything was
+    published, an abandoned publish counting as published. **Nothing published**: 1.x's ``emit``
+    raised and the worker resent the whole batch, so every event is ``RETRYABLE`` and marked
+    sink-counted — the round registers 1.x's own counts and lines, which this function does not.
+    **Something published**: 1.x's ``emit`` returned, so a publish that raised and an event the
+    deadline left unattempted are ``REJECTED``; an abandoned publish counted where it was
+    abandoned is ``UNKNOWN``, never resent; an unanswered confirmation makes every published
+    event ``UNKNOWN``; the rest are ``ACCEPTED``. Kept free of registrations so a test can plant
+    a wrong verdict here without also removing the counts.
+
+    Args:
+      published: The round's publishes.
+      unconfirmed: Whether the confirming round trip went unanswered.
+
+    Returns:
+      The outcomes, one per event, and the indices marked sink-counted.
+
+    Raises:
+      None.
+    """
+    states = [state for state, _ in published.fates]
+    if not any(state in ("ok", "abandoned") for state in states):
+        return (Outcome.RETRYABLE,) * len(states), frozenset(range(len(states)))
+    outcomes: list[Outcome] = []
+    for state in states:
+        if state == "ok":
+            outcomes.append(Outcome.UNKNOWN if unconfirmed else Outcome.ACCEPTED)
+        elif state == "abandoned":
+            judged = published.abandoned_counted or unconfirmed
+            outcomes.append(Outcome.UNKNOWN if judged else Outcome.ACCEPTED)
+        else:
+            outcomes.append(Outcome.REJECTED)
+    return tuple(outcomes), frozenset()
 
 
 class NATSSink:
@@ -411,8 +486,7 @@ class NATSSink:
             if drain_timeout is None
             else usable_timeout(drain_timeout, DEFAULT_CLOSE_TIMEOUT)
         )
-        self.failed = 0
-        self._counter_lock = threading.Lock()
+        self.log_foundry_counters = SinkCounters()
         self._lock = threading.Lock()
         self._pid = os.getpid()
         self._closing = False
@@ -573,23 +647,78 @@ class NATSSink:
             task.cancel()
         self._loop.call_soon(self._loop.stop)
 
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Publishes a batch on the loop thread and waits for it under a bound (FR-007, SPEC-061).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
-        ~~The driver requirement satisfied (SPEC-028 FR-002): an ``asyncio`` event loop is
-        single-entry. A second thread calling ``run_until_complete`` on a loop that is already
-        running raises ``RuntimeError``, and can leave the loop's task machinery in a state where
-        a thread never returns from ``emit`` at all.~~ **Superseded by SPEC-061 FR-001:** nothing
-        enters the loop any more; each call submits one coroutine and waits on its future. The
-        lock stays, now held across the submit and the wait, so the loop still runs one caller's
-        coroutine at a time and the driver sees publishes in the order callers made them.
-
-        The guards run in a fixed order, and the order is the point. The pid is compared before
-        the lock, because a lock a caller thread held at fork time stays held in the child and the
-        child acquired no thread, loop or connection to run anything on (invariant 12). The
-        closing flag is read before the lock and again after acquiring it, so a ``close()`` queued
-        behind a stream of emits is not starved by a lock that is not FIFO: every call that has
-        not yet taken the lock when the close begins is refused rather than published.
+        ``NATSSink`` takes no ``max_retries``, so the adapter makes one round, as 1.x made one
+        publish pass per ``emit``: against a stalled server it still takes one ``publish_timeout``
+        and raises with ``losses()`` unchanged (SPEC-074 FR-004).
 
         Args:
           batch: The events to publish. An empty batch is a no-op.
@@ -598,27 +727,178 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: When none of the events landed, when the sink is closed or closing,
-            in a forked child, while either latch holds (an unanswered probe, or a publish
-            abandoned at an earlier deadline and still pending), or when the backstop bound
-            expired and the sink closed itself.
+          SinkDeliveryError: When none of the events landed, with the engine's message; and, by
+            identity, SPEC-061's own error when the sink is closed or closing, in a forked child,
+            while either latch holds (an unanswered probe, or a publish abandoned at an earlier
+            deadline and still pending), when the client is disconnected or the probe went
+            unanswered, or when the backstop bound expired and the sink closed itself.
         """
-        if not batch:
-            return
-        self._refuse_outside_the_lock(f"NATSSink published none of {len(batch)} event(s)")
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-004).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the loop propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs SPEC-061's coroutine for one round on the loop thread, and maps what it learnt.
+
+        ~~The driver requirement satisfied (SPEC-028 FR-002): an ``asyncio`` event loop is
+        single-entry.~~ **Superseded by SPEC-061 FR-001:** nothing enters the loop; each round
+        submits one coroutine and waits on its future. The lock stays, held across the submit
+        and the wait, so the loop still runs one caller's coroutine at a time and the driver sees
+        publishes in the order callers made them.
+
+        The guards run in a fixed order, and the order is the point. The pid is compared before
+        the lock, because a lock a caller thread held at fork time stays held in the child
+        (invariant 12). The closing flag is read before the lock and again after acquiring it,
+        so a ``close()`` queued behind a stream of rounds is not starved by a lock that is not
+        FIFO. Each refusal SPEC-061 makes before the first publish is a refusal round carrying
+        SPEC-061's own ``SinkDeliveryError`` (SPEC-074 FR-001): ``REJECTED`` for a forked child, a
+        closed or a closing sink; ``RETRYABLE`` for either latch, a disconnected client and an
+        unanswered probe, each of which a later round can pass. The wedged-loop backstop is a
+        ``REJECTED`` refusal carrying SPEC-061's error: the sink has just closed itself, so no
+        later round can pass — the one refusal marker used after events may have reached the
+        transport (SPEC-074 FR-004's adjudication). Otherwise :func:`_verdict_of` maps the
+        publishes and :meth:`_register` registers 1.x's counts and lines.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the loop propagates.
+        """
+        context = run_context()
+        prefix = f"NATSSink published none of {len(batch)} event(s)"
+        refusal = self._refusal_outside_the_lock(prefix)
+        if refusal is not None:
+            context.refuse(refusal[1])
+            return Verdict.uniform(refusal[0], len(batch))
         with self._lock:
-            self._refuse_under_the_lock(f"NATSSink published none of {len(batch)} event(s)")
+            refusal = self._refusal_under_the_lock(prefix)
+            if refusal is not None:
+                context.refuse(refusal[1])
+                return Verdict.uniform(refusal[0], len(batch))
             try:
-                self._run(self._emit_on_loop(batch), self.publish_timeout + CALL_SLACK)
+                report = self._run(self._round_on_loop(batch), self.publish_timeout + CALL_SLACK)
             except _LoopWedgedError as err:
-                raise SinkDeliveryError(
+                wedged = SinkDeliveryError(
                     f"NATSSink published none of {len(batch)} event(s) within "
                     f"{self.publish_timeout + CALL_SLACK}s: the loop is wedged and the sink is "
                     "now closed"
-                ) from err
+                )
+                wedged.__cause__ = err
+                context.refuse(wedged)
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+        if report.refused is not None or report.published is None:
+            context.refuse(report.refused or SinkDeliveryError(prefix))
+            return Verdict.uniform(Outcome.RETRYABLE, len(batch))
+        outcomes, counted = _verdict_of(report.published, report.unconfirmed)
+        self._register(report.published, report.unconfirmed)
+        context.sink_counted(counted)
+        return Verdict(outcomes=outcomes)
+
+    def _register(self, published: _Published, unconfirmed: bool) -> None:
+        """Registers, ``ALWAYS``, the counts and lines 1.x's ``emit`` made for this round.
+
+        Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
+        per publish that raised, in order — 1.x counted each as it happened and then raised —
+        and nothing for an event the deadline left unattempted, whose loss is its catcher's; the
+        round's events are sink-counted, so the engine adds nothing. Something published: the
+        engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in
+        1.x's order — each raised publish, the unattempted remainder, an abandoned publish
+        counted where it was abandoned, and an unanswered confirmation. The last two announce
+        ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that resends
+        an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per run.
+
+        Args:
+          published: The round's publishes.
+          unconfirmed: Whether the confirming round trip went unanswered.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        context = run_context()
+        states = [state for state, _ in published.fates]
+        landed = any(state in ("ok", "abandoned") for state in states)
+        for state, kind in published.fates:
+            if state != "raised":
+                continue
+            if not landed:
+                context.count(self.log_foundry_counters, "failed_events", 1, when=When.ALWAYS)
+            context.announce(_publish_line(kind), when=When.ALWAYS)
+        if not landed:
+            return
+        unattempted = states.count("unattempted")
+        if unattempted:
+            timeout = self.publish_timeout
+            context.announce(
+                lambda: _diag.lost("event", unattempted, f"NATSSink publish_timeout {timeout}s"),
+                when=When.ALWAYS,
+            )
+        unknown = When.LAST if context.resends_unknown(self) else When.ALWAYS
+        abandoned = states.count("abandoned")
+        if abandoned and published.abandoned_counted:
+            what = published.kind
+            context.announce(
+                lambda: _diag.lost("event", abandoned, f"NATSSink unconfirmed, {what} abandoned"),
+                when=unknown,
+            )
+        if unconfirmed:
+            sent = states.count("ok") + (0 if published.abandoned_counted else abandoned)
+            context.announce(
+                lambda: _diag.lost("event", sent, "NATSSink unconfirmed, no PONG after the batch"),
+                when=unknown,
+            )
+
+    def _refusal_outside_the_lock(self, prefix: str) -> tuple[Outcome, SinkDeliveryError] | None:
+        """Returns the refusal for a call that must not even take the lock (SPEC-061 FR-001).
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
+          ``REJECTED`` with SPEC-061's error in a forked child or while the sink is closing or
+          closed; ``RETRYABLE`` with it while the outstanding probe is known to be unanswered
+          (the latch, SPEC-061 FR-002) or a publish abandoned at an earlier deadline is still
+          blocked in the driver; else ``None``.
+
+        Raises:
+          None.
+        """
+        if os.getpid() != self._pid:
+            return Outcome.REJECTED, SinkDeliveryError(
+                f"{prefix}: a forked child acquired no connection"
+            )
+        if self._closed:
+            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closed")
+        if self._closing:
+            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closing")
+        if self._latched():
+            return Outcome.RETRYABLE, SinkDeliveryError(
+                f"{prefix}: the server has not answered a PING, and the stall it measures has "
+                f"lasted more than {self.publish_timeout}s"
+            )
+        stuck = self._stuck_refusal(prefix)
+        return None if stuck is None else (Outcome.RETRYABLE, stuck)
 
     def _refuse_outside_the_lock(self, prefix: str) -> None:
-        """Raises for a call that must not even take the lock (SPEC-061 FR-001).
+        """Raises the refusal :meth:`_refusal_outside_the_lock` finds, for :meth:`flush`.
 
         Args:
           prefix: The start of the message, naming what the call would have done.
@@ -628,24 +908,15 @@ class NATSSink:
 
         Raises:
           SinkDeliveryError: In a forked child, while the sink is closing or closed, while the
-            outstanding probe is known to be unanswered (the latch, SPEC-061 FR-002), or while a
-            publish abandoned at an earlier deadline is still blocked in the driver.
+            outstanding probe is known to be unanswered, or while a publish abandoned at an
+            earlier deadline is still blocked in the driver.
         """
-        if os.getpid() != self._pid:
-            raise SinkDeliveryError(f"{prefix}: a forked child acquired no connection")
-        if self._closed:
-            raise SinkDeliveryError(f"{prefix}: the sink is closed")
-        if self._closing:
-            raise SinkDeliveryError(f"{prefix}: the sink is closing")
-        if self._latched():
-            raise SinkDeliveryError(
-                f"{prefix}: the server has not answered a PING, and the stall it measures has "
-                f"lasted more than {self.publish_timeout}s"
-            )
-        self._refuse_while_stuck(prefix)
+        refusal = self._refusal_outside_the_lock(prefix)
+        if refusal is not None:
+            raise refusal[1]
 
-    def _refuse_while_stuck(self, prefix: str) -> None:
-        """Raises while a publish abandoned at an earlier deadline is still pending (SPEC-061).
+    def _stuck_refusal(self, prefix: str) -> SinkDeliveryError | None:
+        """Returns the abandoned-publish latch's refusal, or ``None`` (SPEC-061).
 
         The second latch, for every client, the sink's own and an injected one alike. A publish
         is abandoned only when the driver did not return from it within the budget, which for a
@@ -661,16 +932,33 @@ class NATSSink:
           prefix: The start of the message, naming what the call would have done.
 
         Returns:
+          The refusal while an abandoned publish has not finished, else ``None``.
+
+        Raises:
+          None.
+        """
+        if self._publish_stuck():
+            return SinkDeliveryError(
+                f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
+                "is still blocked in the driver"
+            )
+        return None
+
+    def _refuse_while_stuck(self, prefix: str) -> None:
+        """Raises while a publish abandoned at an earlier deadline is still pending (SPEC-061).
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
           None.
 
         Raises:
           SinkDeliveryError: While an abandoned publish has not finished.
         """
-        if self._publish_stuck():
-            raise SinkDeliveryError(
-                f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
-                "is still blocked in the driver"
-            )
+        stuck = self._stuck_refusal(prefix)
+        if stuck is not None:
+            raise stuck
 
     def _publish_stuck(self) -> bool:
         """Reports whether a publish abandoned at an earlier deadline is still pending.
@@ -689,13 +977,34 @@ class NATSSink:
         """
         return any(not task.done() for task in self._stuck)
 
-    def _refuse_under_the_lock(self, prefix: str) -> None:
-        """Re-reads the closing flags once the lock is held (SPEC-061 FR-001).
+    def _refusal_under_the_lock(self, prefix: str) -> tuple[Outcome, SinkDeliveryError] | None:
+        """Re-reads the closing flags and the stuck latch once the lock is held (SPEC-061 FR-001).
 
         A ``close()`` can set its flag while this call was waiting for the lock, and a call that
         then published would land after the closer believed the sink quiet. The abandoned-publish
         latch is read again for the same reason: callers that queued on the lock before the
         publish ahead of them was abandoned would otherwise each spend a budget behind it.
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
+          ``REJECTED`` with SPEC-061's error when the sink closed or began closing while the call
+          waited; ``RETRYABLE`` with it while an abandoned publish is still blocked; else
+          ``None``.
+
+        Raises:
+          None.
+        """
+        if self._closed:
+            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closed")
+        if self._closing:
+            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closing")
+        stuck = self._stuck_refusal(prefix)
+        return None if stuck is None else (Outcome.RETRYABLE, stuck)
+
+    def _refuse_under_the_lock(self, prefix: str) -> None:
+        """Raises the refusal :meth:`_refusal_under_the_lock` finds, for :meth:`flush`.
 
         Args:
           prefix: The start of the message, naming what the call would have done.
@@ -707,76 +1016,72 @@ class NATSSink:
           SinkDeliveryError: The sink closed or began closing while the call waited, or a
             publish abandoned at an earlier deadline is still blocked in the driver.
         """
-        if self._closed:
-            raise SinkDeliveryError(f"{prefix}: the sink is closed")
-        if self._closing:
-            raise SinkDeliveryError(f"{prefix}: the sink is closing")
-        self._refuse_while_stuck(prefix)
+        refusal = self._refusal_under_the_lock(prefix)
+        if refusal is not None:
+            raise refusal[1]
 
-    async def _emit_on_loop(self, batch: list[dict[str, object]]) -> None:
-        """The coroutine behind :meth:`emit`, run on the loop thread (SPEC-061 FR-002).
+    async def _round_on_loop(self, batch: list[dict[str, object]]) -> _Report:
+        """The coroutine behind one round, run on the loop thread (SPEC-061 FR-002, SPEC-074).
 
         For a client the sink connected itself, a publish is made only after the server answers a
-        round trip inside the emit's one ``publish_timeout`` deadline, in both core and JetStream
+        round trip inside the round's one ``publish_timeout`` deadline, in both core and JetStream
         modes. The driver's flag stays in front of the round trip as the cheap refusal and is read
         again once the round trip is answered, immediately before the first publish. No answer
         means a refusal with nothing published and no counter moved (SPEC-032's rule: a failure
         reported to the worker is not also counted).
 
-        **A core batch is then confirmed, or counted** (SPEC-061 FR-003). A core ``publish``
-        returns once its bytes are in the driver's pending buffer, which the driver's flusher
-        task writes to the transport, while a PING is written to the transport directly. So the
-        second round trip is sent only once the driver's public ``pending_data_size`` reads zero,
-        waited for inside what remains of the deadline (:meth:`_drained`): then every publish is
-        in the transport ahead of the PING, a single connection is processed in order, and an
-        answered PONG means the server processed every publish before it. A PING sent while the
-        buffer is non-empty overtakes the publishes and confirms nothing about them (reproduced
-        on CPython 3.12.12, where the transport pauses the flusher past its high-water mark: 133
-        of 400 publishes parsed at the PONG). No answer, including when the buffer has not
-        drained by the deadline, the deadline is already spent, or the client has become
-        disconnected, adds every event published and not otherwise counted to ``failed`` and
-        announces it once, and **this returns rather than raises**: the bytes are in flight to a
-        server that may yet process them (M6: five publishes written to a paused server all
-        landed after it resumed), so a worker retry could deliver them twice, which is SPEC-018's
-        rule for an unadjudicable batch. The stall is still reported, because the next call is
-        refused by the probe or its latch; only the one batch that straddles the onset of a stall
-        is counted rather than raised. JetStream mode has no such step, since each publish already
-        awaited its ack, and an injected client has none either. The second round trip is sent
-        only while the client still reports itself connected, because the driver's ``flush``
-        returns without a PONG otherwise and the next call would wait on nothing. When the buffer
-        does not drain, a probe is left outstanding (:meth:`_confirm`), aged from the start of
-        this call, so the latch already holds when this call returns and the callers after it are
-        refused at once rather than each spending a budget.
+        **A core batch is then confirmed, or reported unconfirmed** (SPEC-061 FR-003). A core
+        ``publish`` returns once its bytes are in the driver's pending buffer, which the driver's
+        flusher task writes to the transport, while a PING is written to the transport directly.
+        So the second round trip is sent only once the driver's public ``pending_data_size`` reads
+        zero, waited for inside what remains of the deadline (:meth:`_drained`): then every
+        publish is in the transport ahead of the PING, a single connection is processed in order,
+        and an answered PONG means the server processed every publish before it. No answer,
+        including when the buffer has not drained by the deadline, the deadline is already spent,
+        or the client has become disconnected, makes every event published ``UNKNOWN`` and is
+        announced once, never resent: the bytes are in flight to a server that may yet process
+        them (M6), so a resend could deliver them twice, SPEC-018's rule for an unadjudicable
+        batch. The next call is refused by the probe or its latch, so the stall is still
+        reported. JetStream mode has no such step, since each publish already awaited its ack,
+        and an injected client has none either. The second round trip is sent only while the
+        client still reports itself connected. When the buffer does not drain, a probe is left
+        outstanding (:meth:`_confirm`), aged from the start of this call, so the latch already
+        holds when this call returns.
+
+        Nothing is counted on the loop thread: the round's counts and lines are registered on the
+        caller's thread from the report this returns, so none depends on a context reaching the
+        loop, and a coroutine the backstop abandoned cannot register into a run that has ended.
 
         Args:
           batch: The events to publish.
 
         Returns:
-          None.
+          The round's report.
 
         Raises:
-          SinkDeliveryError: The client is disconnected, the round trip went unanswered, or none
-            of the events landed.
+          None.
         """
         deadline = time.monotonic() + self.publish_timeout
         refusal = f"NATSSink published none of {len(batch)} event(s)"
         if not self._is_connected():
-            raise SinkDeliveryError(f"{refusal}: the client is disconnected")
+            return _Report(SinkDeliveryError(f"{refusal}: the client is disconnected"))
         probing = self._probing()
         if probing:
             if not await self._await_probe(deadline):
-                raise SinkDeliveryError(
-                    f"{refusal}: no PONG from the server within {self.publish_timeout}s"
+                return _Report(
+                    SinkDeliveryError(
+                        f"{refusal}: no PONG from the server within {self.publish_timeout}s"
+                    )
                 )
             if not self._is_connected():
-                raise SinkDeliveryError(f"{refusal}: the client is disconnected")
+                return _Report(SinkDeliveryError(f"{refusal}: the client is disconnected"))
         published = await self._publish_all(batch, deadline)
-        if probing and not self._jetstream and published:
+        sent = any(state in ("ok", "abandoned") for state, _ in published.fates)
+        unconfirmed = False
+        if probing and not self._jetstream and sent:
             confirmed = self._is_connected() and await self._confirm(deadline, arm=True)
-            if not confirmed:
-                with self._counter_lock:
-                    self.failed += published
-                _diag.lost("event", published, "NATSSink unconfirmed, no PONG after the batch")
+            unconfirmed = not confirmed
+        return _Report(published=published, unconfirmed=unconfirmed)
 
     async def _drained(self, deadline: float) -> bool:
         """Waits until the driver's pending buffer is empty, so a PING cannot overtake it.
@@ -1089,9 +1394,9 @@ class NATSSink:
     def losses(self) -> SinkLosses:
         """Reports events whose publish raised or went unconfirmed (SPEC-026 FR-002).
 
-        Read without the counter lock in a forked child, where a lock a parent thread held at
-        fork time may stay held; the child's counter can only be the inherited value, since the
-        child publishes nothing.
+        The engine's totals (SPEC-074 FR-001). Read without the counters' lock in a forked child,
+        where a lock a parent thread held at fork time may stay held; the child's counters can
+        only be the inherited values, since the child publishes nothing.
 
         Args:
           None.
@@ -1103,9 +1408,8 @@ class NATSSink:
           None.
         """
         if os.getpid() != self._pid:
-            return SinkLosses(dropped=0, failed=self.failed)
-        with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed)
+            return _unlocked(self.log_foundry_counters)
+        return self.log_foundry_counters.losses()
 
     def close(self) -> None:
         """Closes the client under the sink's own deadline, then stops the loop thread (SPEC-061).
@@ -1255,7 +1559,7 @@ class NATSSink:
         if pending:
             await asyncio.wait(pending, timeout=LOOP_JOIN_TIMEOUT / 2)
 
-    async def _publish_all(self, batch: list[dict[str, object]], deadline: float) -> int:
+    async def _publish_all(self, batch: list[dict[str, object]], deadline: float) -> _Published:
         """Publishes each event under one deadline for the whole batch (SPEC-047 FR-001).
 
         Per-event isolation stays because a partial batch must not be retried wholesale: the
@@ -1288,65 +1592,42 @@ class NATSSink:
         core client's was counted nowhere, so a batch of one returned with ``failed`` at zero. An
         abandoned publish also arms :meth:`_refuse_while_stuck` until it finishes.
 
-        Two populations are counted by different rules. An event whose publish **raised** is a
-        driver failure and is counted here exactly as before this spec. An event **never
-        attempted** because the budget expired is counted only when this returns: a raise sends
-        the whole batch back to ``Worker._emit``, which retries it, so booking the remainder there
-        would report a loss that has not happened — the rule
-        :meth:`~log_foundry.sinks.kafka.KafkaSink.flush` already applies to its own queued
-        remainder.
+        Nothing is counted here (SPEC-074 FR-004): each event's fate is returned — published,
+        raised (with the exception's type), abandoned or never attempted — and the round maps
+        them. An event whose publish **raised** is a driver failure; an event **never attempted**
+        because the budget expired is a loss only when something else in the round was published,
+        since otherwise the round is resent whole, as 1.x's raise sent the batch back to the
+        worker — the rule :meth:`~log_foundry.sinks.kafka.KafkaSink.flush` applies to its own
+        queued remainder.
 
         Args:
           batch: The events to publish.
           deadline: The ``time.monotonic()`` instant the whole emit must finish by.
 
         Returns:
-          How many events were published, the abandoned one included.
+          Each event's fate, in batch order.
 
         Raises:
-          SinkDeliveryError: When none of them landed (SPEC-026 FR-001).
+          None.
         """
         target = self._client.jetstream() if self._jetstream else self._client
-        published = 0
-        attempted = 0
-        abandoned = 0
+        fates: list[tuple[str, str]] = []
         for event in batch:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            attempted += 1
             try:
                 payload = json.dumps(event).encode("utf-8")
                 if not await self._publish_bounded(target, payload, remaining):
-                    published += 1
-                    abandoned += 1
+                    fates.append(("abandoned", ""))
                     break
             except Exception as err:
-                with self._counter_lock:
-                    self.failed += 1
-                _diag.lost("event", 1, f"NATSSink publish, {type(err).__name__}")
+                fates.append(("raised", type(err).__name__))
             else:
-                published += 1
-        unattempted = len(batch) - attempted
-        if batch and not published:
-            raise SinkDeliveryError(
-                f"NATSSink published none of {len(batch)} event(s)"
-                + (
-                    f", {unattempted} not attempted within {self.publish_timeout}s"
-                    if unattempted
-                    else ""
-                )
-            )
-        if unattempted:
-            with self._counter_lock:
-                self.failed += unattempted
-            _diag.lost("event", unattempted, f"NATSSink publish_timeout {self.publish_timeout}s")
-        if abandoned and (self._jetstream or not self._probing()):
-            with self._counter_lock:
-                self.failed += abandoned
-            kind = "JetStream publish" if self._jetstream else "publish"
-            _diag.lost("event", abandoned, f"NATSSink unconfirmed, {kind} abandoned")
-        return published
+                fates.append(("ok", ""))
+        fates.extend([("unattempted", "")] * (len(batch) - len(fates)))
+        kind = "JetStream publish" if self._jetstream else "publish"
+        return _Published(fates, self._jetstream or not self._probing(), kind)
 
     async def _publish_bounded(self, target: Any, payload: bytes, remaining: float) -> bool:
         """Runs one publish as a task and waits for it under the remaining budget.
@@ -1512,3 +1793,33 @@ class NATSSink:
                 f"{self.publish_timeout}s"
             )
         task.result()
+
+
+def _publish_line(kind: str) -> Callable[[], None]:
+    """Returns SPEC-061's line for one publish that raised, naming its exception's type.
+
+    Args:
+      kind: The exception's type name, never its text (invariant 11).
+
+    Returns:
+      The line, as a no-argument callable for the run context.
+
+    Raises:
+      None.
+    """
+    return lambda: _diag.lost("event", 1, f"NATSSink publish, {kind}")
+
+
+def _unlocked(counters: SinkCounters) -> SinkLosses:
+    """Reads a forked child's inherited counters without the lock a parent thread may hold.
+
+    Args:
+      counters: The sink's counters.
+
+    Returns:
+      Both totals as a ``SinkLosses``.
+
+    Raises:
+      None.
+    """
+    return SinkLosses(dropped=counters.dropped_events, failed=counters.failed_events)

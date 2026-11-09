@@ -30,8 +30,15 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
+from log_foundry.sinks import _engine
 from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_bson, repair_nul
+from log_foundry.sinks._encode import (
+    NUL_ESCAPE,
+    encode_events,
+    encode_round,
+    repair_bson,
+    repair_nul,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -179,18 +186,27 @@ def derive(
     From the resolved ``emit`` it follows every call it can resolve into a function whose module
     starts with one of ``owned``: ``self.<m>(...)`` through the class's MRO, a bare name or a
     ``module.attr`` through the calling function's globals. A call whose callee resolves to
-    ``json.dumps`` — however it was imported — is a hit. A call to ``encode_events`` has its
-    ``encode`` argument resolved the same way and walked as *guarded*; every other reach is
-    *unguarded*. A callable passed as a ``deliver=`` keyword is followed as a call too, since
+    ``json.dumps`` — however it was imported — is a hit. A call to ``encode_events``, or to its
+    engine-mode sibling ``encode_round`` (SPEC-074), has its ``encode`` argument resolved the same
+    way and walked as *guarded*; every other reach is *unguarded*. A callable passed as a
+    ``deliver=`` keyword is followed as a call too, since
     ``emit_via_deliver(self, batch, deliver=self._round)`` is how an engine sink's ``emit`` reaches
-    its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. It does not follow any other
-    callable passed uncalled, a property, or a call through another object.
+    its round (SPEC-073): ``HTTPSink.emit`` renders nothing itself. So are the two other routes an
+    engine sink's ``emit`` takes (SPEC-074): ``emit_via_deliver(self, batch)`` with no
+    ``deliver=`` reaches the class's own ``deliver``, and ``_engine.one_round(self._round, batch)``
+    its round. A class whose ``__init__`` builds a ``SocketTransport(..., frame=<f>)`` hands the
+    transport its frame function, which the transport's round runs through ``encode_round``
+    (``test_the_socket_transport_frames_through_encode_round`` holds that half), so its
+    ``emit_via_deliver(self._socket, …)`` or ``self._socket.deliver(…)`` reaches ``<f>`` guarded
+    (SPEC-074 FR-005). It does not follow any other callable passed uncalled, a property, or a
+    call through another object.
     """
     roster = Roster()
     for cls in classes:
         emit = inspect.getattr_static(cls, "emit", None)
         if not inspect.isfunction(emit):
             continue
+        socket_frame = _socket_frame(cls)
         hits: list[tuple[str, bool]] = []
         stack: list[tuple[Callable[..., Any], bool]] = [(emit, False)]
         seen: set[tuple[int, bool]] = set()
@@ -211,10 +227,11 @@ def derive(
                 callee = _resolve(node.func, fn, cls)
                 if callee is json.dumps:
                     hits.append((fn.__qualname__, guarded))
-                elif callee is encode_events:
+                elif callee is encode_events or callee is encode_round:
+                    at = 1 if callee is encode_events else 2
                     arg = (
-                        node.args[1]
-                        if len(node.args) > 1
+                        node.args[at]
+                        if len(node.args) > at
                         else next((k.value for k in node.keywords if k.arg == "encode"), None)
                     )
                     target = _resolve(arg, fn, cls) if arg is not None else None
@@ -226,8 +243,24 @@ def derive(
                             f"{cls.__module__}: {cls.__qualname__}.emit hands encode_events an "
                             f"encode argument the roster cannot resolve: {shown}"
                         )
+                elif socket_frame is not None and _hands_to_the_socket(node, callee):
+                    stack.append((socket_frame, True))
+                elif callee is _engine.one_round and node.args:
+                    handed = _resolve(node.args[0], fn, cls)
+                    if inspect.isfunction(handed):
+                        stack.append((handed, guarded))
                 elif inspect.isfunction(callee) and (callee.__module__ or "").startswith(owned):
                     stack.append((callee, guarded))
+                    own_deliver = inspect.getattr_static(cls, "deliver", None)
+                    if (
+                        callee is _engine.emit_via_deliver
+                        and node.args
+                        and isinstance(node.args[0], ast.Name)
+                        and node.args[0].id == "self"
+                        and not any(k.arg == "deliver" for k in node.keywords)
+                        and inspect.isfunction(own_deliver)
+                    ):
+                        stack.append((own_deliver, guarded))
                 for keyword in node.keywords:
                     if keyword.arg != "deliver":
                         continue
@@ -250,6 +283,63 @@ def derive(
                 for where in bare
             )
     return roster
+
+
+def _socket_frame(cls: type) -> Callable[..., Any] | None:
+    """The frame function a class's ``__init__`` hands a ``SocketTransport``, resolved on it."""
+    init = inspect.getattr_static(cls, "__init__", None)
+    tree = _parse(init) if inspect.isfunction(init) else None
+    if tree is None:
+        return None
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "SocketTransport"
+        ):
+            for keyword in node.keywords:
+                if keyword.arg == "frame":
+                    found = _resolve(keyword.value, init, cls)
+                    return found if inspect.isfunction(found) else None
+    return None
+
+
+def _is_self_socket(node: ast.expr) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "_socket"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    )
+
+
+def _hands_to_the_socket(node: ast.Call, callee: object) -> bool:
+    """Whether a call runs the transport's round: ``emit_via_deliver(self._socket, …)``, or
+    ``self._socket.deliver(…)``."""
+    if callee is _engine.emit_via_deliver and node.args and _is_self_socket(node.args[0]):
+        return True
+    return (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr == "deliver"
+        and _is_self_socket(node.func.value)
+    )
+
+
+def test_the_socket_transport_frames_through_encode_round() -> None:
+    """The other half of the socket sinks' route: the transport's round guards its frame."""
+    from log_foundry.sinks._socket import SocketTransport
+
+    tree = _parse(inspect.getattr_static(SocketTransport, "_round"))
+    assert tree is not None
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "encode_round"
+    ]
+    assert len(calls) == 1
+    assert ast.unparse(calls[0].args[2]) == "self._frame"
 
 
 def _package_classes() -> list[type]:
@@ -791,3 +881,131 @@ def test_the_placeholder_sites_agree(number: int) -> None:
     assert _Coercer(Config())._bounded_int(number)[0] == expected
     assert _Coercer(Config()).integer(number) == expected
     assert _int_digits(number) == (expected, True)
+
+
+# --- SPEC-074 FR-002: encode_round, the engine-mode sibling ---------------------------------
+
+
+class _RoundOwner:
+    """A run-notes owner; ``encode_round`` stores nothing on it."""
+
+
+def _counting(calls: list[object]) -> Callable[[dict[str, object]], str]:
+    def encode(event: dict[str, object]) -> str:
+        calls.append(event)
+        return json.dumps(event)
+
+    return encode
+
+
+def test_encode_round_encodes_each_event_once_per_run(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+    from log_foundry.sinks._engine import emit_via_deliver, one_round
+    from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+    calls: list[object] = []
+    seen: list[list[int]] = []
+
+    class Sink:
+        log_foundry_stop_signal = None
+        max_retries = 2
+
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+            self.rounds = 0
+
+        def deliver(self, batch):
+            return one_round(self._round, batch)
+
+        def _round(self, batch):
+            self.rounds += 1
+            pairs = encode_round(self, batch, _counting(calls), sink="Sink")
+            seen.append([position for position, _ in pairs])
+            fates = [Outcome.DROPPED] * len(batch)
+            for position, _ in pairs:
+                fates[position] = Outcome.RETRYABLE if self.rounds < 3 else Outcome.ACCEPTED
+            return Verdict(outcomes=tuple(fates))
+
+        def emit(self, batch):
+            emit_via_deliver(self, batch)
+
+    sink = Sink()
+    batch = [{"a": 1}, {"bad": b"x"}, {"a": 3}]
+    sink.emit(batch)
+    assert sink.rounds == 3
+    assert len(calls) == 3, "encode is called len(batch) times however many rounds run"
+    assert seen == [[0, 2], [0, 1], [0, 1]], "later rounds' positions are their own batch's"
+    lines = [line for line in capsys.readouterr().err.splitlines() if "encoding raised" in line]
+    assert lines == ["log-foundry: lost 1 event(s); Sink, encoding raised TypeError"]
+    assert sink.log_foundry_counters.losses().dropped == 1
+
+
+def test_encode_round_registers_its_line_settled_only(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+    from log_foundry.sinks._engine import emit_via_deliver, one_round
+    from log_foundry.sinks.base import SinkDeliveryError
+    from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+    class Sink:
+        log_foundry_stop_signal = None
+
+        def __init__(self) -> None:
+            self.log_foundry_counters = SinkCounters()
+
+        def deliver(self, batch):
+            return one_round(self._round, batch)
+
+        def _round(self, batch):
+            pairs = encode_round(self, batch, _strict, sink="Sink")
+            fates = [Outcome.DROPPED] * len(batch)
+            for position, _ in pairs:
+                fates[position] = Outcome.REJECTED
+            return Verdict(outcomes=tuple(fates))
+
+        def emit(self, batch):
+            emit_via_deliver(self, batch)
+
+    with pytest.raises(SinkDeliveryError):
+        Sink().emit([{"a": 1}, {"bad": b"x"}])
+    assert "encoding raised" not in capsys.readouterr().err, "a failed run's catcher owns it"
+
+
+def test_encode_round_outside_a_run_encodes_once_and_writes_at_once(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+
+    calls: list[object] = []
+    pairs = encode_round(_RoundOwner(), [{"a": 1}, {"bad": b"x"}], _counting(calls), sink="S")
+    assert [position for position, _ in pairs] == [0]
+    assert len(calls) == 2
+    assert "S, encoding raised TypeError" in capsys.readouterr().err
+
+
+def test_encode_round_lets_a_base_exception_out_with_nothing_recorded(capsys) -> None:
+    from log_foundry.sinks._encode import encode_round
+
+    def interrupt(event: dict[str, object]) -> str:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        encode_round(_RoundOwner(), [{"a": 1}], interrupt, sink="S")
+    assert capsys.readouterr().err == ""
+
+
+def test_encode_round_keeps_one_form_per_occurrence_and_skips_a_landed_one() -> None:
+    """M1: an identity twice in a batch keeps two forms; a landed one is never handed out again."""
+    from log_foundry.sinks._encode import encode_round, encoded_landed
+    from log_foundry.sinks._engine import _RUNS, RunContext
+
+    context = RunContext()
+    token = _RUNS.set((context,))
+    owner = _RoundOwner()
+    try:
+        event = {"a": 1}
+        first = encode_round(owner, [event, event], lambda e: dict(e), sink="S")
+        assert first[0][1] is not first[1][1], "each occurrence has its own form"
+        encoded_landed(owner, [0])
+        second = encode_round(owner, [event], lambda e: dict(e), sink="S")
+        assert second[0][1] is first[1][1], "the resend carries the occurrence that did not land"
+    finally:
+        _RUNS.reset(token)
+        context._close()

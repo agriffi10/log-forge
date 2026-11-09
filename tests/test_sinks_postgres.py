@@ -63,7 +63,7 @@ class FakeConnection:
 def _no_sleep(monkeypatch):
     # ``wait`` is bound into each sink at import, and its Event branch never reaches
     # ``time.sleep`` — patching either centrally would leave this fixture inert.
-    monkeypatch.setattr("log_foundry.sinks.postgres.wait", lambda _delay, _stop=None: None)
+    monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
 
 
 def test_is_a_sink() -> None:
@@ -248,7 +248,7 @@ def test_a_total_failure_still_counts_announces_and_raises_the_sink_error(capsys
     """AC-2. Before the fix: `failed` stayed 0, no `lost` line, and a raw RuntimeError escaped."""
     conn = RollbackRaisesConnection()
     sink = PostgresSink("logs", connection=conn, max_retries=1)
-    with pytest.raises(SinkDeliveryError, match="inserted none of 3 event"):
+    with pytest.raises(SinkDeliveryError, match="delivered none of 3 event"):
         sink.emit([{"i": i} for i in range(3)])
     assert sink.failed == 3
     assert sink.losses().failed == 3

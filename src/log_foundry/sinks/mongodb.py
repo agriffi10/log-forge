@@ -10,20 +10,27 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
+from log_foundry.sinks._batch import adjudicate_keyed
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events, repair_bson
+from log_foundry.sinks._encode import encode_round, encoded_landed, repair_bson
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, require_timeout, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count, require_timeout
+from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from log_foundry.sinks._deferral import Deferral
+    from log_foundry.sinks._engine import _Drops
+    from log_foundry.sinks.base import SinkLosses
+
 __all__ = ["MongoDBSink"]
 
-_BACKOFF_BASE = 0.1
 _MAX_DOC_BYTES = 16 * 1024 * 1024
 
 DEFAULT_SOCKET_TIMEOUT = 30.0
@@ -119,8 +126,11 @@ class MongoDBSink:
     The impedance is near zero: events are already dicts, so ``insert_many`` takes them as-is.
     ``pymongo`` is the optional ``mongo`` extra, imported lazily. Inserts are unordered so one bad
     document does not abort the rest of the batch, and the sink is write-only — querying is the
-    downstream tool's job. The worst-case delay (SPEC-027 FR-005) is ``max_retries``
-    interruptible waits per batch, 0.7 s at the defaults.
+    downstream tool's job. It delivers through SPEC-072's engine (SPEC-074 FR-003): one
+    ``insert_many`` per round, the engine resending only what may land, so the worst-case delay
+    (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run, 0.7 s at the defaults. The
+    documents are built once per run, so a resend carries the very ``_id`` pymongo stamped into
+    each on the first attempt.
 
     The driver requirement satisfied (SPEC-028 FR-002): ``pymongo``'s ``MongoClient`` is
     thread-safe and owns a connection pool, so this sink deliberately takes **no** transport lock
@@ -130,8 +140,10 @@ class MongoDBSink:
     driver's.
 
     Attributes:
-      failed: Documents the server rejected, or a whole batch abandoned past the retry bound.
-      dropped_oversized: Documents dropped for exceeding MongoDB's 16 MB per-document limit.
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      failed: Documents the server rejected or never confirmed, ``failed_events``; assignable.
+      dropped_oversized: Documents dropped for exceeding MongoDB's 16 MB per-document limit,
+        counted only by a run that settled.
 
 
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
@@ -201,23 +213,85 @@ class MongoDBSink:
         self._client = client
         self._collection = client[database][collection]
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
+        self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._unencodable = 0
         self._closed = False
-        self._counter_lock = threading.Lock()
         self._close_lock = threading.Lock()
         self._bson_resolved = False
         self._bson_encode: Callable[[Any], object] | None = None
 
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
     def losses(self) -> SinkLosses:
-        """Reports oversized drops and documents the server rejected or never took (FR-002).
+        """Reports the engine's totals: oversized and unencodable drops, documents never confirmed.
 
-        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001);
-        ``dropped_oversized`` still means oversize only.
-
-        Both fields are read under one lock so the pair comes from the same instant rather than
-        straddling a concurrent emit's increments (SPEC-028 FR-003).
+        ``dropped`` folds in the events the encode step could not encode (SPEC-069 FR-001);
+        ``dropped_oversized`` still means oversize only. One snapshot under the counters' lock
+        (SPEC-028 FR-003).
 
         Args:
           None.
@@ -228,29 +302,15 @@ class MongoDBSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(
-                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
-            )
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Inserts every event unordered, counting bulk failures and retrying errors (FR-003).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         A bulk write error means the unordered insert stored what it could, so the rejects are
-        counted and not retried: the successes are already in, and a retry would duplicate them
-        or re-error.
-
-        An oversize drop :meth:`_documents` decides is counted and announced only when ``emit``
-        returns, through the deferral helper (SPEC-059 FR-001). Its ``with`` encloses everything
-        from :meth:`_documents` to the last raise, so a connection error past the retry bound or
-        a bulk write that stored nothing discards the drop, and a bulk write that stored some
-        returns and commits it. The closed check sits before the ``with`` and decides nothing.
-
-        Every event is encoded before any document is sized or inserted (SPEC-069 FR-001),
-        through :meth:`_encode` and the encode helper: one that cannot be encoded is dropped,
-        counted and announced only when this call returns, through the same ledger, rather than
-        failing the whole ``insert_many`` client-side, retrying it and counting the batch
-        ``failed``. A batch of nothing encodable inserts nothing and returns (FR-002).
+        counted and not resent: the successes are already in, and a resend would duplicate them
+        or re-error. An oversize drop is counted and announced only when ``emit`` returns — on
+        the engine, only when the run settles.
 
         Args:
           batch: The events to insert.
@@ -259,63 +319,149 @@ class MongoDBSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the sink is already closed, since ``pymongo`` raises
-            ``InvalidOperation`` on any use of a closed client and the library has its own word
-            for "none of this was delivered". Also when nothing was inserted (SPEC-026 FR-001)
-            — a connection error past the retry bound or one not worth retrying (SPEC-070), or a
-            bulk write every one of whose documents the server rejected. A bulk write that
-            stored some is partial and never raises. A batch of
-            nothing but oversized documents does not raise either: they can never fit, so there
-            is nothing to retry, and they are reported through :meth:`losses`. A raise leaves
-            none of them counted.
+          SinkDeliveryError: When the sink is already closed, by identity, with nothing counted,
+            since ``pymongo`` raises ``InvalidOperation`` on any use of a closed client. Also when
+            the run failed: nothing inserted — a connection error past the budget or one not
+            worth retrying (SPEC-070), or a bulk write that rejected every document. A bulk write
+            that stored some is partial and never raises, and neither does a batch of nothing but
+            oversized documents.
         """
-        if not batch:
-            return
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-003).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Makes one unordered ``insert_many`` of the round's documents and classifies each.
+
+        A closed sink's round is a refusal carrying 1.x's closed error. Each document is built
+        once per run (:func:`~log_foundry.sinks._encode.encode_round` keeps it in the run's
+        notes, keyed by event identity), so a resend is the same object, carrying the ``_id``
+        pymongo stamped into it; an occurrence that landed is never handed out again. A
+        ``BulkWriteError`` whose ``details["writeErrors"]`` the keyed reader can pair by
+        ``index`` makes each named document ``REJECTED``, with 1.x's line, and the rest
+        ``ACCEPTED``, never resent; one it cannot pair makes the call's documents ``UNKNOWN``,
+        counted once with a line. ``writeErrors`` keeps its 1.x precedence over the predicate:
+        any other exception goes to ``_retryable_error``. No transport lock is taken, in 1.x or
+        here: the client is thread-safe, and ``_close_lock`` guards the close alone.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        context = run_context()
         if self._closed:
-            raise SinkDeliveryError(
-                f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"
+            context.refuse(
+                SinkDeliveryError(
+                    f"MongoDBSink inserted none of {len(batch)} document(s): the sink is closed"
+                )
             )
+            return Verdict.uniform(Outcome.REJECTED, len(batch))
         self._resolve_bson()
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            documents = self._documents(encoded, pending)
-            if not documents:
-                return
-            for attempt in range(self.max_retries + 1):
-                try:
-                    self._collection.insert_many(documents, ordered=False)
-                    return
-                except Exception as err:
-                    details = getattr(err, "details", None)
-                    if isinstance(details, dict) and "writeErrors" in details:
-                        rejects = len(details["writeErrors"])
-                        with self._counter_lock:
-                            self.failed += rejects
-                        total = rejects >= len(documents)
-                        _diag.lost(
-                            "document",
-                            rejects,
-                            "MongoDBSink bulk write; none were inserted" if total
-                            else "MongoDBSink bulk write; the rest were inserted",
-                        )
-                        if total:
-                            raise SinkDeliveryError(
-                                f"MongoDBSink inserted none of {len(documents)} document(s)"
-                            ) from None
-                        return
-                    if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                        wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                        continue
-                    with self._counter_lock:
-                        self.failed += len(documents)
-                    _diag.lost(
-                        "document",
-                        len(documents),
-                        f"MongoDBSink, {attempt + 1} attempt(s), {type(err).__name__}",
-                    )
-                    raise SinkDeliveryError(
-                        f"MongoDBSink inserted none of {len(documents)} document(s)"
-                    ) from None
+        fates = [Outcome.DROPPED] * len(batch)
+        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        documents = self._documents(pairs, context.drops(self))
+        if not documents:
+            return Verdict(outcomes=tuple(fates))
+        positions = [position for position, _ in documents]
+        carried = [batch[position] for position in positions]
+        mark_sent(self, carried)
+        try:
+            self._collection.insert_many([document for _, document in documents], ordered=False)
+        except Exception as err:
+            details = getattr(err, "details", None)
+            if isinstance(details, dict) and "writeErrors" in details:
+                self._settle_bulk(details["writeErrors"], positions, fates)
+            else:
+                retryable = is_retryable(self._retryable_error, err)
+                for position in positions:
+                    fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
+                lost = Lost(self)
+                kind = type(err).__name__
+                lost.add(
+                    carried,
+                    when=When.LAST if retryable else When.ALWAYS,
+                    key=kind,
+                    line=raised_line("document", "MongoDBSink", kind),
+                )
+                lost.register()
+        else:
+            for position in positions:
+                fates[position] = Outcome.ACCEPTED
+            encoded_landed(self, positions)
+        return Verdict(outcomes=tuple(fates))
+
+    def _settle_bulk(self, errors: object, positions: list[int], fates: list[Outcome]) -> None:
+        """Reads a ``BulkWriteError``'s ``writeErrors`` by ``index`` through the keyed reader.
+
+        A list it cannot pair makes every document ``UNKNOWN`` with one line, ``ALWAYS``, or
+        ``LAST`` in a run that resends an ``UNKNOWN`` (``RunContext.resends_unknown``), so a
+        document is announced once per run.
+
+        Args:
+          errors: The details' ``writeErrors``, of any shape.
+          positions: Each inserted document's position in the round's batch, in insert order.
+          fates: The round's outcomes, updated in place.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        context = run_context()
+        read = adjudicate_keyed(list(range(len(positions))), errors, key="index")
+        if read.unadjudicated:
+            for position in positions:
+                fates[position] = Outcome.UNKNOWN
+            unread = len(positions)
+            context.announce(
+                lambda: _diag.lost(
+                    "document",
+                    unread,
+                    f"MongoDBSink could not pair a bulk write's writeErrors to the {unread} "
+                    "document(s) sent; not retried",
+                ),
+                when=When.LAST if context.resends_unknown(self) else When.ALWAYS,
+            )
+            return
+        landed: list[int] = []
+        rejects = 0
+        for position, named in zip(positions, read.failed, strict=True):
+            if named is None:
+                fates[position] = Outcome.ACCEPTED
+                landed.append(position)
+            else:
+                fates[position] = Outcome.REJECTED
+                rejects += 1
+        encoded_landed(self, landed)
+        total = rejects >= len(positions)
+        context.announce(
+            lambda: _diag.lost(
+                "document",
+                rejects,
+                "MongoDBSink bulk write; none were inserted"
+                if total
+                else "MongoDBSink bulk write; the rest were inserted",
+            ),
+            when=When.ALWAYS,
+        )
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed insert is worth another attempt (SPEC-070 FR-002).
@@ -438,7 +584,7 @@ class MongoDBSink:
           The document and its size in bytes.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
@@ -459,37 +605,39 @@ class MongoDBSink:
         return document, len(json.dumps(document).encode("utf-8"))
 
     def _documents(
-        self, encoded: list[tuple[dict[str, object], tuple[dict[str, object], int]]],
-        pending: Deferral,
-    ) -> list[dict[str, object]]:
+        self,
+        encoded: list[tuple[int, tuple[dict[str, object], int]]],
+        pending: Deferral | _Drops,
+    ) -> list[tuple[int, dict[str, object]]]:
         """Keeps each encoded document, dropping any too large to ever fit.
 
         It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
         encoded forms and nothing here can fail on an event.
 
         A drop goes to ``pending`` rather than to the counter, so it is counted and announced
-        only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
-        discards it, and the worker's retry decides it afresh. The line names no per-event value,
+        only when ``emit`` returns (SPEC-059 FR-001) — on the engine, ``pending`` is the run
+        context's ``SETTLED`` view, so only when the run settles (SPEC-074). The line names no per-event value,
         so each drop registers its own count and its own line, one per document as before.
 
         Args:
-          encoded: Each encodable event with its document and size.
-          pending: The calling ``emit``'s deferral, which holds every drop decided here until
-            that ``emit`` is known not to raise.
+          encoded: Each encodable event's position in the round's batch with its document and
+            size.
+          pending: The run's ``SETTLED`` view, which holds every drop decided here until the run
+            is known to settle.
 
         Returns:
-          The documents that can be inserted.
+          The position and document of each that can be inserted.
 
         Raises:
           None.
         """
-        documents: list[dict[str, object]] = []
-        for _, (document, size) in encoded:
+        documents: list[tuple[int, dict[str, object]]] = []
+        for position, (document, size) in encoded:
             if size > _MAX_DOC_BYTES:
                 pending.count("dropped_oversized")
                 pending.announce(
                     lambda: _diag.lost("document", 1, "MongoDBSink, exceeds the 16 MB limit")
                 )
                 continue
-            documents.append(document)
+            documents.append((position, document))
         return documents

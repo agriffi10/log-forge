@@ -9,8 +9,7 @@ if TYPE_CHECKING:
     import threading
 
 from log_foundry import _lifecycle
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
 from log_foundry.sinks.base import SinkLosses
 from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink, _valid_url
@@ -191,6 +190,8 @@ class LogstashSink:
                     if max_datagram_bytes is not None
                     else DEFAULT_MAX_DATAGRAM_BYTES
                 ),
+                frame=self._frame,
+                sink_name=type(self).__name__,
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")
@@ -202,17 +203,14 @@ class LogstashSink:
         The assertion narrows the type for mypy rather than checking at runtime: the constructor
         guarantees exactly one backend is set, and the branch above covers the other.
 
-        In socket mode this is the boundary the worker retries, so the ledger lives here: a
-        ``Deferral`` owned by the transport is handed to ``send_all`` (SPEC-059 FR-002), and a
-        UDP frame over the datagram limit is counted and announced only when ``emit`` returns.
-        A raise discards it, and the worker's retry decides it afresh rather than counting it
-        once per attempt. The HTTP branch delegates to ``HTTPSink.emit``, which enters its own.
-
-        In socket mode every event is framed through the encode helper before anything is
-        handed to the transport (SPEC-069 FR-001): one whose frame cannot be built is dropped,
-        counted on the transport and announced only when this call returns. A batch of nothing
-        encodable hands the transport an empty list, which settles on an open transport and is
-        refused by a closed one (FR-002). The HTTP mode is ``HTTPSink._items``' twin rule.
+        In socket mode the inline adapter runs the engine over the transport,
+        ``emit_via_deliver(self._socket, batch)`` (SPEC-074 FR-005), so this ``emit``'s 1.x
+        contract is the engine's: a UDP frame over the datagram limit, and an event whose frame
+        cannot be built (SPEC-069 FR-001), are counted and announced only when ``emit`` returns —
+        on the engine, only when the run settles — on the transport's ledger, and a closed
+        transport refuses even a batch of nothing encodable (FR-002). The HTTP branch delegates
+        to ``HTTPSink.emit``, which runs the engine over its own round; the HTTP mode is
+        ``HTTPSink._items``' twin rule.
 
         Args:
           batch: The events to ship. An empty batch is a no-op.
@@ -229,9 +227,7 @@ class LogstashSink:
             self._http.emit(batch)
         else:
             assert self._socket is not None  # noqa: S101
-            with Deferral(self._socket) as pending:
-                frames = encode_events(batch, self._frame, pending, sink=type(self).__name__)
-                self._socket.send_all([frame for _, frame in frames], pending)
+            emit_via_deliver(self._socket, batch)
 
     def _frame(self, event: dict[str, object]) -> bytes:
         """Frames one event as a newline-terminated UTF-8 JSON line for the socket.
@@ -243,7 +239,7 @@ class LogstashSink:
           The exact bytes to put on the wire.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).

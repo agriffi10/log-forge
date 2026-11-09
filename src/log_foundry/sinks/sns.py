@@ -3,36 +3,50 @@
 from __future__ import annotations
 
 import json
-import threading
 from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._chunk import chunk_items
 from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count
+from log_foundry.sinks._rounds import (
+    Called,
+    KeyedReply,
+    Lost,
+    entry_ids,
+    mark_sent,
+    read_keyed,
+    settle_keyed,
+)
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Mapping
 
-__all__ = ["SNSSink"]
+    from log_foundry.sinks._deferral import Deferral
+    from log_foundry.sinks._engine import _Drops
+    from log_foundry.sinks.base import SinkLosses
 
-_BACKOFF_BASE = 0.1
+__all__ = ["SNSSink"]
 
 
 class SNSSink:
     """A :class:`~log_foundry.sinks.base.Sink` that publishes events to an SNS topic.
 
     This mirrors the SPEC-005 ``SQSSink`` partial-failure policy on SNS's ``publish_batch``:
-    the response's ``Failed`` list is retried within a bounded count, except a sender fault, which
-    is counted at once and never retried (SPEC-070 FR-003), and entries still failing are counted
-    and logged. ``boto3`` is the optional ``aws`` extra, imported lazily.
+    the response's ``Failed`` list is resent within a bounded count, except a sender fault, which
+    is counted and never resent (SPEC-070 FR-003), and entries still failing are counted and
+    logged. ``boto3`` is the optional ``aws`` extra, imported lazily.
 
-    The worst-case delay (SPEC-027 FR-005) is ``max_retries`` waits per chunk, 0.7 s at the
-    defaults. The waits are interruptible, so ``shutdown()`` cuts one short.
+    **It delivers through SPEC-072's engine** (SPEC-074 FR-002): :meth:`deliver` is one round,
+    every chunk published once and its reply read through the keyed reader SQS shares, and the
+    engine resends only the entries that may land. The worst-case delay (SPEC-027 FR-005) is
+    ``max_retries`` waits per run, 0.7 s at the defaults, each interruptible by ``shutdown()``.
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``boto3`` clients are documented thread-safe, this one is built once in
@@ -45,6 +59,11 @@ class SNSSink:
 
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
+
+    Attributes:
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      dropped_oversized: Events dropped for exceeding the message limit, counted only by a run
+        that settled.
     """
 
     MAX_BATCH = 10
@@ -56,9 +75,8 @@ class SNSSink:
         Args:
           topic_arn: The topic to publish to.
           client: A boto3-shaped SNS client, or ``None`` to build one lazily.
-          max_retries: Retries for the failed entries of a chunk, floored at zero as
-            ``Worker._emit`` floors its own (SPEC-021) — a negative value returned from ``_send``
-            having published nothing, and reported success. Anything but an ``int`` is refused
+          max_retries: Further rounds the engine gives the entries still failing, floored at
+            zero as ``Worker._emit`` floors its own (SPEC-021). Anything but an ``int`` is refused
             with ``TypeError`` (SPEC-066 FR-001), before any client is built; a ``bool`` or
             ``int`` subclass is read as the ``int`` it holds.
 
@@ -75,15 +93,79 @@ class SNSSink:
         self.topic_arn = topic_arn
         self.client = client
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
+        self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
-        self._unencodable = 0
-        self._counter_lock = threading.Lock()
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Entries not confirmed: sender faults, entries still failing and chunks lost to a raise.
+
+        The engine's ``failed_events``, each lost entry once per run (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
 
     def losses(self) -> SinkLosses:
-        """Reports oversized drops and entries still failing past the retry bound (FR-002).
+        """Reports the engine's totals: drops of a settled run, and entries never confirmed.
 
-        ``dropped`` folds in the events :meth:`emit` could not encode (SPEC-069 FR-001);
+        ``dropped`` folds in the events the encode step could not encode (SPEC-069 FR-001);
         ``dropped_oversized`` still means oversize only.
 
         Args:
@@ -95,25 +177,10 @@ class SNSSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(
-                dropped=self.dropped_oversized + self._unencodable, failed=self.failed
-            )
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Re-chunks to the publish limits and sends each chunk, retrying failures (FR-010).
-
-        An oversize drop :meth:`_bodies` decides is counted and announced only when ``emit``
-        returns, through the deferral helper whose ``with`` is the outermost block of the work
-        (SPEC-059 FR-001). The drop is decided before any publish, and this call can still raise
-        afterwards — the total-failure raise below, a malformed ``Failed`` entry, a
-        ``BaseException`` from the client — and be retried whole; counting it at once counted one
-        oversized event once per attempt.
-
-        Every event is encoded before any message is sized or published (SPEC-069 FR-001),
-        through :meth:`_encode` and the encode helper: one that cannot be encoded is dropped,
-        counted and announced only when ``emit`` returns, through the same ledger, and a batch of
-        nothing encodable publishes nothing and returns (FR-002).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         Args:
           batch: The events to publish.
@@ -122,29 +189,76 @@ class SNSSink:
           None.
 
         Raises:
-          SinkDeliveryError: When every chunk failed and at least one was sent (SPEC-026
-            FR-001), unless every entry that failed was a sender fault: a batch SNS rejected only
-            as the caller's fault returns with the entries counted, as ``SQSSink``'s does,
-            because a resend can only fail the same way (SPEC-070 FR-003). Events dropped
-            before sending, being too large to ever fit, are not a send failure and do not make a
-            batch of nothing but oversized events raise — they can never be retried into
-            existence, and are reported through :meth:`losses`. A raise leaves none of them
-            counted.
+          SinkDeliveryError: When the run failed: nothing landed and an entry was still failing
+            retryably or refused for a reason other than a sender fault (SPEC-026 FR-001). A
+            batch SNS rejected only as the caller's fault returns with the entries counted, as
+            ``SQSSink``'s does, because a resend can only fail the same way (SPEC-070 FR-003),
+            and so does a batch of nothing but oversized or unencodable events.
         """
-        chunks = delivered = 0
-        recoverable_loss = False
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            bodies = self._bodies(encoded, pending)
-            for chunk in chunk_items(
-                bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=len
-            ):
-                chunks += 1
-                accepted, retryable_lost = self._send(chunk)
-                delivered += accepted
-                recoverable_loss = recoverable_loss or retryable_lost
-            if chunks and not delivered and recoverable_loss:
-                raise SinkDeliveryError(f"SNSSink published none of {chunks} chunk(s)")
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-002).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Publishes every remaining chunk once and classifies every event of the round.
+
+        Every event is encoded once per run (:func:`~log_foundry.sinks._encode.encode_round`),
+        an unencodable one ``DROPPED`` with SPEC-069's line; :meth:`_bodies` drops an oversized
+        one; the rest are chunked with ``chunk_items`` and each chunk published once through
+        :meth:`_send`, its reply settled by the keyed rule SQS shares — a sender fault
+        ``REJECTED`` and a final rejection, any other failed entry ``RETRYABLE``, an unreadable
+        reply ``UNKNOWN``, a raise ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the client propagates.
+        """
+        context = run_context()
+        fates = [Outcome.DROPPED] * len(batch)
+        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        bodies = self._bodies(pairs, context.drops(self))
+        lost = Lost(self)
+        final: list[int] = []
+        for chunk in chunk_items(
+            bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=lambda p: len(p[1])
+        ):
+            positions = [position for position, _ in chunk]
+            carried = [batch[position] for position in positions]
+            mark_sent(self, carried)
+            sent = self._send([body for _, body in chunk], entry_ids(self, carried))
+            settle_keyed(
+                self,
+                positions=positions,
+                carried=carried,
+                error=sent.error,
+                retryable=sent.retryable,
+                reply=sent.result,
+                call="publish_batch",
+                name="SNSSink",
+                fates=fates,
+                final=final,
+                lost=lost,
+            )
+        lost.register()
+        context.final_rejections(final)
+        return Verdict(outcomes=tuple(fates))
 
     def close(self) -> None:
         """Does nothing, since the sink buffers nothing internally (FR-001).
@@ -169,7 +283,7 @@ class SNSSink:
           The JSON text.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
@@ -177,31 +291,33 @@ class SNSSink:
         return json.dumps(event)
 
     def _bodies(
-        self, encoded: list[tuple[dict[str, object], str]], pending: Deferral
-    ) -> list[str]:
+        self, encoded: list[tuple[int, str]], pending: Deferral | _Drops
+    ) -> list[tuple[int, str]]:
         """Keeps each encoded body, dropping any message too large to ever fit (FR-011).
 
         It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
-        encoded forms and nothing here can fail on an event.
+        encoded forms and nothing here can fail on an event. A body's UTF-8 length is its cost,
+        as ``chunk_items`` reads it.
 
         A drop goes to ``pending`` rather than to the counter, so it is counted and announced
-        only when ``emit`` returns (SPEC-059 FR-001): a raise anywhere later in the same call
-        discards it, and the worker's retry decides it afresh. The line names no per-event value,
-        so each drop registers its own count and its own line, one per event as before.
+        only when ``emit`` returns (SPEC-059 FR-001) — on the engine, ``pending`` is the run
+        context's ``SETTLED`` view, so only when the run settles (SPEC-074). The line names no
+        per-event value, so each drop registers its own count and its own line, one per event
+        as before.
 
         Args:
-          encoded: Each encodable event with its JSON body.
-          pending: The calling ``emit``'s deferral, which holds every drop decided here until
-            that ``emit`` is known not to raise.
+          encoded: Each encodable event's position in the round's batch with its JSON body.
+          pending: The run's ``SETTLED`` view, which holds every drop decided here until the run
+            is known to settle.
 
         Returns:
-          The serialized bodies that can be sent.
+          The position and body of each message that can be sent.
 
         Raises:
           None.
         """
-        bodies: list[str] = []
-        for _, body in encoded:
+        bodies: list[tuple[int, str]] = []
+        for position, body in encoded:
             if len(body.encode("utf-8")) > self.MAX_BYTES:
                 pending.count("dropped_oversized")
                 pending.announce(
@@ -210,7 +326,7 @@ class SNSSink:
                     )
                 )
                 continue
-            bodies.append(body)
+            bodies.append((position, body))
         return bodies
 
     def _retryable_error(self, err: Exception) -> bool:
@@ -246,99 +362,44 @@ class SNSSink:
           False for a sender fault, True otherwise.
 
         Raises:
-          AttributeError: When the entry is not a mapping, as before.
+          AttributeError: When the entry is not a mapping; the keyed reader refuses such a reply
+            before this is asked (SPEC-074 FR-002).
         """
         return not sender_fault(entry)
 
-    def _send(self, bodies: list[str]) -> tuple[int, bool]:
-        """Publishes one chunk, retrying only the failed entries within the bound (FR-010).
+    def _send(self, bodies: list[str], ids: list[str]) -> Called[KeyedReply]:
+        """Publishes one chunk once and reads the reply per entry (SPEC-074 FR-002).
 
-        The wait comes before the next attempt and never before abandoning (SPEC-027 FR-003):
-        this loop re-sends the entries the destination flagged, and the canonical reason it flags
-        them is throttling, which an immediate re-send makes worse.
+        Nothing here waits or retries: the engine resends a ``RETRYABLE`` entry in a later round.
+        The reply's ``Failed`` list is read through
+        :func:`~log_foundry.sinks._batch.adjudicate_keyed` against each entry's ``Id``, so a
+        malformed list adjudicates none of the chunk rather than escaping ``emit`` raw.
 
-        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002). It used to
-        propagate out of :meth:`emit`, so a failure on chunk N after chunks 1..N-1 had landed made
-        the worker re-send the whole batch and duplicate everything already delivered — the exit
-        drain, one large batch by construction, is exactly that shape. The guard sits around the
-        client call *inside* this loop rather than around ``_send`` in ``emit``, so only the
-        messages still outstanding at the failing attempt are charged and the ones already accepted
-        still count toward the return.
-
-        A client exception is treated as **provable non-delivery** for the chunk, so a wholly
-        failed batch still raises. The cost is written down —
-        a read timeout means the request went out and the reply was lost, so a re-send may
-        duplicate — and taken because an unreachable endpoint is the common case and is exactly
-        what the worker's retry exists for, while suppressing the raise would lose every event of
-        every batch for a whole outage, silently.
-
-        **An entry SNS marks ``SenderFault`` is not retried** (SPEC-070 FR-003): SNS's
-        ``BatchResultErrorEntry`` carries the same required field as SQS's, and a byte-identical
-        resend of the caller's fault fails again. It is counted on ``failed`` when the reply
-        arrives, announced with the first error code and ``not retried``, and dropped from the
-        next round, exactly as ``SQSSink._send`` does; only :meth:`_retryable_entry`'s entries are
-        resent. It used to retry every entry named in ``Failed``. Acceptance is counted per round
-        by ``Id``, which is what keeps a dropped sender fault from reading as delivered.
+        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002), and it is
+        treated as **provable non-delivery** for the chunk: a read timeout means the request went
+        out and the reply was lost, so a resend may duplicate — taken because an unreachable
+        endpoint is the common case. **An entry SNS marks ``SenderFault`` is not resent**
+        (SPEC-070 FR-003): SNS's ``BatchResultErrorEntry`` carries the same required field as
+        SQS's, and a byte-identical resend of the caller's fault fails again.
 
         Args:
           bodies: One chunk's serialized events.
+          ids: Each entry's ``Id``, kept across the run's rounds.
 
         Returns:
-          How many entries SNS accepted, so :meth:`emit` can tell "nothing landed" from a partial
-          success, and whether anything was given up on that a resend could plausibly recover. A
-          chunk rejected wholly as sender faults reports False there.
+          The call's reply.
 
         Raises:
           None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
             or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
         """
-        entries = [{"Id": str(i), "Message": body} for i, body in enumerate(bodies)]
-        accepted = 0
-        for attempt in range(self.max_retries + 1):
-            try:
-                response = self.client.publish_batch(
-                    TopicArn=self.topic_arn, PublishBatchRequestEntries=entries
-                )
-            except Exception as err:
-                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += len(entries)
-                _diag.lost(
-                    "message",
-                    len(entries),
-                    f"SNSSink, {attempt + 1} attempt(s), {type(err).__name__}",
-                )
-                return accepted, True
-            failed = response.get("Failed", [])
-            failed_ids = {entry["Id"] for entry in failed}
-            accepted += sum(1 for entry in entries if entry["Id"] not in failed_ids)
-            if not failed:
-                return accepted, False
-            sender_faults = [item for item in failed if not self._retryable_entry(item)]
-            if sender_faults:
-                with self._counter_lock:
-                    self.failed += len(sender_faults)
-                _diag.lost(
-                    "message",
-                    len(sender_faults),
-                    f"SNSSink, rejected as invalid (first code: "
-                    f"{sender_faults[0].get('Code', 'unknown')}); not retried",
-                )
-            retryable_ids = {item["Id"] for item in failed if self._retryable_entry(item)}
-            if not retryable_ids:
-                return accepted, False
-            entries = [entry for entry in entries if entry["Id"] in retryable_ids]
-            if attempt < self.max_retries:
-                wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-            if attempt >= self.max_retries:
-                with self._counter_lock:
-                    self.failed += len(entries)
-                _diag.lost(
-                    "message",
-                    len(entries),
-                    f"SNSSink, still failing after {self.max_retries + 1} attempt(s); abandoned",
-                )
-                return accepted, True
-        return accepted, False
+        entries = [
+            {"Id": entry_id, "Message": body} for entry_id, body in zip(ids, bodies, strict=True)
+        ]
+        try:
+            response = self.client.publish_batch(
+                TopicArn=self.topic_arn, PublishBatchRequestEntries=entries
+            )
+        except Exception as err:
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(read_keyed(self._retryable_entry, ids, response))

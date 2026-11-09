@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag
@@ -13,7 +14,14 @@ if TYPE_CHECKING:
 
     from log_foundry.sinks._deferral import Deferral
 
-__all__ = ["NUL_ESCAPE", "encode_events", "repair_bson", "repair_nul"]
+__all__ = [
+    "NUL_ESCAPE",
+    "encode_events",
+    "encode_round",
+    "encoded_landed",
+    "repair_bson",
+    "repair_nul",
+]
 
 NUL_ESCAPE = re.compile(r"(?<!\\)(?:\\\\)*\\u0000")
 """Matches a JSON ``\\u0000`` escape — a real U+0000 — and never the six characters as text.
@@ -83,17 +91,186 @@ def encode_events[T](
     failures = 0
     kind = ""
     for event in batch:
-        try:
-            wire = encode(event)
-        except Exception as err:
+        ok, wire = _guarded(encode, event)
+        if not ok:
             failures += 1
-            kind = kind or type(err).__name__
+            kind = kind or cast("str", wire)
             continue
-        encoded.append((event, wire))
+        encoded.append((event, cast("T", wire)))
     if failures:
         pending.count(counter, failures)
         pending.announce(lambda: _diag.lost("event", failures, f"{sink}, encoding raised {kind}"))
     return encoded
+
+
+def _guarded[T](
+    encode: Callable[[dict[str, object]], T], event: dict[str, object]
+) -> tuple[bool, object]:
+    """Runs one event through ``encode`` under the one guard both encode steps share.
+
+    ``Exception`` is caught and ``BaseException`` never is, so a ``KeyboardInterrupt`` leaves as
+    itself. A failure keeps only its exception's **type name**, so no exception object, and no
+    traceback holding the batch, outlives the call.
+
+    Args:
+      encode: The sink's per-event encode function.
+      event: The event.
+
+    Returns:
+      ``(True, wire form)``, or ``(False, the exception's type name)``.
+
+    Raises:
+      None. A ``BaseException`` from ``encode`` propagates unchanged.
+    """
+    try:
+        return True, encode(event)
+    except Exception as err:
+        return False, type(err).__name__
+
+
+@dataclass(slots=True)
+class _Cell:
+    """One event occurrence's encode result, kept for the rest of its delivery run.
+
+    Attributes:
+      ok: Whether the event encoded.
+      value: Its wire form, or the failure's type name.
+      landed: Whether the sink has reported this occurrence accepted.
+    """
+
+    ok: bool
+    value: object
+    landed: bool = False
+
+
+def encode_round[T](
+    owner: object,
+    batch: list[dict[str, object]],
+    encode: Callable[[dict[str, object]], T],
+    *,
+    sink: str,
+) -> list[tuple[int, T]]:
+    """Encodes a delivery round's events once per run, returning each encodable one's wire form.
+
+    The engine-mode sibling of :func:`encode_events` (SPEC-074 FR-002), sharing its guard. A
+    run spans several ``deliver`` calls, so a ``Deferral`` and its ``_unencodable`` counter
+    cannot carry the drop: every position this omits is unencodable and the caller makes it
+    ``DROPPED``, which the engine counts in ``dropped_events`` only when the run settles. No
+    count is made here. SPEC-069's line, unchanged in text, is registered on the run context as
+    ``SETTLED``, once per run, on the round that first meets a failure.
+
+    **Each event is encoded once per run.** Its wire form, or its failure, is kept in the run's
+    ``notes(owner)`` keyed by event identity, and a later round looks it up rather than calling
+    ``encode`` again — which keeps SPEC-069 FR-001's "``encode`` is called ``len(batch)`` times"
+    across retries, and lets ``MongoDBSink`` resend the very document pymongo stamped an ``_id``
+    into. An identity that appears more than once in a batch keeps one result per occurrence;
+    each round hands an occurrence the first result of its identity that the sink has not
+    reported landed (:func:`encoded_landed`), so a resend never reuses a landed occurrence's
+    form. Outside any run (an immediate context) the batch is encoded once and the line written
+    at once.
+
+    Args:
+      owner: The object whose run notes keep the results — the sink.
+      batch: The events this round was handed, in order.
+      encode: The sink's per-event encode function.
+      sink: The sink's class name, written on the line.
+
+    Returns:
+      ``(position, wire form)`` for each encodable event, in batch order.
+
+    Raises:
+      None. A ``BaseException`` from ``encode`` propagates unchanged.
+    """
+    from log_foundry.sinks._engine import When, run_context
+
+    context = run_context()
+    notes = context.notes(owner)
+    cache = cast("dict[int, tuple[object, list[_Cell]]]", notes.setdefault("encoded", {}))
+    cells: list[_Cell] = []
+    notes["encoded_round"] = cells
+    taken: dict[int, int] = {}
+    encoded: list[tuple[int, T]] = []
+    failures = 0
+    kind = ""
+    for position, event in enumerate(batch):
+        held = cache.get(id(event))
+        if held is None or held[0] is not event:
+            held = (event, [])
+            cache[id(event)] = held
+        live = [cell for cell in held[1] if not cell.landed]
+        skip = taken.get(id(event), 0)
+        taken[id(event)] = skip + 1
+        if skip < len(live):
+            cell = live[skip]
+        else:
+            ok, value = _guarded(encode, event)
+            cell = _Cell(ok, value)
+            held[1].append(cell)
+            if not ok:
+                failures += 1
+                kind = kind or cast("str", value)
+        cells.append(cell)
+        if cell.ok:
+            encoded.append((position, cast("T", cell.value)))
+    if failures:
+        lost = failures
+        context.announce(
+            lambda: _diag.lost("event", lost, f"{sink}, encoding raised {kind}"), when=When.SETTLED
+        )
+    return encoded
+
+
+def unencodable_in_run(owner: object) -> int:
+    """Returns how many event occurrences :func:`encode_round` has found unencodable this run.
+
+    A round is handed only the events still pending, so the run's unencodable events are read
+    from the run's cache rather than the round's batch. ``PostgresSink`` and the Redis sinks
+    count them in ``failed`` with a batch they lose whole, as 1.x did (SPEC-074).
+
+    Args:
+      owner: The object :func:`encode_round` was given.
+
+    Returns:
+      The count, 0 outside a run that has encoded nothing.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks._engine import run_context
+
+    cache = cast(
+        "dict[int, tuple[object, list[_Cell]]]", run_context().notes(owner).get("encoded", {})
+    )
+    found = 0
+    for _, cells in cache.values():
+        found += sum(1 for cell in cells if not cell.ok)
+    return found
+
+
+def encoded_landed(owner: object, positions: list[int]) -> None:
+    """Records that the occurrences at these positions of the round's batch were accepted.
+
+    Only a sink whose wire form is a mutable object it must not resend for another occurrence —
+    ``MongoDBSink``'s document, which carries the ``_id`` pymongo stamped on it — needs to call
+    it; :func:`encode_round` then hands a later round's occurrence of the same identity a form
+    that has not landed.
+
+    Args:
+      owner: The object :func:`encode_round` was given.
+      positions: Positions in the batch the current round was handed.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks._engine import run_context
+
+    cells = cast("list[_Cell]", run_context().notes(owner).get("encoded_round", []))
+    for position in positions:
+        if 0 <= position < len(cells):
+            cells[position].landed = True
 
 
 def repair_nul(event: dict[str, object]) -> dict[str, object] | None:

@@ -4,21 +4,25 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import NUL_ESCAPE, encode_events, repair_nul
+from log_foundry.sinks._encode import NUL_ESCAPE, encode_round, repair_nul, unencodable_in_run
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, require_positive, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count, require_positive
+from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["PostgresSink"]
-
-_BACKOFF_BASE = 0.1
 
 DEFAULT_CONNECT_TIMEOUT = 5
 """Seconds libpq may spend opening one connection (SPEC-041 FR-002).
@@ -83,9 +87,12 @@ class PostgresSink:
 
     Each event is stored as a ``JSONB`` ``event`` column plus a few extracted columns for
     indexing. ``psycopg`` v3 is the optional ``postgres`` extra, imported lazily. The sink is
-    write-only. The worst-case delay (SPEC-027 FR-005) has two halves, and only one of them is
-    interruptible. The backoffs are ``max_retries`` waits per batch — 0.7 s at the defaults —
-    taken through ``_retry.wait`` on the worker's stop event, so a shutdown cuts them short. The
+    write-only, and delivers through SPEC-072's engine (SPEC-074 FR-003): each round runs every
+    chunk in one transaction, and the engine resends a rolled-back round in the next. The
+    worst-case delay (SPEC-027 FR-005) has two halves, and only one of them is interruptible. The
+    backoffs are ``max_retries`` waits per run — 0.7 s at the defaults — taken by the engine
+    through ``_retry.wait`` on the stop event, so a shutdown cuts them short, and never under the
+    transport lock, so a ``close()`` arriving during one takes the lock between rounds. The
     reconnects are up to ``max_retries + 1`` connects of ``connect_timeout`` each, 20 s more at
     the defaults, and they are **bounded but not interruptible**: the wait is inside libpq, which
     consults nothing. That is the settled line rather than a gap — a shutdown shortens a *wait*
@@ -98,12 +105,14 @@ class PostgresSink:
     that assumes it owns it. Two unserialized emits share that transaction — one thread's
     ``commit`` publishes the other's half-written batch, and its ``rollback`` on a failure
     discards rows the other had already inserted and is about to report as delivered. A lock
-    gives the sequence the exclusivity it was written for.
-
+    gives the sequence the exclusivity it was written for, for one round at a time.
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` commits its own transaction, so
     nothing is uncommitted once it returns. The commit in ``close`` is belt and braces, not a
     buffer.
+
+    Attributes:
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
     """
 
     def __init__(
@@ -163,11 +172,9 @@ class PostgresSink:
         self._chunk_size = require_positive(chunk_size, "chunk_size", "PostgresSink")
         self.max_retries = floor_count(max_retries, 0, "max_retries", "PostgresSink")
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
-        self._unencodable = 0
+        self.log_foundry_counters = SinkCounters()
         self._closed = False
         self._lock = threading.Lock()
-        self._counter_lock = threading.Lock()
         self._owns_connection = connection is None
         self._dsn = dsn
         given_timeout = connect_timeout
@@ -191,15 +198,81 @@ class PostgresSink:
         if create_table:
             self._ensure_schema()
 
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
+
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
     def losses(self) -> SinkLosses:
-        """Reports unencodable events, and events abandoned past the retry bound.
+        """Reports the engine's totals: unencodable events, and events never confirmed.
 
-        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        events of a batch abandoned past the retry bound or, for a failure not worth retrying, at
-        its first attempt (SPEC-026 FR-002, SPEC-070).
-
-        Reads under the counter lock rather than the emit lock (SPEC-028 FR-003), so a poll
-        never waits on an in-flight insert and its backoff.
+        ``dropped`` is the events the encode step could not encode (SPEC-069 FR-001), counted only
+        by a run that settled; ``failed`` the encodable events of a run whose last transaction
+        rolled back or, for a failure not worth retrying, of its first (SPEC-026 FR-002, SPEC-070),
+        each once per run (SPEC-074). An unencodable event of a failed run is its catcher's, so
+        ``failed`` no longer counts it as 1.x's whole-batch count did. Read under the counters'
+        lock, never the transport lock (SPEC-028 FR-003).
 
         Args:
           None.
@@ -210,23 +283,14 @@ class PostgresSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(dropped=self._unencodable, failed=self.failed)
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Inserts the whole batch in one transaction, rolling back and retrying (FR-004).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
         The diagnostic names the exception's type and never its repr: ``_row`` binds the whole
         serialized event as a statement parameter, and a psycopg error repr routinely reprints
-        the failing statement and its parameters, so the old line reprinted the event, PII
-        included, into a stream nobody was asked to secure (SPEC-029 FR-002, arch §6).
-
-        Every event's row is built once, before the lock is taken and outside the retry loop
-        (SPEC-069 FR-001), so the loop retries the same rows rather than re-encoding the batch on
-        every attempt. An event whose row cannot be built is dropped, counted and announced only
-        when this call returns; before, the encode sat inside the retry loop, so one such event
-        spent every attempt and cost the whole batch, counted ``failed``. A batch of nothing
-        encodable runs no transaction and returns, once the closed check has passed (FR-002).
+        the failing statement and its parameters (SPEC-029 FR-002, arch §6).
 
         Args:
           batch: The events to insert. An empty batch is a no-op.
@@ -235,85 +299,126 @@ class PostgresSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent, or at once for a failure
-            :meth:`_retryable_error` does not retry (SPEC-070). One transaction, rolled back on
-            failure, means such a batch inserted nothing, and the rollback is what makes the
-            worker's retry safe here — there are no committed rows to duplicate (SPEC-026
-            FR-001).
+          SinkDeliveryError: When the run failed — every round's transaction rolled back, or one
+            failed for a reason :meth:`_retryable_error` does not retry (SPEC-070) — with the
+            engine's message; the rollback is what makes a resend safe here (SPEC-026 FR-001).
+            When the sink is closed, or a non-empty batch produced no chunk (SPEC-049 FR-002),
+            the round is a refusal and this raises the 1.x ``SinkDeliveryError`` by identity,
+            with nothing counted.
         """
-        if not batch:
-            return
-        with Deferral(self) as pending:
-            encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
-            with self._lock:
-                if self._closed:
-                    raise SinkDeliveryError(
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-003).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the driver propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs every chunk of the round in one transaction, under the lock for this round only.
+
+        A closed sink's round is a refusal carrying 1.x's closed error. Every event's row is built
+        once per run (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one
+        ``DROPPED`` with SPEC-069's line. The round's events are then all ``ACCEPTED`` on commit,
+        or all ``RETRYABLE`` or ``REJECTED`` after :meth:`_rollback`, as ``_retryable_error``
+        answers, the line naming the borrowed-broken connection exactly as 1.x wrote it. A
+        non-empty round that produced no chunk is a refusal carrying 1.x's error: a chunker that
+        yields nothing would yield nothing again. A run that fails counts the run's unencodable
+        events in ``failed`` with the rest and its line names them too, as 1.x counted a spent
+        bound's whole batch (:attr:`~log_foundry.sinks._engine.When.FAILED`); a run that settles
+        leaves them ``DROPPED``.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the driver propagates.
+        """
+        context = run_context()
+        with self._lock:
+            if self._closed:
+                context.refuse(
+                    SinkDeliveryError(
                         f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
                     )
-                if not encoded:
-                    return
-                self._insert_batch([row for _, row in encoded], len(batch))
+                )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            fates = [Outcome.DROPPED] * len(batch)
+            pairs = encode_round(self, batch, self._row, sink=type(self).__name__)
+            if not pairs:
+                return Verdict(outcomes=tuple(fates))
+            positions = [position for position, _ in pairs]
+            carried = [batch[position] for position in positions]
+            mark_sent(self, carried)
+            called = self._insert_round([row for _, row in pairs])
+            if called.error is None and not called.result:
+                context.refuse(
+                    SinkDeliveryError(
+                        f"PostgresSink produced no chunk for {len(batch)} event(s); nothing was sent"
+                    )
+                )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            if called.error is None:
+                outcome = Outcome.ACCEPTED
+            else:
+                outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                suffix = (
+                    ", borrowed connection is broken and this sink may not reopen it"
+                    if not self._owns_connection and self._is_broken()
+                    else ""
+                )
+                kind = type(called.error).__name__
+                whole = unencodable_in_run(self)
+                context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
+                lost = Lost(self)
+                lost.add(
+                    carried,
+                    when=When.LAST if called.retryable else When.ALWAYS,
+                    key=kind + suffix,
+                    line=raised_line("event", "PostgresSink", kind, suffix),
+                    whole=whole,
+                )
+                lost.register()
+            for position in positions:
+                fates[position] = outcome
+        return Verdict(outcomes=tuple(fates))
 
-    def _insert_batch(self, rows: list[tuple[object, ...]], batch_size: int) -> None:
-        """Runs the transaction sequence, with the emit lock already held.
-
-        Split out so the lock's extent is one line in :meth:`emit` rather than an extra
-        indentation level over the whole retry loop.
-
-        A spent bound counts the whole batch in ``failed``, unencodable events included, as
-        before SPEC-069: ``failed`` is an upper bound (invariant 2), and the unencodable count is
-        discarded with the raise and decided again by the call that finally returns.
+    def _insert_round(self, rows: list[tuple[object, ...]]) -> Called[int]:
+        """Runs the round's transaction once, with the transport lock already held.
 
         Args:
           rows: The encoded rows to insert, known non-empty.
-          batch_size: How many events the calling ``emit`` was handed.
 
         Returns:
-          None.
+          The call: how many chunks it committed, or its exception after :meth:`_rollback`.
 
         Raises:
-          SinkDeliveryError: When the retry bound is spent, at once for a failure
-            :meth:`_retryable_error` does not retry (SPEC-070), or when a non-empty batch
-            produced no chunk at all — the ``ClickHouseSink.emit`` guard's twin (SPEC-049
-            FR-002, found by the system-frame review): with the chunker yielding nothing this
-            committed an empty transaction and returned, having sent nothing, with every
-            counter at zero. Raised outside the retry loop, because a chunker that yields nothing
-            will yield nothing four times.
+          None. This is an isolation boundary: a driver fault must never crash the worker.
         """
-        for attempt in range(self.max_retries + 1):
-            try:
-                self._reconnect_if_broken()
-                chunks = 0
-                with self._conn.cursor() as cur:
-                    for chunk in chunk_list(rows, self._chunk_size):
-                        chunks += 1
-                        cur.executemany(self._insert_sql, chunk)
-                if chunks:
-                    self._conn.commit()
-                    return
-            except Exception as err:
-                self._rollback()
-                if attempt < self.max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += batch_size
-                _diag.lost(
-                    "event",
-                    batch_size,
-                    f"PostgresSink, {attempt + 1} attempt(s), {type(err).__name__}"
-                    + (
-                        ", borrowed connection is broken and this sink may not reopen it"
-                        if not self._owns_connection and self._is_broken()
-                        else ""
-                    ),
-                )
-                raise SinkDeliveryError(
-                    f"PostgresSink inserted none of {batch_size} event(s)"
-                ) from None
-            raise SinkDeliveryError(
-                f"PostgresSink produced no chunk for {batch_size} event(s); nothing was sent"
-            )
+        try:
+            self._reconnect_if_broken()
+            chunks = 0
+            with self._conn.cursor() as cur:
+                for chunk in chunk_list(rows, self._chunk_size):
+                    chunks += 1
+                    cur.executemany(self._insert_sql, chunk)
+            if chunks:
+                self._conn.commit()
+        except Exception as err:
+            self._rollback()
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(chunks)
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed attempt is worth another (SPEC-070 FR-002).
@@ -575,7 +680,7 @@ class PostgresSink:
           The statement parameters, in column order.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).

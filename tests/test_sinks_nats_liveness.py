@@ -774,8 +774,9 @@ def test_a_closer_is_not_starved_by_queued_emits(monkeypatch) -> None:
 
 
 def test_every_public_call_reaches_the_loop_through_one_helper() -> None:
-    # FR-001 AC-13, by AST: `emit`, `flush` and `close` each call `_run`, and the module hands
-    # work to the loop in exactly one place, `_submit`.
+    # FR-001 AC-13, by AST: `emit`'s round (`_round`, since SPEC-074 put `emit` on the engine),
+    # `flush` and `close` each call `_run`, and the module hands work to the loop in exactly one
+    # place, `_submit`.
     source = pathlib.Path(nats_sink_module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
     sink_class = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "NATSSink")
@@ -790,7 +791,7 @@ def test_every_public_call_reaches_the_loop_through_one_helper() -> None:
             and sub.func.attr == attr
         )
 
-    for name in ("emit", "flush", "close"):
+    for name in ("_round", "flush", "close"):
         assert calls(methods[name], "_run") == 1, f"{name} must reach the loop through _run"
     submitters = [name for name, node in methods.items() if calls(node, "run_coroutine_threadsafe")]
     assert submitters == ["_submit"], submitters

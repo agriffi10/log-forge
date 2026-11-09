@@ -3503,7 +3503,7 @@ def test_every_sink_that_owns_a_buffered_stream_discards_it_after_a_fork() -> No
     """FR-004 AC-5. The roster is derived from the sinks, not written next to them.
 
     Scope is the sink roster ``test_sink_concurrency`` already derives — every class in
-    ``sinks/`` defining or inheriting ``emit``/``send_all``/``close``, floored so it cannot
+    ``sinks/`` defining or inheriting ``deliver``/``emit``/``send_all``/``close``, floored so it cannot
     collapse silently (SPEC-032's scope gate, SPEC-038's floor). What varies is the question:
     which of those classes opens a stream of its own, and therefore inherits a buffer a forked
     child would write a second time.

@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from log_foundry import _diag
-from log_foundry.sinks._args import refuse_with_injected
+from log_foundry.sinks import _engine
+from log_foundry.sinks._args import ReadOnlyCount, refuse_with_injected, store_read_only
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count, require_timeout, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count, require_timeout
+from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["RabbitMQSink"]
 
-_BACKOFF_BASE = 0.1
 _PERSISTENT = 2
 
 DEFAULT_BLOCKED_CONNECTION_TIMEOUT = 30.0
@@ -44,15 +48,23 @@ class RabbitMQSink:
 
     This is a durable-buffer sink on ``pika``, the optional ``amqp`` extra, imported lazily. Each
     event is published as a persistent message to the configured exchange and routing key, and a
-    dropped or closed connection is re-established within a bounded retry. The worst-case delay
-    (SPEC-027 FR-005) is ``max_retries`` interruptible waits per message, 0.7 s at the defaults.
-
+    dropped or closed connection is re-established within a bounded retry. It delivers through
+    SPEC-072's engine (SPEC-074 FR-004): each round publishes every remaining message once, in
+    order, under the lock for that round only, and the engine resends only the messages that may
+    land. The worst-case delay (SPEC-027 FR-005) is ``max_retries`` interruptible waits per run,
+    0.7 s at the defaults, taken with no lock held, so a ``close()`` during one returns at once.
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``basic_publish`` writes the frame
     before it returns, so nothing is queued locally between emits. This sink does not enable
     publisher confirms, so "written" is not "acknowledged" — but that is a delivery-guarantee
     question, not a buffer a flush could empty.
+
+    Attributes:
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      max_retries: The floored constructor value, read-only (SPEC-074 FR-006).
     """
+
+    max_retries = ReadOnlyCount()
 
     def __init__(
         self,
@@ -124,23 +136,90 @@ class RabbitMQSink:
         self._exchange = exchange
         self._routing_key = routing_key
         self._url = url
-        self._max_retries = floor_count(max_retries, 0, "max_retries", "RabbitMQSink")
+        store_read_only(
+            self, "max_retries", floor_count(max_retries, 0, "max_retries", "RabbitMQSink")
+        )
         self.log_foundry_stop_signal: threading.Event | None = None
         self._owns_connection = connection is None
         self._connection = connection if connection is not None else self._connect()
         self._channel: Any = None
         self._properties: Any = None
-        self.failed = 0
-        self._unencodable = 0
-        self._counter_lock = threading.Lock()
+        self.log_foundry_counters = SinkCounters()
         self._lock = threading.Lock()
         self._closed = False
 
-    def losses(self) -> SinkLosses:
-        """Reports unencodable events, and messages abandoned past the reconnect-retry bound.
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes.
 
-        ``dropped`` is the events :meth:`emit` could not encode (SPEC-069 FR-001); ``failed`` the
-        messages abandoned past the reconnect-retry bound (SPEC-026 FR-002).
+        Assigning it replaces the counters' lock, so a test installing a counting lock here
+        counts every acquisition the engine makes (SPEC-074 FR-001).
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
+
+    @property
+    def failed(self) -> int:
+        """Events not confirmed, the engine's ``failed_events``; assignable, as 1.x's attribute was.
+
+        Each lost event once per run (SPEC-074 FR-001), not once per worker attempt.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count, under the counter lock, as assigning the 1.x attribute did.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
+    def losses(self) -> SinkLosses:
+        """Reports the engine's totals: unencodable events, and messages never confirmed.
+
+        ``dropped`` is the events the encode step could not encode (SPEC-069 FR-001), counted only
+        by a run that settled; ``failed`` the messages still failing when the run's rounds ran
+        out, or refused at their first publish (SPEC-026 FR-002, SPEC-070), each once per run.
 
         Args:
           None.
@@ -151,27 +230,13 @@ class RabbitMQSink:
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(dropped=self._unencodable, failed=self.failed)
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Publishes one persistent message per event, reconnecting on error (FR-006).
+        """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
-        A partial publish is counted and left alone: retrying it would re-publish the messages
+        A partial publish is counted and left alone: resending it would re-publish the messages
         already on the exchange.
-
-        The driver requirement satisfied (SPEC-028 FR-002): ``pika`` states that one connection
-        must not be shared across threads, and this sink shares one connection, one channel, and
-        *rebinds* both — ``_reset`` closes and nulls the channel another thread may be mid-publish
-        on. It is structurally the same sink as ``SocketTransport``, one AMQP frame stream over
-        one socket, so it takes the same lock.
-
-        Every event is encoded before the lock is taken and before the first publish (SPEC-069
-        FR-001). One that cannot be encoded is dropped, counted and announced only when this call
-        returns, through the deferral helper; before, the messages ahead of it were already on
-        the exchange when its encode raised, and the worker's retry published them again. A batch
-        of nothing encodable publishes nothing and returns, once the closed check has passed
-        (FR-002).
 
         Args:
           batch: The events to publish.
@@ -180,31 +245,76 @@ class RabbitMQSink:
           None.
 
         Raises:
-          SinkDeliveryError: When no message reached the broker (SPEC-026 FR-001) — a down broker
-            is the case the worker's retry and ``failed_batches`` exist for. Also when the sink
-            is already closed, which is not fussiness: ``_active_channel`` reopens a connection
-            whenever it finds none, and ``close`` is now idempotent, so an emit arriving after a
-            shutdown would open an AMQP connection that nothing will ever reap. One
-            ``log_foundry.info()`` after ``shutdown()`` reaches this on the caller's own thread.
+          SinkDeliveryError: When the run failed — no message reached the broker (SPEC-026
+            FR-001) — with the engine's message. Also when the sink is already closed, by
+            identity, with nothing counted: ``_active_channel`` reopens a connection whenever
+            it finds none, so a publish after ``shutdown()`` would open one nothing would reap.
         """
-        if not batch:
-            return
-        published = 0
-        with Deferral(self) as pending:
-            bodies = encode_events(batch, self._encode, pending, sink=type(self).__name__)
-            with self._lock:
-                if self._closed:
-                    raise SinkDeliveryError(
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-074 FR-004).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``BaseException`` from the driver propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Publishes every remaining message once, in order, under the lock for this round.
+
+        The driver requirement satisfied (SPEC-028 FR-002): ``pika`` states that one connection
+        must not be shared across threads, and this sink shares one connection, one channel, and
+        *rebinds* both — ``_reset`` closes and nulls the channel another thread may be
+        mid-publish on — so the round takes the transport lock, as ``SocketTransport``'s does. A
+        closed sink's round is a refusal carrying 1.x's closed error. Every event is encoded once
+        per run (:func:`~log_foundry.sinks._encode.encode_round`), an unencodable one ``DROPPED``
+        with SPEC-069's line. A publish that raises runs :meth:`_reset`; a retryable one makes
+        that message ``RETRYABLE``, any other ``REJECTED``, and the round goes on to the next.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``BaseException`` from the driver propagates.
+        """
+        context = run_context()
+        with self._lock:
+            if self._closed:
+                context.refuse(
+                    SinkDeliveryError(
                         f"RabbitMQSink published none of {len(batch)} message(s): the sink is "
                         f"closed"
                     )
-                if not bodies:
-                    return
-                for _, body in bodies:
-                    if self._publish(body):
-                        published += 1
-            if not published:
-                raise SinkDeliveryError(f"RabbitMQSink published none of {len(bodies)} message(s)")
+                )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            fates = [Outcome.DROPPED] * len(batch)
+            lost = Lost(self)
+            for position, body in encode_round(self, batch, self._encode, sink=type(self).__name__):
+                mark_sent(self, [batch[position]])
+                called = self._publish(body)
+                if called.error is None:
+                    fates[position] = Outcome.ACCEPTED
+                    continue
+                fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                kind = type(called.error).__name__
+                lost.add(
+                    [batch[position]],
+                    when=When.LAST if called.retryable else When.ALWAYS,
+                    key=kind,
+                    line=raised_line("message", "RabbitMQSink", kind),
+                )
+            lost.register()
+        return Verdict(outcomes=tuple(fates))
 
     def _encode(self, event: dict[str, object]) -> bytes:
         """Encodes one event as the UTF-8 JSON body of its message.
@@ -216,7 +326,7 @@ class RabbitMQSink:
           The message body.
 
         Raises:
-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+          TypeError: If the event is not JSON-serializable, which ``encode_round`` turns into a
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
@@ -248,42 +358,30 @@ class RabbitMQSink:
                 _safe_close(self._connection)
                 self._connection = None
 
-    def _publish(self, body: bytes) -> bool:
-        """Publishes one message within the retry bound.
+    def _publish(self, body: bytes) -> Called[None]:
+        """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.
 
         Args:
           body: The serialized event.
 
         Returns:
-          True when the broker took it, False once it is abandoned.
+          The call, with its exception when it raised, after :meth:`_reset`.
 
         Raises:
           None. This is an isolation boundary: a driver fault must never crash the worker
             (FR-011).
         """
-        for attempt in range(self._max_retries + 1):
-            try:
-                self._active_channel().basic_publish(
-                    exchange=self._exchange,
-                    routing_key=self._routing_key,
-                    body=body,
-                    properties=self._persistent_properties(),
-                )
-                return True
-            except Exception as err:
-                self._reset()
-                if attempt < self._max_retries and is_retryable(self._retryable_error, err):
-                    wait(_BACKOFF_BASE * (2**attempt), self.log_foundry_stop_signal)
-                    continue
-                with self._counter_lock:
-                    self.failed += 1
-                _diag.lost(
-                    "message",
-                    1,
-                    f"RabbitMQSink, {attempt + 1} attempt(s), {type(err).__name__}",
-                )
-                return False
-        return False
+        try:
+            self._active_channel().basic_publish(
+                exchange=self._exchange,
+                routing_key=self._routing_key,
+                body=body,
+                properties=self._persistent_properties(),
+            )
+        except Exception as err:
+            self._reset()
+            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+        return Called(None)
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed publish is worth another attempt (SPEC-070 FR-002).

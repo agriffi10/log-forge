@@ -842,8 +842,16 @@ parallel array with no ids — so they check that it describes as many records a
 acting on it. A response that doesn't is not used to adjudicate any record in the chunk: the chunk is
 abandoned rather than re-sent (some of it almost certainly landed), counted on
 `.dropped_unadjudicated`, and named on stderr. A non-zero value there is real loss, and normally
-means the client isn't AWS-shaped. `SQSSink` and `SNSSink` correlate by explicit `Id` instead, so
-they can't mis-pair and have no such counter.
+means the client isn't AWS-shaped. `SQSSink` and `SNSSink` correlate by explicit `Id` instead, read
+by the same all-or-none rule: a `Failed` list that names an unknown or repeated `Id`, or holds an
+item that is not a mapping, adjudicates none of the chunk, which is counted on `.failed` once and
+named on stderr, never re-sent.
+
+Each makes **one call per chunk per round**: a chunk that failed retryably is re-sent in the next
+round, after the round's later chunks, and only the entries that failed are re-sent — so one entry
+that keeps failing costs only itself, within `max_retries + 1` rounds of your own for each of the
+worker's attempts. An SQS **FIFO** message group keeps its order for `max_retries + 1` sends of an
+earlier message, as before.
 
 | Sink | Import from | Configure |
 |---|---|---|
@@ -863,8 +871,8 @@ Consuming from the buffer and indexing into ELK is a separate component, outside
 `SQSSink` and `SNSSink` do not retry a message the service rejects as a **sender fault** — the
 retry would re-send it byte-identical, so it can only fail the same way. Those are counted on
 `.failed` immediately and the service's error code is named on stderr; a batch lost only to sender
-faults returns rather than raising. Throttles and internal errors are still retried up to
-`max_retries`.
+faults returns rather than raising. Throttles and internal errors are still retried, in later
+rounds.
 
 ##### FIFO queues
 
@@ -900,9 +908,12 @@ unaffected — their messages carry neither parameter.
 
 Two things worth knowing:
 
-- **Ordering is best-effort across a retry.** If one message fails and a same-group message ahead
-  of it succeeded, the retry lands after it. Holding a whole group back on a single failure would
-  trade log delivery for ordering you can rebuild from `timestamp`, so the sink doesn't.
+- **Ordering holds for the sink's own retries, and is best-effort past them.** A message is held
+  back while an earlier message of its group is still being retried within `max_retries + 1`
+  sends; once that one has used its sends, a later message may land first. Holding a group for
+  the worker's whole budget would trade log delivery for ordering you can rebuild from
+  `timestamp`, so the sink doesn't. A message held until the run ends is counted on `.failed`,
+  named on stderr as held behind an earlier message of its group.
 - **FIFO queues cap throughput** at 300 messages/second (3,000 with batching), or higher in
   high-throughput mode. That's queue-side configuration, not something the library sets.
 
@@ -910,8 +921,9 @@ Two things worth knowing:
 
 Each needs its own extra (lazy-imported). All publish within a bound and close cleanly. **Where the
 bound lives differs, and it was measured rather than assumed** (SPEC-041 FR-004, SPEC-047): the
-Redis, RabbitMQ and Event Hubs sinks retry through `sinks/_retry`, so their backoff is bounded
-*and* cut short by a shutdown.
+Redis, RabbitMQ and Event Hubs sinks retry through the library's delivery engine, one attempt per
+pipeline, message or pack per round, so their backoff is bounded *and* cut short by a shutdown, and
+none holds its lock across a wait.
 
 `KafkaSink` and `GooglePubSubSink` add no retry loop and need none — each hands off locally and
 returns without waiting, and their clients retry on their own threads within their own bounds.
@@ -1342,9 +1354,8 @@ If your sink's close can block, give it its own internal timeout.
 
 **What a broken destination can cost you.** There is one drain thread, so a sink's backoff pauses
 *all* log delivery, and it spans `shutdown()`. At the defaults (`max_retries=3`) that is 0.7 s of
-backoff per batch for most sinks (per *message* for the socket-backed ones — ~70 s for a
-100-message batch against a dead syslog host), and up to 90 s for an HTTP sink whose destination
-is sending
+backoff per batch (the socket-backed sinks included, since each round re-sends every frame still
+failing), and up to 90 s for an HTTP sink whose destination is sending
 `Retry-After` — clamped to `max_retry_after=30.0` per wait, which you can lower. Every wait is cut
 short by a shutdown, and `shutdown()`'s own timeout bounds the total either way — for the
 *drain*; a wait taken inside the sink's `close()` is not bounded by it (above). Each sink's class

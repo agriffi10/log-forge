@@ -8,7 +8,7 @@ import threading
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, NamedTuple, cast
 
 from log_foundry import _diag
 from log_foundry.sinks import _retry
@@ -18,7 +18,7 @@ from log_foundry.sinks.base import _ABSENT, SinkDeliveryError, _class_member, _s
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict, _bound_deliver, _probe
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable, Sequence
 
     from log_foundry.sinks._deferral import _Counted
 
@@ -88,6 +88,8 @@ class Delivery:
       declined: Whether a further round was refused by the decline predicate.
       skipped: Events that ended ``SKIPPED``; in no engine counter.
       failed: Whether the run failed, by the rule above.
+      refused: The refusal marker (:meth:`RunContext.refuse`) of the run's last round, when the
+        run failed and that round was a refusal; the inline adapter raises it by identity.
     """
 
     attempts: int
@@ -101,6 +103,7 @@ class Delivery:
     declined: bool
     skipped: int
     failed: bool
+    refused: Exception | None = None
 
 
 _SETTLED_EMPTY: Final = Delivery(
@@ -377,11 +380,31 @@ class When(enum.Enum):
       SETTLED: Only when the run settles; a per-event drop, which a failed run's catcher owns.
       LAST: Only when the round that registered it is the run's last, so a count of something a
         later round may still fix is made once, for the round that ended the run.
+      FAILED: Only when the run fails and the round that registered it ended it: a count a sink
+        makes for a batch it lost whole, once per run (SPEC-074, the unencodable events that 1.x
+        ``PostgresSink`` and the Redis sinks counted in ``failed`` with the rest of a failed
+        batch). An immediate context, which knows no run ending, and a detached one, whose
+        caller owns the verdict, commit none.
     """
 
     ALWAYS = "always"
     SETTLED = "settled"
     LAST = "last"
+    FAILED = "failed"
+
+
+class _Marks(NamedTuple):
+    """What one round registered about its own verdict, beside its counts (SPEC-074 FR-001).
+
+    Attributes:
+      final: Indices marked by :meth:`RunContext.final_rejections`, as given.
+      refused: The refusal marker of :meth:`RunContext.refuse`, or ``None``.
+      counted: Indices marked by :meth:`RunContext.sink_counted`, as given.
+    """
+
+    final: tuple[object, ...]
+    refused: Exception | None
+    counted: tuple[object, ...]
 
 
 class RunContext:
@@ -405,7 +428,17 @@ class RunContext:
       round: The 1-based number of the round in progress.
     """
 
-    __slots__ = ("_entries", "_immediate", "_lines", "_notes", "_resends_unknown", "_round")
+    __slots__ = (
+        "_counted",
+        "_entries",
+        "_final",
+        "_immediate",
+        "_lines",
+        "_notes",
+        "_refused",
+        "_resends_unknown",
+        "_round",
+    )
 
     def __init__(self, *, immediate: bool = False) -> None:
         """Starts an empty context at round one.
@@ -425,6 +458,9 @@ class RunContext:
         self._entries: list[tuple[_Counted, str, int, When, int]] = []
         self._lines: list[tuple[Callable[[], None], When, int]] = []
         self._resends_unknown: bool | None = None
+        self._final: list[object] = []
+        self._counted: list[object] = []
+        self._refused: Exception | None = None
 
     @property
     def round(self) -> int:
@@ -479,19 +515,30 @@ class RunContext:
         if not n:
             return
         if self._immediate:
-            _commit([(owner, {name: n})], [])
+            if when is not When.FAILED:
+                _commit([(owner, {name: n})], [])
             return
         self._entries.append((owner, name, n, when, self._round))
 
-    def announce(self, line: Callable[[], None], *, when: When) -> None:
+    def announce(
+        self,
+        line: Callable[[], None],
+        *,
+        when: When,
+        failed: Callable[[], None] | None = None,
+    ) -> None:
         """Registers a diagnostic line, written after the commit when ``when`` keeps it.
 
         A site passes a ``lambda`` wrapping its own ``_diag`` call, so the detail stays inside a
-        call ``tests/test_diag.py`` reads for a ``repr``.
+        call ``tests/test_diag.py`` reads for a ``repr``. ``failed`` is the same line for a batch
+        lost whole: written in its place when the run fails and this round ended it, so the one
+        line a 1.x ``emit`` wrote for a failed batch still counts every event of it (SPEC-074;
+        see :attr:`When.FAILED`). An immediate context writes ``line``.
 
         Args:
           line: Called with no arguments once the counts are committed, outside every lock.
           when: Which run endings write it.
+          failed: The line written instead when the run fails on this round, or ``None``.
 
         Returns:
           None.
@@ -502,7 +549,7 @@ class RunContext:
         if self._immediate:
             _commit([], [line])
             return
-        self._lines.append((line, when, self._round))
+        self._lines.append((line if failed is None else _Whole(line, failed), when, self._round))
 
     def resends_unknown(self, owner: object) -> bool:
         """Reports whether this run resends an ``UNKNOWN`` event: whether its sink is idempotent.
@@ -560,6 +607,86 @@ class RunContext:
         if not self._immediate:
             self._lines.append((_written, When.ALWAYS, self._round))
 
+    def final_rejections(self, indices: Iterable[int]) -> None:
+        """Marks ``REJECTED`` indices of this round's verdict that do not fail the run (SPEC-074).
+
+        A final rejection is one the same request is refused again — the SQS and SNS sender
+        fault — so a batch lost only to them settles rather than fails, as 1.x's ``emit``
+        returned for it; the events are still counted ``failed_events``. The indices are read
+        when the round returns: one that is not an ``int`` in range whose outcome is
+        ``REJECTED`` fails the round as an exception escaping ``deliver`` would. Outside any run
+        (an immediate context) it does nothing.
+
+        Args:
+          indices: Positions in the batch this round was handed.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not self._immediate:
+            self._final.extend(indices)
+
+    def refuse(self, error: Exception) -> None:
+        """Marks this round a refusal, carrying the exception a 1.x ``emit`` raised for it.
+
+        The round's verdict is an ordinary one — ``REJECTED`` for a refusal a resend cannot
+        change, ``RETRYABLE`` for one a later round may pass. When the run fails, an event whose
+        final outcome came from a refused round commits nothing to ``SinkCounters`` or the run
+        context, so its catcher's term is its only count, and the inline adapter raises
+        ``error`` by identity. When the run settles, the refused events are counted
+        ``failed_events`` with one engine line, since no catcher sees a settled run. Outside any
+        run it does nothing.
+
+        Args:
+          error: What the 1.x ``emit`` raised for this refusal.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not self._immediate:
+            self._refused = error
+
+    def sink_counted(self, indices: Iterable[int]) -> None:
+        """Marks ``RETRYABLE`` indices whose loss this round the sink registered itself.
+
+        The sink has counted and announced them through :meth:`count` and :meth:`announce`,
+        ``ALWAYS``, as its 1.x ``emit`` counted them per call; the engine commits no
+        ``failed_events`` and writes no line for an event whose final outcome came from such a
+        round. Read when the round returns, as :meth:`final_rejections` is: an index that is not
+        ``RETRYABLE`` there fails the round. Outside any run it does nothing.
+
+        Args:
+          indices: Positions in the batch this round was handed.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not self._immediate:
+            self._counted.extend(indices)
+
+    def _marks(self) -> _Marks:
+        """Returns the marks the round in progress registered, unvalidated.
+
+        Args:
+          None.
+
+        Returns:
+          The marks.
+
+        Raises:
+          None.
+        """
+        return _Marks(tuple(self._final), self._refused, tuple(self._counted))
+
     def drops(self, owner: _Counted) -> _Drops:
         """Returns a ``Deferral``-shaped view that registers every count and line ``SETTLED``.
 
@@ -574,29 +701,44 @@ class RunContext:
         """
         return _Drops(self, owner)
 
-    def _mark(self) -> tuple[int, int]:
+    def _mark(self) -> tuple[int, int, int, int, Exception | None]:
         """Returns a point :meth:`_rewind` can return the context to.
+
+        Its first two members are what a caller compares: the counts and the lines registered
+        so far. The rest are SPEC-074's marks — the final rejections, the sink-counted indices
+        and the refusal — so a rewind discards a mark a faulting hook set as it discards the
+        hook's counts.
 
         Args:
           None.
 
         Returns:
-          How many counts and how many lines are registered so far.
+          How many counts, lines, final rejections and sink-counted indices are registered so
+          far, and the refusal registered so far.
 
         Raises:
           None.
         """
-        return len(self._entries), len(self._lines)
+        return (
+            len(self._entries),
+            len(self._lines),
+            len(self._final),
+            len(self._counted),
+            self._refused,
+        )
 
-    def _rewind(self, mark: tuple[int, int]) -> None:
-        """Discards every count and line registered since ``mark``.
+    def _rewind(self, mark: tuple[int, int, int, int, Exception | None]) -> None:
+        """Discards every count, line and mark registered since ``mark``.
 
         A caller guarding a hook that may register a count and then raise uses it to replace
-        what the hook left with its own, so the loss is counted and announced once. An immediate
-        context has committed each entry already, so nothing is left to discard. It assumes no
-        other thread registers on this context between the mark and the rewind, as a context is
-        not thread-safe: a ``deliver`` fanning inner rounds out over threads that share it would
-        have one round's rewind discard a sibling's entries.
+        what the hook left with its own, so the loss is counted and announced once. A mark goes
+        too: the guard settles the hook's chunk itself, so a final rejection or a sink-counted
+        index the hook set there would no longer fit its outcome, and the engine would fail the
+        whole round as it fails one whose marks do not fit (SPEC-074). An immediate context has
+        committed each entry already and keeps no marks, so nothing is left to discard. It
+        assumes no other thread registers on this context between the mark and the rewind, as a
+        context is not thread-safe: a ``deliver`` fanning inner rounds out over threads that
+        share it would have one round's rewind discard a sibling's entries.
 
         Args:
           mark: What :meth:`_mark` returned.
@@ -609,6 +751,9 @@ class RunContext:
         """
         del self._entries[mark[0] :]
         del self._lines[mark[1] :]
+        del self._final[mark[2] :]
+        del self._counted[mark[3] :]
+        self._refused = mark[4]
 
     def _begin(self, number: int) -> None:
         """Records the round about to run.
@@ -623,8 +768,13 @@ class RunContext:
           None.
         """
         self._round = number
+        self._final = []
+        self._counted = []
+        self._refused = None
 
-    def _kept(self, when: When, registered: int, *, settled: bool, final: int) -> bool:
+    def _kept(
+        self, when: When, registered: int, *, settled: bool, final: int, whole: bool = True
+    ) -> bool:
         """Whether an entry registered in one round commits, given how the run ended.
 
         Args:
@@ -632,6 +782,8 @@ class RunContext:
           registered: The round it was registered in.
           settled: Whether the run settled.
           final: The run's last round.
+          whole: Whether the run owns its batch's fate, so a ``FAILED`` entry may commit: false
+            for a detached run, whose caller is handed the verdict and owns it.
 
         Returns:
           True when it commits.
@@ -643,16 +795,26 @@ class RunContext:
             return True
         if when is When.SETTLED:
             return settled
+        if when is When.FAILED:
+            return whole and not settled and registered == final
         return registered == final
 
     def _committed(
-        self, *, settled: bool, final: int
+        self,
+        *,
+        settled: bool,
+        final: int,
+        skip: frozenset[int] = frozenset(),
+        whole: bool = True,
     ) -> tuple[list[tuple[_Counted, dict[str, int]]], list[Callable[[], None]]]:
         """Selects what commits: each owner's counts in first-registration order, then the lines.
 
         Args:
           settled: Whether the run settled.
           final: The run's last round.
+          skip: Rounds whose registrations commit nothing: a failed run's refused rounds.
+          whole: Whether a batch lost whole is this run's to count (:attr:`When.FAILED` and an
+            ``announce(..., failed=)`` line); a detached run passes False.
 
         Returns:
           ``(owners, lines)``: per owner its counts by name, and the lines in registration order.
@@ -663,7 +825,9 @@ class RunContext:
         owners: list[tuple[_Counted, dict[str, int]]] = []
         position: dict[int, int] = {}
         for owner, name, n, when, registered in self._entries:
-            if not self._kept(when, registered, settled=settled, final=final):
+            if registered in skip or not self._kept(
+                when, registered, settled=settled, final=final, whole=whole
+            ):
                 continue
             at = position.get(id(owner))
             if at is None:
@@ -671,11 +835,17 @@ class RunContext:
                 owners.append((owner, {}))
             counts = owners[at][1]
             counts[name] = counts.get(name, 0) + n
-        lines = [
-            line
-            for line, when, registered in self._lines
-            if self._kept(when, registered, settled=settled, final=final)
-        ]
+        lines: list[Callable[[], None]] = []
+        for line, when, registered in self._lines:
+            if registered in skip or not self._kept(
+                when, registered, settled=settled, final=final, whole=whole
+            ):
+                continue
+            if type(line) is _Whole:
+                lost = whole and not settled and registered == final
+                lines.append(line.failed if lost else line.settled)
+            else:
+                lines.append(line)
         return owners, lines
 
     def _close(self) -> None:
@@ -693,6 +863,50 @@ class RunContext:
         self._notes.clear()
         self._entries.clear()
         self._lines.clear()
+        self._final = []
+        self._counted = []
+        self._refused = None
+
+
+class _Whole:
+    """A line with the variant :meth:`RunContext.announce` writes for a batch lost whole.
+
+    Attributes:
+      settled: The line written unless the run fails on the round that registered it.
+      failed: The line written when it does.
+    """
+
+    __slots__ = ("failed", "settled")
+
+    def __init__(self, settled: Callable[[], None], failed: Callable[[], None]) -> None:
+        """Holds both lines.
+
+        Args:
+          settled: The line written unless the run fails on the registering round.
+          failed: The line written when it does.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.settled = settled
+        self.failed = failed
+
+    def __call__(self) -> None:
+        """Writes the settled line, for a caller that writes a line without choosing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.settled()
 
 
 def _written() -> None:
@@ -795,15 +1009,17 @@ def run_context() -> RunContext:
     return RunContext(immediate=True)
 
 
-def _verdict_failed(verdict: object, n: int) -> bool:
+def _verdict_failed(verdict: object, n: int, marks: _Marks | None = None) -> bool:
     """Applies the run-failed rule to one round's verdict, as a one-round run's tally would.
 
     Args:
       verdict: What the round returned.
       n: How many events it was handed.
+      marks: The round's marks, so a final rejection settles here as it would in a run.
 
     Returns:
-      True when the round would fail a run; an unreadable verdict settles, as in :func:`_run`.
+      True when the round would fail a run; an unreadable verdict settles, as in :func:`_run`,
+      and marks that do not fit the verdict fail it, as an escaped exception would.
 
     Raises:
       None.
@@ -811,7 +1027,46 @@ def _verdict_failed(verdict: object, n: int) -> bool:
     outcomes = outcomes_of(verdict, n)
     if outcomes is None:
         return False
-    return _tally(list(outcomes), 1, 1, False).failed
+    final: list[bool] = []
+    if marks is not None:
+        read = _read_marks(marks, outcomes)
+        if read is None:
+            return True
+        final = [index in read[0] for index in range(n)]
+    return _tally(list(outcomes), 1, 1, False, final=final).failed
+
+
+def _read_marks(
+    marks: _Marks, outcomes: tuple[Outcome, ...]
+) -> tuple[frozenset[int], frozenset[int]] | None:
+    """Validates a round's marks against its verdict: ``(final, counted)``, or ``None``.
+
+    A final rejection must name an exact ``int`` index in range whose outcome is ``REJECTED``,
+    and a sink-counted index one whose outcome is ``RETRYABLE``; anything else is a sink bug,
+    which the caller fails as an exception escaping ``deliver``. ``outcomes_of`` stays the one
+    definition of a malformed verdict: this reads only the marks.
+
+    Args:
+      marks: What the round registered.
+      outcomes: The round's well-formed outcomes.
+
+    Returns:
+      The two index sets, or ``None`` when any mark does not fit.
+
+    Raises:
+      None.
+    """
+    found: list[frozenset[int]] = []
+    for given, wanted in ((marks.final, Outcome.REJECTED), (marks.counted, Outcome.RETRYABLE)):
+        indices: set[int] = set()
+        for index in given:
+            if type(index) is not int:
+                return None
+            if not 0 <= index < len(outcomes) or outcomes[index] is not wanted:
+                return None
+            indices.add(index)
+        found.append(frozenset(indices))
+    return found[0], found[1]
 
 
 def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
@@ -820,7 +1075,9 @@ def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
     The context is pushed whatever else is running, so a count inside it is committed here and
     never by an enclosing run. It is its own last round and settles unless ``failed`` says
     otherwise. An ``Exception`` from ``call`` commits it as a failed run and propagates; a
-    ``BaseException`` commits nothing.
+    ``BaseException`` commits nothing. A ``When.FAILED`` count, and the whole-batch variant of a
+    line, commit nothing here: the caller is handed the round's verdict, and an event it calls
+    ``DROPPED`` must not be counted ``failed`` behind it.
 
     Args:
       call: The work to run.
@@ -839,9 +1096,9 @@ def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
         try:
             result = call()
         except Exception:
-            _commit(*context._committed(settled=False, final=1))
+            _commit(*context._committed(settled=False, final=1, whole=False))
             raise
-        _commit(*context._committed(settled=not failed(result), final=1))
+        _commit(*context._committed(settled=not failed(result), final=1, whole=False))
         return result
     finally:
         _RUNS.reset(token)
@@ -871,7 +1128,10 @@ def one_round(
     if _RUNS.get():
         return round_fn(batch)
     size = len(batch)
-    return detached(lambda: round_fn(batch), lambda verdict: _verdict_failed(verdict, size))
+    return detached(
+        lambda: round_fn(batch),
+        lambda verdict: _verdict_failed(verdict, size, run_context()._marks()),
+    )
 
 
 def _uncounted(fault: Exception, n: int, what: str) -> None:
@@ -892,12 +1152,13 @@ def _uncounted(fault: Exception, n: int, what: str) -> None:
 
 
 def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[[], None]]) -> None:
-    """Commits a run context's selected counts, one ``Deferral`` per owner, then its lines.
+    """Commits a run context's selected counts, one ``Deferral`` per lock, then its lines.
 
-    Each owner's counts commit under that owner's ``_counter_lock``, read at commit time, so a
-    fork repair that rebound it is honoured. The lines are written after every count, outside
-    every lock, in registration order, and even when an owner's commit raised, since an
-    announced loss is better than a silent one.
+    Owners are grouped by the identity of their ``_counter_lock``, read at commit time, so a
+    fork repair that rebound one is honoured, and owners sharing one lock — a shipped engine
+    sink and its ``SinkCounters`` — commit under one acquisition (SPEC-074 FR-001). The lines
+    are written after every count, outside every lock, in registration order, and even when a
+    commit raised, since an announced loss is better than a silent one.
 
     Args:
       owners: Each owner with its counts by name.
@@ -909,19 +1170,80 @@ def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[
     Raises:
       None.
     """
-    for owner, counts in owners:
+    for lead, group in _by_lock(owners):
         try:
-            with Deferral(owner) as ledger:
-                for name, n in counts.items():
-                    ledger.count(name, n)
+            with Deferral(lead) as ledger:
+                for owner, counts in group:
+                    for name, n in counts.items():
+                        ledger.count_for(owner, name, n)
         except Exception as fault:
+            total = 0
+            for _, counts in group:
+                total += sum(counts.values())
             _uncounted(
-                fault,
-                sum(counts.values()),
-                f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(owner)))}",
+                fault, total, f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(lead)))}"
             )
     for line in lines:
         line()
+
+
+def _by_lock(
+    owners: list[tuple[_Counted, dict[str, int]]],
+) -> list[tuple[_Counted, list[tuple[_Counted, dict[str, int]]]]]:
+    """Groups owners by the identity of their ``_counter_lock``, in first-seen order.
+
+    An owner whose lock cannot be read is a group of its own, so its commit raises inside its own
+    guard and is announced as before.
+
+    Args:
+      owners: Each owner with its counts by name.
+
+    Returns:
+      Per group, the owner whose ``Deferral`` commits it and every owner in it.
+
+    Raises:
+      None.
+    """
+    groups: list[tuple[_Counted, list[tuple[_Counted, dict[str, int]]]]] = []
+    locks: list[object] = []
+    for owner, counts in owners:
+        try:
+            lock: object = getattr(owner, "_counter_lock", None)
+        except Exception:
+            lock = None
+        for at, seen in enumerate(locks):
+            if lock is not None and seen is lock:
+                groups[at][1].append((owner, counts))
+                break
+        else:
+            locks.append(lock)
+            groups.append((owner, [(owner, counts)]))
+    return groups
+
+
+def _shares_lock(owner: object, counters: SinkCounters) -> bool:
+    """Whether a run-context owner's ``_counter_lock`` is the sink's ``SinkCounters`` lock.
+
+    Such an owner — a shipped engine sink, whose ``_counter_lock`` is a property over its
+    counters' lock — commits in the same ``Deferral`` as the engine's own totals, so a run makes
+    one acquisition and a reader of ``losses()`` and a sub-count never sees half a commit. The
+    lock is read with ordinary access, inside a guard: an owner whose read raises is committed on
+    its own, as before.
+
+    Args:
+      owner: The owner a count was registered against.
+      counters: The run's counters.
+
+    Returns:
+      True when the two locks are one object.
+
+    Raises:
+      None.
+    """
+    try:
+        return getattr(owner, "_counter_lock", None) is counters._counter_lock
+    except Exception:
+        return False
 
 
 def _wait(delay: float, stop: threading.Event | None) -> threading.Event | None:
@@ -1027,12 +1349,40 @@ def _run(
         context._run_sink_resends(idempotent)
         ceiling = _ceiling(sink)
         fate: list[object] = [Outcome.RETRYABLE] * total_events
+        final_of = [False] * total_events
+        counted_of = [False] * total_events
+        refused_in = [0] * total_events
+        refusals: dict[int, Exception] = {}
         pending = list(range(total_events))
         escaped: list[Exception] = []
         attempts = 0
         longest = 0.0
         hint: float | None = None
         declined = False
+
+        def escape(exc: Exception) -> list[int]:
+            """Fails the round's events as SPEC-072's rule for an escaped exception says.
+
+            Args:
+              exc: What ``deliver`` raised, or the ``ValueError`` for marks that do not fit.
+
+            Returns:
+              The events still to send: the round's, only for an idempotent sink whose
+              predicate accepts ``exc``; otherwise none.
+
+            Raises:
+              None.
+            """
+            if not any(type(seen) is type(exc) for seen in escaped):
+                escaped.append(exc)
+            predicate = _predicate_of(sink) if idempotent else None
+            resend = predicate is not None and is_retryable(predicate, exc)
+            for index in pending:
+                fate[index] = _RAISED
+                final_of[index] = counted_of[index] = False
+                refused_in[index] = 0
+            return pending if resend else []
+
         while True:
             if attempts:
                 cycle, position = divmod(attempts, per_cycle)
@@ -1053,27 +1403,36 @@ def _run(
                 result = deliver(offered)
             except Exception as exc:
                 longest = max(longest, time.monotonic() - started)
-                if not any(type(seen) is type(exc) for seen in escaped):
-                    escaped.append(exc)
-                predicate = _predicate_of(sink) if idempotent else None
-                resend = predicate is not None and is_retryable(predicate, exc)
-                for index in pending:
-                    fate[index] = _RAISED
-                if not resend:
-                    pending = []
+                pending = escape(exc)
             else:
                 longest = max(longest, time.monotonic() - started)
                 outcomes = outcomes_of(result, n)
+                marks = context._marks()
+                read = None if outcomes is None else _read_marks(marks, outcomes)
                 if outcomes is None:
                     for index in pending:
                         fate[index] = _UNREAD
+                        final_of[index] = counted_of[index] = False
+                        refused_in[index] = 0
                     if not idempotent:
                         pending = []
+                elif read is None:
+                    pending = escape(
+                        ValueError(
+                            f"{_diag._STR_STR(_diag._STORED_NAME(type(sink)))} marked an index "
+                            "whose outcome does not fit its mark"
+                        )
+                    )
                 else:
                     hint = _hint_of(result)
+                    if marks.refused is not None:
+                        refusals[attempts] = marks.refused
                     still: list[int] = []
-                    for index, outcome in zip(pending, outcomes, strict=True):
+                    for at, (index, outcome) in enumerate(zip(pending, outcomes, strict=True)):
                         fate[index] = outcome
+                        final_of[index] = at in read[0]
+                        counted_of[index] = at in read[1]
+                        refused_in[index] = attempts if marks.refused is not None else 0
                         if outcome is Outcome.RETRYABLE or (
                             idempotent and outcome is Outcome.UNKNOWN
                         ):
@@ -1081,23 +1440,66 @@ def _run(
                     pending = still
             if not pending or attempts >= rounds_allowed:
                 break
-        delivery = _tally(fate, attempts, -(-attempts // per_cycle), declined)
-        unconfirmed = delivery.rejected + delivery.unresolved + delivery.raised + delivery.unknown
+        delivery = _tally(
+            fate,
+            attempts,
+            -(-attempts // per_cycle),
+            declined,
+            final=final_of,
+            refused=refusals.get(attempts),
+        )
+        lost_fates = (Outcome.REJECTED, Outcome.RETRYABLE, Outcome.UNKNOWN, _RAISED, _UNREAD)
+        excluded = sum(
+            1
+            for index in range(total_events)
+            if fate[index] in lost_fates
+            and (counted_of[index] or (delivery.failed and refused_in[index]))
+        )
+        refused_lost = (
+            0
+            if delivery.failed
+            else sum(
+                1
+                for index in range(total_events)
+                if fate[index] in lost_fates and refused_in[index]
+            )
+        )
+        unconfirmed = (
+            delivery.rejected + delivery.unresolved + delivery.raised + delivery.unknown - excluded
+        )
         dropped = 0 if delivery.failed else delivery.dropped
         name = _diag._STR_STR(_diag._STORED_NAME(type(sink)))
-        owners, lines = context._committed(settled=not delivery.failed, final=attempts)
+        skip = frozenset(refusals) if delivery.failed else frozenset()
+        owners, lines = context._committed(settled=not delivery.failed, final=attempts, skip=skip)
+        shared = [entry for entry in owners if _shares_lock(entry[0], counters)]
+        owners = [entry for entry in owners if not _shares_lock(entry[0], counters)]
+        general = unconfirmed - refused_lost + dropped
+        refusal_kind = (
+            _diag._STR_STR(_diag._STORED_NAME(type(refusals[max(refusals)]))) if refusals else ""
+        )
         try:
             with Deferral(counters) as ledger:
                 ledger.count("failed_events", unconfirmed)
                 ledger.count("dropped_events", dropped)
-                if not delivery.failed and unconfirmed + dropped and not lines:
+                for owner, counts in shared:
+                    for counter, amount in counts.items():
+                        ledger.count_for(owner, counter, amount)
+                if not delivery.failed and general and not lines:
                     ledger.announce(
                         lambda: _diag.lost(
                             "event",
-                            unconfirmed + dropped,
+                            general,
                             f"rejected {delivery.rejected}, unresolved {delivery.unresolved}, "
                             f"raised {delivery.raised}, unknown {delivery.unknown}, dropped {dropped} "
                             f"after {delivery.attempts} delivery round(s) to {name}",
+                        )
+                    )
+                if refused_lost:
+                    ledger.announce(
+                        lambda: _diag.lost(
+                            "event",
+                            refused_lost,
+                            f"refused by {name} after others landed, {refusal_kind}",
                         )
                     )
         except Exception as fault:
@@ -1111,14 +1513,28 @@ def _run(
         context._close()
 
 
-def _tally(fate: list[object], attempts: int, cycles: int, declined: bool) -> Delivery:
+def _tally(
+    fate: list[object],
+    attempts: int,
+    cycles: int,
+    declined: bool,
+    *,
+    final: Sequence[bool] = (),
+    refused: Exception | None = None,
+) -> Delivery:
     """Counts the final fates of one run and applies the run-failed rule.
+
+    A ``REJECTED`` event marked final (:meth:`RunContext.final_rejections`) is counted in
+    ``rejected`` but does not make the run fail, so a batch lost only to final rejections
+    settles.
 
     Args:
       fate: Each event's final fate, by index in the run's copy of the batch.
       attempts: ``deliver`` calls made.
       cycles: Cycles started.
       declined: Whether the run was declined.
+      final: Per index, whether its ``REJECTED`` is a final rejection; empty reads as none.
+      refused: The refusal marker to record when the run fails.
 
     Returns:
       The run's record.
@@ -1128,9 +1544,15 @@ def _tally(fate: list[object], attempts: int, cycles: int, declined: bool) -> De
     """
     accepted = sum(1 for one in fate if one is Outcome.ACCEPTED)
     rejected = sum(1 for one in fate if one is Outcome.REJECTED)
+    final_rejected = sum(
+        1
+        for index, one in enumerate(fate)
+        if one is Outcome.REJECTED and index < len(final) and final[index]
+    )
     unresolved = sum(1 for one in fate if one is Outcome.RETRYABLE)
     raised = sum(1 for one in fate if one is _RAISED)
     unknown = sum(1 for one in fate if one is Outcome.UNKNOWN or one is _UNREAD)
+    failed = not accepted and bool(rejected - final_rejected + unresolved + raised) and not unknown
     return Delivery(
         attempts=attempts,
         cycles=cycles,
@@ -1142,7 +1564,8 @@ def _tally(fate: list[object], attempts: int, cycles: int, declined: bool) -> De
         unknown=unknown,
         declined=declined,
         skipped=sum(1 for one in fate if one is Outcome.SKIPPED),
-        failed=not accepted and bool(rejected + unresolved + raised) and not unknown,
+        failed=failed,
+        refused=refused if failed else None,
     )
 
 
@@ -1222,6 +1645,7 @@ def emit_via_deliver(
         ``SinkCounters``, naming its stored type name and the missing member, so a misspelt
         member is a counted failure rather than events that vanish.
       SinkDeliveryError: When the run failed, naming counts and the sink's type, never a value.
+      Exception: The refusal marker of a failed run's last round, by identity (SPEC-074).
       BaseException: Whatever ``deliver`` raises that is not an ``Exception``.
     """
     events = _snapshot(batch)
@@ -1255,6 +1679,8 @@ def emit_via_deliver(
         decline=None,
     )
     if delivery.failed:
+        if delivery.refused is not None:
+            raise delivery.refused
         raise SinkDeliveryError(
             f"delivered none of {len(events)} event(s): rejected {delivery.rejected}, "
             f"unresolved {delivery.unresolved}, raised {delivery.raised} after "

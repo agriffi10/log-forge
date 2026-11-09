@@ -455,6 +455,20 @@ sender faults included — `SQSSink._send` and, since SPEC-070, `SNSSink._send` 
 > no longer resends a shipped family sink's batch. Decision: *The HTTP family delivers in rounds on
 > the engine, and a run context keeps its counters' units* (`docs/decisions/sink-delivery/`).
 
+> **Superseded for the SDK, driver and socket sinks by SPEC-074:** `SQSSink`, `SNSSink`,
+> `KinesisSink`, `FirehoseSink`, `ClickHouseSink`, `MongoDBSink`, `PostgresSink`, both Redis sinks,
+> `RabbitMQSink`, `AzureEventHubsSink`, `NATSSink` and `SocketTransport` (which `SyslogSink` forwards
+> to and socket-mode `LogstashSink`'s `emit` runs the adapter over) define `deliver` — one attempt
+> per chunk, message or frame per round — and an `emit` that is the inline adapter. Their retry
+> loops, backoff constants and hand-built `SinkLosses` are gone: `losses()` returns the engine's
+> `SinkCounters`, `failed` is a property over `failed_events` (assignable), and a drop registers
+> `SETTLED` on the run context, committed with the totals under one acquisition. SQS and SNS read
+> `Failed` and MongoDB `writeErrors` through `_batch.adjudicate_keyed`; a sender fault is a final
+> rejection, so a batch lost only to them still returns; a closed sink's round, a NATS latch and an
+> SQS batch whose every id callable raised are refusals counted by their catcher alone; an SQS FIFO
+> group keeps its order for `max_retries + 1` sends. Decisions: *A sink round resends only what
+> failed, and an SQS FIFO group keeps its order* and *No shipped sink declares itself idempotent*.
+
 SPEC-070 widens the first two of the original three cases. An **SNS sender fault** joins the SQS
 one — the same required `SenderFault` field, read through the same `sinks/_classify.sender_fault`,
 counted and never retried, a batch lost only to sender faults returning — and a Kinesis or Firehose

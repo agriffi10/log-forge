@@ -2577,3 +2577,48 @@ def test_configure_and_config_gain_nothing() -> None:
     ]
     assert list(inspect.signature(log_foundry.configure).parameters) == names
     assert [f.name for f in dataclasses.fields(log_foundry.Config)] == names
+
+
+# --- SPEC-074 FR-006: what each engine sink adds to its surface ---------------------------------
+
+_ENGINE_SURFACE: dict[str, frozenset[str]] = {
+    name: frozenset({"deliver", "emit", "losses", "failed", "log_foundry_counters"})
+    for name in (
+        "SQSSink",
+        "SNSSink",
+        "KinesisSink",
+        "FirehoseSink",
+        "ClickHouseSink",
+        "MongoDBSink",
+        "PostgresSink",
+        "RedisStreamsSink",
+        "RedisListSink",
+        "RabbitMQSink",
+        "AzureEventHubsSink",
+        "SyslogSink",
+    )
+}
+"""SPEC-074 FR-006: the names each engine sink offers, beside its 1.x ones (invariant 10)."""
+
+_READ_ONLY = ("RabbitMQSink", "SyslogSink")
+"""The sinks that kept ``max_retries`` private in 1.x and now expose it read-only."""
+
+
+def test_every_engine_sink_exposes_its_documented_attributes(monkeypatch, tmp_path) -> None:
+    from sink_rigs import RIGS
+
+    for name, names in _ENGINE_SURFACE.items():
+        sink = RIGS[name](monkeypatch, tmp_path).sink
+        try:
+            public = {n for n in dir(sink) if not n.startswith("_")}
+            assert names <= public, (name, sorted(names - public))
+            assert isinstance(sink.max_retries, int), name
+            if name in _READ_ONLY:
+                with pytest.raises(AttributeError, match="read-only"):
+                    sink.max_retries = 9
+            sink.failed = 0
+        finally:
+            sink.close()
+    import log_foundry
+
+    assert len(log_foundry.__all__) == 35, "the engine sinks add attributes, never an export"
