@@ -4,9 +4,11 @@ Imports here are plain: a `log_foundry` module that will not import is an error,
 skipped file. See `tests/README.md` for the two things that may still legitimately skip.
 """
 
+import asyncio
 import contextlib
 import sys
 import threading
+import time
 from typing import ClassVar
 
 import pytest
@@ -60,6 +62,161 @@ def run_concurrently(work, threads: int, *, per_thread: int = 1) -> list[BaseExc
         sys.setswitchinterval(original_interval)
     assert not any(thread.is_alive() for thread in pool), "a worker thread did not finish"
     return errors
+
+
+class Stopwatch:
+    """A ``time.monotonic()`` clock read when it is built, for a lower bound on elapsed time.
+
+    It exists so a timing floor and the delay behind it share one start: a delay armed after the
+    stopwatch is built cannot end before ``began + delay``, whatever the machine does between
+    the two. :func:`release_after_clock` builds one and only then arms its timer.
+
+    Attributes:
+      began: The ``time.monotonic()`` instant the stopwatch was built.
+      ended: The instant :meth:`stop` was called, or None while it runs.
+    """
+
+    def __init__(self) -> None:
+        """Reads the clock.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.began = time.monotonic()
+        self.ended: float | None = None
+
+    def stop(self) -> float:
+        """Stops the stopwatch, once, and returns the elapsed seconds.
+
+        Args:
+          None.
+
+        Returns:
+          The seconds from ``began`` to the first ``stop``.
+
+        Raises:
+          None.
+        """
+        if self.ended is None:
+            self.ended = time.monotonic()
+        return self.elapsed
+
+    @property
+    def elapsed(self) -> float:
+        """Returns the seconds since ``began``, up to ``ended`` once it has stopped.
+
+        Args:
+          None.
+
+        Returns:
+          The elapsed seconds.
+
+        Raises:
+          None.
+        """
+        end = time.monotonic() if self.ended is None else self.ended
+        return end - self.began
+
+
+@contextlib.contextmanager
+def release_after_clock(seconds: float, release):
+    """Starts a stopwatch, then arms a timer that calls ``release`` ``seconds`` later.
+
+    The shared helper for a test that bounds elapsed time from below. A floor ``X <= elapsed``
+    holds only if the delay it measures opens **after** the test's clock does: a fake's timer
+    armed in its constructor, a close that sleeps from the moment a test sees it enter, or a
+    timer started on the line before the clock all open first, and any preemption between the
+    two is subtracted from ``elapsed``. That class of flake recurred six times here (the orphan
+    handoff, the NATS ``SlowFlusherNATS`` fake and the four sites PR 314 fixed). Gate the slow
+    thing on an Event the fake waits on, and pass that Event's ``set`` here; the floor is then
+    exact by construction, because the clock is read before the timer exists.
+
+    On exit the stopwatch stops first, and then ``release`` is called if the timer has not
+    called it yet, so a measured call that returned early (the bug a floor catches) never leaves
+    the fake parked for a teardown to wait on. ``release`` runs exactly once either way.
+    ``tests/test_timing_floors.py`` refuses the unsafe shapes this replaces.
+
+    Args:
+      seconds: The delay, from the stopwatch's start, before ``release`` is called.
+      release: Called with no arguments, once, on the timer's thread or at exit.
+
+    Returns:
+      A context manager yielding the running :class:`Stopwatch`; read its ``elapsed`` after the
+      block, where it is the measured call's duration.
+
+    Raises:
+      None.
+    """
+    watch = Stopwatch()
+    once = threading.Lock()
+
+    def fire() -> None:
+        if once.acquire(blocking=False):
+            release()
+
+    timer = threading.Timer(seconds, fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield watch
+    finally:
+        watch.stop()
+        timer.cancel()
+        fire()
+
+
+class DelayArmedOnUse:
+    """A loop delay a fake arms from inside the call a test times, never from its constructor.
+
+    The asyncio twin of :func:`release_after_clock`, for a fake whose delay is its own (a
+    ``call_later`` that unparks a flusher, say) rather than one the test releases. A sink that
+    connects in its constructor builds its fake there too, so a ``call_later`` in the fake's
+    ``__init__`` is already running before the test's clock starts. ``arm`` is called from the
+    fake's first operation inside the measured call, and only the first call arms.
+
+    Attributes:
+      seconds: The delay from the first :meth:`arm`.
+      armed: Whether :meth:`arm` has scheduled the delay.
+    """
+
+    def __init__(self, seconds: float, fire) -> None:
+        """Records the delay without scheduling it.
+
+        Args:
+          seconds: The delay from the first :meth:`arm`.
+          fire: Called with no arguments on the loop when the delay ends.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.seconds = seconds
+        self.armed = False
+        self._fire = fire
+
+    def arm(self) -> None:
+        """Schedules the delay on the running loop, the first time only.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          RuntimeError: When called with no running loop.
+        """
+        if not self.armed:
+            self.armed = True
+            asyncio.get_running_loop().call_later(self.seconds, self._fire)
 
 
 def install_worker(worker) -> None:

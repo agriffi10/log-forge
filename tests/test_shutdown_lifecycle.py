@@ -10,6 +10,7 @@ import time
 import pytest
 
 import log_foundry
+from conftest import release_after_clock
 from log_foundry import _lifecycle
 
 
@@ -759,12 +760,11 @@ def test_a_second_closer_waits_for_a_close_it_did_not_start_even_while_taking_wo
 
     log_foundry.configure(service="test", sink=second)
     log_foundry.info("y")
-    # The first close is released on a timer started after `start`, so its remaining second
+    # The first close is released on a timer started after the clock, so its remaining second
     # cannot have begun running before the clock did.
-    start = time.monotonic()
-    threading.Timer(1.0, first.release.set).start()
-    _lifecycle._close_owed()  # closes the second sink, and waits on the first
-    waited = time.monotonic() - start
+    with release_after_clock(1.0, first.release.set) as watch:
+        _lifecycle._close_owed()  # closes the second sink, and waits on the first
+    waited = watch.elapsed
 
     assert second.closed == 1, "the premise: this caller had work of its own to do"
     assert waited > 0.3, (
@@ -816,10 +816,9 @@ def test_a_bystander_does_not_release_the_gate_for_the_next_one(
     assert sink.in_close.wait(5.0), "the premise: the close is running"
 
     _lifecycle._close_owed()  # first bystander
-    start = time.monotonic()
-    threading.Timer(1.0, sink.release.set).start()
-    _lifecycle._close_owed()  # second: must still find the close in flight
-    waited = time.monotonic() - start
+    with release_after_clock(1.0, sink.release.set) as watch:
+        _lifecycle._close_owed()  # second: must still find the close in flight
+    waited = watch.elapsed
 
     assert waited > 0.1, (
         f"the second bystander returned in {waited:.3f}s, so the first released a count it "

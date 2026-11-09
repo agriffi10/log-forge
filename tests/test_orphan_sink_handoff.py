@@ -7,6 +7,7 @@ import time
 import pytest
 
 import log_foundry
+from conftest import release_after_clock
 from log_foundry import _lifecycle, config
 from log_foundry import _lifecycle as lifecycle
 from log_foundry import worker as worker_mod
@@ -548,17 +549,16 @@ def test_the_live_orphan_sinks_close_stays_inline_and_unbounded() -> None:
     log_foundry.info("to it")
 
     caller = threading.current_thread().name
-    # `start` is taken BEFORE the timer, and the order is the assertion. Started first, the
+    # The clock starts BEFORE the timer, and the order is the assertion. Started first, the
     # timer's 0.4 s runs on a clock that begins earlier than the measured one, so anything
     # between the two lines -- a GIL handoff, an OS preemption, `Thread.start()` itself -- is
     # subtracted from `elapsed` and never enters the window `elapsed >= 0.4` claims to clear.
     # Both matrix legs failed that way on a loaded runner at 0.390 s and 0.397 s while passing
-    # everywhere else. This order makes the bound hold by construction: the release cannot fire
-    # before `start + 0.4`, whatever the machine does in between.
-    start = time.monotonic()
-    threading.Timer(0.4, slow.release.set).start()
-    log_foundry.shutdown(timeout=5.0)
-    elapsed = time.monotonic() - start
+    # everywhere else. `release_after_clock` reads the clock and only then arms the timer, so the
+    # release cannot fire before `began + 0.4`, whatever the machine does in between.
+    with release_after_clock(0.4, slow.release.set) as watch:
+        log_foundry.shutdown(timeout=5.0)
+    elapsed = watch.elapsed
 
     assert slow.closed == 1, "shutdown waited for it rather than detaching it"
     assert elapsed >= 0.4, "it did not return before the close finished"
