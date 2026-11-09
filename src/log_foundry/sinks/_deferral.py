@@ -170,6 +170,12 @@ class Deferral:
         ``BaseException`` included — commits nothing and is never suppressed, so the exception
         propagates by identity with its own traceback.
 
+        The commit is all or nothing: under the lock every new value is read first, the owner's
+        and each target's, summed per object and counter, and only then is any written. A
+        counter that is not an attribute raises before anything is stored, so a caller reporting
+        the raise as nothing counted is telling the truth (invariant 11; the engine's one-lock
+        commit hands a sink's sub-counts in beside its totals, SPEC-074).
+
         Args:
           exc_type: The type of the exception leaving the block, or ``None``.
           exc: The exception itself, or ``None``.
@@ -186,10 +192,18 @@ class Deferral:
         if self._counts or self._targets:
             owner = self._owner
             with owner._counter_lock:
-                for name, n in self._counts.items():
-                    setattr(owner, name, getattr(owner, name) + n)
-                for target, name, n in self._targets:
-                    setattr(target, name, getattr(target, name) + n)
+                values: dict[tuple[int, str], tuple[object, int]] = {}
+                pending: list[tuple[object, str, int]] = [
+                    (owner, name, n) for name, n in self._counts.items()
+                ]
+                pending.extend(self._targets)
+                for counted, name, n in pending:
+                    key = (id(counted), name)
+                    held = values.get(key)
+                    base = getattr(counted, name) if held is None else held[1]
+                    values[key] = (counted, base + n)
+                for (_, name), (counted, value) in values.items():
+                    setattr(counted, name, value)
         for line in self._lines:
             line()
 

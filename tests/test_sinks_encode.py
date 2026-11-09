@@ -428,6 +428,27 @@ def test_a_failed_run_counts_the_whole_batch_once_and_a_settled_one_drops(
     assert settled.delivered() == ["a"]
 
 
+@pytest.mark.parametrize("name", ["PostgresSink", "RedisStreamsSink", "RedisListSink"])
+def test_a_direct_deliver_counts_no_dropped_event_in_failed(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ``deliver`` outside any run hands its caller the verdict, so the whole-batch count is off.
+
+    The verdict calls the unencodable event ``DROPPED``; counting it ``failed`` behind that, as
+    a run that fails does for 1.x's sake, would count an event its caller was told was dropped
+    (frame-2 review). The sink's line names the two it tried.
+    """
+    from log_foundry.sinks.verdict import Outcome
+
+    rig = RIGS[name](monkeypatch, tmp_path)
+    rig.state.down = True
+    verdict = rig.sink.deliver([ok("a"), ok("b"), unencodable()])
+    assert verdict.outcomes == (Outcome.RETRYABLE, Outcome.RETRYABLE, Outcome.DROPPED)
+    assert read_losses(rig.sink) == SinkLosses(dropped=0, failed=0)
+    lost = [line for line in capsys.readouterr().err.splitlines() if f"; {name}, " in line]
+    assert len(lost) == 1 and lost[0].startswith(f"log-foundry: lost 2 event(s); {name}, "), lost
+
+
 def test_a_failing_remainder_raises_and_counts_nothing_until_a_retry_returns(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -880,7 +880,9 @@ defines `deliver` nor `log_foundry_counters`, and each keeps `rejected` and `los
       and `.dropped_unadjudicated`, set through the engine, equal the 1.x formula; `.failed` is
       assignable.
 - [ ] A subclass of each converted sink that overrides `emit` is delivered to through its `emit` by
-      the worker (SPEC-072's override rule), and its events are counted once.
+      the worker (SPEC-072's override rule), and its events are counted once per `emit` call, as
+      1.x: a batch lost to a down destination under a worker with `max_retries=w` is `failed`
+      `(w + 1) · n`, with one line per call.
 - [ ] No class under `sinks/` defines `log_foundry_idempotent`; `kafka.py`, `pubsub.py` and `multi.py`
       are byte-identical to the commit the build branches from, and their tests pass unedited.
 - [ ] A forked child of each engine sink, forked while a parent thread holds its counters' lock,
@@ -1099,3 +1101,4 @@ other site still stating the old claim:
 - 2026-11-09, build (plan review S2): the no-wait check names `pubsub.py` as an exclusion beside `_engine.py` and `_retry.py`, since its result poll waits through `_retry.wait` and this spec leaves it unedited; FR-006's deletion sentence said only `_engine.py` would.
 - 2026-11-09, rebase onto #315 (`ddc78707`): every `UNKNOWN` a converted sink announces or counts itself (an unread SQS or SNS reply, an unadjudicable Kinesis or Firehose response, MongoDB's unpairable `writeErrors`, NATS's abandoned and unconfirmed lines) is `ALWAYS`, or `LAST` in a run whose sink resends an `UNKNOWN`, read from #315's `RunContext.resends_unknown`; #315's `_mark`/`_rewind` carry the three marks, so a hook its guard settles leaves none behind.
 - 2026-11-09, diff review frame 1: `PostgresSink` and the Redis sinks count a failed run's unencodable events in `failed` and name them in its line, as 1.x did (`When.FAILED`, `announce(..., failed=)`); the build had left them `DROPPED`, a change of term this spec rules out. FR-006 names `nats.py`'s fork-safe `_unlocked` as the one `SinkLosses` a converted module still builds.
+- 2026-11-09, diff review frame 2: an `emit` override's events are counted once per `emit` call, as 1.x, and the criterion says so; a detached run (a direct `deliver` outside any run) commits no `When.FAILED` count, its caller owning the verdict; the engine's one-lock commit is all or nothing.

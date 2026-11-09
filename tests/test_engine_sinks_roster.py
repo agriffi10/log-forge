@@ -350,6 +350,47 @@ def test_an_emit_override_is_delivered_through_its_emit(
         sink.close()
 
 
+@pytest.mark.parametrize("name", _RIGGED)
+def test_an_emit_override_counts_a_lost_batch_once_per_emit_call_as_1x(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The override's failing twin: each ``emit`` call is its own run, so it counts as 1.x did.
+
+    A subclass that overrides ``emit`` keeps the worker's whole-batch loop, so a batch lost to a
+    down destination is counted once per ``emit`` call — ``(w + 1) · n`` under a worker with
+    ``max_retries=w`` — with one line per call naming that call's single attempt, as 1.x's
+    ``emit`` counted it. Only the engine's own path counts a lost event once per batch.
+    """
+    rig = RIGS[name](monkeypatch, tmp_path)
+    sink = rig.sink
+    seen: list[int] = []
+    base = type(sink)
+
+    def emit(self: Any, batch: list[dict[str, object]]) -> None:
+        seen.append(len(batch))
+        base.emit(self, batch)
+
+    sink.__class__ = type(f"Stamping{base.__name__}", (base,), {"emit": emit})
+    rig.state.down = True
+    retries = 2
+    try:
+        worker = Worker(sink, batch_size=10, flush_interval=60.0, max_retries=retries)
+        install_worker(worker)
+        worker.submit([ok("a"), ok("b")])
+        assert not worker.flush(timeout=30.0)
+        assert seen == [2] * (retries + 1)
+        assert sink.failed == (retries + 1) * 2
+        lines = [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if line.startswith("log-foundry: lost") and "1 attempt(s)" in line
+        ]
+        assert len(lines) == retries + 1, lines
+        assert all(line.startswith("log-foundry: lost 2 ") for line in lines), lines
+    finally:
+        sink.close()
+
+
 @pytest.mark.parametrize("name", _ALL)
 def test_a_forked_child_completes_an_emit_while_the_parent_holds_the_counter_lock(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

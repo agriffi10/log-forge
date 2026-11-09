@@ -383,7 +383,8 @@ class When(enum.Enum):
       FAILED: Only when the run fails and the round that registered it ended it: a count a sink
         makes for a batch it lost whole, once per run (SPEC-074, the unencodable events that 1.x
         ``PostgresSink`` and the Redis sinks counted in ``failed`` with the rest of a failed
-        batch). An immediate context, which knows no run ending, commits none.
+        batch). An immediate context, which knows no run ending, and a detached one, whose
+        caller owns the verdict, commit none.
     """
 
     ALWAYS = "always"
@@ -771,7 +772,9 @@ class RunContext:
         self._counted = []
         self._refused = None
 
-    def _kept(self, when: When, registered: int, *, settled: bool, final: int) -> bool:
+    def _kept(
+        self, when: When, registered: int, *, settled: bool, final: int, whole: bool = True
+    ) -> bool:
         """Whether an entry registered in one round commits, given how the run ended.
 
         Args:
@@ -779,6 +782,8 @@ class RunContext:
           registered: The round it was registered in.
           settled: Whether the run settled.
           final: The run's last round.
+          whole: Whether the run owns its batch's fate, so a ``FAILED`` entry may commit: false
+            for a detached run, whose caller is handed the verdict and owns it.
 
         Returns:
           True when it commits.
@@ -791,11 +796,16 @@ class RunContext:
         if when is When.SETTLED:
             return settled
         if when is When.FAILED:
-            return not settled and registered == final
+            return whole and not settled and registered == final
         return registered == final
 
     def _committed(
-        self, *, settled: bool, final: int, skip: frozenset[int] = frozenset()
+        self,
+        *,
+        settled: bool,
+        final: int,
+        skip: frozenset[int] = frozenset(),
+        whole: bool = True,
     ) -> tuple[list[tuple[_Counted, dict[str, int]]], list[Callable[[], None]]]:
         """Selects what commits: each owner's counts in first-registration order, then the lines.
 
@@ -803,6 +813,8 @@ class RunContext:
           settled: Whether the run settled.
           final: The run's last round.
           skip: Rounds whose registrations commit nothing: a failed run's refused rounds.
+          whole: Whether a batch lost whole is this run's to count (:attr:`When.FAILED` and an
+            ``announce(..., failed=)`` line); a detached run passes False.
 
         Returns:
           ``(owners, lines)``: per owner its counts by name, and the lines in registration order.
@@ -813,7 +825,9 @@ class RunContext:
         owners: list[tuple[_Counted, dict[str, int]]] = []
         position: dict[int, int] = {}
         for owner, name, n, when, registered in self._entries:
-            if registered in skip or not self._kept(when, registered, settled=settled, final=final):
+            if registered in skip or not self._kept(
+                when, registered, settled=settled, final=final, whole=whole
+            ):
                 continue
             at = position.get(id(owner))
             if at is None:
@@ -823,10 +837,13 @@ class RunContext:
             counts[name] = counts.get(name, 0) + n
         lines: list[Callable[[], None]] = []
         for line, when, registered in self._lines:
-            if registered in skip or not self._kept(when, registered, settled=settled, final=final):
+            if registered in skip or not self._kept(
+                when, registered, settled=settled, final=final, whole=whole
+            ):
                 continue
             if type(line) is _Whole:
-                lines.append(line.failed if not settled and registered == final else line.settled)
+                lost = whole and not settled and registered == final
+                lines.append(line.failed if lost else line.settled)
             else:
                 lines.append(line)
         return owners, lines
@@ -1058,7 +1075,9 @@ def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
     The context is pushed whatever else is running, so a count inside it is committed here and
     never by an enclosing run. It is its own last round and settles unless ``failed`` says
     otherwise. An ``Exception`` from ``call`` commits it as a failed run and propagates; a
-    ``BaseException`` commits nothing.
+    ``BaseException`` commits nothing. A ``When.FAILED`` count, and the whole-batch variant of a
+    line, commit nothing here: the caller is handed the round's verdict, and an event it calls
+    ``DROPPED`` must not be counted ``failed`` behind it.
 
     Args:
       call: The work to run.
@@ -1077,9 +1096,9 @@ def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
         try:
             result = call()
         except Exception:
-            _commit(*context._committed(settled=False, final=1))
+            _commit(*context._committed(settled=False, final=1, whole=False))
             raise
-        _commit(*context._committed(settled=not failed(result), final=1))
+        _commit(*context._committed(settled=not failed(result), final=1, whole=False))
         return result
     finally:
         _RUNS.reset(token)

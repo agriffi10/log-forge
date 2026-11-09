@@ -113,7 +113,9 @@ engine, where each lost event lands in `failed` once per run. The HTTP family's 
 is registered on the run context and committed when the run ends, once per request refused for
 good and once per request of the last round still retryable, and a shipped family sink is never
 resent whole by the worker, which calls its `deliver`. A third-party subclass kept on its 1.x path
-(SPEC-073 FR-004) is resent through its `emit`, and its `failed` lands again on each attempt. A third-party sink that counts
+(SPEC-073 FR-004), or a subclass of one of SPEC-074's engine sinks that overrides `emit` (SPEC-072's
+override rule), is resent through its `emit`, and its `failed` lands again on each attempt, once
+per `emit` call as in 1.x. A third-party sink that counts
 a drop before raising is outside what the library can hold to this (`MultiSink.emit` names the
 cost).
 A sink that offers `deliver` (SPEC-072) reports instead of counting: the delivery engine is the one

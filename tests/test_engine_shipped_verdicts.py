@@ -486,3 +486,47 @@ def test_marks_outside_any_run_do_nothing() -> None:
     context.refuse(Refused("x"))
     context.sink_counted({0})
     assert context._marks() == ((), None, ())
+
+
+# --- frame-2 review: the one-lock commit is all or nothing ----------------------------------------
+
+
+class _Misspelt:
+    """A sink sharing its counters' lock that registers a sub-count under a name it lacks."""
+
+    max_retries = 0
+
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()
+        self.dropped_oversized = 0
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        return self.log_foundry_counters._counter_lock
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        _engine.run_context().count(self, "dropped_oversize", 1, when=When.ALWAYS)
+        return Verdict.uniform(Outcome.REJECTED, len(batch))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+    def losses(self) -> SinkLosses:
+        return self.log_foundry_counters.losses()
+
+
+def test_a_misspelt_sub_count_commits_nothing_so_the_line_is_true(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The engine commits a sink's sub-counts with its totals in one ``Deferral``.
+
+    One that names no attribute used to leave ``failed_events`` committed while the line said
+    the whole total was not counted (invariant 11); the commit now reads every value before it
+    writes any, so the counters and the line agree.
+    """
+    sink = _Misspelt()
+    _engine.run_delivery(sink, [{"i": 0}, {"i": 1}], worker_retries=0, stop=None)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert sink.dropped_oversized == 0
+    err = capsys.readouterr().err
+    assert "(AttributeError); 2 event(s) not counted" in err, err
