@@ -267,7 +267,7 @@ def test_the_buffering_sinks_refuse_a_flush_after_close() -> None:
     """AC-10 per sink. A released transport refuses rather than being touched (SPEC-032).
 
     Asserted here per class rather than through `POST_CLOSE_BUILDERS`, whose exemption gate reads
-    `deliver`/`emit`/`send_all` only and so cannot yet judge a `flush`. Recorded as owed: until that gate
+    `deliver`/`emit` only and so cannot yet judge a `flush`. Recorded as owed: until that gate
     learns `flush`, these are what stands between a released driver and a call into it — each
     survived the whole suite as a mutant before this test existed.
 

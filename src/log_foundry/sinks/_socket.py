@@ -164,7 +164,7 @@ class SocketTransport:
     it returns, and no client object outlives it holding data.
     """
 
-    max_retries = ReadOnlyCount()
+    max_retries: ReadOnlyCount[int] = ReadOnlyCount()
 
     def __init__(
         self,

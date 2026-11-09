@@ -521,23 +521,31 @@ for both classes), not from the code under test, so a new public name fails here
 being copied into the expectation.
 """
 
+_GAINED_BY_SPEC_075 = frozenset(
+    {"deliver", "log_foundry_counters", "max_retries", "max_retry_after"}
+)
+"""What SPEC-075 FR-001 adds to both wrappers' public names, as ``ENGINE_GAINED`` does for SPEC-074.
+
+The surface only grows (invariant 10); a name beyond these two sets is still a finding.
+"""
+
 
 @pytest.mark.parametrize("kind", KINDS)
 def test_neither_wrapper_gains_a_public_name(kind: str) -> None:
     """FR-003: the count is private, so the public names equal the pre-SPEC-058 set (invariant 10).
 
     Checked after construction and again after a counted failure, so a public attribute set
-    lazily by the first commit is caught too.
+    lazily by the first commit is caught too. SPEC-075's set is named beside the 1.x one.
     """
     sink = _wrapper(kind, Recording(), fails=lambda e: e["i"] == 1)
 
     def public() -> set[str]:
         return {name for name in dir(sink) if not name.startswith("_")}
 
-    assert public() == _PUBLIC_AT_324936E
+    assert public() == _PUBLIC_AT_324936E | _GAINED_BY_SPEC_075
     sink.emit([_ev(0), _ev(1)])
     assert sink.losses() == SinkLosses(dropped=1, failed=0), "the failure was counted"
-    assert public() == _PUBLIC_AT_324936E
+    assert public() == _PUBLIC_AT_324936E | _GAINED_BY_SPEC_075
 
 
 def test_a_parked_commit_loses_no_increment(monkeypatch: pytest.MonkeyPatch) -> None:

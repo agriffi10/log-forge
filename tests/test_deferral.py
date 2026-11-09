@@ -2599,3 +2599,61 @@ _RUN_CONTEXT_CORPUS: dict[str, tuple[str, list[str]]] = {
 def test_the_run_context_count_check_reports_what_it_claims_to(case: str) -> None:
     source, expected = _RUN_CONTEXT_CORPUS[case]
     assert run_context_count_findings("m.py", source, {"dropped_oversized"}) == expected
+
+
+# --- SPEC-075 FR-002: the wrappers' deliver writes nothing itself -------------------------------
+
+
+def _plant_first_in(source: str, cls_name: str, method: str, line: str) -> tuple[str, int]:
+    """``source`` with ``line`` planted first in ``cls_name.method``'s body, after its docstring.
+
+    The line goes at the body's own indentation and its number is read from the parsed tree, so
+    an edit above the method moves the expectation with it.
+    """
+    cls = _class(ast.parse(source), cls_name)
+    assert cls is not None, f"{cls_name} is gone"
+    fn = _methods(cls).get(method)
+    assert fn is not None and len(fn.body) > 1, f"{cls_name}.{method} has moved"
+    first = fn.body[1]
+    lines = source.splitlines(keepends=True)
+    planted = [" " * first.col_offset + part + "\n" for part in line.split("\n")]
+    lines[first.lineno - 1 : first.lineno - 1] = planted
+    return "".join(lines), first.lineno
+
+
+def test_a_dropped_store_planted_in_filtering_deliver_is_named() -> None:
+    """SPEC-075 FR-002: ``FilteringSink.deliver`` counts only through the run context.
+
+    A ``self._dropped += 1`` there would count a failed event on every round of a run and in a
+    run that fails; the dropped-counter check names the module, the line, the method and the path.
+    """
+    sources = _tree_sources()
+    planted, line = _plant_first_in(
+        sources["sinks/filtering.py"], "FilteringSink", "deliver", "self._dropped += 1"
+    )
+    named = (
+        f"sinks/filtering.py:{line}: FilteringSink.deliver stores self._dropped, which a losses() "
+        f"reports as dropped; count it through the calling emit's Deferral"
+    )
+    assert dropped_store_findings("sinks/filtering.py", planted, _tree_counters(sources)) == [named]
+
+
+def test_a_deferral_planted_in_transform_deliver_is_named() -> None:
+    """SPEC-075 FR-002: ``TransformSink.deliver`` enters no ``Deferral``; the construction rule says so.
+
+    A ``Deferral`` belongs to ``emit`` alone, so one built in ``deliver`` is a finding naming its
+    line, whatever its body.
+    """
+    sources = _tree_sources()
+    planted, line = _plant_first_in(
+        sources["sinks/transform.py"], "TransformSink", "deliver", "with Deferral(self):\n    pass"
+    )
+    findings = deferral_findings(
+        "sinks/transform.py", planted, DEFERRING_SITES.get("sinks/transform.py"), IMMEDIATE, set()
+    )
+    assert findings == [
+        (
+            f"sinks/transform.py:{line}: Deferral(...) built outside a `with` item in an emit; "
+            f"one call's pending drops must stay local to that call"
+        )
+    ]

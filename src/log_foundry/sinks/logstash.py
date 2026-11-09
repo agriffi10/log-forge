@@ -5,14 +5,24 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Unpack
 
+from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._args import ReadOnlyCount, ReadOnlySeconds
+from log_foundry.sinks._engine import emit_via_deliver
+from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
+from log_foundry.sinks._wrapper import (
+    ForwardedStopSignal,
+    copy_budget,
+    current_deliver,
+    offered_counters,
+)
+from log_foundry.sinks.base import SinkLosses
+from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink, _valid_url
+from log_foundry.sinks.verdict import SinkCounters
+
 if TYPE_CHECKING:
     import threading
 
-from log_foundry import _lifecycle
-from log_foundry.sinks._engine import emit_via_deliver
-from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
-from log_foundry.sinks.base import SinkLosses
-from log_foundry.sinks.http import HTTPAuthKwargs, HTTPSink, _valid_url
+    from log_foundry.sinks.verdict import Verdict
 
 __all__ = ["LogstashSink"]
 
@@ -78,7 +88,35 @@ class LogstashSink:
     It keeps **no** client buffer (SPEC-036 FR-002): each ``emit`` hands its bytes to the
     socket before it returns, and no client object outlives it holding data. What the *network*
     then does with a datagram is not something a flush could hurry.
+
+    **It delegates** :meth:`deliver` **to whichever backend offers it** (SPEC-075 FR-003). It
+    decides nothing per event in either mode, so it is a pure delegate: its verdict is the
+    backend's, unmapped. In socket mode the backend is the ``SocketTransport``, which defines
+    ``deliver`` and deliberately no ``emit``, so SPEC-072's probe never offers it; this sink
+    offers on the transport's counters from construction and calls the transport's ``deliver``
+    directly, as ``SyslogSink`` does over the same transport. In HTTP mode it offers when the
+    probe offers the ``HTTPSink``'s ``deliver`` at construction. Either way
+    ``log_foundry_counters`` is the backend's own object, so the engine's totals, and every count
+    the backend registers through the run context under its own name, land exactly where a run
+    through the bare backend puts them, and the unchanged :meth:`losses` and :attr:`failed`
+    report it. A socket-mode batch the worker delivers therefore runs through the engine inside
+    SPEC-062's per-round prediction, and a lost event is counted once per batch rather than once
+    per worker attempt.
+
+    Attributes:
+      log_foundry_counters: The backend's own counters when it offers ``deliver``, else
+        ``None``, fixed at construction.
+      log_foundry_stop_signal: The worker's shutdown event, stored where the engine reads it
+        statically and forwarded to the backend.
+      max_retries: The backend's ``max_retries``, copied at construction, read-only; ``None``
+        when this sink offers nothing.
+      max_retry_after: The HTTP backend's ``max_retry_after``, copied and read-only as
+        ``max_retries`` is; ``None`` in socket mode, whose transport has none.
     """
+
+    log_foundry_stop_signal = ForwardedStopSignal()
+    max_retries: ReadOnlyCount[int | None] = ReadOnlyCount()
+    max_retry_after = ReadOnlySeconds()
 
     def __init__(
         self,
@@ -195,7 +233,20 @@ class LogstashSink:
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")
-        self._stop_signal: threading.Event | None = None
+        vars(self)["log_foundry_stop_signal"] = None
+        backend: HTTPSink | SocketTransport | None = None
+        if self._socket is not None:
+            counters = self._socket.log_foundry_counters
+            if type(counters) is SinkCounters:
+                backend = self._socket
+                self.log_foundry_counters: SinkCounters | None = counters
+            else:
+                self.log_foundry_counters = None
+        else:
+            self.log_foundry_counters = offered_counters(self._http)
+            if self.log_foundry_counters is not None:
+                backend = self._http
+        copy_budget(self, backend)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Sends the batch over the configured backend (FR-005).
@@ -228,6 +279,41 @@ class LogstashSink:
         else:
             assert self._socket is not None  # noqa: S101
             emit_via_deliver(self._socket, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Hands the round to the backend's ``deliver`` and returns its verdict (SPEC-075 FR-003).
+
+        The verdict is the backend's own object, unmapped: this sink decides nothing per event.
+        In socket mode it is the transport's ``deliver``; in HTTP mode the ``HTTPSink``'s, taken
+        through the probe again on every call, so an ``HTTPSink`` whose counters were replaced
+        since construction is refused rather than counted into two objects.
+
+        Args:
+          batch: The events. The list is not mutated.
+
+        Returns:
+          The backend's verdict.
+
+        Raises:
+          TypeError: When this sink offers no ``deliver`` (its backend offered none at
+            construction), naming this class; or when the HTTP backend stopped offering since,
+            naming its type.
+          Exception: Whatever the backend's ``deliver`` raises, unchanged.
+        """
+        if self.log_foundry_counters is None:
+            raise TypeError(
+                f"{_diag._STR_STR(_diag._STORED_NAME(type(self)))} offers no deliver: its backend "
+                "offered none at construction"
+            )
+        if self._socket is not None:
+            return self._socket.deliver(batch)
+        deliver = current_deliver(self._http, self.log_foundry_counters)
+        if deliver is None:
+            raise TypeError(
+                f"{_diag._STR_STR(_diag._STORED_NAME(type(self._http)))} no longer offers "
+                "deliver with the counters its LogstashSink holds"
+            )
+        return deliver(batch)
 
     def _frame(self, event: dict[str, object]) -> bytes:
         """Frames one event as a newline-terminated UTF-8 JSON line for the socket.
@@ -268,29 +354,15 @@ class LogstashSink:
         elif self._socket is not None:
             self._socket.close()
 
-    @property
-    def log_foundry_stop_signal(self) -> threading.Event | None:
-        """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
-
-        The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
-        where the waiting happens. Without the forward the attribute is set on an object that
-        never waits, and the backoff one level down stays uninterruptible — which is the whole
-        defect, moved rather than fixed.
-
-        Args:
-          None.
-
-        Returns:
-          The stop signal, or ``None`` if none was offered.
-
-        Raises:
-          None.
-        """
-        return self._stop_signal
-
-    @log_foundry_stop_signal.setter
-    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
+    def _forward_stop_signal(self, signal: threading.Event | None) -> None:
         """Forwards the stop signal to the active backend.
+
+        The worker sets ``log_foundry_stop_signal`` on the configured sink (SPEC-027 FR-002).
+        The engine's rounds over this sink read it from here, but the HTTP backend's own
+        ``emit`` and the socket transport's inline engine wait too, on the 1.x path, so the
+        signal is handed on to whichever backend is held.
+        :class:`~log_foundry.sinks._wrapper.ForwardedStopSignal` has already stored it where the
+        engine's static read finds it.
 
         Args:
           signal: The worker's shutdown event, or ``None``.
@@ -301,7 +373,6 @@ class LogstashSink:
         Raises:
           None.
         """
-        self._stop_signal = signal
         if self._http is not None:
             self._http.log_foundry_stop_signal = signal
         elif self._socket is not None:

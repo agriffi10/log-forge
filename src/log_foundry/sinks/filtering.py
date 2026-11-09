@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _lifecycle
-from log_foundry.sinks._args import require_callable
+from log_foundry.sinks import _engine
+from log_foundry.sinks._args import ReadOnlyCount, ReadOnlySeconds, require_callable
 from log_foundry.sinks._deferral import Deferral, wrapped_losses
+from log_foundry.sinks._wrapper import (
+    ForwardedStopSignal,
+    copy_budget,
+    current_deliver,
+    map_forwarded,
+    offered_counters,
+)
 from log_foundry.sinks.base import flush_sink, read_losses
+from log_foundry.sinks.verdict import Outcome, Verdict
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,7 +54,32 @@ class FilteringSink:
     did not forward would leave a buffering child unreachable through ``log_foundry.flush()``
     while looking fine — the SPEC-027 lesson about ``log_foundry_stop_signal``, that a signal
     stopped at a wrapper reaches nothing and moves the defect rather than fixing it.
+
+    **It offers** :meth:`deliver` **exactly when the inner sink does** (SPEC-075 FR-001), decided
+    once at construction by SPEC-072's probe. When it offers, ``log_foundry_counters`` is the
+    inner sink's own ``SinkCounters`` object, so the engine's totals for a run through this
+    wrapper land exactly where the bare inner sink's would, and ``max_retries`` and
+    ``max_retry_after`` are the inner sink's, copied statically, so a wrapped engine sink gets
+    the rounds it gets alone. It declares no idempotence, so nothing is resent through it that
+    would re-run the predicate on an event that may have landed. Over an emit-only inner sink,
+    a ``MultiSink``, a third-party wrapper or a ``__getattr__`` proxy it offers nothing and the
+    worker calls :meth:`emit`, its 1.x body, unchanged. A subclass that overrides ``emit`` is not
+    offered ``deliver`` either, so its ``emit`` runs.
+
+    Attributes:
+      log_foundry_counters: The inner sink's own counters when it offers ``deliver``, else
+        ``None``, fixed at construction.
+      log_foundry_stop_signal: The worker's shutdown event, stored where the engine reads it
+        statically and forwarded to the inner sink.
+      max_retries: The inner sink's ``max_retries`` as found at construction, read-only; ``None``
+        when this wrapper offers nothing or the inner sink has none.
+      max_retry_after: The inner sink's ``max_retry_after``, copied and read-only as
+        ``max_retries`` is.
     """
+
+    log_foundry_stop_signal = ForwardedStopSignal()
+    max_retries: ReadOnlyCount[int | None] = ReadOnlyCount()
+    max_retry_after = ReadOnlySeconds()
 
     def __init__(
         self,
@@ -71,7 +105,9 @@ class FilteringSink:
         """
         require_callable(predicate, "predicate", type(self).__name__)
         self._inner = inner
-        self._stop_signal: threading.Event | None = None
+        vars(self)["log_foundry_stop_signal"] = None
+        self.log_foundry_counters = offered_counters(inner)
+        copy_budget(self, inner if self.log_foundry_counters is not None else None)
         self._predicate = predicate
         self._min_rank: int | None = None
         self._counter_lock = threading.Lock()
@@ -136,6 +172,113 @@ class FilteringSink:
             if kept:
                 self._inner.emit(kept)
 
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Filters one round and forwards the rest to the inner sink's ``deliver`` (SPEC-075).
+
+        One round, as every shipped engine sink's ``deliver`` is: inside an engine run it is
+        part of that run, and a direct call outside one is a one-round run of its own whose
+        count commits only if its verdict settles. :meth:`_round` says what the round does.
+
+        Args:
+          batch: The events. The list is not mutated.
+
+        Returns:
+          One outcome per event of ``batch``.
+
+        Raises:
+          TypeError: When this wrapper offers no ``deliver`` (its inner sink offered none at
+            construction), naming this class; or when the inner sink stopped offering since,
+            naming the inner sink's type.
+          Exception: Whatever the inner sink's ``deliver`` raises, unchanged.
+        """
+        if self.log_foundry_counters is None:
+            raise TypeError(
+                f"{_diag._STR_STR(_diag._STORED_NAME(type(self)))} offers no deliver: its inner "
+                "sink offered none at construction"
+            )
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Gives every event of the batch one outcome: its own decision, or the inner sink's.
+
+        The 1.x per-event step runs first, each event under its own guard: the predicate, then
+        the level floor. A declined event is ``SKIPPED`` and counted nowhere, since declining is
+        the configuration working. An event the predicate failed on is ``SKIPPED`` too, and the
+        failures are registered against this wrapper's ``_dropped`` through the run context,
+        ``SETTLED``, so they land under its own counter lock only if the run settles — SPEC-058's
+        count at SPEC-058's moment. ``SKIPPED`` rather than ``DROPPED``, because the engine would
+        commit a ``DROPPED`` into the shared counters, which the inner sink's ``losses()``
+        reports and this wrapper's adds its own count to, so the event would be counted twice.
+
+        When the predicate failed on every event, nothing is forwarded and the batch is
+        ``REJECTED`` with the first exception as the run context's refusal marker (SPEC-074), so
+        the run fails at once and its catcher owns it, and no sink counter moves — the caller's
+        code is not something any sink declared retryable. A call with any failure writes one
+        ``absorbed`` line at once, naming this class, the first exception's type and how many
+        events were not forwarded, never a value; it is not registered with the run context,
+        because a registered line suppresses the engine's own settled line for the whole run.
+
+        The kept events go to the inner sink's ``deliver``, taken again on every round, as one
+        list in batch order, through the run context's ``delegate``, which moves any mark the
+        inner round registered into this batch's positions. Its verdict is mapped back to those
+        positions: a malformed one turns them ``UNKNOWN``. An exception from it propagates
+        unchanged, and so the engine applies SPEC-072's rule to it as it would to the bare inner
+        sink's. When nothing is kept the inner sink is not called. Nothing here takes a lock,
+        enters a ``Deferral`` or stores an attribute, so concurrent calls share nothing
+        (SPEC-028).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          One outcome per event of ``batch``, with the inner sink's hint.
+
+        Raises:
+          TypeError: When the inner sink no longer offers ``deliver`` with the counters this
+            wrapper holds, naming its type.
+          Exception: Whatever the inner sink's ``deliver`` raises, unchanged.
+        """
+        deliver = current_deliver(self._inner, self.log_foundry_counters)
+        if deliver is None:
+            raise TypeError(
+                f"{_diag._STR_STR(_diag._STORED_NAME(type(self._inner)))} no longer offers "
+                "deliver with the counters its wrapper holds"
+            )
+        outcomes = [Outcome.SKIPPED] * len(batch)
+        kept: list[dict[str, object]] = []
+        positions: list[int] = []
+        declined = False
+        failures = 0
+        first: Exception | None = None
+        for index, event in enumerate(batch):
+            try:
+                passes = self._passes(event)
+            except Exception as err:
+                failures += 1
+                first = first if first is not None else err
+                continue
+            if passes:
+                kept.append(event)
+                positions.append(index)
+            else:
+                declined = True
+        context = _engine.run_context()
+        if first is not None:
+            _diag.absorbed(
+                "filtering a batch",
+                first,
+                f"{_diag._STR_STR(_diag._STORED_NAME(type(self)))} did not forward "
+                f"{failures} event(s) its predicate failed on",
+            )
+            if not kept and not declined:
+                context.refuse(first)
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context.count(self, "_dropped", failures, when=_engine.When.SETTLED)
+        hint: object = None
+        if kept:
+            hint = map_forwarded(context.delegate(deliver, kept, positions), positions, outcomes)
+        return Verdict(outcomes=tuple(outcomes), retry_after=cast("float | None", hint))
+
     def _passes(self, event: dict[str, object]) -> bool:
         """Reports whether an event clears the predicate and the minimum level.
 
@@ -161,29 +304,15 @@ class FilteringSink:
                 return False
         return True
 
-    @property
-    def log_foundry_stop_signal(self) -> threading.Event | None:
-        """The worker's shutdown event, forwarded to whatever actually holds the retry loop.
+    def _forward_stop_signal(self, signal: threading.Event | None) -> None:
+        """Forwards the stop signal to the inner sink, which is where the waiting happens.
 
-        The worker sets this on the configured sink (SPEC-027 FR-002), and a wrapper is not
-        where the waiting happens. Without the forward the attribute is set on an object that
-        never waits, and the backoff one level down stays uninterruptible — which is the whole
-        defect, moved rather than fixed.
-
-        Args:
-          None.
-
-        Returns:
-          The stop signal, or ``None`` if none was offered.
-
-        Raises:
-          None.
-        """
-        return self._stop_signal
-
-    @log_foundry_stop_signal.setter
-    def log_foundry_stop_signal(self, signal: threading.Event | None) -> None:
-        """Forwards the stop signal to the inner sink.
+        The worker sets ``log_foundry_stop_signal`` on the configured sink (SPEC-027 FR-002).
+        The engine's rounds over this wrapper read it from here, but the inner sink's own
+        ``emit`` waits too, on the 1.x path. Without the forward that backoff one level down
+        stays uninterruptible — which is the whole defect, moved rather than fixed.
+        :class:`~log_foundry.sinks._wrapper.ForwardedStopSignal` has already stored the signal
+        where the engine's static read finds it.
 
         Args:
           signal: The worker's shutdown event, or ``None``.
@@ -194,7 +323,6 @@ class FilteringSink:
         Raises:
           None.
         """
-        self._stop_signal = signal
         try:
             self._inner.log_foundry_stop_signal = signal  # type: ignore[attr-defined]
         except Exception as err:

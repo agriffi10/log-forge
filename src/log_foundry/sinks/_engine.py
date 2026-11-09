@@ -407,6 +407,27 @@ class _Marks(NamedTuple):
     counted: tuple[object, ...]
 
 
+def _moved(index: object, positions: Sequence[int]) -> object:
+    """Moves one wrapped sink's mark into its wrapper's positions, keeping an invalid one invalid.
+
+    Args:
+      index: The mark as the wrapped sink registered it.
+      positions: For each forwarded event, its index in the wrapper's batch.
+
+    Returns:
+      ``positions[index]`` for an exact ``int`` in range; a non-``int`` as given; else ``-1``,
+      which no verdict accepts.
+
+    Raises:
+      None.
+    """
+    if type(index) is not int:
+        return index
+    if 0 <= index < len(positions):
+        return positions[index]
+    return -1
+
+
 class RunContext:
     """One engine run's counts and lines, committed once when the run ends (SPEC-073 FR-002).
 
@@ -700,6 +721,43 @@ class RunContext:
         """
         if not self._immediate:
             self._counted.extend(indices)
+
+    def delegate(
+        self,
+        deliver: Callable[[list[dict[str, object]]], object],
+        forwarded: list[dict[str, object]],
+        positions: Sequence[int],
+    ) -> object:
+        """Runs a wrapped sink's round for a wrapper, moving its marks into the wrapper's positions.
+
+        A round marks positions of the batch it was handed (:meth:`final_rejections`,
+        :meth:`sink_counted`), and the engine checks each mark against the verdict of the run's
+        own sink. When a wrapper forwards part of its batch, the run's sink is the wrapper and
+        the marked positions are the wrapped sink's, so every mark the call registers is
+        rewritten through ``positions`` before the wrapper builds its verdict (SPEC-075 FR-002):
+        the wrapped sink's index ``i`` becomes ``positions[i]``. An index that is not an exact
+        ``int`` in range of ``positions`` stays invalid — a non-``int`` as given, any other as
+        ``-1`` — so a round the bare sink's engine would fail still fails. Nothing is rewritten
+        when the call raises: the engine then fails the round's events whatever its marks say.
+        An immediate context keeps no marks, so it only calls.
+
+        Args:
+          deliver: The wrapped sink's bound ``deliver``.
+          forwarded: The events the wrapper forwards, in its own order.
+          positions: For each forwarded event, its index in the wrapper's batch.
+
+        Returns:
+          What ``deliver`` returned, unread.
+
+        Raises:
+          Exception: Whatever ``deliver`` raises, unchanged.
+          BaseException: Whatever ``deliver`` raises that is not an ``Exception``.
+        """
+        final, counted = len(self._final), len(self._counted)
+        verdict = deliver(forwarded)
+        self._final[final:] = [_moved(index, positions) for index in self._final[final:]]
+        self._counted[counted:] = [_moved(index, positions) for index in self._counted[counted:]]
+        return verdict
 
     def _marks(self) -> _Marks:
         """Returns the marks the round in progress registered, unvalidated.

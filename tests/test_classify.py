@@ -332,13 +332,18 @@ def retry_loop_findings(
     return loops, findings
 
 
+_WRAPPER_REASON = (
+    "SPEC-075's wrapper: its emit is a 1.x body, its losses() is a 1.x formula, and its deliver "
+    "catches nothing"
+)
+
 ENGINE_EXCLUSIONS: dict[str, str] = {
     "HTTPSink": "its classification is SPEC-073's, held by http_engine_findings",
     "NATSSink": "declares no predicate (SPEC-070); a publish that raised takes FR-004's outcome",
     "SyslogSink": "forwards deliver to its SocketTransport, which is judged instead",
-    "FilteringSink": "SPEC-075's wrapper, named for when it gains deliver",
-    "TransformSink": "SPEC-075's wrapper, named for when it gains deliver",
-    "LogstashSink": "SPEC-075's wrapper, named for when it gains deliver",
+    "FilteringSink": _WRAPPER_REASON,
+    "TransformSink": _WRAPPER_REASON,
+    "LogstashSink": _WRAPPER_REASON,
 }
 """Classes defining ``deliver`` that the restated loop roster passes over, each with its reason."""
 
@@ -487,6 +492,20 @@ def test_removing_an_exclusion_reddens_naming_the_class() -> None:
     exclusions = {k: v for k, v in ENGINE_EXCLUSIONS.items() if k != "SyslogSink"}
     _, findings = engine_round_findings(_SINKS, exclusions)
     assert any("SyslogSink" in f and "defines no _retryable_error" in f for f in findings), findings
+
+
+@pytest.mark.parametrize("wrapper", ["FilteringSink", "TransformSink", "LogstashSink"])
+def test_removing_a_wrapper_exclusion_reddens_naming_it(wrapper: str) -> None:
+    """SPEC-075 FR-001: each wrapper now defines ``deliver``, so its exclusion is load-bearing.
+
+    Before SPEC-075 no wrapper defined ``deliver`` and removing the entry changed nothing; now the
+    roster names the class, and the population with every exclusion in place stays eleven.
+    """
+    exclusions = {k: v for k, v in ENGINE_EXCLUSIONS.items() if k != wrapper}
+    owners, findings = engine_round_findings(_SINKS, exclusions)
+    assert wrapper in owners
+    assert any(wrapper in f and "defines no _retryable_error" in f for f in findings), findings
+    assert len(engine_round_findings(_SINKS)[0]) == 11
 
 
 _CORPUS_HEAD = '"""A fixture sink module."""\n\nfrom x import is_retryable\n\n'

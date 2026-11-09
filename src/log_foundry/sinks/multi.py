@@ -85,10 +85,21 @@ class MultiSink:
         owns the batch; the old rule counted a silent child at catch time even then, so the
         worker's retries counted the same batch once per attempt. Three costs are accepted, all
         in ``losses().failed``, the upper-bound term: a reporting child that had already counted
-        its own failures before raising is counted twice; a third-party sink that counts a drop
+        its own failures before raising is counted twice — an engine child among them (SPEC-075
+        FR-004), whose ``emit`` is SPEC-072's adapter and commits a failed run's events into its
+        own ``failed`` before it raises, as 1.x ``HTTPSink`` did; a third-party sink that counts a drop
         before raising is counted once in its own ``dropped`` and once here — no shipped sink
         does, since SPEC-059 deferred the last of them; and a raising wrapper child is charged
         its whole batch, including the events it chose not to forward.
+
+        **An engine child's rounds run inside this one call** (SPEC-075 FR-004). This class offers
+        no ``deliver`` — it cannot give one verdict for an event one child took and another
+        refused — so the worker calls this ``emit``, and this calls each child's ``emit``, never a
+        child's ``deliver``, even a wrapper child's that offers one. An engine child's ``emit``
+        runs its engine inline, with its own budget and the stop signal forwarded to it, and to
+        the worker's shutdown prediction the whole fan-out is still one attempt. A child whose run
+        settled — a partial, ``UNKNOWN`` or malformed outcome included — returns and is counted
+        nothing here; its drops are its own, committed once per run however many rounds it made.
 
         Partial success stays isolated: a retry there would re-deliver the batch to the children
         that already took it, and duplicates are worse than the one failure already counted on

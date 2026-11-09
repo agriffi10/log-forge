@@ -69,7 +69,7 @@ class SyslogSink:
       max_retries: The floored constructor value, read-only (SPEC-074 FR-006).
     """
 
-    max_retries = ReadOnlyCount()
+    max_retries: ReadOnlyCount[int] = ReadOnlyCount()
 
     def __init__(
         self,
