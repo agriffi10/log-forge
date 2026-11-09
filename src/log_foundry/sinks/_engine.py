@@ -626,8 +626,7 @@ class RunContext:
         ``counted_only`` says the line names only events this round marked
         :meth:`sink_counted`, which the engine's settled line never names, so the line owns no
         other loss of its round (:meth:`_lined`). Without it a wrapper's own loss in a round where
-        a wrapped ``NATSSink`` announced its sink-counted publishes was counted and never named
-        (the frame-2 and frame-3 reviews of fix/settled-line-fixes).
+        a wrapped ``NATSSink`` announced its sink-counted publishes was counted and never named.
 
         Args:
           line: Called with no arguments once the counts are committed, outside every lock.
@@ -1044,7 +1043,8 @@ class RunContext:
           final: The run's last round.
 
         Returns:
-          ``(lined, last)``: the rounds with any kept line, and those with a kept ``LAST`` line.
+          ``(lined, last)``: the rounds with any kept line, and those with a kept ``LAST`` or
+          ``SETTLED_LAST`` line, ``counted_only`` lines left out of both.
 
         Raises:
           None.
@@ -1556,8 +1556,9 @@ def _run(
     event that ended rejected, unresolved, raised or unknown, and ``dropped_events`` the dropped
     ones only when the run settled, since a failed run's drops belong to its catcher. A settled
     run's loss is announced in ``_diag.lost`` lines naming counts and the deciding round, one per
-    round that decided a loss, after the commit; then each distinct exception type that escaped ``deliver`` gets one ``absorbed`` line,
-    record first, announce second, by type and never by text.
+    round that decided a loss, after the commit; then each distinct exception type that escaped
+    ``deliver`` gets one ``absorbed`` line, record first, announce second, by type and never by
+    text.
 
     **The run's context** (SPEC-073 FR-002) is pushed onto :data:`_RUNS` for the whole run and
     popped in a ``finally``, so a round reads its own :func:`run_context` and a run nested inside
@@ -1573,9 +1574,10 @@ def _run(
     lines. The key is the round, the engine's form of the HTTP round's chunk key, because a line
     carries no event identity to count against: a round that announces some of its losses owns
     the rest. A line registered ``counted_only`` names only events the sink counted, which this
-    line never names, and owns nothing (:meth:`RunContext._lined`). An event the round left resendable — ``RETRYABLE``, or ``UNKNOWN`` for an
-    idempotent sink — is a loss only because the run ended on that round, so only a ``LAST``
-    line the round registered for that ending owns it. A round whose verdict the engine set
+    line never names, and owns nothing (:meth:`RunContext._lined`). An event the round left
+    resendable — ``RETRYABLE``, or ``UNKNOWN`` for an idempotent sink — is a loss only because
+    the run ended on that round, so only a ``LAST`` or ``SETTLED_LAST`` line the round
+    registered for that ending owns it. A round whose verdict the engine set
     aside — one that raised, could not be read, or marked an index its outcome does not fit —
     owns nothing, and what it registered on the run context is discarded (:meth:`RunContext._rewind`),
     as the HTTP round's hook guard discards a faulting hook's: the engine, not the round,

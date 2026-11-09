@@ -823,12 +823,13 @@ class NATSSink:
         ``SETTLED_LAST``: only when the run settles on this round, since a later round resends
         it. Before, nothing counted or named it. Every line of such a round names only events it
         marked sink-counted, so each is registered ``counted_only`` and owns no other loss of the
-        round — a wrapper's own losses beside it are still the engine's to name. Something published: the
-        engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers 1.x's lines in
-        1.x's order — each raised publish, the unattempted remainder, an abandoned publish
-        counted where it was abandoned, and an unanswered confirmation. The last two announce
-        ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that resends
-        an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per run.
+        round — a wrapper's own losses beside it are still the engine's to name. Something
+        published: the engine counts the ``REJECTED`` and ``UNKNOWN`` events, and this registers
+        1.x's lines in 1.x's order — each raised publish, the unattempted remainder, an abandoned
+        publish counted where it was abandoned, and an unanswered confirmation. The last two
+        announce ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that
+        resends an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per
+        run.
 
         Args:
           published: The round's publishes.
