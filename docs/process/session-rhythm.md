@@ -3,7 +3,8 @@
 This is the operating loop, start to finish. It loads with CLAUDE.md at launch, so it is read every
 session by mechanism rather than by instruction. It is the **one** copy of this procedure:
 CLAUDE.md's *Session Workflow* points here rather than restating it, and keeps only what is not a
-step — the review gate, delegation, the multi-session rules. **If this file and CLAUDE.md ever
+step: delegation, the review gate, spec size, the multi-session rules, completion and the doc-size
+guardrail. **If this file and CLAUDE.md ever
 disagree, CLAUDE.md wins** — fix the drift here in the same session you notice it.
 
 **Start of session**
@@ -48,7 +49,7 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that
   linter, the shared frontmatter reader or the index generator — plus `sh scripts/pr-queue-test.sh` if you touched the queue or its hook, and
   `sh scripts/pr-queue/install-test.sh` if you touched its installer.
-  **The last two are in that set and nothing in CI runs either.** They are a pre-push step — don't
+  **`docs-lint.sh` and `docstring-lint.py` are in that set and nothing in CI runs either.** They are a pre-push step — don't
   push red and leave CI to discover it. **`ruff format` is deliberately NOT a gate here** — the repo
   is not clean under it and running it over a directory rewrites files your change never touched
   (`operational-traps.md`). Format only the files you edited.
