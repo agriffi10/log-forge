@@ -95,19 +95,19 @@ cd "$ROOT"
 # BOTH RE-DERIVED AT THE DEDUPLICATION CUT, which took the start, gates and landing procedure out
 # of CLAUDE.md's Session Workflow (session-rhythm.md is now its one copy) and the evidence
 # narratives out of the rhythm into reviewer-contract.md and operational-traps.md. The set was
-# 37758 against the old 38000 at `44db79a6`, the parent of the cut; the cut took nearly five
-# kilobytes from it and over two and a half from CLAUDE.md, so the old caps (38000, 21000) would
-# each have sat about five kilobytes above the file or set it governs — the cap-that-cannot-fire
-# trap the paragraph above describes. Each run's success line prints today's measurement against each cap.
+# 37758 against the old 38000 at `44db79a6`, the parent of the cut; the cut took over four
+# kilobytes from it and over two from CLAUDE.md, so the old caps (38000, 21000) would each have sat
+# about five kilobytes above the file or set it governs — the cap-that-cannot-fire trap the
+# paragraph above describes. Each run's success line prints today's measurement against each cap,
+# which is why no measurement after the cut is restated here.
 #
-# The set carries about two kilobytes: room for one paragraph the size of CLAUDE.md's *Review*
-# paragraph, the longest in the Session Workflow at about 1.4 KB, with about half a kilobyte to
-# spare, and not for a second, so the change after that one must cut something first. CLAUDE.md carries a
-# little over one kilobyte,
-# deliberately LESS than the set's room, so that growth in CLAUDE.md alone — where accretion
-# historically happened, a Specs section appended one spec at a time — fires its own cap before it
-# spends the room the rhythm and the router share. Were the two caps given the same room, this one
-# could fire FIRST only when the imports had shrunk, and would be a fence in name only.
+# The set's cap leaves room for one paragraph the size of CLAUDE.md's *Review* paragraph, the
+# longest in the Session Workflow at about 1.4 KB, and not for a second, so the change after that
+# one must cut something first. CLAUDE.md's leaves about one kilobyte, deliberately LESS than the
+# set's room, so that growth in CLAUDE.md alone — where accretion historically happened, a Specs
+# section appended one spec at a time — fires its own cap before it spends the room the rhythm and
+# the router share. Were the two caps given the same room, this one could fire FIRST only when the
+# imports had shrunk, and would be a fence in name only.
 CLAUDE_MAX_BYTES=17000
 ALWAYS_LOADED_MAX_BYTES=35000
 
