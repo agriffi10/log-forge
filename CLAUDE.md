@@ -117,13 +117,11 @@ pyproject.toml` after. Always `git diff pyproject.toml` before committing.
 
 ## Specs
 
-Status: each spec's frontmatter (`@docs/specs/index.yaml` is generated from it); what each spec shipped: `@docs/spec-delivery/`; which release
+Status, and what is in flight: each spec's frontmatter (`@docs/specs/index.yaml` is generated from it); what each spec shipped: `@docs/spec-delivery/`; which release
 carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@docs/implementation-guide.md`.
 **This section carries only what is live and recorded nowhere else** — when a spec closes, prune here
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
 loads every session — `561a9f6` cut the Specs section this file had accumulated.
-
-**Current work:** none in flight.
 
 ## Key Decisions (settled — don't re-litigate)
 

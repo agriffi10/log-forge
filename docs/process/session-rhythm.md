@@ -17,6 +17,7 @@ disagree, CLAUDE.md wins** — fix the drift here in the same session you notice
    `origin/main`, never the shared checkout — and set the spec's frontmatter `spec_status: In Progress` and
    regenerate the index in the same commit — that transition is what makes "exactly one spec in flight" (`spec-lifecycle.md`) legible
    to the next session, and nothing gates it, so it is missed by being skipped rather than by failing.
+   A delegated implementer builds from that commit's SHA on a branch of its own (`agent-roles.md`).
 5. **Generate and validate a plan before writing code.** Turn the spec's Implementation Phases into a
    concrete implementation plan, then validate it against the spec — every FR + acceptance criterion is
    covered, reuse from `component-inventory.md` is used, and nothing out of scope crept in. The plan —
@@ -44,6 +45,9 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   is the point of no return for the review, as the merge is for CI. **Green CI is not a review** —
   why pushing first inverts the gate, and the green merge that proved it: `reviewer-contract.md` →
   *The review gates the push, not the merge*.
+- **Once the phases are built, run the completion ritual (`completion-ritual.md`) on this branch**,
+  before the gates and the two diff reviews, so the reviewers see its edits and they land in the
+  spec's own squash merge.
 - Before pushing, run **this repo's six gates** locally and get them green: `poetry run ruff check .`,
   `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
   `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that
@@ -118,8 +122,8 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   `gh pr view <n> --json headRefOid,statusCheckRollup` returns the sha and the checks against it in
   one call, and the shipped `.claude/settings.json` covers it where `gh api` is not.
 - **`main` is always watched.** After any merge, confirm `main`'s build went green. If `main` fails,
-  **diagnose immediately and fix it with a new PR** — a red `main` is the top priority and blocks
-  starting the next spec.
+  **diagnose immediately and fix it with a new PR**, through the queue's red-trunk path
+  (`scripts/pr-queue/PROTOCOL.md`) — a red `main` is the top priority and blocks starting the next
+  spec.
 - **Re-verify `main` is green** before starting the next spec (land before starting the next).
-- Then run the completion ritual (`completion-ritual.md`).
 

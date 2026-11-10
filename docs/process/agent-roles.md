@@ -27,6 +27,27 @@ another by its brief, its tools and its isolation, never by its model.
 *implementation*, whatever documents it also touches; a change with no code in its diff is
 *docs-only*. A review is always a `reviewer` row, whatever produced the artifact.
 
+## The implementer's branch
+
+The `implementer` and `reviewer` roles run in a worktree of their own, and that worktree is cut from
+the shared checkout's HEAD — observed to be `main`, or the parent of the caller's commit — never from
+the orchestrator's branch. Git also refuses to check out a branch another worktree holds. So the
+delegated implementer owns the branch the spec is pushed from:
+
+- The orchestrator commits the `In Progress` transition (`session-rhythm.md`, step 4) in its own
+  worktree, then briefs the implementer with that commit's exact SHA and a branch name that is the
+  implementer's own, never the orchestrator's session branch, which git would refuse. Committing
+  before delegating is enough to make the SHA reachable, because every worktree shares the repo's
+  object store.
+- The implementer creates that branch from that SHA in its own worktree (`git switch -c <name>
+  <sha>`), confirms it with `git log --oneline -1`, builds there, and names in its report the SHA
+  it started from.
+- The orchestrator runs both diff reviews against that branch's head SHA. Each reviewer is briefed
+  with the exact SHA, checks it out detached in its own worktree and confirms its tree with
+  `git log --oneline -1` before reviewing.
+- The orchestrator runs `acquire`, the push and the PR from the implementer's worktree path, because
+  the queue lock records the branch it was acquired on (`scripts/pr-queue/PROTOCOL.md`).
+
 ## Fences
 
 - **Write `model: inherit`, never omit it.** An omitted `model` falls back to

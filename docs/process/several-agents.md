@@ -33,7 +33,8 @@ order agents asked, with `main` settled and green before the next**.
   pause button.
 - **Merging needs no lock; pushing does.** A session whose CI is green can watch, merge and drop the
   ticket without the lock. Any push of an enforced branch is refused while you do not hold it, which
-  is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through. Which
+  is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through — as it
+  is for a red `main` your own merge caused, under the conditions `PROTOCOL.md` sets. Which
   branches are enforced is a per-install setting: **read `enforce-branches` in the queue directory**
   rather than assuming, and rather than re-running `install.sh` to find out, which rewrites this
   checkout's hook. A fresh install writes `.` — every branch — but an
@@ -116,8 +117,8 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   - a session ends blocked, or ends with its spec not landed by the check above;
   - a session is waiting on Andrew's answer: relay its question verbatim;
   - `main` is red: start nothing until it is green again, and ask before the chain resumes. The
-    session whose merge turned it red fixes it (`session-rhythm.md`); start a fix session only if that one
-    has ended;
+    session whose merge turned it red fixes it, through the queue's red-trunk exception
+    (`scripts/pr-queue/PROTOCOL.md`); start a fix session only if that one has ended;
   - the next spec is `In Progress` from a session this orchestrator did not start (name its branch,
     its PR and any queue lock it holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or
     depends on a spec outside the arc that is not `Completed`.

@@ -14,9 +14,12 @@ For a plan: turn the spec's Implementation Phases into a concrete plan; validate
 (as few PRs as the dependencies allow, with the boundaries named); return both. Name every premise
 the plan rests on that nobody has checked.
 
-For a build: work the reviewed plan's phases in order, straight through. Triage emergent issues by
-kind — reversible or technical, decide and note it; product-changing or ambiguous, STOP and return
-with options and a recommendation. Get this repo's gates green: `poetry run ruff check .`,
+For a build: first create the branch your brief names from the SHA it gives, in your own worktree
+(`git switch -c <name> <sha>`), and confirm it with `git log --oneline -1` — your worktree starts
+elsewhere, and `docs/process/agent-roles.md` → *The implementer's branch* says why. Then work the
+reviewed plan's phases in order, straight through. Triage emergent issues by kind — reversible or
+technical, decide and note it; product-changing or ambiguous, STOP and return with options and a
+recommendation. Get this repo's gates green: `poetry run ruff check .`,
 `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
 `poetry run python scripts/docstring-lint.py`, plus a linter's own `-test.sh` corpus whenever you
 changed that linter, plus whatever CI will run on the branch (`.github/workflows/`) — that list is
@@ -25,5 +28,5 @@ a floor, not the set. `ruff format` is not a gate here — format only the files
 with messages that say why. Never push, never open a PR, never merge — the orchestrator owns the
 review gate and the remote.
 
-Return: the branch name, what each phase delivered, the gates' exit codes, and anything you could
-not settle.
+Return: the branch name and the SHA you started it from, what each phase delivered, the gates' exit
+codes, and anything you could not settle.

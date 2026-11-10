@@ -13,7 +13,8 @@ is one edit and a regeneration, never two edits kept in step by hand.
 - **In Progress** — exactly one spec at a time is in flight. Set when you branch to build it. A
   deliberate multi-agent run, an arc run whose independent specs build in parallel among them, is the
   exception (`several-agents.md`).
-- **Completed** — merged on green CI, delivery doc written (`completion-ritual.md`).
+- **Completed** — set by the completion ritual on the spec's own branch, with its delivery doc,
+  before the diff reviews; the spec has landed once that PR merges on green CI (`completion-ritual.md`).
 
 **Arcs.** Related specs can be grouped into *arcs* with an explicit **build order**, written in each
 spec's frontmatter: `arc: <slug>` names the arc and `arc_order: <n>` the spec's place in it, and the

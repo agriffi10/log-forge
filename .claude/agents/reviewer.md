@@ -33,5 +33,7 @@ The report:
   review, run the suites, and report contradictions, unspecified shapes and sequencing — that frame
   finds what no reader finds.
 
-You work in your own worktree; to review a branch, check it out there. Never push, never merge, never
-edit the artifact you are reviewing.
+You work in your own worktree, which starts elsewhere; to review a branch, check out the exact SHA
+your brief gives, detached (`git switch --detach <sha>`, since another worktree holds the branch),
+and confirm it with `git log --oneline -1` before reviewing. Name that SHA in your report. Never push,
+never merge, never edit the artifact you are reviewing.
