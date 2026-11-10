@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
+from conftest import join_graced
 from log_foundry import _fork, _lifecycle
 
 if TYPE_CHECKING:
@@ -257,7 +258,7 @@ def test_the_racing_shutdown_closes_the_sink_twice_when_the_orphan_branch_closes
     shutdown = threading.Thread(target=lambda: log_foundry.shutdown(timeout=5.0))
     shutdown.start()
     assert sink.in_close.wait(5.0), "the shutdown reached the orphan close having found no worker"
-    assert id(sink) not in _lifecycle._state._owed, "and discharged it before closing"
+    assert id(sink) not in _lifecycle._state._closes.owed, "and discharged it before closing"
 
     @log_foundry.trace
     def work() -> int:
@@ -267,7 +268,7 @@ def test_the_racing_shutdown_closes_the_sink_twice_when_the_orphan_branch_closes
     worker = _lifecycle._state.worker_exists()
     assert worker is not None, "the late worker was built inside the shutdown's window"
     assert _lifecycle._state._late_worker is worker, "and registered for the running shutdown"
-    assert id(sink) in _lifecycle._state._owed, "and its build re-armed the sink"
+    assert id(sink) in _lifecycle._state._closes.owed, "and its build re-armed the sink"
 
     sink.may_finish.set()
     shutdown.join(20.0)
@@ -323,7 +324,7 @@ def test_a_late_worker_that_swaps_still_closes_the_sink_it_adopted() -> None:
 
     a.may_finish.set()
     shutdown.join(20.0)
-    _lifecycle.join_closers(time.monotonic() + 5.0)
+    join_graced(5.0)
 
     assert b.closes == 1, (
         f"the sink adopted after the discharged-close claim must still be closed: {b}"
@@ -346,7 +347,7 @@ def test_a_worker_built_after_the_shutdown_returned_owns_its_sinks_close() -> No
     log_foundry.info("before the shutdown")
     log_foundry.shutdown()
     assert sink.closes == 1, "the orphan branch closed it"
-    assert id(sink) not in _lifecycle._state._owed, "and discharged it"
+    assert id(sink) not in _lifecycle._state._closes.owed, "and discharged it"
     assert _lifecycle._state._shutdown_running == 0, "and the shutdown has returned"
 
     @log_foundry.trace
@@ -356,7 +357,7 @@ def test_a_worker_built_after_the_shutdown_returned_owns_its_sinks_close() -> No
     work()
     worker = _lifecycle._state.worker_exists()
     assert worker is not None, "the sequential case still builds a live worker"
-    assert id(worker.sink) in _lifecycle._state._owed, (
+    assert id(worker.sink) in _lifecycle._state._closes.owed, (
         "a worker built outside a running shutdown owns its sink's close, so its build arms it"
     )
 
@@ -566,8 +567,15 @@ def test_a_second_shutdown_strands_and_counts_the_late_workers_next_submission()
     )
 
 
-_UNDER_LOCK_OFFENDERS = frozenset({"join_closers", "_close_owed"})
-"""Calls that must never appear inside a `with _state._lock` body.
+_UNDER_LOCK_OFFENDERS = frozenset({"join_joined", "wait_graced", "_close_owed"})
+"""Calls that must never appear inside a `with _state._lock` body, matched on the last name.
+
+SPEC-078 deleted `join_closers` and gave its work to the close registry: `wait_graced` is the
+graced wait (the bystander wait and the join of detached closes) and `join_joined` the full join
+of a shutdown's fan-out. Both are called through a receiver (`_state._closes.wait_graced(...)`),
+so the match is on the **last dotted component** of the call: the bare-name match this list had
+would have made both entries vacuous, and removing `join_closers` would have emptied half the
+list with nothing red.
 
 Every one performs or waits on a sink `close()` or on a drain. A name is added here whenever a
 helper starts wrapping one, because this lint matches on the **name** and cannot see through a
@@ -619,7 +627,8 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
             if not isinstance(inner, ast.Call):
                 continue
             name = ast.unparse(inner.func)
-            if name in _UNDER_LOCK_OFFENDERS or name.endswith(_UNDER_LOCK_METHOD_SUFFIXES):
+            last = name.rsplit(".", 1)[-1]
+            if last in _UNDER_LOCK_OFFENDERS or name.endswith(_UNDER_LOCK_METHOD_SUFFIXES):
                 offenders.append(name)
             if name == "release" and not any(kw.arg == "detached" for kw in inner.keywords):
                 offenders.append("inline release()")
@@ -642,7 +651,7 @@ def test_a_worker_that_did_not_adopt_the_recorded_sink_does_not_discard_its_clos
     a, b = CountingSink("A"), CountingSink("B")
     log_foundry.configure(service="t", sink=a)
     log_foundry.info("to A")
-    assert _lifecycle._state._owed.get(id(a)) is a, (
+    assert _lifecycle._state._closes.owed.get(id(a)) is a, (
         "the record is armed by the emit that landed"
     )
 
@@ -668,7 +677,7 @@ def test_a_worker_that_did_not_adopt_the_recorded_sink_does_not_discard_its_clos
     worker = _lifecycle._state.worker_exists()
     assert worker is not None and worker.sink is b, "the worker captured the newly configured B"
     log_foundry.shutdown(timeout=5.0)
-    _lifecycle.join_closers(time.monotonic() + 5.0)
+    join_graced(5.0)
     assert a.events and a.closes == 1, f"A had events and must be closed exactly once: {a}"
 
 
@@ -688,51 +697,113 @@ def test_a_worker_that_did_adopt_the_recorded_sink_leaves_one_close() -> None:
 
     work()
     log_foundry.shutdown(timeout=5.0)
-    _lifecycle.join_closers(time.monotonic() + 5.0)
+    join_graced(5.0)
     assert sink.closes == 1, f"a mixed process closes once, in either order: {sink}"
 
 
-def _orphan_record_sites() -> dict[tuple[str, str], ast.FunctionDef]:
-    """Every site that assigns `_state._orphan_sink`, keyed by (function, assigned expression).
+_RECORD_MOVES = frozenset({"arm", "take", "put_back"})
+"""The close registry's methods that arm or drop an owed sink (SPEC-078 FR-001)."""
 
-    One walker, used by both properties asserted over this population — the disposition table
-    below and SPEC-045's released-record consultation. Two walkers over one population drift, as
-    SPEC-038 FR-001 AC-1a/AC-1b had to write a cross-check to catch.
+_RECORD_WRITERS = frozenset(
+    {
+        "_CloseRegistry.__init__",
+        "_CloseRegistry.arm",
+        "_CloseRegistry.take",
+        "_CloseRegistry.put_back",
+    }
+)
+"""The only functions allowed to touch the owed record other than to read it."""
+
+_RECORD_MUTATORS = frozenset(
+    {"pop", "popitem", "setdefault", "clear", "update", "__setitem__", "__delitem__"}
+)
+
+OWED_WRITE_OUTSIDE = "the owed record is written outside the close registry's arm/take/put_back"
+
+
+def _qualified_scopes(tree: ast.AST) -> dict[int, str]:
+    """Each node's enclosing ``Class.function`` (or ``<module>``), by node id."""
+    scopes: dict[int, str] = {}
+
+    def visit(node: ast.AST, qual: tuple[str, ...]) -> None:
+        for child in ast.iter_child_nodes(node):
+            here = qual
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+                here = (*qual, child.name)
+            scopes[id(child)] = ".".join(here) or "<module>"
+            visit(child, here)
+
+    visit(tree, ())
+    return scopes
+
+
+def _is_owed(node: ast.AST) -> bool:
+    """Whether an expression is the owed record, ``<anything>.owed``."""
+    return isinstance(node, ast.Attribute) and node.attr == "owed"
+
+
+def _orphan_record_sites(
+    source: str | None = None,
+) -> tuple[dict[tuple[str, str, int], ast.AST], list[tuple[str, str]]]:
+    """Every site that arms or drops an owed sink, and every write to the record, in one walk.
+
+    One walker, for both properties asserted over this population (SPEC-078 FR-001 AC-1): the
+    disposition table below, and that nothing outside the registry's own three moves writes the
+    record. Since SPEC-078 the record is ``_state._closes.owed`` and every arm, take and put-back
+    is a call to the registry, so the *sites* are those calls, by enclosing function and
+    occurrence; a write is any subscript of the record (a read included — the record is read
+    whole, through ``.values()`` or ``in``, everywhere else), a ``del`` of one, a mutating method
+    call on it, or a rebind.
 
     Args:
-      None.
+      source: The module source to walk, or ``None`` for ``_lifecycle.py``.
 
     Returns:
-      A mapping from `(enclosing function, assigned expression)` to that function's AST node.
+      The call sites, keyed ``(enclosing function, method, occurrence)``, and every write to the
+      record as ``(enclosing function, the write)``.
 
     Raises:
       None.
     """
-    tree = ast.parse(_LIFECYCLE_SRC.read_text())
-    found: dict[tuple[str, str], ast.FunctionDef] = {}
-    for scope in ast.walk(tree):
-        if not isinstance(scope, ast.FunctionDef):
-            continue
-        for node in ast.walk(scope):
-            if isinstance(node, (ast.Assign, ast.Delete)):
-                writes = [ast.unparse(target) for target in node.targets]
-            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-                writes = [ast.unparse(node.value.func)]
-            else:
-                continue
-            for write in writes:
-                if "_owed" in write:
-                    value = (
-                        ast.unparse(node.value)
-                        if isinstance(node, ast.Assign)
-                        else write
-                    )
-                    found[(scope.name, value)] = scope
-    return found
+    tree = ast.parse(_LIFECYCLE_SRC.read_text() if source is None else source)
+    scopes = _qualified_scopes(tree)
+    sites: dict[tuple[str, str, int], ast.AST] = {}
+    seen: dict[tuple[str, str], int] = {}
+    writes: list[tuple[str, str]] = []
+    for node in ast.walk(tree):
+        scope = scopes.get(id(node), "<module>")
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _RECORD_MOVES
+            and ast.unparse(node.func.value).endswith("_closes")
+        ):
+            occurrence = seen.get((scope, node.func.attr), 0)
+            seen[(scope, node.func.attr)] = occurrence + 1
+            sites[(scope, node.func.attr, occurrence)] = node
+        if isinstance(node, ast.Subscript) and _is_owed(node.value):
+            writes.append((scope, ast.unparse(node)))
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _RECORD_MUTATORS
+            and _is_owed(node.func.value)
+        ):
+            writes.append((scope, ast.unparse(node.func)))
+        elif isinstance(node, ast.Assign | ast.AnnAssign | ast.AugAssign):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            writes.extend((scope, ast.unparse(t)) for t in targets if _is_owed(t))
+    return sites, writes
+
+
+def _owed_writes_outside(source: str | None = None) -> list[tuple[str, str]]:
+    """The writes to the owed record made anywhere but the registry's own moves."""
+    _, writes = _orphan_record_sites(source)
+    return [write for write in writes if write[0] not in _RECORD_WRITERS]
 
 
 def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> None:
-    """FR-002 AC-5. Derived, because a hand-written list of sites rots (SPEC-028, SPEC-035).
+    """FR-002 AC-5, and SPEC-078 FR-001 AC-1. Derived, because a hand-written list rots.
 
     A transition may drop a sink from the owed-close record only after deciding who performs the
     close it was holding, and this enumerates the sites that arm or drop one so that a new one is
@@ -740,51 +811,99 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
 
     SPEC-045 made the record a `dict` rather than a single slot, which collapsed three separate
     clears into one transition. SPEC-054 FR-002 then merged four records into it and FR-003 gave
-    it one closer, so what remains is the armings and the per-sink removals that pair with a
-    close — one for each thing that can perform one, and **no wholesale clear at all**.
+    it one closer. SPEC-078 FR-001 moved it onto the close registry, so every arm, take and
+    put-back is now a call to the registry, and the record itself is written only inside those
+    three methods: the second assertion is that scan, and its corpus is below.
 
     The set equality **is** the floor: an exact comparison against a hand-written table cannot
     shrink unnoticed, so a separate `>= n` assertion beside it would read as a second safety net
-    while being strictly implied. Stated rather than asserted twice, as the sibling roster does.
+    while being strictly implied.
     """
     dispositions = {
-        ("_close_owed", "_state._owed[id(sink)]"): (
-            "removed per sink — the one closer performs that sink's close, and it removes and "
-            "registers the close in the **same** critical section, so there is no instant at "
-            "which the sink is neither owed nor in flight (SPEC-054 FR-003)"
+        ("_get_worker", "arm", 0): (
+            "armed — a worker built on a sink owes it a close whether or not anything is emitted "
+            "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
         ),
-        ("_close_owed", "_state._owed.setdefault"): (
+        ("_note_orphan_emit", "arm", 0): "armed — the emit that landed owns the close",
+        ("_swap_sink", "arm", 0): (
+            "armed — no live worker: the sink configure() just installed is owed a close, armed "
+            "only when something already was"
+        ),
+        ("_swap_sink", "arm", 1): (
+            "armed — the worker's branch arms the new sink whether or not the worker adopted it "
+            "(SPEC-035 FR-003)"
+        ),
+        ("_swap_sink", "take", 0): (
+            "removed per sink — the swap releases a superseded sink itself, detached, and the "
+            "take records that close in flight in the same call (SPEC-054 FR-003)"
+        ),
+        ("_swap_sink", "take", 1): (
+            "removed per sink — the previous sink, once the worker confirmed its fence, so "
+            "nothing can still be inside it; released detached and joined to the swap's budget"
+        ),
+        ("_close_owed", "take", 0): (
+            "removed per sink — the one closer performs that sink's close, and the take records "
+            "it in flight in the **same** call, so there is no instant at which the sink is "
+            "neither owed nor in flight (SPEC-054 FR-003)"
+        ),
+        ("_close_owed", "put_back", 0): (
             "re-armed — a sink this call took but never handed to a closer is put back, so an "
             "interrupt between the take and the close leaves it owed rather than owed by nobody. "
             "`setdefault`, so a re-arm that landed meanwhile keeps its own entry. Measured "
             "before it: three sinks, `closes=[0, 0, 0]`, and an empty record"
         ),
-        ("_swap_sink", "_state._owed[id(stale)]"): (
-            "removed per sink — the swap releases a superseded sink itself, detached, and "
-            "registers that close beside the removal under _state._lock for the same reason"
-        ),
-        ("_swap_sink", "_state._owed.pop"): (
-            "removed per sink — the previous sink, once the worker confirmed its fence, so "
-            "nothing can still be inside it; released detached and joined to the swap's budget"
-        ),
-        ("_swap_sink", "new_sink"): "armed — the sink configure() just installed is owed a close",
-        ("_note_orphan_emit", "sink"): "armed — the emit that landed owns the close",
-        ("_get_worker", "sink"): (
-            "armed — a worker built on a sink owes it a close whether or not anything is emitted "
-            "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
-        ),
-        ("_shutdown_worker", "_close_owed"): (
-            "neither — it is the call to the closer, which the walker sees because the callee's "
-            "name carries the record's. Listed rather than filtered out, because a filter narrow "
-            "enough to drop it would drop a real site under a similar name"
-        ),
     }
-    found = set(_orphan_record_sites())
+    found = set(_orphan_record_sites()[0])
     assert found == set(dispositions), (
-        "a site writing _state._orphan_sink is a close-ownership decision — add it to the table "
-        f"with its disposition. missing: {sorted(set(dispositions) - found)}; "
+        "a site arming or dropping an owed sink is a close-ownership decision — add it to the "
+        f"table with its disposition. missing: {sorted(set(dispositions) - found)}; "
         f"undeclared: {sorted(found - set(dispositions))}"
     )
+    outside = _owed_writes_outside()
+    assert not outside, f"{OWED_WRITE_OUTSIDE}: {outside}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(s):\n    _state._closes.owed[id(s)] = s\n",
+        "def f(s):\n    del _state._closes.owed[id(s)]\n",
+        "def f(s):\n    _state._closes.owed.setdefault(id(s), s)\n",
+        "def f(s):\n    _state._closes.owed.pop(id(s), None)\n",
+        "def f(s):\n    return _state._closes.owed[id(s)]\n",
+        "def f():\n    _state._closes.owed = {}\n",
+        "class _CloseRegistry:\n    def tidy(self):\n        self.owed.clear()\n",
+    ],
+    ids=["assign", "del", "setdefault", "pop", "subscript-read", "rebind", "another-method"],
+)
+def test_the_owed_write_scan_refuses_a_write_outside_the_registry(source: str) -> None:
+    """The scan above is not vacuous: each shape of write, placed outside the three moves, is found.
+
+    Asserted on the reason the live test reports, not on a count: each fixture must produce a
+    write the scan files as outside the registry.
+    """
+    assert _owed_writes_outside(source), f"{OWED_WRITE_OUTSIDE} — the scan missed: {source!r}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(s):\n    return id(s) in _state._closes.owed\n",
+        "def f():\n    return list(_state._closes.owed.values())\n",
+        "class _CloseRegistry:\n    def arm(self, s):\n        self.owed[id(s)] = s\n",
+        "class _CloseRegistry:\n    def take(self, s, r):\n        self.owed.pop(id(s), None)\n",
+    ],
+    ids=["membership", "values", "arm", "take"],
+)
+def test_the_owed_write_scan_is_silent_on_a_read_and_inside_the_registry(source: str) -> None:
+    """Half of a gate's regressions are false positives: a read, and the moves themselves, pass."""
+    assert not _owed_writes_outside(source), source
+
+
+def test_a_new_arm_site_is_an_undeclared_disposition() -> None:
+    """The site half: an arm in a new function is a site the table must name before it passes."""
+    sites, _ = _orphan_record_sites("def f(s):\n    _state._closes.arm(s)\n")
+    assert set(sites) == {("f", "arm", 0)}
 
 
 def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
@@ -801,17 +920,20 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
     assertion below is therefore that **nothing** clears the record — a `clear()` reappearing
     would be a caller taking sinks whose closes it has not decided.
 
-    The collector gathers `ast.Assign` only, so `__init__`'s annotated declaration is not a
-    rebind it can see — an earlier draft carried a disjunct exempting that line, which read as
-    covering a case the walk never reaches.
+    The collector gathers `ast.Assign` only, so the registry's annotated declaration of `owed`
+    is not a rebind it can see. Since SPEC-078 the record is `_state._closes.owed`, so a rebind of
+    either the record or the registry holding it is the same defect; the one sanctioned
+    assignment of the registry, in `Runtime.__init__`, is the declaration and is excluded by
+    scope.
     """
     tree = ast.parse(_LIFECYCLE_SRC.read_text())
+    scopes = _qualified_scopes(tree)
     rebinds = [
         ast.unparse(node)
         for node in ast.walk(tree)
-        if isinstance(node, ast.Assign)
+        if isinstance(node, ast.Assign) and scopes.get(id(node)) != "Runtime.__init__"
         for target in node.targets
-        if isinstance(target, ast.Attribute) and target.attr == "_owed"
+        if isinstance(target, ast.Attribute) and target.attr in {"owed", "_closes"}
     ]
     assert not rebinds, (
         "the owed-close record is rebound rather than mutated, which drops whatever another "
@@ -822,7 +944,7 @@ def test_the_owed_close_record_is_only_ever_mutated_in_place() -> None:
         for scope in ast.walk(tree)
         if isinstance(scope, ast.FunctionDef)
         for node in ast.walk(scope)
-        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("_owed.clear")
+        if isinstance(node, ast.Call) and ast.unparse(node.func).endswith("owed.clear")
     }
     assert clears == set(), (
         "the record is emptied per sink, in the critical section that decides each close, so a "
@@ -944,8 +1066,7 @@ def test_a_release_that_raises_still_drops_its_in_flight_registration() -> None:
     _lifecycle.stamp(sink)
     with pytest.raises(RuntimeError):
         _lifecycle.release(sink)
-    with _lifecycle._state._closing_now_lock:
-        registered = id(sink) in _lifecycle._state._closing_now
+    registered = _lifecycle._state._closes.in_flight(sink)
     assert not registered, (
         "a close that raised left its id registered — the sink is now permanently exempt from "
         "the stop-signal refresh"
@@ -960,8 +1081,10 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
     once the child sets its own `_orphan_stop`, that sink is handed the set event and backs off
     not at all. Measured before `_clear_closing_after_fork` existed.
     """
-    with _lifecycle._state._closing_now_lock:
-        _lifecycle._state._closing_now[0xDEADBEEF] = threading.Event()
+    with _lifecycle._state._closes._lock:
+        _lifecycle._state._closes._in_flight[0xDEADBEEF] = _lifecycle._Close(
+            _lifecycle._Rule.GRACED
+        )
     try:
         read_fd, write_fd = os.pipe()
         # See `run_in_child` in test_fork_lifecycle.py: a child must not be left anything
@@ -970,8 +1093,8 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         pid = os.fork()
         if pid == 0:  # pragma: no cover - the child never returns to pytest
             os.close(read_fd)
-            with _lifecycle._state._closing_now_lock:
-                remaining = len(_lifecycle._state._closing_now)
+            with _lifecycle._state._closes._lock:
+                remaining = len(_lifecycle._state._closes._in_flight)
             os.write(write_fd, str(remaining).encode())
             os._exit(0)
         os.close(write_fd)
@@ -981,8 +1104,8 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         )
         os.close(read_fd)
     finally:
-        with _lifecycle._state._closing_now_lock:
-            _lifecycle._state._closing_now.pop(0xDEADBEEF, None)
+        with _lifecycle._state._closes._lock:
+            _lifecycle._state._closes._in_flight.pop(0xDEADBEEF, None)
 
 
 # --------------------------------------------------------------------------- FR-004
@@ -1017,7 +1140,7 @@ def test_a_swap_that_hands_a_sink_to_the_worker_owes_a_second_close_for_the_late
         return 1
 
     work()  # builds the worker on A
-    assert id(a) in _lifecycle._state._owed, (
+    assert id(a) in _lifecycle._state._closes.owed, (
         "the build arms its sink rather than clearing the record (SPEC-054 FR-002)"
     )
 
@@ -1042,7 +1165,7 @@ def test_a_swap_that_hands_a_sink_to_the_worker_owes_a_second_close_for_the_late
     emitter.join(10.0)
 
     log_foundry.shutdown(timeout=5.0)
-    _lifecycle.join_closers(time.monotonic() + 5.0)
+    join_graced(5.0)
     assert a.closes == 2, (
         f"the emit that landed after the swap's close re-armed A, so it is owed another: {a}"
     )
@@ -1083,13 +1206,13 @@ def test_a_swap_releases_a_third_sink_the_record_named(
 
     # Re-arm the record on a sink the worker does not hold, the way a preempted emit would.
     with _lifecycle._state._lock:
-        _lifecycle._state._owed[id(third)] = third
+        _lifecycle._state._closes.owed[id(third)] = third
     _lifecycle.stamp(third)
 
     started = time.monotonic()
     log_foundry.configure(sink=second)
     swap_seconds = time.monotonic() - started
-    _lifecycle.join_closers(time.monotonic() + 5.0)
+    join_graced(5.0)
 
     assert worker.sink is second, "the worker adopted the newly configured sink"
     assert third.closes == 1, (
@@ -1135,8 +1258,10 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     its file re-opened on every fork for the life of the process. The module-level `_FORK_SKIP`
     of the time could not reach it: `_owned` was then a module global while this slot is an
     attribute of `_state`, and `_fork._skipped_names` asks the holder. Measured pre-fix: the
-    child hooked both. Both records are attributes of `_state` since SPEC-077, so one
-    `Runtime._FORK_SKIP` now names both.
+    child hooked both. Both records were attributes of `_state` from SPEC-077, so one
+    `Runtime._FORK_SKIP` named both; SPEC-078 moved the owed record onto `_state._closes`, so it
+    is opted out there, by `_CloseRegistry._FORK_SKIP`, and this test reddens if either holder
+    stops declaring its record.
     """
     _HOOKED.clear()
     superseded, live = _HookSink("superseded"), _HookSink("live")
@@ -1144,8 +1269,8 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     log_foundry.info("to the sink that is about to be superseded")
     log_foundry.configure(sink=live)
     log_foundry.info("to the live sink")
-    _lifecycle.join_closers(time.monotonic() + 5.0)
-    assert superseded.closes == 1 and id(superseded) not in _lifecycle._state._owed, (
+    join_graced(5.0)
+    assert superseded.closes == 1 and id(superseded) not in _lifecycle._state._closes.owed, (
         "the premise: the swap released it and it left the record, so what could still reach it "
         "is a walk that descends into a record it should not"
     )
@@ -1198,7 +1323,7 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     log_foundry.configure(service="t", sink=superseded)
     log_foundry.info("to the sink that is about to be superseded")
     log_foundry.configure(sink=live)
-    _lifecycle.join_closers(time.monotonic() + 5.0)
+    join_graced(5.0)
     assert superseded.closes == 1, "the premise: the swap released it before the fork"
 
     parent_pid = os.getpid()
@@ -1239,12 +1364,13 @@ def test_the_fork_opt_out_is_declared_where_the_walk_reads_it() -> None:
     """FR-005 AC-3. The stale-detector: moving the slot must not silently un-skip it.
 
     `_fork._skipped_names` reads the declaration off the **holder** of the attribute, so this
-    asserts against the real reader rather than against `Runtime._FORK_SKIP` directly — a
+    asserts against the real reader rather than against a `_FORK_SKIP` tuple directly — a
     declaration that stops being found is exactly the failure the behavioural test above would
     also catch, and exactly the one a `getattr` on the class would not.
     """
-    assert "_owed" in _fork._skipped_names(_lifecycle._state), (
-        "the record pinning superseded sinks must be opted out on the object that holds it"
+    assert "owed" in _fork._skipped_names(_lifecycle._state._closes), (
+        "the record pinning superseded sinks must be opted out on the object that holds it, "
+        "which is the close registry since SPEC-078"
     )
     assert "_owned" in _fork._skipped_names(_lifecycle._state), (
         "and the ownership record is opted out on the same holder, since SPEC-077 moved it there "

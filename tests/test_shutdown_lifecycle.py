@@ -100,7 +100,9 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
     _trace_once()
     worker = _lifecycle._state._worker
     assert worker is not None
-    assert sink.log_foundry_stop_signal is worker._stop, "the worker owns this sink's signal to begin with"
+    assert sink.log_foundry_stop_signal is worker._stop, (
+        "the worker owns this sink's signal to begin with"
+    )
 
     shutting_down = threading.Thread(target=lambda: log_foundry.shutdown(timeout=3.0))
     try:
@@ -170,7 +172,9 @@ def test_a_sink_adopted_after_a_retired_worker_still_receives_a_signal() -> None
     assert second.log_foundry_stop_signal is not None, (
         "a sink adopted after shutdown got no stop signal, so SPEC-027's guarantee is false here"
     )
-    assert second.log_foundry_stop_signal is not first.log_foundry_stop_signal, "it must not inherit the retired signal"
+    assert second.log_foundry_stop_signal is not first.log_foundry_stop_signal, (
+        "it must not inherit the retired signal"
+    )
 
 
 # --- FR-004: the idempotent shutdown waits for the drain it found ----------------------------
@@ -367,30 +371,55 @@ def test_an_atexit_exit_after_an_expired_shutdown_returns_without_closing() -> N
     )
 
 
+class _HungCloseSink(CountingSink):
+    """A sink whose ``close()`` parks on an event the test releases, so a close stays in flight."""
+
+    def __init__(self, name: str = "hung") -> None:
+        super().__init__(name)
+        self.in_close = threading.Event()
+        self.release = threading.Event()
+
+    def close(self) -> None:
+        self.in_close.set()
+        self.release.wait(30.0)
+        super().close()
+
+
 def test_the_closer_grace_is_granted_exactly_once_per_call(monkeypatch) -> None:
-    """AC-4. Asserted by counting the joins, not by timing them — a gauge that has already
-    unwound, or an elapsed time, is the observable that fails to hold here."""
-    from log_foundry import _lifecycle as lifecycle
-    joins: list[float | None] = []
-    real = lifecycle.join_closers
-    monkeypatch.setattr(
-        lifecycle, "join_closers", lambda t: (joins.append(t), real(t))[1], raising=True
-    )
+    """AC-4, re-expressed on SPEC-078 FR-002's counting hook rather than on ``join_closers``.
 
+    Counting calls to ``join_closers`` asserted that each caller reached the grace once, but a
+    second grace was not one: the bystander wait inside ``_close_owed`` computed its own, so a
+    shutdown with a swapped-out close in flight waited twice (4.00 s against a 2 s grace, measured
+    at ``fda134a``). The grace is now one instant per call, ``grace_end``, written by
+    ``_CloseRegistry._open_grace``, and this counts its **writes** per call. Two concurrent
+    shutdowns, each with a swapped-out close in flight to wait on, must each write theirs exactly
+    once — and a grace computed per wait shows as two writes on one of them.
+    """
+    monkeypatch.setattr(_lifecycle, "DEFAULT_CLOSER_GRACE", 0.2)
+    from conftest import count_grace_writes
+
+    writes = count_grace_writes(monkeypatch)
+    hung = _HungCloseSink()
     sink = SlowEmitSink(emit_seconds=1.0)
-    log_foundry.configure(service="t", sink=sink)
+    log_foundry.configure(service="t", sink=hung)
     _trace_once()
+    try:
+        _lifecycle._swap_sink(sink, timeout=0.1)
+        assert hung.in_close.wait(5.0), "the premise: the swapped-out close is in flight"
+        _trace_once()
 
-    first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
-    first.start()
-    assert sink.in_emit.wait(5.0)
-    log_foundry.shutdown(timeout=30.0)
-    first.join(30.0)
+        first = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0))
+        first.start()
+        assert sink.in_emit.wait(5.0)
+        log_foundry.shutdown(timeout=30.0)
+        first.join(30.0)
+    finally:
+        hung.release.set()
 
-    assert len(joins) == 2, (
-        f"both callers must reach the grace exactly once each, got {len(joins)}"
+    assert sorted(writes.values()) == [1, 1], (
+        f"each of the two callers fixes its one grace exactly once, got {writes}"
     )
-    assert all(t is None or t >= 0 for t in joins), "and each with a non-negative budget"
 
 
 # --- FR-003: a swap racing a shutdown leaves its sink owned ----------------------------------
@@ -442,7 +471,7 @@ def test_a_swap_declined_mid_shutdown_leaves_its_sink_owned() -> None:
     shutting_down.join(60.0)
 
     assert worker.sink is old, "the swap really was declined, or this test proves nothing"
-    assert _lifecycle._state._owed.get(id(new)) is new or new.closed == 1, (
+    assert _lifecycle._state._closes.owed.get(id(new)) is new or new.closed == 1, (
         "the declined sink is neither closed nor armed for the exit handler — owned by nobody"
     )
 
@@ -522,7 +551,7 @@ def test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade() -
         result = real_flush(timeout)
         worker.flush = real_flush
         log_foundry.info("an orphan log that arms B while the swap is in flight")
-        assert _lifecycle._state._owed.get(id(new)) is new, (
+        assert _lifecycle._state._closes.owed.get(id(new)) is new, (
             "the orphan log must have armed B"
         )
         log_foundry.shutdown(timeout=30.0)  # closes B and records it closed
@@ -637,6 +666,7 @@ def test_an_orphan_only_second_shutdown_waits_for_the_close_in_flight() -> None:
     closes the sink — which makes an `atexit` call returning through a running close total loss
     of a close-is-delivery sink's buffer.
     """
+
     class _CloseIsDelivery:
         """Buffers on emit; the close is the delivery, and it is slow enough to be raced."""
 
@@ -682,6 +712,7 @@ def test_an_orphan_only_shutdown_with_no_close_in_flight_does_not_wait() -> None
     `_shutdown_worker` calls this on the *worker* path too, that is a stall on every ordinary
     shutdown, not just an orphan one.
     """
+
     class _Quiet:
         def __init__(self) -> None:
             self.closed = 0
@@ -729,6 +760,7 @@ def test_a_second_closer_waits_for_a_close_it_did_not_start_even_while_taking_wo
     caller closing the second sink does not return until the first sink's close has finished, and
     the first sink's buffer reaches the wire.
     """
+
     class _Slow:
         def __init__(self, seconds: float | None) -> None:
             self.seconds = seconds
@@ -795,6 +827,7 @@ def test_a_bystander_does_not_release_the_gate_for_the_next_one(
     outlasts both waits by construction rather than by a sleep that began before either.
     """
     monkeypatch.setattr(_lifecycle, "DEFAULT_CLOSER_GRACE", 0.3)
+
     class _Slow:
         def __init__(self) -> None:
             self.closed = 0
@@ -851,6 +884,7 @@ def test_an_interrupt_after_the_take_does_not_leak_a_close_registration() -> Non
     once in 21,000 after it. A storm is not in the suite because it cannot report through its own
     interrupts; the placement is held by review and by this test's weaker cousin.
     """
+
     class _Quiet:
         def __init__(self) -> None:
             self.closed = 0
@@ -879,8 +913,8 @@ def test_an_interrupt_after_the_take_does_not_leak_a_close_registration() -> Non
     finally:
         _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
 
-    assert not _lifecycle._state._closing_now, (
-        f"a close registration leaked and never discharges: {_lifecycle._state._closing_now}"
+    assert not _lifecycle._state._closes._in_flight, (
+        f"a close registration leaked and never discharges: {_lifecycle._state._closes._in_flight}"
     )
 
     start = time.monotonic()
@@ -906,7 +940,7 @@ def test_an_interrupt_after_the_take_leaves_the_sinks_owed_for_a_later_shutdown(
     log_foundry.configure(service="t", sink=first)
     log_foundry.info("arms A")
     _lifecycle._note_orphan_emit(second)
-    assert len(_lifecycle._state._owed) == 2, "the premise: two sinks are owed"
+    assert len(_lifecycle._state._closes.owed) == 2, "the premise: two sinks are owed"
 
     real_choice = _lifecycle._inline_close_choice
 
@@ -922,8 +956,8 @@ def test_an_interrupt_after_the_take_leaves_the_sinks_owed_for_a_later_shutdown(
         _lifecycle._inline_close_choice = real_choice  # type: ignore[assignment]
 
     assert (first.closed, second.closed) == (0, 0), "the premise: neither close ran"
-    assert not _lifecycle._state._closing_now, "the registrations were discharged"
-    assert {id(first), id(second)} <= set(_lifecycle._state._owed), (
+    assert not _lifecycle._state._closes._in_flight, "the registrations were discharged"
+    assert {id(first), id(second)} <= set(_lifecycle._state._closes.owed), (
         "and both sinks are owed again, so a later shutdown can still close them"
     )
 
@@ -940,7 +974,7 @@ def test_a_forks_clear_inside_a_close_leaves_the_registry_consistent() -> None:
     (SPEC-021): there is no count to drive negative. The reproduction it came from survives and
     still matters: forking from *inside* the inline close runs the child's handler, which clears
     the whole registry, and the forking thread's own discharge then arrives at an entry that is
-    already gone. A count went to -1 there and never recovered; `_finish_closing` removes an
+    already gone. A count went to -1 there and never recovered; `_CloseRegistry.finish` removes an
     entry only when it is still **the one it was handed**, so the late discharge finds nothing,
     removes nothing, and leaves the registry exactly as the clear left it.
     """
@@ -960,9 +994,9 @@ def test_a_forks_clear_inside_a_close_leaves_the_registry_consistent() -> None:
     log_foundry.info("orphan")
     _lifecycle._close_owed()
 
-    assert not _lifecycle._state._closing_now, (
+    assert not _lifecycle._state._closes._in_flight, (
         f"the clear and the late discharge left the registry inconsistent: "
-        f"{_lifecycle._state._closing_now}"
+        f"{_lifecycle._state._closes._in_flight}"
     )
 
 
@@ -975,6 +1009,7 @@ def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() ->
     arithmetic, and the gap is what carries the claim: the close in flight lasts far longer than
     the cap, so a caller returning promptly can only have carved from its own budget.
     """
+
     class _Slow:
         def __init__(self) -> None:
             self.closed = 0
@@ -1006,7 +1041,7 @@ def test_an_orphan_only_second_shutdown_does_not_inherit_the_other_deadline() ->
         f"shutdown(timeout=0) waited {elapsed:.2f}s on another caller's close"
     )
     # The first caller is still inside the 5 s close. Left running, it finishes during whichever
-    # test this worker process runs next and reaches `join_closers` there: a test counting that
+    # test this worker process runs next and reaches the graced wait there: a test counting that
     # call's grants then reads two (found in SPEC-068's build, once a new test file reshuffled
     # the xdist schedule). So the test waits for its own thread before it ends.
     first.join(10.0)

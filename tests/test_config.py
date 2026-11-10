@@ -583,8 +583,10 @@ def test_the_live_sink_is_closed_before_any_swapped_out_close_is_joined() -> Non
     process *during* the grace, where the live sink would otherwise be the one left unclosed.
 
     Asserted at the **owner** since SPEC-054 FR-003 moved both calls there: `_close_owed` runs
-    the closes and `join_closers` grants the grace, once, at the end of `_shutdown_worker`. The
-    first and last entries are what carry the claim, because the closer may run twice.
+    the closes and the close registry's graced wait grants the grace, which ends once per call
+    (SPEC-078 FR-002, which replaced `join_closers` with `_CloseRegistry.wait_graced`). The
+    first and last entries are what carry the claim, because the closer may run twice and the
+    graced wait may run inside it as the bystander wait.
     """
     hung = SlowCloseSink()
     _worker_with(hung)
@@ -593,20 +595,21 @@ def test_the_live_sink_is_closed_before_any_swapped_out_close_is_joined() -> Non
         assert hung.in_close.wait(5.0)
 
         order: list[str] = []
-        real_close_owed, real_join = _lifecycle._close_owed, _lifecycle.join_closers
+        registry = _lifecycle._CloseRegistry
+        real_close_owed, real_join = _lifecycle._close_owed, registry.wait_graced
         _lifecycle._close_owed = lambda *a, **k: (  # type: ignore[assignment]
             order.append("live sink"),
             real_close_owed(*a, **k),
         )[1]
-        _lifecycle.join_closers = lambda d: (  # type: ignore[assignment]
+        registry.wait_graced = lambda self, op, closes: (  # type: ignore[method-assign]
             order.append("swapped-out"),
-            real_join(d),
+            real_join(self, op, closes),
         )[1]
         try:
             _lifecycle._shutdown_worker(timeout=0.5)
         finally:
             _lifecycle._close_owed = real_close_owed  # type: ignore[assignment]
-            _lifecycle.join_closers = real_join  # type: ignore[assignment]
+            registry.wait_graced = real_join  # type: ignore[method-assign]
 
         assert order[0] == "live sink" and order[-1] == "swapped-out", (
             f"the live sink is never made to wait: {order}"
@@ -663,7 +666,9 @@ def test_the_grace_is_shared_across_every_outstanding_close() -> None:
         assert all(sink.in_close.wait(5.0) for sink in hung), "four closes are outstanding"
 
         start = time.monotonic()
-        _lifecycle.join_closers(time.monotonic() + grace)
+        _lifecycle._state._closes.wait_graced(
+            _lifecycle._Operation(_lifecycle._Op.STOP, grace), None
+        )
         elapsed = time.monotonic() - start
 
         assert elapsed < grace * 2, f"one shared deadline, not one each — took {elapsed:.2f}s"
@@ -691,7 +696,9 @@ def test_an_unbounded_shutdown_still_caps_the_grace() -> None:
         # never run. Off-thread, the bound below fails cleanly and teardown still happens.
         def timed_join() -> None:
             start = time.monotonic()
-            _lifecycle.join_closers(None)
+            _lifecycle._state._closes.wait_graced(
+                _lifecycle._Operation(_lifecycle._Op.STOP, None), None
+            )
             elapsed.append(time.monotonic() - start)
 
         joiner = threading.Thread(target=timed_join)
@@ -716,7 +723,10 @@ def test_health_does_not_block_behind_the_grace() -> None:
         _lifecycle._swap_sink(SwapSink(), timeout=0.3)
         assert hung.in_close.wait(5.0)
 
-        joining = threading.Thread(target=_lifecycle.join_closers, args=(time.monotonic() + 2.0,))
+        joining = threading.Thread(
+            target=_lifecycle._state._closes.wait_graced,
+            args=(_lifecycle._Operation(_lifecycle._Op.STOP, 2.0), None),
+        )
         joining.start()
         try:
             start = time.monotonic()
@@ -735,16 +745,17 @@ def test_finished_closers_are_not_retained_between_swaps() -> None:
     """``health()`` prunes the roster, but a process that never calls it must not accumulate.
 
     A config-watcher reconfiguring on every file change is exactly the shape SPEC-030 exists
-    for, and nothing obliges it to poll ``health()``.
+    for, and nothing obliges it to poll ``health()``. Since SPEC-078 the threads live on the
+    close registry's in-flight entries, which each close discharges as it ends, so the bound is
+    asserted on that half.
     """
     _worker_with(SwapSink())  # the roster is process-global now, not this worker's (SPEC-033)
 
     for _ in range(50):
         _lifecycle._swap_sink(SwapSink(), timeout=5.0)
 
-    assert len(lifecycle._state._closers) <= 2, (
-        f"finished closers accumulated: {len(lifecycle._state._closers)} retained across 50 swaps"
-    )
+    retained = len(lifecycle._state._closes._in_flight)
+    assert retained <= 2, f"finished closers accumulated: {retained} retained across 50 swaps"
 
 
 def test_an_expired_close_is_neither_abandoned_nor_reported(capsys) -> None:

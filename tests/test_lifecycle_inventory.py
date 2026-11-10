@@ -63,7 +63,12 @@ _SRC = pathlib.Path(log_foundry.__file__).resolve().parent
 
 FILES = ("_lifecycle.py", "worker.py", "_fork.py", "config.py", "decorator.py", "console.py")
 PAIR = ("_lifecycle.py", "worker.py")
-FIELD_CLASSES = ("Runtime", "Worker")
+FIELD_CLASSES = ("Runtime", "Worker", "_CloseRegistry")
+"""The classes whose every ``self`` field is a lifecycle field.
+
+``_CloseRegistry`` joined at SPEC-078 (FR-001), when the owed record and the closes in flight
+moved onto it from ``Runtime``. Without it here its fields are derived by nothing, so the rows that
+declare them would read as stale and a field added to it later would need no row."""
 STATE_CLASS = "Runtime"
 MODULE_STATE_FILE = "_lifecycle.py"
 WALKABLE = frozenset({"Lock", "RLock", "Event"})
@@ -72,9 +77,15 @@ TOKEN_SETS_CHILD = ("reset: _lifecycle._clear_after_fork",)
 REPAIR_ITSELF = ("_fork", "_reinit_after_fork")
 CHILD_VALUE = re.compile(r"^(walk|inherited|none|reset: [A-Za-z_][\w]*\.[A-Za-z_]\w*)$")
 
-PAIR_FLOOR = 11
+PAIR_FLOOR = 10
 OUTSIDE_FLOOR = 9
-"""Construction floors, measured at ``3d65cf32``: 11 in the pair and 9 outside it.
+"""Construction floors: 10 in the pair and 9 outside it.
+
+Measured at ``3d65cf32`` as 11 and 9. **The pair's fell by exactly one at SPEC-078 (FR-006), for
+the merged leaf lock**: ``Runtime.__init__``'s ``_closers_lock`` and ``_closing_now_lock`` became
+the close registry's one ``_CloseRegistry.__init__`` ``self._lock`` (minus two, plus one), and
+``_Closing.__init__``'s event became ``_Close.__init__``'s (one for one). Lowered in the commit
+that merged them, and by that count only.
 
 The spec's Overview counts 8 outside with a line grep; ``_fork.py:422`` holds two constructions on
 one line (``threading.RLock() if ... else threading.Lock()``), which an AST population counts as
@@ -728,6 +739,10 @@ def _wk(name: str) -> Key:
     return ("field", "Worker", name)
 
 
+def _cr(name: str) -> Key:
+    return ("field", "_CloseRegistry", name)
+
+
 INVENTORY: dict[Key, Row] = {
     _c("_lifecycle.py", "Runtime.__init__", "self._lock", "Lock"): Row(
         "Runtime", _W, "the state lock, held across Worker(_ensure_sink())"
@@ -738,17 +753,16 @@ INVENTORY: dict[Key, Row] = {
     _c("_lifecycle.py", "Runtime.refresh_stop_signal", "self._stop", "Event"): Row(
         "Runtime", _W, "the replacement for a set stop signal, for a later deliverer"
     ),
-    _c("_lifecycle.py", "Runtime.__init__", "self._closers_lock", "Lock"): Row(
-        "Runtime", _W, "guards the closer roster; moved off the module in SPEC-077"
-    ),
-    _c("_lifecycle.py", "Runtime.__init__", "self._closing_now_lock", "Lock"): Row(
-        "Runtime", _W, "guards the in-flight close registry, a leaf; moved in SPEC-077"
+    _c("_lifecycle.py", "_CloseRegistry.__init__", "self._lock", "Lock"): Row(
+        "_CloseRegistry",
+        _W,
+        "the registry's leaf; _closing_now_lock and _closers_lock merged into it (SPEC-078 FR-001)",
     ),
     _c("_lifecycle.py", "Runtime.__init__", "self._owned_lock", "Lock"): Row(
         "Runtime", _W, "guards the ownership record, last in the order; moved in SPEC-077"
     ),
-    _c("_lifecycle.py", "_Closing.__init__", "self.event", "Event"): Row(
-        "_Closing", _W, "a per-close event owned by its registry entry"
+    _c("_lifecycle.py", "_Close.__init__", "self.event", "Event"): Row(
+        "_Close", _W, "a per-close event owned by its in-flight entry (SPEC-078; was _Closing)"
     ),
     _c("worker.py", "_FlushMarker.__init__", "self.event", "Event"): Row(
         "_FlushMarker", _NONE, "one per flush() call; it lives in the queue a child replaces"
@@ -792,7 +806,7 @@ INVENTORY: dict[Key, Row] = {
     _rt("_lock"): Row("Runtime", _W, "the state lock"),
     _rt("_worker"): Row("Runtime", _INH, "the process worker; guarded by _lock, read unlocked"),
     _rt("_late_worker"): Row("Runtime", _INH, "a worker built inside a no-worker shutdown"),
-    _rt("_owed"): Row("Runtime", _INH, "the one owed-close record; opted out of the walk"),
+    _rt("_closes"): Row("Runtime", _INH, "the close registry (SPEC-078); walked as a holder"),
     _rt("retirements"): Row("Runtime", _INH, "the retirement count"),
     _rt("_atexit_registered"): Row("Runtime", _INH, "the exit handler is registered once"),
     _rt("_shutdown_running"): Row(
@@ -805,12 +819,15 @@ INVENTORY: dict[Key, Row] = {
         ("walk", _REBUILD),
         "walked, then replaced through refresh_stop_signal when a resumed child's worker asks",
     ),
-    _rt("_closers"): Row("Runtime", _INH, "closer threads; a child's read dead and are pruned"),
-    _rt("_closers_lock"): Row("Runtime", _W, "moved from the module in SPEC-077"),
-    _rt("_closing_now"): Row(
-        "Runtime", ("reset: _lifecycle._clear_after_fork",), "in-flight closes; moved in SPEC-077"
+    _cr("owed"): Row(
+        "_CloseRegistry", _INH, "the one owed-close record; opted out by its _FORK_SKIP"
     ),
-    _rt("_closing_now_lock"): Row("Runtime", _W, "moved from the module in SPEC-077"),
+    _cr("_in_flight"): Row(
+        "_CloseRegistry",
+        ("reset: _lifecycle._clear_after_fork",),
+        "closes in flight, their threads with them (was _closing_now and _closers; SPEC-078)",
+    ),
+    _cr("_lock"): Row("_CloseRegistry", _W, "the registry's leaf lock"),
     _rt("_owned"): Row(
         "Runtime", ("reset: _lifecycle._mark_inherited",), "the ownership record; SPEC-077 moved it"
     ),
@@ -868,7 +885,7 @@ def test_every_lifecycle_entry_has_a_home() -> None:
 
 
 def test_the_construction_population_meets_its_floors() -> None:
-    """FR-003 AC-1: at least eleven constructions in the pair and nine outside it."""
+    """FR-003 AC-1: at least ten constructions in the pair (eleven before SPEC-078) and nine out."""
     _, pops = derive(_live_sources())
     in_pair = [k for k in pops.homes if k[0] == "construction" and k[1] in PAIR]
     outside = [k for k in pops.homes if k[0] == "construction" and k[1] not in PAIR]
@@ -987,6 +1004,15 @@ REFUSED: list[tuple[str, dict[str, str], dict[Key, Row], str]] = [
     (
         "an-undeclared-runtime-field",
         {"_lifecycle.py": _RUNTIME.replace("self._x = 0\n", "self._x = 0\n        self._y = 1\n")},
+        _BASE_TABLE,
+        UNDECLARED_FIELD,
+    ),
+    (
+        "an-undeclared-close-registry-field",
+        {
+            "_lifecycle.py": _RUNTIME
+            + "class _CloseRegistry:\n    def __init__(self):\n        self.owed = {}\n"
+        },
         _BASE_TABLE,
         UNDECLARED_FIELD,
     ),

@@ -436,9 +436,7 @@ class Worker:
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()
         _lifecycle.offer_stop_signal(sink, self._stop)
-        self._thread = threading.Thread(
-            target=self._run, name="log-foundry-worker", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         self._thread.start()
 
     def _reinit_after_fork(self, *, resume: bool) -> None:
@@ -502,8 +500,9 @@ class Worker:
         close. ``_taken_markers`` goes with it: a child inherits no ``flush()`` caller to answer.
 
         The in-flight-close slot this method also cleared is gone (SPEC-054 FR-006). A close in
-        flight is registered per sink in ``_lifecycle._state._closing_now`` now, and the child drops
-        the whole registry in ``_lifecycle._clear_after_fork`` for the reason this slot was cleared
+        flight is registered per sink in the close registry's in-flight half now
+        (``_lifecycle._state._closes``, SPEC-078), and the child drops that whole half in
+        ``_lifecycle._clear_after_fork`` for the reason this slot was cleared
         here: it names closes running on threads that did not survive the fork, and
         ``_fork._fresh_primitive`` carries an ``Event``'s set state across, so an inherited entry
         that was already **set** would answer the child's *own* later close instantly — its first
@@ -1213,8 +1212,8 @@ class Worker:
 
         It takes only ``_lock`` and calls nothing while holding it, so it is a leaf in the lock
         order: :func:`_lifecycle._shutdown_worker` calls it under ``_state._lock`` and the
-        nesting ``_state._lock`` then ``Worker._lock`` is the order the closer already
-        documents at ``_closing_now_lock``.
+        nesting ``_state._lock`` then ``Worker._lock`` is the order ``Runtime``'s docstring
+        states, with this lock and the close registry's leaf lock both leaves.
 
         Args:
           deadline: The caller's deadline as a ``time.monotonic()`` instant, or ``None`` for

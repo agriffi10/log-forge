@@ -999,7 +999,9 @@ def _check_invariants(run: _Run, step: str, result: object, driver: int, where: 
         unclosed = [i for i, s in enumerate(run.sinks) if s.events and s.closes == 0]
         overlapped = [i for i, s in enumerate(run.sinks) if s.overlapped]
         assert not unclosed, f"invariant 5 (every sink written to is closed): {unclosed} {where}"
-        assert not _lifecycle._state._owed, f"invariant 5 (nothing owed after a shutdown) {where}"
+        assert not _lifecycle._state._closes.owed, (
+            f"invariant 5 (nothing owed after a shutdown) {where}"
+        )
         assert not overlapped, f"invariant 5 (closed once, never overlapping): {overlapped} {where}"
 
 
@@ -1041,7 +1043,9 @@ def test_the_sequential_driver_holds_the_state_table(
         assert not _lifecycle._state._swaps_running and not _lifecycle._state._stops_running, (
             f"a token outlived its call {where}"
         )
-        assert bool(_lifecycle._state._owed) == model.owed, f"owed is not the model's {where}"
+        assert bool(_lifecycle._state._closes.owed) == model.owed, (
+            f"owed is not the model's {where}"
+        )
         assert (_lifecycle._state.live_worker() is not None) == model.live, (
             f"liveness is not the model's {where}"
         )

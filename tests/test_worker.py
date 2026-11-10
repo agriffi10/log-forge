@@ -446,7 +446,9 @@ def test_shutdown_answers_a_marker_left_in_the_queue() -> None:
     stopper.join(5.0)
     flusher.join(5.0)
 
-    assert [bool(r) for r in flushed] == [True], "a flush racing shutdown is answered by the final drain"
+    assert [bool(r) for r in flushed] == [True], (
+        "a flush racing shutdown is answered by the final drain"
+    )
     assert {e["message"] for e in sink.events} == {"a", "b"}, "and its events really did land"
     for batch in sink.batches:
         assert all(isinstance(e, dict) for e in batch), "no marker leaked into the final batch"
@@ -1078,7 +1080,9 @@ def test_flush_racing_shutdown_reports_the_final_drains_outcome() -> None:
     stopper.join(5.0)
     flusher.join(5.0)
 
-    assert [bool(r) for r in flushed] == [False], "the final drain's emit failed, so the flush it answered failed"
+    assert [bool(r) for r in flushed] == [False], (
+        "the final drain's emit failed, so the flush it answered failed"
+    )
     assert sink.events == []
 
 
@@ -1134,7 +1138,9 @@ def test_every_flush_outstanding_over_a_lost_batch_reports_the_loss() -> None:
         for t in threads:
             t.join(5.0)
 
-        assert [bool(r) for r in results] == [False] * 4, f"every flush must report the loss, got {results}"
+        assert [bool(r) for r in results] == [False] * 4, (
+            f"every flush must report the loss, got {results}"
+        )
         assert w.failed_batches == 1, "one batch, one abandonment — reported to all four"
         assert sink.events == []
     finally:
@@ -1422,6 +1428,7 @@ def test_the_public_shutdown_is_total_too(monkeypatch) -> None:
     """FR-004's criterion names `log_foundry.shutdown()`, whose delegate is deliberately
     unguarded — it relies entirely on `Worker.shutdown()` being total."""
     import log_foundry
+
     sink = _CloseFailsSink()
     log_foundry.configure(service="t", sink=sink)
 
@@ -2148,7 +2155,9 @@ def test_an_unbounded_flush_does_not_hang_on_a_marker_nothing_will_answer() -> N
 
     worker._queue.put = die_then_put  # type: ignore[method-assign]
 
-    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [False], "nothing carried it, so it did not deliver"
+    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [False], (
+        "nothing carried it, so it did not deliver"
+    )
 
 
 def test_a_flush_the_drain_answered_before_exiting_still_reports_delivery() -> None:
@@ -2172,7 +2181,9 @@ def test_a_flush_the_drain_answered_before_exiting_still_reports_delivery() -> N
 
     worker._queue.put = put_then_die  # type: ignore[method-assign]
 
-    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [True], "a drain carried it and said so"
+    assert [bool(r) for r in _flush_on_watchdog(worker, None)] == [True], (
+        "a drain carried it and said so"
+    )
     assert sink.events == [{"message": "a"}]
 
 
@@ -2355,8 +2366,9 @@ def test_a_parked_unbounded_flush_is_released_when_shutdown_expires(capsys) -> N
         target=lambda: verdict.append(worker.flush(timeout=None)), daemon=True
     )
     flusher.start()
-    assert _wait_until(lambda: any(isinstance(i, worker_mod._FlushMarker)
-                                   for i in list(worker._queue.queue))), "marker never queued"
+    assert _wait_until(
+        lambda: any(isinstance(i, worker_mod._FlushMarker) for i in list(worker._queue.queue))
+    ), "marker never queued"
 
     worker.stop(timeout=0.3)
     flusher.join(timeout=2.0)
@@ -2606,6 +2618,7 @@ def test_an_unbounded_flush_on_a_full_queue_ends_when_the_drain_dies(capsys) -> 
     Pre-existing on `main` in the same way the given-up case was, and the reason mapping differs:
     this one is `thread-died`, because the thread did die.
     """
+
     class _DiesWhenReleased(RecordingSink):
         """Blocks in emit, then takes the drain thread down when released."""
 
@@ -3242,7 +3255,7 @@ def _strand(worker: Worker, old: _ClientBufferingSink, new: object) -> None:
     _lifecycle._swap_sink(new, timeout=0.05)
     assert worker.incomplete_swaps >= 1, "the premise: the drain was not confirmed"
     assert worker.holds_unfenced(old), "the premise: the worker still holds it unfenced"
-    assert id(old) in _lifecycle._state._owed, "and it is still owed a close"
+    assert id(old) in _lifecycle._state._closes.owed, "and it is still owed a close"
 
 
 def test_a_sink_stranded_by_an_unconfirmed_swap_is_closed_at_shutdown(capsys) -> None:
@@ -3265,7 +3278,7 @@ def test_a_sink_stranded_by_an_unconfirmed_swap_is_closed_at_shutdown(capsys) ->
 
     assert old.closed == 1, "the stranded sink is closed exactly once"
     assert old.wire == old.events, "and its buffer reached the wire"
-    assert id(old) not in _lifecycle._state._owed, "the record is discharged"
+    assert id(old) not in _lifecycle._state._closes.owed, "the record is discharged"
 
 
 def test_an_expired_shutdown_leaves_a_stranded_sink_for_the_next_call(capsys) -> None:
@@ -3286,7 +3299,7 @@ def test_an_expired_shutdown_leaves_a_stranded_sink_for_the_next_call(capsys) ->
     retire_process(worker, timeout=0.3)
     assert worker._thread.is_alive(), "the premise: the join expired"
     assert old.closed == 0, "a live drain thread means no close is decided yet"
-    assert id(old) in _lifecycle._state._owed, "and the record survives the attempt"
+    assert id(old) in _lifecycle._state._closes.owed, "and the record survives the attempt"
 
     # The idempotent path is where `_close_if_owed` is actually reached with the thread still
     # alive — the expiry branch returns before it — so this is what pins the liveness guard.
@@ -3295,7 +3308,7 @@ def test_an_expired_shutdown_leaves_a_stranded_sink_for_the_next_call(capsys) ->
     assert old.closed == 0, (
         "the drain thread may still be inside the stranded sink's emit; it must not be closed"
     )
-    assert id(old) in _lifecycle._state._owed, "and the record still survives"
+    assert id(old) in _lifecycle._state._closes.owed, "and the record still survives"
 
     blocking.release.set()
     worker._thread.join(timeout=5)
@@ -3380,7 +3393,7 @@ def test_a_confirmed_swap_records_nothing(capsys) -> None:
     _lifecycle._swap_sink(new, timeout=5.0)
     assert worker.incomplete_swaps == 0, "the premise: this drain was confirmed"
     assert not worker.holds_unfenced(old), "a confirmed swap leaves nothing unfenced"
-    assert id(old) not in _lifecycle._state._owed, "and nothing owed for the old sink"
+    assert id(old) not in _lifecycle._state._closes.owed, "and nothing owed for the old sink"
 
     retire_process(worker, timeout=5.0)
     capsys.readouterr()
@@ -3393,6 +3406,7 @@ def test_a_stuck_stranded_close_does_not_extend_the_shutdown_budget(capsys) -> N
     The stranded sink's `close()` never returns and the live sink's is instant, so a shutdown
     that ran the stranded close inline would not return at all.
     """
+
     class _NeverCloses(_ClientBufferingSink):
         def close(self) -> None:
             """Never returns, so an inline close here would hang the shutdown outright."""

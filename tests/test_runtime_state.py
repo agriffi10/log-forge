@@ -102,12 +102,14 @@ def _rule4_no_worker() -> None:
 
 def _rule5_owed() -> None:
     sink = Sink()
-    _lifecycle._state._owed[id(sink)] = sink
+    _lifecycle._state._closes.owed[id(sink)] = sink
 
 
 def _rule5_resolved() -> None:
     log_foundry.configure(sink=Sink())
-    assert not _lifecycle._state._owed, "configure() alone owes nothing; this case is rule 5's half"
+    assert not _lifecycle._state._closes.owed, (
+        "configure() alone owes nothing; this case is rule 5's half"
+    )
 
 
 def _rule6() -> None:
@@ -618,9 +620,9 @@ def test_state_never_raises_for_any_combination() -> None:
                 state._swaps_running.add(object())
             state._worker = None if which == "none" else worker
             state.retirements = worker._epoch + (1 if which == "retired" or retired else 0)
-            state._owed.clear()
+            state._closes.owed.clear()
             if owed:
-                state._owed[id(sink)] = sink
+                state._closes.owed[id(sink)] = sink
             log_foundry.config._config = log_foundry.config.Config(sink=sink if resolved else None)
             assert isinstance(state.state, State)
     finally:

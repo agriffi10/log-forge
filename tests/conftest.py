@@ -387,7 +387,7 @@ def install_worker(worker) -> None:
 
     with _lifecycle._state._lock:
         _lifecycle._state._worker = worker
-        _lifecycle._state._owed[id(worker.sink)] = worker.sink
+        _lifecycle._state._closes.arm(worker.sink)
 
 
 def retire_process(worker=None, timeout: float | None = 30.0) -> None:
@@ -470,7 +470,7 @@ def _reset_worker() -> None:
     SPEC-031 FR-006's three flags are cleared alongside it, for the same reason and one more:
     ``retirements`` is what ``health()`` reads for ``retired``, so a test
     that calls ``shutdown()`` would otherwise make every later test read ``retired=True``, and
-    ``_owed`` would make "nothing was ever logged, so nothing is closed"
+    the owed record would make "nothing was ever logged, so nothing is closed"
     untestable in-process. ``_atexit_registered`` is deliberately **not** cleared — the
     handler really is registered for the life of the interpreter, and re-arming the flag would
     have the next worker register a second one.
@@ -480,15 +480,16 @@ def _reset_worker() -> None:
     later test's sink backing off not at all. SPEC-054 made it and ``retirements`` the process's
     only pair, so resetting the count to zero is what makes ``retired`` false again and what puts
     a worker built by the next test back in step with it — a count left raised makes every later
-    worker read as retired at its own build, which is a suite that delivers nothing. ``_lifecycle._state._closers`` is now process-global, so a
-    hung closer from one test — the capped-grace tests create them deliberately — would
+    worker read as retired at its own build, which is a suite that delivers nothing. The close
+    registry's in-flight half (``_closers`` before SPEC-078) is process-global, so a hung closer
+    from one test — the capped-grace tests create them deliberately — would
     otherwise leak a non-zero ``closing_sinks`` into the next.
 
     SPEC-044 adds three more, and each would leak in a different direction. A
     ``_shutdown_running`` left raised by a test that injected a preemption point makes the
     **next** test's first ``@trace`` register a late worker for a shutdown that ended long ago,
     and hand it a discharged close. A ``_late_worker`` left set pins a worker object and hands
-    the next ``shutdown()`` something to drain that it does not own. And ``_closing_now`` left
+    the next ``shutdown()`` something to drain that it does not own. And an in-flight entry left
     holding an id makes the next test's sink miss its stop-signal refresh — silently, since the
     symptom is a backoff that does not happen rather than an error.
 
@@ -503,7 +504,8 @@ def _reset_worker() -> None:
     count stayed raised and the gate stayed clear, and every later caller that found nothing owed
     paid the whole closer grace. Nothing errored — the suite was green only because those three
     happen to sit *after* the test that measures the no-wait path. SPEC-054 FR-003 replaced both
-    with a per-sink registration in ``_closing_now``, which was already cleared here, so the pair
+    with a per-sink registration (the registry's in-flight half since SPEC-078), which was already
+    cleared here, so the pair
     is gone rather than merely reset: a caller now waits only on closes actually in flight against
     a sink, and a leaked entry shows up as that sink never being closed rather than as a
     process-wide charge.
@@ -512,7 +514,8 @@ def _reset_worker() -> None:
     ``finally`` it then bypasses, or sets a token directly, would otherwise leave every later test
     reading ``SWAPPING`` or ``DRAINING``.
 
-    SPEC-054 also merged four records into ``_state._owed``, so one ``clear()`` replaces the four
+    SPEC-054 also merged four records into one owed record (``_state._closes.owed`` since
+    SPEC-078), so one ``clear()`` replaces the four
     lines that reset them, and ``retirements`` replaces the retirement flag: it is a **count**, so
     resetting it to zero is what puts a worker built by the next test back in step with it — one
     left raised makes every later worker read as retired at its own build, which is a suite that
@@ -526,7 +529,7 @@ def _reset_worker() -> None:
     if worker is not None:
         worker.stop()
         _lifecycle._state._worker = None
-    _lifecycle._state._owed.clear()
+    _lifecycle._state._closes.owed.clear()
     _lifecycle._state.retirements = 0
     _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
@@ -535,10 +538,8 @@ def _reset_worker() -> None:
     _lifecycle._state._stops_running.clear()
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
-    with _lifecycle._state._closers_lock:
-        _lifecycle._state._closers.clear()
-    with _lifecycle._state._closing_now_lock:
-        _lifecycle._state._closing_now.clear()
+    with _lifecycle._state._closes._lock:
+        _lifecycle._state._closes._in_flight.clear()
 
 
 class FakeSink:
@@ -748,3 +749,91 @@ def fan_out() -> object:
     for _ in range(7):
         shape = [shape] * 16
     return shape
+
+
+def join_graced(seconds: float | None = 5.0) -> None:
+    """Gives every detached close in flight the capped grace a shutdown would, then returns.
+
+    The drop-in for the tests' ``_lifecycle.join_closers(time.monotonic() + seconds)``, which
+    SPEC-078 replaced with the close registry's graced wait. It builds an operation of its own, so
+    the wait is bounded by the smaller of ``seconds`` and ``DEFAULT_CLOSER_GRACE``, exactly as the
+    old call was.
+
+    Args:
+      seconds: The budget the grace is carved from, or ``None`` for the cap alone.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry import _lifecycle
+
+    _lifecycle._state._closes.wait_graced(_lifecycle._Operation(_lifecycle._Op.STOP, seconds), None)
+
+
+@pytest.fixture
+def no_close_left_in_flight():
+    """Asserts, after the test, that no close it started is left for nobody (SPEC-078 FR-001).
+
+    A close is discharged by its own thread, which may still be finishing when the test body
+    returns, so this polls for up to five seconds. An entry still there after that is a leak
+    unless a live thread is still performing it: a test may abandon a stuck detached close on
+    purpose (the grace's whole point), and that close discharges its entry when it ends. An entry
+    with no thread, or whose thread has ended, is one nothing will ever discharge — the sink is
+    then skipped by the signal refresh forever and every later bystander waits out the grace.
+
+    Yields:
+      None.
+    """
+    from log_foundry import _lifecycle
+
+    def orphaned() -> dict[int, object]:
+        with _lifecycle._state._closes._lock:
+            return {
+                key: close
+                for key, close in _lifecycle._state._closes._in_flight.items()
+                if close.thread is None or not close.thread.is_alive()
+            }
+
+    yield
+    deadline = time.monotonic() + 5.0
+    while orphaned() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    left = orphaned()
+    assert not left, f"a close was left in flight, and nothing will discharge it: {left}"
+
+
+def count_grace_writes(monkeypatch) -> dict[int, int]:
+    """Counts, per ``shutdown()`` operation, how many times its ``grace_end`` was written.
+
+    SPEC-078 FR-002's counting hook. It wraps ``_CloseRegistry._open_grace`` and compares the
+    operation's ``grace_end`` before and after each call, so it counts **writes**, not calls: an
+    ``_open_grace`` that reset the instant on every call — a grace computed per wait — shows as
+    two writes, where a call that found the instant already fixed shows as none.
+
+    Args:
+      monkeypatch: The test's ``monkeypatch`` fixture.
+
+    Returns:
+      A live mapping from ``id(operation)`` to the number of writes it saw.
+
+    Raises:
+      None.
+    """
+    from log_foundry import _lifecycle
+
+    writes: dict[int, int] = {}
+    real = _lifecycle._CloseRegistry._open_grace
+
+    def counting(self, op):
+        before = op.grace_end
+        end = real(self, op)
+        writes.setdefault(id(op), 0)
+        if op.grace_end is not before:
+            writes[id(op)] += 1
+        return end
+
+    monkeypatch.setattr(_lifecycle._CloseRegistry, "_open_grace", counting)
+    return writes

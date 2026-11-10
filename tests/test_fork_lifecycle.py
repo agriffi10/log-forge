@@ -624,7 +624,9 @@ def _diagnose(child: _Child, *, reached: bool) -> str:
             f"names the fork-unsafe finalizer that produced it here"
         )
     if child.output.startswith("!"):
-        return f"it {child.ending} without reaching `os.kill`, and the `!Type: msg` it left says why"
+        return (
+            f"it {child.ending} without reaching `os.kill`, and the `!Type: msg` it left says why"
+        )
     return f"it {child.ending} without reaching `os.kill`, leaving no exception report behind"
 
 
@@ -714,17 +716,29 @@ def test_every_crash_child_outcome_is_reported_apart() -> None:
     cases = {
         "reached, crashed": (True, int(signal.SIGSEGV), "", "and then was killed by SIGSEGV"),
         "reached, own watchdog": (
-            True, int(signal.SIGALRM), "", "its own watchdog had to end it",
+            True,
+            int(signal.SIGALRM),
+            "",
+            "its own watchdog had to end it",
         ),
         "reached, parent's deadline": (
-            True, int(signal.SIGKILL), "", "still alive at the parent's deadline",
+            True,
+            int(signal.SIGKILL),
+            "",
+            "still alive at the parent's deadline",
         ),
         "reached, ran on": (True, 0 << 8, "", "and then exited 0"),
         "stalled after arming": (
-            False, int(signal.SIGALRM), "", "armed its own watchdog and then stalled",
+            False,
+            int(signal.SIGALRM),
+            "",
+            "armed its own watchdog and then stalled",
         ),
         "stalled before arming": (
-            False, int(signal.SIGKILL), "", "never reached `signal.alarm`",
+            False,
+            int(signal.SIGKILL),
+            "",
+            "never reached `signal.alarm`",
         ),
         "died another way": (False, int(signal.SIGBUS), "", "not either watchdog"),
         "raised": (False, 1 << 8, "!ValueError: boom", "the `!Type: msg` it left"),
@@ -738,9 +752,7 @@ def test_every_crash_child_outcome_is_reported_apart() -> None:
         readings[name] = reading
 
     for name, reading in readings.items():
-        intruders = [
-            other for other, case in cases.items() if other != name and case[3] in reading
-        ]
+        intruders = [other for other, case in cases.items() if other != name and case[3] in reading]
         assert not intruders, (name, reading, intruders)
 
     endings = [int(member) for member in (signal.SIGALRM, signal.SIGKILL)]
@@ -752,9 +764,7 @@ def test_every_crash_child_outcome_is_reported_apart() -> None:
             child = _Child(status, "")
             swept[(reached, child.ending)] = _diagnose(child, reached=reached)
     assert len(swept) == 2 * len(endings), swept
-    collisions = {
-        reading for reading in swept.values() if list(swept.values()).count(reading) > 1
-    }
+    collisions = {reading for reading in swept.values() if list(swept.values()).count(reading) > 1}
     assert not collisions, collisions
 
 
@@ -1634,9 +1644,7 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
     install_worker(worker)
     gate = _park_the_drain_thread(stream, worker, 0)
 
-    shutting_down = threading.Thread(
-        target=lambda: _lifecycle._shutdown_worker(30.0), daemon=True
-    )
+    shutting_down = threading.Thread(target=lambda: _lifecycle._shutdown_worker(30.0), daemon=True)
     shutting_down.start()
     deadline = time.monotonic() + 5.0
     while not worker._stopped and time.monotonic() < deadline:
@@ -1709,9 +1717,7 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     worker.submit([{"msg": "parks the drain thread"}])
     assert gate.entered.wait(5.0), "the drain thread never parked, so the fork misses the window"
 
-    shutting_down = threading.Thread(
-        target=lambda: _lifecycle._shutdown_worker(30.0), daemon=True
-    )
+    shutting_down = threading.Thread(target=lambda: _lifecycle._shutdown_worker(30.0), daemon=True)
     shutting_down.start()
 
     def parent_ready() -> bool:
@@ -2876,9 +2882,7 @@ def _buffered_sink(
     return sink, stream, path
 
 
-def _park_inside_a_buffered_batch(
-    stream: _GatingStream, worker: Worker
-) -> _Gate:
+def _park_inside_a_buffered_batch(stream: _GatingStream, worker: Worker) -> _Gate:
     """Submits a two-event batch and returns once the drain thread is inside the second write.
 
     Args:
@@ -3725,17 +3729,18 @@ def test_a_child_does_not_inherit_a_promise_that_a_close_is_running() -> None:
     worker = Worker(_Quiet())
     try:
         _lifecycle._state._worker = worker  # only the *registered* worker is rebuilt
-        inherited = _lifecycle._register_closing(worker.sink)
+        inherited = _lifecycle._state._closes.register(worker.sink, _lifecycle._Rule.GRACED)
         inherited.event.set()  # as an already-answered close would arrive
 
         def in_child() -> str:
             """Reports the registry as the child sees it, after the handlers have run."""
-            return f"{not _lifecycle._state._closing_now},{_lifecycle.closing_count()}"
+            closes = _lifecycle._state._closes
+            return f"{not closes._in_flight},{closes.graced_alive()}"
 
         child = run_in_child(in_child)
     finally:
-        with _lifecycle._state._closing_now_lock:
-            _lifecycle._state._closing_now.clear()
+        with _lifecycle._state._closes._lock:
+            _lifecycle._state._closes._in_flight.clear()
         _lifecycle._state._worker = None
         worker.stop(timeout=2.0)
 
@@ -4022,7 +4027,9 @@ def test_without_the_container_branch_the_multisink_child_blocks(
 ) -> None:
     """The positive control: only the container member's reach is taken away, and it hangs."""
     monkeypatch.setattr(
-        _fork, "_container_push", lambda child, kind: child if _fork._is_traversable(child) else None
+        _fork,
+        "_container_push",
+        lambda child, kind: child if _fork._is_traversable(child) else None,
     )
     child = _forked_multisink_run()
     assert child.output.startswith("at-the-call;"), f"never reached the call: {child.output!r}"

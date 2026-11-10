@@ -52,6 +52,7 @@ a close that is *nearly* done, not a second full attempt: it already had the swa
 more likely stuck than slow, and every second spent on it is a second the process does not exit.
 """
 
+
 class State(enum.Enum):
     """The process's lifecycle state, read off today's flags and deciding nothing (SPEC-077 FR-002).
 
@@ -82,6 +83,497 @@ class State(enum.Enum):
     CLOSED = enum.auto()
 
 
+class _Op(enum.Enum):
+    """The six lifecycle calls the transition table has a row for (SPEC-078 FR-004).
+
+    The values are ``enum.auto()`` for :class:`State`'s reason: a literal would be filed by the
+    predicate roster if it ever matched one of its sentinel words.
+
+    Attributes:
+      BUILD: A span needs a worker and none exists (``_get_worker``'s inner check).
+      ARM: An orphan log reaches a sink not owed (``_note_orphan_emit``'s locked branch).
+      SWAP: ``configure(sink=...)``, through :func:`_swap_sink`.
+      FLUSH: ``flush()``, through :func:`_flush_worker`.
+      STOP: ``shutdown()`` or the exit drain, through :func:`_shutdown_worker`.
+      FORK: A forked child's entry, :func:`_clear_after_fork`.
+    """
+
+    BUILD = enum.auto()
+    ARM = enum.auto()
+    SWAP = enum.auto()
+    FLUSH = enum.auto()
+    STOP = enum.auto()
+    FORK = enum.auto()
+
+
+class _Rule(enum.Enum):
+    """How one close in flight is run and waited for (SPEC-078 FR-002).
+
+    Today's three rules, gathered rather than changed: SPEC-030 keeps the live sink's close on the
+    calling thread, SPEC-046 joins a shutdown's fan-out in full because a daemon that exit kills
+    loses what it was flushing, and SPEC-030 FR-003 detaches a swapped-out close and grants it
+    only the closer grace, since it already had the swap's whole budget.
+
+    Attributes:
+      INLINE: Closed on the calling thread.
+      JOINED: A shutdown's fan-out thread, joined in full.
+      GRACED: Detached; joined to the swap's budget by the swap, then to the shutdown's one grace.
+    """
+
+    INLINE = enum.auto()
+    JOINED = enum.auto()
+    GRACED = enum.auto()
+
+
+class _Operation:
+    """The slow half of a ``SWAP`` or a ``STOP``, and the token that holds its state (SPEC-078).
+
+    Built once per call, before that call's first critical section, and added to
+    :attr:`Runtime._swaps_running` or :attr:`Runtime._stops_running` inside it; discarded in the
+    call's ``finally`` by one lock-free ``set.discard`` (SPEC-077 FR-002). Its ``deadline`` is
+    computed here and nowhere else, and every slow step of the call reads what remains of it.
+
+    It is built **before** the lock rather than inside it so that a call blocked behind
+    ``Worker(_ensure_sink())``, which runs under ``_state._lock``, does not have its budget start
+    only after that wait: the deadline is the instant the caller asked, as it was when the call
+    computed a local.
+
+    ``budget`` is the caller's timeout as given, kept only so :meth:`Worker.stop` can render it in
+    its expiry line. The stop's join does not read it: it ends at the deadline
+    :meth:`Worker.claim_stop` recorded from this operation.
+
+    ``grace_end`` is written only by :meth:`_CloseRegistry._open_grace`, at the first graced wait
+    of a ``STOP``, and every later graced wait of the same call ends at it, which is what makes
+    the closer grace spent once per call (FR-002).
+
+    Attributes:
+      kind: ``_Op.SWAP`` or ``_Op.STOP``.
+      deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None``.
+      budget: The caller's timeout as given, for a diagnostic only.
+      grace_end: The instant every graced wait of this call ends, once one has started.
+    """
+
+    def __init__(self, kind: _Op, timeout: float | None) -> None:
+        """Fixes the call's deadline from the caller's timeout, once.
+
+        Args:
+          kind: Which call this is the slow half of.
+          timeout: The caller's timeout in seconds, or ``None`` for an unbounded call.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.kind = kind
+        self.budget = timeout
+        self.deadline: float | None = None if timeout is None else monotonic() + timeout
+        self.grace_end: float | None = None
+
+
+class _Close:
+    """One close in flight: the event a bystander waits on, its rule and its thread (SPEC-078).
+
+    It holds **no sink**, as ``_Closing`` did not, and for the reason the fork walk gives: the
+    registry is reached by ``_fork``'s repair walk through :data:`_state`, and an owned object
+    holding a sink would hand the walk superseded sinks to run fork hooks on. The thread is not
+    walked (``threading.Thread`` is not this package's), so holding it is safe.
+
+    The event is an attribute of an object this package owns rather than a value in a dict,
+    because ``_fork._reinit_primitives`` replaces a primitive by assigning it back on a holder by
+    name, and a dict value has no name to assign to.
+
+    **It counts its participants.** A release that finds a close of the same sink already in
+    flight joins that entry rather than starting a second (a wrapper forwarding the close of a
+    child a swap is closing detached, say). The entry leaves the registry, and its event is set,
+    only when the last participant finishes. Discharging it at the first finish would drop a
+    still-running detached thread out of the shutdown's graced wait and out of
+    ``health().closing_sinks`` while that close was still going on.
+
+    Attributes:
+      event: Set when the last participant in this close has finished, however it finished.
+      rule: Which rule runs and waits for it.
+      thread: The thread performing it, or ``None`` for an inline close and until one starts.
+      participants: How many releases are performing this close; guarded by the registry's lock.
+    """
+
+    def __init__(self, rule: _Rule) -> None:
+        """Builds an unset event for one close.
+
+        Args:
+          rule: Which rule runs and waits for this close.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.event = threading.Event()
+        self.rule = rule
+        self.thread: threading.Thread | None = None
+        self.participants = 1
+
+
+class _CloseRegistry:
+    """Every close the library owes and every close in flight, with the moves between them.
+
+    SPEC-078 FR-001. A close passed through three facts held in four places: **owed**
+    (``Runtime._owed``), **in flight** (``_closing_now`` under its own leaf lock) and, for a
+    detached close, **its thread** (``_closers`` under another), plus the fan-out threads
+    :func:`_close_owed` kept in a local list. The moves between them were written out at each
+    site, and the rule all of them keep — no instant at which a sink is neither owed nor in flight
+    (SPEC-054 FR-003) — was restated at each. Here :meth:`take` removes a sink from ``owed`` and
+    records its entry in one call made under ``_state._lock``, so the rule has one home.
+
+    **Two locks guard it, by half.** ``owed`` is guarded by ``Runtime._lock``, which every caller
+    that arms, takes or puts back already holds. The in-flight half is guarded by :attr:`_lock`, a
+    leaf: :meth:`Runtime.held` and :meth:`Runtime.in_flight` are asked with ``_state._lock`` held
+    and read it, and closer threads discharge it without ``_state._lock``. That leaf replaces two
+    (``_closing_now_lock`` and ``_closers_lock``), which were both leaves under ``_state._lock``
+    and never nested with each other, so no acquisition order changes. It is held across a dict
+    read or a single mutation, never across a ``close()`` or a join.
+
+    **An entry nothing discharges is permanent**, and three questions suffer from it: the sink is
+    skipped by the signal refresh forever, the closer never takes it because :meth:`Runtime.held`
+    stays true, and every later bystander waits out the whole grace on an event nobody will set.
+    So every exit discharges, including a refused release and a closer thread that never started.
+    A fork breaks the bracket — the child inherits entries whose ``finally`` no thread will run —
+    so :func:`_clear_after_fork` empties the in-flight half in the child.
+
+    Attributes:
+      owed: Every sink the library owes a close, by ``id``; guarded by ``_state._lock``.
+    """
+
+    _FORK_SKIP = ("owed",)
+    """Keeps the owed record, which pins superseded sinks, out of ``_fork``'s repair walk.
+
+    It strongly references every sink still owed a close (SPEC-044 FR-005, SPEC-054 FR-002),
+    including sinks the process abandoned several ``configure()`` calls ago. Without the opt-out the
+    walk reaches them and runs their fork hooks: measured, a child of ``configure(A)`` → ``info()``
+    → ``configure(B)`` ran ``reacquire_after_fork()`` on both, and a ``FileSink`` in that place would
+    have its file re-opened on every fork. A live target is still reached through the config and
+    through ``worker.sink``. ``_fork._skipped_names`` reads the opt-out off the holder of the
+    attribute, which is this object since SPEC-078 moved the record here from
+    :attr:`Runtime._FORK_SKIP`; a class attribute, for the reason that one is.
+    """
+
+    def __init__(self) -> None:
+        """Builds an empty registry.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.owed: dict[int, Sink] = {}
+        self._in_flight: dict[int, _Close] = {}
+        self._lock = threading.Lock()
+
+    def arm(self, sink: Sink) -> None:
+        """Records that the library owes *sink* a close; the caller holds ``_state._lock``.
+
+        Args:
+          sink: The sink something has delivered to, or will.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.owed[id(sink)] = sink
+
+    def take(self, sink: Sink, rule: _Rule) -> _Close:
+        """Moves *sink* from owed to in flight in one call; the caller holds ``_state._lock``.
+
+        A sink already absent from the record is taken all the same, which is the ``pop`` with a
+        default the swap's fenced branch always used.
+
+        Args:
+          sink: The sink whose close the caller has decided to perform.
+          rule: How that close is run and waited for.
+
+        Returns:
+          The in-flight entry the close discharges.
+
+        Raises:
+          None.
+        """
+        self.owed.pop(id(sink), None)
+        return self._enter(sink, rule)
+
+    def put_back(self, sink: Sink, close: _Close) -> None:
+        """Re-arms a sink whose close was never handed off, and discharges its entry.
+
+        ``setdefault`` rather than assignment, so a re-arm that landed meanwhile keeps its own
+        entry. The caller holds ``_state._lock``.
+
+        Args:
+          sink: The sink a take removed and no closer received.
+          close: The entry that take made.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.owed.setdefault(id(sink), sink)
+        self.finish(sink, close)
+
+    def register(self, sink: Sink, rule: _Rule) -> _Close:
+        """Records a close with no take, which is how a wrapper's forwarded release reaches here.
+
+        Args:
+          sink: The sink about to be closed.
+          rule: How that close is run and waited for.
+
+        Returns:
+          The in-flight entry the close discharges.
+
+        Raises:
+          None.
+        """
+        return self._enter(sink, rule)
+
+    def _enter(self, sink: Sink, rule: _Rule) -> _Close:
+        """Adds an in-flight entry, or joins the one already there as a further participant.
+
+        A close already registered keeps its entry rather than gaining a second: two deciders
+        cannot take one sink, because a take is under ``_state._lock`` and asks
+        :meth:`Runtime.held` first, but a wrapper's forwarded release of a child can arrive while
+        that child's own close is in flight. That release becomes a participant, so the entry
+        outlives it while the first close is still running.
+
+        Args:
+          sink: The sink whose close is starting.
+          rule: The rule for a new entry; an existing entry keeps its own.
+
+        Returns:
+          The entry this close discharges.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            existing = self._in_flight.get(id(sink))
+            if existing is not None:
+                existing.participants += 1
+                return existing
+            close = _Close(rule)
+            self._in_flight[id(sink)] = close
+            return close
+
+    def finish(self, sink: Sink, close: _Close | None) -> None:
+        """Discharges one participant in a close, and the entry with the last of them.
+
+        The entry is removed only when it is still the one this caller was handed, so a sink
+        re-armed and re-closed inside the window cannot have the wrong close discharged for it,
+        and a forked child's clear followed by the forking thread's own late discharge removes
+        nothing. Setting the event outside the lock is deliberate: a waiter woken by it goes on to
+        take ``_state._lock``, and holding the leaf across that would invert the lock order.
+
+        Args:
+          sink: The sink whose close has ended, however it ended.
+          close: The entry this participant was handed, or ``None`` for a caller with none.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if close is None:
+            return
+        with self._lock:
+            close.participants -= 1
+            done = close.participants <= 0
+            if done and self._in_flight.get(id(sink)) is close:
+                del self._in_flight[id(sink)]
+        if done:
+            close.event.set()
+
+    def in_flight(self, sink: Sink) -> bool:
+        """Whether a close of *sink* is in flight on some thread right now.
+
+        Args:
+          sink: The sink whose close is in question.
+
+        Returns:
+          Whether an entry for it is registered.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return id(sink) in self._in_flight
+
+    def attach(self, close: _Close, thread: threading.Thread) -> None:
+        """Records the thread performing a close, once it has started.
+
+        Args:
+          close: The entry the thread discharges.
+          thread: The started thread.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            close.thread = thread
+
+    def bystanders(self, mine: set[int]) -> list[_Close]:
+        """Every close in flight that the caller did not take, for its bystander wait.
+
+        Captured at the take, in the caller's critical section, rather than after its own closes:
+        SPEC-050 FR-002's rule is that a caller waits for a close somebody else had in flight when
+        it arrived, and a re-read later would also wait on closes that started afterwards.
+
+        Args:
+          mine: The ids of the sinks the caller took.
+
+        Returns:
+          The entries the caller must wait for.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return [close for key, close in self._in_flight.items() if key not in mine]
+
+    def join_joined(self, closes: list[_Close]) -> None:
+        """Joins every ``JOINED`` close's thread **in full** (SPEC-046).
+
+        Not capped by the grace: SPEC-046 built the capped version and measured it losing data —
+        four owed 2-second closes against ``shutdown(timeout=1.0)`` completed one — so a
+        shutdown's own closes cost the slowest of them and none is abandoned to a daemon that exit
+        kills. ``architecture.md`` §13 records the unbounded wait.
+
+        Args:
+          closes: The entries whose threads the caller started.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for close in closes:
+            thread = close.thread
+            if thread is not None:
+                thread.join()
+
+    def _open_grace(self, op: _Operation) -> float:
+        """Fixes the instant every graced wait of *op* ends, at its first graced wait.
+
+        The one writer of :attr:`_Operation.grace_end`. At ``fda134a`` two waits computed the grace
+        independently — the bystander wait and ``join_closers`` — and a swapped-out close the
+        shutdown did not take was waited on by both: ``shutdown(timeout=30)`` measured 4.00 s
+        against a 2.0 s grace. Fixed once per call, the second wait gets only what is left.
+
+        Args:
+          op: The ``STOP`` whose graced waits share one end.
+
+        Returns:
+          That end, as a ``time.monotonic()`` instant.
+
+        Raises:
+          None.
+        """
+        if op.grace_end is None:
+            op.grace_end = monotonic() + closer_grace(op.deadline)
+        return op.grace_end
+
+    def wait_graced(self, op: _Operation, closes: list[_Close] | None) -> None:
+        """Waits on closes the caller did not perform, all ending at the call's one grace.
+
+        Two callers. :func:`_close_owed` passes the bystander entries it captured at its take —
+        closes somebody else had in flight, whatever their rule — and waits on each entry's event.
+        :func:`_shutdown_worker` passes ``None`` at its end, which means every ``GRACED`` close in
+        flight whose thread is alive, and joins each thread; that is the last chance a detached
+        close gets before the process exits. A list with nothing in it spends no grace and sets no
+        ``grace_end``.
+
+        Args:
+          op: The ``STOP`` this wait belongs to.
+          closes: The entries to wait on, or ``None`` for every live ``GRACED`` close.
+
+        Returns:
+          None.
+
+        Raises:
+          None. A wait that expires abandons the close to its daemon, which is the contract of a
+            detached close, not a failure.
+        """
+        if closes is None:
+            with self._lock:
+                closes = [
+                    close
+                    for close in self._in_flight.values()
+                    if close.rule is _Rule.GRACED
+                    and close.thread is not None
+                    and close.thread.is_alive()
+                ]
+        if not closes:
+            return
+        end = self._open_grace(op)
+        for close in closes:
+            thread = close.thread
+            remaining = max(0.0, end - monotonic())
+            if close.rule is _Rule.GRACED and thread is not None:
+                thread.join(remaining)
+            else:
+                close.event.wait(remaining)
+
+    def graced_alive(self) -> int:
+        """Counts the detached closes running right now, backing ``Health.closing_sinks``.
+
+        A live fact rather than an inference from a timeout: an expired join reports nothing, since
+        a slow close and a stuck one cannot be told apart at that moment, so this gauge is what an
+        operator reads instead. ``JOINED`` fan-out closes are not counted, as they never were.
+
+        Args:
+          None.
+
+        Returns:
+          The number of ``GRACED`` entries whose thread is alive.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return sum(
+                1
+                for close in self._in_flight.values()
+                if close.rule is _Rule.GRACED
+                and close.thread is not None
+                and close.thread.is_alive()
+            )
+
+
+def _remaining(deadline: float | None) -> float | None:
+    """What is left of a deadline, as a timeout, or ``None`` for an unbounded one.
+
+    Args:
+      deadline: A ``time.monotonic()`` instant, or ``None``.
+
+    Returns:
+      The seconds until it, never negative, or ``None``.
+
+    Raises:
+      None.
+    """
+    return None if deadline is None else max(0.0, deadline - monotonic())
+
+
 class Runtime:
     """The process's delivery lifecycle: one owner, four locks, four questions (SPEC-040, SPEC-077).
 
@@ -94,11 +586,11 @@ class Runtime:
     **The ownership states** (SPEC-040). A process is in exactly one of these, and the field that
     decides is named; :class:`State` is the separate, five-member view the observer reads:
 
-    - **cold** — ``_worker is None`` and ``_owed`` is empty. Nothing has been logged, no
+    - **cold** — ``_worker is None`` and nothing is owed. Nothing has been logged, no
       thread exists, no sink is owed a close. ``configure()`` alone does not leave this state:
       it runs ``_ensure_sink()`` unconditionally, so a resolved sink is not evidence anything
       was written to it (SPEC-031 FR-006).
-    - **orphan-only** — ``_owed`` names every sink a level call with no span actually
+    - **orphan-only** — the owed record names every sink a level call with no span actually
       reached, and ``_worker`` is still ``None``. The close is owed to this path, and the
       ``atexit`` handler is armed by the emit that landed rather than by the sink existing.
     - **worker-backed** — ``_worker`` holds the process worker. It owns the drain; the sink's
@@ -133,15 +625,14 @@ class Runtime:
     fourth reader under the same rule: it names which of the :class:`State` members today's
     flags describe, decides nothing, and is read by tests only.
 
-    **Four locks, not one.** :attr:`_lock` guards the worker, the record, the count and the stop
-    event; :attr:`_closers_lock`, :attr:`_closing_now_lock` and :attr:`_owned_lock` each guard
-    the one structure they name, and moved here from module globals in SPEC-077 without being
-    merged. Folding ``_closing_now_lock`` into ``_lock`` would deadlock :meth:`in_flight` and
-    :meth:`held`, which are asked with ``_lock`` held and take that leaf by design; the other two
-    are taken beneath ``_lock`` and on closer threads beside it, and ``_lock`` is held across a
-    blocking ``Worker(_ensure_sink())`` build, so merging any of them changes the lock order,
-    which is behaviour. The order is ``_lock`` then ``_config_lock`` then ``_owned_lock``, and
-    ``_lock`` then ``Worker._lock``, ``_closers_lock`` and ``_closing_now_lock`` as leaves, with
+    **Three locks, not one.** :attr:`_lock` guards the worker, the owed record, the count and
+    the stop event; the close registry's leaf lock guards the closes in flight, and
+    :attr:`_owned_lock` the ownership record. SPEC-078 merged two leaves into the registry's one
+    (``_closing_now_lock`` and ``_closers_lock`` never nested with each other), which changed no
+    acquisition order. Folding the leaf into ``_lock`` would deadlock :meth:`in_flight` and
+    :meth:`held`, which are asked with ``_lock`` held and take that leaf by design, and closer
+    threads discharge it without ``_lock``. The order is ``_lock`` then ``_config_lock`` then
+    ``_owned_lock``, and ``_lock`` then ``Worker._lock`` and the registry's lock as leaves, with
     nothing acquiring ``_lock`` beneath any of them.
 
     Args:
@@ -154,22 +645,20 @@ class Runtime:
       None.
     """
 
-    _FORK_SKIP = ("_owed", "_owned")
-    """Keeps the two records that pin superseded sinks out of ``_fork``'s repair walk.
+    _FORK_SKIP = ("_owned",)
+    """Keeps the ownership record, which pins superseded sinks, out of ``_fork``'s repair walk.
 
-    Both strongly reference sinks the process may have abandoned several ``configure()`` calls
-    ago: ``_owed`` every sink still owed a close (SPEC-044 FR-005, SPEC-054 FR-002), ``_owned``
-    every sink this process ever acquired (SPEC-042 FR-001). Without the opt-out the walk reaches
-    them and calls their fork hooks — measured, a child of ``configure(A)`` → ``info()`` →
-    ``configure(B)`` ran ``reacquire_after_fork()`` on both, a child announced a buffer discard
-    for a superseded sink, and a ``FileSink`` in that place would have its file re-opened on
-    every fork forever. A **live** target is still reached by the walk through the config and
-    through ``worker.sink``, so nothing the child must repair is hidden by this.
-
-    ``_fork._skipped_names`` reads the opt-out off **the holder of the attribute** — a plain
-    ``getattr`` — so it must be declared where the records live. Both are attributes of
-    :data:`_state` since SPEC-077 moved ``_owned`` off the module, which is why this one tuple is
-    now the whole rule and the module declares none.
+    ``_owned`` strongly references every sink this process ever acquired (SPEC-042 FR-001),
+    including sinks it abandoned several ``configure()`` calls ago. Without the opt-out the walk
+    reaches them and calls their fork hooks — measured, a child of ``configure(A)`` → ``info()`` →
+    ``configure(B)`` ran ``reacquire_after_fork()`` on both, a child announced a buffer discard for
+    a superseded sink, and a ``FileSink`` in that place would have its file re-opened on every fork
+    forever. A **live** target is still reached by the walk through the config and through
+    ``worker.sink``, so nothing the child must repair is hidden by this. The owed record, the
+    other one that pins such sinks, moved to the close registry in SPEC-078 and carries its own
+    opt-out, :attr:`_CloseRegistry._FORK_SKIP`, because ``_fork._skipped_names`` reads the opt-out
+    off **the holder of the attribute** — a plain ``getattr`` — so it must be declared where the
+    record lives.
 
     A **class** attribute deliberately. ``_fork._namespace_items`` reads ``vars(holder)``, the
     instance ``__dict__`` only, so a plain ``getattr`` finds this while the walk over
@@ -177,9 +666,9 @@ class Runtime:
     harmlessly: it is a tuple of strings, which holds no primitive to replace and no sink to
     hook.
 
-    Marking is not narrowed: :func:`_inheritance_roots` reads the record directly, so the walk
-    still reaches an inherited superseded sink and it is still refused (SPEC-042 FR-001) — on the
-    stamp ``configure()`` left, since :func:`_mark_inherited` ``setdefault``s and leaves an
+    Marking is not narrowed: :func:`_inheritance_roots` reads the owed record directly, so the
+    walk still reaches an inherited superseded sink and it is still refused (SPEC-042 FR-001) — on
+    the stamp ``configure()`` left, since :func:`_mark_inherited` ``setdefault``s and leaves an
     existing record alone rather than writing ``_FOREIGN`` over it — or on ``_FOREIGN``, for a
     sink held inside it that the bounded stamp walk never reached.
     """
@@ -204,62 +693,17 @@ class Runtime:
         self._worker: Worker | None = None
         self._lock = threading.Lock()
         self._atexit_registered = False
-        self._owed: dict[int, Sink] = {}
         self._stop = threading.Event()
         self.retirements = 0
         self._shutdown_running = 0
         self._late_worker: Worker | None = None
-        self._closers: list[threading.Thread] = []
-        self._closers_lock = threading.Lock()
-        self._closing_now: dict[int, _Closing] = {}
-        """Sinks a close is running against **right now**, by id, each with the event it will set.
+        self._closes = _CloseRegistry()
+        """Every close the library owes and every close in flight (SPEC-078 FR-001).
 
-        The *moment* term of arch §9.2's questions, applied to the close rather than to the worker,
-        and one of the two things :meth:`Runtime.held` consults. It answers two callers at once
-        (SPEC-044 FR-003, SPEC-050 FR-002, SPEC-054 FR-003):
-
-        - :func:`_offer_orphan_signal` replaces a stop event that is already set, so a sink is never
-          left holding one that collapses every later backoff to zero — right, and pinned by
-          SPEC-033 FR-004 for a sink adopted **after** ``shutdown()``. What it must not do is cancel
-          the signal a close is *currently waiting on*: measured, an ``info()`` landing inside the
-          close made ``shutdown()`` serve an 8 s backoff in full, against 0.00 s with no racing log,
-          on both delivery paths.
-        - A second ``shutdown()`` must **wait for** a close already running rather than returning
-          through it, so each entry carries an ``Event`` the performer sets on its way out. A
-          process-wide count and one idle gate stood here before SPEC-054 and cost a worker-path
-          ``shutdown()`` the whole grace for an orphan close it had nothing to do with — measured at
-          2.007 s wall, 0.000 s CPU. Per sink, a caller waits only on closes that are actually in
-          flight.
-
-        **A registration is made by the thread that decides the close, in the same critical section
-        that takes the sink out of** :attr:`Runtime._owed` (FR-003). Registering inside
-        :func:`release` instead leaves a gap for a detached close — the daemon thread registers
-        after the caller has dropped ``_lock`` — and with the closed-sink latch retired that gap is
-        a sink neither owed nor in flight, which a preempted orphan emit re-arms and a racing
-        ``shutdown()`` then closes alongside. Every exit discharges it, including a
-        :func:`releasable` that refuses and a closer thread that never starts. An entry nothing
-        discharges is permanent, and it is not ``health().closing_sinks`` that suffers — that counts
-        live closer *threads*, through :func:`closing_count` — but the two questions this registry
-        answers: the sink is skipped by the signal refresh forever, the closer never takes it
-        because :meth:`Runtime.held` stays true, and every later bystander waits out the whole grace
-        on an event nobody will set.
-
-        It is keyed by ``int`` id and the value is an ``Event``, so it pins no sink against garbage
-        collection and needs no :attr:`Runtime._FORK_SKIP` entry; the registration brackets
-        ``close()``, so an id cannot be reused while it is registered. **A fork breaks that
-        bracket** — the child inherits a registration whose ``finally`` no thread will ever run — so
-        :func:`_clear_after_fork` empties it in the child. Measured before that handler existed: the
-        id survived, and once the child set its own ``_stop`` that sink was handed the **set** event
-        and backed off not at all, permanently.
-        """
-        self._closing_now_lock = threading.Lock()
-        """Guards :attr:`Runtime._closing_now`, and sits **last** in the lock order.
-
-        ``_state._lock`` -> ``worker._lock`` -> this one is the order the closer takes, and
-        ``_state._lock`` -> ``_config_lock`` -> ``_owned_lock`` is the order
-        :attr:`Runtime._owned_lock` states. This lock is never nested with either of the last two,
-        so there is no cycle. It is held only across a dict lookup or a single mutation, never
-        across a ``close()``.
+        Replaces ``_owed``, ``_closing_now``, ``_closing_now_lock``, ``_closers`` and
+        ``_closers_lock``. Walked by the fork repair as an owned holder: its leaf lock and every
+        entry's event are replaced, and its owed record is opted out by
+        :attr:`_CloseRegistry._FORK_SKIP`.
         """
         self._marking_failed = False
         """Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
@@ -299,7 +743,7 @@ class Runtime:
         The orphan logging path is the opposite constraint and takes **no** lock at all: it reaches
         ``_ensure_sink``'s fast-path return once per event, which must never stamp (AC-10).
         """
-        self._swaps_running: set[object] = set()
+        self._swaps_running: set[_Operation] = set()
         """One token per ``_swap_sink`` call inside its work; non-empty reads ``SWAPPING``.
 
         A set of tokens rather than a counter or a flag, for ``_shutdown_running``'s reason: two
@@ -313,7 +757,7 @@ class Runtime:
         deliberate exception, and a lost discard would only misreport an observer nothing in
         ``src/`` reads. A forked child empties it in :func:`_clear_after_fork`.
         """
-        self._stops_running: set[object] = set()
+        self._stops_running: set[_Operation] = set()
         """One token per ``_shutdown_worker`` call inside its body; non-empty reads ``DRAINING``.
 
         The same mechanism as :attr:`_swaps_running`, for two concurrent ``shutdown()`` calls; the
@@ -454,10 +898,10 @@ class Runtime:
         into sink X.
 
         Takes no ``_lock``, which is the class docstring's rule and is what lets
-        :func:`_offer_orphan_signal`'s callers hold it. It does take the leaf
-        ``_closing_now_lock`` through :func:`_closing`, which is the order the shipped code
-        already establishes — ``_offer_orphan_signal`` reaches that lock under ``_lock`` today —
-        and it is a leaf, so nothing acquires ``_lock`` beneath it.
+        :func:`_offer_orphan_signal`'s callers hold it. It does take the close registry's leaf
+        lock through :meth:`_CloseRegistry.in_flight`, which is the order the shipped code already
+        establishes — ``_offer_orphan_signal`` reaches that lock under ``_lock`` — and it is a leaf,
+        so nothing acquires ``_lock`` beneath it.
 
         Args:
           sink: The sink about to be offered a stop signal.
@@ -471,7 +915,7 @@ class Runtime:
         worker = self._worker
         if worker is not None and worker.sink is sink and worker.draining:
             return True
-        return _closing(sink)
+        return self._closes.in_flight(sink)
 
     def held(self, sink: Sink) -> bool:
         """Moment, for the close — may anything still be inside this sink (arch §9.2).
@@ -503,7 +947,7 @@ class Runtime:
         worker = self._worker
         if worker is not None and worker.may_be_inside(sink):
             return True
-        return _closing(sink)
+        return self._closes.in_flight(sink)
 
     @property
     def state(self) -> State:
@@ -549,7 +993,7 @@ class Runtime:
         swapping = bool(self._swaps_running)
         live = self.live_worker()
         retirements = self.retirements
-        owed = bool(self._owed)
+        owed = bool(self._closes.owed)
         resolved = _live_config_sink() is not None
         if stopping:
             return State.DRAINING
@@ -575,115 +1019,10 @@ event above all.
 """
 
 
-class _Closing:
-    """One close in flight, holding the event a bystander waits on (SPEC-054 FR-003).
-
-    A wrapper rather than a bare ``threading.Event`` in :attr:`Runtime._closing_now`, and the
-    reason is the fork walk. ``_fork._reinit_primitives`` replaces a primitive by **assigning it
-    back on a holder by name**, so an ``Event`` sitting as a *value* in a dict is reached by
-    the traversal and replaced by nothing — there is no name to assign. Held as an attribute of
-    an object this package owns, it is found by ``_fork._namespace_items`` and written back like
-    any other, which is the shape ``tests/test_fork_lifecycle.py``'s primitive lint enforces
-    (SPEC-039 FR-002).
-
-    That the child empties the whole registry moments later (:func:`_clear_after_fork`) is not
-    the argument: a primitive built where the walk cannot repair it is refused by shape here,
-    deliberately, so a later use of one does not have to re-derive whether it happens to be safe.
-
-    Attributes:
-      event: Set when the close this registration brackets has ended, however it ended.
-    """
-
-    def __init__(self) -> None:
-        """Builds an unset event for one close.
-
-        Args:
-          None.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        self.event = threading.Event()
-
-
-def _closing(sink: Sink) -> bool:
-    """Whether a release of this sink is in flight on some thread right now (FR-003).
-
-    Args:
-      sink: The sink whose close is in question.
-
-    Returns:
-      Whether a close of that sink is registered.
-
-    Raises:
-      None.
-    """
-    with _state._closing_now_lock:
-        return id(sink) in _state._closing_now
-
-
-def _register_closing(sink: Sink) -> _Closing:
-    """Registers a close of *sink* as in flight and returns the event a bystander waits on.
-
-    Called by the thread that **decides** the close, in the critical section that takes the sink
-    out of the owed record, so there is no instant at which the sink is neither owed nor in
-    flight (FR-003). A close already registered keeps its event rather than gaining a second: two
-    deciders cannot reach here for one sink, because the take is under ``_state._lock``, but a
-    detached close re-enters :func:`release` on its own thread and must find the event its
-    requester registered.
-
-    Args:
-      sink: The sink whose close is about to start.
-
-    Returns:
-      The registration, whose event is set when that close finishes.
-
-    Raises:
-      None.
-    """
-    with _state._closing_now_lock:
-        existing = _state._closing_now.get(id(sink))
-        if existing is not None:
-            return existing
-        registration = _Closing()
-        _state._closing_now[id(sink)] = registration
-        return registration
-
-
-def _finish_closing(sink: Sink, closing: _Closing | None) -> None:
-    """Discharges a close registration and releases whoever was waiting on it.
-
-    The entry is removed only when it is still the one this caller was handed, so a sink re-armed
-    and re-closed inside the window cannot have the wrong close discharged for it. Setting the
-    event outside the lock is deliberate: a waiter woken by it goes on to take ``_state._lock``,
-    and holding the leaf lock across that would invert the order the module's docstrings state.
-
-    Args:
-      sink: The sink whose close has ended, however it ended.
-      closing: The registration :func:`_register_closing` returned, or ``None`` for a caller
-        that never made one.
-
-    Returns:
-      None.
-
-    Raises:
-      None.
-    """
-    if closing is None:
-        return
-    with _state._closing_now_lock:
-        if _state._closing_now.get(id(sink)) is closing:
-            del _state._closing_now[id(sink)]
-    closing.event.set()
-
-
 def _clear_after_fork() -> None:
-    """Drops the in-flight close registrations a child inherited (FR-003, FR-006).
+    """Drops the in-flight close entries a child inherited (SPEC-054 FR-003, SPEC-078 FR-001).
 
-    The registration is discharged by a ``finally`` on the thread performing the close — and a
+    An entry is discharged by a ``finally`` on the thread performing the close — and a
     forked child has only the thread that called ``fork()``, so every inherited entry is one
     nothing will ever clear. Left in place it is not a missed refresh but a permanent one: once
     the child sets its own ``_stop``, that sink is handed the set event and every backoff
@@ -691,12 +1030,16 @@ def _clear_after_fork() -> None:
     would also wait out the grace for a close that can never finish.
 
     Registered with ``_fork`` rather than reached for by it, the inversion SPEC-039 FR-006
-    requires so that ``_fork`` imports nothing but ``_diag``. It takes the registry's own lock,
-    which the repair walk re-initialised moments earlier.
+    requires so that ``_fork`` imports nothing but ``_diag``. It takes the registry's own leaf
+    lock, which the repair walk re-initialised moments earlier, and writes the in-flight half
+    directly rather than through a method, so the inventory gate's reset check sees the write in
+    the registered handler itself. A detached close's thread lived in that half since SPEC-078
+    (it was ``_closers``, read as dead in a child and pruned), so it is dropped with its entry.
+    The owed record is not touched: the child inherits it, as it always has.
 
     It runs **after** :func:`_mark_inherited` and before :func:`_rebuild_worker_after_fork`, and
-    the placement is free rather than load-bearing: the registry holds ``int`` ids and no handler
-    reads it.
+    the placement is free rather than load-bearing: the in-flight half holds ``int`` ids, and no
+    handler reads it.
 
     The process-wide orphan-close count and its idle gate were reset here too and are gone
     (SPEC-054 FR-006): with a per-sink registration there is no second thing that can be left
@@ -719,8 +1062,8 @@ def _clear_after_fork() -> None:
     Raises:
       None.
     """
-    with _state._closing_now_lock:
-        _state._closing_now.clear()
+    with _state._closes._lock:
+        _state._closes._in_flight.clear()
         _state._swaps_running.clear()
         _state._stops_running.clear()
 
@@ -899,9 +1242,7 @@ def _reachable_sinks(root: object) -> list[object]:
             if _is_candidate(value):
                 stack.append(value)
             elif _fork._is_container(value):
-                stack.extend(
-                    member for member in _bounded_children(value) if _is_candidate(member)
-                )
+                stack.extend(member for member in _bounded_children(value) if _is_candidate(member))
     return found
 
 
@@ -960,7 +1301,7 @@ def _inheritance_roots() -> list[object]:
     candidates = (
         config._live_config().sink,
         None if worker is None else worker.sink,
-        *_state._owed.values(),
+        *_state._closes.owed.values(),
     )
     roots: list[object] = [found for found in candidates if found is not None]
     with _state._owned_lock:
@@ -1200,7 +1541,7 @@ def release(
     *,
     detached: bool = False,
     owner: object = None,
-    closing: _Closing | None = None,
+    closing: _Close | None = None,
 ) -> threading.Thread | None:
     """Closes a sink on the library's behalf — the one path by which it ever does (SPEC-042 FR-002).
 
@@ -1236,12 +1577,13 @@ def release(
       owner: The wrapper forwarding this close, when one is. The five shipped wrappers pass
         themselves; the lifecycle sites hold their sink directly and pass nothing. See
         :func:`releasable` for what the distinction decides.
-      closing: The in-flight registration this close is discharging, from
-        :func:`_register_closing`, for a caller that registered before deciding who performs the
-        close (FR-003). It is discharged on **every** exit — a refused release and a closer
-        thread that never started included, since either would otherwise leave an event nobody
-        sets. ``None`` for a caller that did not register, in which case one is made and
-        bracketed here as it always was.
+      closing: The in-flight entry this close discharges, from :meth:`_CloseRegistry.take`, for
+        a caller that took the sink before deciding who performs the close (SPEC-054 FR-003). It
+        is discharged on **every** exit — a refused release and a closer thread that never
+        started included, since either would otherwise leave an event nobody sets. ``None`` for a
+        caller that did not take one, in which case one is registered here: ``GRACED`` before a
+        detached thread starts, so the thread is attached to it and counted, and ``INLINE``
+        around an inline close, which is how a wrapper's forwarded release reaches the registry.
 
     Returns:
       The started closer thread for a detached release, or ``None`` — for a refused release, for
@@ -1254,22 +1596,23 @@ def release(
         hand it to.
     """
     if not releasable(sink, owner=owner):
-        _finish_closing(sink, closing)
+        _state._closes.finish(sink, closing)
         return None
     if detached:
-        closer = _start_closer(sink, closing)
+        entry = closing if closing is not None else _state._closes.register(sink, _Rule.GRACED)
+        closer = _start_closer(sink, entry)
         if closer is None:
-            _finish_closing(sink, closing)
+            _state._closes.finish(sink, entry)
         return closer
-    registration = closing if closing is not None else _register_closing(sink)
+    registration = closing if closing is not None else _state._closes.register(sink, _Rule.INLINE)
     try:
         sink.close()
     finally:
-        _finish_closing(sink, registration)
+        _state._closes.finish(sink, registration)
     return None
 
 
-def _start_closer(sink: Sink, closing: _Closing | None = None) -> threading.Thread | None:
+def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
     """Starts a daemon close of a sink no longer being delivered to (SPEC-030 FR-003).
 
     The thread is returned rather than joined, so a caller holding a lock can start under it and
@@ -1278,15 +1621,19 @@ def _start_closer(sink: Sink, closing: _Closing | None = None) -> threading.Thre
     FR-002). Callers that hold no lock join it immediately and are equivalent to the single call
     this replaced.
 
-    The thread is a **daemon**, and it is :func:`join_closers` that makes that safe rather than
-    merely available. A non-daemon thread was tried and is worse on its own: CPython joins
+    The thread is a **daemon**, and it is the shutdown's graced wait
+    (:meth:`_CloseRegistry.wait_graced`) that makes that safe rather than merely available. A non-daemon thread was tried and is worse on its own: CPython joins
     non-daemon threads *before* running ``atexit``, so one hung close stops the exit drain from
     ever running and loses everything buffered in the **live** sink. A daemon alone is worse in
     the opposite case: a close that is slow but *succeeding* is killed at exit, losing whatever
     it was flushing.
 
+    The started thread is attached to the close's entry, which is what the graced wait joins and
+    ``health().closing_sinks`` counts.
+
     Args:
       sink: The sink that was swapped out.
+      closing: The in-flight entry the thread discharges.
 
     Returns:
       The started thread, or ``None`` when the platform would not give the process another one.
@@ -1312,13 +1659,11 @@ def _start_closer(sink: Sink, closing: _Closing | None = None) -> threading.Thre
             "it is left open and may still hold its resources",
         )
         return None
-    with _state._closers_lock:
-        _state._closers[:] = [old for old in _state._closers if old.is_alive()]
-        _state._closers.append(closer)
+    _state._closes.attach(closing, closer)
     return closer
 
 
-def _close_guarded(sink: Sink, closing: _Closing | None = None) -> None:
+def _close_guarded(sink: Sink, closing: _Close) -> None:
     """Closes a swapped-out sink on its own thread, absorbing a failure.
 
     The guard is what makes the thread safe to leave unattended: an exception escaping here
@@ -1329,6 +1674,7 @@ def _close_guarded(sink: Sink, closing: _Closing | None = None) -> None:
 
     Args:
       sink: The sink to close.
+      closing: The in-flight entry the close discharges.
 
     Returns:
       None.
@@ -1351,8 +1697,10 @@ def closer_grace(deadline: float | None) -> float:
     so it cannot extend it either.
 
     Three copies of this stood in the tree before SPEC-054 FR-003 — ``worker._closer_grace``,
-    ``_lifecycle._bystander_grace`` and an inline one inside :func:`join_closers` — which is one
-    arithmetic asked in three places about the same budget.
+    ``_lifecycle._bystander_grace`` and an inline one inside ``join_closers`` — which is one
+    arithmetic asked in three places about the same budget. Since SPEC-078 it is asked once per
+    ``shutdown()`` call, by :meth:`_CloseRegistry._open_grace`, and every graced wait of that call
+    ends at the instant it fixed.
 
     Args:
       deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None`` for an
@@ -1369,54 +1717,6 @@ def closer_grace(deadline: float | None) -> float:
     if deadline is None:
         return DEFAULT_CLOSER_GRACE
     return max(0.0, min(DEFAULT_CLOSER_GRACE, deadline - monotonic()))
-
-
-def join_closers(deadline: float | None) -> None:
-    """Gives outstanding detached closes their last chance before the process exits.
-
-    The registry is process-global rather than per-worker because a close started before any
-    worker existed must still be counted and still be granted this grace (SPEC-033 FR-005).
-    Granted **once**, at the end of :func:`_shutdown_worker`, on every path (FR-003) — two
-    functions arranged that by hand before.
-
-    Args:
-      deadline: The ``time.monotonic()`` instant the shutdown's budget expires, or ``None``.
-        :func:`closer_grace` caps it, and the result is shared across every outstanding close.
-
-    Returns:
-      None.
-
-    Raises:
-      None. A join on a thread that has already finished is a no-op, and one that has not is
-        abandoned at the deadline — which is the daemon's contract, not a failure.
-    """
-    with _state._closers_lock:
-        closers = [closer for closer in _state._closers if closer.is_alive()]
-        _state._closers[:] = closers
-    end = monotonic() + closer_grace(deadline)
-    for closer in closers:
-        closer.join(max(0.0, end - monotonic()))
-
-
-def closing_count() -> int:
-    """Counts the swapped-out closes running at this instant, backing ``Health.closing_sinks``.
-
-    A live fact rather than an inference from a timeout: an expired join reports nothing, since
-    a slow close and a stuck one cannot be told apart at that moment, so this gauge is what an
-    operator reads instead. It falls as well as rises.
-
-    Args:
-      None.
-
-    Returns:
-      The number of closer threads still alive.
-
-    Raises:
-      None.
-    """
-    with _state._closers_lock:
-        _state._closers[:] = [closer for closer in _state._closers if closer.is_alive()]
-        return len(_state._closers)
 
 
 def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
@@ -1513,8 +1813,10 @@ def _get_worker() -> Worker:
                 _state._worker = worker
                 if _state._shutdown_running > 0:
                     _state._late_worker = worker
-                _state._owed[id(sink)] = sink
+                _state._closes.arm(sink)
     return worker
+
+
 def _register_exit_handler() -> None:
     """Registers the one ``atexit`` handler that covers both delivery paths (SPEC-031 FR-006).
 
@@ -1538,6 +1840,8 @@ def _register_exit_handler() -> None:
     if not _state._atexit_registered:
         atexit.register(_shutdown_worker)
         _state._atexit_registered = True
+
+
 def _note_orphan_emit(sink: Sink) -> None:
     """Records which sink a level call with no span reached (SPEC-031 FR-006, SPEC-033 FR-001).
 
@@ -1570,14 +1874,16 @@ def _note_orphan_emit(sink: Sink) -> None:
     Raises:
       None.
     """
-    if id(sink) in _state._owed and not _state._stop.is_set():
+    if id(sink) in _state._closes.owed and not _state._stop.is_set():
         return
     with _state._lock:
         _offer_orphan_signal(sink)
-        if id(sink) in _state._owed:
+        if id(sink) in _state._closes.owed:
             return
         _register_exit_handler()
-        _state._owed[id(sink)] = sink
+        _state._closes.arm(sink)
+
+
 def _rebuild_worker_after_fork() -> None:
     """Gives a forked child a drain thread of its own, or a retired worker (SPEC-039 FR-002).
 
@@ -1610,6 +1916,8 @@ def _rebuild_worker_after_fork() -> None:
         return
     resume = _state.live_worker() is not None
     worker._reinit_after_fork(resume=resume)
+
+
 def _offer_orphan_signal(sink: Sink) -> None:
     """Gives a sink no live worker owns an unset stop signal (SPEC-033 FR-004).
 
@@ -1669,7 +1977,9 @@ def _offer_orphan_signal(sink: Sink) -> None:
     if _state.in_flight(sink):
         return
     offer_stop_signal(sink, _state.refresh_stop_signal())
-def _close_taken(sink: Sink, closing: _Closing) -> None:
+
+
+def _close_taken(sink: Sink, closing: _Close) -> None:
     """Closes one sink the closer took, absorbing whatever the close raised (SPEC-046).
 
     Factored out so the inline close and the threaded ones are provably the same call, and
@@ -1679,14 +1989,14 @@ def _close_taken(sink: Sink, closing: _Closing) -> None:
     the ``_diag`` text of the site it actually is (SPEC-029).
 
     It records nothing of its own, and needs to: :func:`_close_owed` takes the sink out of the
-    owed record and registers its close **in one critical section** under ``_state._lock``, which
-    is what stops two callers performing the same close (SPEC-054 FR-002, FR-003). Handing the
-    registration down rather than making one here is what lets a caller register before deciding
-    who performs the close, detached closes included.
+    owed record and records its close in flight **in one call**, :meth:`_CloseRegistry.take`,
+    under ``_state._lock``, which is what stops two callers performing the same close (SPEC-054
+    FR-002, FR-003). Handing the entry down rather than making one here is what lets a caller take
+    a sink before deciding who performs the close, detached closes included.
 
     Args:
       sink: The sink to close.
-      closing: The in-flight registration to discharge, whatever the close does.
+      closing: The in-flight entry to discharge, whatever the close does.
 
     Returns:
       None.
@@ -1767,7 +2077,7 @@ def _inline_close_choice(owed: list[Sink], worker: Worker | None) -> Sink:
     return owed[-1]
 
 
-def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -> bool:
+def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) -> bool:
     """Closes every owed sink nothing is holding — the one closer, for every exit (FR-003).
 
     It replaces four functions that each closed sinks on one path: ``Worker._close_if_owed``,
@@ -1775,59 +2085,66 @@ def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -
     owed-close record now (FR-002), so there is one thing to take from and one place that decides
     who performs a close.
 
-    **The take, under** ``_state._lock``. Every owed sink that is not :meth:`Runtime.held` is
-    removed from the record and registered in :attr:`Runtime._closing_now` **in the same critical
-    section**, so there is no instant at which a sink is neither owed nor in flight — a gap a
-    preempted orphan emit re-arms and a racing ``shutdown()`` then closes alongside. A sink left
-    behind is either inside a live drain thread or already being closed by somebody else, and the
-    two are answered differently below.
+    **The take, under** ``_state._lock``. Every owed sink that is not :meth:`Runtime.held` goes
+    through :meth:`_CloseRegistry.take`, which removes it from the record and records its close in
+    flight **in one call**, so there is no instant at which a sink is neither owed nor in flight —
+    a gap a preempted orphan emit re-arms and a racing ``shutdown()`` then closes alongside
+    (SPEC-054 FR-003). Each take names the entry's rule (SPEC-078 FR-002): ``GRACED`` for a sink
+    the worker holds unfenced whose thread has since ended (SPEC-050 FR-004), ``JOINED`` for every
+    other. A sink left behind is either inside a live drain thread or already being closed by
+    somebody else, and the two are answered differently below.
 
     **The closes, with the lock released.** SPEC-046's shape: :func:`_inline_close_choice` runs on
-    this thread and the rest on threads joined in a ``finally``, so a ``KeyboardInterrupt``
-    delivered mid-fan-out reaches the caller with every started close joined rather than four
-    abandoned mid-write. One exception is **detached** rather than joined — a sink the worker
-    holds unfenced whose thread has since ended (SPEC-050 FR-004): it already had the swap's whole
-    budget, so it is far more likely stuck than slow, and joining it would let one stuck
-    swapped-out sink hold the exit where :func:`join_closers` costs it only the grace.
+    this thread, its entry's rule rebound to ``INLINE`` just before the close, and the rest on
+    threads joined in full in a ``finally``, so a ``KeyboardInterrupt`` delivered mid-fan-out
+    reaches the caller with every started close joined rather than four abandoned mid-write. The
+    choice is made **after** the take, inside the ``try``, so an interrupt there is an interrupt
+    between a take and its close and is put back below. A ``GRACED`` entry is released detached
+    rather than joined: it already had the swap's whole budget, so it is far more likely stuck
+    than slow, and joining it would let one stuck swapped-out sink hold the exit where the graced
+    wait at the end of :func:`_shutdown_worker` costs it only what is left of the grace.
 
-    **The wait, and why it is on the registry rather than on the record.** A caller waits on every
-    close registered in :attr:`Runtime._closing_now` that is not **its own**, for
-    :func:`closer_grace` — SPEC-050's rule that a second caller waits for a close rather than
-    returning through it. The trigger is deliberately not "an owed sink was left behind": by the time a bystander arrives,
-    the caller inside the close has already **discharged** that sink from the record, so the
-    record is empty and the wait would never fire. Measured on the shipped reproduction —
+    **The wait, and why it is on the in-flight half rather than on the record.** A caller waits on
+    every close that was in flight when it took and that is not **its own**
+    (:meth:`_CloseRegistry.bystanders`) — SPEC-050's rule that a second caller waits for a close
+    rather than returning through it. The trigger is deliberately not "an owed sink was left
+    behind": by the time a bystander arrives, the caller inside the close has already
+    **discharged** that sink from the record, so the record is empty and the wait would never fire.
+    Measured on the shipped reproduction —
     ``tests/test_worker.py::test_a_second_shutdown_waits_for_an_inline_close_it_did_not_claim``,
     with a 0.6 s close — the record-keyed version returned through it at ``closed == 0``, which
     is the defect SPEC-050 FR-002 exists to prevent, re-introduced.
 
-    A sink held only by a *drain thread* — an expired ``shutdown()``, or a late worker mid-drain
-    — still costs no grace, because it carries no registration to wait on. Excluding its own
-    registrations is what stops a caller spending the grace twice on the detached close
-    :func:`join_closers` already bounds. Run unconditionally, a second pass defeats FR-002's
-    two-caller criterion: the first caller, just out of its own inline close,
-    re-takes the re-armed sink before the bystander returns from its wait.
+    The wait ends at the call's **one** grace, :attr:`_Operation.grace_end`, which this wait fixes
+    if it is the call's first graced wait (SPEC-078 FR-002). The graced join at the end of
+    :func:`_shutdown_worker` then gets only what is left of it rather than a second grace:
+    measured at ``fda134a``, two independently computed waits made ``shutdown(timeout=30)`` take
+    4.00 s against a 2.0 s grace. A sink held only by a *drain thread* — an expired ``shutdown()``,
+    or a late worker mid-drain — costs no grace, because it has no entry to wait on. Run
+    unconditionally, a second pass defeats SPEC-050 FR-002's two-caller criterion: the first
+    caller, just out of its own inline close, re-takes the re-armed sink before the bystander
+    returns from its wait.
 
-    **A sink this call did not hand off is put back and its registration discharged**, however
-    the call leaves. Two halves, and the second was found by this spec's own second diff review.
-    A ``KeyboardInterrupt`` delivered between the take and a close would otherwise leave an entry
-    nobody sets — that sink is then skipped by the signal refresh forever, never taken by a later
-    closer, and every later bystander waits out the whole grace on it. Discharging alone is not
-    enough: the take has already removed the sink from the record, so an interrupt there left it
-    **owed by nobody**, closed by nobody and unreachable by a later ``shutdown()``. Measured with
-    an interrupt injected at :func:`_inline_close_choice`: three sinks, ``closes=[0, 0, 0]``, the
-    record empty. ``setdefault`` rather than assignment, so a re-arm that landed meanwhile keeps
-    its own entry.
+    **A sink this call did not hand off is put back and its entry discharged**, however the call
+    leaves (:meth:`_CloseRegistry.put_back`). A ``KeyboardInterrupt`` delivered between the take
+    and a close would otherwise leave an entry nobody sets — that sink is then skipped by the
+    signal refresh forever, never taken by a later closer, and every later bystander waits out the
+    whole grace on it. Discharging alone is not enough: the take has already removed the sink from
+    the record, so an interrupt there left it **owed by nobody**. Measured with an interrupt
+    injected at :func:`_inline_close_choice`: three sinks, ``closes=[0, 0, 0]``, the record empty.
 
     Each entry is dropped from that set immediately **before** its close is handed off, and the
     ``try`` opens on the line after the take rather than after the inline choice — an interrupt
-    inside :func:`_inline_close_choice` leaked every registration the take had just made. The
-    residual window is the few bytecodes between the drop and the call — the same narrow shape
-    SPEC-050 FR-002 accepted for the count this replaced, and for the same reason: it contains no
-    call, so nothing but a real signal storm can land in it.
+    inside :func:`_inline_close_choice` leaked every entry the take had just made. The residual
+    window is the few bytecodes between the drop and the call — the same narrow shape SPEC-050
+    FR-002 accepted for the count this replaced, and for the same reason: it contains no call, so
+    nothing but a real signal storm can land in it.
 
     Args:
-      deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None``.
-      bystander_wait: Whether to wait on closes somebody else registered. ``False`` for
+      op: The ``STOP`` this closer runs for, whose deadline bounds the grace and which carries the
+        call's one ``grace_end``. ``None`` only for a direct call from a test, which gets an
+        unbounded operation of its own, as the old ``deadline=None`` default gave it.
+      bystander_wait: Whether to wait on closes somebody else had in flight. ``False`` for
         :func:`_shutdown_worker`'s second pass, which runs only when there is something for it to
         do and must never wait a second time.
 
@@ -1840,38 +2157,38 @@ def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -
         been joined. ``Exception`` from a close is absorbed by :func:`_close_taken`; what reaches
         here is the SPEC-025 pair a caller is owed.
     """
-    started: list[threading.Thread] = []
+    operation = _Operation(_Op.STOP, None) if op is None else op
+    joined: list[_Close] = []
     with _state._lock:
         worker = _state.worker_exists()
-        taken = [sink for sink in _state._owed.values() if not _state.held(sink)]
-        for sink in taken:
-            del _state._owed[id(sink)]
-        registrations = [(sink, _register_closing(sink)) for sink in taken]
-        detach = {
-            id(sink)
-            for sink in taken
-            if worker is not None and worker.holds_unfenced(sink)
-        }
-        mine = {id(sink) for sink in taken}
-        with _state._closing_now_lock:
-            waiting = (
-                [entry for key, entry in _state._closing_now.items() if key not in mine]
-                if bystander_wait
-                else []
+        taken = [sink for sink in _state._closes.owed.values() if not _state.held(sink)]
+        entries = [
+            (
+                sink,
+                _state._closes.take(
+                    sink,
+                    _Rule.GRACED
+                    if worker is not None and worker.holds_unfenced(sink)
+                    else _Rule.JOINED,
+                ),
             )
-    undischarged = {id(sink): (sink, closing) for sink, closing in registrations}
+            for sink in taken
+        ]
+        mine = {id(sink) for sink in taken}
+        waiting = _state._closes.bystanders(mine) if bystander_wait else []
+    undischarged = {id(sink): (sink, close) for sink, close in entries}
     try:
         inline = _inline_close_choice(taken, worker) if taken else None
-        for sink, closing in registrations:
+        for sink, close in entries:
             if sink is inline:
                 continue
             del undischarged[id(sink)]
-            if id(sink) in detach:
-                release(sink, detached=True, closing=closing)
+            if close.rule is _Rule.GRACED:
+                release(sink, detached=True, closing=close)
                 continue
             closer = threading.Thread(
                 target=_close_taken,
-                args=(sink, closing),
+                args=(sink, close),
                 name="log-foundry-owed-close",
                 daemon=True,
             )
@@ -1883,26 +2200,24 @@ def _close_owed(deadline: float | None = None, *, bystander_wait: bool = True) -
                     exc,
                     "it is closed inline instead",
                 )
-                _close_taken(sink, closing)
+                _close_taken(sink, close)
             else:
-                started.append(closer)
-        for sink, closing in registrations:
+                _state._closes.attach(close, closer)
+                joined.append(close)
+        for sink, close in entries:
             if sink is inline:
+                close.rule = _Rule.INLINE
                 del undischarged[id(sink)]
-                _close_taken(sink, closing)
+                _close_taken(sink, close)
     finally:
         if undischarged:
             with _state._lock:
-                for sink, closing in undischarged.values():
-                    _state._owed.setdefault(id(sink), sink)
-                    _finish_closing(sink, closing)
-        for closer in started:
-            closer.join()
+                for sink, close in undischarged.values():
+                    _state._closes.put_back(sink, close)
+        _state._closes.join_joined(joined)
     if not waiting:
         return False
-    end = monotonic() + closer_grace(deadline)
-    for entry in waiting:
-        entry.event.wait(max(0.0, end - monotonic()))
+    _state._closes.wait_graced(operation, waiting)
     return True
 
 
@@ -1957,8 +2272,12 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     own inline close, re-takes the re-armed sink before the bystander returns from its wait.
     Nothing runs a third.
 
-    The closer grace is granted **once**, at the end, on every path. Two functions arranged that
-    between them before, and granting it twice measured 4.01 s against a 2 s grace.
+    **The closer grace is spent once per call** (SPEC-078 FR-002). Every graced wait of the call —
+    the first pass's bystander wait and the graced join at the end — ends at the operation's one
+    ``grace_end``, fixed by the first of them, after the inline close so SPEC-030's order holds.
+    Two independently computed waits measured 4.00 s and 4.01 s against a 2 s grace at
+    ``fda134a``. The graced join at the end runs on every path, as ``join_closers`` did, and spends
+    nothing when no detached close is alive.
 
     **A live worker's stop is claimed here, before** ``_state._stop`` **is set** (SPEC-062
     FR-001). That event is the worker's own, and setting it is what cuts a backoff short, so the
@@ -1970,14 +2289,14 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     sink's ``emit`` calling ``shutdown()`` — it cannot join, so the next call from another thread
     takes the gate over in ``claim_stop`` with its own deadline and joins instead (SPEC-068
     FR-006). Nothing here changes for it: the closer leaves the sink a live drain thread may
-    still be inside, which on that call is the caller's own thread, and the closer grace and
-    ``join_closers`` still apply, so that call can wait on a swapped-out sink's close though it
-    never waits on its own thread. A late worker is stopped through ``stop`` without a verdict
+    still be inside, which on that call is the caller's own thread, and the closer grace still
+    applies, so that call can wait on a swapped-out sink's close though it never waits on its own
+    thread. A late worker is stopped through ``stop`` without a verdict
     and claims for itself, before it sets the different event it holds.
 
-    **The draining token** (SPEC-077 FR-002). A fresh ``object()`` is added to
+    **The draining token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._stops_running` in the first critical section, before ``_stop`` is set, and
-    discarded in the outer ``finally`` once ``join_closers`` has returned, so
+    discarded in the outer ``finally`` once the graced join has returned, so
     :attr:`Runtime.state` reads ``DRAINING`` for the whole body on both branches, the late
     worker's stop and the second ``_close_owed`` pass included — and is never left there by an
     exception. The discard takes no lock: it is one ``set.discard``, so the token adds no
@@ -1992,26 +2311,25 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     Raises:
       None.
     """
-    deadline = None if timeout is None else monotonic() + timeout
+    op = _Operation(_Op.STOP, timeout)
     claimed = False
-    token = object()
     try:
         with _state._lock:
-            _state._stops_running.add(token)
+            _state._stops_running.add(op)
             _state.retirements += 1
             worker = _state.worker_exists()
             if worker is None:
                 _state._shutdown_running += 1
             else:
-                claimed = worker.claim_stop(deadline)
+                claimed = worker.claim_stop(op.deadline)
             _state._stop.set()
         late_worker: Worker | None = None
         if worker is not None:
-            worker.stop(timeout, claimed=claimed)
-            waited = _close_owed(deadline)
+            worker.stop(op.budget, claimed=claimed)
+            waited = _close_owed(op)
         else:
             try:
-                waited = _close_owed(deadline)
+                waited = _close_owed(op)
             finally:
                 with _state._lock:
                     late_worker = _state._late_worker
@@ -2020,12 +2338,12 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             if late_worker is not None:
                 with _state._lock:
                     _state.retirements += 1
-                late_worker.stop(None if deadline is None else max(0.0, deadline - monotonic()))
+                late_worker.stop(_remaining(op.deadline))
         if waited or late_worker is not None:
-            _close_owed(deadline, bystander_wait=False)
-        join_closers(deadline)
+            _close_owed(op, bystander_wait=False)
+        _state._closes.wait_graced(op, None)
     finally:
-        _state._stops_running.discard(token)
+        _state._stops_running.discard(op)
 
 
 def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
@@ -2048,7 +2366,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       running *concurrently* with a first. ``retarget`` takes the old sink out of the worker's
       own held set when it confirms the fence, and this branch then re-takes ``_lock``; in that
       gap the sink is owed and no longer held, so a concurrent ``shutdown()`` takes it, registers
-      it and starts closing it. :func:`_register_closing` hands this branch back that *same*
+      it and starts closing it. The registry hands this branch back that *same*
       registration — it is one per sink by design — so the detached release starts a second
       closer into a ``close()`` already in flight. Measured with an injected preemption point at
       two overlapping closes, and at 13 of 120 seeds unforced against a 2 ms ``close()``;
@@ -2096,7 +2414,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     critical section under ``_state._lock``, so a preempted orphan emit cannot re-arm a sink in a
     gap where it is neither owed nor in flight (FR-003).
 
-    **The swapping token** (SPEC-077 FR-002). A fresh ``object()`` is added to
+    **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no
     live worker and nothing owed, so a swap with no work never enters ``SWAPPING``, and before any
     stale sink is released, so every close this swap starts runs inside the state. It is
@@ -2114,30 +2432,30 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       None. A retarget that raises is absorbed and announced: the previous sink keeps receiving,
         which is a reported degradation rather than a lost configure.
     """
-    deadline = None if timeout is None else monotonic() + timeout
+    op = _Operation(_Op.SWAP, timeout)
     closers: list[threading.Thread] = []
-    token = object()
     try:
         with _state._lock:
             worker = _state.live_worker()
             old = None if worker is None else worker.sink
-            if worker is None and not _state._owed:
+            if worker is None and not _state._closes.owed:
                 return
-            _state._swaps_running.add(token)
-            for stale in list(_state._owed.values()):
+            _state._swaps_running.add(op)
+            for stale in list(_state._closes.owed.values()):
                 if stale is new_sink or stale is old or _state.held(stale):
                     continue
-                del _state._owed[id(stale)]
-                closer = release(stale, detached=True, closing=_register_closing(stale))
+                closer = release(
+                    stale, detached=True, closing=_state._closes.take(stale, _Rule.GRACED)
+                )
                 if closer is not None:
                     closers.append(closer)
             if worker is None:
                 _register_exit_handler()
-                _state._owed[id(new_sink)] = new_sink
+                _state._closes.arm(new_sink)
                 _offer_orphan_signal(new_sink)
         if worker is not None:
             try:
-                outcome = worker.retarget(new_sink, deadline)
+                outcome = worker.retarget(new_sink, op.deadline)
             except Exception as exc:
                 _diag.absorbed(
                     "swapping the log sink",
@@ -2147,7 +2465,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             else:
                 with _state._lock:
                     _register_exit_handler()
-                    _state._owed[id(new_sink)] = new_sink
+                    _state._closes.arm(new_sink)
                     previous = outcome.previous
                     fenced_out = (
                         outcome.verdict == "fenced"
@@ -2156,16 +2474,17 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                         and not _state.held(previous)
                     )
                     if fenced_out and previous is not None:
-                        _state._owed.pop(id(previous), None)
                         closer = release(
-                            previous, detached=True, closing=_register_closing(previous)
+                            previous,
+                            detached=True,
+                            closing=_state._closes.take(previous, _Rule.GRACED),
                         )
                         if closer is not None:
                             closers.append(closer)
         for closer in closers:
-            closer.join(None if deadline is None else max(0.0, deadline - monotonic()))
+            closer.join(_remaining(op.deadline))
     finally:
-        _state._swaps_running.discard(token)
+        _state._swaps_running.discard(op)
 
 
 def _flush_live_sink() -> bool:
@@ -2199,7 +2518,7 @@ def _flush_live_sink() -> bool:
     from log_foundry.sinks.base import flush_sink
 
     with _state._lock:
-        pending = list(_state._owed.values())
+        pending = list(_state._closes.owed.values())
     if not pending:
         return True
     drained = True
@@ -2210,6 +2529,8 @@ def _flush_live_sink() -> bool:
             _diag.absorbed("flushing the sink's own buffer", exc, "its client still holds events")
             drained = False
     return drained
+
+
 def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     """Drains the process worker without retiring it, backing ``flush()`` (SPEC-013 FR-003).
 
@@ -2269,6 +2590,8 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     if not sink_drained:
         return FlushResult(ok=False, reason="sink-flush")
     return drained
+
+
 def _delivering_to_an_inherited_sink() -> bool:
     """Whether the sink this process delivers to was handed over by another one (SPEC-042).
 
@@ -2386,15 +2709,14 @@ def _worker_health() -> Health:
         stopped_reason=None if counters is None else counters.stopped_reason,
         sink=None if configured is None else read_losses(configured),
         retired=retired,
-        submitted_after_shutdown=(
-            0 if counters is None else counters.submitted_after_shutdown
-        ),
+        submitted_after_shutdown=(0 if counters is None else counters.submitted_after_shutdown),
         incomplete_swaps=0 if counters is None else counters.incomplete_swaps,
-        closing_sinks=closing_count(),
+        closing_sinks=_state._closes.graced_alive(),
         inherited_sink=_delivering_to_an_inherited_sink(),
         orphan_lost=orphan_lost,
         in_span_lost=in_span_lost,
     )
+
 
 _fork.register_child_handler(_mark_inherited)
 _fork.register_child_handler(_clear_after_fork)

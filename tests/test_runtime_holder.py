@@ -1,11 +1,23 @@
 """SPEC-077 FR-001 and FR-005: one holder for the lifecycle bookkeeping, and nothing public moved.
 
-The lock-site literal below was derived on the build's base commit, ``3d65cf32``, from the
+The lock-site literal below was derived on SPEC-077's base commit, ``3d65cf32``, from the
 unmodified ``_lifecycle.py`` and ``worker.py`` (the spec's FR-001 criterion: not the set at
 ``fda134a``, since SPEC-072 rewrote ``Worker._emit`` in between). A moved lock is written under its
 new path, ``_state.<name>``. It is held as a **multiset** of (enclosing function, lock), which
 implies the spec's set equality and also catches a second identical acquisition added to one
 function — the shape the pinned lock counts in ``tests/test_runtime_state.py`` measure at runtime.
+
+**Re-recorded at SPEC-078 (FR-006), from the code at ``64d0d039`` plus the registry.** SPEC-078
+merged ``_closing_now_lock`` and ``_closers_lock`` into the close registry's one leaf lock and
+deleted ``join_closers``, which turns this literal red by design. The diff from SPEC-077's literal
+is exactly: every site that took either merged leaf is listed under the registry's lock
+(``_closing`` → ``_CloseRegistry.in_flight``, ``_register_closing`` → ``_CloseRegistry._enter``,
+``_finish_closing`` → ``_CloseRegistry.finish``, ``_start_closer`` → ``_CloseRegistry.attach``,
+``closing_count`` → ``_CloseRegistry.graced_alive``, ``_close_owed``'s snapshot →
+``_CloseRegistry.bystanders``, and ``_clear_after_fork`` on ``_state._closes._lock``);
+``join_closers``' site leaves with it; and the registry's graced join
+(``_CloseRegistry.wait_graced``) enters. No ``_state._lock``, ``_owned_lock`` or ``worker.py`` row
+changed.
 """
 
 from __future__ import annotations
@@ -24,34 +36,55 @@ from test_lifecycle_inventory import _NESTED_BINDINGS, module_bindings, module_s
 _SRC = pathlib.Path(log_foundry.__file__).resolve().parent
 
 MOVED = (
+    "_owned",
+    "_owned_lock",
+    "_marking_failed",
+    "_closes",
+)
+"""SPEC-077's moved names still on ``Runtime``, and the registry SPEC-078 put in place of four."""
+
+REPLACED = (
     "_closers",
     "_closers_lock",
     "_closing_now",
     "_closing_now_lock",
-    "_owned",
-    "_owned_lock",
-    "_marking_failed",
+    "_owed",
 )
+"""SPEC-077's names SPEC-078 replaced with ``Runtime._closes``: bound nowhere any more."""
+
+REMOVED_FROM_MODULE = (
+    "_closing_now",
+    "_closing_now_lock",
+    "_closers",
+    "_closers_lock",
+    "_Closing",
+    "_register_closing",
+    "_finish_closing",
+    "_closing",
+    "join_closers",
+    "closing_count",
+)
+"""SPEC-078 FR-001 AC-1's ten names, none of which ``_lifecycle.py`` binds at module level."""
 
 LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
     "_lifecycle.py": collections.Counter(
         {
-            ("_closing", "_state._closing_now_lock"): 1,
-            ("_register_closing", "_state._closing_now_lock"): 1,
-            ("_finish_closing", "_state._closing_now_lock"): 1,
-            ("_clear_after_fork", "_state._closing_now_lock"): 1,
+            ("_CloseRegistry.in_flight", "self._lock"): 1,
+            ("_CloseRegistry._enter", "self._lock"): 1,
+            ("_CloseRegistry.finish", "self._lock"): 1,
+            ("_clear_after_fork", "_state._closes._lock"): 1,
             ("_inheritance_roots", "_state._owned_lock"): 1,
             ("_mark_inherited", "_state._owned_lock"): 1,
             ("reclaim", "_state._owned_lock"): 1,
             ("stamp", "_state._owned_lock"): 1,
             ("releasable", "_state._owned_lock"): 1,
-            ("_start_closer", "_state._closers_lock"): 1,
-            ("join_closers", "_state._closers_lock"): 1,
-            ("closing_count", "_state._closers_lock"): 1,
+            ("_CloseRegistry.attach", "self._lock"): 1,
+            ("_CloseRegistry.wait_graced", "self._lock"): 1,
+            ("_CloseRegistry.graced_alive", "self._lock"): 1,
             ("_get_worker", "_state._lock"): 1,
             ("_note_orphan_emit", "_state._lock"): 1,
             ("_close_owed", "_state._lock"): 2,
-            ("_close_owed", "_state._closing_now_lock"): 1,
+            ("_CloseRegistry.bystanders", "self._lock"): 1,
             ("_shutdown_worker", "_state._lock"): 3,
             ("_swap_sink", "_state._lock"): 2,
             ("_flush_live_sink", "_state._lock"): 1,
@@ -131,9 +164,15 @@ def test_runtime_replaces_the_lifecycle_class_and_has_one_instance() -> None:
 
 
 def test_no_moved_name_is_bound_at_module_level() -> None:
-    """FR-001 AC-2: the seven names and ``_FORK_SKIP`` are gone from module scope, onto ``self``."""
+    """FR-001 AC-2, re-expressed for SPEC-078 FR-001 AC-1: nothing moved or replaced is a global.
+
+    SPEC-077's seven names and ``_FORK_SKIP`` left module scope for ``Runtime``; SPEC-078 then
+    replaced four of them, and ``_owed``, with ``Runtime._closes``. So: none of the moved, replaced
+    or removed names is bound at module level; the moved ones and the registry are assigned on
+    ``self`` in ``Runtime.__init__``; and the replaced ones are not assigned there either.
+    """
     tree = _tree("_lifecycle.py")
-    leftover = _module_bound(tree) & {*MOVED, "_FORK_SKIP"}
+    leftover = _module_bound(tree) & {*MOVED, *REPLACED, *REMOVED_FROM_MODULE, "_FORK_SKIP"}
     assert not leftover, f"still bound at module level: {sorted(leftover)}"
 
     runtime = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Runtime")
@@ -149,6 +188,9 @@ def test_no_moved_name_is_bound_at_module_level() -> None:
     }
     missing = set(MOVED) - on_self
     assert not missing, f"not assigned on self in Runtime.__init__: {sorted(missing)}"
+    kept = set(REPLACED) & on_self
+    assert not kept, f"replaced by the close registry, yet still on Runtime: {sorted(kept)}"
+    assert not any(hasattr(_lifecycle._state, name) for name in REPLACED)
 
 
 def _module_bound(tree: ast.Module) -> set[str]:
@@ -181,12 +223,16 @@ def test_the_module_scan_sees_an_import_and_ignores_function_bodies() -> None:
 
 
 def test_the_fork_opt_out_lists_both_pinning_records() -> None:
-    """FR-001 AC-3: one class-level declaration names both records that pin superseded sinks.
+    """FR-001 AC-3: both records that pin superseded sinks are opted out, each on its holder.
 
-    The behavioural half — a child of ``configure(A)``, ``info()``, ``configure(B)`` runs no hook on
-    A — is ``test_lifecycle_races.test_a_forked_child_does_not_hook_a_superseded_sink``.
+    SPEC-078 moved the owed record onto the close registry, so ``Runtime._FORK_SKIP`` names only
+    ``_owned`` and ``_CloseRegistry._FORK_SKIP`` names ``owed``: ``_fork._skipped_names`` reads the
+    opt-out off the holder of the attribute. The behavioural half — a child of ``configure(A)``,
+    ``info()``, ``configure(B)`` runs no hook on A — is
+    ``test_lifecycle_races.test_a_forked_child_does_not_hook_a_superseded_sink``.
     """
-    assert _lifecycle.Runtime._FORK_SKIP == ("_owed", "_owned")
+    assert _lifecycle.Runtime._FORK_SKIP == ("_owned",)
+    assert _lifecycle._CloseRegistry._FORK_SKIP == ("owed",)
 
 
 def test_the_lock_sites_are_the_base_commits() -> None:
@@ -196,7 +242,7 @@ def test_the_lock_sites_are_the_base_commits() -> None:
         added = found - expected
         lost = expected - found
         assert not added and not lost, (
-            f"{name}: the lock sites moved from those derived at 3d65cf32 — added "
+            f"{name}: the lock sites moved from those recorded at SPEC-078 — added "
             f"{dict(added)}, lost {dict(lost)}. Moving a lock changes the lock order, which is "
             "behaviour (SPEC-077 FR-001)"
         )
@@ -207,7 +253,17 @@ _STALE_DOC = re.compile(
     r"|_lifecycle\.(_closers|_closing_now|_owned|_marking_failed|_FORK_SKIP)\b"
     r"|:data:`(_closers|_closers_lock|_closing_now|_closing_now_lock|_owned|_owned_lock"
     r"|_marking_failed|_FORK_SKIP)`"
+    r"|_state\.(_owed|_closers|_closers_lock|_closing_now|_closing_now_lock)\b"
+    r"|:(func|attr|class|meth):`[~.\w]*\b(_Closing|_closing|_register_closing|_finish_closing"
+    r"|join_closers|closing_count|_owed|_closers|_closers_lock|_closing_now"
+    r"|_closing_now_lock)`"
 )
+"""A docstring cross-reference to a name that no longer exists.
+
+SPEC-078 FR-001 widened it to the registry's removed names, as a live path (``_state._owed``) or
+as a Sphinx role (:func:`join_closers`), which are the two shapes that claim a symbol exists. A
+backticked name in prose, ``join_closers``, is history and is left alone.
+"""
 
 
 def test_no_docstring_names_a_removed_module_attribute() -> None:
@@ -227,3 +283,25 @@ def test_runtime_and_state_are_not_public(name: str) -> None:
     assert name not in log_foundry.__all__
     with pytest.raises(ImportError):
         exec(f"from log_foundry import {name}", {})  # noqa: S102
+
+
+@pytest.mark.parametrize(
+    ("line", "stale"),
+    [
+        ("    the wait takes :func:`join_closers`' grace", True),
+        ("    it reads :attr:`Runtime._owed` under the lock", True),
+        ("    registered in ``_state._closing_now`` now", True),
+        ("    see :func:`~log_foundry._lifecycle.closing_count`", True),
+        ("    ``join_closers`` granted it, before SPEC-078", False),
+        ("    the closer, :func:`_close_owed`, takes it", False),
+        ("    a worker's ``_join_owed`` flag", False),
+    ],
+)
+def test_the_stale_docstring_pattern_names_what_it_refuses(line: str, stale: bool) -> None:
+    """The widened pattern is not vacuous, and it leaves history and live neighbours alone.
+
+    A Sphinx role or a live ``_state.`` path claims the symbol exists, so either one naming a
+    removed name is refused; a backticked name in prose is a record of what used to be, and
+    ``_close_owed`` and ``_join_owed`` contain the old record's name without being it.
+    """
+    assert bool(_STALE_DOC.search(line)) is stale, line

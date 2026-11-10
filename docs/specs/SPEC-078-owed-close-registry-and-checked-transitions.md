@@ -506,7 +506,12 @@ Tests that pin a removed mechanism are re-expressed, never deleted. Measured at 
 `test_api.py`, `test_concurrent_owed_closes.py`, `test_config.py`, `test_fork_lifecycle.py`,
 `test_lifecycle_races.py`, `test_orphan_sink_handoff.py`, `test_owed_closes.py`,
 `test_shutdown_lifecycle.py`, `test_sink_ownership.py`, `test_sink_release_roster.py`,
-`test_worker.py` and `test_worker_predicate_roster.py`. Most edits are a path. The rest move a
+`test_worker.py` and `test_worker_predicate_roster.py`. Re-measured at the build's base,
+`64d0d039`, after SPEC-077 landed: the same grep names those thirteen and four more, SPEC-077's
+`test_invariants_model.py`, `test_lifecycle_inventory.py`, `test_runtime_holder.py` and
+`test_runtime_state.py`; its four other hits (`test_closed_guard.py`, `test_sink_concurrency.py`,
+`test_sink_post_close.py`, `test_sinks_nats_liveness.py`) are an unrelated `_closing` — a test
+helper and a sink attribute — and are not edited. Most edits are a path. The rest move a
 monkeypatch from `join_closers` to the registry's graced join and keep the assertion.
 
 Four guards are re-derived, never left to shrink. `tests/test_lifecycle_races.py`'s
@@ -514,7 +519,7 @@ under-lock lint keys on names (`_UNDER_LOCK_OFFENDERS = frozenset({"join_closers
 at `fda134a`), so removing `join_closers` would empty half of it silently: the set names the
 registry's join methods instead, and a mutant that calls one under `_state._lock` must fail it.
 `tests/test_worker_predicate_roster.py`'s `_SITE_FLOOR` for `log_foundry._lifecycle` (43 at
-`fda134a`) does not fall, and the state reads in the entries are filed with a category. SPEC-077's
+`fda134a`, 47 at the build's base after SPEC-077) does not fall, and the state reads in the entries are filed with a category. SPEC-077's
 lifecycle inventory test re-declares the moved fields, and its floor of lock and event construction
 sites in `_lifecycle.py` and `worker.py` falls by exactly one, for the merged leaf, in the same
 commit, with the merge named in the table's `reason`. SPEC-077 FR-001's lock-site test holds its
@@ -530,7 +535,8 @@ FR-001 gives, and the token sets keep `reset: _clear_after_fork`.
 - [ ] The directed tests and the totality check pass, and the sequential driver passes over its
   fixed seed range with the stored-versus-derived check of FR-003 after every step.
 - [ ] A mutant calling the registry's graced join under `_state._lock` fails the under-lock lint,
-  and the predicate roster's `_lifecycle` floor is at least 43.
+  and the predicate roster's `_lifecycle` floor is at least 47, its value at the build's base
+  (43 at `fda134a`; SPEC-077 raised it).
 - [ ] SPEC-077 FR-001's lock-site test passes against its re-recorded literal, whose diff from
   SPEC-077's names only the merged leaf lock's sites, `join_closers`' removed sites and the
   registry's join; a mutant that takes `_state._lock` in place of the leaf in one registry method
