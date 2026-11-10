@@ -18,6 +18,14 @@ is exactly: every site that took either merged leaf is listed under the registry
 ``join_closers``' site leaves with it; and the registry's graced join
 (``_CloseRegistry.wait_graced``) enters. No ``_state._lock``, ``_owned_lock`` or ``worker.py`` row
 changed.
+
+**Re-recorded at SPEC-079.** SPEC-079 deleted ``_inheritance_roots`` and ``_mark_inherited``,
+which turns this literal red by design. The diff from SPEC-078's literal is exactly: their two
+``_state._owned_lock`` sites leave, and the same lock's two sites in the one walk that replaced
+them enter (``_record_seeds``, reading the record as a seed, and ``_walk_after_fork``, writing
+the marks). ``_clear_after_fork`` also takes ``_state._lock``, outside the registry's leaf, to
+reset the shutdown count and the late worker and re-settle the stored state (FR-004), and
+``_adopt_factory_after_fork`` takes it to install a factory's sink on the worker (FR-006).
 """
 
 from __future__ import annotations
@@ -73,8 +81,10 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_CloseRegistry._enter", "self._lock"): 1,
             ("_CloseRegistry.finish", "self._lock"): 1,
             ("_clear_after_fork", "_state._closes._lock"): 1,
-            ("_inheritance_roots", "_state._owned_lock"): 1,
-            ("_mark_inherited", "_state._owned_lock"): 1,
+            ("_clear_after_fork", "_state._lock"): 1,
+            ("_adopt_factory_after_fork", "_state._lock"): 1,
+            ("_record_seeds", "_state._owned_lock"): 1,
+            ("_walk_after_fork", "_state._owned_lock"): 1,
             ("reclaim", "_state._owned_lock"): 1,
             ("stamp", "_state._owned_lock"): 1,
             ("releasable", "_state._owned_lock"): 1,

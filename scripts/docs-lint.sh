@@ -1569,7 +1569,9 @@ fi
 # with a bare universal, and attaches no restriction to it. All four parts are load-bearing and
 # each was measured; the numbers below are reproducible with `git archive <sha> | tar -x`.
 #
-#   ANCHOR    _mark_inherited, `_FOREIGN`, ``_FOREIGN``, or the phrase "marking walk". NAMED
+#   ANCHOR    _mark_inherited, _walk_after_fork, `_FOREIGN`, ``_FOREIGN``, or the phrase "marking
+#             walk". _walk_after_fork joined at SPEC-079, which folded the marking into the one
+#             walk a forked child runs; _mark_inherited stays because frozen records name it. NAMED
 #             symbols only. A descriptive anchor — one that also matches "a forked child",
 #             "it inherited", "inherited sink" — is rejected: every widening tried took the
 #             clean-tree count from 0 into the tens or hundreds against zero true positives,
@@ -1707,7 +1709,7 @@ import os
 import re
 import sys
 
-ANCHOR = re.compile(r"_mark_inherited|`_FOREIGN`|marking walk")
+ANCHOR = re.compile(r"_mark_inherited|_walk_after_fork|`_FOREIGN`|marking walk")
 UNIVERSAL = re.compile(r"\b(every|everything|each|all)\b", re.IGNORECASE)
 SUBJECT = re.compile(
     r"\b(sink|record|inherit|stamp|transport|descriptor|object)\w*",
@@ -1731,7 +1733,7 @@ ESCAPE = "docs-lint: marking-walk"
 REPORT = (
     "FAIL  %s:%d claims the marking walk acts on EVERYTHING, with no scope.\n"
     "      %s\n"
-    "      `_mark_inherited` ``setdefault``s: a sink `configure()` already stamped keeps the\n"
+    "      `_walk_after_fork` ``setdefault``s: a sink `configure()` already stamped keeps the\n"
     "      parent's real pid, and ``_FOREIGN`` lands only where nothing was recorded. Say what\n"
     "      the universal is restricted TO, INSIDE its own noun phrase — \"every inherited sink\n"
     "      its walk reaches\", \"everything inherited that the parent never recorded\". A scoping\n"

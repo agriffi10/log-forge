@@ -7,10 +7,11 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _lifecycle
+from log_foundry._sink_arg import require_sink
 from log_foundry.sanitize import _int_text
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from log_foundry.sinks.base import Sink
 
@@ -37,6 +38,10 @@ class Config:
     assigning a ceiling bypassed :func:`_require_positive`, so ``max_value_bytes = 0`` was
     accepted and emptied every event it touched. Both measured. :func:`configure` is the only
     supported route to a change, and it rebinds the module global rather than mutating.
+
+    ``sink_factory`` (SPEC-079 FR-005) is where this process's sink comes from when it is built
+    per process: with one configured, ``sink`` is the library's private wrapper that builds the
+    factory's sink on its first emit, and ``sink_factory`` is the callable itself.
     """
 
     service: str = "unknown"
@@ -48,6 +53,7 @@ class Config:
     max_stack_bytes: int = 32768
     max_keys: int = 256
     max_depth: int = 8
+    sink_factory: Callable[[], Sink] | None = None
 
 
 _config = Config()
@@ -166,6 +172,50 @@ def _require_text(name: str, value: object) -> str | None:
     return plain
 
 
+def _require_factory(value: object) -> None:
+    """Refuses a ``sink_factory`` that is not callable or cannot be called with no arguments.
+
+    Checked with the ceilings and stamps, before anything is assigned, so a refused call leaves
+    the config and the ownership record as it found them (SPEC-079 FR-005). ``callable`` reads the
+    type's call slot, and the message names the type through its stored name, never the value
+    (SPEC-071 FR-005's door shape). A signature that cannot bind zero arguments is refused —
+    ``sink_factory=FileSink`` needs a path — and one that ``inspect.signature`` cannot read, a
+    ``ValueError``, is accepted, since only calling it would tell. Whatever else the signature read
+    raises propagates unchanged. ``inspect`` is imported here rather than at module scope, because
+    it is costly to import and only this check needs it.
+
+    What the factory returns can only be known by calling it, which ``configure()`` never does:
+    ``_FactorySink`` gives that case its defined answer on the first emit.
+
+    Args:
+      value: The ``sink_factory`` argument, not ``None``.
+
+    Returns:
+      None.
+
+    Raises:
+      TypeError: When the value is not callable, or its signature cannot bind zero arguments.
+    """
+    if not callable(value):
+        raise TypeError(
+            "sink_factory must be callable with no arguments, "
+            f"got {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        )
+    import inspect
+
+    try:
+        signature = inspect.signature(value)
+    except ValueError:
+        return
+    try:
+        signature.bind()
+    except TypeError:
+        raise TypeError(
+            "sink_factory must be callable with no arguments, "
+            f"got {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"
+        ) from None
+
+
 def configure(
     *,
     service: str | None = None,
@@ -177,6 +227,7 @@ def configure(
     max_stack_bytes: int | None = None,
     max_keys: int | None = None,
     max_depth: int | None = None,
+    sink_factory: Callable[[], Sink] | None = None,
 ) -> None:
     """Patches the global config, and is meant to be called once at startup.
 
@@ -216,6 +267,26 @@ def configure(
     on in the background. An expired join reports nothing, since a slow close and a stuck one
     cannot be told apart at that moment; ``health().closing_sinks`` reports the live fact instead.
 
+    **``sink_factory`` and ``sink`` are one setting: where this process's sink comes from**
+    (SPEC-079 FR-005). Passing both raises ``ValueError``, because one would be silently ignored.
+    A later ``sink=`` clears ``sink_factory`` and a later ``sink_factory=`` replaces the sink; a
+    call passing neither keeps both. ``sink_factory=f`` installs a private wrapper sink that calls
+    ``f`` on the **first emit in each process** — never here, so a prefork master that never logs
+    never builds one — and when logging has started it is swapped in exactly as ``sink=`` is.
+    Passing the factory already configured (``is``) does nothing. A forked child is handed a new
+    wrapper by the fork handler and builds its own sink on its own first emit; the parent's stays
+    the parent's. A factory that raises or returns no sink is not refused here: each emit until
+    one builds fails, counted and announced (``docs/invariants.md`` §13). **The factory must build
+    a new sink on each call**: one returning an object that existed before the fork hands every
+    child that object, which the child then delivers to as an inherited sink, or claims if
+    nothing recorded it.
+
+    ``sink=`` is refused when it is a value that can never be a sink — exactly one of the builtin
+    types ``_sink_arg._UNPATCHABLE`` lists, such as ``object()``, a ``str`` or a ``dict`` — since
+    every batch would otherwise be lost on the drain thread. A sink with no ``close`` is accepted,
+    and so is one that has no ``emit`` yet but could gain one; a user class that never does loses
+    its batches counted and announced.
+
     This is still a startup call, and it is **not thread-safe**. A span finishing on another
     thread during a swap may land on either sink, and two threads calling this at once can leave
     the config naming one sink while delivery goes to another. What is unconditional is that
@@ -238,15 +309,21 @@ def configure(
       max_keys: Ceiling on the entries of one mapping or sequence. An ``int``, as
         ``max_value_bytes``.
       max_depth: Ceiling on nesting levels. An ``int``, as ``max_value_bytes``.
+      sink_factory: Called with no arguments, on the first emit in each process, to build that
+        process's sink. Never called by ``configure()``.
 
     Returns:
       None.
 
     Raises:
-      ValueError: If any ceiling is less than 1, or a stamp does not encode as UTF-8.
-      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001), or
-        a ceiling is not an ``int`` (SPEC-065 FR-001).
+      ValueError: If any ceiling is less than 1, a stamp does not encode as UTF-8, or both
+        ``sink`` and ``sink_factory`` are given.
+      TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001), a
+        ceiling is not an ``int`` (SPEC-065 FR-001), ``sink`` is a value that can never be a sink,
+        or ``sink_factory`` is not callable with no arguments (SPEC-079 FR-005).
     """
+    if sink is not None and sink_factory is not None:
+        raise ValueError("configure() takes sink or sink_factory, not both")
     max_value_bytes = _require_positive("max_value_bytes", max_value_bytes)
     max_stack_bytes = _require_positive("max_stack_bytes", max_stack_bytes)
     max_keys = _require_positive("max_keys", max_keys)
@@ -254,6 +331,10 @@ def configure(
     service = _require_text("service", service)
     version = _require_text("version", version)
     env = _require_text("env", env)
+    if sink is not None:
+        require_sink(sink, "sink")
+    if sink_factory is not None:
+        _require_factory(sink_factory)
 
     changed: dict[str, object] = {
         name: value
@@ -270,6 +351,14 @@ def configure(
         )
         if value is not None
     }
+    if sink is not None:
+        changed["sink_factory"] = None
+    elif sink_factory is not None and sink_factory is not _config.sink_factory:
+        from log_foundry.sinks._factory import _FactorySink
+
+        sink = _FactorySink(sink_factory)
+        changed["sink"] = sink
+        changed["sink_factory"] = sink_factory
     if sink is not None:
         _lifecycle.stamp(sink)
 

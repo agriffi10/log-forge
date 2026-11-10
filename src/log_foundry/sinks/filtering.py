@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _lifecycle
+from log_foundry._sink_arg import require_sink
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import ReadOnlyCount, ReadOnlySeconds, require_callable
 from log_foundry.sinks._deferral import Deferral, wrapped_losses
@@ -100,10 +101,13 @@ class FilteringSink:
           None.
 
         Raises:
-          TypeError: If ``predicate`` is neither callable nor ``None``, refused here rather than
-            raised out of every ``emit`` (SPEC-071 FR-005).
+          TypeError: If ``inner`` is an unpatchable builtin value that can never be a sink
+            (``_sink_arg.require_sink``, SPEC-079 FR-005), or ``predicate`` is neither callable
+            nor ``None``, each refused here rather than raised out of every ``emit``
+            (SPEC-071 FR-005).
           ValueError: If the minimum level is not one of the five standard names.
         """
+        require_sink(inner, "FilteringSink inner")
         require_callable(predicate, "predicate", type(self).__name__)
         self._inner = inner
         vars(self)["log_foundry_stop_signal"] = None

@@ -521,8 +521,9 @@ hostile probe (SPEC-067).
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
-Locks and events first, inherited buffers second, registered handlers last; `before` never runs
-for a C-level fork; a value the child inherits is stranded, not detached (SPEC-039, SPEC-042).
+The package's global locks and events from one roster first, then one walk from the runtime's
+roots, inherited buffers next, registered handlers last; `before` never runs for a C-level fork; a
+value the child inherits is stranded, not detached (SPEC-039, SPEC-042, SPEC-079).
 
 *Observable:* a child forked mid-drain delivers its own events, never hangs on a parent's lock,
 and closes no transport the parent opened.
@@ -530,22 +531,28 @@ and closes no transport the parent opened.
 `close()` returns without touching anything, because the child acquired no thread, loop or
 connection and `reacquire_after_fork` is not implemented (SPEC-061 FR-001; `architecture.md` §12
 names what would close it). The pid is compared before the sink's lock, since a lock a caller
-held at fork time stays held in the child. The walk enters only this package's objects, so a sink
-of your own is repaired only if it subclasses `Sink` or a shipped sink — with one reach past that
-boundary (SPEC-072 FR-003): a value the walk would not enter, such as a structurally typed sink the
-worker holds, is read for the one attribute `log_foundry_counters`, statically, and an exact
-`SinkCounters` there has its lock replaced, so a child does not hang on a reached engine sink's
-counters. The reach is one level deep: an engine sink held inside a wrapper of your own, or a sink
-that is itself a container subclass of your own, is not reached, and nothing else of a foreign
-namespace is read. **An unreached shape whose counters' lock a parent thread held at the fork
-hangs the child's first run that commits into it:** an `info()` on the orphan path blocks the
-caller, and on the worker path the drain thread blocks, so `flush()` times out. A registry of live
-`SinkCounters` the walk reads, rather than finds, is SPEC-079's follow-up. A sink's closed guard
+held at fork time stays held in the child. The walk replaces locks only on this package's
+objects, so a sink of your own is repaired only if it subclasses `Sink` or a shipped sink. Since
+SPEC-079 a package object behind a third-party holder, or two containers down, is reached from what
+the walk's repair frontier forwards to its marking frontier and is repaired and re-acquired
+**within that frontier's ceiling**; past a tripped ceiling it is not. Every live `SinkCounters` is
+repaired from a registry the walk reads rather than searches, whatever holds it, so an engine
+sink's counters no longer hang a child however they are held. A package object reachable only
+through a bound method, a closure cell or a `functools.partial` is neither repaired nor marked
+(`architecture.md` §13). A sink handed to the library — the configured sink, a value in a package
+wrapper's child-sink slot, a live worker's sink — is recorded by position whatever it looks like,
+so a `weakref.proxy`, `super(Sub, inst)` or `__getattr__` proxy there is never claimed by a child;
+but a sink **behind a `weakref.proxy`** is not repaired, because its referent is reachable only by
+calling into the proxy, so a lock it holds at the fork stays held in the child (`architecture.md`
+§13). After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink owns
+it and closes it (§13, pre-existing). A sink's closed guard
 (SPEC-076) is on the walk at `self._guard`, so its locks and its event are replaced, and its state
 is adopted lazily by pid: the child counts no parent section inside, turns a `CLOSING` it
 inherited back to `OPEN`, since no parent closer runs there, and keeps `CLOSED`.
 *Guarded:* `tests/test_fork_lifecycle.py` (including an engine sink's counters, SPEC-072, and
-the closed guard driven through `configure()`, SPEC-076),
+the closed guard driven through `configure()`, SPEC-076), `tests/test_fork_roster.py`,
+`tests/test_fork_one_walk.py`, `tests/test_fork_static_reads.py` and
+`tests/test_fork_child_state.py` (SPEC-079),
 `tests/test_sink_ownership.py`,
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
 `tests/test_invariants_model.py` (a child forked at a step boundary of the sequential driver,
@@ -569,7 +576,12 @@ having delivered nothing; no argument is silently ignored because another was gi
 *Recorded exceptions:* a required argument that a constructor documents as ignored beside an
 injected connection is accepted, because refusing it would break every such caller —
 `SQLiteSink.database`, the one such argument, pinned by name in
-`tests/test_injected_client_roster.py` (SPEC-071 FR-003).
+`tests/test_injected_client_roster.py` (SPEC-071 FR-003). A `sink_factory` is called lazily, on
+the first emit in each process (Andrew's decision of 2026-11-04, SPEC-079 FR-006), so one that
+raises or returns no sink is accepted by `configure()`, and each emit until it builds fails,
+counted and announced, and the next retries. A `sink=` that `configure()` cannot prove unpatchable
+is accepted (SPEC-079 FR-005): only exactly one of a closed list of builtin types is refused, so a
+user class that never gains an `emit` loses its batches counted and announced.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
 non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
@@ -582,6 +594,7 @@ also holds SPEC-065's spoofed-subclass pins for the three validators, and
 measured list of what still constructs and should not; `tests/test_numeric_doors.py` for the
 `int` doors and the `flush()`/`shutdown()` `timeout`, and `tests/test_numeric_door_roster.py`,
 which derives the `int` doors from the AST and fails naming one left unjudged (SPEC-066);
+`tests/test_config.py` and `tests/test_sink_factory.py` for `sink=` and `sink_factory=` (SPEC-079);
 `tests/test_type_doors.py` for a value lying about its type at every argument door, the HTTP
 sinks' `auth` and the seven callable arguments, and `tests/test_type_door_roster.py`, which derives
 the doors from the AST and fails naming one that asks the value rather than its type;

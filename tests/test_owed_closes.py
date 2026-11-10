@@ -511,7 +511,9 @@ def test_flush_reaches_every_sink_the_orphan_path_still_owes() -> None:
 
 
 def test_a_forked_child_repairs_every_owed_sink_not_only_the_last() -> None:
-    """FR-004 AC-2. `_inheritance_roots` reads the record, so it had the same single-slot bound.
+    """FR-004 AC-2. The child's walk seeds from the record, so it had the same single-slot bound.
+
+    The seed was `_inheritance_roots` until SPEC-079 and is `_lifecycle._record_seeds` since.
 
     A child's walk must reach every inherited sink, or one it did not see and the parent never
     recorded becomes claimable and it can legitimately close the parent's transport (SPEC-042
@@ -548,8 +550,8 @@ def test_the_record_is_opted_out_of_the_repair_walk() -> None:
     the foreign-pid record the child holds for it.
 
     Nothing is lost by skipping it: a **live** sink is still reached by the walk through the
-    config and through `worker.sink`, and `_inheritance_roots` reads this record directly, so
-    marking still refuses an inherited superseded sink.
+    config and through `worker.sink`, and `_record_seeds` reads this record directly (SPEC-079),
+    so marking still refuses an inherited superseded sink.
 
     SPEC-078 FR-001 moved the record onto the close registry, so the opt-out moved with it: it is
     declared on `_CloseRegistry`, the holder of the attribute, as `"owed"`, and `Runtime` declares

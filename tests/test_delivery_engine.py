@@ -1007,7 +1007,7 @@ def _hostile_engine_sink(calls: list[str], script: list[Any]) -> Any:
 
 
 def test_no_static_read_runs_a_hostile_metaclass_hook(capsys: pytest.CaptureFixture[str]) -> None:
-    """``read_deliver``, the fork reach, ``run_delivery`` and the adapter read only builtins.
+    """``read_deliver``, the fork's static reads, ``run_delivery`` and the adapter read only builtins.
 
     ``inspect.getattr_static`` hashed and compared the class through its ``lru_cache``d
     shadowed-``__dict__`` check: measured ``['eq', 'hash']`` for ``read_deliver`` and four ``eq``
@@ -1025,7 +1025,8 @@ def test_no_static_read_runs_a_hostile_metaclass_hook(capsys: pytest.CaptureFixt
     )
     sink.log_foundry_stop_signal = WaitRecorder()
     assert read_deliver(sink) is not None
-    assert _fork._counters_reach(sink, SinkCounters) is sink.log_foundry_counters
+    assert _fork._sink_shaped(sink) is True
+    assert _fork._static_value(sink, "log_foundry_counters") is sink.log_foundry_counters
     delivery = _deliver(sink, events(2), worker_retries=1)
     assert sink.calls == 3 and delivery.dropped == 1 and delivery.rejected == 1
     sink.script = [J]

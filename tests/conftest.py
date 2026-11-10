@@ -526,6 +526,15 @@ def _reset_worker() -> None:
     resetting it to zero is what puts a worker built by the next test back in step with it — one
     left raised makes every later worker read as retired at its own build, which is a suite that
     delivers nothing.
+
+    SPEC-079 adds the ownership record and its failure flag, which only
+    ``tests/test_sink_ownership.py`` cleared until then. The record is process-global and holds a
+    strong reference to every sink any earlier test stamped, and a forked child walks every one of
+    those references as a record seed of its marking, bounded by ``_MARKING_CEILING``. Left
+    uncleared it grows for the whole session in each xdist worker: measured at ``44db79a6``, one
+    worker ended a full run at 92,940 marking visits, and a test that configured a ``MemorySink``
+    holding 60,000 events made the next test's child trip the ceiling and announce it, which is
+    how ``test_a_child_of_a_process_that_built_no_worker_is_silent`` failed on ``44db79a6``.
     """
     try:
         from log_foundry import _lifecycle, decorator
@@ -546,6 +555,9 @@ def _reset_worker() -> None:
     decorator._in_span_lost = 0
     with _lifecycle._state._closes._lock:
         _lifecycle._state._closes._in_flight.clear()
+    with _lifecycle._state._owned_lock:
+        _lifecycle._state._owned.clear()
+    _lifecycle._state._marking_failed = False
     with _lifecycle._state._lock:
         _lifecycle._state._move()
 

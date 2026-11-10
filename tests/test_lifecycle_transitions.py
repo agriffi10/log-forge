@@ -1028,12 +1028,22 @@ def test_the_registry_names_tests_that_exist() -> None:
 # --------------------------------------------------------------------------- FR-003 AC-1
 
 CURRENT_WRITTEN_ELSEWHERE = "_current is written outside Runtime._move and Runtime.__init__"
-MOVE_OUTSIDE_THE_FOUR = "_state._move() is called outside the four sections that can change it"
+MOVE_OUTSIDE_THE_FOUR = "_state._move() is called outside the five sites that can change it"
 MOVE_MISSING = "a section that can change the stored state does not call _state._move()"
 MOVE_BEFORE_A_WRITE = "_state._move() comes before a write of _worker, retirements or the record"
 
-MOVE_SITES = {"_get_worker": 1, "_note_orphan_emit": 1, "_shutdown_worker": 2}
-"""The four critical sections that can change the stored state, by function and count."""
+MOVE_SITES = {
+    "_get_worker": 1,
+    "_note_orphan_emit": 1,
+    "_shutdown_worker": 2,
+    "_clear_after_fork": 1,
+}
+"""The four critical sections that can change the stored state, and the child's re-settle.
+
+``_clear_after_fork`` joined at SPEC-079 (FR-004): a fork landing inside one of the four sections,
+between a field write and its ``_move``, leaves the child's stored state behind its fields, so the
+child's handler re-settles it under the lock the roster replaced.
+"""
 
 _WRITES = re.compile(r"^_state\.(_worker|retirements)$")
 _RECORD_CALLS = frozenset({"arm", "take", "put_back"})
@@ -1111,7 +1121,7 @@ def stored_state_findings(source: str) -> list[str]:
 
 
 def test_the_stored_state_is_written_in_one_place_and_moved_in_four() -> None:
-    """FR-003 AC-1, over the live source."""
+    """FR-003 AC-1, over the live source: the four sections and, since SPEC-079, the fork handler."""
     source = (_SRC / "_lifecycle.py").read_text(encoding="utf-8")
     assert stored_state_findings(source) == []
 
@@ -1137,6 +1147,12 @@ def _shutdown_worker():
         _state._move()
     with _state._lock:
         _state.retirements += 1
+        _state._move()
+def _clear_after_fork():
+    with _state._lock:
+        _state._shutdown_running = 0
+        _state._late_worker = None
+        _state._closes.arm(worker.sink)
         _state._move()
 """
 
@@ -1171,8 +1187,22 @@ def _shutdown_worker():
             MOVE_MISSING,
         ),
         (lambda s: s + "def f():\n    _state._move()\n", MOVE_OUTSIDE_THE_FOUR),
+        (
+            lambda s: s.replace(
+                "        _state._closes.arm(worker.sink)\n        _state._move()\n",
+                "        _state._closes.arm(worker.sink)\n",
+            ),
+            MOVE_MISSING,
+        ),
     ],
-    ids=["a-fifth-section", "before-the-arm", "another-writer", "a-section-without", "unlocked"],
+    ids=[
+        "a-fifth-section",
+        "before-the-arm",
+        "another-writer",
+        "a-section-without",
+        "unlocked",
+        "the-fork-handler-without",
+    ],
 )
 def test_the_stored_state_scan_refuses_each_shape(mutate: Any, reason: str) -> None:
     """Each check of the scan fires on its own shape, asserted by its reason."""

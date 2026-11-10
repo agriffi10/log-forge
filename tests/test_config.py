@@ -1117,3 +1117,81 @@ def test_a_refused_ceiling_does_not_swap_a_running_worker() -> None:
         assert b.batches == []
     finally:
         retire_process(worker)
+
+
+# --- SPEC-079 FR-005: what configure() refuses where it is written ---------------------------
+
+
+def _snapshot() -> tuple[object, dict[int, tuple[int, object]]]:
+    """The config and the ownership record, as a refused call must leave them."""
+    with _lifecycle._state._owned_lock:
+        record = dict(_lifecycle._state._owned)
+    return config.get_config(), record
+
+
+def test_sink_and_sink_factory_together_are_refused() -> None:
+    """FR-005: both in one call raise ``ValueError`` naming both, and change nothing."""
+    import log_foundry
+    from log_foundry.sinks.memory import MemorySink
+
+    log_foundry.configure(service="before")
+    before = _snapshot()
+    with pytest.raises(ValueError, match="sink or sink_factory, not both"):
+        log_foundry.configure(sink=MemorySink(), sink_factory=MemorySink)
+    assert _snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [(3, "int"), ("FileSink", "type")],
+    ids=["not-callable", "needs-arguments"],
+)
+def test_a_factory_that_is_not_callable_or_needs_arguments_is_refused(
+    value: object, stored: str
+) -> None:
+    """FR-005: ``sink_factory=3`` and ``sink_factory=FileSink`` raise ``TypeError``, changing nothing."""
+    import log_foundry
+    from log_foundry.sinks.file import FileSink
+
+    factory = FileSink if value == "FileSink" else value
+    log_foundry.configure(service="before")
+    before = _snapshot()
+    with pytest.raises(
+        TypeError, match=rf"^sink_factory must be callable with no arguments, got {stored}$"
+    ):
+        log_foundry.configure(sink_factory=factory)  # type: ignore[arg-type]
+    assert _snapshot() == before
+
+
+@pytest.mark.parametrize("path", ["no-worker", "worker"])
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [(object(), "object"), ("s", "str"), (5, "int"), ([], "list"), ({}, "dict")],
+    ids=["object", "str", "int", "list", "dict"],
+)
+def test_an_unpatchable_sink_is_refused(value: object, stored: str, path: str) -> None:
+    """FR-005: an unpatchable ``sink=`` raises ``TypeError`` naming ``sink`` and the type.
+
+    With and without a running worker; the config and the ownership record are left as they
+    were, and nothing is stamped.
+    """
+    import log_foundry
+    from log_foundry.sinks.memory import MemorySink
+
+    log_foundry.configure(service="before", sink=MemorySink())
+    if path == "worker":
+
+        @log_foundry.trace
+        def work() -> int:
+            return 1
+
+        work()
+        assert _lifecycle._state.worker_exists() is not None
+    before = _snapshot()
+    with pytest.raises(
+        TypeError, match=rf"^sink must be a sink with an emit method, got {stored}$"
+    ):
+        log_foundry.configure(sink=value)  # type: ignore[arg-type]
+    assert _snapshot() == before
+    with _lifecycle._state._owned_lock:
+        assert id(value) not in _lifecycle._state._owned

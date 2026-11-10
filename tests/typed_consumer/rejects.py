@@ -25,6 +25,7 @@ from log_foundry import (
 from log_foundry.sinks.datadog import DatadogSink
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
 from log_foundry.sinks.logstash import LogstashSink
+from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.otlp import OTLPSink
 from log_foundry.sinks.splunk import SplunkHECSink
 
@@ -53,6 +54,16 @@ _i = SplunkHECSink("u", "tok", nonsense=1)     # want: Unexpected keyword argume
 _j = DatadogSink("k", body_format="ndjson")    # want: Unexpected keyword argument "body_format" for "DatadogSink"
 _l = OTLPSink("u", body_format="ndjson")       # want: Unexpected keyword argument "body_format" for "OTLPSink"
 _k = LogstashSink(host="h", port=1, unknown=2) # want: Unexpected keyword argument "unknown" for "LogstashSink"
+
+# SPEC-079 FR-005: a factory is a zero-argument callable returning a sink. The one-argument
+# factory is a `def`, not a lambda: an unannotated lambda adds mypy's own "Cannot infer type of
+# lambda" beside the error planted here, and this corpus counts one error per planted line.
+def _needs_an_argument(x: int) -> MemorySink:
+    return MemorySink()
+
+
+configure(sink_factory=3)                  # want: Argument "sink_factory" to "configure" has incompatible type "int"
+configure(sink_factory=_needs_an_argument)  # want: Argument "sink_factory" to "configure" has incompatible type "Callable[[int], MemorySink]"
 
 # 1.2.0: emit_via_deliver is public and keyword-first, so `deliver` is never positional.
 emit_via_deliver(object(), [], None)  # want: Too many positional arguments for "emit_via_deliver"

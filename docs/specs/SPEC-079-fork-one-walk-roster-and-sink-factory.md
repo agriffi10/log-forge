@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-079
 title: "Fork: One Walk From the Runtime's Roots, the Global Lock Roster, and sink_factory="
 description: "Repairs a forked child by re-creating the package's global locks from one explicit roster and reaching every sink through one bounded walk from the runtime's roots, deletes the module-wide walk and the separate inheritance marking, and adds sink_factory= so each process can build a sink of its own."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-039, SPEC-042, SPEC-044, SPEC-053, SPEC-054, SPEC-068, SPEC-072, SPEC-077, SPEC-078, SPEC-080]
 arc: stability-redesign
 arc_order: 11
@@ -181,8 +181,8 @@ each catches what the other cannot.
   or `Event` to a `self` attribute, and requires each to be declared in the test's
   `_PRIMITIVE_HOMES` with one home:
   - `roster`: its instance is on a roster path (`Runtime`, `_CloseRegistry`, `ConsoleWriter`);
-  - `walk`: it is sink-shaped, or a `Worker`, or held by an attribute of one (`SocketTransport`,
-    `SinkCounters`, SPEC-076's guard);
+  - `walk`: it is sink-shaped, or a `Worker`, or held by an attribute of one (`SinkCounters`,
+    SPEC-076's guard);
   - `dropped: <handler>`: a child handler drops its instances (`_Close`, by `_clear_after_fork`;
     `_FlushMarker`, by `_rebuild_worker_after_fork`, which replaces the queue that holds it).
   An undeclared class fails by name, and so does an entry whose class is gone. That catches a new
@@ -220,7 +220,7 @@ roster repairs both before either path runs.
   `decorator._loss_lock`'s through `health()`.
 - [ ] A pair whose attribute is missing is announced on stderr by type and does not stop the other
   seven from being replaced.
-- [ ] `_fork.py` still imports nothing from the package but `_diag`
+- [ ] `_fork.py` still imports nothing from the package but `_diag` and `sinks.base`
   (`test_fork_imports_nothing_from_the_package_but_diag` passes unedited).
 - [ ] Invariants 1 and 12: a forked child never hangs on a package global lock its parent held, and
   no fault in resolving the roster reaches the caller.
@@ -229,8 +229,9 @@ roster repairs both before either path runs.
 
 #### Description:
 
-`_lifecycle._reachable_sinks` stays the walk `stamp` runs, unchanged, with a container scanned one
-level deep and only sinks and package objects pushed. In a forked child, the same function runs
+`_lifecycle._reachable_sinks` stays the walk `stamp` runs, with a container scanned one level deep
+and only sinks and package objects pushed; its reach is unchanged and its predicates become
+static (below). In a forked child, the same function runs
 with an `after_fork` argument, a `_fork._Repair` that carries the memo FR-001 used. With that
 argument it does more at every holder on its **repair frontier**:
 
@@ -239,12 +240,52 @@ argument it does more at every holder on its **repair frontier**:
   memo. If the holder offers `reacquire_after_fork`, it collects the holder for the hook step. It
   forwards to the marking frontier of FR-003 every value it does not push itself: a container, and
   an object that is neither a sink nor a package object.
-- On a sink-shaped holder this package does not own, it reads `log_foundry_counters` with
-  `inspect.getattr_static`. When the value is a `SinkCounters`, it pushes it onto the repair
-  frontier, which keeps SPEC-072's reach for a third-party sink that subclasses no package type.
-  It replaces nothing on that holder. It forwards the holder's `_namespace_items` to the marking
-  frontier. Without that step, the holder is already in the shared `seen` set when the marking
-  frontier reaches it, so nothing beneath it would ever be visited.
+- On a sink-shaped holder this package does not own, it replaces nothing. It forwards the
+  holder's `_namespace_items` to the marking frontier. Without that step, the holder is already
+  in the shared `seen` set when the marking frontier reaches it, so nothing beneath it would ever
+  be visited.
+- A name in a holder's `_FORK_SKIP` is neither replaced, entered, pushed nor forwarded: forwarding
+  `Worker._held` would hook a superseded sink, which is what the opt-out exists to stop.
+
+**A registry of live `SinkCounters` replaces SPEC-072's counters reach.** `sinks/verdict.py`
+keeps a `weakref.WeakSet`, `_LIVE_COUNTERS`, of the `SinkCounters` objects that are alive, and
+`_walk_after_fork` reads it from `sys.modules` (no import in a child) and repairs the members on
+the repair frontier, checking `seen` first so none is repaired twice. It repairs a third-party
+engine sink's counters whatever holds them, including a wrapper that keeps only the engine
+sink's bound `emit`, which no reading walk reaches. It differs from a registry of every package
+primitive holder, which would stop being one walk from the runtime's roots, because invariant 12
+names this registry as SPEC-072's follow-up and it covers the one class the walk cannot reach by
+reading. `_fork._counters_reach`, `_counters_type`, `_container_push`, `_SCALAR_TYPES`,
+`_SKIPPED_TYPE_IDS` and `_COUNTERS_ATTRIBUTE` are deleted with the module-wide walk.
+
+**Every read the walk makes on an object runs none of the object's code**, in both modes of
+`_reachable_sinks` and in the marking frontier. Ownership, container, primitive and sink-shape
+tests read the real type's MRO and namespaces through `sinks.base`'s unbound accessors and compare
+by identity; a namespace is read through `sinks.base._instance_dict`; a slot through its member
+descriptor; a container's members through its builtin base type's own iteration, never the
+subclass's; `_FORK_SKIP` and `reacquire_after_fork` through `sinks.base._static_value`. A
+container subclass is read both ways: its builtin storage and its namespace. The sink-shape test
+is `_fork._sink_shaped`, the static twin of `isinstance(x, Sink)`; it differs from `isinstance`
+for a class carrying `emit` and `close`, for a value whose `__class__` lies, and for a
+`weakref.proxy`, whose C attribute forwarding no static read follows.
+
+**Ownership is recorded by position where position is known, and by shape only where it is
+not.** Recording runs none of a value's code — an `id` and a reference — so a value the library
+was handed as a sink is recorded unconditionally, whatever a static read says it looks like: the
+root `stamp` is handed; a value in a package wrapper's child-sink slot, named in
+`_fork._CHILD_SINK_SLOTS` (`MultiSink._sinks`, `_inner` on `FilteringSink`, `TransformSink` and
+`_FactorySink`, `Worker.sink`, `Config.sink`, `SwapOutcome.previous`), on both frontiers; and the
+live delivery sinks the runtime holds (`_live_sinks`). `tests/test_child_sink_slots.py` holds
+the table complete by behaviour — a package class that stores a `Sink`-annotated value on `self`
+however it is written, calls `require_sink`, or releases a sink with `owner=self` must have an
+entry or a reasoned exemption — and builds each declared class around a sentinel sink, requiring
+it recorded. A value `require_sink` would refuse, planted in a slot after construction, is never
+recorded. `_fork._sink_shaped` decides
+only inside holders this package does not define, where the marking frontier also records a
+value whose exact type is a `weakref` proxy. A `super(Sub, inst)` is transparent: its `__self__`
+is read in C and walked. A `weakref.proxy`, a `super(...)` or a `__getattr__` proxy configured as
+`sink=` or held by a package wrapper is therefore recorded in the parent, closed by the parent,
+and stays the parent's in a child, which refuses its close.
 
 **The roots** are the runtime's live delivery targets: the config's sink
 (`config._live_config().sink`), `_state._worker` and `_state._late_worker`. A worker is a
@@ -258,8 +299,9 @@ the marking needs.
 state. `Runtime._FORK_SKIP = ("_owned",)` and `_CloseRegistry._FORK_SKIP = ("owed",)` stay as
 SPEC-078 leaves them, as a guard for any other route by which the walk might reach `_state`. The
 in-flight entries of `_state._closes` are emptied by `_clear_after_fork`, so their events are not
-repaired. SPEC-078's inventory row for `_Close.event` changes from `walk` to
-`reset: _clear_after_fork`.
+repaired. SPEC-078's inventory row for `_Close.event` changes from `walk` to `none`, "dropped with
+its in-flight entry by `_clear_after_fork`", as `_FlushMarker.event` already is: the inventory's
+reset check requires a write of the field, and `_clear_after_fork` drops the entry instead.
 
 **`_fork` keeps the order and gains one registration.** `_fork.register_walk(fn)` stores the one
 walk to run, and `_lifecycle` registers `_walk_after_fork` at import. A second registration
@@ -322,7 +364,7 @@ seeds, visited in this order:
 1. **Forwarded seeds**: what the repair frontier forwarded. Everything reached from them is part
    of a live delivery target's graph.
 2. **Record seeds**: every sink in `_state._closes.owed`, then every reference in `_state._owned`.
-   These are the sinks `_inheritance_roots` adds today. The `_owned` references are the
+   These are the sinks `_inheritance_roots` added at `fda134a`. The `_owned` references are the
    load-bearing seed for a superseded wrapper
    (`test_a_superseded_wrapper_still_shields_the_transport_beneath_it`).
 
@@ -346,11 +388,24 @@ How the marking frontier reads and what it changes:
 - **No hooks from record seeds.** On a holder reached only from a record seed, it **never collects
   a hook**. That keeps SPEC-044 FR-005: a superseded sink, which only `owed` or `_owned` still pin,
   is never re-acquired, so `reclaim` never overrides its record.
-- **The bound.** It is bounded by `_MARKING_CEILING` visits across both groups. Tripping the bound
+- **The order.** Each group is visited first in first out, so every forwarded seed is visited
+  before any of their members: a large forwarded container (a `MemorySink`'s events) cannot spend
+  the ceiling before a forwarded `FileSink` behind a third-party wrapper is reached.
+- **The bound.** It is bounded by `_MARKING_CEILING` visits of the marking frontier across both
+  groups (its own visits, not the size of the shared `seen` set). Tripping the bound
   sets `_marking_failed` and writes today's `_diag.lost` line. Because the repair frontier is
   drained first, a trip cannot cost a holder on the repair frontier its repair or its hook.
+- **The record seeds are what tripped the ceiling in the suite.** `_state._owned` holds a strong
+  reference to every sink the process ever stamped, and no conftest fixture cleared it, so in each
+  xdist worker it grew for the whole session until a child's record-seed walk passed
+  `_MARKING_CEILING` and announced it. `tests/conftest.py`'s reset now clears the record and
+  `_marking_failed`, and the per-file fixture in `tests/test_sink_ownership.py` moves there. The
+  same growth is not test-only: a long-lived process that reconfigures with buffering sinks and
+  then forks grows the record the same way, which `architecture.md` §13 records as a constraint
+  and a separate session fixes.
 
-After both frontiers, each sink-shaped object that the walk recorded is written with
+After both frontiers, every object that the walk recorded — by position or, in a foreign
+holder, by shape — is written with
 `_owned.setdefault(id(sink), (_FOREIGN, sink))` under `_state._owned_lock`, as `_mark_inherited`
 writes it today. A sink the parent stamped keeps the parent's pid. An escaping exception sets
 `_marking_failed`, exactly as today.
@@ -400,6 +455,29 @@ first.
 - `tests/test_worker_predicate_roster.py` re-files `_inheritance_roots`' `_state.worker_exists()`
   site under the roots function of `_walk_after_fork`, which keeps that read. Its `_SITE_FLOOR` for
   `log_foundry._lifecycle` is not lowered.
+- `tests/test_fork_lifecycle.py`, beyond the list above:
+  `test_without_the_container_branch_the_multisink_child_blocks` and
+  `test_without_the_reach_the_same_child_blocks` are re-derived as positive controls with
+  `_MARKING_CEILING` patched in the parent, so the repair frontier is observed alone: the first
+  takes away the repair frontier's one-level container read, and the `MultiSink`'s positional slot read, on a `MultiSink(FileSink)`, at a
+  ceiling of one with the `MultiSink` holding one child (the ceiling also bounds every container
+  read); the second removes the counters registry read, at a ceiling of zero (at one the marking
+  frontier visits the forwarded counters first and repairs them).
+  `test_the_counters_type_is_read_without_an_import` and
+  `test_the_counters_reach_refuses_everything_but_exact_counters` keep their names and are
+  re-expressed against the registry. `test_the_walk_terminates_on_a_cycle` and
+  `test_every_lock_is_assigned_where_the_walk_can_reach_it` change their docstrings.
+- `tests/test_lifecycle_races.py::test_a_forked_child_does_not_hook_a_superseded_sink` passes
+  unedited; its docstring's claim that removing a `_FORK_SKIP` reddens it is false once `_state` is
+  not on the walk, and `test_a_forked_child_does_not_hook_a_superseded_sink_the_worker_holds` is
+  the test a forwarded `_FORK_SKIP` name reddens.
+- `tests/test_sinks_nats_liveness.py::test_a_forked_child_refuses_without_touching_the_lock_loop_or_client`
+  changes its docstring; `tests/test_delivery_engine.py`'s one `_counters_reach` assertion is
+  re-expressed as the static reads that replaced it; `tests/test_runtime_holder.py`'s lock-site
+  literal, `tests/test_lifecycle_inventory.py`'s rows, `tests/test_lifecycle_transitions.py`'s
+  `_move` sites and `tests/test_orphan_sink_handoff.py`'s import set (narrowed to `_diag` and
+  `_fork`, since `Sink` is no longer a runtime import) change with the code; `tests/conftest.py`
+  clears the ownership record (FR-003's record seeds).
 
 **Tests deleted, because each pins only a removed mechanism:** none. Every test above asserts a
 promise that still holds.
@@ -424,8 +502,9 @@ close, both answered from the same record.
   `test_the_marking_walk_does_not_escape_through_a_module_reference` pass with no edit beyond
   SPEC-077's and SPEC-078's path changes.
 - [ ] A forked child whose configured sink holds a `list` subclass with a non-terminating
-  `__iter__` returns from `fork` within 30 s, with `_marking_failed` true and an unrecorded sink
-  refused.
+  `__iter__` never enters that `__iter__`, and a configured sink holding more than
+  `_MARKING_CEILING` distinct objects trips the ceiling in a real child, with `_marking_failed`
+  true and an unrecorded sink refused.
 - [ ] `test_a_forked_child_does_not_hook_a_superseded_sink` passes with no edit beyond SPEC-078's
   path changes. A walk that collects hooks from record seeds turns it red.
 - [ ] A child forked while a parent thread is inside `FileSink.emit`, between its write loop and its
@@ -434,8 +513,10 @@ close, both answered from the same record.
   hooks from forwarded seeds turns both red.
 - [ ] A spy on `_fork._namespace_items` records each object at most once per fork.
 - [ ] Every test named above as re-expressed is present at the head under the same name. The
-  `pytest --collect-only -q` names at the build's base are all present at the head, and the only
-  additions are this spec's.
+  `pytest --collect-only -q` names at the build's base are all present at the head but one, and
+  the only additions are this spec's. The one is
+  `test_numeric_door_roster.py::test_removing_a_helper_call_is_reported[worker.py:Worker.max_retries@418]`,
+  whose id embeds a line number that `Worker._FORK_SKIP`'s longer docstring moves.
 - [ ] `sh scripts/docs-lint-test.sh` passes with the two new fixtures, and removing
   `_walk_after_fork` from check 17's anchors turns the firing one red.
 - [ ] Invariants 2, 5 and 12: a child writes no inherited pending byte a second time, releases no
@@ -489,7 +570,19 @@ count's pair.
 beside the token sets it already empties. The inherited worker keeps the liveness its epoch gives
 it. A child forked inside SPEC-078's `_shutdown_running` window, or in the drain's tail
 (`_lifecycle.py:1875`), inherits that worker as its live worker either way. Neither field is read by
-SPEC-078's `_current` rules, so `_current` stays `inherited` and no `_move` is added.
+SPEC-078's `_current` rules.
+
+**A child re-settles what a fork inside a critical section half-wrote.** A fork landing inside one
+of SPEC-078's four sections, between a field write and that section's `_move`, leaves a child
+whose stored state differs from its derived one: the parent thread holds `_state._lock`, the
+roster gives the child a fresh one, and the child sees the fields written up to the fork point.
+The same fork inside `_get_worker`, between `_state._worker = worker` and the arm, leaves a live
+worker's sink unowed, so a re-acquired `FileSink` is never closed by the child. So
+`_clear_after_fork` takes `_state._lock`, arms the live worker's sink when the owed record lacks
+it, and calls `_state._move()`, which makes it a fifth `_move` site. SPEC-078's inventory row for
+`_current` becomes `("inherited", "reset: _lifecycle._clear_after_fork")`, and
+`docs/decisions/pipeline/lifecycle-state-has-one-holder-runtime-and-state-observes-it.md`'s fence
+is rewritten to name the fifth site.
 
 The observable asserted is the field values. A caller-visible consequence was not constructed:
 once a child builds a worker, every later `shutdown()` in it takes the worker branch, which never
@@ -522,7 +615,12 @@ reads `_late_worker`. SPEC-077's inventory rows for both fields change from `inh
   `_late_worker` is `None`, and its `@trace` events are delivered. Removing either reset from
   `_clear_after_fork` turns its case red.
 - [ ] SPEC-077's inventory test passes with both rows reading `reset: _clear_after_fork`, and
-  SPEC-078's `_move` AST scan still finds exactly four sites.
+  SPEC-078's `_move` AST scan finds the four sections and `_clear_after_fork`, named.
+- [ ] A child forked while a parent thread is parked inside `_get_worker`'s section, between
+  `_worker =` and the arm, reads a stored state equal to the derived one, owes the live worker's
+  sink, and closes the `FileSink` it re-acquired at its `shutdown()`. Removing the `_move` or the
+  arm from `_clear_after_fork` turns it red. Every parking patch is gated on the parent's pid, so
+  the child never runs it.
 - [ ] `architecture.md` §13's fork-boundary item names the runtime's roots, and no sentence in
   `docs/architecture.md` or `src/` says the repair walk starts from the package's modules.
 - [ ] Invariants 2, 5, 6 and 12: a child forked mid-drain delivers its own events exactly once on
@@ -629,11 +727,17 @@ parameter's stored type name. The build adds exactly those two to that guard's p
 
 - `tests/test_public_surface.py` pins `[f.name for f in fields(Config)][-1] == "sink_factory"`, pins
   `sink_factory` as the last keyword-only parameter of `configure` with default `None`, and keeps
-  every existing pin unedited. `len(log_foundry.__all__)` is unchanged.
+  every existing pin unedited but one. `len(log_foundry.__all__)` is unchanged. The one is
+  `test_configure_and_config_gain_nothing`, whose promise was another spec's "nothing added": it
+  pinned the whole parameter list, so appending `sink_factory` reddens it by design, and it now
+  pins the nine names unchanged and in order and the list as exactly those nine plus
+  `sink_factory`.
 - `tests/typed_consumer/accepts.py` gains `configure(sink_factory=lambda: MemorySink())`,
   `Config(sink_factory=None)` and a read of `get_config().sink_factory`.
-- `tests/typed_consumer/rejects.py` gains `configure(sink_factory=3)` and
-  `configure(sink_factory=lambda x: MemorySink())`, each with its `want:` line.
+- `tests/typed_consumer/rejects.py` gains `configure(sink_factory=3)` and a one-argument factory,
+  each with its `want:` line. The one-argument factory is a `def`, not `lambda x: MemorySink()`:
+  an unannotated lambda adds mypy's own "Cannot infer type of lambda" beside the planted error,
+  and that corpus counts one error per planted line.
 - `tests/test_config.py` gains each refusal above, and a test that a refused call leaves
   `get_config()` and the ownership record unchanged.
 
@@ -679,11 +783,14 @@ refused by one helper, so they cannot drift apart. A sink that is accepted but n
   `weakref.ProxyType` and `super` are not members.
 - [ ] During `configure()` and the three wrapper constructors, no `__getattr__`, `__getattribute__`,
   `__class__` getter, metaclass `__name__` or metaclass `__eq__` of the value runs, each counted by
-  a probe.
+  a probe. `configure(sink=h)` is probed with no logging started and on the swap path; on the swap
+  path the one exception is the stop-signal offer, `_lifecycle.offer_stop_signal`, which reads
+  `log_foundry_stop_signal` by name and is delivery machinery, excepted by that name.
 - [ ] `tests/test_type_door_roster.py`'s pinned door set gains exactly `_sink_arg.require_sink` and
   `config._require_factory`.
 - [ ] `tests/test_public_surface.py` and `tests/typed_consumer/` pass with the additions above, and
-  every pin that existed at the build's base passes unedited.
+  every pin that existed at the build's base passes unedited, except
+  `test_configure_and_config_gain_nothing` as re-expressed above.
 - [ ] Invariants 10, 13 and 6: the surface only grows, every refusal above is raised at the
   `configure()` call that supplied the argument, naming it, and `sink=` and `sink_factory=`, and the
   worker and no-worker paths, behave alike.
@@ -693,17 +800,18 @@ refused by one helper, so they cannot drift apart. A sink that is accepted but n
 #### Description:
 
 `_FactorySink` is a private wrapper sink in `src/log_foundry/sinks/_factory.py`. It holds the
-factory, a `_lock`, and at most one built sink, `_inner`, which starts as `None`. Its
+factory, a `_build_lock`, and at most one built sink, `_inner`, which starts as `None`. Its
 `__init__` assigns those fields and nothing else.
 
 **When the factory runs.** It runs on the first `emit` in each process. That is on whichever thread
 emits: the drain thread for span events and the caller's thread on the orphan path. So inside a
 span the caller's thread still carries no sink construction (invariant 4).
 
-- The first emit takes `_lock`, calls the factory once, checks the result, calls `stamp` on it
+- The first emit takes `_build_lock`, calls the factory once, checks the result, calls `stamp` on it
   (so the process that built it owns it), forwards the stop signal it was offered, and stores it.
   Later emits read `_inner` without the lock and call `_inner.emit(batch)`.
-- Concurrent first emits wait on `_lock` and call the factory once between them.
+- Concurrent first emits wait on `_build_lock` and call the factory once between them. It is a
+  build lock, not a transport lock: held across the one factory call, never across a delivery.
 - An emit made **from inside the factory**, on the same thread, raises `SinkDeliveryError` at once
   rather than calling the factory again, and does not deadlock. On the orphan path that one event
   is counted in `orphan_lost` and announced.
@@ -746,7 +854,8 @@ instead: the failure is counted, announced and retried, and it never reaches the
 
 **What it forwards.**
 
-- `flush()` calls `flush_sink(_inner)` when a sink has been built and returns `True` otherwise.
+- `flush()` calls `flush_sink(_inner)` when a sink has been built and does nothing otherwise,
+  returning `None` as every shipped wrapper's `flush` does.
 - `losses()` returns `read_losses(_inner)` when a sink has been built and `SinkLosses()`
   otherwise. It counts nothing of its own.
 - `close()` calls `_lifecycle.release(_inner, owner=self)` when a sink has been built, as the five
@@ -886,10 +995,10 @@ class Config:
 // src/log_foundry/sinks/_factory.py
 class _FactorySink:                        # private; a Sink
     _factory: Callable[[], Sink]
-    _lock: threading.Lock                  # held across the one factory call
+    _build_lock: threading.Lock            # held across the one factory call; not a transport lock
     _inner: Sink | None                    # at most one per instance; set once
     _building: int | None                  # thread ident inside the factory call, else None
-    _stop_signal: threading.Event | None   # forwarded to _inner once built
+    log_foundry_stop_signal = ForwardedStopSignal()  # stored in __dict__, forwarded once built
     _failures: int                         # build failures, for the throttled line
 ```
 
@@ -900,7 +1009,7 @@ class _FactorySink:                        # private; a Sink
 | `_state._lock`, `_state._stop`, `_state._owned_lock`, `_state._closes._lock` | walk | roster |
 | `_config_lock`, `ConsoleWriter._lock` (as `api._console`), `_sweep_lock`, `_loss_lock` | walk | roster |
 | `_state._shutdown_running`, `_state._late_worker` | inherited | reset: `_clear_after_fork` |
-| `_Close.event` | walk | reset: `_clear_after_fork` |
+| `_Close.event` | walk | none (dropped with its entry by `_clear_after_fork`) |
 | `_state._owned`, `_state._marking_failed` | reset: `_mark_inherited` | reset: `_walk_after_fork` |
 
 The inventory's accepted reset functions gain the function registered with `_fork.register_walk`.
@@ -1015,6 +1124,13 @@ and its reach is unchanged.
 dated History line: the hooks are collected from the repair frontier and the forwarded seeds, so a
 live sink behind a third-party holder is now stranded too.
 
+`docs/invariants.md` §12's recorded exception changes: it named the counters reach and the
+third-party-wrapper boundary, and the registry and the forwarded seeds change both. `architecture.md`
+§13 gains the residual the registry leaves for every other class: a package object reachable only
+through a bound method, a closure cell or a `functools.partial` (`self._emit = file_sink.emit` in
+a third-party wrapper) is neither repaired nor marked, because descending into callables
+routinely escapes into application state and would trip the ceiling in every child.
+
 `docs/invariants.md` §13 gains the recorded exception FR-006 states, citing Andrew's decision of
 2026-11-04.
 
@@ -1089,3 +1205,74 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   sinks. The `sink_factory` refusal is named `config._require_factory`, and the user-class case
   moves to §13.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- Build: the `test_a_child_of_a_process_that_built_no_worker_is_silent` failure on `44db79a6` was
+  the marking ceiling tripping on an ownership record that grows for the life of the process,
+  which this spec's record seeds keep. Measured at `44db79a6`: one xdist worker ended a full run
+  at 92,940 marking visits, and a two-test reproducer fails deterministically. The conftest reset
+  now clears the record, which fixes the suite; a long-lived process that reconfigures and forks
+  grows it the same way, recorded in `architecture.md` §13 and handed to its own session (A1).
+- Build: `configure(sink=h)` at `44db79a6` ran a hostile sink's `__class__` getter,
+  `__getattribute__` and metaclass `__hash__` and `__eq__`, all from `stamp`'s walk, so FR-005's
+  no-hook criterion could not hold with `_reachable_sinks` unchanged. The walk's predicates became
+  static, which also closes SPEC-072's follow-up on hostile sink code at the at-fork sites, and
+  FR-003's runaway criterion is restated: the runaway `__iter__` is never called, so the ceiling
+  is asserted on a genuinely large graph (A3).
+- Build, on Andrew's standing rule to harden rather than defer: invariant 12 names a registry of
+  live `SinkCounters` as this spec's follow-up, and the forward made the static counters read an
+  equivalent mutant within the ceiling (measured by tracing `_forked_engine_run`). The registry
+  repairs every live counters whatever holds it, including a wrapper that keeps only the engine
+  sink's bound `emit`, which no reach finds. The two unit tests of the removed reach keep their
+  names, re-expressed against the registry (A4).
+- Build: the marking frontier visits first in first out and counts its own visits, so a
+  forwarded seed cannot lose its repair to the caller data of another seed (A5).
+- Build: a name in a holder's `_FORK_SKIP` is neither replaced, entered, pushed nor forwarded (A6).
+- Build: the deletion reddened tests outside FR-003's list; each is listed with what changes. The
+  positive controls patch the ceiling to one and keep their `MultiSink` at one child, or to zero
+  for the registry control, rather than splitting the per-read bound into a constant of its own
+  (A7).
+- Build: three stale references corrected against `44db79a6` (`_fork` imports `sinks.base` too;
+  `SocketTransport` holds a guard, not a primitive; the record seeds' predecessor is named as
+  history), and the collect-only rename recorded (A9).
+- Build: the inventory's reset check requires a write of the field, so a dropped `_Close.event`
+  is `none`, as `_FlushMarker.event` already is (A10).
+- Build: the Documentation section gains `docs/invariants.md` §12, whose recorded exception
+  named the counters reach and the third-party-wrapper boundary, and the §13 residual for a
+  package object reachable only through a bound method, closure or partial (A11).
+- Build: a fork landing between a section's field write and its `_move` left a child whose stored
+  state differs from its derived one, and a fork inside `_get_worker` between `_worker =` and the
+  arm left a live worker's sink unowed (a re-acquired `FileSink` then never closed by the child).
+  `_clear_after_fork` re-settles both, which makes it a fifth `_move` site, and the lifecycle-state
+  decision's fence is rewritten to name it (A2).
+- Build: one public-surface pin is edited. `test_configure_and_config_gain_nothing` pinned the
+  whole parameter list, so appending `sink_factory` reddens it by design; it now pins the prefix
+  and the one appended name (A8).
+- Build: FR-005's no-hook criterion keeps the swap path and excepts the stop-signal offer by name,
+  since that offer is delivery machinery (A9 as revised by the plan review).
+- Build: `_FactorySink`'s lock is `_build_lock`, a build lock rather than a transport lock, so the
+  sink-concurrency lints read it as what it is; its stop signal is stored through
+  `ForwardedStopSignal`, as `FilteringSink`'s is; its `flush` returns `None` as every shipped
+  wrapper's does; and the typed consumer's one-argument factory is a `def` (A12).
+- Build, after the first diff review: under static reads `stamp` stopped recording a
+  `weakref.proxy` configured as `sink=` (the same hole existed at base for a `__getattr__` proxy and
+  `super(Sub, inst)`), and the child's walk did not mark it, so a child whose walk succeeded found
+  it releasable and its `shutdown()` closed the parent's transport. `stamp` now records the root it
+  is handed, and the walk records every live delivery sink, both unconditionally; the earlier
+  sentence saying such a proxy was refused its close was false and is replaced. The same review
+  made a class never offer `reacquire_after_fork`, and pinned three `sink_factory` behaviours.
+- Build, after the second diff review: a static shape predicate answering differently from
+  `isinstance` changed an ownership record for the third time, now for a `weakref.proxy` held as a
+  package wrapper's member (closed by nobody in the parent, claimable in a child). The mechanism
+  changed rather than one more position being patched: ownership is recorded by position wherever
+  position is known — the root, a package wrapper's child-sink slot from `_fork._CHILD_SINK_SLOTS`,
+  a live delivery sink — and by shape only inside foreign holders, where a `weakref` proxy is
+  recorded by its exact type. A slot roster and a differential corpus over every recording site
+  and degenerate shape hold it. `super(Sub, inst)` became transparent to the walk, so a sink behind
+  one is repaired; a sink behind a `weakref.proxy`, and a child's bare re-hand of an unrecorded
+  sink after a tripped ceiling, are recorded as constraints.
+- Build, after the execution review of the record-by-position change: the slot roster keyed on
+  how a value is stored missed most natural future wrappers, so it is keyed on behaviour instead
+  (a `Sink` annotation anywhere flowing to a `self` attribute, `require_sink`, `release(owner=self)`),
+  with runtime keys and a sentinel per declared class; `LogstashSink` and `SentrySink` joined the
+  table. A planted non-`str` namespace key is dropped before it is hashed; a slot value
+  `require_sink` would refuse is not recorded; `_live_sinks` no longer lists a factory's built
+  sink, which the `_inner` slot records; `MultiSink.close` closes a member held twice once.

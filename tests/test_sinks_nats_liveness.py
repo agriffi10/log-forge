@@ -637,8 +637,8 @@ def test_after_close_emit_and_flush_refuse_and_a_second_close_is_inert(monkeypat
 def test_a_forked_child_refuses_without_touching_the_lock_loop_or_client(monkeypatch) -> None:
     """FR-001 AC-10, with a real ``os.fork`` while a caller holds ``self._lock``.
 
-    The sink is unreachable from ``log_foundry``'s modules, so ``_fork._reinit_primitives`` does
-    not replace its lock and the child inherits it **held**. A pid check made after the lock
+    The sink is reached from none of the runtime's roots, so the child's walk does not replace
+    its lock (SPEC-079) and the child inherits it **held**. A pid check made after the lock
     acquisition hangs the child on that lock and the alarm kills it; made before, the child
     refuses at once and touches nothing it did not acquire.
     """

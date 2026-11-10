@@ -567,6 +567,15 @@ def _filtering(inner: Any) -> Any:
     return FilteringSink(inner)
 
 
+def _factory(inner: Any) -> Any:
+    """``sink_factory``'s private wrapper, its sink built by one empty emit (SPEC-079 FR-006)."""
+    from log_foundry.sinks._factory import _FactorySink
+
+    wrapper = _FactorySink(lambda: inner)
+    wrapper.emit([])
+    return wrapper
+
+
 def _transform(inner: Any) -> Any:
     from log_foundry.sinks.transform import TransformSink
 
@@ -597,6 +606,7 @@ ACCEPTING_BUILDERS: dict[str, Callable[[pytest.MonkeyPatch, Path], Any]] = {
     "loki.LokiSink": _http("LokiSink", "http://x", max_retries=0),
     "memory.MemorySink": _memory,
     "multi.MultiSink": _inner_built(_multi),
+    "_factory._FactorySink": _inner_built(_factory),
     "newrelic.NewRelicSink": _http("NewRelicSink", "k", max_retries=0),
     "null.NullSink": _null,
     "otlp.OTLPSink": _http("OTLPSink", max_retries=0),

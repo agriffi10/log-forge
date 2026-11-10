@@ -1,0 +1,43 @@
+@@@ expect exit=0
+@@@ file docs/architecture.md
+# Architecture
+
+`_walk_after_fork` marks everything the child inherited that the parent never recorded.
+
+@@@ file CLAUDE.md
+# Project
+
+## Key Decisions
+
+Intro prose; every decision is a file in its area directory.
+
+| Area | Directory |
+|---|---|
+| Area one | `docs/decisions/area-one/` |
+
+## Out of Scope
+
+nothing
+
+@@@ file docs/decisions/area-one/area-one.md
+---
+type: Decision Area
+title: Area one
+governs: []
+---
+
+intro
+@@@ file docs/decisions/area-one/alpha-rule.md
+---
+type: Decision
+title: Alpha rule
+description: short claim and its fence.
+---
+
+Reasoning.
+
+## History
+
+### 2026-01-01
+
+- **Settled.**

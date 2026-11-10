@@ -601,9 +601,12 @@ A few conventions hold across every sink below:
   be *closed* by both — the library records which process it was handed each sink in, and a child
   refuses to close one it inherited — but a shared connection is still a shared connection, and
   there are two exceptions below.
-  **Under gunicorn, uWSGI or Celery, build a connection-holding sink in the worker process:**
-  `configure()` from gunicorn's `post_fork` hook rather than under preload, and don't log from the
-  master. Reconfiguring in the child is harmless **for a sink the library was handed in this
+  **Under gunicorn, uWSGI or Celery, build a connection-holding sink in the worker process.** The
+  simplest way is `configure(sink_factory=lambda: LogstashSink(host="logs", port=5000))` in the
+  master: the library calls the factory on the first event each process sends, never in the master
+  unless it logs and never in the fork handler, so every worker opens and closes its own
+  connection. The factory must build a new sink on each call. Otherwise call `configure()` from
+  gunicorn's `post_fork` hook rather than under preload, and don't log from the master. Reconfiguring in the child is harmless **for a sink the library was handed in this
   process** — but if the master *built* a connection sink and never called `configure()` with it,
   a child that then does is the first process to hand it over, so it owns it and closes it at exit.
   That is the one case the record cannot decide, and it is the case this advice avoids. A master
@@ -611,9 +614,10 @@ A few conventions hold across every sink below:
   sink whose `close()` costs nothing to share, such as `StdoutSink` or `FileSink`. A sink you wrote
   yourself is repaired only if it subclasses `Sink` or a shipped sink; one that satisfies the
   protocol structurally is outside the repair, along with any third-party client's own locks and
-  buffers — except that a sink the library holds directly has its `log_foundry_counters` lock
-  replaced, so an engine sink of your own never hangs a child on its counters (that reach does not
-  extend into a wrapper of yours holding one). The second exception: if you subclass a shipped sink **and add a transport of your
+  buffers — except that every live `SinkCounters` is repaired, so an engine sink of your own never
+  hangs a child on its counters, however it is held. A library sink inside a wrapper of your own is
+  repaired too, within a bound on how far the child reads, unless your wrapper holds it only through
+  a bound method or a closure. The second exception: if you subclass a shipped sink **and add a transport of your
   own**, override `reacquire_after_fork()` — inheriting it claims the whole object on the strength
   of re-opening only the part the parent class knows about, after which the child *will* close
   your connection.

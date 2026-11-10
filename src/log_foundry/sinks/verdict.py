@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import threading
 import types
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self, cast, final
 
@@ -145,6 +146,25 @@ class Verdict:
         return cls(outcomes=(outcome,) * n, retry_after=retry_after)
 
 
+_LIVE_COUNTERS: weakref.WeakSet[SinkCounters] = weakref.WeakSet()
+"""Every ``SinkCounters`` this process built that is still alive (SPEC-079 FR-002).
+
+A forked child repairs each member's ``_counter_lock``, whatever holds it: a third-party engine
+sink the walk never enters, a wrapper that keeps only that sink's bound ``emit``, a closure or a
+C extension. Searching for counters reached them only through the one attribute
+``log_foundry_counters`` on a value the walk already met, so counters behind a bound method or a
+closure kept a dead lock and hung the child's first engine run; invariant 12 named this registry
+as the follow-up. It is read, never searched: ``_lifecycle._walk_after_fork`` takes it from
+``sys.modules``, so a child imports nothing. It differs from a registry of every package
+primitive holder, which would replace the walk from the runtime's roots, because it covers the
+one class the walk cannot reach by reading.
+
+Weak, so a counters object lives exactly as long as its sink and the registry pins nothing. A
+``WeakSet`` holds no lock or event and no sink, so the walk need not skip it; its adds run under
+the GIL and only a forked child iterates it, before any thread of its own exists.
+"""
+
+
 @final
 class SinkCounters:
     """The counter object a sink owns for the engine, exposed as ``log_foundry_counters``.
@@ -184,6 +204,7 @@ class SinkCounters:
         self.dropped_events = 0
         self.failed_events = 0
         self._counter_lock = threading.Lock()
+        _LIVE_COUNTERS.add(self)
 
     def losses(self) -> SinkLosses:
         """Returns both counters as one snapshot, read under the counter lock.

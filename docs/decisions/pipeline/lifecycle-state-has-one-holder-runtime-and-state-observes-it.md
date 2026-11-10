@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "Lifecycle state has one holder, Runtime, and the stored State decides the transitions"
-description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside critical sections the calls already take, and the transition table is total over six calls and five states, with one changed cell — a swap during a drain with no live worker declines while the drain still has a take ahead of it. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry (`Runtime._closes`). Three locks remain, not one. The token sets are added under `_lock` and discarded lock-free, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078; arch §9.2)"
+description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside the four critical sections the calls already take and the fork handler's re-settle, and inside critical sections the calls already take, and the transition table is total over six calls and five states, with one changed cell — a swap during a drain with no live worker declines while the drain still has a take ahead of it. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry (`Runtime._closes`). Three locks remain, not one. The token sets are added under `_lock` and discarded lock-free, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078; arch §9.2)"
 ---
 
 **One holder.** SPEC-040 put the orphan side's seven globals on one object, `_lifecycle._state`,
@@ -33,7 +33,9 @@ observer derived from the flags. Now `Runtime._current` stores the settled part 
 SPEC-077's derivation **without** the configured-sink term, because the config is not the
 runtime's and `configure()` must not take its lock — written only by `Runtime._move`, at the end of
 the four critical sections that can change it (the build, the orphan arm, and the shutdown's entry
-and late-worker sections). No other section calls it, because none can change the value. `state`
+and late-worker sections), and — since SPEC-079 — in the forked child's `_clear_after_fork`, which
+re-settles what a fork landing inside one of those sections half-wrote. No other section calls
+it, because none can change the value. `state`
 reads the token sets, then `_current`, and reports a stored `UNCONFIGURED` as `RUNNING` once a sink
 has resolved; it stays lock-free and is the reporting view. The library reads `Runtime._column()`
 — the token sets, then `_current` — under the lock it already holds.
@@ -92,7 +94,8 @@ which costs that one swap a decline of a drain already over, never a close under
 - **Grace-capping the fan-out joins**: SPEC-046 measured it losing data.
 
 **Do NOT** write `_current` outside `Runtime._move`, or call `_move` outside the four sections that
-can change it — `tests/test_lifecycle_transitions.py` scans both. Do NOT let a library call decide
+can change it and the fork handler `_clear_after_fork` — `tests/test_lifecycle_transitions.py` scans
+both, by name. Do NOT let a library call decide
 on `Runtime.state`; it reads `_column()` under its own lock. Do NOT add lifecycle state at module
 scope in `_lifecycle.py`, or a field to `Runtime`, `Worker` or `_CloseRegistry`, without a row in
 the inventory test. Do NOT merge the three locks without re-deriving the lock order. Do NOT touch
@@ -100,6 +103,13 @@ the owed record outside `_CloseRegistry.arm`, `take` and `put_back`. (SPEC-077 F
 SPEC-078 FR-001 to FR-004)
 
 ## History
+
+### 2026-11-10
+
+- **Refined by SPEC-079**: `_clear_after_fork` is a fifth `_move` site. A fork landing inside one of
+  the four sections, between a field write and its `_move`, left a child whose stored state differed
+  from its derived one, and a fork inside `_get_worker` between `_worker =` and the arm left a live
+  worker's sink unowed; the handler re-settles both under the lock the roster replaced.
 
 ### 2026-11-09
 

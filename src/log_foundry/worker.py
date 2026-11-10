@@ -324,8 +324,13 @@ class Worker:
     only, and knows nothing about spans or context.
     """
 
-    _FORK_SKIP = ("_held", "_taken_markers")
+    _FORK_SKIP = ("_held", "_taken_markers", "_queue", "_thread")
     """Attribute names ``_fork``'s repair walk must not read or descend into (SPEC-050 FR-004).
+
+    ``_queue`` and ``_thread`` joined at SPEC-079, when the worker became a root of the walk.
+    Neither holds a primitive the walk could replace and neither holds anything the marking needs:
+    the queue is replaced whole by :meth:`_reinit_after_fork` with its mutex and conditions, and
+    the thread did not survive the fork.
 
     ``_taken_markers`` names ``flush()`` callers **in the parent**, whose ``Event`` the walk would
     otherwise replace on an object nothing in the child will ever wait on. The skip stops that
@@ -339,7 +344,7 @@ class Worker:
     to repair. Without the opt-out the walk reaches a superseded sink, replaces its locks — merely
     wasteful — and runs its fork hooks, which is not: ``_lifecycle.reclaim`` then overwrites the
     foreign-pid record the child holds for it — the parent's own stamp, or the ``_FOREIGN``
-    ``_mark_inherited`` ``setdefault``s where the parent recorded nothing — leaving a child able
+    ``_walk_after_fork`` ``setdefault``s where the parent recorded nothing — leaving a child able
     to release a transport it never acquired. Nothing is lost by skipping it, for the reason
     ``_lifecycle._state._owned``'s entry gives: a sink that is still *live* is reached through
     ``self.sink`` and the config, neither of which is opted out — which is what makes skipping the

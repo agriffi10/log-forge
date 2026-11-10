@@ -75,6 +75,16 @@ _FLUSH = FlushResult(ok=True)
 _CONTINUE = ContinueResult(ok=False, reason="nothing-supplied")
 _CONFIG = Config(service="svc", version="1.0.0", env="prod")
 
+# SPEC-079 FR-005: `sink_factory`, on the dataclass, read back, and passed to `configure`.
+_FACTORY_CONFIG = Config(sink_factory=None)
+_FACTORY: Callable[[], Sink] | None = get_config().sink_factory
+
+
+def _configure_a_factory() -> None:
+    from log_foundry.sinks.memory import MemorySink
+
+    configure(sink_factory=lambda: MemorySink())
+
 # FR-002: the invariance. A caller's labels are a `dict[str, str]`, and `dict` is invariant, so
 # this line is the whole point of the probe -- it was a `mypy --strict` error until SPEC-051.
 _LABELS: dict[str, str] = {"tenant": "acme", "region": "eu-west-1"}
@@ -310,6 +320,7 @@ _DEDUP: DedupIdSource = None
 # claim; touching each name here is what makes the claim checkable.
 _NAMES: tuple[object, ...] = (
     _HEALTH, _LOSSES, _FLUSH, _CONTINUE, _CONFIG, _LABELS, _wire, _work, _sinks,
+    _FACTORY_CONFIG, _FACTORY, _configure_a_factory,
     __version__, health, get_config, get_baggage, current_baggage_header, current_trace_context,
     read_losses, flush_sink, SinkDeliveryError, merge_headers, _BACKEND, _GROUP, _DEDUP,
     _MyEngineSink, read_deliver, Outcome, Verdict, SinkCounters,

@@ -17,8 +17,9 @@ A *door* is a function raising a `TypeError` that names the type of one of its p
    rewritten earlier test, or a second copy of an exempt one, is still reported. A read of
    `p.__class__` anywhere in a door's body (`if not value.__class__ is int:`) is reported too,
    since it asks the value what it is by another spelling.
-3. The derived set of doors equals, exactly, the eleven written out below (the ten of `2368ade3`
-   and SPEC-072's `_engine.emit_via_deliver`): a door removed, renamed or inlined back reddens by
+3. The derived set of doors equals, exactly, the thirteen written out below (the ten of `2368ade3`,
+   SPEC-072's `_engine.emit_via_deliver` and SPEC-079's `_sink_arg.require_sink` and
+   `config._require_factory`): a door removed, renamed or inlined back reddens by
    name, and a new one is a visible edit.
 
 **What it does not see**, each a deliberate edge its corpus asserts silence on: a type named by a
@@ -56,12 +57,26 @@ EXPECTED_DOORS = frozenset(
         "sinks.otlp.OTLPSink.__init__",
         "sinks._args.require_callable",
         "sinks._engine.emit_via_deliver",
+        "_sink_arg.require_sink",
+        "config._require_factory",
     }
 )
-"""The eleven doors: SPEC-080's two, SPEC-071's seven, ``require_callable``, SPEC-072's adapter.
+"""The thirteen doors: SPEC-080's two, SPEC-071's seven, ``require_callable``, SPEC-072's adapter,
+and SPEC-079's two, ``_sink_arg.require_sink`` and ``config._require_factory``.
 
 ``emit_via_deliver`` names ``type(sink)`` in its two ``TypeError`` messages, and routes ``batch`` on
 its real type through ``_snapshot``, so it contributes both kinds of plant to the sweep below.
+"""
+
+NO_CLASS_TEST = frozenset({"_sink_arg.require_sink", "config._require_factory"})
+"""Doors that judge their argument with no class test at all, so they plant no ``issubclass``.
+
+SPEC-079's two. ``require_sink`` refuses by exact identity, ``type(value) is t`` over a closed
+list of builtin types, because a subclass of ``dict`` with an ``emit`` is a sink and must not be
+refused; ``_require_factory`` asks ``callable`` and a signature bind. Neither has an
+``issubclass(type(p), T)`` for the sweep to rewrite back to ``isinstance``, which check 2 would
+then report; each still contributes its stored-name plant, and check 2 still refuses an
+``isinstance`` of its parameter if one is ever written there.
 """
 
 RAISE_EXEMPT = frozenset({"sanitize._coerce_unbounded", "sinks.transform.TransformSink._apply"})
@@ -634,6 +649,10 @@ def test_every_door_site_rewritten_back_is_reported() -> None:
             f"{door}: the {kind} site at {rel}:{line} went unreported: {reported}"
         )
     kinds = {door: {kind for _, d, _, _, kind in plants if d == door} for door in EXPECTED_DOORS}
-    assert {door: sorted(k) for door, k in kinds.items() if k != {"issubclass", "stored"}} == {}, (
+    expected = {
+        door: {"stored"} if door in NO_CLASS_TEST else {"issubclass", "stored"}
+        for door in EXPECTED_DOORS
+    }
+    assert {door: sorted(k) for door, k in kinds.items() if k != expected[door]} == {}, (
         "every door contributes at least one issubclass plant and one stored-name plant"
     )
