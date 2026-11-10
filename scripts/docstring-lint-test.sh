@@ -35,7 +35,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CASES="$ROOT/tests/docstring-lint"
 FILTER="${1:-}"
 WORK="${TMPDIR:-/tmp}/docstring-lint-test.$$"
-trap 'rm -rf "$WORK"' EXIT INT TERM
+# A signal EXITS, and the EXIT trap then cleans up: a handler that only cleaned up let the shell
+# resume after it with its scratch gone. HUP and PIPE are trapped too, because dash runs no EXIT
+# trap when a signal kills it. `scripts/signal-test.sh` (template repo only) holds every script to this.
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 1' HUP INT PIPE TERM
 
 # Parse the checker before exercising it. A SyntaxError partway through would otherwise
 # surface as every case failing for the same wrong reason, which reads as a broken corpus
