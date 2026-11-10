@@ -33,7 +33,8 @@ order agents asked, with `main` settled and green before the next**.
   pause button.
 - **Merging needs no lock; pushing does.** A session whose CI is green can watch, merge and drop the
   ticket without the lock. Any push of an enforced branch is refused while you do not hold it, which
-  is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through. Which
+  is the case a red CI puts you in, and `PR_QUEUE_BYPASS=1` is the documented way through — as it
+  is for a red `main` your own merge caused, under the conditions `PROTOCOL.md` sets. Which
   branches are enforced is a per-install setting: **read `enforce-branches` in the queue directory**
   rather than assuming, and rather than re-running `install.sh` to find out, which rewrites this
   checkout's hook. A fresh install writes `.` — every branch — but an
@@ -87,8 +88,12 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
 
 - **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec
   is ready when it is `Draft` on `origin/main` (the status a spec takes once reviewed, `spec-lifecycle.md`),
-  `spec-lint` reports no failure for it there, and every earlier spec in `arc_order` that it is not
-  independent of has landed. With no independent specs this is one session at a time, in
+  `spec-lint` reports no failure for it there, every earlier spec in `arc_order` that it is not
+  independent of has landed, and nobody is building it. A spec being built still reads `Draft` on
+  `origin/main`, so check that last condition separately: this orchestrator has started no session
+  for it, and no local branch carries it `In Progress` — list the branches with
+  `git for-each-ref --format='%(refname:short)' refs/heads` and read each candidate's status with
+  `git show <branch>:<spec path>`. With no independent specs this is one session at a time, in
   `arc_order`. Start every ready spec before stopping to ask about one that is not.
 - **Two specs are independent** when neither needs the other's result, whether through `depends_on`
   or through something the earlier one builds, and they touch different source files. The files every
@@ -116,10 +121,11 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   - a session ends blocked, or ends with its spec not landed by the check above;
   - a session is waiting on Andrew's answer: relay its question verbatim;
   - `main` is red: start nothing until it is green again, and ask before the chain resumes. The
-    session whose merge turned it red fixes it (`session-rhythm.md`); start a fix session only if that one
-    has ended;
-  - the next spec is `In Progress` from a session this orchestrator did not start (name its branch,
-    its PR and any queue lock it holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or
-    depends on a spec outside the arc that is not `Completed`.
+    session whose merge turned it red fixes it, through the queue's red-trunk exception
+    (`scripts/pr-queue/PROTOCOL.md`); start a fix session only if that one has ended;
+  - the next spec is `In Progress` on a branch from a session this orchestrator did not start
+    (found the way the readiness bullet above says; name its branch, its PR and any queue lock it
+    holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or depends on a spec outside the
+    arc that is not `Completed`.
 - **When the arc's last spec lands,** archive its session and report the arc done to Andrew,
   with the lessons its sessions reported.

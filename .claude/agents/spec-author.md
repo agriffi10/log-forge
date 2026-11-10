@@ -21,7 +21,10 @@ report the lint output verbatim.
 For completion work: follow the seven steps in `completion-ritual.md` in order; a new decision is one
 file in its area — fence and entry together, ending in its dated History — then
 `sh scripts/gen-index.sh`, and `CLAUDE.md`'s `## Specs` is pruned, never appended to. Run
-`sh scripts/docs-lint.sh` and report its output verbatim.
+`sh scripts/docs-lint.sh` and report its output verbatim. When the brief names a worktree path and
+a branch, work only there: run every git and script command as `cd <path> && …` in the same call,
+since your working directory resets between calls, and commit the ritual on that branch when the
+brief asks you to.
 
 Return: the paths you wrote, the lint output, and the decisions you could not make (or "none"). You
 do not review your own work — the orchestrator sends it to `reviewer`.

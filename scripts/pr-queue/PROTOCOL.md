@@ -48,6 +48,28 @@ open on the remote, `main` is unsettled, or a check could not run. Two need a di
 anything else merges. If it says `NO_TICKET` (exit **3**, not 1) you never got in line; run `ticket`.
 Every other refusal exits 1 and means keep polling.
 
+**The one exception to escalating is the session whose own merge turned `main` red: it fixes the red
+itself.** Its merge turned `main` red when a push run of its merge commit, `Release` or `Spec Lint`,
+failed because of its change. Everything else that reads `IS RED` is escalated to the human like any
+other red: drift the merge only triggered (a `pip-audit`, `Scorecard` or `Zizmor` push failure,
+such as an advisory published that day), a run that is not a push run (a scheduled run, a `dynamic`
+CodeQL or Dependabot job), a GitHub billing block, and a CodeQL upload stall
+(`docs/process/operational-traps.md`). Whether to use `PR_QUEUE_BYPASS=1` for any of those is
+Andrew's call (`.claude/skills/supervise/SKILL.md`). For its own red, `turn` and `acquire` refuse
+every session but the lock's holder while `main` is red, so a fix that waited for the lock in the
+ordinary way would never get it. Cut the fix branch from a freshly fetched `origin/main`, and rebase
+onto it if `main` moves before the push. Run `queue.sh status` first and go on only if nothing would
+be cut in line: the lock is free or still your own, and no non-draft PR is open. If you still hold
+the lock, which the ordinary lifecycle below releases after `main` is confirmed green, re-running
+`acquire` with the same id from the fix branch's worktree re-stamps the lock onto that branch
+(`turn` answers its holder before it reads `main`), and the push then needs no bypass. Otherwise
+push the fix branch with `PR_QUEUE_BYPASS=1`, knowing that it skips the hook's base check as well as
+its lock check (`pre-push` exits on the bypass before either), which is why the fresh `origin/main`
+above is yours to guarantee. Say in the PR body that it bypassed the queue and why, merge on green,
+and confirm `main` went green; only then release, and take a fresh ticket for any other work. Never
+bypass to get ahead of a waiter or an open PR. If the session that caused the red has ended, the red
+is escalated like any other.
+
 **A DRAFT DOES NOT BLOCK.** The remote check stands in for "another agent is mid-turn", and a draft
 is the one open PR explicitly *not* ready to merge — it can sit for hours by design. Counting one
 starves every agent that obeys this queue, while agents that never took a ticket push straight past

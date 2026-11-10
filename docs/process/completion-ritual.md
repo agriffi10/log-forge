@@ -1,6 +1,9 @@
 # Completion ritual (keep the always-loaded tier lean)
 
-When a spec is done, in the same pass:
+The ritual runs **on the spec's own branch, once its phases are built and before its local gates
+and two diff reviews**, so the reviewers see its edits and they ride in the spec's PR (its last, if
+it needs several) rather than in a follow-up after the merge. Step 1 is therefore set before the
+merge, and the spec reads `Completed` on `main` the moment that PR merges on green. In one pass:
 1. Set the spec's frontmatter `spec_status: Completed`.
 2. Regenerate the indexes — `sh scripts/gen-index.sh` — and commit them with it. They are never edited
    by hand; `docs-lint.sh` fails one that is stale.
@@ -44,10 +47,10 @@ When a spec is done, in the same pass:
    (`212fd16`), so recency is a hint and not the test: the test is reading the delivery docs.
    `git log --format='%h %ci' -- docs/release-notes/<tag>.md` bounds the search; it does not
    close it.
-7. **Prune `CLAUDE.md`'s `## Specs`** of whatever the closed spec made stale. Its **Current work**
-   line carries the spec in flight or `none in flight`, and the section carries nothing recorded
-   elsewhere — the rule that section states for itself, made a step so it is done at the moment it
-   applies: a closed spec's status is in its frontmatter and its delivery doc says what shipped.
+7. **Prune `CLAUDE.md`'s `## Specs`** of whatever the closed spec made stale. The section carries
+   nothing recorded elsewhere — the rule that section states for itself, made a step so it is done at
+   the moment it applies: a closed spec's status is in its frontmatter and its delivery doc says what
+   shipped.
 
 **Anti-regrowth & doc hygiene** (each rule below was earned by a real doc defect in a project run
 this way).

@@ -123,8 +123,6 @@ carried it: `@docs/spec-delivery/RELEASES.md`. Phase-level build reference: `@do
 rather than appending. A completed spec's narrative belongs in its delivery doc, not in the file that
 loads every session — `561a9f6` cut the Specs section this file had accumulated.
 
-**Current work:** none in flight.
-
 ## Key Decisions (settled — don't re-litigate)
 
 Settled decisions live in `docs/decisions/`, **one file per decision** in one directory per area: its

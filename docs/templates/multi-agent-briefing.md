@@ -30,7 +30,7 @@ do not start it, and do not ask whether to. A question only the human can answer
 with the question tool, and the orchestrator relays it. What the arc's landed specs left for you: [the lessons and leftovers their
 sessions reported, or "first in its arc"]. Your spec is finished when `spec_status: Completed` and
 the regenerated indexes are merged on `origin/main`, so the completion ritual's commit rides in your
-last PR or in one of its own that you also land. End your last turn with your PR numbers and the
+last PR, committed before its diff reviews (`docs/process/completion-ritual.md`). End your last turn with your PR numbers and the
 lessons this spec taught.
 
 **Files you and a peer will both touch.** [List them — the always-loaded `CLAUDE.md`, an index, a
@@ -50,7 +50,7 @@ The queue serialises the remote — it is not a review, and it does not replace 
 ```
 [queue-dir]/queue.sh ticket  SPEC-XXX     # get in line — when ready to push, not before
 [queue-dir]/queue.sh turn    SPEC-XXX     # poll until it exits 0 (Monitor's until-loop, not sleep)
-[queue-dir]/queue.sh acquire SPEC-XXX     # take the lock — from your worktree, on your branch
+[queue-dir]/queue.sh acquire SPEC-XXX     # take the lock — from the worktree of the branch you push
 [queue-dir]/queue.sh release SPEC-XXX     # on EVERY exit path, including failure and abandonment
 ```
 
@@ -62,13 +62,14 @@ keyed on the head sha, merge, confirm `main` went green — not just the push. T
 lock because the wait is exactly when peers merge, and `pre-push` refuses a push whose commits do not
 contain the remote's current `main` whether or not you hold the lock. One ticket per PR: if your spec needs several,
 release between them so the others interleave. If `turn` reports the trunk `IS RED`, stop and
-escalate; a red `main` is fixed before anything else merges.
+escalate; a red `main` is fixed before anything else merges. The one exception is a red your own
+merge caused: you fix it, through the red-trunk path in `scripts/pr-queue/PROTOCOL.md`.
 
 **Escalate, don't improvise — and ask, don't list.** [Name who to escalate to and how: in an arc
 run, the orchestrator; else the supervisor session by its `ListAgents` name, if one is running
 `/supervise`; else Andrew.] A
 product-changing or ambiguous call, a conflict you cannot resolve without discarding someone's work,
-and a red `main` all stop the session — the reversible technical calls are still yours to make. When
+and a red `main` you did not cause all stop the session — the reversible technical calls are still yours to make. When
 you do stop, ask with the question tool: the options as selections, the recommended one first, and
 carry on with the answer. Options written out in prose that end the turn are a stop nobody asked for.
 

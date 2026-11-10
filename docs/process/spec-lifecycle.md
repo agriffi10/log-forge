@@ -10,10 +10,14 @@ is one edit and a regeneration, never two edits kept in step by hand.
   has unresolved questions (`authoring-a-spec.md`), and a spec that has not been through the gate is not Draft-ready,
   whatever its `spec_status` says. Being told to build an arc is being told to build each of its
   specs, and the session told orchestrates them (`several-agents.md`).
-- **In Progress** — exactly one spec at a time is in flight. Set when you branch to build it. A
-  deliberate multi-agent run, an arc run whose independent specs build in parallel among them, is the
-  exception (`several-agents.md`).
-- **Completed** — merged on green CI, delivery doc written (`completion-ritual.md`).
+- **In Progress** — exactly one spec at a time is in flight. Set when you branch to build it. The
+  status is set on the spec's build branch and reaches `main` with the spec's first PR, so for a
+  one-PR spec only in the merge that marks it `Completed`. What is in flight is therefore read from
+  the spec branches in this repo, as `several-agents.md` says, not from the index on `main` alone.
+  A deliberate multi-agent run, an arc run whose independent specs build in parallel among them, is
+  the exception (`several-agents.md`).
+- **Completed** — set by the completion ritual on the spec's own branch, with its delivery doc,
+  before the diff reviews; the spec has landed once that PR merges on green CI (`completion-ritual.md`).
 
 **Arcs.** Related specs can be grouped into *arcs* with an explicit **build order**, written in each
 spec's frontmatter: `arc: <slug>` names the arc and `arc_order: <n>` the spec's place in it, and the
