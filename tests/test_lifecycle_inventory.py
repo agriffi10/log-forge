@@ -807,6 +807,9 @@ INVENTORY: dict[Key, Row] = {
     _rt("_worker"): Row("Runtime", _INH, "the process worker; guarded by _lock, read unlocked"),
     _rt("_late_worker"): Row("Runtime", _INH, "a worker built inside a no-worker shutdown"),
     _rt("_closes"): Row("Runtime", _INH, "the close registry (SPEC-078); walked as a holder"),
+    _rt("_current"): Row(
+        "Runtime", _INH, "the stored settled state; inherited, which is exact (SPEC-078 FR-003)"
+    ),
     _rt("retirements"): Row("Runtime", _INH, "the retirement count"),
     _rt("_atexit_registered"): Row("Runtime", _INH, "the exit handler is registered once"),
     _rt("_shutdown_running"): Row(

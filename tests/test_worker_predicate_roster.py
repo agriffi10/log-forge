@@ -481,30 +481,40 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "thread has ended answers False here and must, because then nothing is inside it."
         ),
     ),
-    ("Runtime.state", "self.live_worker()", 0): (
+    ("Runtime._move", "self.live_worker()", 0): (
         LIVENESS,
         (
-            "the observer's rule 3 (SPEC-077 FR-002): a worker that still delivers reads RUNNING, "
-            "including one built after a shutdown() returned. Liveness rather than existence "
-            "because a retired worker is still the process worker and must read CLOSED. The "
-            "observer decides nothing, so this is the question asked in order to report it."
+            "the stored state's rule 3 (SPEC-077 FR-002, stored by SPEC-078 FR-003): a worker that "
+            "still delivers is RUNNING, including one built after a shutdown() returned. Liveness "
+            "rather than existence because a retired worker is still the process worker and must "
+            "settle CLOSED. Moved here from `Runtime.state`, which now reads the stored value."
         ),
     ),
-    ("Runtime.state", "self.retirements", 0): (
+    ("Runtime._move", "self.retirements", 0): (
         LIVENESS,
         (
             "the snapshot of the retirement count rule 4 reads, filed as a binding because "
             "rebinding is how a guard changes category with its text unchanged. Reading the count "
-            "to report it is the liveness question asked for a different purpose."
+            "to settle the state is the liveness question asked for a different purpose."
         ),
     ),
-    ("Runtime.state", "retirements > 0", 0): (
+    ("Runtime._move", "retirements > 0", 0): (
         LIVENESS,
         (
-            "the observer's rule 4: retired with no live worker reads CLOSED, which is when "
-            "health().retired is true and nothing is drained. Tested after rule 3 deliberately - "
-            "the other order reads a live worker built after a shutdown() as CLOSED, the mutant "
-            "SPEC-077 FR-004's sequential driver kills."
+            "rule 4: retired with no live worker settles CLOSED, which is when health().retired "
+            "is true and nothing is drained. Tested after rule 3 deliberately - the other order "
+            "settles a live worker built after a shutdown() as CLOSED, the mutant SPEC-077 "
+            "FR-004's sequential driver kills."
+        ),
+    ),
+    ("_swap_sink", "worker is None and _state._column() is State.DRAINING", 0): (
+        LIVENESS,
+        (
+            "the one cell of the transition table whose answer is new (SPEC-078 FR-004): a swap "
+            "during a drain with **no live worker** declines at entry, because the drain owns every "
+            "owed close - at `fda134a` it released the drained sink onto a daemon. Liveness, from "
+            "the binding above: a live worker in the drain (a late one, or one built in its tail) "
+            "still swaps, since declining there loses the configure."
         ),
     ),
     ("_offer_orphan_signal", "_state.in_flight(sink)", 0): (
@@ -1061,8 +1071,13 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 52, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 53, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived count again at SPEC-078 (FR-003, FR-004), 52 -> 53.** `Runtime.state`'s
+three sites moved to `Runtime._move` with their categories, because the stored state is now
+derived there and `state` reads it; the one added site is `_swap_sink`'s decline in `DRAINING`
+with no live worker, which is the state read FR-006 asks to be filed with a category.
 
 **Raised to the derived count at SPEC-078 (FR-001), 47 -> 52.** Measured with this file's
 `_per_module_sites` on the branch, by diffing `_numbered()` against the base. Six rows re-keyed

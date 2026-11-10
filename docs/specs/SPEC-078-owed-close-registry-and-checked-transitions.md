@@ -77,7 +77,7 @@ each on purpose:**
 - The close rules kept exactly — inline, fan-out joined in full, detached and graced, a bystander
   waiting — and the grace spent once per call (FR-002).
 - A stored `State` with one writer, SPEC-077's token sets carrying the operation that holds
-  `SWAPPING` or `DRAINING`, and every lifecycle entry reading it under the lock with no new lock
+  `SWAPPING` or `DRAINING`, and the lifecycle entries answering from it under the lock with no new lock
   acquisition (FR-003).
 - The transition table, total over six calls and five states, its one changed cell (a swap during a
   drain with no live worker declines), and the decision that `CLOSED` keeps its arrows (FR-004).
@@ -295,14 +295,20 @@ so the token that holds `SWAPPING` or `DRAINING` also carries that call's deadli
 and their discipline are unchanged: `set[_Operation]`, each token added in the call's first critical
 section, and discarded in a `finally` by one `set.discard`, without the lock.
 
-**Dispatch.** Each lifecycle entry reads, once, in the critical section it already takes,
-`_stops_running`, then `_swaps_running`, then `_current`. The first non-empty set, or else
-`_current`, is the table column FR-004 answers from. Dispatch never reads the config term, so a
-`SWAP` or an `ARM` from cold is in the `UNCONFIGURED` column although `state` already reports
-`RUNNING` there. The entries are `_get_worker`'s inner check (`BUILD`),
-`_note_orphan_emit`'s locked branch (`ARM`), `_swap_sink` (`SWAP`), `_flush_worker` (`FLUSH`, which
-moves nothing), `_shutdown_worker` for `shutdown()` and the exit drain (`STOP`), and
-`_clear_after_fork` (`FORK`). The `FORK` entry empties the token sets (SPEC-077), and the child's
+**Dispatch.** The table column FR-004 answers from is `Runtime._column()`: `_stops_running`, then
+`_swaps_running`, then `_current`, the first non-empty set or else `_current`, read in a critical
+section the caller already holds. Dispatch never reads the config term, so a `SWAP` or an `ARM`
+from cold is in the `UNCONFIGURED` column although `state` already reports `RUNNING` there. The
+entries are `_get_worker`'s inner check (`BUILD`), `_note_orphan_emit`'s locked branch (`ARM`),
+`_swap_sink` (`SWAP`), `_flush_worker` (`FLUSH`, which moves nothing), `_shutdown_worker` for
+`shutdown()` and the exit drain (`STOP`), and `_clear_after_fork` (`FORK`). **Only `_swap_sink`
+reads `_column()`** (amended during the build, 2026-11-09): five of the six rows give the same code
+in every column — `BUILD` × `DRAINING` is split by `_shutdown_running`, kept on purpose (Out of
+Scope), `STOP` × `DRAINING` by `Worker.claim_stop`, and `BUILD`, `ARM`, `FLUSH` and `FORK` do the
+same thing wherever they are — so a read at those entries would decide nothing and be a dead
+binding. `SWAP` × `DRAINING` with no live worker is the one cell whose answer differs, and that is
+where the column is read; the other entries' existing code is the table's answer, and FR-004's
+per-cell tests prove each cell. The `FORK` entry empties the token sets (SPEC-077), and the child's
 `_current` is inherited as the parent had it, which is exact. Its child-repair value is `inherited`.
 `configure()` without `sink=` writes the config and is not a lifecycle call.
 

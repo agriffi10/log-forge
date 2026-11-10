@@ -370,7 +370,8 @@ def install_worker(worker) -> None:
     critical section, and that is what `shutdown()` and `flush()` both read. Assigning the slot
     alone leaves a worker whose sink nothing owes a close and nothing will flush.
 
-    The two lines below are `_get_worker`'s, which is a fixture reproducing production setup
+    The three lines below are `_get_worker`'s — the slot, the arm and, since SPEC-078, the move
+    of the stored state that ends that critical section — which is a fixture reproducing production setup
     rather than a production expectation: what a test then asserts still comes from the library.
     A test that wants the *unarmed* state asserts on the record itself and does not use this.
 
@@ -388,6 +389,7 @@ def install_worker(worker) -> None:
     with _lifecycle._state._lock:
         _lifecycle._state._worker = worker
         _lifecycle._state._closes.arm(worker.sink)
+        _lifecycle._state._move()
 
 
 def retire_process(worker=None, timeout: float | None = 30.0) -> None:
@@ -510,6 +512,10 @@ def _reset_worker() -> None:
     a sink, and a leaked entry shows up as that sink never being closed rather than as a
     process-wide charge.
 
+    SPEC-078 stores the settled state, so the reset ends by re-settling it through ``_move``
+    over the fields it has just cleared, which is ``UNCONFIGURED``: a test that left a worker or
+    a retirement behind would otherwise leave the next one reading ``RUNNING`` or ``CLOSED``.
+
     SPEC-077 adds the two token sets ``state`` reads: a test that injects an exception past a
     ``finally`` it then bypasses, or sets a token directly, would otherwise leave every later test
     reading ``SWAPPING`` or ``DRAINING``.
@@ -540,6 +546,8 @@ def _reset_worker() -> None:
     decorator._in_span_lost = 0
     with _lifecycle._state._closes._lock:
         _lifecycle._state._closes._in_flight.clear()
+    with _lifecycle._state._lock:
+        _lifecycle._state._move()
 
 
 class FakeSink:

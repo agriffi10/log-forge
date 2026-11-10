@@ -54,23 +54,33 @@ more likely stuck than slow, and every second spent on it is a second the proces
 
 
 class State(enum.Enum):
-    """The process's lifecycle state, read off today's flags and deciding nothing (SPEC-077 FR-002).
+    """The process's lifecycle state, stored by the runtime and checked by every call (SPEC-078).
 
-    An **observer**: :attr:`Runtime.state` derives a member from fields the runtime already keeps,
-    and nothing in ``src/`` reads it, so a wrong derivation can fail a test and cannot change a
-    delivery. SPEC-078 is what makes the transitions checked; until then the states describe the
-    code rather than govern it, and the ways the code departs from the stability plan's diagram
-    are recorded rather than fixed: ``CLOSED`` is not terminal (a ``@trace`` after a no-worker
-    ``shutdown()`` builds a live worker and the state returns to ``RUNNING``), and ``SWAPPING`` is
-    entered from ``CLOSED`` as well as ``RUNNING``.
+    SPEC-077 introduced it as an observer, derived from the flags and deciding nothing. SPEC-078
+    makes it the authority: the settled part is stored in :attr:`Runtime._current`, written only
+    by :meth:`Runtime._move` inside critical sections the calls already take, and the lifecycle
+    calls take the answer the transition table gives for the column they find on entry
+    (:meth:`Runtime._column`). The two transient states are read off the token sets, which is
+    what keeps both writes free of a new lock acquisition.
+
+    **``CLOSED`` keeps three arrows out, by decision** (SPEC-078 FR-004). After a ``shutdown()``
+    that built no worker, a ``@trace`` call builds a live worker, delivers and reads ``RUNNING``
+    (SPEC-044 FR-001 refused a permanent retirement fence). After a ``shutdown()`` that stopped a
+    worker, the same call is counted in ``submitted_after_shutdown`` and the state stays
+    ``CLOSED`` (SPEC-019, SPEC-030: reported, not restarted). An orphan log after either reaches
+    the configured sink and arms it again (SPEC-032). Making ``CLOSED`` terminal would turn the
+    first case's delivered events into ``submitted_after_shutdown``, which a minor release may not
+    do. ``SWAPPING`` is entered from ``CLOSED`` as well as ``RUNNING``, when something is owed.
 
     The values are ``enum.auto()`` because nothing reads them, and a literal ``"draining"`` would
     be filed by ``tests/test_worker_predicate_roster.py`` as a worker question, its sentinel
     vocabulary including that word.
 
     Attributes:
-      UNCONFIGURED: Nothing resolved, owed, built or retired.
-      RUNNING: A live worker, or a sink resolved or owed, and not retired.
+      UNCONFIGURED: Nothing owed, built or retired. Stored, it is also the dispatch column of a
+        process whose configured sink has resolved, which :attr:`Runtime.state` reports as
+        ``RUNNING``.
+      RUNNING: A live worker, or a sink owed a close, and not retired.
       SWAPPING: ``_swap_sink`` is inside its work.
       DRAINING: ``_shutdown_worker`` is inside its body, ``shutdown()`` and the exit drain alike.
       CLOSED: Retired, with no live worker.
@@ -575,7 +585,7 @@ def _remaining(deadline: float | None) -> float | None:
 
 
 class Runtime:
-    """The process's delivery lifecycle: one owner, four locks, four questions (SPEC-040, SPEC-077).
+    """The process's delivery lifecycle: one owner, one state, three locks (SPEC-040, SPEC-078).
 
     The state below lived as seven loose module globals in ``decorator.py``, and seven pieces of
     shipped work came out of that one fact — SPEC-030, SPEC-031 FR-006, SPEC-033, two SPEC-035
@@ -583,32 +593,41 @@ class Runtime:
     the same thing at a different site: *who owns the worker or the sink at this instant, and what
     may this path therefore do?*
 
-    **The ownership states** (SPEC-040). A process is in exactly one of these, and the field that
-    decides is named; :class:`State` is the separate, five-member view the observer reads:
+    **The states.** A process is in exactly one :class:`State`, and the fields that decide it are
+    named. SPEC-040's four ownership states are the settled three of these, by the same fields:
 
-    - **cold** — ``_worker is None`` and nothing is owed. Nothing has been logged, no
-      thread exists, no sink is owed a close. ``configure()`` alone does not leave this state:
-      it runs ``_ensure_sink()`` unconditionally, so a resolved sink is not evidence anything
-      was written to it (SPEC-031 FR-006).
-    - **orphan-only** — the owed record names every sink a level call with no span actually
-      reached, and ``_worker`` is still ``None``. The close is owed to this path, and the
-      ``atexit`` handler is armed by the emit that landed rather than by the sink existing.
-    - **worker-backed** — ``_worker`` holds the process worker. It owns the drain; the sink's
-      close and the stop signal are this owner's on both paths (SPEC-054). A mixed process passes
-      through orphan-only first, and one record is what keeps that exactly one ``close()``.
-    - **retired** — ``retirements`` is above zero, and every worker built before the last
-      ``shutdown()`` reads as no longer live with it. A retired worker never restarts: a later
-      log through it is accepted, reported, and refused at the closed sink rather than prevented
-      (SPEC-030). Retirement is not terminal for the process, though: a ``@trace`` after a
-      ``shutdown()`` that found no worker builds a live worker (SPEC-044 FR-001), which is why
-      :attr:`State.CLOSED` can return to :attr:`State.RUNNING`.
+    - ``UNCONFIGURED`` (SPEC-040's **cold**) — ``_worker is None``, nothing owed and nothing
+      retired. Nothing has been logged, no thread exists, no sink is owed a close. ``configure()``
+      alone does not leave it as far as the runtime is concerned: it runs ``_ensure_sink()``
+      unconditionally, so a resolved sink is not evidence anything was written to it (SPEC-031
+      FR-006). :attr:`state` reports such a process as ``RUNNING``, because the config has a sink
+      to deliver to; the stored value and the dispatch column stay ``UNCONFIGURED``, because the
+      config is not the runtime's to read under its lock.
+    - ``RUNNING`` — either **orphan-only** (the owed record names every sink a level call with no
+      span reached, and ``_worker`` is still ``None``; the ``atexit`` handler is armed by the emit
+      that landed rather than by the sink existing), or **worker-backed** (``_worker`` holds a
+      live process worker, which owns the drain; the sink's close and the stop signal are this
+      owner's on both paths, SPEC-054). A mixed process passes through orphan-only first, and one
+      record is what keeps that exactly one ``close()``.
+    - ``CLOSED`` (SPEC-040's **retired**) — ``retirements`` is above zero and no worker is live:
+      every worker built before the last ``shutdown()`` reads as no longer live with it. A retired
+      worker never restarts: a later log through it is accepted, reported and refused at the
+      closed sink rather than prevented (SPEC-030). Retirement is not terminal for the process,
+      though: a ``@trace`` after a ``shutdown()`` that found no worker builds a live worker
+      (SPEC-044 FR-001), so ``CLOSED`` returns to ``RUNNING`` — the decision :class:`State`
+      records.
+    - ``SWAPPING`` and ``DRAINING`` — a :func:`_swap_sink` with work, or :func:`_shutdown_worker`,
+      is inside its body; read off the token sets.
 
-    **The transitions.** ``_get_worker`` takes cold or orphan-only to worker-backed, once, under
-    the lock. ``_note_orphan_emit`` takes cold to orphan-only. ``_swap_sink`` retargets within
-    whichever state holds, and re-points the record rather than clearing it, because clearing
-    leaks the new sink in a process that swaps and exits. ``_shutdown_worker`` takes any state to
-    retired and is idempotent on both paths. ``_rebuild_worker_after_fork`` re-enters the child
-    in the state its parent held — a retired parent forks a retired child.
+    **The transitions** are the table SPEC-078 FR-004 states, six calls by five states.
+    ``_get_worker`` builds once, under the lock, from any settled state. ``_note_orphan_emit``
+    arms a sink. ``_swap_sink`` retargets within whichever state holds and re-points the record
+    rather than clearing it, because clearing leaks the new sink in a process that swaps and
+    exits; during a drain with no live worker it declines, because the drain owns every owed close.
+    ``_shutdown_worker`` takes any state to ``CLOSED`` and is idempotent on both paths. A forked
+    child re-enters in the state its parent held — a retired parent forks a retired child.
+    :attr:`_current` is moved by :meth:`_move` alone, at the end of the four critical sections
+    that can change it.
 
     **The four questions** (``architecture.md`` §9.2) are the methods below, one each, and a
     caller *selects* one rather than composing a predicate. Answering with the wrong one is this
@@ -621,9 +640,8 @@ class Runtime:
     acquire inside a question would deadlock them; and :func:`_get_worker`'s **outer** check is
     deliberately unlocked on the ``@trace`` hot path, where a lock would serialize every span
     flush in the process. Each read is a single reference load, which is atomic — a caller
-    needing consistency across two reads takes ``_lock`` itself. :attr:`state` (SPEC-077) is a
-    fourth reader under the same rule: it names which of the :class:`State` members today's
-    flags describe, decides nothing, and is read by tests only.
+    needing consistency across two reads takes ``_lock`` itself. :attr:`state` is a reader under
+    the same rule; :meth:`_column` and :meth:`_move` are asked with ``_lock`` held.
 
     **Three locks, not one.** :attr:`_lock` guards the worker, the owed record, the count and
     the stop event; the close registry's leaf lock guards the closes in flight, and
@@ -697,6 +715,13 @@ class Runtime:
         self.retirements = 0
         self._shutdown_running = 0
         self._late_worker: Worker | None = None
+        self._current = State.UNCONFIGURED
+        """The settled state the runtime owns: ``RUNNING``, ``CLOSED`` or ``UNCONFIGURED``.
+
+        SPEC-077's rules 3 to 6 without the configured-sink term, written only by :meth:`_move`
+        under :attr:`_lock`. A forked child inherits it as the parent held it, which is exact:
+        the fields it is a function of are inherited too.
+        """
         self._closes = _CloseRegistry()
         """Every close the library owes and every close in flight (SPEC-078 FR-001).
 
@@ -949,63 +974,125 @@ class Runtime:
             return True
         return self._closes.in_flight(sink)
 
-    @property
-    def state(self) -> State:
-        """The lifecycle state, derived from the flags the runtime keeps; takes no lock.
+    def _move(self) -> None:
+        """Re-settles :attr:`_current` from the worker, the count and the owed record (SPEC-078).
 
-        Each input is read once into a local before any rule is tested — the two token sets, the
-        live worker, the retirement count, the owed record and the configured sink — and the rules
-        are then tested in this order, the first that holds deciding (SPEC-077 FR-002). The count
-        is the one field read twice: :meth:`live_worker` reads it to compare against the worker's
-        epoch, and the local is a second load, so under a concurrent ``shutdown()`` the two can
-        differ; an observer read off unlocked loads is a snapshot, not a consistent cut.
+        The one writer of the stored state outside ``__init__``, and the caller holds ``_lock``.
+        It evaluates SPEC-077's rules 3 to 6 **without** rule 5's configured-sink term: a live
+        worker is ``RUNNING``; otherwise a retirement is ``CLOSED``; otherwise something owed is
+        ``RUNNING``; otherwise ``UNCONFIGURED``. The config is left out because it is not the
+        runtime's: ``configure()`` writes it without entering the runtime and must not take this
+        lock, so a stored value that read it could go stale the instant ``configure()`` returned.
 
-        1. a token in :attr:`_stops_running` is ``DRAINING`` — ``shutdown()`` or the exit drain is
-           inside :func:`_shutdown_worker`;
-        2. a token in :attr:`_swaps_running` is ``SWAPPING``;
-        3. a live worker (:meth:`live_worker`) is ``RUNNING``, which includes one built after a
-           ``shutdown()`` returned (SPEC-044 FR-001);
-        4. ``retirements > 0`` is ``CLOSED``: retired with no live worker, which is when
-           ``health().retired`` is true and nothing is being drained;
-        5. something owed a close, or a configured sink resolved, is ``RUNNING``. The configured
-           sink is the one input the runtime does not own, read through the config because it is
-           the recorded authority for the installed sink (``architecture.md`` §12); it is what
-           makes ``configure()`` leave ``UNCONFIGURED``, since ``configure()`` resolves the sink
-           unconditionally;
-        6. otherwise ``UNCONFIGURED``.
-
-        **A fourth lock-free reader**, beside the three worker questions and for their reason: it
-        must answer while another thread holds ``_lock``, and several guards hold that lock when
-        they ask, which a non-reentrant acquire here would deadlock. Each read is one reference
-        load or one ``len`` of a builtin; the answer is a snapshot, which is all an observer
-        needs. Nothing in ``src/`` reads it — the tests do.
+        **Where it is called is decided by whether removing the call would be observable.** It is
+        the last statement of the four critical sections that can change the value — the build in
+        :func:`_get_worker` (a worker, and the record armed from empty), the locked branch of
+        :func:`_note_orphan_emit` (the record armed from empty), and :func:`_shutdown_worker`'s
+        entry and late-worker sections (the retirement count). No other section calls it, because
+        none can change the value, and a call there would be an equivalent mutant:
+        :func:`_close_owed`'s take and put-back run only after the shutdown has moved the count,
+        after which rule 3 or 4 decides and the record is not read; :func:`_swap_sink` arms a sink
+        only when one is already owed or a worker is live; and :func:`_clear_after_fork` changes
+        none of the fields it reads.
 
         Args:
           None.
 
         Returns:
-          The state the flags describe.
+          None.
+
+        Raises:
+          None.
+        """
+        live = self.live_worker()
+        retirements = self.retirements
+        if live is not None:
+            self._current = State.RUNNING
+        elif retirements > 0:
+            self._current = State.CLOSED
+        elif self._closes.owed:
+            self._current = State.RUNNING
+        else:
+            self._current = State.UNCONFIGURED
+
+    def _column(self) -> State:
+        """The column of the transition table a lifecycle call takes its answer from (SPEC-078).
+
+        The token sets first, then the stored state: ``DRAINING`` while a ``shutdown()`` or the
+        exit drain is inside its body, else ``SWAPPING`` while a swap is inside its work, else
+        :attr:`_current`. It never reads the config, so a ``SWAP`` or an ``ARM`` from cold is in
+        the ``UNCONFIGURED`` column although :attr:`state` already reports ``RUNNING`` there.
+        The caller holds ``_lock``; the reads are each one reference load or one ``bool`` of a
+        builtin set, so the answer is exact for the section that asks.
+
+        **Only** :func:`_swap_sink` **consults it**, and that is the table rather than an omission.
+        Five of its six rows give the same code in every column: ``BUILD`` and ``ARM`` build and
+        arm wherever they are; ``BUILD`` × ``DRAINING`` is split by ``_shutdown_running``, which is
+        kept on purpose because its window is narrower than the state's (a worker built after the
+        drain lowered it must not be registered where nothing stops it); ``FLUSH`` moves nothing;
+        ``STOP`` × ``DRAINING`` is the second caller ``Worker.claim_stop`` already answers; and the
+        ``FORK`` entry only empties the token sets. A read whose value decided nothing at those
+        entries would be a dead binding. ``SWAP`` × ``DRAINING`` with no live worker is the one
+        cell whose answer differs — it declines — and that is where this is read.
+
+        Args:
+          None.
+
+        Returns:
+          The column the calling entry is in.
+
+        Raises:
+          None.
+        """
+        if self._stops_running:
+            return State.DRAINING
+        if self._swaps_running:
+            return State.SWAPPING
+        return self._current
+
+    @property
+    def state(self) -> State:
+        """The lifecycle state: the token sets, then the stored state; takes no lock (SPEC-078).
+
+        Each input is read once into a local before any rule is tested — the two token sets, the
+        stored state and whether the configured sink has resolved — and the rules are then tested
+        in this order, the first that holds deciding:
+
+        1. a token in :attr:`_stops_running` is ``DRAINING`` — ``shutdown()`` or the exit drain is
+           inside :func:`_shutdown_worker`;
+        2. a token in :attr:`_swaps_running` is ``SWAPPING``;
+        3. a stored ``UNCONFIGURED`` with a configured sink resolved is ``RUNNING``: the one input
+           the runtime does not own, read through the config because it is the recorded authority
+           for the installed sink (``architecture.md`` §12), and what makes ``configure()`` leave
+           ``UNCONFIGURED`` as a caller sees it;
+        4. otherwise the stored :attr:`_current`.
+
+        **Lock-free**, beside the four questions and for their reason: it must answer while
+        another thread holds ``_lock``, and several guards hold that lock, which a non-reentrant
+        acquire here would deadlock. The answer is a snapshot. Nothing in ``src/`` reads it: the
+        library's own calls read :meth:`_column` under the lock they already hold, so this is the
+        reporting view, read by tests.
+
+        Args:
+          None.
+
+        Returns:
+          The state the process is in.
 
         Raises:
           None.
         """
         stopping = bool(self._stops_running)
         swapping = bool(self._swaps_running)
-        live = self.live_worker()
-        retirements = self.retirements
-        owed = bool(self._closes.owed)
+        current = self._current
         resolved = _live_config_sink() is not None
         if stopping:
             return State.DRAINING
         if swapping:
             return State.SWAPPING
-        if live is not None:
+        if current is State.UNCONFIGURED and resolved:
             return State.RUNNING
-        if retirements > 0:
-            return State.CLOSED
-        if owed or resolved:
-            return State.RUNNING
-        return State.UNCONFIGURED
+        return current
 
 
 _state = Runtime()
@@ -1045,6 +1132,10 @@ def _clear_after_fork() -> None:
     (SPEC-054 FR-006): with a per-sink registration there is no second thing that can be left
     inconsistent, and the events themselves are replaced by the repair walk before any handler
     runs.
+
+    **It is the transition table's ``FORK`` entry** (SPEC-078 FR-003). The child's stored state,
+    :attr:`Runtime._current`, is inherited as the parent held it and is not re-derived here: the
+    fields it is a function of are inherited with it, so it is exact.
 
     **It also empties the two token sets** (SPEC-077 FR-002), for the same reason as the
     registry: a token is discarded by a ``finally`` in the ``_swap_sink`` or ``_shutdown_worker``
@@ -1814,6 +1905,7 @@ def _get_worker() -> Worker:
                 if _state._shutdown_running > 0:
                     _state._late_worker = worker
                 _state._closes.arm(sink)
+                _state._move()
     return worker
 
 
@@ -1882,6 +1974,7 @@ def _note_orphan_emit(sink: Sink) -> None:
             return
         _register_exit_handler()
         _state._closes.arm(sink)
+        _state._move()
 
 
 def _rebuild_worker_after_fork() -> None:
@@ -2261,6 +2354,10 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     measured, a worker built at that instant was registered nowhere and the second call returned
     having stopped nothing, which is the original defect verbatim.
 
+    **The stored state moves with the count** (SPEC-078 FR-003): :meth:`Runtime._move` is the
+    last statement of the entry's critical section and of the late worker's, the two sections of
+    this call that change the retirement count.
+
     **The count moves a second time before a late worker is stopped**, under the same lock
     (FR-001). That worker recorded the already-incremented count at its build, so without the
     second move the call that stops it leaves it reading as *live*: delivering nothing, its next
@@ -2323,6 +2420,7 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             else:
                 claimed = worker.claim_stop(op.deadline)
             _state._stop.set()
+            _state._move()
         late_worker: Worker | None = None
         if worker is not None:
             worker.stop(op.budget, claimed=claimed)
@@ -2338,6 +2436,7 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             if late_worker is not None:
                 with _state._lock:
                     _state.retirements += 1
+                    _state._move()
                 late_worker.stop(_remaining(op.deadline))
         if waited or late_worker is not None:
             _close_owed(op, bystander_wait=False)
@@ -2414,6 +2513,20 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     critical section under ``_state._lock``, so a preempted orphan emit cannot re-arm a sink in a
     gap where it is neither owed nor in flight (FR-003).
 
+    **During a drain with no live worker it declines at entry** (SPEC-078 FR-004): no retarget,
+    no close and no arm, from its first critical section. The drain in progress owns every owed
+    close, and at ``fda134a`` a swap landing there — after the worker's stop had retired it —
+    released the worker's sink detached once its drain thread had ended (measured: A's close ran
+    on ``log-foundry-sink-close``, a daemon joined only for the grace and killed at exit wherever
+    it has reached, the SPEC-028 objection SPEC-030 and SPEC-046 keep the live sink's close inline
+    to avoid) and armed the new sink, which the drain then closed though nothing had been written
+    to it. The config already names the new sink, and the first event that reaches it arms it as
+    any orphan log does. **A live worker in the drain still swaps**: a late worker the drain will
+    stop, or one built in the drain's tail that it will not, which delivers (SPEC-044 FR-001);
+    declining there would leave a live worker on the old sink with no ``incomplete_swaps`` and no
+    line — the lost configure this function's ``Raises:`` disowns. A swap that entered before the
+    drain is past this check and finishes by the rules above, where its retarget declines.
+
     **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no
     live worker and nothing owed, so a swap with no work never enters ``SWAPPING``, and before any
@@ -2439,6 +2552,8 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             worker = _state.live_worker()
             old = None if worker is None else worker.sink
             if worker is None and not _state._closes.owed:
+                return
+            if worker is None and _state._column() is State.DRAINING:
                 return
             _state._swaps_running.add(op)
             for stale in list(_state._closes.owed.values()):
