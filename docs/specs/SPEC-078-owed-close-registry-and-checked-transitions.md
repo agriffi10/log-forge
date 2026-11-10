@@ -448,12 +448,23 @@ by design … nothing restarts") and the public `shutdown()` docstring ("Logging
 
 #### Description:
 
-An `_Operation` is the slow half of a `SWAP` or a `STOP`, and the token SPEC-077's sets hold: added
-under the lock in the call's first critical section, run outside it, and discarded without it. Its
-`deadline` is computed once, when it is built, from the caller's timeout, and every slow
-step reads what remains from it rather than from a local: the swap's `Worker.retarget` and its
-closer joins; the shutdown's `Worker.claim_stop` (which records it for the exit drain's decline,
-SPEC-062 FR-001), `Worker.stop`, the bystander wait and the graced join, through `grace_end`. The
+An `_Operation` is the slow half of a `SWAP` or a `STOP`, and the token SPEC-077's sets hold: built
+once on the call's first line, **before** its first critical section, added to its token set inside
+that section, run outside it, and discarded without it (amended during the build, 2026-11-09:
+building it inside the section would start the budget only after a wait for `_state._lock`, which
+is held across a blocking `Worker(_ensure_sink())`, so a `configure()` queued behind a slow build
+would overrun its timeout by that wait; the deadline is the instant the caller asked, as the local
+it replaces was). Its `deadline` is computed once, when it is built, from the caller's timeout,
+and every slow step reads what remains from it rather than from a local: the swap's
+`Worker.retarget` and its closer joins; the shutdown's `Worker.claim_stop` (which records it for
+the exit drain's decline, SPEC-062 FR-001), `Worker.stop`, the bystander wait and the graced
+join, through `grace_end`. **`Worker.stop` reads it through `claim_stop`** (amended during the
+build, 2026-11-09): passed `claimed=True`, it joins until the `_exit_deadline` that
+`claim_stop(op.deadline)` recorded, and its `timeout` argument — the operation's `budget`, the
+caller's timeout as given — only renders the expiry line, so the line still reads
+`shutdown timed out after 0.5s` (`tests/test_worker_exit_budget.py` pins it through
+`_shutdown_worker`) where passing a remainder would have rendered `0.499998s`. `Worker.stop`'s
+signature does not change. The
 emit on the drain thread is the tracked half of the drain: it is bounded by what SPEC-062 bounds it
 by, the op's deadline as `claim_stop` recorded it. `BUILD`, `ARM` and `FLUSH` hold no state while
 they run and create no operation.
@@ -478,11 +489,15 @@ keep accepting when it released nothing, invariant 7) is that helper's.
 
 #### Acceptance Criteria:
 
-- [ ] Each `_Operation`'s `deadline` is set once, when it is built in the call's first critical
+- [ ] Each `_Operation`'s `deadline` is set once, when it is built, before the call's first critical
   section. In `_swap_sink` and `_shutdown_worker`, an AST scan finds the `timeout` parameter read
-  only in that construction. Every call to `Worker.stop`, `Worker.retarget`, `Worker.claim_stop` or
-  a thread join is passed `op.deadline` or a remainder computed from it, so today's
-  `worker.stop(timeout, …)` (`_lifecycle.py:1866` at `fda134a`) fails the scan.
+  only in that construction. Every call to `Worker.retarget`, `Worker.claim_stop` or a thread join
+  is passed `op.deadline` or a remainder computed from it, and every call to `Worker.stop` is passed
+  either that or the `claimed=` verdict of a `claim_stop(op.deadline)` in the same function, while
+  `Worker.stop`'s join reads the recorded `_exit_deadline` when claimed. So today's
+  `worker.stop(timeout, …)` (`_lifecycle.py:1866` at `fda134a`) fails the scan, and so does a
+  `Worker.stop` whose claimed join reverts to `monotonic() + timeout` (amended during the build,
+  2026-11-09).
 - [ ] A sink whose `emit` blocks on an event the test holds, past `shutdown(timeout=0.3)`: while the
   drain thread is inside it, a second `shutdown(timeout=0.3)`, a `configure(sink=B)` and the exit
   drain's function `_lifecycle._shutdown_worker(timeout=0.3)` each return without calling its
@@ -574,6 +589,7 @@ class _Op(enum.Enum):                # the table's six rows
 class _Operation:                    # the slow half of a SWAP or a STOP
     kind: _Op                        # SWAP or STOP
     deadline: float | None           # time.monotonic() + timeout, set once when built
+    budget: float | None             # the caller's timeout as given, for Worker.stop's expiry line only
     grace_end: float | None          # STOP only: set at the call's first graced wait, then reused
 
 class _Rule(enum.Enum):
@@ -622,7 +638,8 @@ _state._closes.join_joined(closes) -> None        # every JOINED thread, in full
 _state._closes.wait_graced(op, mine) -> None      # bystander wait and GRACED joins, to op.grace_end
 _state._closes.graced_alive() -> int              # Health.closing_sinks
 _state._move() -> None                            # caller holds _state._lock; re-settles _current
-_Operation(kind, timeout)                         # built and added to its token set in the call's first critical section;
+_Operation(kind, timeout)                         # built on the call's first line, before its first critical section;
+                                                  # added to its token set in that section;
                                                   # discarded in a finally with set.discard, no lock (SPEC-077)
 _state.state -> State                             # lock-free; DRAINING / SWAPPING from the token sets, else _current
                                                   # (a stored UNCONFIGURED reported RUNNING once a sink resolved)
@@ -632,7 +649,7 @@ _state.state -> State                             # lock-free; DRAINING / SWAPPI
 
 ```
 src/log_foundry/_lifecycle.py                 # _CloseRegistry, _Close, _Rule, _Op, _Operation; Runtime's stored state
-src/log_foundry/worker.py                     # docstrings only (the moved names)
+src/log_foundry/worker.py                     # docstrings, and Worker.stop's claimed join reading _exit_deadline
 src/log_foundry/__init__.py                   # shutdown()'s docstring (FR-004)
 tests/test_lifecycle_transitions.py           # the directed cell tests and the totality check
 tests/test_invariants_model.py                # the stored-versus-derived check

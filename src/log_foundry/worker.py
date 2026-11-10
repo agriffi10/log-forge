@@ -1292,8 +1292,19 @@ class Worker:
         own event — and passes the verdict in as ``claimed``. A direct caller, and the late-worker
         route, pass nothing and claim here, before ``self._stop.set()``. Either way a backoff cut
         short by the stop wakes to find the deadline already recorded. Each caller joins or waits
-        against **its own** timeout, never another caller's: a second caller is bounded by the
+        against **its own** budget, never another caller's: a second caller is bounded by the
         budget it asked for whichever deadline the drain is declining against.
+
+        **The caller who won the claim joins until the deadline the claim recorded**
+        (SPEC-078 FR-005), ``_exit_deadline``, rather than until a deadline computed here from
+        ``timeout``. For :func:`_lifecycle._shutdown_worker` that recorded deadline is its
+        operation's, fixed once when the call began, so every slow step of a shutdown reads what
+        remains of one instant and the join cannot end later than the deadline the drain declines
+        against. ``timeout`` is then only what the expiry line renders — the budget the caller
+        asked for, as given, so the line still reads ``shutdown timed out after 0.5s`` rather than
+        whatever remainder was left. A direct caller passes nothing, claims here with ``now +
+        timeout``, and joins until that, as before; a losing caller waits its own ``now +
+        timeout``, since the recorded deadline is the winner's.
 
         An expired join leaves the sink **open**, because the thread is still inside it
         (SPEC-027 FR-004). The closer sees that through :meth:`may_be_inside` and leaves the sink
@@ -1309,7 +1320,9 @@ class Worker:
         (:meth:`_queued_submissions`).
 
         Args:
-          timeout: Seconds to wait for the drain thread, or ``None`` to wait indefinitely.
+          timeout: The caller's budget in seconds, or ``None`` to wait indefinitely. It bounds the
+            wait of a caller that claims here or loses the claim, and it is what the expiry line
+            renders; a caller that already won the claim joins until the deadline it recorded.
           claimed: The verdict of a :meth:`claim_stop` the caller already made under its own
             lock, or ``None`` to claim here.
 
@@ -1319,9 +1332,10 @@ class Worker:
         Raises:
           None.
         """
-        deadline = None if timeout is None else time.monotonic() + timeout
+        own = None if timeout is None else time.monotonic() + timeout
         on_drain_thread = threading.current_thread() is self._thread
-        first = self.claim_stop(deadline) if claimed is None else claimed
+        first = self.claim_stop(own) if claimed is None else claimed
+        deadline = self._exit_deadline if first else own
         if not first:
             if on_drain_thread:
                 return
@@ -1339,7 +1353,7 @@ class Worker:
         self._stop.set()
         if on_drain_thread:
             return
-        self._thread.join(timeout)
+        self._thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         if self._thread.is_alive():
             queued = self._queued_submissions()
             in_flight = self._in_flight

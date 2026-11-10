@@ -28,6 +28,7 @@ import itertools
 import pathlib
 import re
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -1025,3 +1026,302 @@ def test_the_two_docstrings_state_both_shapes_of_a_later_span() -> None:
     assert "submitted_after_shutdown" in shutdown_doc
     assert "builds a live worker" in runtime_doc
     assert "accepted, reported" in runtime_doc
+
+
+# --------------------------------------------------------------------------- FR-005
+
+TIMEOUT_READ_OUTSIDE_THE_OPERATION = "the call's timeout is read outside its _Operation(...)"
+DEADLINE_NOT_FROM_THE_OPERATION = "a stop, retarget, claim_stop or join is not given op.deadline"
+STOP_IGNORES_THE_RECORDED_DEADLINE = "Worker.stop's join does not end at the deadline claimed"
+
+_SLOW_STEPS = frozenset({"stop", "retarget", "claim_stop", "join"})
+_OPERATION_CALLS = ("_swap_sink", "_shutdown_worker")
+
+
+def _is_op_deadline(node: ast.AST) -> bool:
+    text = ast.unparse(node)
+    return text in {"op.deadline", "_remaining(op.deadline)"}
+
+
+def _function(tree: ast.AST, name: str) -> ast.FunctionDef | None:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def deadline_findings(lifecycle_source: str, worker_source: str) -> list[str]:
+    """Every reason a slow step of a ``SWAP`` or ``STOP`` does not read its operation's deadline.
+
+    In ``_swap_sink`` and ``_shutdown_worker`` the ``timeout`` parameter is read once, as the
+    argument of ``_Operation(...)``, and every call to ``stop``, ``retarget``, ``claim_stop`` or
+    ``join`` is passed ``op.deadline`` or ``_remaining(op.deadline)`` — or, for ``stop``, the
+    ``claimed=`` verdict of a ``claim_stop(op.deadline)`` in the same function, which records that
+    deadline for the join (ruling B1). That route is accepted only while ``Worker.stop`` itself
+    joins until the recorded ``self._exit_deadline`` and not until ``timeout``.
+    """
+    findings: list[str] = []
+    tree = ast.parse(lifecycle_source)
+    for name in _OPERATION_CALLS:
+        function = _function(tree, name)
+        if function is None:
+            continue
+        loads = [
+            n
+            for n in ast.walk(function)
+            if isinstance(n, ast.Name) and n.id == "timeout" and isinstance(n.ctx, ast.Load)
+        ]
+        constructions = [
+            n
+            for n in ast.walk(function)
+            if isinstance(n, ast.Call)
+            and ast.unparse(n.func) == "_Operation"
+            and any(isinstance(a, ast.Name) and a.id == "timeout" for a in n.args)
+        ]
+        if len(loads) != 1 or len(constructions) != 1:
+            findings.append(TIMEOUT_READ_OUTSIDE_THE_OPERATION)
+        claimed_names = {
+            target.id
+            for n in ast.walk(function)
+            if isinstance(n, ast.Assign)
+            for target in n.targets
+            if isinstance(target, ast.Name)
+            and isinstance(n.value, ast.Call)
+            and isinstance(n.value.func, ast.Attribute)
+            and n.value.func.attr == "claim_stop"
+            and any(_is_op_deadline(a) for a in n.value.args)
+        }
+        for call in ast.walk(function):
+            if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+                continue
+            if call.func.attr not in _SLOW_STEPS:
+                continue
+            values = [*call.args, *(kw.value for kw in call.keywords)]
+            if any(_is_op_deadline(v) for v in values):
+                continue
+            claimed = [kw.value for kw in call.keywords if kw.arg == "claimed"]
+            if (
+                call.func.attr == "stop"
+                and claimed
+                and isinstance(claimed[0], ast.Name)
+                and claimed[0].id in claimed_names
+            ):
+                continue
+            findings.append(DEADLINE_NOT_FROM_THE_OPERATION)
+    worker_tree = ast.parse(worker_source)
+    stop = next(
+        (
+            node
+            for cls in ast.walk(worker_tree)
+            if isinstance(cls, ast.ClassDef) and cls.name == "Worker"
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "stop"
+        ),
+        None,
+    )
+    if stop is not None:
+        recorded = {
+            target.id
+            for n in ast.walk(stop)
+            if isinstance(n, ast.Assign) and "self._exit_deadline" in ast.unparse(n.value)
+            for target in n.targets
+            if isinstance(target, ast.Name)
+        }
+        joins = [
+            n
+            for n in ast.walk(stop)
+            if isinstance(n, ast.Call) and ast.unparse(n.func) == "self._thread.join"
+        ]
+        for join in joins:
+            names = {n.id for arg in join.args for n in ast.walk(arg) if isinstance(n, ast.Name)}
+            if not names & recorded or "timeout" in names:
+                findings.append(STOP_IGNORES_THE_RECORDED_DEADLINE)
+        if not joins:
+            findings.append(STOP_IGNORES_THE_RECORDED_DEADLINE)
+    return findings
+
+
+def _live(name: str) -> str:
+    return (_SRC / name).read_text(encoding="utf-8")
+
+
+def test_every_slow_step_reads_its_operations_deadline() -> None:
+    """FR-005 AC-1 (as amended by ruling B1), over the live sources."""
+    assert deadline_findings(_live("_lifecycle.py"), _live("worker.py")) == []
+
+
+_STOP_LIVE = """
+class Worker:
+    def stop(self, timeout=None, *, claimed=None):
+        own = None if timeout is None else time.monotonic() + timeout
+        first = self.claim_stop(own) if claimed is None else claimed
+        deadline = self._exit_deadline if first else own
+        self._thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
+"""
+
+_SHUTDOWN_LIVE = """
+def _shutdown_worker(timeout=30.0):
+    op = _Operation(_Op.STOP, timeout)
+    claimed = False
+    with _state._lock:
+        claimed = worker.claim_stop(op.deadline)
+    worker.stop(op.budget, claimed=claimed)
+    late_worker.stop(_remaining(op.deadline))
+def _swap_sink(new_sink, timeout=5.0):
+    op = _Operation(_Op.SWAP, timeout)
+    outcome = worker.retarget(new_sink, op.deadline)
+    for closer in closers:
+        closer.join(_remaining(op.deadline))
+"""
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "worker", "reason"),
+    [
+        (
+            _SHUTDOWN_LIVE.replace(
+                "worker.stop(op.budget, claimed=claimed)", "worker.stop(timeout, claimed=claimed)"
+            ),
+            _STOP_LIVE,
+            TIMEOUT_READ_OUTSIDE_THE_OPERATION,
+        ),
+        (
+            _SHUTDOWN_LIVE.replace(
+                "worker.stop(op.budget, claimed=claimed)", "worker.stop(timeout, claimed=False)"
+            ),
+            _STOP_LIVE,
+            DEADLINE_NOT_FROM_THE_OPERATION,
+        ),
+        (
+            _SHUTDOWN_LIVE.replace(
+                "late_worker.stop(_remaining(op.deadline))", "late_worker.stop()"
+            ),
+            _STOP_LIVE,
+            DEADLINE_NOT_FROM_THE_OPERATION,
+        ),
+        (
+            _SHUTDOWN_LIVE.replace(
+                "closer.join(_remaining(op.deadline))", "closer.join(deadline - monotonic())"
+            ),
+            _STOP_LIVE,
+            DEADLINE_NOT_FROM_THE_OPERATION,
+        ),
+        (
+            _SHUTDOWN_LIVE,
+            _STOP_LIVE.replace(
+                "        deadline = self._exit_deadline if first else own\n",
+                "        deadline = time.monotonic() + timeout if first else own\n",
+            ),
+            STOP_IGNORES_THE_RECORDED_DEADLINE,
+        ),
+        (
+            _SHUTDOWN_LIVE,
+            _STOP_LIVE.replace(
+                "self._thread.join(None if deadline is None else max(0.0, deadline - "
+                "time.monotonic()))",
+                "self._thread.join(timeout)",
+            ),
+            STOP_IGNORES_THE_RECORDED_DEADLINE,
+        ),
+        (
+            _SHUTDOWN_LIVE,
+            _STOP_LIVE.replace(
+                "self._thread.join(None if deadline is None else max(0.0, deadline - "
+                "time.monotonic()))",
+                "self._thread.join(timeout if deadline is None else min(timeout, deadline))",
+            ),
+            STOP_IGNORES_THE_RECORDED_DEADLINE,
+        ),
+    ],
+    ids=[
+        "a-raw-timeout-at-the-call-site",
+        "a-stop-with-no-claim-and-a-raw-timeout",
+        "a-stop-with-no-deadline",
+        "a-join-on-a-local-deadline",
+        "a-claimed-stop-that-recomputes-its-deadline",
+        "a-claimed-stop-that-joins-for-timeout",
+        "a-claimed-stop-that-joins-for-the-lesser-of-both",
+    ],
+)
+def test_the_deadline_scan_refuses_each_shape(lifecycle: str, worker: str, reason: str) -> None:
+    """Each check refuses its own shape, by its reason; the fixture's edit must have applied."""
+    assert (lifecycle, worker) != (_SHUTDOWN_LIVE, _STOP_LIVE), "the fixture did not change"
+    assert reason in deadline_findings(lifecycle, worker)
+
+
+def test_the_deadline_scan_is_silent_on_the_live_shape() -> None:
+    """And the shape the library has is not refused."""
+    assert deadline_findings(_SHUTDOWN_LIVE, _STOP_LIVE) == []
+
+
+class StuckEmitRec(Rec):
+    """A recorder whose first ``emit`` parks until released, and which logs every interval."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.intervals: list[tuple[str, str, float, float]] = []
+        self._intervals_lock = threading.Lock()
+
+    def _note(self, kind: str, began: float) -> None:
+        with self._intervals_lock:
+            self.intervals.append((kind, threading.current_thread().name, began, time.monotonic()))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Parks on the first emit, then keeps the batch."""
+        began = time.monotonic()
+        if not self.entered.is_set():
+            self.entered.set()
+            self.release.wait(GATE_WAIT * 6)
+        super().emit(batch)
+        self._note("emit", began)
+
+    def close(self) -> None:
+        """Records the close and its interval."""
+        began = time.monotonic()
+        super().close()
+        self._note("close", began)
+
+
+def _returns_within(work: Callable[[], object]) -> None:
+    thread = background(work)
+    thread.join(GATE_WAIT)
+    assert not thread.is_alive(), "the call did not return while the drain thread was stuck"
+
+
+def test_no_library_close_begins_while_the_drain_thread_is_inside_the_sink() -> None:
+    """FR-005 AC-2 and AC-3: past its deadline the drain is left inside ``emit``, and nothing closes.
+
+    Each take asks ``Runtime.held``, which answers from the drain thread's liveness, never from a
+    deadline. So a second ``shutdown()``, a ``configure(sink=...)`` and the exit drain all return
+    while the thread is still inside the sink, and none of them calls its ``close()``; and across
+    the whole run no close interval overlaps an emit interval on the drain thread.
+    """
+    a, b = StuckEmitRec("A"), Rec("B")
+    log_foundry.configure(service="cells", sink=a)
+    span("stuck")
+    log_foundry.flush(timeout=0.2)
+    try:
+        assert a.entered.wait(GATE_WAIT), "the drain thread is inside A's emit"
+        log_foundry.shutdown(timeout=0.3)
+        assert a.closes == 0, "the expired shutdown left A open"
+        _returns_within(lambda: log_foundry.shutdown(timeout=0.3))
+        assert a.closes == 0, "a second shutdown closed A under the drain thread"
+        _returns_within(lambda: log_foundry.configure(sink=b))
+        assert a.closes == 0, "a configure() closed A under the drain thread"
+        _returns_within(lambda: _lifecycle._shutdown_worker(timeout=0.3))
+        assert a.closes == 0, "the exit drain closed A under the drain thread"
+    finally:
+        a.release.set()
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None
+    worker._thread.join(GATE_WAIT)
+    log_foundry.shutdown(timeout=5.0)
+    assert a.closes == 1, "once the drain thread ended, A was closed, once"
+    drain = worker._thread.name
+    emits = [(s, e) for kind, who, s, e in a.intervals if kind == "emit" and who == drain]
+    closes = [(s, e) for kind, _, s, e in a.intervals if kind == "close"]
+    assert emits, "the premise: the drain thread emitted"
+    overlaps = [(c, m) for c in closes for m in emits if c[0] < m[1] and m[0] < c[1]]
+    assert not overlaps, f"a close overlapped an emit on the drain thread: {overlaps}"
