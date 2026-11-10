@@ -75,7 +75,7 @@ WALKABLE = frozenset({"Lock", "RLock", "Event"})
 TOKEN_SETS = ("_swaps_running", "_stops_running")
 TOKEN_SETS_CHILD = ("reset: _lifecycle._clear_after_fork",)
 REPAIR_ITSELF = ("_fork", "_reinit_after_fork")
-CHILD_VALUE = re.compile(r"^(walk|inherited|none|reset: [A-Za-z_][\w]*\.[A-Za-z_]\w*)$")
+CHILD_VALUE = re.compile(r"^(walk|roster|inherited|none|reset: [A-Za-z_][\w]*\.[A-Za-z_]\w*)$")
 
 PAIR_FLOOR = 10
 OUTSIDE_FLOOR = 9
@@ -103,6 +103,8 @@ WALK_NOT_PRIMITIVE = "a walk row holds something other than a lock or an event"
 RESET_NOT_REGISTERED = "a reset row names a function no child handler is or reaches"
 RESET_DOES_NOT_WRITE = "a reset row's function, and what it reaches, never writes the entry"
 TOKEN_SETS_ROW = "the token sets must read reset: _lifecycle._clear_after_fork"  # noqa: S105
+ROSTER_ROW_UNMATCHED = "a roster row names no pair _fork._GLOBAL_PRIMITIVES resolves to"
+ROSTER_PAIR_UNDECLARED = "a _fork._GLOBAL_PRIMITIVES pair has no roster row"
 
 Key = tuple[str, ...]
 
@@ -145,6 +147,7 @@ class _Index:
     """The parsed sources, their functions, and receiver-based call resolution."""
 
     def __init__(self, sources: dict[str, str]) -> None:
+        self.sources = sources
         self.trees = {name: ast.parse(text) for name, text in sources.items()}
         self.modules = {name.removesuffix(".py") for name in sources}
         self.functions: dict[Key, ast.FunctionDef | ast.AsyncFunctionDef] = {}
@@ -244,14 +247,14 @@ class _Index:
         return seen
 
     def registered(self) -> set[Key]:
-        """Every function passed to ``register_child_handler`` anywhere in the sources."""
+        """Every function passed to ``register_child_handler`` or ``register_walk`` (SPEC-079)."""
         found: set[Key] = set()
         for name, tree in self.trees.items():
             module = name.removesuffix(".py")
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
-                    and ast.unparse(node.func).endswith("register_child_handler")
+                    and ast.unparse(node.func).endswith(("register_child_handler", "register_walk"))
                     and node.args
                     and isinstance(node.args[0], ast.Name)
                 ):
@@ -699,6 +702,108 @@ def check_token_sets(index: _Index, pops: Populations, table: dict[Key, Row]) ->
     ]
 
 
+def _roster_pairs(sources: dict[str, str]) -> list[tuple[str, str]]:
+    """The ``(module, path)`` pairs ``_fork._GLOBAL_PRIMITIVES`` lists in the sources, if any."""
+    source = sources.get("_fork.py")
+    if source is None:
+        return []
+    for node in ast.parse(source).body:
+        target = node.target if isinstance(node, ast.AnnAssign) else None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id == "_GLOBAL_PRIMITIVES" and node.value:
+            return [tuple(pair) for pair in ast.literal_eval(node.value)]
+    return []
+
+
+def _built_classes(sources: dict[str, str]) -> dict[str, str]:
+    """Each module global and ``self`` attribute bound to a ``Name(...)`` call, keyed by name.
+
+    A module global ``_state = Runtime()`` keys ``"<module>._state"``; ``self._closes =
+    _CloseRegistry()`` inside class ``Runtime`` keys ``"Runtime._closes"``.
+    """
+    built: dict[str, str] = {}
+    for name, source in sources.items():
+        module = name.removesuffix(".py")
+        tree = ast.parse(source)
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign | ast.AnnAssign)
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+            ):
+                for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                    if isinstance(target, ast.Name):
+                        built[f"{module}.{target.id}"] = node.value.func.id
+        for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
+            for node in ast.walk(cls):
+                if (
+                    isinstance(node, ast.Assign | ast.AnnAssign)
+                    and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Name)
+                ):
+                    for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and ast.unparse(target.value) == "self"
+                        ):
+                            built[f"{cls.name}.{target.attr}"] = node.value.func.id
+    return built
+
+
+def _roster_homes(sources: dict[str, str]) -> set[tuple[str, str]]:
+    """Each roster pair as the ``(home, attribute)`` an inventory row names for it.
+
+    A one-hop path's home is its module. A longer path's home is the class of the object its
+    last hop is read from, followed statically through the sources' ``Name(...)`` bindings, and
+    through the live package for a module outside the six files (``api``, for the console).
+    """
+    built = _built_classes(sources)
+    homes: set[tuple[str, str]] = set()
+    for module, path in _roster_pairs(sources):
+        hops = path.split(".")
+        if len(hops) == 1:
+            homes.add((module, hops[0]))
+            continue
+        owner = built.get(f"{module}.{hops[0]}")
+        if owner is None:
+            import importlib
+
+            holder = importlib.import_module(f"log_foundry.{module}")
+            for hop in hops[:-1]:
+                holder = getattr(holder, hop)
+            owner = type(holder).__name__
+        else:
+            for hop in hops[1:-1]:
+                owner = built.get(f"{owner}.{hop}", f"{owner}.{hop}")
+        homes.add((owner, hops[-1]))
+    return homes
+
+
+def _roster_rows(table: dict[Key, Row]) -> dict[Key, tuple[str, str]]:
+    """Each ``roster`` row's ``(home, attribute)``."""
+    return {k: (row.home, _attr_of(k)[1]) for k, row in table.items() if "roster" in row.child}
+
+
+def check_roster_rows(index: _Index, pops: Populations, table: dict[Key, Row]) -> list[Finding]:
+    """A ``roster`` row that names no pair ``_fork._GLOBAL_PRIMITIVES`` resolves to."""
+    homes = _roster_homes(index.sources)
+    return [
+        Finding(ROSTER_ROW_UNMATCHED, k)
+        for k, home in _roster_rows(table).items()
+        if home not in homes
+    ]
+
+
+def check_roster_pairs(index: _Index, pops: Populations, table: dict[Key, Row]) -> list[Finding]:
+    """A ``_fork._GLOBAL_PRIMITIVES`` pair that no ``roster`` row declares."""
+    declared = set(_roster_rows(table).values())
+    return [
+        Finding(ROSTER_PAIR_UNDECLARED, ("roster", owner, attr))
+        for owner, attr in sorted(_roster_homes(index.sources) - declared)
+    ]
+
+
 CHECKS = (
     check_undeclared_constructions,
     check_undeclared_fields,
@@ -710,6 +815,8 @@ CHECKS = (
     check_reset_registered,
     check_reset_writes,
     check_token_sets,
+    check_roster_rows,
+    check_roster_pairs,
 )
 
 
@@ -722,6 +829,7 @@ def audit(sources: dict[str, str], table: dict[Key, Row]) -> list[Finding]:
 # -- the inventory, in code: the spec's Data Model ---------------------------------------------
 
 _W = ("walk",)
+_R = ("roster",)
 _INH = ("inherited",)
 _NONE = ("none",)
 _REBUILD = "reset: _lifecycle._rebuild_worker_after_fork"
@@ -745,24 +853,26 @@ def _cr(name: str) -> Key:
 
 INVENTORY: dict[Key, Row] = {
     _c("_lifecycle.py", "Runtime.__init__", "self._lock", "Lock"): Row(
-        "Runtime", _W, "the state lock, held across Worker(_ensure_sink())"
+        "Runtime", _R, "the state lock, held across Worker(_ensure_sink())"
     ),
     _c("_lifecycle.py", "Runtime.__init__", "self._stop", "Event"): Row(
-        "Runtime", _W, "the one stop signal, replaced and never cleared"
+        "Runtime", _R, "the one stop signal, replaced and never cleared"
     ),
     _c("_lifecycle.py", "Runtime.refresh_stop_signal", "self._stop", "Event"): Row(
-        "Runtime", _W, "the replacement for a set stop signal, for a later deliverer"
+        "Runtime", _R, "the replacement for a set stop signal, for a later deliverer"
     ),
     _c("_lifecycle.py", "_CloseRegistry.__init__", "self._lock", "Lock"): Row(
         "_CloseRegistry",
-        _W,
+        _R,
         "the registry's leaf; _closing_now_lock and _closers_lock merged into it (SPEC-078 FR-001)",
     ),
     _c("_lifecycle.py", "Runtime.__init__", "self._owned_lock", "Lock"): Row(
-        "Runtime", _W, "guards the ownership record, last in the order; moved in SPEC-077"
+        "Runtime", _R, "guards the ownership record, last in the order; moved in SPEC-077"
     ),
     _c("_lifecycle.py", "_Close.__init__", "self.event", "Event"): Row(
-        "_Close", _W, "a per-close event owned by its in-flight entry (SPEC-078; was _Closing)"
+        "_Close",
+        _NONE,
+        "a per-close event, dropped with its in-flight entry by _clear_after_fork (SPEC-079)",
     ),
     _c("worker.py", "_FlushMarker.__init__", "self.event", "Event"): Row(
         "_FlushMarker", _NONE, "one per flush() call; it lives in the queue a child replaces"
@@ -777,16 +887,16 @@ INVENTORY: dict[Key, Row] = {
         "Worker", _W, "guards the worker's counters, markers and _stopped"
     ),
     _c("config.py", "<module>", "_config_lock", "Lock"): Row(
-        "config", _W, "no lifecycle state; guards the config rebinding"
+        "config", _R, "no lifecycle state; guards the config rebinding"
     ),
     _c("console.py", "ConsoleWriter.__init__", "self._lock", "Lock"): Row(
-        "ConsoleWriter", _W, "no lifecycle state; serialises console writes"
+        "ConsoleWriter", _R, "no lifecycle state; serialises console writes (as api._console)"
     ),
     _c("decorator.py", "<module>", "_sweep_lock", "Lock"): Row(
-        "decorator", _W, "no lifecycle state; guards the open-span sweep"
+        "decorator", _R, "no lifecycle state; guards the open-span sweep"
     ),
     _c("decorator.py", "<module>", "_loss_lock", "Lock"): Row(
-        "decorator", _W, "no lifecycle state; deliberately not the lifecycle lock"
+        "decorator", _R, "no lifecycle state; deliberately not the lifecycle lock"
     ),
     _c("_fork.py", "<module>", "_RLOCK_TYPE", "RLock"): Row(
         "none", _NONE, "a type probe at import, fed to type(); stores no primitive"
@@ -803,10 +913,12 @@ INVENTORY: dict[Key, Row] = {
     _c("_fork.py", "_fresh_primitive", "fresh", "Lock"): Row(
         "none", _NONE, "the repair's replacement factory, handed back and never kept"
     ),
-    _rt("_lock"): Row("Runtime", _W, "the state lock"),
+    _rt("_lock"): Row("Runtime", _R, "the state lock"),
     _rt("_worker"): Row("Runtime", _INH, "the process worker; guarded by _lock, read unlocked"),
     _rt("_late_worker"): Row("Runtime", _INH, "a worker built inside a no-worker shutdown"),
-    _rt("_closes"): Row("Runtime", _INH, "the close registry (SPEC-078); walked as a holder"),
+    _rt("_closes"): Row(
+        "Runtime", _INH, "the close registry (SPEC-078); its lock is on the roster (SPEC-079)"
+    ),
     _rt("_current"): Row(
         "Runtime", _INH, "the stored settled state; inherited, which is exact (SPEC-078 FR-003)"
     ),
@@ -819,8 +931,8 @@ INVENTORY: dict[Key, Row] = {
     ),
     _rt("_stop"): Row(
         "Runtime",
-        ("walk", _REBUILD),
-        "walked, then replaced through refresh_stop_signal when a resumed child's worker asks",
+        ("roster", _REBUILD),
+        "on the roster, then replaced through refresh_stop_signal when a resumed child asks",
     ),
     _cr("owed"): Row(
         "_CloseRegistry", _INH, "the one owed-close record; opted out by its _FORK_SKIP"
@@ -830,14 +942,16 @@ INVENTORY: dict[Key, Row] = {
         ("reset: _lifecycle._clear_after_fork",),
         "closes in flight, their threads with them (was _closing_now and _closers; SPEC-078)",
     ),
-    _cr("_lock"): Row("_CloseRegistry", _W, "the registry's leaf lock"),
+    _cr("_lock"): Row("_CloseRegistry", _R, "the registry's leaf lock"),
     _rt("_owned"): Row(
-        "Runtime", ("reset: _lifecycle._mark_inherited",), "the ownership record; SPEC-077 moved it"
+        "Runtime",
+        ("reset: _lifecycle._walk_after_fork",),
+        "the ownership record; SPEC-077 moved it",
     ),
-    _rt("_owned_lock"): Row("Runtime", _W, "moved from the module in SPEC-077"),
+    _rt("_owned_lock"): Row("Runtime", _R, "moved from the module in SPEC-077"),
     _rt("_marking_failed"): Row(
         "Runtime",
-        ("reset: _lifecycle._mark_inherited",),
+        ("reset: _lifecycle._walk_after_fork",),
         "set by the child's marking walk when it cannot finish; moved in SPEC-077",
     ),
     _rt("_swaps_running"): Row("Runtime", TOKEN_SETS_CHILD, "swap tokens, observer-only"),
@@ -871,7 +985,9 @@ INVENTORY: dict[Key, Row] = {
     _wk("_lock"): Row("Worker", _W, "guards the worker's counters"),
     _wk("_thread"): Row("Worker", (_REBUILD,), "the drain thread"),
     ("module", "_lifecycle.py", "_state"): Row(
-        "_lifecycle", _INH, "the one Runtime; walked as a holder, its fields repaired one by one"
+        "_lifecycle",
+        _INH,
+        "the one Runtime; not a root of the walk, its primitives are on the roster (SPEC-079)",
     ),
 }
 
@@ -1195,8 +1311,30 @@ REFUSED += [
     ),
 ]
 
+_ROSTER_FORK = '_GLOBAL_PRIMITIVES = (("_lifecycle", "_state._x"),)\n'
+_ROSTER_TABLE = {**_BASE_TABLE, _rt("_x"): Row("Runtime", _R, "fixture roster field")}
+REFUSED += [
+    (
+        "a-roster-pair-with-no-roster-row",
+        {"_lifecycle.py": _RUNTIME, "_fork.py": _ROSTER_FORK},
+        _BASE_TABLE,
+        ROSTER_PAIR_UNDECLARED,
+    ),
+    (
+        "a-roster-row-with-no-pair",
+        {"_lifecycle.py": _RUNTIME, "_fork.py": "_GLOBAL_PRIMITIVES = ()\n"},
+        _ROSTER_TABLE,
+        ROSTER_ROW_UNMATCHED,
+    ),
+]
+
 SILENT: list[tuple[str, dict[str, str], dict[Key, Row]]] = [
     ("a-declared-field", {"_lifecycle.py": _RUNTIME}, _BASE_TABLE),
+    (
+        "a-roster-pair-and-its-row",
+        {"_lifecycle.py": _RUNTIME, "_fork.py": _ROSTER_FORK},
+        _ROSTER_TABLE,
+    ),
     (
         "the-constant-shapes-and-an-import",
         {
@@ -1258,6 +1396,8 @@ def test_every_check_has_a_refusing_fixture() -> None:
         RESET_NOT_REGISTERED,
         RESET_DOES_NOT_WRITE,
         TOKEN_SETS_ROW,
+        ROSTER_ROW_UNMATCHED,
+        ROSTER_PAIR_UNDECLARED,
     }
     assert len(reasons) == len(CHECKS), "one reason per check"
     assert {r[3] for r in REFUSED} == reasons

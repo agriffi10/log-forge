@@ -181,8 +181,8 @@ each catches what the other cannot.
   or `Event` to a `self` attribute, and requires each to be declared in the test's
   `_PRIMITIVE_HOMES` with one home:
   - `roster`: its instance is on a roster path (`Runtime`, `_CloseRegistry`, `ConsoleWriter`);
-  - `walk`: it is sink-shaped, or a `Worker`, or held by an attribute of one (`SocketTransport`,
-    `SinkCounters`, SPEC-076's guard);
+  - `walk`: it is sink-shaped, or a `Worker`, or held by an attribute of one (`SinkCounters`,
+    SPEC-076's guard);
   - `dropped: <handler>`: a child handler drops its instances (`_Close`, by `_clear_after_fork`;
     `_FlushMarker`, by `_rebuild_worker_after_fork`, which replaces the queue that holds it).
   An undeclared class fails by name, and so does an entry whose class is gone. That catches a new
@@ -220,7 +220,7 @@ roster repairs both before either path runs.
   `decorator._loss_lock`'s through `health()`.
 - [ ] A pair whose attribute is missing is announced on stderr by type and does not stop the other
   seven from being replaced.
-- [ ] `_fork.py` still imports nothing from the package but `_diag`
+- [ ] `_fork.py` still imports nothing from the package but `_diag` and `sinks.base`
   (`test_fork_imports_nothing_from_the_package_but_diag` passes unedited).
 - [ ] Invariants 1 and 12: a forked child never hangs on a package global lock its parent held, and
   no fault in resolving the roster reaches the caller.
@@ -240,12 +240,23 @@ argument it does more at every holder on its **repair frontier**:
   memo. If the holder offers `reacquire_after_fork`, it collects the holder for the hook step. It
   forwards to the marking frontier of FR-003 every value it does not push itself: a container, and
   an object that is neither a sink nor a package object.
-- On a sink-shaped holder this package does not own, it reads `log_foundry_counters` with
-  `inspect.getattr_static`. When the value is a `SinkCounters`, it pushes it onto the repair
-  frontier, which keeps SPEC-072's reach for a third-party sink that subclasses no package type.
-  It replaces nothing on that holder. It forwards the holder's `_namespace_items` to the marking
-  frontier. Without that step, the holder is already in the shared `seen` set when the marking
-  frontier reaches it, so nothing beneath it would ever be visited.
+- On a sink-shaped holder this package does not own, it replaces nothing. It forwards the
+  holder's `_namespace_items` to the marking frontier. Without that step, the holder is already
+  in the shared `seen` set when the marking frontier reaches it, so nothing beneath it would ever
+  be visited.
+- A name in a holder's `_FORK_SKIP` is neither replaced, entered, pushed nor forwarded: forwarding
+  `Worker._held` would hook a superseded sink, which is what the opt-out exists to stop.
+
+**A registry of live `SinkCounters` replaces SPEC-072's counters reach.** `sinks/verdict.py`
+keeps a `weakref.WeakSet`, `_LIVE_COUNTERS`, of the `SinkCounters` objects that are alive, and
+`_walk_after_fork` reads it from `sys.modules` (no import in a child) and repairs the members on
+the repair frontier, checking `seen` first so none is repaired twice. It repairs a third-party
+engine sink's counters whatever holds them, including a wrapper that keeps only the engine
+sink's bound `emit`, which no reading walk reaches. It differs from a registry of every package
+primitive holder, which would stop being one walk from the runtime's roots, because invariant 12
+names this registry as SPEC-072's follow-up and it covers the one class the walk cannot reach by
+reading. `_fork._counters_reach`, `_counters_type`, `_container_push`, `_SCALAR_TYPES`,
+`_SKIPPED_TYPE_IDS` and `_COUNTERS_ATTRIBUTE` are deleted with the module-wide walk.
 
 **Every read the walk makes on an object runs none of the object's code**, in both modes of
 `_reachable_sinks` and in the marking frontier. Ownership, container, primitive and sink-shape
@@ -271,8 +282,9 @@ the marking needs.
 state. `Runtime._FORK_SKIP = ("_owned",)` and `_CloseRegistry._FORK_SKIP = ("owed",)` stay as
 SPEC-078 leaves them, as a guard for any other route by which the walk might reach `_state`. The
 in-flight entries of `_state._closes` are emptied by `_clear_after_fork`, so their events are not
-repaired. SPEC-078's inventory row for `_Close.event` changes from `walk` to
-`reset: _clear_after_fork`.
+repaired. SPEC-078's inventory row for `_Close.event` changes from `walk` to `none`, "dropped with
+its in-flight entry by `_clear_after_fork`", as `_FlushMarker.event` already is: the inventory's
+reset check requires a write of the field, and `_clear_after_fork` drops the entry instead.
 
 **`_fork` keeps the order and gains one registration.** `_fork.register_walk(fn)` stores the one
 walk to run, and `_lifecycle` registers `_walk_after_fork` at import. A second registration
@@ -335,7 +347,7 @@ seeds, visited in this order:
 1. **Forwarded seeds**: what the repair frontier forwarded. Everything reached from them is part
    of a live delivery target's graph.
 2. **Record seeds**: every sink in `_state._closes.owed`, then every reference in `_state._owned`.
-   These are the sinks `_inheritance_roots` adds today. The `_owned` references are the
+   These are the sinks `_inheritance_roots` added at `fda134a`. The `_owned` references are the
    load-bearing seed for a superseded wrapper
    (`test_a_superseded_wrapper_still_shields_the_transport_beneath_it`).
 
@@ -359,7 +371,11 @@ How the marking frontier reads and what it changes:
 - **No hooks from record seeds.** On a holder reached only from a record seed, it **never collects
   a hook**. That keeps SPEC-044 FR-005: a superseded sink, which only `owed` or `_owned` still pin,
   is never re-acquired, so `reclaim` never overrides its record.
-- **The bound.** It is bounded by `_MARKING_CEILING` visits across both groups. Tripping the bound
+- **The order.** Each group is visited first in first out, so every forwarded seed is visited
+  before any of their members: a large forwarded container (a `MemorySink`'s events) cannot spend
+  the ceiling before a forwarded `FileSink` behind a third-party wrapper is reached.
+- **The bound.** It is bounded by `_MARKING_CEILING` visits of the marking frontier across both
+  groups (its own visits, not the size of the shared `seen` set). Tripping the bound
   sets `_marking_failed` and writes today's `_diag.lost` line. Because the repair frontier is
   drained first, a trip cannot cost a holder on the repair frontier its repair or its hook.
 - **The record seeds are what tripped the ceiling in the suite.** `_state._owned` holds a strong
@@ -421,6 +437,29 @@ first.
 - `tests/test_worker_predicate_roster.py` re-files `_inheritance_roots`' `_state.worker_exists()`
   site under the roots function of `_walk_after_fork`, which keeps that read. Its `_SITE_FLOOR` for
   `log_foundry._lifecycle` is not lowered.
+- `tests/test_fork_lifecycle.py`, beyond the list above:
+  `test_without_the_container_branch_the_multisink_child_blocks` and
+  `test_without_the_reach_the_same_child_blocks` are re-derived as positive controls with
+  `_MARKING_CEILING` patched in the parent, so the repair frontier is observed alone: the first
+  takes away the repair frontier's one-level container read on a `MultiSink(FileSink)`, at a
+  ceiling of one with the `MultiSink` holding one child (the ceiling also bounds every container
+  read); the second removes the counters registry read, at a ceiling of zero (at one the marking
+  frontier visits the forwarded counters first and repairs them).
+  `test_the_counters_type_is_read_without_an_import` and
+  `test_the_counters_reach_refuses_everything_but_exact_counters` keep their names and are
+  re-expressed against the registry. `test_the_walk_terminates_on_a_cycle` and
+  `test_every_lock_is_assigned_where_the_walk_can_reach_it` change their docstrings.
+- `tests/test_lifecycle_races.py::test_a_forked_child_does_not_hook_a_superseded_sink` passes
+  unedited; its docstring's claim that removing a `_FORK_SKIP` reddens it is false once `_state` is
+  not on the walk, and `test_a_forked_child_does_not_hook_a_superseded_sink_the_worker_holds` is
+  the test a forwarded `_FORK_SKIP` name reddens.
+- `tests/test_sinks_nats_liveness.py::test_a_forked_child_refuses_without_touching_the_lock_loop_or_client`
+  changes its docstring; `tests/test_delivery_engine.py`'s one `_counters_reach` assertion is
+  re-expressed as the static reads that replaced it; `tests/test_runtime_holder.py`'s lock-site
+  literal, `tests/test_lifecycle_inventory.py`'s rows, `tests/test_lifecycle_transitions.py`'s
+  `_move` sites and `tests/test_orphan_sink_handoff.py`'s import set (narrowed to `_diag` and
+  `_fork`, since `Sink` is no longer a runtime import) change with the code; `tests/conftest.py`
+  clears the ownership record (FR-003's record seeds).
 
 **Tests deleted, because each pins only a removed mechanism:** none. Every test above asserts a
 promise that still holds.
@@ -456,8 +495,10 @@ close, both answered from the same record.
   hooks from forwarded seeds turns both red.
 - [ ] A spy on `_fork._namespace_items` records each object at most once per fork.
 - [ ] Every test named above as re-expressed is present at the head under the same name. The
-  `pytest --collect-only -q` names at the build's base are all present at the head, and the only
-  additions are this spec's.
+  `pytest --collect-only -q` names at the build's base are all present at the head but one, and
+  the only additions are this spec's. The one is
+  `test_numeric_door_roster.py::test_removing_a_helper_call_is_reported[worker.py:Worker.max_retries@418]`,
+  whose id embeds a line number that `Worker._FORK_SKIP`'s longer docstring moves.
 - [ ] `sh scripts/docs-lint-test.sh` passes with the two new fixtures, and removing
   `_walk_after_fork` from check 17's anchors turns the firing one red.
 - [ ] Invariants 2, 5 and 12: a child writes no inherited pending byte a second time, releases no
@@ -922,7 +963,7 @@ class _FactorySink:                        # private; a Sink
 | `_state._lock`, `_state._stop`, `_state._owned_lock`, `_state._closes._lock` | walk | roster |
 | `_config_lock`, `ConsoleWriter._lock` (as `api._console`), `_sweep_lock`, `_loss_lock` | walk | roster |
 | `_state._shutdown_running`, `_state._late_worker` | inherited | reset: `_clear_after_fork` |
-| `_Close.event` | walk | reset: `_clear_after_fork` |
+| `_Close.event` | walk | none (dropped with its entry by `_clear_after_fork`) |
 | `_state._owned`, `_state._marking_failed` | reset: `_mark_inherited` | reset: `_walk_after_fork` |
 
 The inventory's accepted reset functions gain the function registered with `_fork.register_walk`.
@@ -1037,6 +1078,13 @@ and its reach is unchanged.
 dated History line: the hooks are collected from the repair frontier and the forwarded seeds, so a
 live sink behind a third-party holder is now stranded too.
 
+`docs/invariants.md` §12's recorded exception changes: it named the counters reach and the
+third-party-wrapper boundary, and the registry and the forwarded seeds change both. `architecture.md`
+§13 gains the residual the registry leaves for every other class: a package object reachable only
+through a bound method, a closure cell or a `functools.partial` (`self._emit = file_sink.emit` in
+a third-party wrapper) is neither repaired nor marked, because descending into callables
+routinely escapes into application state and would trip the ceiling in every child.
+
 `docs/invariants.md` §13 gains the recorded exception FR-006 states, citing Andrew's decision of
 2026-11-04.
 
@@ -1123,3 +1171,24 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   static, which also closes SPEC-072's follow-up on hostile sink code at the at-fork sites, and
   FR-003's runaway criterion is restated: the runaway `__iter__` is never called, so the ceiling
   is asserted on a genuinely large graph (A3).
+- Build, on Andrew's standing rule to harden rather than defer: invariant 12 names a registry of
+  live `SinkCounters` as this spec's follow-up, and the forward made the static counters read an
+  equivalent mutant within the ceiling (measured by tracing `_forked_engine_run`). The registry
+  repairs every live counters whatever holds it, including a wrapper that keeps only the engine
+  sink's bound `emit`, which no reach finds. The two unit tests of the removed reach keep their
+  names, re-expressed against the registry (A4).
+- Build: the marking frontier visits first in first out and counts its own visits, so a
+  forwarded seed cannot lose its repair to the caller data of another seed (A5).
+- Build: a name in a holder's `_FORK_SKIP` is neither replaced, entered, pushed nor forwarded (A6).
+- Build: the deletion reddened tests outside FR-003's list; each is listed with what changes. The
+  positive controls patch the ceiling to one and keep their `MultiSink` at one child, or to zero
+  for the registry control, rather than splitting the per-read bound into a constant of its own
+  (A7).
+- Build: three stale references corrected against `44db79a6` (`_fork` imports `sinks.base` too;
+  `SocketTransport` holds a guard, not a primitive; the record seeds' predecessor is named as
+  history), and the collect-only rename recorded (A9).
+- Build: the inventory's reset check requires a write of the field, so a dropped `_Close.event`
+  is `none`, as `_FlushMarker.event` already is (A10).
+- Build: the Documentation section gains `docs/invariants.md` §12, whose recorded exception
+  named the counters reach and the third-party-wrapper boundary, and the §13 residual for a
+  package object reachable only through a bound method, closure or partial (A11).

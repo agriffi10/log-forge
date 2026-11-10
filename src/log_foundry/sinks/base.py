@@ -145,7 +145,10 @@ class Sink(Protocol):
     and a fork mid-batch there can still duplicate — including when a wrapper this library owns
     is holding it. Inheriting from ``Sink`` or from a shipped sink is what brings it inside. A
     **wrapper** sink the walk enters need do nothing itself, because the owned sinks it holds
-    are reached directly rather than through it.
+    are reached directly rather than through it. Since SPEC-079 the walk starts from the
+    runtime's live roots, and an owned sink held by a **third-party** wrapper, or two containers
+    below a package holder, is asked too: it is reached from what the repair frontier forwards
+    to the marking frontier, within that frontier's ceiling.
 
     **It runs in a child that has not yet returned from ``fork``, on that child's only thread,
     and must not block.** Nothing else is running there, so there is no holder a lock could be

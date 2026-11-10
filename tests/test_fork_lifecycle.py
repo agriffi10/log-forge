@@ -38,6 +38,7 @@ import pytest
 import log_foundry
 from conftest import install_worker
 from log_foundry import _fork, _lifecycle
+from log_foundry.sinks import verdict
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.base import Sink, SinkDeliveryError
 from log_foundry.sinks.file import FileSink, RotatingFileSink
@@ -552,20 +553,20 @@ def test_a_failing_repair_is_absorbed_and_writes_no_message() -> None:
     back what the handler wrote. Patching it here rather than in a fixture is deliberate —
     pytest's capture reverts a fixture's patch before the test body runs.
     """
-    original = _fork._reinit_primitives
+    original = _fork._walk
 
-    def boom() -> None:
+    def boom(repair: _fork._Repair) -> None:
         raise RuntimeError("a-value-from-the-event-1234")
 
     buffer = io.StringIO()
     saved = sys.stderr
-    _fork._reinit_primitives = boom  # type: ignore[assignment]
+    _fork._walk = boom
     sys.stderr = buffer
     try:
         child = run_in_child(buffer.getvalue, timeout=4)
     finally:
         sys.stderr = saved
-        _fork._reinit_primitives = original  # type: ignore[assignment]
+        _fork._walk = original
 
     assert child.finished, child.output
     assert "a-value-from-the-event-1234" not in child.output
@@ -1916,22 +1917,49 @@ def test_the_marking_handler_still_runs_before_the_worker_rebuild() -> None:
     """SPEC-042 FR-001 puts a record naming another process on what the child's walk reaches,
     and it must do that before any other handler runs — handler order is registration order.
 
-    The two registrations used to sit in different modules — `_mark_inherited` at the foot of
-    `_lifecycle`, the rebuild at the foot of `decorator` — and the order held only because
-    `decorator` imports `_lifecycle`. SPEC-040 put both in one module, where the order is now a
-    property of two adjacent lines and nothing else. A rebuild that ran first would repair the
-    worker while the sinks it holds were still unmarked, and a sink that is neither marked nor
-    recorded is claimable.
+    Since SPEC-079 the marking is the registered walk's marking frontier, which
+    `_fork._reinit_after_fork` runs before every handler, and the first handler is
+    `_reclaim_after_fork`, the half of the old `_mark_inherited` that was not a walk. A rebuild
+    that ran first would repair the worker while the sinks it holds were still unmarked, and a
+    sink that is neither marked nor recorded is claimable. So this asserts the order and, in a
+    real child, that the first handler already finds an unrecorded inherited sink marked.
     """
     order = [handler.__name__ for handler in _fork._child_handlers]
-    assert "_mark_inherited" in order and "_rebuild_worker_after_fork" in order, order
-    assert order.index("_mark_inherited") < order.index("_rebuild_worker_after_fork"), (
-        f"the marking handler must be registered first, got {order}"
+    assert _fork._walk is _lifecycle._walk_after_fork, "the marking walk is the registered walk"
+    assert "_reclaim_after_fork" in order and "_rebuild_worker_after_fork" in order, order
+    assert order[0] == "_reclaim_after_fork", (
+        f"before *any* other handler, which a pairwise check does not pin: a handler registered "
+        f"ahead of it passes that and not this. Got {order}"
     )
-    assert order[0] == "_mark_inherited", (
-        f"before *any* other handler, which the pairwise check above does not pin: a fourth "
-        f"handler registered ahead of it passes that and not this. Got {order}"
-    )
+
+    class _Wrapper:
+        """A third-party wrapper, so the parent's stamp records it but not what it holds."""
+
+        def __init__(self, inner: object) -> None:
+            self.inner = inner
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Accepts a batch."""
+
+        def close(self) -> None:
+            """Releases nothing."""
+
+    inner = _Wrapper(None)
+    log_foundry.configure(service="fork", version="0", env="test", sink=_Wrapper(inner))
+    assert id(inner) not in _lifecycle._state._owned, "the parent must not have recorded it"
+    first = _fork._child_handlers[0]
+    seen_by_first: list[object] = []
+
+    def spy() -> None:
+        seen_by_first.append(_lifecycle._state._owned.get(id(inner), (None,))[0])
+        first()
+
+    _fork._child_handlers[0] = spy
+    try:
+        child = run_in_child(lambda: str(seen_by_first))
+    finally:
+        _fork._child_handlers[0] = first
+    assert child.output == f"[{_lifecycle._FOREIGN}]", child.output
 
 
 def test_registering_the_same_handler_twice_is_a_no_op() -> None:
@@ -2229,8 +2257,11 @@ def _assignment_targets(tree: ast.AST, call: ast.Call) -> list[ast.expr]:
 def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) -> None:
     """FR-003 AC-3. Completeness is proved by the shape rather than claimed by a roster.
 
-    The walk replaces at two positions and no others: a module global and an instance attribute.
-    A lock constructed into a list, a tuple, a closure cell or a bare local is invisible to it,
+    The repair replaces at two positions and no others: a module global and an instance
+    attribute. Since SPEC-079 each is reached by its own mechanism: a module global by the roster,
+    ``_fork._GLOBAL_PRIMITIVES``, and a ``self`` attribute by the walk from the runtime's roots, or
+    by the roster when its object is a global; ``tests/test_fork_roster.py`` holds both complete.
+    A lock constructed into a list, a tuple, a closure cell or a bare local is invisible to both,
     and would be a silent return of the 19-of-60 hang. Forbidding the shape is also what picks
     up a lock added by a **later** spec with no edit to ``_fork.py`` — SPEC-036 FR-003 adds a
     counter lock after this one ships. A primitive of a *type* the walk cannot replace is a
@@ -2446,9 +2477,10 @@ def test_the_walk_terminates_on_a_cycle(tmp_path: pathlib.Path) -> None:
 
     Driven through a real fork rather than by re-running the loop here. A first version popped,
     marked and extended in the test body and asserted on its own local ``seen`` — it never
-    called the function whose termination it named, so deleting ``seen.add`` from
-    ``_reinit_primitives`` left it passing while a cycle spun forever. The expectation has to
-    come from the production path, not from a copy of it.
+    called the function whose termination it named, so deleting ``seen.add`` from the module-wide
+    walk SPEC-079 deleted left it passing while a cycle spun forever. Since SPEC-079 the cycle is
+    met by the one walk from the runtime's roots, whose shared ``seen`` set ends it. The
+    expectation has to come from the production path, not from a copy of it.
 
     A cycle is not a slow repair. The handler runs before the forking application gets control
     back, so a walk that does not terminate is a process that never returns from ``fork`` — and
@@ -2761,19 +2793,20 @@ def test_the_handler_is_registered_once_for_a_double_import() -> None:
     _fork.install()
 
     runs: list[int] = []
-    original = _fork._reinit_primitives
+    original = _fork._walk
+    assert original is not None
 
-    def counted() -> list[Any]:
+    def counted(repair: _fork._Repair) -> None:
         runs.append(1)
-        # The walk's return value is FR-004's roster of buffer-holding sinks, so a double that
-        # swallowed it would leave the discard step running against nothing on this path.
-        return original()
+        # The walk fills `repair.hooked`, FR-004's roster of buffer-holding sinks, so a double
+        # that skipped it would leave the discard step running against nothing on this path.
+        original(repair)
 
-    _fork._reinit_primitives = counted  # type: ignore[assignment]
+    _fork._walk = counted
     try:
         child = run_in_child(lambda: str(len(runs)))
     finally:
-        _fork._reinit_primitives = original  # type: ignore[assignment]
+        _fork._walk = original
     assert child.output == "1", child.output
 
 
@@ -3595,13 +3628,24 @@ def test_the_buffer_lint_reads_the_shapes_it_claims_to() -> None:
 # -- SPEC-050: the two pieces of new state a fork must not carry across ------------------
 
 
+def _walked() -> list[Any]:
+    """Runs the child's registered walk in-process with a fresh ``_Repair``; returns its hooks.
+
+    The walk that replaced ``_fork._reinit_primitives`` at SPEC-079 is ``_lifecycle``'s
+    ``_walk_after_fork``, and what it collects for the hook step is ``_Repair.hooked``.
+    """
+    repair = _fork._Repair()
+    _lifecycle._walk_after_fork(repair)
+    return repair.hooked
+
+
 def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
     """FR-004. `Worker._held` pins superseded sinks, so the walk must not enter it.
 
     The hazard `_fork._SKIP_ATTRIBUTE` documents, at a new container: reaching a sink the process
     abandoned replaces its locks — merely wasteful — and runs its fork hooks, which is not, since
     `_lifecycle.reclaim` then overwrites the foreign-pid record the child holds for it — the
-    parent's own stamp, or the `_FOREIGN` `_mark_inherited` `setdefault`s where the parent
+    parent's own stamp, or the `_FOREIGN` `_walk_after_fork` `setdefault`s where the parent
     recorded nothing — and leaves a child able to release a transport it never acquired.
 
     Asserted against the walk itself rather than against a symptom, because the symptom is a
@@ -3627,7 +3671,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
     try:
         worker._held = [worker.sink, stranded]
         _lifecycle._state._worker = worker
-        reached = _fork._reinit_primitives()
+        reached = _walked()
         assert not any(obj is stranded for obj in reached), (
             "the repair walk reached a sink the record only pins"
         )
@@ -3635,7 +3679,7 @@ def test_the_owed_swap_record_is_skipped_by_the_repair_walk() -> None:
         # Control: the same walk, with the attribute renamed out from under the opt-out.
         worker._held = [worker.sink]
         worker._not_skipped = [stranded]  # type: ignore[attr-defined]
-        reached_control = _fork._reinit_primitives()
+        reached_control = _walked()
         assert any(obj is stranded for obj in reached_control), (
             "the control did not reach it either, so the assertion above proves nothing"
         )
@@ -3690,7 +3734,7 @@ def test_the_in_flight_marker_record_is_skipped_by_the_repair_walk() -> None:
         _lifecycle._state._worker = worker
         worker._taken_markers = [marker]
         before = id(marker.event)
-        _fork._reinit_primitives()
+        _walked()
         assert id(marker.event) == before, (
             "the repair walk replaced the Event of a flush() caller that is in the parent"
         )
@@ -3698,7 +3742,7 @@ def test_the_in_flight_marker_record_is_skipped_by_the_repair_walk() -> None:
         # Control: the same walk, with the record renamed out from under the opt-out.
         worker._taken_markers = []
         worker._not_skipped = [marker]  # type: ignore[attr-defined]
-        _fork._reinit_primitives()
+        _walked()
         assert id(marker.event) != before, (
             "the control did not reach it either, so the assertion above proves nothing"
         )
@@ -4022,23 +4066,68 @@ def test_a_child_repairs_an_engine_sink_held_inside_a_multisink() -> None:
     assert child.output == "at-the-call;dropped=1 repaired=True", child.output
 
 
-def test_without_the_container_branch_the_multisink_child_blocks(
-    monkeypatch: pytest.MonkeyPatch,
+def _forked_owned_multisink_run(tmp_path: pathlib.Path) -> _Child:
+    """A ``MultiSink`` holding a ``FileSink``, its guard lock held by a parent thread at the fork.
+
+    Run with ``_MARKING_CEILING`` patched to one by the caller, so the marking frontier can
+    repair nothing and the repair frontier is observed alone (SPEC-079 FR-002). The ceiling also
+    caps every container read at one member, which is why the ``MultiSink`` holds exactly one.
+    """
+    inner = FileSink(str(tmp_path / "multi.ndjson"))
+    log_foundry.configure(service="fork", version="0", env="test", sink=MultiSink(inner))
+    released, holder = _held_by_a_parent_thread(inner._guard._lock)
+    at_the_call = "at-the-call;"
+
+    def run_then_read() -> str:
+        report_from_child(at_the_call)
+        log_foundry.info("child")
+        return "returned"
+
+    try:
+        return run_in_child(run_then_read, timeout=5)
+    finally:
+        released.set()
+        holder.join(5.0)
+
+
+def test_with_only_the_repair_frontier_the_multisink_child_returns(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The positive control: only the container member's reach is taken away, and it hangs."""
-    monkeypatch.setattr(
-        _fork,
-        "_container_push",
-        lambda child, kind: child if _fork._is_traversable(child) else None,
-    )
-    child = _forked_multisink_run()
+    """The pair of the control below: the repair frontier alone reaches a wrapper's child."""
+    monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", 1)
+    child = _forked_owned_multisink_run(tmp_path)
+    assert child.finished, f"the child did not return: it {child.ending}, {child.output!r}"
+    assert child.output.endswith("returned"), child.output
+
+
+def test_without_the_container_branch_the_multisink_child_blocks(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control: only the container member's reach is taken away, and it hangs.
+
+    Re-derived at SPEC-079: the repair frontier's one-level container read is
+    ``_lifecycle._push_members``, and with the marking ceiling at one nothing behind the
+    repair frontier repairs the wrapper's child either, so taking the read away leaves the
+    ``FileSink``'s guard lock dead.
+    """
+    monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", 1)
+    monkeypatch.setattr(_lifecycle, "_push_members", lambda container, stack: None)
+    child = _forked_owned_multisink_run(tmp_path)
     assert child.output.startswith("at-the-call;"), f"never reached the call: {child.output!r}"
     assert child.blocked, f"the unrepaired child did not block: it {child.ending}, {child.output!r}"
 
 
 def test_without_the_reach_the_same_child_blocks(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The positive control: with the reach answering nothing, the structural child hangs."""
-    monkeypatch.setattr(_fork, "_counters_reach", lambda value, kind: None)
+    """The positive control: with the reach answering nothing, the structural child hangs.
+
+    Re-derived at SPEC-079: the reach is the registry of live ``SinkCounters``, read by
+    ``_lifecycle._repair_live_counters``. With it taken away and the marking ceiling at zero, so
+    the marking frontier cannot repair the counters through the forwarded namespace either (at
+    one it visits the forwarded counters first and repairs them), a structural engine sink's
+    counters lock stays dead.
+    """
+    monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", 0)
+    monkeypatch.setattr(_lifecycle, "_repair_live_counters", lambda repair: None)
     child, _ = _forked_engine_run(_StructuralEngineSink())
     assert child.blocked, f"the unrepaired child did not block: it {child.ending}, {child.output!r}"
 
@@ -4080,13 +4169,23 @@ def test_the_counters_reach_enters_no_other_third_party_attribute() -> None:
 
 
 def test_the_counters_type_is_read_without_an_import(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With ``sinks.verdict`` absent from ``sys.modules`` the reach answers nothing, importing nothing."""
+    """With ``sinks.verdict`` absent from ``sys.modules`` the registry read repairs nothing.
+
+    SPEC-079 replaced the static counters reach with a registry of live ``SinkCounters``, read
+    from ``sys.modules`` by ``_lifecycle._repair_live_counters``; the promise is unchanged: a
+    child that never loaded the module imports nothing and repairs nothing.
+    """
+    sink = _StructuralEngineSink()
+    lock = sink.log_foundry_counters._counter_lock
     monkeypatch.delitem(sys.modules, "log_foundry.sinks.verdict")
-    assert _fork._counters_type() is None
+    repair = _fork._Repair()
+    _lifecycle._repair_live_counters(repair)
     assert "log_foundry.sinks.verdict" not in sys.modules
+    assert repair.seen == set()
     monkeypatch.setitem(sys.modules, "log_foundry.sinks.verdict", None)
-    assert _fork._counters_type() is None
-    assert _fork._counters_reach(_StructuralEngineSink(), None) is None
+    _lifecycle._repair_live_counters(repair)
+    assert repair.seen == set()
+    assert sink.log_foundry_counters._counter_lock is lock
 
 
 @pytest.mark.parametrize(
@@ -4119,8 +4218,21 @@ def test_the_counters_type_is_read_without_an_import(monkeypatch: pytest.MonkeyP
     ],
 )
 def test_the_counters_reach_refuses_everything_but_exact_counters(value: object) -> None:
-    """Only an exact ``SinkCounters`` is handed back; a property is never called."""
-    assert _fork._counters_reach(value, SinkCounters) is None
+    """Only an exact ``SinkCounters`` is in the registry the child repairs; a property never runs.
+
+    Re-expressed at SPEC-079 against ``sinks.verdict._LIVE_COUNTERS``: the child repairs what
+    the registry holds, so the promise is that nothing but a built ``SinkCounters`` is ever a
+    member, and that holding a value whose ``log_foundry_counters`` is a property neither calls
+    the property nor adds anything.
+    """
+    before = {id(member) for member in verdict._LIVE_COUNTERS}
+    holder = [value]
+    repair = _fork._Repair()
+    _lifecycle._repair_live_counters(repair)
+    after = {id(member) for member in verdict._LIVE_COUNTERS}
+    assert after <= before, "holding the value added a member: a property ran"
+    assert id(holder[0]) not in after
+    assert all(type(member) is SinkCounters for member in verdict._LIVE_COUNTERS)
 
 
 # -- SPEC-076 FR-006: the closed guard in a forked child ------------------------------------------

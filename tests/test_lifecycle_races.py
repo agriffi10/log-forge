@@ -1313,13 +1313,13 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
 
     It does not, and the reason is worth stating because it is not the obvious one. The refusal
     is grounded in `_owned`, where `configure()` stamped the sink with the **parent's** pid;
-    `_mark_inherited` uses `setdefault`, so it leaves that stamp alone, and `releasable` answers
-    on `record[0] == pid`, which the parent's stamp fails. `_inheritance_roots`' own docstring
-    says the same from the other side — `_owned.values()` is its load-bearing entry, and dropping
-    any of the four live handles "changes nothing, since each is itself stamped".
+    the child's walk, `_walk_after_fork`, writes its marks with `setdefault`, so it leaves that
+    stamp alone, and `releasable` answers on `record[0] == pid`, which the parent's stamp fails.
+    `_record_seeds`' own docstring says the same from the other side — `_owned` is the
+    load-bearing seed of the marking (SPEC-079).
 
-    No edit to FR-005's opt-out can reach that: `_FORK_SKIP` is read only by
-    `_fork._skipped_names` for the repair walk, and the marking path never consults it. So the
+    No edit to FR-005's opt-out can reach that: `_FORK_SKIP` drops names from what the walk
+    repairs and descends into, and the record write is a `setdefault` either way. So the
     two terms the child reports carry different work, and the split is not the obvious one. The
     **verdict** is the term that sees `releasable` itself weakened while the record stands:
     drop its `record[0] == pid` and the child answers `releasable,the-parent-s`. A change that

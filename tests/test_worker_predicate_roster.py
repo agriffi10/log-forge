@@ -406,22 +406,17 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "destroyed with `flush()` reporting success and every counter zero."
         ),
     ),
-    ("_inheritance_roots", "_state.worker_exists()", 0): (
+    ("_live_roots", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
-            "which sinks a forked child's marking walk starts from, before any other handler "
-            "runs (SPEC-042 FR-001). Existence rather than liveness, deliberately: a retired "
-            "worker's sink is still a transport this process inherited and must not release. "
-            "Nothing observable turns on the choice today — every object that becomes "
-            "`worker.sink` was stamped by `configure()` or `_ensure_sink()` before it got "
-            "there, so it is already in `_owned.values()`, the entry `_inheritance_roots` "
-            "calls load-bearing, and the walk descends from a root unboundedly. Existence "
-            "keeps this site honest about the question it asks rather than resting on that "
-            "redundancy. "
-            "This site is **new to the roster** rather than new to the code - it read "
-            "`decorator._worker` directly and composed the question on it, one module away "
-            "from a roster that walked only `decorator.py`, so it passed silently for two "
-            "specs. That is the gap SPEC-040 FR-004 widens the scope to close."
+            "which worker a forked child's one walk repairs from, before any handler runs "
+            "(SPEC-079 FR-002; SPEC-042 FR-001 for the marking it carries). Existence rather "
+            "than liveness, deliberately: a retired worker's locks are still inherited and its "
+            "sink is still a transport this process inherited and must not release. The "
+            "existence question was `_inheritance_roots`' until SPEC-079 folded the marking "
+            "into the walk; it keeps that site's reasoning, and it once read "
+            "`decorator._worker` directly, one module away from a roster that walked only "
+            "`decorator.py`, which is the gap SPEC-040 FR-004 widened the scope to close."
         ),
     ),
     ("_worker_health", "_state.retirements > 0", 0): (
@@ -714,20 +709,15 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "re-armed sink before the bystander returns from its wait."
         ),
     ),
-    (
-        "_inheritance_roots",
-        (
-            "(config._live_config().sink, None if worker is None else worker.sink, "
-            "*_state._closes.owed.values())"
-        ),
-        0,
-    ): (
+    ("_live_roots", "(config._live_config().sink, worker, _state._late_worker)", 0): (
         EXISTENCE,
         (
-            "every sink this process could still be holding, so the child can refuse to close "
-            "what it inherited (SPEC-042 FR-001). Existence, not liveness: a retired worker's "
-            "sink is exactly the one a child must not close. The record term reaches superseded "
-            "sinks, which is why `_FORK_SKIP` narrows the *repair* walk and not this one."
+            "the runtime's live delivery targets, the roots of a forked child's repair "
+            "frontier (SPEC-079 FR-002). Existence, not liveness: a retired worker's sink is "
+            "exactly the one a child must not close, and the late worker is a root because a "
+            "child inherits it as state to repair even though `_clear_after_fork` then forgets "
+            "it. The owed record and the ownership record are not roots; they seed the marking "
+            "frontier, never hooked, which is why `_FORK_SKIP` narrows the repair and not them."
         ),
     ),
 }

@@ -211,7 +211,8 @@ fi
 # the headroom is today.
 # Re-ratcheted to keep that headroom when the agent-roles port added its cases: the additions
 # had let it grow past three, so losing the whole `yaml-*` family had stopped firing.
-CASES_MIN=306
+# Re-ratcheted by two for SPEC-079's two marking-walk cases, for the same reason.
+CASES_MIN=308
 if { [ -z "${DOCS_LINT_TEST_CASES:-}" ] || [ -n "${DOCS_LINT_TEST_FLOOR:-}" ]; } && [ -z "$FILTER" ] && [ "$pass" -lt "$CASES_MIN" ]; then
   echo "docs-lint-test: only $pass cases ran, against a floor of $CASES_MIN. The corpus has"
   echo "shrunk or gone missing — a run over nothing exits 0 and looks exactly like a healthy"

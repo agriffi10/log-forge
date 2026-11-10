@@ -14,6 +14,7 @@ a same-process double cannot exhibit it.
 
 from __future__ import annotations
 
+import collections
 import gc
 import pathlib
 import socket
@@ -289,7 +290,7 @@ class BuriedHolder(MemorySink):
     ],
 )
 def test_a_child_cannot_claim_a_sink_the_parent_never_recorded(hide: object) -> None:
-    """The claiming-side hole, and the reason `_mark_inherited` exists (FR-001).
+    """The claiming-side hole, and the reason the child's walk marks (FR-001; SPEC-079 FR-003).
 
     Write-once defends a record that **already exists**, so where the parent's bounded walk
     recorded nothing there was nothing to defend: a child re-wrapping the inherited object in a
@@ -350,8 +351,8 @@ def test_a_marking_walk_that_fails_refuses_everything_unrecorded(
 
     **The failure is induced through the real walk**, not by assigning the flag. Written the
     other way first, and it only proved that `releasable` reads a global — mutating the handler
-    so it never sets the flag survived. Driving `_mark_inherited` with a raising root resolver
-    exercises the guard, the flag, and the refusal together.
+    so it never sets the flag survived. Driving the child's walk, `_walk_after_fork`, with a
+    raising root resolver exercises the guard, the flag, and the refusal together.
     """
     unrecorded = RecordingSink()
     assert _lifecycle.releasable(unrecorded) is True, "the baseline: unrecorded is the caller's"
@@ -359,9 +360,9 @@ def test_a_marking_walk_that_fails_refuses_everything_unrecorded(
     def exploding_roots() -> list[object]:
         raise RuntimeError("the roots cannot be resolved")
 
-    monkeypatch.setattr(_lifecycle, "_inheritance_roots", exploding_roots)
+    monkeypatch.setattr(_lifecycle, "_live_roots", exploding_roots)
     try:
-        _lifecycle._mark_inherited()
+        _lifecycle._walk_after_fork(_fork._Repair())
         assert _lifecycle._state._marking_failed is True, (
             "the guard caught it and withdrew the default"
         )
@@ -372,20 +373,32 @@ def test_a_marking_walk_that_fails_refuses_everything_unrecorded(
         _lifecycle._state._marking_failed = False
 
 
-def test_a_superseded_wrapper_still_shields_the_transport_beneath_it() -> None:
-    """`_owned.values()` is the load-bearing root, and nothing else reaches this sink.
+def _live_reach() -> set[int]:
+    """The ids the child's walk reaches from the live roots alone, record seeds left out."""
+    repair = _fork._Repair()
+    found: list[object] = []
+    for root in _lifecycle._live_roots():
+        found.extend(_lifecycle._reachable_sinks(root, after_fork=repair))
+    queue = collections.deque(repair.forwarded)
+    _lifecycle._mark_frontier(queue, repair, found, hook=True, visits=0)
+    return repair.seen
 
-    A wrapper one `configure()` has replaced is no live delivery target, so none of the four
-    live handles finds it -- but the transport inside it is still the parent's. Dropping the
-    recorded-sinks root leaves this a destructive close with the whole suite green, which is
-    why it is asserted separately from the live-target roots.
+
+def test_a_superseded_wrapper_still_shields_the_transport_beneath_it() -> None:
+    """`_owned.values()` is the load-bearing seed, and nothing else reaches this sink.
+
+    A wrapper one `configure()` has replaced is no live delivery target, so neither the walk's
+    live roots nor what they forward find it -- but the transport inside it is still the
+    parent's. Dropping the record seeds leaves this a destructive close with the whole suite
+    green, which is why it is asserted separately from the live-target roots. The precondition
+    is built from the walk itself (SPEC-079): its repair frontier from `_live_roots()`, then the
+    forwarded seeds of its marking frontier, both without the record seeds.
     """
     conn = RecordingSink()
     log_foundry.configure(service="own", sink=MultiSink(ThirdPartyWrapper(conn)))
     log_foundry.configure(sink=StdoutSink())
 
-    live = {id(found) for found in _lifecycle._inheritance_roots()}
-    assert id(conn) not in live, "the precondition: it is not reachable as a live target"
+    assert id(conn) not in _live_reach(), "the precondition: it is not reachable as a live target"
 
     def in_child() -> str:
         log_foundry.configure(sink=MultiSink(conn))
@@ -482,17 +495,18 @@ def test_the_marking_walk_does_not_escape_through_a_module_reference() -> None:
 
 
 def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
-    """The walk is bounded, and tripping the bound degrades the safe way.
+    """The walk is bounded, and tripping the bound degrades the safe way, in a real child.
 
     SPEC-039 declined to bound its repair walk because an unfound lock is a hang with no safe
-    degradation. This walk has one: `_marking_failed` means "did not finish, trust nothing
+    degradation. The marking has one: `_marking_failed` means "did not finish, trust nothing
     unrecorded", so a trip costs a leaked handle rather than a destructive close. The exposure
     was also wider -- a `list` subclass with a non-terminating `__iter__` reachable through any
     third-party object took a child to 5.7 GB RSS in nine minutes, unkillable by its parent.
 
     SPEC-079 FR-002 reads a container through its builtin base's own iteration, so that
     `__iter__` is never entered at all and cannot trip anything; the ceiling is asserted on what
-    can still exceed it, a configured sink holding more than `_MARKING_CEILING` distinct objects.
+    can still exceed it, a configured sink holding more than `_MARKING_CEILING` distinct objects,
+    in a real child now that no unbounded read stands in front of it.
     """
     entered: list[int] = []
 
@@ -518,12 +532,18 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     assert configured < 10.0, "the *parent's* stamp walk is bounded too"
     assert entered == [], "the stamp walk entered the subclass's own `__iter__`"
 
-    _lifecycle._mark_inherited()
-    assert entered == [], "the marking entered the subclass's own `__iter__`"
-    assert _lifecycle._state._marking_failed is True, (
-        "the ceiling tripped rather than the walk running on"
+    def in_child() -> str:
+        return (
+            f"entered={entered} failed={_lifecycle._state._marking_failed} "
+            f"releasable={_lifecycle.releasable(unrecorded)}"
+        )
+
+    child = run_in_child(in_child, timeout=30)
+    assert child.finished, f"the child did not return from fork: {child.ending}"
+    assert child.output == "entered=[] failed=True releasable=False", (
+        f"the ceiling tripped, nothing entered the runaway iterator, and an unrecorded sink was "
+        f"refused: {child.output}"
     )
-    assert _lifecycle.releasable(unrecorded) is False, "and it degraded toward refusing"
 
 
 def test_the_marking_handler_runs_before_the_worker_rebuild() -> None:
@@ -534,9 +554,10 @@ def test_the_marking_handler_runs_before_the_worker_rebuild() -> None:
     docstring claimed a test pinned this and none did.
     """
     handlers = [handler.__name__ for handler in _fork._child_handlers]
-    assert "_mark_inherited" in handlers, "the marking handler is registered at all"
+    assert _fork._walk is _lifecycle._walk_after_fork, "the marking walk is the registered walk"
+    assert "_reclaim_after_fork" in handlers, "the reclaim handler is registered at all"
     assert "_rebuild_worker_after_fork" in handlers
-    assert handlers.index("_mark_inherited") < handlers.index("_rebuild_worker_after_fork"), (
+    assert handlers.index("_reclaim_after_fork") < handlers.index("_rebuild_worker_after_fork"), (
         "a handler that reaches a release path must not run before the marks exist"
     )
 
@@ -728,7 +749,7 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
         "_state._owned.setdefault",
         "_state._owned.clear",
         "_state._owned.values",
-        "roots.extend",
+        "seeds.extend",
         "id",
     }
     assert set(under_lock) <= permitted, (
@@ -1011,11 +1032,13 @@ def test_the_fork_repair_walk_does_not_reach_a_superseded_sink() -> None:
     `configure()` calls out of date, and a `FileSink` there would be reopened on every fork for
     the life of the process.
 
-    This drives `_fork._reinit_primitives` -- the **repair** walk, the only one that consults
-    `_FORK_SKIP`. A first version called `_lifecycle._reachable_sinks(_lifecycle)` instead, which
-    is the *ownership* walk and cannot even enter a module (`_is_owned` is `False` for a
-    `ModuleType`, so it returns `[]` for any module). That assertion was true for every possible
-    input and disabling `_FORK_SKIP` left it passing.
+    This drives the child's registered walk, `_walk_after_fork`, with a fresh `_Repair`, and
+    asserts on what it collects for the hook step. A first version called
+    `_lifecycle._reachable_sinks(_lifecycle)` instead, which is the *ownership* walk and cannot
+    even enter a module; that assertion was true for every possible input. Since SPEC-079 the
+    superseded sink is reached, as a record seed of the marking frontier, and is repaired but
+    never hooked; the assertion on `_state._FORK_SKIP` is dropped, since `_state` is not on the
+    walk at all.
     """
     hooked: list[str] = []
 
@@ -1036,15 +1059,16 @@ def test_the_fork_repair_walk_does_not_reach_a_superseded_sink() -> None:
     log_foundry.configure(service="own", sink=superseded)
     log_foundry.configure(sink=RecordingSink())
 
-    assert "_owned" in _lifecycle._state._FORK_SKIP
     with _lifecycle._state._owned_lock:
         assert id(superseded) in _lifecycle._state._owned, (
             "the record still pins it, which is the precondition that makes this test mean "
             "something -- without the pin there would be nothing for the walk to over-reach to"
         )
 
-    collected = _fork._reinit_primitives()
-    assert superseded not in collected, (
+    repair = _fork._Repair()
+    _lifecycle._walk_after_fork(repair)
+    collected = repair.hooked
+    assert not any(found is superseded for found in collected), (
         "the repair walk reached a sink two configure() calls out of date and would have called "
         "its fork hook"
     )
@@ -1301,7 +1325,9 @@ def test_the_reacquired_roster_does_not_survive_into_the_next_fork(
     def in_child() -> str:
         log_foundry.configure(sink=FileSink(str(tmp_path / "second.log")))
         log_foundry.configure(sink=FileSink(str(tmp_path / "third.log")))
-        collected = len(_fork._reinit_primitives())
+        repair = _fork._Repair()
+        _lifecycle._walk_after_fork(repair)
+        collected = len(repair.hooked)
         grandchild = run_in_child(lambda: str(_lifecycle.releasable(first)))
         return f"{collected},{grandchild.output}"
 
@@ -1326,10 +1352,11 @@ def test_a_marking_walk_that_fails_still_honours_a_re_acquisition(
     sink = FileSink(str(tmp_path / "reacquired.log"))
     monkeypatch.setattr(_fork, "reacquired_in_child", [sink])
     monkeypatch.setattr(
-        _lifecycle, "_inheritance_roots", lambda: (_ for _ in ()).throw(RuntimeError("no roots"))
+        _lifecycle, "_live_roots", lambda: (_ for _ in ()).throw(RuntimeError("no roots"))
     )
 
-    _lifecycle._mark_inherited()
+    _lifecycle._walk_after_fork(_fork._Repair())
+    _lifecycle._reclaim_after_fork()
     try:
         assert _lifecycle._state._marking_failed is True, "the walk did fail"
         assert _lifecycle.releasable(sink) is True, "and the re-acquisition still counted"
@@ -1347,11 +1374,12 @@ def test_the_reacquired_roster_is_empty_when_the_repair_walk_starts() -> None:
     middle. So the assertion is made where the claim is, at the walk's entry.
     """
     observed: list[int] = []
-    original = _fork._reinit_primitives
+    original = _fork._walk
+    assert original is not None
 
-    def spy() -> list[object]:
+    def spy(repair: _fork._Repair) -> None:
         observed.append(len(_fork.reacquired_in_child))
-        return original()
+        original(repair)
 
     import tempfile
 
@@ -1359,13 +1387,13 @@ def test_the_reacquired_roster_is_empty_when_the_repair_walk_starts() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         log_foundry.configure(service="own", sink=FileSink(f"{tmp}/pin.log"))
-        _fork._reinit_primitives = spy  # type: ignore[assignment]
+        _fork._walk = spy
         try:
             _fork._reinit_after_fork()
             assert _fork.reacquired_in_child, "the precondition: this fork did populate a roster"
             _fork._reinit_after_fork()
         finally:
-            _fork._reinit_primitives = original  # type: ignore[assignment]
+            _fork._walk = original
 
     assert observed == [0, 0], (
         f"the walk saw a non-empty roster on entry: {observed}. The previous generation's sinks "
