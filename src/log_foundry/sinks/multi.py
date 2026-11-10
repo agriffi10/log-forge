@@ -304,10 +304,18 @@ class MultiSink:
         Raises:
           None.
         """
+        closed: set[int] = set()
         for sink in self._sinks:
+            if id(sink) in closed:
+                continue
+            closed.add(id(sink))
             try:
                 _lifecycle.release(sink, owner=self)
             except Exception as err:
                 with self._counter_lock:
                     self.failed += 1
-                _diag.absorbed("closing a MultiSink child", err, f"{type(sink).__name__} skipped")
+                _diag.absorbed(
+                    "closing a MultiSink child",
+                    err,
+                    f"{_diag._STR_STR(_diag._STORED_NAME(type(sink)))} skipped",
+                )

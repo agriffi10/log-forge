@@ -275,8 +275,12 @@ was handed as a sink is recorded unconditionally, whatever a static read says it
 root `stamp` is handed; a value in a package wrapper's child-sink slot, named in
 `_fork._CHILD_SINK_SLOTS` (`MultiSink._sinks`, `_inner` on `FilteringSink`, `TransformSink` and
 `_FactorySink`, `Worker.sink`, `Config.sink`, `SwapOutcome.previous`), on both frontiers; and the
-live delivery sinks the runtime holds (`_live_sinks`). `tests/test_child_sink_slots.py` derives
-the slots from the source and fails on one missing from the table. `_fork._sink_shaped` decides
+live delivery sinks the runtime holds (`_live_sinks`). `tests/test_child_sink_slots.py` holds
+the table complete by behaviour — a package class that stores a `Sink`-annotated value on `self`
+however it is written, calls `require_sink`, or releases a sink with `owner=self` must have an
+entry or a reasoned exemption — and builds each declared class around a sentinel sink, requiring
+it recorded. A value `require_sink` would refuse, planted in a slot after construction, is never
+recorded. `_fork._sink_shaped` decides
 only inside holders this package does not define, where the marking frontier also records a
 value whose exact type is a `weakref` proxy. A `super(Sub, inst)` is transparent: its `__self__`
 is read in C and walked. A `weakref.proxy`, a `super(...)` or a `__getattr__` proxy configured as
@@ -1265,3 +1269,10 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   and degenerate shape hold it. `super(Sub, inst)` became transparent to the walk, so a sink behind
   one is repaired; a sink behind a `weakref.proxy`, and a child's bare re-hand of an unrecorded
   sink after a tripped ceiling, are recorded as constraints.
+- Build, after the execution review of the record-by-position change: the slot roster keyed on
+  how a value is stored missed most natural future wrappers, so it is keyed on behaviour instead
+  (a `Sink` annotation anywhere flowing to a `self` attribute, `require_sink`, `release(owner=self)`),
+  with runtime keys and a sentinel per declared class; `LogstashSink` and `SentrySink` joined the
+  table. A planted non-`str` namespace key is dropped before it is hashed; a slot value
+  `require_sink` would refuse is not recorded; `_live_sinks` no longer lists a factory's built
+  sink, which the `_inner` slot records; `MultiSink.close` closes a member held twice once.

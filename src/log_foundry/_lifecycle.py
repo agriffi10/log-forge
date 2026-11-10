@@ -13,7 +13,7 @@ from itertools import islice
 from time import monotonic
 from typing import TYPE_CHECKING
 
-from log_foundry import _diag, _fork
+from log_foundry import _diag, _fork, _sink_arg
 
 if TYPE_CHECKING:
     from log_foundry.results import FlushResult
@@ -1478,7 +1478,7 @@ def _positional_sinks(holder: object, items: list[tuple[str, object]]) -> list[o
             sinks.append(value)
         elif kind == "many":
             sinks.extend(_bounded_children(value))
-    return [sink for sink in sinks if sink is not None]
+    return [sink for sink in sinks if sink is not None and not _sink_arg.unpatchable(sink)]
 
 
 def _push_members(container: object, stack: list[object]) -> None:
@@ -1621,8 +1621,9 @@ def _live_roots() -> list[object]:
 def _live_sinks() -> list[object]:
     """Returns the sinks the runtime delivers to, recorded by the walk whatever they look like.
 
-    The configured sink, the live and the late worker's ``sink``, and the sink a configured
-    ``sink_factory`` wrapper has built. Recording one runs none of its code — an ``id`` and a
+    The configured sink, and the live and the late worker's ``sink``. A ``sink_factory`` wrapper's
+    built sink is not listed here: the walk records it by position, from the wrapper's declared
+    ``_inner`` slot. Recording one runs none of its code — an ``id`` and a
     reference — so each is recorded unconditionally, beside what the walk's static sink-shape test
     finds (SPEC-079). Without it a ``weakref.proxy``, a ``super(Sub, inst)`` or a ``__getattr__``
     proxy configured as the sink, which no static read finds sink-shaped, could stay unrecorded in
@@ -1643,11 +1644,6 @@ def _live_sinks() -> list[object]:
     sinks: list[object] = [configured]
     workers = (_state.worker_exists(), _state._late_worker)
     sinks.extend(worker.sink for worker in workers if worker is not None)
-    module = sys.modules.get(f"{_fork._PACKAGE}.sinks._factory")
-    if module is not None and _fork._is_module(module):
-        factory_type = _fork._MODULE_DICT(module).get("_FactorySink")
-        built = [vars(sink).get("_inner") for sink in sinks if type(sink) is factory_type]
-        sinks.extend(built)
     return [sink for sink in sinks if sink is not None]
 
 

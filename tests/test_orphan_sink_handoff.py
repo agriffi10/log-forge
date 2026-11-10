@@ -971,6 +971,7 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
 
     from log_foundry import _diag as diag
     from log_foundry import _fork as fork_mod
+    from log_foundry import _sink_arg as sink_arg
     from log_foundry.sinks import base as sink_base
 
     source = pathlib.Path(lifecycle.__file__).read_text()
@@ -997,8 +998,10 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
     # over a handed-over sink graph, and it reuses `_fork`'s descent predicates rather than
     # duplicating them. `sinks.base` was a runtime import while the walk asked
     # `isinstance(x, Sink)`; SPEC-079 FR-002 made that test `_fork._sink_shaped`, a static read,
-    # so `Sink` went back to TYPE_CHECKING and the set narrowed to two.
-    allowed = {"log_foundry._diag", "log_foundry._fork"}
+    # so `Sink` went back to TYPE_CHECKING and the set narrowed to two. `_sink_arg` joined it
+    # later in SPEC-079: a leaf importing only `_diag`, whose `unpatchable` the walk shares with
+    # `require_sink`, so a slot holding a value `require_sink` would refuse is never recorded.
+    allowed = {"log_foundry._diag", "log_foundry._fork", "log_foundry._sink_arg"}
     assert package_modules(tree.body) == allowed, (
         f"at runtime it may import only {sorted(allowed)}, got {package_modules(tree.body)}"
     )
@@ -1006,7 +1009,7 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
     # The exact-set assertion above is the guard; this is why that set is safe. The property is
     # not "few imports" but "nothing that imports back", and it is checked rather than argued --
     # every module this one pulls in is read and must not name `_lifecycle`.
-    for module in (diag, fork_mod, sink_base):
+    for module in (diag, fork_mod, sink_base, sink_arg):
         imported = package_modules(ast.parse(pathlib.Path(module.__file__).read_text()).body)
         assert not any("_lifecycle" in name for name in imported), (
             f"{module.__name__} imports back into _lifecycle, which is the cycle this forbids"

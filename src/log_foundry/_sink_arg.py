@@ -33,6 +33,26 @@ and announced, as before; that trade is deliberate (Andrew's decisions of 2026-1
 """
 
 
+def unpatchable(value: object) -> bool:
+    """Whether a value is exactly one of :data:`_UNPATCHABLE`'s types, so it can never be a sink.
+
+    ``type(value) is t`` reads the type pointer and compares identities, so nothing of the value
+    runs. Shared by :func:`require_sink` and by the fork walk's positional record, which skips a
+    value ``require_sink`` would have refused even when one was assigned into a slot after
+    construction.
+
+    Args:
+      value: Any object.
+
+    Returns:
+      Whether its exact type is one of the unpatchable builtin types.
+
+    Raises:
+      None.
+    """
+    return any(type(value) is kind for kind in _UNPATCHABLE)
+
+
 def require_sink(value: object, name: str) -> None:
     """Refuses a sink argument that is exactly one of the unpatchable builtin types.
 
@@ -54,7 +74,7 @@ def require_sink(value: object, name: str) -> None:
     Raises:
       TypeError: When ``value`` is exactly one of the unpatchable builtin types.
     """
-    if any(type(value) is unpatchable for unpatchable in _UNPATCHABLE):
+    if unpatchable(value):
         raise TypeError(
             f"{name} must be a sink with an emit method, "
             f"got {_diag._STR_STR(_diag._STORED_NAME(type(value)))}"

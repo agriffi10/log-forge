@@ -15,7 +15,8 @@
     the counters reach, `_mark_inherited` and `_inheritance_roots`.
   - Every read the walk and `stamp` make is static. Ownership is recorded by position where it
     is known (the root, `_fork._CHILD_SINK_SLOTS`, the live sinks) and by shape only in foreign
-    holders; `super(...)` is walked through.
+    holders; `super(...)` is walked through. The slot table is held complete by behaviour and a
+    runtime sentinel per class (`tests/test_child_sink_slots.py`).
   - A registry of live `SinkCounters` replaces the counters reach.
   - `Worker._FORK_SKIP` gains `_queue` and `_thread`.
 - **The child's state** (FR-004). `_clear_after_fork` resets `_shutdown_running` and

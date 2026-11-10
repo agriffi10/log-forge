@@ -346,3 +346,32 @@ def test_a_file_sink_still_offers_its_hook() -> None:
     """The static hook read still finds a shipped sink's `reacquire_after_fork`."""
     assert _fork._offers_reacquire(FileSink.__new__(FileSink)) is True
     assert _fork._offers_reacquire(MemorySink()) is False
+
+
+class _HostileKey(str):
+    """A ``str`` subclass key whose ``__hash__`` and ``__eq__`` record while armed."""
+
+    def __hash__(self) -> int:
+        _note("key __hash__")
+        return str.__hash__(self)
+
+    def __eq__(self, other: object) -> bool:
+        _note("key __eq__")
+        return str.__eq__(self, other)
+
+
+def test_a_str_subclass_key_in_an_instance_dict_runs_nothing_at_fork() -> None:
+    """A planted non-``str`` key is dropped by type before anything hashes or compares it."""
+    holder = FilteringSink(MemorySink())
+    vars(holder)[_HostileKey("planted")] = MemorySink()
+    log_foundry.configure(service="static", sink=holder)
+    Ran.calls.clear()
+    Ran.armed = True
+    try:
+        items = _fork._namespace_items(holder)
+        child = run_in_child(lambda: repr(sorted(Ran.calls.items())))
+    finally:
+        Ran.armed = False
+    assert all(type(name) is str for name, _value in items)
+    assert dict(Ran.calls) == {}, "the parent's read ran the key's hooks"
+    assert child.output == "[]", f"the child's walk ran the key's hooks: {child.output}"

@@ -267,6 +267,8 @@ _CHILD_SINK_SLOTS: dict[tuple[str, str], dict[str, str]] = {
     ("sinks.filtering", "FilteringSink"): {"_inner": "one"},
     ("sinks.transform", "TransformSink"): {"_inner": "one"},
     ("sinks._factory", "_FactorySink"): {"_inner": "one"},
+    ("sinks.logstash", "LogstashSink"): {"_http": "one"},
+    ("sinks.sentry", "SentrySink"): {"_http": "one"},
 }
 """Where a package class holds a sink it was handed, by ``(module, qualname)`` and slot name.
 
@@ -278,8 +280,10 @@ as not sink-shaped, because no static read follows a C type's own forwarding, an
 shape left it unrecorded: its wrapper then refused its close in the parent, and a forked child
 could claim it and close the parent's transport. ``one`` is a slot holding one sink, ``many`` a
 container of them. The shape test, ``_sink_shaped``, is kept only where position is unknown, in
-holders this package does not define. ``tests/test_child_sink_slots.py`` derives the slots from
-the source and fails on one missing here or named here and gone.
+holders this package does not define. ``tests/test_child_sink_slots.py`` holds the table complete
+by behaviour — a class that stores a ``Sink``-annotated value on ``self`` however it is written,
+calls ``require_sink`` or releases a sink with ``owner=self`` must have an entry — and checks each
+entry at run time by building its class around a sentinel sink and requiring it recorded.
 """
 
 _QUALNAME = type.__dict__["__qualname__"].__get__
@@ -443,6 +447,25 @@ def _slot_names(holder: object) -> list[tuple[type, str]]:
     return names
 
 
+def _str_keyed(pairs: Any) -> list[tuple[str, Any]]:
+    """Keeps the pairs whose key is an exact ``str``, deciding by type before anything hashes it.
+
+    A key planted in an instance ``__dict__`` can be a ``str`` subclass with its own ``__hash__``
+    or ``__eq__``, which every later set, frozenset or dict lookup on the name would run. No
+    attribute the walk needs has such a name, so the pair is dropped unread.
+
+    Args:
+      pairs: ``(key, value)`` pairs from a builtin ``dict``'s own ``items``.
+
+    Returns:
+      The pairs with an exact-``str`` key.
+
+    Raises:
+      None.
+    """
+    return [(key, value) for key, value in pairs if type(key) is str]
+
+
 def _namespace_items(holder: Any) -> list[tuple[str, Any]]:
     """Returns the ``(name, value)`` pairs a holder owns, running none of the holder's code.
 
@@ -467,11 +490,11 @@ def _namespace_items(holder: Any) -> list[tuple[str, Any]]:
     """
     try:
         if _is_class(holder):
-            return list(_NAMESPACE(holder).items())
+            return _str_keyed(dict.items(_NAMESPACE(holder).copy()))
         if _is_module(holder):
-            return list(dict.items(_MODULE_DICT(holder)))
+            return _str_keyed(dict.items(_MODULE_DICT(holder)))
         own = _instance_dict(holder)
-        items: list[tuple[str, Any]] = [] if own is None else list(dict.items(own))
+        items: list[tuple[str, Any]] = [] if own is None else _str_keyed(dict.items(own))
         present = {name for name, _value in items}
         for cls, name in _slot_names(holder):
             if name in present:
