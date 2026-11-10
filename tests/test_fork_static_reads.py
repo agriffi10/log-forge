@@ -28,6 +28,7 @@ import log_foundry
 from log_foundry import _fork, _lifecycle
 from log_foundry.sinks.base import Sink
 from log_foundry.sinks.file import FileSink
+from log_foundry.sinks.filtering import FilteringSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from test_fork_lifecycle import run_in_child
@@ -249,8 +250,13 @@ def test_the_static_type_tests_agree_with_isinstance(value: object) -> None:
 
 
 def _hostile_graph() -> tuple[Hostile, MultiSink]:
+    """The hostile sink held two ways: a ``MultiSink`` child, and a ``FilteringSink``'s attribute.
+
+    The attribute is what puts it in front of the repair's primitive test, which reads every
+    value in a package holder's own namespace.
+    """
     hostile = Hostile()
-    return hostile, MultiSink(MemorySink(), hostile)
+    return hostile, MultiSink(MemorySink(), hostile, FilteringSink(hostile))
 
 
 def test_stamp_and_the_reachable_walk_run_no_hook_of_a_sink() -> None:

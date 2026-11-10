@@ -416,7 +416,7 @@ def test_an_emit_from_inside_the_factory_is_refused_not_deadlocked() -> None:
 
     log_foundry.configure(service="factory", sink_factory=reentrant)
     _buffer, saved = _capture_stderr()
-    worker = threading.Thread(target=log_foundry.info, args=("triggering",))
+    worker = threading.Thread(target=log_foundry.info, args=("triggering",), daemon=True)
     try:
         worker.start()
         worker.join(5.0)
