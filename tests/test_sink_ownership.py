@@ -19,7 +19,6 @@ import pathlib
 import socket
 import threading
 import time
-from typing import TYPE_CHECKING
 
 import pytest
 
@@ -33,9 +32,6 @@ from log_foundry.sinks.transform import TransformSink
 from test_fork_lifecycle import run_in_child
 
 pytestmark = pytest.mark.usefixtures("no_close_left_in_flight")
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
 
 
 class RecordingSink:
@@ -75,20 +71,8 @@ class StructuralSink:
         self.closed += 1
 
 
-@pytest.fixture(autouse=True)
-def _clear_ownership_record() -> Iterator[None]:
-    """Empties the process-global record around each test.
-
-    It is write-once and holds a strong reference for the life of the process, which is correct
-    in an application and would otherwise carry one test's sinks into the next.
-    """
-    with _lifecycle._state._owned_lock:
-        _lifecycle._state._owned.clear()
-    _lifecycle._state._marking_failed = False
-    yield
-    with _lifecycle._state._owned_lock:
-        _lifecycle._state._owned.clear()
-    _lifecycle._state._marking_failed = False
+# The ownership record and its failure flag are emptied around every test by
+# `conftest._reset_worker` (SPEC-079), which this file's own fixture did until then.
 
 
 # -- FR-001: the acquisition record ------------------------------------------------------------

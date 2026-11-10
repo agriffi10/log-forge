@@ -349,6 +349,14 @@ How the marking frontier reads and what it changes:
 - **The bound.** It is bounded by `_MARKING_CEILING` visits across both groups. Tripping the bound
   sets `_marking_failed` and writes today's `_diag.lost` line. Because the repair frontier is
   drained first, a trip cannot cost a holder on the repair frontier its repair or its hook.
+- **The record seeds are what tripped the ceiling in the suite.** `_state._owned` holds a strong
+  reference to every sink the process ever stamped, and no conftest fixture cleared it, so in each
+  xdist worker it grew for the whole session until a child's record-seed walk passed
+  `_MARKING_CEILING` and announced it. `tests/conftest.py`'s reset now clears the record and
+  `_marking_failed`, and the per-file fixture in `tests/test_sink_ownership.py` moves there. The
+  same growth is not test-only: a long-lived process that reconfigures with buffering sinks and
+  then forks grows the record the same way, which `architecture.md` §13 records as a constraint
+  and a separate session fixes.
 
 After both frontiers, each sink-shaped object that the walk recorded is written with
 `_owned.setdefault(id(sink), (_FOREIGN, sink))` under `_state._owned_lock`, as `_mark_inherited`
@@ -1089,3 +1097,9 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   sinks. The `sink_factory` refusal is named `config._require_factory`, and the user-class case
   moves to §13.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- Build: the `test_a_child_of_a_process_that_built_no_worker_is_silent` failure on `44db79a6` was
+  the marking ceiling tripping on an ownership record that grows for the life of the process,
+  which this spec's record seeds keep. Measured at `44db79a6`: one xdist worker ended a full run
+  at 92,940 marking visits, and a two-test reproducer fails deterministically. The conftest reset
+  now clears the record, which fixes the suite; a long-lived process that reconfigures and forks
+  grows it the same way, recorded in `architecture.md` §13 and handed to its own session (A1).
