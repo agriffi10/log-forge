@@ -15,11 +15,13 @@ For a plan: turn the spec's Implementation Phases into a concrete plan; validate
 the plan rests on that nobody has checked.
 
 For a build: first switch to the branch your brief names, in your own worktree (`git switch
-<name>`), and confirm with `git log --oneline -1` that its head is the SHA the brief gives — your
-worktree starts elsewhere, and `docs/process/agent-roles.md` → *The implementer's branch* says
-why. Then work the reviewed plan's phases in order, straight through. Triage emergent issues by
-kind — reversible or technical, decide and note it; product-changing or ambiguous, STOP and return
-with options and a recommendation. Get this repo's gates green: `poetry run ruff check .`,
+<name>`). When the brief instead names another worktree's path, because that worktree holds the
+branch, work there with `cd <path> && …` in every call. Either way, confirm with
+`git log --oneline -1` that the head is the SHA the brief gives: your worktree starts elsewhere,
+and `docs/process/agent-roles.md` → *The implementer's branch* says why. Then work the reviewed
+plan's phases in order, straight through. Triage emergent issues by kind — reversible or
+technical, decide and note it; product-changing or ambiguous, STOP and return with options and a
+recommendation. Get this repo's gates green: `poetry run ruff check .`,
 `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
 `poetry run python scripts/docstring-lint.py`, plus a linter's own `-test.sh` corpus whenever you
 changed that linter, plus whatever CI will run on the branch (`.github/workflows/`) — that list is

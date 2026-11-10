@@ -36,7 +36,8 @@ is pushed from:
 
 - The orchestrator cuts the implementer's branch, under a name for the implementer and never its own
   session branch, from a freshly fetched `origin/main` in its own worktree
-  (`git switch -c <name> origin/main`), and commits the `In Progress` transition there
+  (`git switch --no-track -c <name> origin/main`, since a branch tracking `main` offers to push to
+  it), and commits the `In Progress` transition there
   (`session-rhythm.md`, step 4). It then runs `git switch --detach origin/main`, which frees the
   branch for the implementer and leaves its own worktree holding no unpushed commit: after the
   squash merge, `scripts/supervisor/done_check.py` reads any commit in `origin/main..HEAD` there as
@@ -45,6 +46,10 @@ is pushed from:
 - The orchestrator briefs the implementer with the branch name and that commit's SHA. The
   implementer runs `git switch <name>` in its own worktree, confirms `git log --oneline -1` shows
   that SHA, builds there, and names the SHA in its report.
+- A later implementer round on the same branch (fixes for a review finding, or a later PR's phases)
+  cannot switch to it, because the first implementer's worktree still holds it. Resume the same
+  implementer with `SendMessage`, or brief a new one with the first worktree's absolute path, where
+  it works by `cd <path> && …` in every call instead of switching.
 - The completion ritual (`completion-ritual.md`) is committed on the implementer's branch, in the
   implementer's worktree, before the diff reviews, because that is the branch that is pushed. The
   `spec-author` has no worktree of its own, so the orchestrator briefs it with that worktree's
@@ -53,8 +58,9 @@ is pushed from:
 - The orchestrator runs both diff reviews against that branch's head SHA. Each reviewer is briefed
   with the exact SHA, checks it out detached in its own worktree and confirms its tree with
   `git log --oneline -1` before reviewing.
-- The orchestrator runs `acquire`, the push and the PR from the implementer's worktree path, because
-  the queue lock records the branch it was acquired on (`scripts/pr-queue/PROTOCOL.md`).
+- The orchestrator runs `acquire`, the push (`git push -u origin <name>`) and the PR from the
+  implementer's worktree path, because the queue lock records the branch it was acquired on
+  (`scripts/pr-queue/PROTOCOL.md`).
 
 ## Fences
 
