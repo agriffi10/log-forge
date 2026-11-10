@@ -552,7 +552,19 @@ count's pair.
 beside the token sets it already empties. The inherited worker keeps the liveness its epoch gives
 it. A child forked inside SPEC-078's `_shutdown_running` window, or in the drain's tail
 (`_lifecycle.py:1875`), inherits that worker as its live worker either way. Neither field is read by
-SPEC-078's `_current` rules, so `_current` stays `inherited` and no `_move` is added.
+SPEC-078's `_current` rules.
+
+**A child re-settles what a fork inside a critical section half-wrote.** A fork landing inside one
+of SPEC-078's four sections, between a field write and that section's `_move`, leaves a child
+whose stored state differs from its derived one: the parent thread holds `_state._lock`, the
+roster gives the child a fresh one, and the child sees the fields written up to the fork point.
+The same fork inside `_get_worker`, between `_state._worker = worker` and the arm, leaves a live
+worker's sink unowed, so a re-acquired `FileSink` is never closed by the child. So
+`_clear_after_fork` takes `_state._lock`, arms the live worker's sink when the owed record lacks
+it, and calls `_state._move()`, which makes it a fifth `_move` site. SPEC-078's inventory row for
+`_current` becomes `("inherited", "reset: _lifecycle._clear_after_fork")`, and
+`docs/decisions/pipeline/lifecycle-state-has-one-holder-runtime-and-state-observes-it.md`'s fence
+is rewritten to name the fifth site.
 
 The observable asserted is the field values. A caller-visible consequence was not constructed:
 once a child builds a worker, every later `shutdown()` in it takes the worker branch, which never
@@ -585,7 +597,12 @@ reads `_late_worker`. SPEC-077's inventory rows for both fields change from `inh
   `_late_worker` is `None`, and its `@trace` events are delivered. Removing either reset from
   `_clear_after_fork` turns its case red.
 - [ ] SPEC-077's inventory test passes with both rows reading `reset: _clear_after_fork`, and
-  SPEC-078's `_move` AST scan still finds exactly four sites.
+  SPEC-078's `_move` AST scan finds the four sections and `_clear_after_fork`, named.
+- [ ] A child forked while a parent thread is parked inside `_get_worker`'s section, between
+  `_worker =` and the arm, reads a stored state equal to the derived one, owes the live worker's
+  sink, and closes the `FileSink` it re-acquired at its `shutdown()`. Removing the `_move` or the
+  arm from `_clear_after_fork` turns it red. Every parking patch is gated on the parent's pid, so
+  the child never runs it.
 - [ ] `architecture.md` §13's fork-boundary item names the runtime's roots, and no sentence in
   `docs/architecture.md` or `src/` says the repair walk starts from the package's modules.
 - [ ] Invariants 2, 5, 6 and 12: a child forked mid-drain delivers its own events exactly once on
@@ -1192,3 +1209,8 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
 - Build: the Documentation section gains `docs/invariants.md` §12, whose recorded exception
   named the counters reach and the third-party-wrapper boundary, and the §13 residual for a
   package object reachable only through a bound method, closure or partial (A11).
+- Build: a fork landing between a section's field write and its `_move` left a child whose stored
+  state differs from its derived one, and a fork inside `_get_worker` between `_worker =` and the
+  arm left a live worker's sink unowed (a re-acquired `FileSink` then never closed by the child).
+  `_clear_after_fork` re-settles both, which makes it a fifth `_move` site, and the lifecycle-state
+  decision's fence is rewritten to name it (A2).

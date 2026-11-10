@@ -842,6 +842,12 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
         ),
         ("_note_orphan_emit", "arm", 0): "armed — the emit that landed owns the close",
+        ("_clear_after_fork", "arm", 0): (
+            "armed — a child forked inside `_get_worker`'s section, between `_worker =` and the "
+            "arm, has a live worker whose sink is unowed; the child re-arms it so its own "
+            "`shutdown()` closes what it re-acquired (SPEC-079 FR-004). Only when the record "
+            "lacks it, which in an unbroken fork it never does"
+        ),
         ("_swap_sink", "arm", 0): (
             "armed — no live worker: the sink configure() just installed is owed a close, armed "
             "only when something already was"

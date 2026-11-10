@@ -915,19 +915,25 @@ INVENTORY: dict[Key, Row] = {
     ),
     _rt("_lock"): Row("Runtime", _R, "the state lock"),
     _rt("_worker"): Row("Runtime", _INH, "the process worker; guarded by _lock, read unlocked"),
-    _rt("_late_worker"): Row("Runtime", _INH, "a worker built inside a no-worker shutdown"),
+    _rt("_late_worker"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "a worker built inside a no-worker shutdown; the count's pair (SPEC-079 FR-004)",
+    ),
     _rt("_closes"): Row(
         "Runtime", _INH, "the close registry (SPEC-078); its lock is on the roster (SPEC-079)"
     ),
     _rt("_current"): Row(
-        "Runtime", _INH, "the stored settled state; inherited, which is exact (SPEC-078 FR-003)"
+        "Runtime",
+        ("inherited", "reset: _lifecycle._clear_after_fork"),
+        "the stored settled state; inherited, then re-settled for a fork inside a section",
     ),
     _rt("retirements"): Row("Runtime", _INH, "the retirement count"),
     _rt("_atexit_registered"): Row("Runtime", _INH, "the exit handler is registered once"),
     _rt("_shutdown_running"): Row(
         "Runtime",
-        _INH,
-        "no-worker shutdown depth; a child inheriting it is a known defect left to SPEC-079",
+        ("reset: _lifecycle._clear_after_fork",),
+        "no-worker shutdown depth; no such call survives a fork (SPEC-079 FR-004)",
     ),
     _rt("_stop"): Row(
         "Runtime",

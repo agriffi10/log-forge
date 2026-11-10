@@ -1158,7 +1158,7 @@ for any other route by which the walk might reach it.
 
 
 def _clear_after_fork() -> None:
-    """Drops the in-flight close entries a child inherited (SPEC-054 FR-003, SPEC-078 FR-001).
+    """Drops what no thread will finish in a child, and re-settles its state (SPEC-078, SPEC-079).
 
     An entry is discharged by a ``finally`` on the thread performing the close — and a
     forked child has only the thread that called ``fork()``, so every inherited entry is one
@@ -1183,9 +1183,29 @@ def _clear_after_fork() -> None:
     (SPEC-054 FR-006): with a per-sink registration there is no second thing that can be left
     inconsistent, and the in-flight events are dropped here with their entries.
 
-    **It is the transition table's ``FORK`` entry** (SPEC-078 FR-003). The child's stored state,
-    :attr:`Runtime._current`, is inherited as the parent held it and is not re-derived here: the
-    fields it is a function of are inherited with it, so it is exact.
+    **It is the transition table's ``FORK`` entry** (SPEC-078 FR-003), and since SPEC-079 it is
+    the fifth site that calls :meth:`Runtime._move`. The fields :attr:`Runtime._current` is a
+    function of are inherited with it, which made the stored state exact — unless the fork landed
+    inside one of the four sections, between a field write and that section's ``_move``. A parent
+    thread holds ``_state._lock`` there, the roster gives the child a fresh one, and the child
+    sees the fields written up to the fork point and the state from before them. So the handler
+    re-settles: it takes ``_state._lock``, which the roster replaced, and calls ``_move`` over
+    the fields as they are. That is not an equivalent mutant of SPEC-078's "inherited, so exact":
+    measured, a child forked inside ``_get_worker``'s section read a stored state that differed
+    from the derived one.
+
+    **The same fork inside ``_get_worker`` left a live worker's sink unowed**, between
+    ``_state._worker = worker`` and the arm. A re-acquired ``FileSink`` the child then owned was
+    never closed by the child's ``shutdown()``, which closes only owed sinks. So the handler arms
+    the live worker's sink when the owed record lacks it, which in an unbroken fork it never does.
+
+    **It resets the no-worker shutdown count and the late worker** (SPEC-079 FR-004).
+    ``_shutdown_running`` counts the no-worker ``shutdown()`` calls inside their body, and no such
+    call survived the fork; inherited, every worker the child built was registered as
+    ``_late_worker`` for a shutdown that would never come (SPEC-077's measurement).
+    ``_late_worker`` is the count's pair. The inherited worker keeps the liveness its epoch gives
+    it, so a child forked inside the ``_shutdown_running`` window inherits that worker as its live
+    worker either way.
 
     **It also empties the two token sets** (SPEC-077 FR-002), for the same reason as the
     registry: a token is discarded by a ``finally`` in the ``_swap_sink`` or ``_shutdown_worker``
@@ -1203,10 +1223,17 @@ def _clear_after_fork() -> None:
     Raises:
       None.
     """
-    with _state._closes._lock:
-        _state._closes._in_flight.clear()
-        _state._swaps_running.clear()
-        _state._stops_running.clear()
+    with _state._lock:
+        with _state._closes._lock:
+            _state._closes._in_flight.clear()
+            _state._swaps_running.clear()
+            _state._stops_running.clear()
+        _state._shutdown_running = 0
+        _state._late_worker = None
+        worker = _state.live_worker()
+        if worker is not None and id(worker.sink) not in _state._closes.owed:
+            _state._closes.arm(worker.sink)
+        _state._move()
 
 
 _FOREIGN = -1

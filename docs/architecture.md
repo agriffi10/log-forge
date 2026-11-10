@@ -678,13 +678,23 @@ decorated call ends
   hung permanently in `info()` on the application's own thread. `_fork.py` registers **one**
   `os.register_at_fork(after_in_child=…)` handler, whose order of work is the contract:
 
-  1. **Re-initialise every lock and event the library owns**, found by walking this package's
-     modules and descending only into objects it defines and plain containers. A lock that was
-     not held is replaced too — asking whether one is held has no answer that is not itself a
-     race — and an identity memo keeps two holders of one primitive sharing it, which is what
-     stops a sink's `log_foundry_stop_signal` drifting from the worker's `_stop`. An AST lint
-     forbids building a primitive anywhere the walk cannot write it back, so a lock added by a
-     later spec is picked up with no edit.
+  1. **Re-initialise every lock and event the library owns**, in two steps sharing one identity
+     memo (SPEC-079). First the package's **global** primitives, listed in one roster,
+     `_fork._GLOBAL_PRIMITIVES` — the runtime's state, stop, record and close-registry locks,
+     the config lock, the decorator's two and the console's — which `tests/test_fork_roster.py`
+     holds complete from a live sweep of every module global and an AST scan of every class
+     that assigns a primitive to `self`. Then **one walk from the runtime's roots**, the
+     configured sink, the worker and the late worker: its repair frontier enters this package's
+     objects and sinks, reads a container one level deep and replaces every lock and event on
+     each package holder; its marking frontier follows what the repair frontier forwarded, a
+     third-party wrapper's namespace and the containers, first in first out under a visit
+     ceiling, then the records. A lock that was not held is replaced too — asking whether one is
+     held has no answer that is not itself a race — and the memo keeps two holders of one
+     primitive sharing it, which is what stops a sink's `log_foundry_stop_signal` drifting from
+     the worker's `_stop` and from the roster's `_state._stop`. Every read the walk makes is
+     static, so no attribute hook of a sink runs. A registry of live `SinkCounters` repairs
+     every engine sink's counters whatever holds them. An AST lint forbids building a primitive
+     anywhere the repair cannot write it back.
   2. **Re-acquire what can be re-acquired.** A fork landing inside `emit`, after the write loop
      and before the flush, leaves both processes holding the same pending bytes; the child
      strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
@@ -692,8 +702,10 @@ decorated call ends
      larger half (SPEC-042 FR-005): a sink that returns from it has claimed the transport as
      **this process's own**, which is what makes releasing it safe later. Which hooks returned
      is published, not acted on — ownership is `_lifecycle`'s.
-  3. **Run the registered handlers**, `_lifecycle`'s inherited-sink marking first and
-     `decorator`'s worker rebuild after it. The worker is rebuilt **in place** with a fresh
+  3. **Run the registered handlers**, in order: the reclaim of every sink whose hook returned,
+     the clearing of what no thread will finish (in-flight closes, the token sets, the
+     no-worker shutdown count and the late worker, then a re-settle of the stored state), the
+     adoption of a `sink_factory` (FR-006 of SPEC-079), and the worker rebuild. The worker is rebuilt **in place** with a fresh
      queue and zeroed counters, so ownership guards keyed on `_worker.sink is X` survive; a
      retired parent forks a retired child, since a fork does not undo a `shutdown()`.
 
@@ -970,15 +982,6 @@ close it.
   must not become a *loss* — A keeps taking events through the wrapper, is owed a further close,
   and delivers everything. **Closed by** not releasing a sink reachable from the graph just handed
   over, which is decidable only against a live config read.
-- **`_fork._reinit_primitives` can exhaust memory, not merely hang.** Its container read is
-  `list(container)`, so a `list` subclass with a non-terminating `__iter__` reachable from any
-  sink never returns — measured 5.7 GB RSS in nine minutes, with the parent unable to kill the
-  child because it was being starved. SPEC-039 declined to bound this walk because an unfound
-  lock is a child that hangs with no safe degradation, and SPEC-042 bounded its own two walks
-  and explicitly left this one. **Closed by** giving the repair walk the fallback the marking
-  walk has, so a cap degrades to a leaked handle rather than a hung child; it is SPEC-039's to
-  change. It sits here rather than in §13 because it has a named remedy nobody has scheduled,
-  which is this section's criterion.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
   of it is the seam lint guarding the prose in its own data table rather than the rule. The case
@@ -1144,6 +1147,17 @@ close it.
   per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
 
 ### Resolved
+
+- ~~**`_fork._reinit_primitives` can exhaust memory, not merely hang.**~~ → **closed by SPEC-079.**
+  Its container read was `list(container)`, so a `list` subclass with a non-terminating
+  `__iter__` reachable from any sink never returned — measured 5.7 GB RSS in nine minutes, with
+  the parent unable to kill the child because it was being starved. The module-wide walk is
+  deleted; the one walk from the runtime's roots reads every container through its builtin
+  base's own iteration, so a subclass's `__iter__` never runs, and bounds every read by
+  `_MARKING_CEILING`. A graph genuinely larger than the ceiling trips the marking frontier, which
+  degrades to a leaked handle; the repair frontier reads one level and has no visit cap.
+  `tests/test_sink_ownership.py::test_a_runaway_container_trips_the_ceiling_and_refuses_everything`
+  runs it in a real child.
 
 - ~~**An empty `auth` token or pair is accepted, and sends an empty credential**~~ (HTTP auth fix's
   frame-2 review; invariant 13) → **closed by the 1.2.0 follow-up fix (no spec)**, by refusal, at
@@ -1882,10 +1896,14 @@ and a third copy is a fork with no merge.
   audit; the AC that recorded it named two sites, and re-auditing the rule rather than the line
   (`docs/process/reviewer-contract.md`) found the third.
 
-- **A fork's repair stops at the library's own objects, and five things sit outside it**
-  (SPEC-039 FR-005). The child's walk descends into what this package defines and the plain
-  containers those objects hold (§9); everything below is reachable only by reaching into
-  somebody else's state, which would be a fork fix that breaks a driver.
+- **A fork's repair stops at the library's own objects, and the things below sit outside it**
+  (SPEC-039 FR-005, SPEC-079). The child's one walk starts from the runtime's roots — the
+  configured sink, the worker and the late worker — and replaces locks only on what this package
+  defines; it reaches a package object behind a third-party holder, or two containers down, from
+  what its repair frontier forwards to its marking frontier, which repairs and re-acquires it
+  **within that frontier's ceiling** (§9). What follows is reachable only by reaching into
+  somebody else's state, which would be a fork fix that breaks a driver, or lies beyond that
+  reach.
 
   - **A third-party client that buffers across `emit`.** `KafkaSink`'s producer holds a local
     batch and `GooglePubSubSink` holds unresolved futures, so a fork mid-batch there can still
@@ -1905,10 +1923,16 @@ and a third copy is a fork with no merge.
     Inheriting from `Sink` or from a shipped sink is what brings it inside. The one consequence
     that would otherwise break an earlier guarantee is closed separately: the worker rebuild
     **re-offers** its fresh stop signal, so SPEC-027's interruptible backoff still holds for a
-    sink the walk cannot enter. The same boundary holds for a **shipped** sink held inside a
-    third-party wrapper the walk does not enter: since SPEC-069 `StdoutSink`, `FileSink`,
-    `RotatingFileSink` and `SQLiteSink` carry a `_counter_lock` as well, and inside such a
-    wrapper it is not repaired, exactly like the third-party sink's own lock.
+    sink the walk cannot enter. A **shipped** sink held inside a third-party wrapper is repaired
+    and re-acquired since SPEC-079, from the forwarded seeds, within the marking ceiling; past a
+    tripped ceiling it is neither. Its `SinkCounters`, and every engine sink's, are repaired
+    whatever holds them, from a registry of the live ones.
+  - **A package object reachable only through a callable is neither repaired nor marked**
+    (SPEC-079). A third-party wrapper that keeps `self._emit = file_sink.emit`, a closure cell or
+    a `functools.partial` holds the sink where no reading walk follows: descending into callables
+    routinely escapes into application state through a callback's closure or a bound method's
+    `self`, which would trip the ceiling and refuse every unrecorded sink in every child. Hand the
+    library the sink itself, or build it in the worker process with `sink_factory=`.
   - **The converse costs a mixed-base class its foreign attributes.** Ownership is keyed on the
     whole MRO, because subclassing a shipped sink is a documented extension point and a
     defining-module test walked straight past a `_lock` that `FileSink.__init__` built — measured,
@@ -1917,7 +1941,22 @@ and a third copy is a fork with no merge.
     told apart from the instance, and refusing the mixed case would mean refusing the sink's own
     lock with it.
   - **A sink the application holds but never gave the library is not reached at all** — the walk
-    starts from this package's modules. Same accepted boundary the locks already carry.
+    starts from the runtime's roots, and such a sink is reachable from none of them. Same accepted
+    boundary the locks already carry; `sink_factory=` is the library's way to build the sink in
+    the worker process instead.
+
+- **The ownership record grows for the life of the process, and a forked child walks all of it**
+  (SPEC-079). `_state._owned` holds a strong reference to every sink the process ever stamped
+  (SPEC-042 FR-001), and a child's marking frontier seeds from every one of those references,
+  bounded by `_MARKING_CEILING`. A long-lived process that reconfigures with buffering sinks and
+  then forks therefore grows the walk until every child trips the ceiling, announces it, and
+  refuses every sink it has no record of — a leaked handle in each child, never a destructive
+  close. Measured in the suite at `44db79a6`: one xdist worker's record had grown to 92,940
+  marking visits by the end of a run, which is how
+  `test_a_child_of_a_process_that_built_no_worker_is_silent` failed; the suite's own reset now
+  clears the record between tests. The remedy — the record seeds not descending into a
+  superseded sink's caller data, or released sinks pruned from the record — changes SPEC-042's
+  settled strong-reference record and is work of its own.
 
 - **A forked child releases only a transport it acquired in *this* process, and what that
   cannot decide is listed here** (SPEC-042). The record is stamped when the library is handed a

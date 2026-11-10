@@ -23,7 +23,8 @@ changed.
 which turns this literal red by design. The diff from SPEC-078's literal is exactly: their two
 ``_state._owned_lock`` sites leave, and the same lock's two sites in the one walk that replaced
 them enter (``_record_seeds``, reading the record as a seed, and ``_walk_after_fork``, writing
-the marks).
+the marks). ``_clear_after_fork`` also takes ``_state._lock``, outside the registry's leaf, to
+reset the shutdown count and the late worker and re-settle the stored state (FR-004).
 """
 
 from __future__ import annotations
@@ -79,6 +80,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_CloseRegistry._enter", "self._lock"): 1,
             ("_CloseRegistry.finish", "self._lock"): 1,
             ("_clear_after_fork", "_state._closes._lock"): 1,
+            ("_clear_after_fork", "_state._lock"): 1,
             ("_record_seeds", "_state._owned_lock"): 1,
             ("_walk_after_fork", "_state._owned_lock"): 1,
             ("reclaim", "_state._owned_lock"): 1,

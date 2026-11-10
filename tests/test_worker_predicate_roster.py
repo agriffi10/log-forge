@@ -191,6 +191,25 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "order to prove there is nothing to drain."
         ),
     ),
+    ("_clear_after_fork", "_state.live_worker()", 0): (
+        LIVENESS,
+        (
+            "which worker's sink the child must owe a close (SPEC-079 FR-004). Liveness, because "
+            "the arm says a worker will deliver to that sink and a retired worker performs "
+            "nothing: a retired child's sink is owed only if the parent already owed it."
+        ),
+    ),
+    (
+        "_clear_after_fork",
+        "worker is not None and id(worker.sink) not in _state._closes.owed",
+        0,
+    ): (
+        LIVENESS,
+        (
+            "the arm's guard: a live worker whose sink a fork inside `_get_worker`'s section left "
+            "unowed. The live result of the call above, so the same question, asked once."
+        ),
+    ),
     ("_rebuild_worker_after_fork", "_state.live_worker() is not None", 0): (
         LIVENESS,
         (
