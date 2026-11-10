@@ -102,6 +102,16 @@ diff, and on code it builds the thing and runs the suites. Its starting point is
 keeps it on every **twin path** (invariant 6), not only the path the spec names — a fix applied to
 one twin is a recurring shape in this repo's history, and the page names examples.
 
+**The review gates the push, not the merge**
+
+Pushing first and reviewing after inverts the gate: the branch is already public, the fixes arrive
+as follow-up commits, and the review reads as commentary on something that has already happened
+rather than as the thing that decides whether it should. **Green CI is not a review and never was**
+— CI cannot see a test that passes against the bug it claims to catch, a lock taken in the wrong
+order, or an acceptance criterion ticked with no evidence. SPEC-028 merged green and a review then
+found a sink that could hang an application thread forever; that review is the one that now happens
+before the push.
+
 **Rotating the frame — why round count is the wrong exit criterion**
 
 Review rounds converge on the frame they are given, not on correctness. Measured on SPEC-033
