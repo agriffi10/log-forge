@@ -11,7 +11,8 @@
 #     below for the accepted spellings and the Completed exemption).
 # ERROR (exit 2): the shared frontmatter reader (`frontmatter.awk`, beside this script) is missing,
 #   failed, or returned no verdict for a file — the frontmatter checks cannot run, and a check that
-#   cannot run must not read as one that passed.
+#   cannot run must not read as one that passed. Also a run stopped by a signal (HUP, INT, PIPE or
+#   TERM), which printed nothing it can stand by.
 # WARN (exit 0): soft issues — unfilled template placeholders, FRs with no acceptance
 #   criteria, and a spec carrying more FRs than one buildable slice should (see
 #   FR_CEILING below). The ceiling is a warn, not a fail: an indivisible spec can
@@ -58,8 +59,11 @@ MISSING="$SCRATCH.missing"
 REC="$SCRATCH.rec"
 ONE="$SCRATCH.one"
 FMF="$SCRATCH.fm"
+# A signal EXITS, and the EXIT trap then cleans up: a handler that only cleaned up let the shell
+# resume after it with its scratch gone. HUP and PIPE are trapped too, because dash runs no EXIT
+# trap when a signal kills it. `scripts/signal-test.sh` (template repo only) holds every script to this.
 trap 'rm -f "$MISSING" "$REC" "$ONE" "$ONE.err" "$FMF"' EXIT
-trap 'exit 1' INT TERM
+trap 'exit 2' HUP INT PIPE TERM
 # The invariants page sits beside the spec directory, not beside this script: the lint is
 # run with a spec directory argument, and the corpus runs it against a scratch tree.
 INVARIANTS="$(dirname "$SPEC_DIR")/invariants.md"
