@@ -7,13 +7,21 @@ import os
 import sys
 import threading
 import types
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from log_foundry import _diag
-from log_foundry.sinks.base import _class_member, _instance_dict, _static_value
+from log_foundry.sinks.base import (
+    _ABSENT,
+    _MEMBER_GET,
+    _MRO,
+    _NAMESPACE,
+    _class_member,
+    _instance_dict,
+    _static_value,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
 _PACKAGE = __name__.rpartition(".")[0]
 """This package's import name, derived rather than written.
@@ -25,9 +33,24 @@ repair nothing.
 
 _RLOCK_TYPE = type(threading.RLock())
 
-_LOCK_TYPES: tuple[type, ...] = (type(threading.Lock()), _RLOCK_TYPE)
+_LOCK_TYPE = type(threading.Lock())
 
 _CONTAINER_TYPES: tuple[type, ...] = (list, tuple, set, frozenset, dict, collections.deque)
+
+_PLAIN_TYPE_IDS = frozenset(
+    id(kind)
+    for kind in (dict, list, tuple, set, frozenset, str, bytes, int, float, bool, type(None))
+)
+"""The ids of the builtin types that provably cannot be a sink, read by ``_lifecycle``.
+
+A fact rather than a heuristic: ``Sink`` requires ``emit`` and ``close``, and no builtin has
+either. Tested by **exact type**, so a ``class MySink(dict)`` is still asked, and by the type's
+**id**, so the test hashes an ``int`` and never the type: a frozenset of the types themselves
+hashed every value's type, which runs a metaclass ``__hash__``, and compared it on a collision,
+which runs a metaclass ``__eq__`` (SPEC-079 FR-002). Each is a builtin type alive for the
+process, so its id is stable. Defined here rather than in ``_lifecycle`` because the lifecycle
+inventory reads a ``frozenset`` built from a generator there as module state.
+"""
 
 _COUNTERS_ATTRIBUTE = "log_foundry_counters"
 """The one attribute the walk reads on a value it would not otherwise enter (SPEC-072 FR-003)."""
@@ -111,6 +134,11 @@ recording the registration somewhere outside this module, which is a worse trade
 def _defined_here(cls: type) -> bool:
     """Whether one class was defined in this package.
 
+    The defining module is read from the class's own namespace through ``sinks.base._NAMESPACE``
+    and accepted only as an exact ``str``, so no metaclass ``__module__`` property runs and no
+    ``__eq__`` or ``startswith`` of a planted ``str`` subclass is called (SPEC-079 FR-002). A
+    builtin type carries no ``__module__`` in its own namespace and is never this package's.
+
     Args:
       cls: The class to place.
 
@@ -120,8 +148,44 @@ def _defined_here(cls: type) -> bool:
     Raises:
       None.
     """
-    module = getattr(cls, "__module__", "") or ""
+    module = _NAMESPACE(cls).get("__module__")
+    if type(module) is not str:
+        return False
     return module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
+
+
+def _is_class(value: object) -> bool:
+    """Whether a value is a class, decided from its real type's MRO and never from ``__class__``.
+
+    ``isinstance(value, type)`` falls back to the value's ``__class__`` when its real type is not a
+    subclass, which runs a ``__class__`` property or a ``__getattribute__`` the value defines.
+    The real type's MRO, read through ``sinks.base._MRO`` and compared by identity, runs nothing.
+
+    Args:
+      value: Any object.
+
+    Returns:
+      Whether ``type`` is in the MRO of the value's real type.
+
+    Raises:
+      None.
+    """
+    return any(base is type for base in _MRO(type(value)))
+
+
+def _is_module(value: object) -> bool:
+    """Whether a value is a module, decided statically as :func:`_is_class` decides a class.
+
+    Args:
+      value: Any object.
+
+    Returns:
+      Whether ``types.ModuleType`` is in the MRO of the value's real type.
+
+    Raises:
+      None.
+    """
+    return any(base is types.ModuleType for base in _MRO(type(value)))
 
 
 def _is_owned(value: object) -> bool:
@@ -145,6 +209,10 @@ def _is_owned(value: object) -> bool:
     which is the boundary FR-005 states — the two cannot be told apart from the instance, and
     refusing the mixed case would mean refusing the sink's own lock with it.
 
+    **Every read is static** (SPEC-079 FR-002): whether the value is a class, and the MRO asked,
+    come from the value's real type through ``sinks.base._MRO``, so no ``__class__`` property,
+    ``__getattribute__`` or metaclass ``__mro__`` of the value runs.
+
     Args:
       value: Any object, including a class.
 
@@ -154,17 +222,70 @@ def _is_owned(value: object) -> bool:
     Raises:
       None.
     """
-    owner = value if isinstance(value, type) else type(value)
-    return any(_defined_here(base) for base in getattr(owner, "__mro__", (owner,)))
+    owner = value if _is_class(value) else type(value)
+    return any(_defined_here(base) for base in _MRO(owner))
+
+
+def _container_base(value: object) -> type | None:
+    """Returns the builtin container type a value's real type derives from, or ``None``.
+
+    Read from the real type's MRO and compared by identity, so neither ``__class__`` nor a
+    metaclass ``__eq__`` runs. The builtin base is what the walk iterates a container through,
+    never the subclass, so a subclass's own ``__iter__``, ``keys`` or ``values`` is never
+    entered (SPEC-079 FR-002).
+
+    Args:
+      value: Any object.
+
+    Returns:
+      The member of :data:`_CONTAINER_TYPES` in the value's MRO, or ``None``. At most one can
+      be: no class derives from two of them, since their layouts conflict.
+
+    Raises:
+      None.
+    """
+    chain = _MRO(type(value))
+    for kind in _CONTAINER_TYPES:
+        if any(base is kind for base in chain):
+            return kind
+    return None
+
+
+def _storage_iterators(container: object) -> list[Iterator[object]]:
+    """Returns iterators over a container's real storage, through its builtin base's own methods.
+
+    ``dict.keys`` and ``dict.values`` for a mapping, and the builtin base's unbound ``__iter__``
+    otherwise, so a subclass's own ``__iter__``, ``keys`` or ``values`` never runs (SPEC-079
+    FR-002). The iterators are lazy: the caller bounds how far each is read.
+
+    Args:
+      container: Any object.
+
+    Returns:
+      Two iterators for a mapping (keys, then values), one for any other container, and none
+      for a value that is not a container.
+
+    Raises:
+      None.
+    """
+    base = _container_base(container)
+    if base is None:
+        return []
+    if base is dict:
+        held = cast("dict[object, object]", container)
+        return [iter(dict.keys(held)), iter(dict.values(held))]
+    iterate = cast("Callable[[object], Iterator[object]]", _NAMESPACE(base)["__iter__"])
+    return [iterate(container)]
 
 
 def _is_container(value: object) -> bool:
     """Whether the walk reads this value's members as well as its attributes.
 
-    ``isinstance`` rather than an exact-type test, so a ``deque``, a ``defaultdict`` or any
+    A subclass test rather than an exact-type test, so a ``deque``, a ``defaultdict`` or any
     other ordinary subclass is entered: an exact tuple made membership depend on which concrete
     class a future sink happened to hold its children in, which is the guess FR-003 AC-3 exists
-    to replace.
+    to replace. Decided by :func:`_container_base` from the real type's MRO, so the question
+    runs none of the value's code.
 
     Args:
       value: Any object.
@@ -175,7 +296,38 @@ def _is_container(value: object) -> bool:
     Raises:
       None.
     """
-    return isinstance(value, _CONTAINER_TYPES)
+    return _container_base(value) is not None
+
+
+def _sink_shaped(value: object) -> bool:
+    """Whether a value satisfies ``Sink``'s two members, read without running any of its code.
+
+    The static twin of ``isinstance(value, Sink)`` on Python 3.12 and later, whose runtime
+    protocol check reads ``emit`` and ``close`` with ``inspect.getattr_static`` and refuses a
+    member that is ``None``. ``isinstance`` also asks the ABC machinery first, which reads the
+    value's ``__class__`` and hashes and compares its type in the ABC cache, running a
+    ``__class__`` property, a ``__getattribute__`` and a metaclass ``__hash__`` or ``__eq__``
+    (SPEC-079 FR-002, measured through ``configure()``). Here each member is read with
+    ``sinks.base._static_value``. A class is never sink-shaped, whatever functions it carries:
+    the walk records instances it may close, and a class that ``isinstance`` would accept is a
+    named divergence in ``tests/test_fork_static_reads.py``.
+
+    Args:
+      value: Any object.
+
+    Returns:
+      Whether both members resolve, neither to ``None``.
+
+    Raises:
+      None.
+    """
+    if _is_class(value):
+        return False
+    for name in ("emit", "close"):
+        found = _static_value(value, name)
+        if found is _ABSENT or found is None:
+            return False
+    return True
 
 
 def _is_traversable(value: object) -> bool:
@@ -194,9 +346,9 @@ def _is_traversable(value: object) -> bool:
     Raises:
       None.
     """
-    if isinstance(value, types.ModuleType):
-        name = getattr(value, "__name__", "") or ""
-        return name == _PACKAGE or name.startswith(f"{_PACKAGE}.")
+    if _is_module(value):
+        name = _MODULE_DICT(cast("types.ModuleType", value)).get("__name__")
+        return type(name) is str and (name == _PACKAGE or name.startswith(f"{_PACKAGE}."))
     return _is_container(value) or _is_owned(value)
 
 
@@ -231,40 +383,59 @@ def _container_children(container: Any) -> list[Any]:
         return []
 
 
-def _slot_names(holder: object) -> list[str]:
-    """Returns every ``__slots__`` name declared across a holder's class hierarchy.
+_MODULE_DICT: Callable[[types.ModuleType], dict[str, Any]] = _NAMESPACE(types.ModuleType)[
+    "__dict__"
+].__get__
+"""A module's ``__dict__``, read through ``ModuleType``'s own member, so no hook of it runs."""
 
-    A slotted instance keeps its attributes off ``__dict__``, so a walk reading only ``vars()``
-    would miss them. No shipped class needs this today and that is stated rather than dressed
+_SLOT_SEQUENCES: tuple[type, ...] = (tuple, list)
+"""The exact types a ``__slots__`` declaration is read from; anything else declares nothing."""
+
+
+def _slot_names(holder: object) -> list[tuple[type, str]]:
+    """Returns every ``__slots__`` name declared across a holder's class hierarchy, with its class.
+
+    A slotted instance keeps its attributes off ``__dict__``, so a walk reading only the instance
+    dict would miss them. No shipped class needs this today and that is stated rather than dressed
     up: ``worker._FlushMarker`` is slotted and holds an ``Event``, but a marker lives inside a
     ``queue.Queue`` the walk never enters. It is here because the shape lint accepts a slotted
     ``self.<attr>``, so the walk has to be able to reach one.
+
+    **Read statically** (SPEC-079 FR-002): the MRO and each class's namespace through
+    ``sinks.base._MRO`` and ``_NAMESPACE``, and a declaration accepted only as an exact ``str``,
+    or an exact ``tuple`` or ``list`` of exact ``str``, so no metaclass ``__mro__``, no iterator
+    of a planted sequence and no ``__str__`` or ``__eq__`` of a planted name runs.
 
     Args:
       holder: Any object.
 
     Returns:
-      The declared slot names, which may be empty.
+      ``(declaring class, name)`` for each declared slot, which may be empty.
 
     Raises:
       None.
     """
-    names: list[str] = []
-    for cls in type(holder).__mro__:
-        declared = cls.__dict__.get("__slots__", ())
-        if isinstance(declared, str):
-            names.append(declared)
-        else:
-            names.extend(str(name) for name in declared)
+    names: list[tuple[type, str]] = []
+    for cls in _MRO(type(holder)):
+        declared = _NAMESPACE(cls).get("__slots__", ())
+        if type(declared) is str:
+            names.append((cls, declared))
+        elif any(type(declared) is kind for kind in _SLOT_SEQUENCES):
+            names.extend((cls, name) for name in declared if type(name) is str)
     return names
 
 
 def _namespace_items(holder: Any) -> list[tuple[str, Any]]:
-    """Returns the ``(name, value)`` pairs a holder owns, without triggering its properties.
+    """Returns the ``(name, value)`` pairs a holder owns, running none of the holder's code.
 
-    Values come from the instance ``__dict__`` and the slot descriptors rather than from a
-    blanket ``getattr`` over ``dir()``, which would evaluate every property — including ones
-    that open a connection or take the very lock this is about to replace.
+    Values come from the instance ``__dict__``, read through ``sinks.base._instance_dict`` and
+    copied with ``dict.items``, and from the slot member descriptors, rather than from ``vars()``
+    or a blanket ``getattr`` over ``dir()``: ``vars()`` reads ``__dict__`` through the holder's
+    ``__getattribute__`` or a ``__dict__`` property, ``dict()`` of a hostile mapping runs its
+    ``keys`` and ``__getitem__``, and ``getattr`` evaluates every property, including ones that
+    open a connection or take the very lock the walk is about to replace (SPEC-079 FR-002). A
+    class's items are its own namespace through ``_NAMESPACE``, and a module's its ``__dict__``
+    through ``ModuleType``'s member.
 
     Args:
       holder: A module, a class, or an instance.
@@ -273,38 +444,41 @@ def _namespace_items(holder: Any) -> list[tuple[str, Any]]:
       One pair per attribute the holder itself carries.
 
     Raises:
-      None. An attribute that cannot be read is skipped, since a repair that stops at the first
-        awkward object leaves the rest of the process holding dead locks.
+      None. A holder that cannot be read contributes nothing, announced, since a repair that
+        stops at the first awkward object leaves the rest of the process holding dead locks.
     """
-    items: list[tuple[str, Any]] = []
     try:
-        own = dict(vars(holder))
-    except TypeError:
-        own = {}
+        if _is_class(holder):
+            return list(_NAMESPACE(holder).items())
+        if _is_module(holder):
+            return list(dict.items(_MODULE_DICT(holder)))
+        own = _instance_dict(holder)
+        items: list[tuple[str, Any]] = [] if own is None else list(dict.items(own))
+        present = {name for name, _value in items}
+        for cls, name in _slot_names(holder):
+            if name in present:
+                continue
+            value = _slot_value(holder, cls, name)
+            if value is not None:
+                items.append((name, value))
+        return items
     except Exception as exc:
         _diag.absorbed("reading an object's attributes after a fork", exc, "it is not repaired")
         return []
-    items.extend(own.items())
-    if isinstance(holder, types.ModuleType | type):
-        return items
-    for name in _slot_names(holder):
-        if name in own:
-            continue
-        value = _slot_value(holder, name)
-        if value is not None:
-            items.append((name, value))
-    return items
 
 
-def _slot_value(holder: object, name: str) -> Any | None:
-    """Reads one slot, answering ``None`` for a slot that is unset or refuses to be read.
+def _slot_value(holder: object, cls: type, name: str) -> Any | None:
+    """Reads one slot through its member descriptor, answering ``None`` when it is unset.
 
-    Both answers are deliberately the same, because both mean "there is nothing here to
-    replace": a lock is never ``None``, so nothing is lost by conflating them, and an object
-    that raises on attribute access must not end the repair for the rest of the process.
+    Only an exact ``MemberDescriptorType`` in the declaring class's own namespace is read, through
+    its builtin ``__get__``, so no property, ``__getattr__``, ``__getattribute__`` or descriptor
+    of the holder runs (SPEC-079 FR-002). An unset slot, a name the class shadows with anything
+    else, and a read that raises all answer ``None``, because each means "there is nothing here
+    to replace": a lock is never ``None``, so nothing is lost by conflating them.
 
     Args:
       holder: The instance to read from.
+      cls: The class whose ``__slots__`` declared the name.
       name: The slot name.
 
     Returns:
@@ -313,8 +487,11 @@ def _slot_value(holder: object, name: str) -> Any | None:
     Raises:
       None.
     """
+    member = _NAMESPACE(cls).get(name)
+    if type(member) is not types.MemberDescriptorType:
+        return None
     try:
-        return getattr(holder, name, None)
+        return _MEMBER_GET(member, holder, type(holder))
     except Exception:
         return None
 
@@ -376,7 +553,7 @@ def _assign(holder: Any, name: str, value: Any) -> None:
         ``fork``.
     """
     try:
-        if isinstance(holder, types.ModuleType | type):
+        if _is_class(holder) or _is_module(holder):
             setattr(holder, name, value)
         elif (own := _set_only_dict(holder, name)) is not None:
             own[name] = value
@@ -386,7 +563,8 @@ def _assign(holder: Any, name: str, value: Any) -> None:
         _diag.absorbed(
             "re-initialising a lock after a fork",
             exc,
-            f"{type(holder).__name__}.{name} may block the next caller forever",
+            f"{_diag._STR_STR(_diag._STORED_NAME(type(holder)))}.{name} may block the next "
+            f"caller forever",
         )
 
 
@@ -404,6 +582,10 @@ def _fresh_primitive(value: Any, memo: dict[int, Any], keepalive: list[Any]) -> 
       keepalive: Holds every replaced primitive, so no id in ``memo`` can be reused by a later
         object and hand back the wrong replacement.
 
+    The type tests read the value's real type's MRO through ``sinks.base._MRO`` and compare by
+    identity, so no ``__class__`` property of an attribute value runs (SPEC-079 FR-002). An
+    ``Event``'s ``is_set`` is the one call made, and only on a real ``threading.Event``.
+
     Returns:
       The replacement, or ``None`` when this value is not a lock or an event.
 
@@ -414,12 +596,15 @@ def _fresh_primitive(value: Any, memo: dict[int, Any], keepalive: list[Any]) -> 
     if existing is not None:
         return existing
     fresh: Any
-    if isinstance(value, threading.Event):
+    kinds = _MRO(type(value))
+    if any(kind is threading.Event for kind in kinds):
         fresh = threading.Event()
         if value.is_set():
             fresh.set()
-    elif isinstance(value, _LOCK_TYPES):
-        fresh = threading.RLock() if isinstance(value, _RLOCK_TYPE) else threading.Lock()
+    elif any(kind is _RLOCK_TYPE for kind in kinds):
+        fresh = threading.RLock()
+    elif any(kind is _LOCK_TYPE for kind in kinds):
+        fresh = threading.Lock()
     else:
         return None
     memo[id(value)] = fresh
@@ -443,14 +628,14 @@ place the name is read.
 def _offers_reacquire(holder: object) -> bool:
     """Whether this object carries FR-004's buffer hook, without letting the question raise.
 
-    Every other read the walk makes is guarded individually, and this one has to be too: an
-    owned ``__getattr__`` raising anything but ``AttributeError`` would abort the walk, and
-    what is lost then is not a buffer but the **lock repair** for everything the walk had not
-    reached yet — the hang this module exists to remove, arrived at through the probe for a
-    different hazard. Nothing owned defines ``__getattr__`` today.
+    Read with ``sinks.base._static_value``, which raises nothing and runs none of the holder's
+    code (SPEC-079 FR-002): an owned ``__getattr__`` or a user subclass's property raising
+    anything would otherwise abort the walk, and what is lost then is not a buffer but the
+    **lock repair** for everything the walk had not reached yet — the hang this module exists to
+    remove, arrived at through the probe for a different hazard.
 
     Callability is part of the question, so an attribute of that name which is not a method is
-    simply not the hook.
+    simply not the hook; a property reads as the property object, which is not callable.
 
     Args:
       holder: Any object the walk has entered.
@@ -461,10 +646,7 @@ def _offers_reacquire(holder: object) -> bool:
     Raises:
       None.
     """
-    try:
-        return callable(getattr(holder, _REACQUIRE_HOOK, None))
-    except Exception:
-        return False
+    return callable(_static_value(holder, _REACQUIRE_HOOK))
 
 
 _SKIP_ATTRIBUTE = "_FORK_SKIP"
@@ -479,14 +661,22 @@ child announced a buffer-discard failure for a sink that had been superseded, an
 that state would have its file reopened on every fork for the life of the process.
 
 Declared by the holder of the state — a module, or a class whose instance holds it, since
-``getattr`` reads either — rather than listed here, which keeps this module's rule that it imports
+``sinks.base._static_value`` reads either — rather than listed here, which keeps this module's rule that it imports
 nothing but ``_diag`` (SPEC-039 FR-006). Nothing is lost by skipping: a sink that is still *live* is
 reached through the config and the worker, which are not opted out.
 """
 
 
+_SKIP_SEQUENCES: tuple[type, ...] = (tuple, list, frozenset)
+"""The exact types a ``_FORK_SKIP`` declaration is read from; anything else opts nothing out."""
+
+
 def _skipped_names(holder: object) -> frozenset[str]:
     """Returns the attribute names a holder has opted out of the walk.
+
+    The declaration is read with ``sinks.base._static_value`` and accepted only as an exact
+    ``tuple``, ``list`` or ``frozenset``, keeping its exact ``str`` members, so no property,
+    iterator or ``__eq__`` of a planted value runs (SPEC-079 FR-002).
 
     Args:
       holder: The module, class or instance the walk is about to read.
@@ -498,11 +688,10 @@ def _skipped_names(holder: object) -> frozenset[str]:
       None. A malformed or unreadable declaration opts nothing out, so the walk does more work
         rather than less — the safe direction for a repair whose absence is a hang.
     """
-    try:
-        declared = getattr(holder, _SKIP_ATTRIBUTE, None)
-        return frozenset(declared) if declared else frozenset()
-    except Exception:
+    declared = _static_value(holder, _SKIP_ATTRIBUTE)
+    if not any(type(declared) is kind for kind in _SKIP_SEQUENCES):
         return frozenset()
+    return frozenset(name for name in declared if type(name) is str)  # type: ignore[attr-defined]
 
 
 def _counters_type() -> type | None:

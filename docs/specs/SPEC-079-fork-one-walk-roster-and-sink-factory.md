@@ -229,8 +229,9 @@ roster repairs both before either path runs.
 
 #### Description:
 
-`_lifecycle._reachable_sinks` stays the walk `stamp` runs, unchanged, with a container scanned one
-level deep and only sinks and package objects pushed. In a forked child, the same function runs
+`_lifecycle._reachable_sinks` stays the walk `stamp` runs, with a container scanned one level deep
+and only sinks and package objects pushed; its reach is unchanged and its predicates become
+static (below). In a forked child, the same function runs
 with an `after_fork` argument, a `_fork._Repair` that carries the memo FR-001 used. With that
 argument it does more at every holder on its **repair frontier**:
 
@@ -245,6 +246,18 @@ argument it does more at every holder on its **repair frontier**:
   It replaces nothing on that holder. It forwards the holder's `_namespace_items` to the marking
   frontier. Without that step, the holder is already in the shared `seen` set when the marking
   frontier reaches it, so nothing beneath it would ever be visited.
+
+**Every read the walk makes on an object runs none of the object's code**, in both modes of
+`_reachable_sinks` and in the marking frontier. Ownership, container, primitive and sink-shape
+tests read the real type's MRO and namespaces through `sinks.base`'s unbound accessors and compare
+by identity; a namespace is read through `sinks.base._instance_dict`; a slot through its member
+descriptor; a container's members through its builtin base type's own iteration, never the
+subclass's; `_FORK_SKIP` and `reacquire_after_fork` through `sinks.base._static_value`. A
+container subclass is read both ways: its builtin storage and its namespace. The sink-shape test
+is `_fork._sink_shaped`, the static twin of `isinstance(x, Sink)`; it differs from `isinstance`
+for a class carrying `emit` and `close`, for a value whose `__class__` lies, and for a
+`weakref.proxy`, whose C attribute forwarding no static read follows, so a proxy configured as
+`sink=` is unrecorded and therefore refused its close, which leaks rather than closes.
 
 **The roots** are the runtime's live delivery targets: the config's sink
 (`config._live_config().sink`), `_state._worker` and `_state._late_worker`. A worker is a
@@ -432,8 +445,9 @@ close, both answered from the same record.
   `test_the_marking_walk_does_not_escape_through_a_module_reference` pass with no edit beyond
   SPEC-077's and SPEC-078's path changes.
 - [ ] A forked child whose configured sink holds a `list` subclass with a non-terminating
-  `__iter__` returns from `fork` within 30 s, with `_marking_failed` true and an unrecorded sink
-  refused.
+  `__iter__` never enters that `__iter__`, and a configured sink holding more than
+  `_MARKING_CEILING` distinct objects trips the ceiling in a real child, with `_marking_failed`
+  true and an unrecorded sink refused.
 - [ ] `test_a_forked_child_does_not_hook_a_superseded_sink` passes with no edit beyond SPEC-078's
   path changes. A walk that collects hooks from record seeds turns it red.
 - [ ] A child forked while a parent thread is inside `FileSink.emit`, between its write loop and its
@@ -1103,3 +1117,9 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   at 92,940 marking visits, and a two-test reproducer fails deterministically. The conftest reset
   now clears the record, which fixes the suite; a long-lived process that reconfigures and forks
   grows it the same way, recorded in `architecture.md` §13 and handed to its own session (A1).
+- Build: `configure(sink=h)` at `44db79a6` ran a hostile sink's `__class__` getter,
+  `__getattribute__` and metaclass `__hash__` and `__eq__`, all from `stamp`'s walk, so FR-005's
+  no-hook criterion could not hold with `_reachable_sinks` unchanged. The walk's predicates became
+  static, which also closes SPEC-072's follow-up on hostile sink code at the at-fork sites, and
+  FR-003's runaway criterion is restated: the runaway `__iter__` is never called, so the ceiling
+  is asserted on a genuinely large graph (A3).

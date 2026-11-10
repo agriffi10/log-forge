@@ -6,16 +6,15 @@ import atexit
 import enum
 import os
 import threading
-import types
 from itertools import islice
 from time import monotonic
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _fork
-from log_foundry.sinks.base import Sink
 
 if TYPE_CHECKING:
     from log_foundry.results import FlushResult
+    from log_foundry.sinks.base import Sink
     from log_foundry.worker import Health, Worker
 
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
@@ -1242,24 +1241,15 @@ Set far above any real graph — a sink's is on the order of hundreds — and ab
 module escape used to reach before :func:`_mark_inherited` stopped descending into modules.
 """
 
-_PLAIN_TYPES = frozenset(
-    {dict, list, tuple, set, frozenset, str, bytes, int, float, bool, type(None)}
-)
-"""Builtin types that provably cannot be a sink, skipped before any structural test.
-
-A fact rather than a heuristic: ``Sink`` requires ``emit`` and ``close``, and no builtin has
-either. Tested by **exact type, never ``isinstance``**, so a ``class MySink(dict)`` is still
-asked — measured, the exact form answers ``True`` for a dict-subclass sink and ``False`` for a
-plain dict.
-
-It is the single largest term in the walk's cost, because a buffering sink's contents are almost
-entirely these: skipping them took a ``MemorySink`` holding 100k events from 1,109 ms to 279 ms
-before the descent was bounded at all (FR-001 AC-11).
-"""
-
 
 def _may_be_a_sink(value: object) -> bool:
     """Whether a value is worth asking the structural question about at all.
+
+    Tested against ``_fork._PLAIN_TYPE_IDS`` by the exact type's id, so a ``class MySink(dict)``
+    is still asked and no metaclass ``__hash__`` or ``__eq__`` of the value's type runs. Skipping
+    the plain builtins is the single largest term in the walk's cost, because a buffering sink's
+    contents are almost entirely these: it took a ``MemorySink`` holding 100k events from
+    1,109 ms to 279 ms before the descent was bounded at all (SPEC-042 FR-001 AC-11).
 
     Args:
       value: Any object reached by the walk.
@@ -1270,7 +1260,7 @@ def _may_be_a_sink(value: object) -> bool:
     Raises:
       None.
     """
-    return type(value) not in _PLAIN_TYPES
+    return id(type(value)) not in _fork._PLAIN_TYPE_IDS
 
 
 def _bounded_children(container: object) -> list[object]:
@@ -1282,6 +1272,11 @@ def _bounded_children(container: object) -> list[object]:
     child reached 5.7 GB RSS in nine minutes and its parent's own timeout could not kill it,
     because the parent was being starved. So the bound has to be on the *read*, not only on the
     loop around it.
+
+    **The members are read through the builtin base type's own iteration**, never the
+    subclass's (SPEC-079 FR-002): ``dict.keys`` and ``dict.values`` for a mapping, and the base's
+    unbound ``__iter__`` otherwise, so a subclass's own ``__iter__``, ``keys`` or ``values`` never
+    runs and a non-terminating one is never entered. What is read is the container's real storage.
 
     Args:
       container: Any value ``_fork._is_container`` accepted.
@@ -1296,12 +1291,10 @@ def _bounded_children(container: object) -> list[object]:
         7's residual otherwise, since absorbing here leaves :attr:`Runtime._marking_failed` clear.
     """
     try:
-        if isinstance(container, dict):
-            return [
-                *islice(container.keys(), _MARKING_CEILING),
-                *islice(container.values(), _MARKING_CEILING),
-            ]
-        return list(islice(container, _MARKING_CEILING))  # type: ignore[call-overload]
+        members: list[object] = []
+        for storage in _fork._storage_iterators(container):
+            members.extend(islice(storage, _MARKING_CEILING))
+        return members
     except Exception as exc:
         _diag.absorbed(
             "reading a container while marking a forked child's sinks",
@@ -1322,8 +1315,10 @@ def _reachable_sinks(root: object) -> list[object]:
     **Reaching the graph is a descent question, not an ownership one**, and that distinction is
     what keeps this inside SPEC-039's boundary. The walk enters library objects and plain
     containers as that module's predicates already define, and *records* any sink-shaped member
-    it meets even where it will not descend into it. Recording reads nothing from the object: an
-    ``id``, a reference, and the two attribute lookups a runtime-checkable Protocol performs.
+    it meets even where it will not descend into it. Recording runs nothing of the object: an
+    ``id``, a reference, and ``_fork._sink_shaped``'s static read of ``emit`` and ``close``, which
+    like every predicate here reads the real type's MRO and namespaces and never calls a hook of
+    the value, its class or its metaclass (SPEC-079 FR-002).
     "Do not reach into third-party state" (SPEC-039 FR-003 AC-2) forbids mutating and traversing
     a foreign object, not noticing one.
 
@@ -1372,7 +1367,7 @@ def _reachable_sinks(root: object) -> list[object]:
         if id(holder) in seen or not _may_be_a_sink(holder):
             continue
         seen.add(id(holder))
-        if isinstance(holder, Sink):
+        if _fork._sink_shaped(holder):
             found.append(holder)
         if not _fork._is_owned(holder):
             continue
@@ -1396,7 +1391,7 @@ def _is_candidate(value: object) -> bool:
     Raises:
       None.
     """
-    return _may_be_a_sink(value) and (isinstance(value, Sink) or _fork._is_owned(value))
+    return _may_be_a_sink(value) and (_fork._sink_shaped(value) or _fork._is_owned(value))
 
 
 def _inheritance_roots() -> list[object]:
@@ -1512,10 +1507,10 @@ def _mark_inherited() -> None:
                 )
                 break
             holder = stack.pop()
-            if id(holder) in seen or isinstance(holder, types.ModuleType):
+            if id(holder) in seen or _fork._is_module(holder):
                 continue
             seen.add(id(holder))
-            if _may_be_a_sink(holder) and isinstance(holder, Sink):
+            if _may_be_a_sink(holder) and _fork._sink_shaped(holder):
                 found.append(holder)
             if _fork._is_container(holder):
                 stack.extend(_bounded_children(holder))

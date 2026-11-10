@@ -791,7 +791,7 @@ INVENTORY: dict[Key, Row] = {
     _c("_fork.py", "<module>", "_RLOCK_TYPE", "RLock"): Row(
         "none", _NONE, "a type probe at import, fed to type(); stores no primitive"
     ),
-    _c("_fork.py", "<module>", "_LOCK_TYPES", "Lock"): Row(
+    _c("_fork.py", "<module>", "_LOCK_TYPE", "Lock"): Row(
         "none", _NONE, "a type probe at import, fed to type(); stores no primitive"
     ),
     _c("_fork.py", "_fresh_primitive", "fresh", "Event"): Row(

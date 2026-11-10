@@ -995,10 +995,10 @@ def test_lifecycle_imports_nothing_that_could_cycle() -> None:
     # SPEC-042 widened this from `{_diag}` to three, and both additions are deliberate.
     # `_fork` is the second arrow FR-001 states outright: the ownership record owns the walk
     # over a handed-over sink graph, and it reuses `_fork`'s descent predicates rather than
-    # duplicating them. `sinks.base` moved from TYPE_CHECKING to runtime because the walk has to
-    # ask `isinstance(x, Sink)` -- FR-001 puts the sink-shape test on this side precisely so
-    # `_fork`'s own rule (it imports nothing but `_diag`) stays untouched.
-    allowed = {"log_foundry._diag", "log_foundry._fork", "log_foundry.sinks.base.Sink"}
+    # duplicating them. `sinks.base` was a runtime import while the walk asked
+    # `isinstance(x, Sink)`; SPEC-079 FR-002 made that test `_fork._sink_shaped`, a static read,
+    # so `Sink` went back to TYPE_CHECKING and the set narrowed to two.
+    allowed = {"log_foundry._diag", "log_foundry._fork"}
     assert package_modules(tree.body) == allowed, (
         f"at runtime it may import only {sorted(allowed)}, got {package_modules(tree.body)}"
     )
