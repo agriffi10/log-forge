@@ -531,3 +531,38 @@ def test_the_sinks_and_the_workers_stop_signal_are_the_rosters_in_the_child() ->
 
     child = run_in_child(read)
     assert child.output == "True,True,True", child.output
+
+
+def test_a_missing_later_hop_is_announced_and_the_rest_replaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001: a pair whose later hop is missing is announced by type, the other eight replaced."""
+    import io
+    import sys
+
+    monkeypatch.setattr(
+        _fork, "_GLOBAL_PRIMITIVES", (("_lifecycle", "_state._gone_lock"), *_EXPECTED_ROSTER)
+    )
+    modules = _package_modules()
+    before = {f"{m}.{p}": id(_resolve(modules, m, p)) for m, p in _EXPECTED_ROSTER}
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(
+            lambda: (
+                buffer.getvalue()
+                + "|"
+                + ",".join(
+                    str(id(_resolve(modules, m, p)) != before[f"{m}.{p}"])
+                    for m, p in _EXPECTED_ROSTER
+                )
+            )
+        )
+    finally:
+        sys.stderr = saved
+    announced, _, replaced = child.output.rpartition("|")
+    assert (
+        "(AttributeError)" in announced and "replacing a global lock after a fork" in announced
+    ), announced
+    assert replaced == ",".join(["True"] * 8), replaced

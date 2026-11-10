@@ -138,7 +138,7 @@ class _FactorySink:
             return result
 
     def _announce(self, exc: BaseException, what: str) -> None:
-        """Counts one failed build and writes the throttled line on the first and every 1000th.
+        """Counts one failed build; writes the line on the first and every ``WARN_EVERY``-th.
 
         Args:
           exc: The factory's exception, or the refusal of what it returned.

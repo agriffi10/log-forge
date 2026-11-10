@@ -1578,6 +1578,39 @@ def _live_roots() -> list[object]:
     return [found for found in candidates if found is not None]
 
 
+def _live_sinks() -> list[object]:
+    """Returns the sinks the runtime delivers to, recorded by the walk whatever they look like.
+
+    The configured sink, the live and the late worker's ``sink``, and the sink a configured
+    ``sink_factory`` wrapper has built. Recording one runs none of its code — an ``id`` and a
+    reference — so each is recorded unconditionally, beside what the walk's static sink-shape test
+    finds (SPEC-079). Without it a ``weakref.proxy``, a ``super(Sub, inst)`` or a ``__getattr__``
+    proxy configured as the sink, which no static read finds sink-shaped, could stay unrecorded in
+    a child whose walk succeeded, and the child would then close the parent's transport.
+
+    Args:
+      None.
+
+    Returns:
+      The live delivery sinks, ``None`` dropped; a sink may appear twice.
+
+    Raises:
+      Exception: Whatever resolving the config raises; :func:`_walk_after_fork` absorbs it.
+    """
+    from log_foundry import config
+
+    configured = config._live_config().sink
+    sinks: list[object] = [configured]
+    workers = (_state.worker_exists(), _state._late_worker)
+    sinks.extend(worker.sink for worker in workers if worker is not None)
+    module = sys.modules.get(f"{_fork._PACKAGE}.sinks._factory")
+    if module is not None and _fork._is_module(module):
+        factory_type = _fork._MODULE_DICT(module).get("_FactorySink")
+        built = [vars(sink).get("_inner") for sink in sinks if type(sink) is factory_type]
+        sinks.extend(built)
+    return [sink for sink in sinks if sink is not None]
+
+
 def _record_seeds() -> list[object]:
     """Returns the sinks the record pins, the marking frontier's second group of seeds.
 
@@ -1740,7 +1773,7 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
         still run, and ``_reclaim_after_fork`` runs either way.
     """
     try:
-        found: list[object] = []
+        found: list[object] = _live_sinks()
         for root in _live_roots():
             found.extend(_reachable_sinks(root, after_fork=repair))
         _repair_live_counters(repair)
@@ -1839,6 +1872,13 @@ def stamp(sink: object) -> None:
     The walk runs **outside** the lock and only the record write takes it, so an arbitrary
     object graph is never traversed while holding a process-wide lock.
 
+    **The root is recorded whether or not it reads as sink-shaped** (SPEC-079). Being handed it
+    is what declares it a sink, and recording it runs none of its code: an ``id`` and a reference.
+    The walk below it is static, so a sink whose members only a C type's own lookup can reach — a
+    ``weakref.proxy``, a ``super(Sub, inst)``, a ``__getattr__`` proxy — does not read as
+    sink-shaped there; left unrecorded, a forked child found it unrecorded with its walk
+    succeeded and closed the parent's transport at its ``shutdown()``.
+
     Args:
       sink: The sink being installed, whose reachable graph is acquired with it.
 
@@ -1849,11 +1889,11 @@ def stamp(sink: object) -> None:
       None. This runs inside ``configure()``, which must not fail an application's startup over
         a bookkeeping step; an unrecorded sink is a refused one, which leaks rather than closes.
     """
+    reachable: list[object] = [sink]
     try:
-        reachable = _reachable_sinks(sink)
+        reachable.extend(_reachable_sinks(sink))
     except Exception as exc:
         _diag.absorbed("recording which sinks this process owns", exc, "they will not be closed")
-        return
     pid = os.getpid()
     with _state._owned_lock:
         for found in reachable:

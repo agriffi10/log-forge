@@ -231,3 +231,144 @@ def test_a_child_owns_a_reacquired_file_sink_and_refuses_the_others(tmp_path: pa
     finally:
         server.close()
         client.close()
+
+
+class _ClosingSink:
+    """A sink counting its emits and closes, so a child's close of an inherited one shows."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+        self.closes = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Keeps the batch."""
+        self.events.extend(batch)
+
+    def close(self) -> None:
+        """Counts the close."""
+        self.closes += 1
+
+
+class _GetattrProxy:
+    """A ``__getattr__`` proxy over a full sink."""
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _SubSink(_ClosingSink):
+    pass
+
+
+_KEEP: list[object] = []
+
+
+def _proxied(shape: str) -> tuple[Any, _ClosingSink]:
+    """One of FR-005's accepted shapes that no static read finds sink-shaped, and its target."""
+    import weakref
+
+    if shape == "super":
+        sub = _SubSink()
+        _KEEP.append(sub)
+        return super(_SubSink, sub), sub
+    inner = _ClosingSink()
+    _KEEP.append(inner)
+    if shape == "weakref-proxy":
+        return weakref.proxy(inner), inner
+    return _GetattrProxy(inner), inner
+
+
+@pytest.mark.parametrize("path", ["orphan", "worker"])
+@pytest.mark.parametrize("shape", ["weakref-proxy", "getattr-proxy", "super"])
+def test_a_child_does_not_close_an_inherited_proxy_sink(shape: str, path: str) -> None:
+    """Invariant 12: a proxy-shaped configured sink stays the parent's, so the child closes nothing.
+
+    Recording a root runs none of its code, so ``stamp`` records the sink it was handed whatever
+    the static sink-shape test says, and the child's walk records every live delivery sink. Without
+    either, such a sink was unrecorded in a child whose walk succeeded, and the child's
+    ``shutdown()`` closed the parent's transport.
+    """
+    configured, target = _proxied(shape)
+    log_foundry.configure(service="proxy", sink=configured)
+    if path == "worker":
+        _traced()
+    else:
+        log_foundry.info("parent")
+    log_foundry.flush(timeout=5.0)
+    parent = os.getpid()
+    with _lifecycle._state._owned_lock:
+        recorded = _lifecycle._state._owned.get(id(configured))
+
+    def in_child() -> str:
+        record = _lifecycle._state._owned.get(id(configured), (None,))[0]
+        releasable = _lifecycle.releasable(configured)
+        log_foundry.shutdown(3.0)
+        return f"record={'parent' if record == parent else record} releasable={releasable} closes={target.closes}"
+
+    child = run_in_child(in_child)
+    assert child.output.endswith("releasable=False closes=0"), child.output
+    assert recorded is not None and recorded[0] == parent, (
+        "the parent recorded the sink it was handed"
+    )
+    assert child.output == "record=parent releasable=False closes=0", child.output
+
+
+def test_a_child_does_not_call_a_hook_on_a_class_a_wrapper_holds(tmp_path: pathlib.Path) -> None:
+    """A package class held as an attribute is not a hook holder: the child writes no diagnostic.
+
+    ``_is_owned`` accepts a package class, so a wrapper holding ``self.kind = FileSink`` once had
+    every child call the unbound ``FileSink.reacquire_after_fork()``, absorb the ``TypeError`` and
+    announce a re-acquisition failure that never happened.
+    """
+    import io
+    import sys
+
+    class _Wrapper:
+        def __init__(self, inner: FileSink) -> None:
+            self.inner = inner
+            self.kind = FileSink
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            self.inner.emit(batch)
+
+        def close(self) -> None:
+            self.inner.close()
+
+    log_foundry.configure(service="cls", sink=_Wrapper(FileSink(str(tmp_path / "a.log"))))
+    log_foundry.info("parent")
+    log_foundry.flush(timeout=5.0)
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(buffer.getvalue)
+    finally:
+        sys.stderr = saved
+    assert child.finished, child.ending
+    assert child.output == "", f"the child announced something: {child.output!r}"
+
+
+def test_a_child_records_a_live_proxy_sink_the_parent_never_stamped() -> None:
+    """The child's walk records every live delivery sink itself, whatever the parent's record says.
+
+    A worker installed directly on a ``weakref.proxy`` never passed through ``stamp``, so only the
+    walk's unconditional record of the worker's sink keeps the child from closing it.
+    """
+    from conftest import install_worker
+    from log_foundry.worker import Worker
+
+    configured, target = _proxied("weakref-proxy")
+    install_worker(Worker(configured, batch_size=1, flush_interval=0.01))
+    with _lifecycle._state._owned_lock:
+        assert id(configured) not in _lifecycle._state._owned, "the precondition: never stamped"
+
+    def in_child() -> str:
+        releasable = _lifecycle.releasable(configured)
+        log_foundry.shutdown(3.0)
+        return f"releasable={releasable} closes={target.closes}"
+
+    child = run_in_child(in_child)
+    assert child.output == "releasable=False closes=0", child.output

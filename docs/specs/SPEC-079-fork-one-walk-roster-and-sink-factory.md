@@ -267,8 +267,12 @@ subclass's; `_FORK_SKIP` and `reacquire_after_fork` through `sinks.base._static_
 container subclass is read both ways: its builtin storage and its namespace. The sink-shape test
 is `_fork._sink_shaped`, the static twin of `isinstance(x, Sink)`; it differs from `isinstance`
 for a class carrying `emit` and `close`, for a value whose `__class__` lies, and for a
-`weakref.proxy`, whose C attribute forwarding no static read follows, so a proxy configured as
-`sink=` is unrecorded and therefore refused its close, which leaks rather than closes.
+`weakref.proxy`, whose C attribute forwarding no static read follows. Recording a root runs
+none of its code, so `stamp` records the sink it was handed whether or not it reads as
+sink-shaped, and `_walk_after_fork` records the live delivery sinks that the runtime holds — the configured sink, the
+live and late worker's `sink`, and a factory wrapper's built sink — unconditionally. A
+`weakref.proxy`, a `super(Sub, inst)` or a `__getattr__` proxy configured as `sink=` is therefore
+recorded in the parent and stays the parent's in a child, which refuses its close.
 
 **The roots** are the runtime's live delivery targets: the config's sink
 (`config._live_config().sink`), `_state._worker` and `_state._late_worker`. A worker is a
@@ -1234,3 +1238,10 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   sink-concurrency lints read it as what it is; its stop signal is stored through
   `ForwardedStopSignal`, as `FilteringSink`'s is; its `flush` returns `None` as every shipped
   wrapper's does; and the typed consumer's one-argument factory is a `def` (A12).
+- Build, after the first diff review: under static reads `stamp` stopped recording a
+  `weakref.proxy` configured as `sink=` (the same hole existed at base for a `__getattr__` proxy and
+  `super(Sub, inst)`), and the child's walk did not mark it, so a child whose walk succeeded found
+  it releasable and its `shutdown()` closed the parent's transport. `stamp` now records the root it
+  is handed, and the walk records every live delivery sink, both unconditionally; the earlier
+  sentence saying such a proxy was refused its close was false and is replaced. The same review
+  made a class never offer `reacquire_after_fork`, and pinned three `sink_factory` behaviours.

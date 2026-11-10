@@ -36,8 +36,9 @@
   `_lifecycle` (narrowed to `_diag` and `_fork`), and the docs-lint case floor (308).
 - **A caller sees:** `sink_factory=`; the refusal of an unpatchable `sink=` and inner sink; a
   library sink behind a third-party wrapper repaired and re-acquired in a child; an engine sink's
-  counters repaired however held; `configure()` and the fork repair running no hook of a sink; a
-  `weakref.proxy` passed as `sink=` no longer recorded, so left open at `shutdown()`.
+  counters repaired however held; `configure()` and the fork repair running no hook of a sink.
+  A proxy-shaped `sink=` (`weakref.proxy`, `super(...)`, a `__getattr__` proxy) is recorded by
+  `stamp` and by the child's walk unconditionally, so a child never closes the parent's.
 - **Decisions:** the fork-order decision rewritten; the lifecycle-state fence names the fifth
   `_move` site; History lines on the marking and the stranding decisions; one new sink-lifecycle
   decision for `sink_factory=` and the `sink=` refusal.

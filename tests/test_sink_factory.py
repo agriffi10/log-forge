@@ -640,3 +640,82 @@ def test_a_grandchild_builds_its_own_and_a_childs_sink_is_inherited() -> None:
 
     child = run_in_child(in_child, timeout=12)
     assert child.output == "True,True", child.output
+
+
+class _SignalledSink:
+    """A built sink declaring the stop-signal member, so the hand-off at build is observable."""
+
+    log_foundry_stop_signal = None
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+        self.closed = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Keeps the batch."""
+        self.events.extend(batch)
+
+    def close(self) -> None:
+        """Counts the close."""
+        self.closed += 1
+
+
+def _signalled_factory() -> tuple[Any, list[_SignalledSink]]:
+    built: list[_SignalledSink] = []
+
+    def factory() -> _SignalledSink:
+        sink = _SignalledSink()
+        built.append(sink)
+        return sink
+
+    return factory, built
+
+
+def test_the_built_sink_is_handed_the_workers_stop_signal() -> None:
+    """FR-006: what the factory built holds the worker's ``_stop`` after the first ``@trace``."""
+    factory, built = _signalled_factory()
+    log_foundry.configure(service="factory", sink_factory=factory)
+    _traced()
+    log_foundry.flush(timeout=5.0)
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None and built
+    assert vars(built[0]).get("log_foundry_stop_signal") is worker._stop
+
+
+def _child_of_a_traced_factory(monkeypatch: pytest.MonkeyPatch, *, ceiling: int | None) -> str:
+    factory, built = _signalled_factory()
+    if ceiling is not None:
+        monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", ceiling)
+    log_foundry.configure(service="factory", sink_factory=factory)
+    _traced()
+    log_foundry.flush(timeout=5.0)
+
+    def in_child() -> str:
+        _traced()
+        log_foundry.flush(timeout=5.0)
+        mine = built[-1]
+        adopted = log_foundry.get_config().sink
+        owed = id(adopted) in _lifecycle._state._closes.owed
+        log_foundry.shutdown(3.0)
+        return f"owed={owed} closed={mine.closed}"
+
+    return run_in_child(in_child).output
+
+
+def test_a_trace_only_child_owes_and_closes_its_own_built_sink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-006: the adopted wrapper is armed on the worker, so ``shutdown()`` closes the child's sink."""
+    assert _child_of_a_traced_factory(monkeypatch, ceiling=None) == "owed=True closed=1"
+
+
+def test_a_factory_child_owns_its_wrapper_when_the_marking_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-006: the child stamps its adopted wrapper, so even a failed marking leaves it releasable.
+
+    With ``_MARKING_CEILING`` at zero every child's marking fails and refuses every sink it has
+    no record of; only the adoption's own stamp makes the child's wrapper, and through it the sink
+    the child built, the child's to close.
+    """
+    assert _child_of_a_traced_factory(monkeypatch, ceiling=0).endswith("closed=1")

@@ -543,6 +543,11 @@ def _offers_reacquire(holder: object) -> bool:
     Callability is part of the question, so an attribute of that name which is not a method is
     simply not the hook; a property reads as the property object, which is not callable.
 
+    **A class or a module never offers it**, decided statically. ``_is_owned`` accepts a package
+    class, so without this a wrapper holding ``self.kind = FileSink`` had every child call the
+    unbound ``FileSink.reacquire_after_fork()``, absorb the ``TypeError`` and announce a
+    re-acquisition failure that never happened.
+
     Args:
       holder: Any object the walk has entered.
 
@@ -552,6 +557,8 @@ def _offers_reacquire(holder: object) -> bool:
     Raises:
       None.
     """
+    if _is_class(holder) or _is_module(holder):
+        return False
     return callable(_static_value(holder, _REACQUIRE_HOOK))
 
 

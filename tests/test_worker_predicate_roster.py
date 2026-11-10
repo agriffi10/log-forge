@@ -201,9 +201,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     ("_adopt_factory_after_fork", "worker is not None", 0): (
         EXISTENCE,
-        (
-            "the guard on the result of the call above: the same existence question, asked once."
-        ),
+        ("the guard on the result of the call above: the same existence question, asked once."),
     ),
     ("_clear_after_fork", "_state.live_worker()", 0): (
         LIVENESS,
@@ -438,6 +436,18 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "already happened leaves the events in a discarded local — measured, 3 of 4 "
             "destroyed with `flush()` reporting success and every counter zero."
         ),
+    ),
+    ("_live_sinks", "(_state.worker_exists(), _state._late_worker)", 0): (
+        EXISTENCE,
+        (
+            "which workers' sinks a forked child records unconditionally as live delivery sinks "
+            "(SPEC-079). Existence, not liveness: a retired worker's sink is still a transport "
+            "the child inherited and must not release, so it is recorded like any other."
+        ),
+    ),
+    ("_live_sinks", "worker is not None", 0): (
+        EXISTENCE,
+        ("the guard on the pair above: the same existence question, asked once per worker."),
     ),
     ("_live_roots", "_state.worker_exists()", 0): (
         EXISTENCE,
@@ -1105,8 +1115,13 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 54, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 60, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised at SPEC-079 to the derived count, 54 -> 60.** `_inheritance_roots`' two sites re-keyed to
+`_live_roots` with their category; added: `_clear_after_fork`'s live-worker read and its arm guard,
+`_adopt_factory_after_fork`'s existence read and its guard, and `_live_sinks`' worker pair and its
+guard. Measured with this file's `_per_module_sites` on the branch.
 
 **Raised to the derived count after SPEC-078's first diff review, 53 -> 54.** The decline now also
 reads `_state._take_ahead()` (re-keyed in place), `_close_owed`'s rule choice is a plain `if` rather
