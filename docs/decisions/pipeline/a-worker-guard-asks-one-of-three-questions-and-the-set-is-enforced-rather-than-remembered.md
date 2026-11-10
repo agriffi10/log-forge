@@ -17,6 +17,8 @@ description: "existence, liveness, and the **moment**, which carries two predica
 
 ### 2026-11-09
 
+- **Refined** by SPEC-078: the owed-close record and the join rules now live in the close registry, `Runtime._closes`. The moment's close half — whether a close of a sink is in flight — is `_CloseRegistry.in_flight`, which both `Runtime.in_flight` and `Runtime.held` end in; the three questions are unchanged. `Runtime.state` reads the stored state now, so its three roster sites moved to `Runtime._move`, and `_swap_sink`'s decline in `DRAINING` with no live worker is filed as liveness. The roster files the registry's reads of `_in_flight` too, through the `in_flight` token's over-match, and the `_lifecycle` floor rose from 47 to 53.
+
 - **Refined** by SPEC-077: the guards' home, `_lifecycle._Lifecycle`, is now `Runtime`, and `_state` is still its one instance, so every question is unchanged. `Runtime.state` is a fourth lock-free reader, for the same reason the three questions take no lock. It is an observer that nothing in `src/` reads, and it is not a fourth question a guard may ask. The predicate roster files three of its sites, and the `_lifecycle` floor rose from 44 to 47. See *Lifecycle state has one holder, Runtime*.
 
 ### 2026-11-03

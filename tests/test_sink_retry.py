@@ -356,9 +356,7 @@ def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
     tree = ast.parse(
         (_pathlib.Path(log_foundry.__file__).parent / "sinks" / "_engine.py").read_text()
     )
-    functions = {
-        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
-    }
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
     loops = [node for node in ast.walk(functions["_run"]) if isinstance(node, ast.While)]
     assert len(loops) == 1, "the engine has one round loop"
     assert any(
@@ -373,7 +371,6 @@ def test_the_engines_round_loop_waits_through_the_shared_wait() -> None:
         and call.func.value.id == "_retry"
         for call in ast.walk(functions["_wait"])
     ), "and _wait waits through _retry.wait"
-
 
 
 def test_every_engine_sink_declares_a_stop_signal() -> None:
@@ -777,6 +774,8 @@ def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
     seen: list[float | None] = []
 
     class SpyWorker:
+        _epoch = 0  # the count at its build, which the stored state's move reads (SPEC-078)
+
         def claim_stop(self, deadline: float | None) -> bool:
             return True
 

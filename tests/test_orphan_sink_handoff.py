@@ -99,7 +99,7 @@ def test_a_configured_but_never_written_sink_is_not_closed() -> None:
     _lifecycle._close_owed()
 
     assert sink.closed == 0
-    assert not _lifecycle._state._owed
+    assert not _lifecycle._state._closes.owed
 
 
 def test_a_sink_whose_emit_raised_is_still_closed() -> None:
@@ -109,7 +109,7 @@ def test_a_sink_whose_emit_raised_is_still_closed() -> None:
 
     log_foundry.info("this will raise inside the sink")  # absorbed by SPEC-025
 
-    assert _lifecycle._state._owed.get(id(sink)) is sink, (
+    assert _lifecycle._state._closes.owed.get(id(sink)) is sink, (
         "armed before the emit, not after it"
     )
     _lifecycle._close_owed()
@@ -211,9 +211,7 @@ def test_reconfiguring_the_same_sink_is_a_no_op() -> None:
     log_foundry.configure(sink=sink)
 
     assert sink.closed == 0, "no close"
-    assert _lifecycle._state._owed.get(id(sink)) is sink, (
-        "and still armed for one at exit"
-    )
+    assert _lifecycle._state._closes.owed.get(id(sink)) is sink, "and still armed for one at exit"
 
 
 @pytest.mark.parametrize("orphan_first", [True, False])
@@ -260,7 +258,7 @@ def test_a_close_that_raises_is_absorbed_and_the_swap_stands(capsys) -> None:
 
     assert _eventually(lambda: old.closed == 1), "the close was attempted"
     assert config.get_config().sink is new, "and the swap still stands"
-    assert _lifecycle._state._owed == {id(new): new}
+    assert _lifecycle._state._closes.owed == {id(new): new}
     assert "absorbed a failure while closing a swapped-out sink" in capsys.readouterr().err
 
 
@@ -518,10 +516,14 @@ def test_the_grace_runs_after_the_live_sinks_own_close(monkeypatch) -> None:
 
     live.close = note_live_close  # type: ignore[method-assign]
 
-    real_join = lifecycle.join_closers
-    monkeypatch.setattr(
-        lifecycle, "join_closers", lambda t: (order.append("grace"), real_join(t))[1]
-    )
+    real_join = lifecycle._CloseRegistry.wait_graced
+
+    def note_the_graced_join(self, op, closes):
+        if closes is None:
+            order.append("grace")
+        return real_join(self, op, closes)
+
+    monkeypatch.setattr(lifecycle._CloseRegistry, "wait_graced", note_the_graced_join)
 
     log_foundry.configure(service="t", sink=slow)
     log_foundry.info("to slow")
@@ -585,9 +587,7 @@ def test_a_closer_that_cannot_start_leaves_the_sink_open_and_says_so(capsys, mon
     log_foundry.configure(sink=new)
 
     assert old.closed == 0, "left open rather than closed inline"
-    assert _lifecycle._state._owed == {id(new): new}, (
-        "and the record still re-points (AC-8)"
-    )
+    assert _lifecycle._state._closes.owed == {id(new): new}, "and the record still re-points (AC-8)"
     err = capsys.readouterr().err
     assert "starting the thread that closes a swapped-out sink" in err
     assert log_foundry.health().incomplete_swaps == 0
@@ -610,6 +610,7 @@ def test_an_orphan_emit_gives_the_sink_a_stop_signal() -> None:
 def test_shutdown_sets_the_orphan_stop_signal() -> None:
     """AC-2. A sink parked in a backoff must be released rather than serving it in full."""
     from log_foundry.sinks import _retry as retry
+
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("to it")
@@ -709,7 +710,9 @@ def test_a_sink_adopted_after_a_retired_worker_still_gets_a_signal() -> None:
 
     worker = _lifecycle._state._worker
     assert worker is not None and worker.sink is old, "the retired worker never swapped"
-    assert isinstance(new.log_foundry_stop_signal, threading.Event), "yet the live sink has a signal"
+    assert isinstance(new.log_foundry_stop_signal, threading.Event), (
+        "yet the live sink has a signal"
+    )
     assert not new.log_foundry_stop_signal.is_set(), "and an unset one"
 
 
@@ -722,6 +725,7 @@ def test_a_sink_emitted_to_after_shutdown_still_backs_off() -> None:
     on *arming* misses the second case, which `FR-001 AC-5` refuses to re-arm.
     """
     from log_foundry.sinks import _retry as retry
+
     same, fresh = CountingSink("same"), CountingSink("fresh")
     log_foundry.configure(service="t", sink=same)
     log_foundry.info("before")
@@ -854,6 +858,7 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
     exists to prevent, in a mixed process rather than an orphan-only one.
     """
     from log_foundry.sinks import _retry as retry
+
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
 
@@ -877,14 +882,18 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
 
 
 def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> None:
-    """`Worker.shutdown` already joins closers; joining again charges a second full grace."""
+    """Joining a swapped-out close a second time charges a second full grace (SPEC-078 FR-002).
+
+    Re-expressed on the counting hook. Counting calls to ``join_closers`` missed the defect the
+    name promised to catch: the bystander wait inside ``_close_owed`` computed its own grace, and
+    that second grace was not a call to ``join_closers``. The shutdown here has the swapped-out
+    close as a bystander entry, so it must write its one ``grace_end`` exactly once.
+    """
+    from conftest import count_grace_writes
+
     monkeypatch.setattr(lifecycle, "DEFAULT_CLOSER_GRACE", 0.2)
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.1)
-    grants: list[float | None] = []
-    real_join = lifecycle.join_closers
-    monkeypatch.setattr(
-        lifecycle, "join_closers", lambda t: (grants.append(t), real_join(t))[1]
-    )
+    writes = count_grace_writes(monkeypatch)
 
     hung, live = SlowCloseSink("hung"), CountingSink("live")
     worker = worker_mod.Worker(hung, batch_size=1000, flush_interval=100.0)
@@ -897,9 +906,8 @@ def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> No
 
         # The count is the property. Timing it would need a budget between one grace and two,
         # which on a loaded runner is a coin flip — and the grace is deliberately short.
-        assert len(grants) == 1, (
-            f"the grace is granted once per exit, by whoever owns the call — got {len(grants)} "
-            f"grants ({grants}); `Worker.shutdown` already joins"
+        assert list(writes.values()) == [1], (
+            f"the grace is fixed once per exit, by whoever owns the call — got {writes}"
         )
     finally:
         hung.release.set()
@@ -1037,17 +1045,17 @@ def test_a_swap_does_not_close_a_sink_a_retired_worker_holds() -> None:
     log_foundry.info("orphan, arming the record at a")
     log_foundry.shutdown()
     assert a.closed == 1
-    assert not _lifecycle._state._owed, "the shutdown discharged what it closed"
+    assert not _lifecycle._state._closes.owed, "the shutdown discharged what it closed"
 
     log_foundry.configure(sink=b)
 
     assert a.closed == 1, "the worker already closed it; the swap must not close it again"
-    assert not _lifecycle._state._owed, (
+    assert not _lifecycle._state._closes.owed, (
         "and nothing is armed: a configured sink nothing wrote to is never owed a close"
     )
 
     log_foundry.info("the first thing that delivers to b")
-    assert _lifecycle._state._owed.get(id(b)) is b, "which is what arms it"
+    assert _lifecycle._state._closes.owed.get(id(b)) is b, "which is what arms it"
 
 
 def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
@@ -1108,6 +1116,7 @@ def test_an_emit_preempted_across_a_swap_re_arms_the_closed_sink_and_owes_it_a_c
     races that need one.
     """
     from log_foundry import api
+
     old, new = CountingSink("old"), CountingSink("new")
     log_foundry.configure(service="t", sink=old)
     log_foundry.info("arms the record at old")
@@ -1131,7 +1140,7 @@ def test_an_emit_preempted_across_a_swap_re_arms_the_closed_sink_and_owes_it_a_c
         resume.set()
         emitter.join(15.0)
 
-    assert _lifecycle._state._owed.get(id(old)) is old, (
+    assert _lifecycle._state._closes.owed.get(id(old)) is old, (
         "the stale emit landed on the old sink, so it is owed a close for it"
     )
     log_foundry.shutdown()
@@ -1199,7 +1208,7 @@ def _race_two_shutdowns_over_a_re_armed_sink(
     assert sink.in_close.wait(5.0), "the premise: the first caller is inside close()"
 
     log_foundry.info("lands on the sink the first caller is closing")
-    assert _lifecycle._state._owed.get(id(sink)) is sink, "the premise: the emit re-armed it"
+    assert _lifecycle._state._closes.owed.get(id(sink)) is sink, "the premise: the emit re-armed it"
 
     second = threading.Thread(target=lambda: log_foundry.shutdown(timeout=30.0), daemon=True)
     second.start()
@@ -1260,7 +1269,7 @@ def test_a_close_held_past_the_grace_leaves_the_sink_for_a_later_shutdown() -> N
             "the second caller returned rather than waiting out the first caller's close"
         )
         assert sink.closed == 0, "the premise: the first caller's close has not finished"
-        assert _lifecycle._state._owed.get(id(sink)) is sink, (
+        assert _lifecycle._state._closes.owed.get(id(sink)) is sink, (
             "so the sink is still in the record, for a later shutdown to close"
         )
 

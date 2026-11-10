@@ -311,6 +311,7 @@ class _BrokenStream:
 @pytest.mark.parametrize("level", LEVELS)
 def test_an_orphan_log_survives_a_broken_sink(level, capsys) -> None:
     import log_foundry as lf
+
     lf.configure(service="t", sink=_BrokenSink())
 
     def body() -> None:
@@ -327,8 +328,10 @@ def test_an_orphan_log_survives_a_broken_sink(level, capsys) -> None:
 def test_an_in_span_log_is_unaffected_by_a_broken_sink() -> None:
     """FR-003 requires no behaviour change in-span: it buffers and never touches the sink."""
     import log_foundry as lf
+
     lf.configure(service="t", sink=_BrokenSink())
     from log_foundry import context
+
     seen: list[int] = []
 
     def body() -> None:
@@ -355,15 +358,15 @@ def _break_console(monkeypatch, exc: BaseException | None = None) -> None:
     absorb the breakage silently for the rest of the session.
     """
     from log_foundry import console as console_mod
-    monkeypatch.setattr(
-        api, "_console", console_mod.ConsoleWriter(stream=_BrokenStream(exc))
-    )
+
+    monkeypatch.setattr(api, "_console", console_mod.ConsoleWriter(stream=_BrokenStream(exc)))
 
 
 def test_echo_survives_a_broken_console_and_the_event_still_reaches_the_sink(
     fake_sink, monkeypatch, capsys
 ) -> None:
     import log_foundry as lf
+
     lf.configure(service="t", sink=fake_sink)
     _break_console(monkeypatch)
 
@@ -383,8 +386,10 @@ def test_a_broken_sink_still_lets_the_echo_through(monkeypatch, capsys) -> None:
     console even though the sink lost it — which is the more useful of the two outcomes.
     """
     import log_foundry as lf
+
     lf.configure(service="t", sink=_BrokenSink())
     from log_foundry import console as console_mod
+
     stream = io.StringIO()
     monkeypatch.setattr(api, "_console", console_mod.ConsoleWriter(stream=stream))
 
@@ -402,6 +407,7 @@ def test_a_broken_sink_still_lets_the_echo_through(monkeypatch, capsys) -> None:
 def test_a_keyboardinterrupt_from_the_console_still_propagates(fake_sink, monkeypatch) -> None:
     """The echo guard draws the same line as the sink guard: Exception, never BaseException."""
     import log_foundry as lf
+
     lf.configure(service="t", sink=fake_sink)
     _break_console(monkeypatch, KeyboardInterrupt())
 
@@ -420,6 +426,7 @@ def test_the_guard_covers_building_the_orphan_event_not_only_the_emit(monkeypatc
     guard that exists to keep this call quiet.
     """
     import log_foundry as lf
+
     lf.configure(service="t")
     monkeypatch.setattr(
         api, "build_event", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cannot build"))
@@ -437,6 +444,7 @@ def test_the_guard_covers_building_the_orphan_event_not_only_the_emit(monkeypatc
 def test_an_orphan_log_returns_even_when_stderr_is_broken_too(monkeypatch) -> None:
     """The channel of last resort has no fallback: losing the line beats raising."""
     import log_foundry as lf
+
     lf.configure(service="t", sink=_BrokenSink())
     monkeypatch.setattr(sys, "stderr", _BrokenStream())
 
@@ -449,6 +457,7 @@ def test_an_orphan_log_returns_even_when_stderr_is_broken_too(monkeypatch) -> No
 def test_a_keyboardinterrupt_from_the_sink_still_propagates() -> None:
     """FR-003, as FR-001: the guard catches Exception, never BaseException."""
     import log_foundry as lf
+
     lf.configure(service="t", sink=_BrokenSink(KeyboardInterrupt()))
 
     def body() -> None:
@@ -461,6 +470,7 @@ def test_a_keyboardinterrupt_from_the_sink_still_propagates() -> None:
 def test_a_sink_that_fails_to_construct_does_not_fail_an_orphan_log(monkeypatch, capsys) -> None:
     """`_ensure_sink` builds the sink on first use, so the whole branch is guarded, not `emit`."""
     import log_foundry as lf
+
     lf.configure(service="t")
     monkeypatch.setattr(
         api, "_ensure_sink", lambda: (_ for _ in ()).throw(RuntimeError("cannot build a sink"))
@@ -494,6 +504,7 @@ class _CountingSink:
 def test_an_orphan_only_process_closes_its_sink_exactly_once_on_shutdown() -> None:
     """The defect: shutdown() returned early on a null worker, so close() never happened."""
     import log_foundry as lf
+
     sink = _CountingSink()
     lf.configure(service="t", version="0", env="t", sink=sink)
 
@@ -508,6 +519,7 @@ def test_an_orphan_only_process_closes_its_sink_exactly_once_on_shutdown() -> No
 
 def test_shutdown_stays_idempotent_on_the_orphan_path() -> None:
     import log_foundry as lf
+
     sink = _CountingSink()
     lf.configure(service="t", sink=sink)
     lf.info("x")
@@ -620,6 +632,7 @@ def test_a_guarded_sink_refuses_the_log_that_follows_the_close(tmp_path, capsys)
 def test_the_default_stdout_sink_is_not_expected_to_refuse(capsys) -> None:
     """The counterpart to AC-6: 19 of 34 sink classes add no post-close guard, by design."""
     import log_foundry as lf
+
     stream = io.StringIO()
     from log_foundry.sinks.stdout import StdoutSink
 
@@ -754,6 +767,7 @@ def test_interpreter_exit_closes_an_orphan_only_sink_exactly_once(
     import sys as sys_mod
 
     import log_foundry as lf
+
     src = pathlib.Path(lf.__file__).resolve().parent.parent
     script = tmp_path / f"orphan_exit_{len(shutdown)}.py"
     script.write_text(_ORPHAN_EXIT_PROGRAM.format(shutdown=shutdown))
@@ -829,6 +843,7 @@ def test_a_mixed_process_at_interpreter_exit_closes_once_and_still_drains(
     import sys as sys_mod
 
     import log_foundry as lf
+
     src = pathlib.Path(lf.__file__).resolve().parent.parent
     script = tmp_path / f"mixed_exit_{order}.py"
     script.write_text(_MIXED_EXIT_PROGRAM.format(first=first, second=second))
@@ -972,7 +987,7 @@ def test_a_sink_that_fails_to_construct_arms_nothing() -> None:
     finally:
         api._ensure_sink = original  # type: ignore[assignment]
 
-    assert not _lifecycle._state._owed
+    assert not _lifecycle._state._closes.owed
 
 
 def test_retired_survives_a_worker_built_after_an_orphan_only_shutdown() -> None:

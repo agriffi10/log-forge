@@ -1,7 +1,9 @@
-"""SPEC-077 FR-002: ``State`` is read off today's flags, is total, and costs no lock.
+"""SPEC-077 FR-002: ``State`` is read off the flags, is total, and costs no lock.
 
-``Runtime.state`` is an observer — nothing in ``src/`` reads it — so these tests set the fields it
-reads directly, the way ``conftest.install_worker`` does, and drive the two calls that add a token
+Since SPEC-078 the settled part is stored, in ``Runtime._current``, and written only by
+``Runtime._move``. These tests set the fields directly, the way ``conftest.install_worker`` does,
+and then settle the stored state through ``_settle()`` — the move the library makes at the end of
+the critical section that writes them — before reading ``state``. They drive the two calls that add a token
 (``_swap_sink`` and ``_shutdown_worker``) through every exit, including a ``KeyboardInterrupt`` that
 only a ``finally`` survives. The lock counts are the spec's, re-measured on the base commit
 ``3d65cf32`` before the token sets existed, and equal there; the token sets must not move them.
@@ -86,6 +88,16 @@ def _rule3() -> None:
     install_worker(Worker(Sink()))
 
 
+def _settle() -> None:
+    """Re-settles the stored state after a test wrote the fields directly (SPEC-078 FR-003).
+
+    The library moves ``_current`` at the end of each critical section that writes these fields;
+    a test that writes them itself takes the same step.
+    """
+    with _lifecycle._state._lock:
+        _lifecycle._state._move()
+
+
 def _rule3_after_retirement() -> None:
     _lifecycle._state.retirements = 1
     install_worker(Worker(Sink()))
@@ -94,20 +106,25 @@ def _rule3_after_retirement() -> None:
 def _rule4_retired_worker() -> None:
     install_worker(Worker(Sink()))
     _lifecycle._state.retirements += 1
+    _settle()
 
 
 def _rule4_no_worker() -> None:
     _lifecycle._state.retirements = 1
+    _settle()
 
 
 def _rule5_owed() -> None:
     sink = Sink()
-    _lifecycle._state._owed[id(sink)] = sink
+    _lifecycle._state._closes.owed[id(sink)] = sink
+    _settle()
 
 
 def _rule5_resolved() -> None:
     log_foundry.configure(sink=Sink())
-    assert not _lifecycle._state._owed, "configure() alone owes nothing; this case is rule 5's half"
+    assert not _lifecycle._state._closes.owed, (
+        "configure() alone owes nothing; this case is rule 5's half"
+    )
 
 
 def _rule6() -> None:
@@ -507,6 +524,38 @@ def test_lock_counts_are_pinned(
     assert _counted(call) == expected
 
 
+def test_a_swap_declining_in_draining_takes_the_lock_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-078 FR-003 AC-5: the one changed cell returns from its first critical section.
+
+    A ``configure(sink=...)`` that lands in a drain with no live worker declines at entry, so it
+    takes ``_state._lock`` once — SPEC-077's figure for a ``configure(sink=...)`` with no live
+    worker. A separate test rather than a ``LOCK_COUNTS`` row, because the drain it lands in must
+    be released only after ``_counted`` has put the real lock back.
+    """
+    _setup_owed()
+    gate = threading.Event()
+    release = threading.Event()
+    real = _lifecycle._close_owed
+
+    def parked(*args: Any, **kwargs: Any) -> bool:
+        if not gate.is_set():
+            gate.set()
+            release.wait(GATE_WAIT * 3)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_lifecycle, "_close_owed", parked)
+    stop = threading.Thread(target=lambda: log_foundry.shutdown(timeout=5.0), daemon=True)
+    stop.start()
+    try:
+        assert gate.wait(GATE_WAIT), "the drain is inside its window"
+        assert _lifecycle._state.state is State.DRAINING
+        assert _counted(_configure_new_sink) == 1
+    finally:
+        release.set()
+        stop.join(GATE_WAIT)
+    assert not stop.is_alive()
+
+
 # -- no lock, no reader, the hot path, totality ------------------------------------------------
 
 
@@ -539,7 +588,13 @@ def _reads_of_state_outside_runtime(tree: ast.AST) -> list[int]:
 
 
 def test_nothing_in_src_outside_runtime_reads_state() -> None:
-    """AC-7: an observer only while nothing in the library acts on it."""
+    """AC-7, kept by SPEC-078: the library acts on ``_column()``, and ``state`` is the report.
+
+    SPEC-078 made the stored state the authority, but no library call reads the ``state``
+    property: each reads ``Runtime._column()`` under the lock it already holds, which never reads
+    the config. ``state`` stays the lock-free reporting view, so a read of it in ``src/`` would
+    be a call deciding on a snapshot instead of on its own critical section.
+    """
     readers = {
         str(path.relative_to(_SRC)): lines
         for path in sorted(_SRC.rglob("*.py"))
@@ -618,10 +673,14 @@ def test_state_never_raises_for_any_combination() -> None:
                 state._swaps_running.add(object())
             state._worker = None if which == "none" else worker
             state.retirements = worker._epoch + (1 if which == "retired" or retired else 0)
-            state._owed.clear()
+            state._closes.owed.clear()
             if owed:
-                state._owed[id(sink)] = sink
+                state._closes.owed[id(sink)] = sink
             log_foundry.config._config = log_foundry.config.Config(sink=sink if resolved else None)
+            assert isinstance(state.state, State)
+            with state._lock:
+                state._move()
+                assert isinstance(state._column(), State)
             assert isinstance(state.state, State)
     finally:
         state._worker = worker

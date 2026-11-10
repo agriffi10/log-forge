@@ -20,8 +20,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
-from conftest import cpu_window
+from conftest import count_grace_writes, cpu_window, release_after_clock
 from log_foundry import _lifecycle
+
+pytestmark = pytest.mark.usefixtures("no_close_left_in_flight")
 
 if TYPE_CHECKING:
     from log_foundry.worker import Worker
@@ -118,11 +120,9 @@ def test_four_owed_closes_cost_the_slowest_not_their_sum() -> None:
     this test — measured. A 0.2 s inline close against 2 s threaded ones is what makes AC-2
     load-bearing here rather than only in the two tests below.
     """
-    sinks = [SlowCloseSink("inline", seconds=0.2)] + [
-        SlowCloseSink(f"s{i}") for i in range(3)
-    ]
+    sinks = [SlowCloseSink("inline", seconds=0.2)] + [SlowCloseSink(f"s{i}") for i in range(3)]
     _arm(*sinks)
-    assert len(_lifecycle._state._owed) == 4, "four are owed, or this measures nothing"
+    assert len(_lifecycle._state._closes.owed) == 4, "four are owed, or this measures nothing"
     assert _lifecycle._live_config_sink() is sinks[0], (
         "the short close is the inline one, or a dropped join is hidden behind a 2 s wait"
     )
@@ -163,7 +163,7 @@ def test_the_configured_sink_closes_on_the_calling_thread() -> None:
     """
     live, other = SlowCloseSink("live"), SlowCloseSink("other")
     _arm(live, other)
-    owed = _lifecycle._state._owed
+    owed = _lifecycle._state._closes.owed
     assert list(owed.values()) == [live, other], "the config's sink is armed first, not last"
     assert _lifecycle._live_config_sink() is live, "and the config still names it"
 
@@ -191,7 +191,7 @@ def test_the_last_armed_sink_closes_inline_when_the_config_is_not_owed() -> None
     from log_foundry import config as config_module
 
     config_module._rebind(sink=elsewhere)
-    owed = _lifecycle._state._owed
+    owed = _lifecycle._state._closes.owed
     assert id(elsewhere) not in owed, "the configured sink is not among those owed"
     assert list(owed.values())[-1] is last, "and `last` is the most recently armed"
 
@@ -254,7 +254,6 @@ def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one()
     assert owed_sink == twin == second_owed, "all three compare equal"
     assert owed_sink is not twin and owed_sink is not second_owed, "and none is another"
 
-
     _arm(owed_sink)
     _lifecycle._note_orphan_emit(second_owed)
     from log_foundry import config as config_module
@@ -281,7 +280,7 @@ def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one()
 def test_a_close_longer_than_the_closer_grace_still_delivers() -> None:
     """FR-002 AC-1. The case the rejected design lost, pinned so it cannot come back.
 
-    `join_closers` caps at `DEFAULT_CLOSER_GRACE`, so releasing these detached abandons any close
+    The graced wait caps at `DEFAULT_CLOSER_GRACE`, so releasing these detached abandons any close
     that exceeds it — measured during the spec review at 3 s: delivered nothing, where today it
     delivers. Joining every close is what makes the duration irrelevant.
     """
@@ -389,7 +388,7 @@ def test_one_owed_sink_creates_no_thread() -> None:
     """
     only = SlowCloseSink("only", seconds=0.1)
     _arm(only)
-    assert len(_lifecycle._state._owed) == 1, "exactly one is owed"
+    assert len(_lifecycle._state._closes.owed) == 1, "exactly one is owed"
 
     caller = threading.current_thread().name
     log_foundry.shutdown(timeout=1.0)
@@ -402,7 +401,8 @@ def test_one_owed_sink_creates_no_thread() -> None:
     assert log_foundry.health().closing_sinks == 0, (
         "these closes are joined before shutdown() returns, so none is ever outstanding after it"
     )
-    # `closing_sinks` counts `_closers`, which this path never registers in — so the assertion
+    # `closing_sinks` counts `GRACED` entries with a live thread, which this path never makes —
+    # its fan-out entries are `JOINED` (SPEC-078) — so the assertion
     # above is structural rather than a live check, and it is here to fail if a later change
     # routes these closes through `_start_closer` after all.
 
@@ -478,7 +478,7 @@ def test_four_owed_closes_on_the_worker_path_cost_the_slowest_not_their_sum() ->
     others = [SlowCloseSink(f"s{i}") for i in range(3)]
     _arm_on_the_worker_path(live, *others)
     sinks = [live, *others]
-    assert len(_lifecycle._state._owed) == 4, "four are owed, or this measures nothing"
+    assert len(_lifecycle._state._closes.owed) == 4, "four are owed, or this measures nothing"
 
     started = time.monotonic()
     log_foundry.shutdown(timeout=1.0)
@@ -619,9 +619,10 @@ def test_a_stranded_close_that_outlasts_the_grace_does_not_hold_the_shutdown() -
 
     SPEC-050 FR-004's judgement, kept: a sink the worker swapped out without confirming a fence
     already had the swap's whole budget, so one still closing at exit is far more likely stuck
-    than slow. It is released detached and granted only `join_closers`' grace, where joining it
+    than slow. It is released detached and granted only what is left of the shutdown's one grace, where joining it
     would let one stuck sink hold the exit for the shutdown's whole budget.
     """
+
     class _SlowEmit(SlowCloseSink):
         """Emits slowly, so a swap's drain cannot be confirmed inside its budget."""
 
@@ -649,3 +650,243 @@ def test_a_stranded_close_that_outlasts_the_grace_does_not_hold_the_shutdown() -
         f"{_lifecycle.DEFAULT_CLOSER_GRACE}s grace on a 30s budget"
     )
     assert live.closes == 1, "and the live sink was still closed"
+
+
+# --------------------------------------------------------------------------- SPEC-078
+
+
+class GatedCloseSink:
+    """A sink whose first ``close()`` parks on an event the test releases.
+
+    Parked on an event rather than asleep, so a floor measured against it is not one
+    ``tests/test_timing_floors.py`` refuses: the delay a floor reads is the library's grace,
+    which opens inside the measured call. Only the **first** close parks, so a second, forwarded
+    close of the same sink returns at once — the shape of a wrapper releasing a child that a
+    swap is already closing detached.
+    """
+
+    log_foundry_stop_signal: threading.Event | None = None
+
+    def __init__(self, name: str = "gated") -> None:
+        self.name = name
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self.closes = 0
+        self.events = 0
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Counts what it was handed."""
+        self.events += len(batch)
+
+    def close(self) -> None:
+        """Parks on the first call until released; returns at once on any later one."""
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            self.release.wait(60.0)
+        self.closes += 1
+
+
+@log_foundry.trace
+def _one_span() -> None:
+    log_foundry.info("in a span")
+
+
+def _leave_a_swapped_out_close_in_flight(path: str) -> tuple[GatedCloseSink, SlowCloseSink]:
+    """Runs the spec's probe up to the shutdown: A swapped out by a 0.1 s swap, its close stuck.
+
+    Args:
+      path: ``"worker"`` delivers the one event through ``@trace`` and ``flush()``; ``"orphan"``
+        through ``info()``.
+
+    Returns:
+      A, whose close is in flight, and B, the sink swapped in.
+
+    Raises:
+      None.
+    """
+    a, b = GatedCloseSink("A"), SlowCloseSink("B", seconds=0.0)
+    log_foundry.configure(service="t", sink=a)
+    if path == "worker":
+        _one_span()
+        log_foundry.flush(timeout=5.0)
+    else:
+        log_foundry.info("to A")
+    _lifecycle._swap_sink(b, timeout=0.1)
+    assert a.entered.wait(5.0), "the premise: A's close outlived the swap's budget"
+    return a, b
+
+
+@pytest.mark.parametrize("path", ["worker", "orphan"])
+def test_a_shutdown_spends_the_closer_grace_once_not_twice(path: str) -> None:
+    """SPEC-078 FR-002 AC-1. The double grace, on both delivery paths.
+
+    At ``fda134a`` the probe took 4.00 s on the worker path and 4.01 s on the orphan path against
+    a 2.0 s ``DEFAULT_CLOSER_GRACE``: ``_close_owed``'s bystander wait and ``join_closers`` each
+    computed a grace of their own, and A's close was waited on by both. One ``grace_end`` per
+    call makes it one. The floor says the grace was waited and not skipped; it is read from
+    ``release_after_clock``'s stopwatch, which starts before the shutdown opens the grace.
+    """
+    a, b = _leave_a_swapped_out_close_in_flight(path)
+    grace = _lifecycle.DEFAULT_CLOSER_GRACE
+    with release_after_clock(10.0, a.release.set) as watch:
+        log_foundry.shutdown(timeout=30.0)
+    assert watch.elapsed >= 0.9 * grace, f"the grace was skipped: {watch.elapsed:.2f}s"
+    assert watch.elapsed < 1.5 * grace, (
+        f"the grace was spent more than once: {watch.elapsed:.2f}s against {grace}s"
+    )
+    assert b.closes == 1, "and the live sink was closed"
+
+
+def test_a_shutdown_with_nothing_graced_fixes_no_grace(monkeypatch) -> None:
+    """SPEC-078 FR-002 AC-2, the zero half: no bystander and no ``GRACED`` entry, no write."""
+    writes = count_grace_writes(monkeypatch)
+    sink = SlowCloseSink("live", seconds=0.0)
+    _arm_on_the_worker_path(sink)
+    log_foundry.shutdown(timeout=30.0)
+    assert sink.closes == 1, "the premise: it closed the one sink it owed"
+    assert sum(writes.values()) == 0, f"a shutdown with nothing graced fixed a grace: {writes}"
+
+
+def test_a_shutdown_that_detaches_a_stranded_close_fixes_its_grace_once(monkeypatch) -> None:
+    """SPEC-078 FR-002 AC-2, the ``GRACED`` half: a close the call itself detaches.
+
+    A sink swapped out without a confirmed fence, whose drain thread has since ended, is taken by
+    the shutdown as ``GRACED`` and released detached; the graced join at the end of the call is
+    the first graced wait it makes, and it must write the call's one ``grace_end`` exactly once.
+    """
+    monkeypatch.setattr(_lifecycle, "DEFAULT_CLOSER_GRACE", 0.2)
+    writes = count_grace_writes(monkeypatch)
+
+    class _SlowEmitGated(GatedCloseSink):
+        """Emits slowly, so the swap cannot confirm its drain inside its budget."""
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            """Buffers after a delay that outlasts the swap budget."""
+            time.sleep(0.4)
+            super().emit(batch)
+
+    stuck = _SlowEmitGated("stranded")
+    live = SlowCloseSink("live", seconds=0.0)
+    worker = _arm_on_the_worker_path(stuck)
+    worker.submit([{"message": "so the drain is inside the stranded sink"}])
+    _lifecycle._swap_sink(live, timeout=0.05)
+    assert worker.holds_unfenced(stuck), "the premise: the swap could not confirm its fence"
+    _wait_for_the_drain_to_end(worker)
+    try:
+        log_foundry.shutdown(timeout=30.0)
+        assert stuck.entered.is_set(), "the stranded close was started, detached"
+        assert list(writes.values()) == [1], f"one call, one grace: {writes}"
+    finally:
+        stuck.release.set()
+
+
+def test_a_close_entry_holds_no_sink() -> None:
+    """SPEC-078 FR-001 AC-3: an in-flight entry references no sink, so the fork walk finds none.
+
+    The registry is reached by ``_fork``'s repair walk through ``_state``, and an owned object
+    holding a sink would hand the walk superseded sinks to run fork hooks on. The entry's thread
+    does reference the sink through its arguments, and that is not walked: ``Thread`` is not this
+    package's class.
+    """
+    a, _ = _leave_a_swapped_out_close_in_flight("orphan")
+    try:
+        with _lifecycle._state._closes._lock:
+            entries = list(_lifecycle._state._closes._in_flight.values())
+        assert entries, "the premise: A's close is in flight"
+        for entry in entries:
+            assert not any(value is a for value in vars(entry).values()), vars(entry)
+    finally:
+        a.release.set()
+
+
+def test_a_forwarded_release_does_not_end_a_detached_close_still_running() -> None:
+    """SPEC-078: an entry stays in flight until the **last** release performing it has finished.
+
+    A wrapper forwarding the close of a child that a swap is already closing detached reaches
+    the registry with no take, finds the child's entry, and joins it. Discharged at its first
+    finish, the entry would vanish while the detached thread was still inside ``close()``: the
+    shutdown's graced join would not wait for it, ``health().closing_sinks`` would read zero, and
+    a bystander would be released while the close it waited on was still running. Each release
+    is a participant, and only the last one discharges the entry.
+    """
+    sink = GatedCloseSink("child")
+    log_foundry.configure(service="t", sink=sink)
+    with _lifecycle._state._lock:
+        _lifecycle._state._closes.arm(sink)
+        entry = _lifecycle._state._closes.take(sink, _lifecycle._Rule.GRACED)
+        thread = _lifecycle.release(sink, detached=True, closing=entry)
+    assert thread is not None and sink.entered.wait(5.0), "the detached close is running"
+    try:
+        _lifecycle.release(sink)
+        assert sink.calls == 2, "the premise: the forwarded close ran and returned"
+        assert _lifecycle._state._closes.in_flight(sink), (
+            "the forwarded release discharged an entry a detached thread is still performing"
+        )
+        assert not entry.event.is_set(), "and released whoever was waiting on that close"
+        assert log_foundry.health().closing_sinks == 1, "and dropped it from the gauge"
+    finally:
+        sink.release.set()
+    thread.join(5.0)
+    assert not _lifecycle._state._closes.in_flight(sink), "the last participant discharges it"
+    assert entry.event.is_set()
+
+
+def test_a_second_detached_participant_keeps_the_first_thread_in_view() -> None:
+    """A detached release joining a close already running on a thread adds its own, never swaps.
+
+    With one thread slot, the second participant's ``attach`` overwrote the first: once the
+    second's quick close ended, ``health().closing_sinks`` read zero and the graced join saw
+    nothing alive, while the first thread was still inside ``close()``.
+    """
+    sink = GatedCloseSink("child")
+    log_foundry.configure(service="t", sink=sink)
+    with _lifecycle._state._lock:
+        _lifecycle._state._closes.arm(sink)
+        entry = _lifecycle._state._closes.take(sink, _lifecycle._Rule.GRACED)
+        first = _lifecycle.release(sink, detached=True, closing=entry)
+    assert first is not None and sink.entered.wait(5.0), "the first close is running"
+    try:
+        second = _lifecycle.release(sink, detached=True)
+        assert second is not None
+        second.join(5.0)
+        assert sink.calls == 2, "the premise: the second participant's close ran and returned"
+        assert entry.threads == [first, second], "the first thread was overwritten"
+        assert log_foundry.health().closing_sinks == 1, "the running close dropped from view"
+    finally:
+        sink.release.set()
+    first.join(5.0)
+    assert not _lifecycle._state._closes.in_flight(sink)
+
+
+def test_the_graced_wait_waits_for_a_forwarded_participant_still_inside_close() -> None:
+    """The graced wait ends at the entry's event, set by the last participant, not at a thread.
+
+    A forwarded release is inside ``close()`` when the detached thread's own close returns and
+    the thread ends. Joining the thread returned at once, through a close still running; waiting
+    on the event waits for the forwarded participant too, to the grace.
+    """
+    sink = GatedCloseSink("child")
+    log_foundry.configure(service="t", sink=sink)
+    with _lifecycle._state._lock:
+        _lifecycle._state._closes.arm(sink)
+        entry = _lifecycle._state._closes.take(sink, _lifecycle._Rule.GRACED)
+    forwarded = threading.Thread(target=lambda: _lifecycle.release(sink), daemon=True)
+    forwarded.start()
+    assert sink.entered.wait(5.0), "the forwarded participant is inside close()"
+    thread = _lifecycle.release(sink, detached=True, closing=entry)
+    assert thread is not None
+    thread.join(5.0)
+    assert not thread.is_alive() and not entry.event.is_set(), "the premise: one still closing"
+    releaser = threading.Timer(0.3, sink.release.set)
+    releaser.start()
+    try:
+        _lifecycle._state._closes.wait_graced(
+            _lifecycle._Operation(_lifecycle._Op.STOP, 5.0), [entry]
+        )
+        assert entry.event.is_set(), "the graced wait returned through a close still running"
+    finally:
+        sink.release.set()
+        releaser.cancel()
+    forwarded.join(5.0)

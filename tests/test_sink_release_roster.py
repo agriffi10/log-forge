@@ -108,17 +108,18 @@ a sink the worker swapped out **without a confirmed fence** whose drain thread h
 (SPEC-050 FR-004). It declines the join because that sink already had the swap's whole budget and
 is far more likely stuck than slow, so joining it would let one stuck swapped-out sink hold the
 exit; and because this runs immediately before the live sink's own inline close, where joining
-would serialise the two and spend the budget `join_closers` is about to spend anyway. The grace
-that follows is the join, one call later, at the end of `_shutdown_worker`.
+would serialise the two and spend the budget the graced wait is about to spend anyway. The grace
+that follows is the join, one call later, at the end of `_shutdown_worker`
+(`_CloseRegistry.wait_graced`, which replaced `join_closers` in SPEC-078).
 
 Two sites stood here before SPEC-054 FR-002/FR-003 and both are gone with what they did.
 `_get_worker` released a sink the worker it built did not adopt; under one owed-close record that
 sink simply stays owed, so the build releases nothing. `Worker._close_if_owed` is the closer this
 one replaced.
 
-What replaces the join is what SPEC-030 FR-003 built for exactly this: the thread is registered
-in `_closers`, `join_closers` grants it the capped grace at shutdown and at exit, and
-`health().closing_sinks` reports it live. So the close is still bounded and still visible; what
+What replaces the join is what SPEC-030 FR-003 built for exactly this: the thread is attached to
+its `GRACED` entry in the close registry, the graced wait grants it what is left of the
+shutdown's one grace at shutdown and at exit, and `health().closing_sinks` reports it live. So the close is still bounded and still visible; what
 it is not is *waited on here*.
 
 Kept as its own table rather than folded into `_EXPECTED_REQUESTERS`, whose stated invariant is
@@ -628,8 +629,8 @@ _LATCH_DISPOSITIONS = {
     ),
     ("_lifecycle", "_close_owed"): (
         "discharges and registers in one critical section, for every sink it takes: that pair "
-        "**is** the record a later re-arm consults, since a sink not in `_owed` and not in "
-        "`_closing_now` is one nothing owes anything to"
+        "**is** the record a later re-arm consults, since a sink not owed and not "
+        "in flight (`_state._closes`) is one nothing owes anything to"
     ),
     ("sinks/multi", "MultiSink.close"): "not a lifecycle close — a wrapper forwarding to a child",
     ("sinks/filtering", "FilteringSink.close"): "not a lifecycle close — a wrapper forwarding",

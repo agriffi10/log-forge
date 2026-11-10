@@ -318,10 +318,10 @@ class Worker:
 
     :meth:`submit` is a fast, in-process handoff, so a slow or down sink can never
     back-pressure the app: the queue is bounded and overflow is dropped-newest with a counter
-    (arch §9). Two drains are deliberately distinct (SPEC-013) — :meth:`shutdown` is terminal
-    and the worker never comes back, while :meth:`flush` drains on demand and leaves everything
-    running, which a process that is frozen rather than exited needs. This class owns delivery
-    mechanics only, and knows nothing about spans or context.
+    (arch §9). Two drains are deliberately distinct (SPEC-013) — :meth:`stop` retires this worker
+    and it never comes back, while :meth:`flush` drains on demand and leaves everything running,
+    which a process that is frozen rather than exited needs. This class owns delivery mechanics
+    only, and knows nothing about spans or context.
     """
 
     _FORK_SKIP = ("_held", "_taken_markers")
@@ -436,9 +436,7 @@ class Worker:
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()
         _lifecycle.offer_stop_signal(sink, self._stop)
-        self._thread = threading.Thread(
-            target=self._run, name="log-foundry-worker", daemon=True
-        )
+        self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         self._thread.start()
 
     def _reinit_after_fork(self, *, resume: bool) -> None:
@@ -502,8 +500,9 @@ class Worker:
         close. ``_taken_markers`` goes with it: a child inherits no ``flush()`` caller to answer.
 
         The in-flight-close slot this method also cleared is gone (SPEC-054 FR-006). A close in
-        flight is registered per sink in ``_lifecycle._state._closing_now`` now, and the child drops
-        the whole registry in ``_lifecycle._clear_after_fork`` for the reason this slot was cleared
+        flight is registered per sink in the close registry's in-flight half now
+        (``_lifecycle._state._closes``, SPEC-078), and the child drops that whole half in
+        ``_lifecycle._clear_after_fork`` for the reason this slot was cleared
         here: it names closes running on threads that did not survive the fork, and
         ``_fork._fresh_primitive`` carries an ``Event``'s set state across, so an inherited entry
         that was already **set** would answer the child's *own* later close instantly — its first
@@ -1213,8 +1212,8 @@ class Worker:
 
         It takes only ``_lock`` and calls nothing while holding it, so it is a leaf in the lock
         order: :func:`_lifecycle._shutdown_worker` calls it under ``_state._lock`` and the
-        nesting ``_state._lock`` then ``Worker._lock`` is the order the closer already
-        documents at ``_closing_now_lock``.
+        nesting ``_state._lock`` then ``Worker._lock`` is the order ``Runtime``'s docstring
+        states, with this lock and the close registry's leaf lock both leaves.
 
         Args:
           deadline: The caller's deadline as a ``time.monotonic()`` instant, or ``None`` for
@@ -1292,8 +1291,19 @@ class Worker:
         own event — and passes the verdict in as ``claimed``. A direct caller, and the late-worker
         route, pass nothing and claim here, before ``self._stop.set()``. Either way a backoff cut
         short by the stop wakes to find the deadline already recorded. Each caller joins or waits
-        against **its own** timeout, never another caller's: a second caller is bounded by the
+        against **its own** budget, never another caller's: a second caller is bounded by the
         budget it asked for whichever deadline the drain is declining against.
+
+        **The caller who won the claim joins until the deadline the claim recorded**
+        (SPEC-078 FR-005), ``_exit_deadline``, rather than until a deadline computed here from
+        ``timeout``. For :func:`_lifecycle._shutdown_worker` that recorded deadline is its
+        operation's, fixed once when the call began, so every slow step of a shutdown reads what
+        remains of one instant and the join cannot end later than the deadline the drain declines
+        against. ``timeout`` is then only what the expiry line renders — the budget the caller
+        asked for, as given, so the line still reads ``shutdown timed out after 0.5s`` rather than
+        whatever remainder was left. A direct caller passes nothing, claims here with ``now +
+        timeout``, and joins until that, as before; a losing caller waits its own ``now +
+        timeout``, since the recorded deadline is the winner's.
 
         An expired join leaves the sink **open**, because the thread is still inside it
         (SPEC-027 FR-004). The closer sees that through :meth:`may_be_inside` and leaves the sink
@@ -1309,7 +1319,9 @@ class Worker:
         (:meth:`_queued_submissions`).
 
         Args:
-          timeout: Seconds to wait for the drain thread, or ``None`` to wait indefinitely.
+          timeout: The caller's budget in seconds, or ``None`` to wait indefinitely. It bounds the
+            wait of a caller that claims here or loses the claim, and it is what the expiry line
+            renders; a caller that already won the claim joins until the deadline it recorded.
           claimed: The verdict of a :meth:`claim_stop` the caller already made under its own
             lock, or ``None`` to claim here.
 
@@ -1319,9 +1331,10 @@ class Worker:
         Raises:
           None.
         """
-        deadline = None if timeout is None else time.monotonic() + timeout
+        own = None if timeout is None else time.monotonic() + timeout
         on_drain_thread = threading.current_thread() is self._thread
-        first = self.claim_stop(deadline) if claimed is None else claimed
+        first = self.claim_stop(own) if claimed is None else claimed
+        deadline = self._exit_deadline if first else own
         if not first:
             if on_drain_thread:
                 return
@@ -1339,7 +1352,7 @@ class Worker:
         self._stop.set()
         if on_drain_thread:
             return
-        self._thread.join(timeout)
+        self._thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         if self._thread.is_alive():
             queued = self._queued_submissions()
             in_flight = self._in_flight

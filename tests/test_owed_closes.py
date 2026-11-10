@@ -22,6 +22,8 @@ import pytest
 import log_foundry
 from log_foundry import _fork, _lifecycle, api
 
+pytestmark = pytest.mark.usefixtures("no_close_left_in_flight")
+
 
 class CountingSink:
     """Counts closes and events, and records the event count seen by each close.
@@ -180,7 +182,7 @@ def test_a_preempted_emit_does_not_take_the_owed_close_from_the_live_sink(
     emitter.join(10.0)
     assert not emitter.is_alive(), "the preempted emit finished"
 
-    owed = _lifecycle._state._owed
+    owed = _lifecycle._state._closes.owed
     assert owed.get(id(third)) is third, (
         f"the live sink is still owed its close — the resumed emit must not displace it. "
         f"Record holds {sorted(sink.name for sink in owed.values())}"
@@ -234,7 +236,7 @@ def test_a_swap_closes_every_superseded_sink_not_only_the_last() -> None:
     log_foundry.info("to A")
     _lifecycle._note_orphan_emit(second)
     second.emit([{"message": "to B"}])
-    assert len(_lifecycle._state._owed) == 2, "two sinks are owed, or this proves nothing"
+    assert len(_lifecycle._state._closes.owed) == 2, "two sinks are owed, or this proves nothing"
 
     log_foundry.configure(sink=third)
 
@@ -244,7 +246,7 @@ def test_a_swap_closes_every_superseded_sink_not_only_the_last() -> None:
     assert (first.buffered, second.buffered) == (0, 0), (
         f"so neither is left holding its buffer — got {first!r} {second!r}"
     )
-    assert _lifecycle._state._owed == {id(third): third}, (
+    assert _lifecycle._state._closes.owed == {id(third): third}, (
         "and the record now names only the sink that replaced them"
     )
 
@@ -274,7 +276,7 @@ def test_building_the_worker_arms_its_sink_and_releases_nothing() -> None:
     stale_one.emit([{"message": "to stale-1"}])
     _lifecycle._note_orphan_emit(stale_two)
     stale_two.emit([{"message": "to stale-2"}])
-    assert len(_lifecycle._state._owed) == 3, "three are owed, or this proves nothing"
+    assert len(_lifecycle._state._closes.owed) == 3, "three are owed, or this proves nothing"
 
     @log_foundry.trace
     def work() -> int:
@@ -283,21 +285,19 @@ def test_building_the_worker_arms_its_sink_and_releases_nothing() -> None:
     work()
 
     assert (stale_one.closes, stale_two.closes, adopted.closes) == (0, 0, 0), (
-        "the build releases nothing — got "
-        f"{stale_one!r} {stale_two!r} {adopted!r}"
+        f"the build releases nothing — got {stale_one!r} {stale_two!r} {adopted!r}"
     )
     worker = _lifecycle._state.worker_exists()
-    assert worker is not None and id(worker.sink) in _lifecycle._state._owed, (
+    assert worker is not None and id(worker.sink) in _lifecycle._state._closes.owed, (
         "and it arms the sink it was built on"
     )
-    assert {id(sink) for sink in (adopted, stale_one, stale_two)} <= set(_lifecycle._state._owed), (
-        "every sink is still owed a close, including the two the build did not adopt"
-    )
+    assert {id(sink) for sink in (adopted, stale_one, stale_two)} <= set(
+        _lifecycle._state._closes.owed
+    ), "every sink is still owed a close, including the two the build did not adopt"
 
     log_foundry.shutdown(timeout=5.0)
     assert (stale_one.closes, stale_two.closes, adopted.closes) == (1, 1, 1), (
-        "and the exit closes all three, once each — got "
-        f"{stale_one!r} {stale_two!r} {adopted!r}"
+        f"and the exit closes all three, once each — got {stale_one!r} {stale_two!r} {adopted!r}"
     )
 
 
@@ -325,10 +325,10 @@ def test_a_swap_with_a_live_worker_closes_every_superseded_sink() -> None:
     for stale in (stale_one, stale_two):
         _lifecycle._note_orphan_emit(stale)
         stale.emit([{"message": f"to {stale.name}"}])
-    assert {id(stale_one), id(stale_two)} <= set(_lifecycle._state._owed), (
+    assert {id(stale_one), id(stale_two)} <= set(_lifecycle._state._closes.owed), (
         "two stale sinks are owed, or this is vacuous"
     )
-    assert id(adopted) in _lifecycle._state._owed, (
+    assert id(adopted) in _lifecycle._state._closes.owed, (
         "and the worker's own sink is owed too since SPEC-054 FR-002 — its build arms it, so "
         "the record holds three and the swap must still pick the right two"
     )
@@ -356,7 +356,7 @@ def test_the_record_holds_more_than_one_sink_at_a_time() -> None:
     log_foundry.info("to A")
     _lifecycle._note_orphan_emit(second)
 
-    owed = _lifecycle._state._owed
+    owed = _lifecycle._state._closes.owed
     assert {sink.name for sink in owed.values()} == {"A", "B"}, (
         f"both sinks are owed a close at once — got {sorted(s.name for s in owed.values())}"
     )
@@ -404,6 +404,7 @@ def test_a_sink_shared_with_the_graph_that_replaces_it_is_not_stranded() -> None
     `A.LOST == 2` on a draft that vetoed the repeat close.
     """
     from log_foundry.sinks import multi
+
     first, second = BufferingSink("A"), BufferingSink("B")
     log_foundry.configure(service="t", sink=first)
     log_foundry.info("one")
@@ -438,13 +439,13 @@ def test_the_owed_close_record_is_emptied_by_one_transition() -> None:
     log_foundry.configure(service="t", sink=first)
     log_foundry.info("to A")
     _lifecycle._note_orphan_emit(second)
-    assert [sink.name for sink in _lifecycle._state._owed.values()] == ["A", "B"], (
+    assert [sink.name for sink in _lifecycle._state._closes.owed.values()] == ["A", "B"], (
         "the premise: both sinks are owed, in arming order"
     )
 
     _lifecycle._close_owed()
 
-    assert not _lifecycle._state._owed, "the take leaves the record empty in the same step"
+    assert not _lifecycle._state._closes.owed, "the take leaves the record empty in the same step"
     assert (first.closes, second.closes) == (1, 1), "and each sink was closed exactly once"
 
 
@@ -484,6 +485,7 @@ def test_flush_reaches_every_sink_the_orphan_path_still_owes() -> None:
     `flush()` drains the sink's own client buffer (SPEC-036 FR-002). It read the single slot, so
     with two sinks owed it drained one and reported success over the other.
     """
+
     class FlushableSink(BufferingSink):
         """Empties its client buffer on `flush()` — the optional protocol SPEC-036 probes for."""
 
@@ -523,9 +525,7 @@ def test_a_forked_child_repairs_every_owed_sink_not_only_the_last() -> None:
     _lifecycle._note_orphan_emit(second)
 
     def in_child() -> str:
-        return ",".join(
-            str(_lifecycle.releasable(sink)) for sink in (first, second)
-        )
+        return ",".join(str(_lifecycle.releasable(sink)) for sink in (first, second))
 
     child = run_in_child(in_child)
 
@@ -550,16 +550,20 @@ def test_the_record_is_opted_out_of_the_repair_walk() -> None:
     Nothing is lost by skipping it: a **live** sink is still reached by the walk through the
     config and through `worker.sink`, and `_inheritance_roots` reads this record directly, so
     marking still refuses an inherited superseded sink.
+
+    SPEC-078 FR-001 moved the record onto the close registry, so the opt-out moved with it: it is
+    declared on `_CloseRegistry`, the holder of the attribute, as `"owed"`, and `Runtime` declares
+    only `_owned`.
     """
     sink = CountingSink("live")
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("arm")
 
-    assert _lifecycle._state._owed, "populated, so the claim below is about real contents"
-    assert "_owed" in _lifecycle.Runtime._FORK_SKIP, (
+    assert _lifecycle._state._closes.owed, "populated, so the claim below is about real contents"
+    assert "owed" in _lifecycle._CloseRegistry._FORK_SKIP, (
         "the record pins superseded sinks, so it is opted out of the repair walk"
     )
-    assert "_owed" in _fork._skipped_names(_lifecycle._state), (
+    assert "owed" in _fork._skipped_names(_lifecycle._state._closes), (
         "and the walk reads that declaration off the object that holds the attribute"
     )
 
@@ -624,6 +628,7 @@ def test_a_stranded_sink_re_armed_on_the_orphan_path_is_closed_once(
     worse than none.
     """
     from log_foundry import worker as worker_mod
+
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 0.3)
 
     class _Slow(BufferingSink):
@@ -671,7 +676,7 @@ def test_a_stranded_sink_re_armed_on_the_orphan_path_is_closed_once(
     may_resume.set()
     emitter.join(10.0)
     monkeypatch.setattr(api, "_ensure_sink", real_ensure_sink)
-    assert any(s is first for s in _lifecycle._state._owed.values()), (
+    assert any(s is first for s in _lifecycle._state._closes.owed.values()), (
         "the premise: the resumed emit re-armed A, so both records now name it"
     )
 

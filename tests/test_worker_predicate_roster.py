@@ -165,7 +165,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "keeps naming the publication and this one is index 1."
         ),
     ),
-        ("_rebuild_worker_after_fork", "_state.worker_exists()", 0): (
+    ("_rebuild_worker_after_fork", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the two questions below read, taken once. The existence question "
@@ -225,7 +225,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "property of the current source and not of the design."
         ),
     ),
-                            ("_shutdown_worker", "_state.worker_exists()", 0): (
+    ("_shutdown_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "which exit path to take. A worker that exists drains first, and only then is the "
@@ -244,7 +244,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "retargeted without this line changing - the shape SPEC-035 FR-002 exists to catch."
         ),
     ),
-    ("_shutdown_worker", "worker.claim_stop(deadline)", 0): (
+    ("_shutdown_worker", "worker.claim_stop(op.deadline)", 0): (
         MOMENT,
         (
             "whether this caller is the one stopping the worker right now, and therefore "
@@ -301,7 +301,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "counted only predicates would not notice."
         ),
     ),
-            ("_swap_sink", "worker is not None", 0): (
+    ("_swap_sink", "worker is not None", 0): (
         LIVENESS,
         (
             "the in-lock branch: a live worker means the orphan path relinquishes its record, "
@@ -313,7 +313,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "worker closed by nobody."
         ),
     ),
-                                ("_flush_worker", "_state.worker_exists()", 0): (
+    ("_flush_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
             "the snapshot the existence test below reads. Deliberately the existence question "
@@ -346,7 +346,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "choice between them."
         ),
     ),
-        ("_flush_worker", "worker is not None", 0): (
+    ("_flush_worker", "worker is not None", 0): (
         EXISTENCE,
         (
             "is there a queue to drain at all. Was `worker is None` guarding an early return; "
@@ -369,14 +369,14 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "FR-002 sequences the sink's own flush *after* the drain, so the drain's verdict has "
             "to be held while that runs; it was `return worker.flush(timeout)`, which the walker "
             "does not file because a Return is filed only for a boolean-shaped value. The "
-            "precedent is `(\"_worker_health\", \"worker.health()\", 0)` — a method-call binding "
+            'precedent is `("_worker_health", "worker.health()", 0)` — a method-call binding '
             "on the worker, filed here. SPEC-036 FR-002 AC-9 settles this rather than leaving it "
             "to be discovered at build time against a red test, and settles it as a category that "
             "already exists: an earlier draft claimed none of the four described performing a "
             "drain, which is false against LIVENESS's own definition."
         ),
     ),
-                ("_flush", "_lifecycle._get_worker()", 0): (
+    ("_flush", "_lifecycle._get_worker()", 0): (
         LIVENESS,
         (
             "who *performs* the submit of a finished span's buffer — `_sweep_open_spans`'s "
@@ -424,7 +424,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "specs. That is the gap SPEC-040 FR-004 widens the scope to close."
         ),
     ),
-        ("_worker_health", "_state.retirements > 0", 0): (
+    ("_worker_health", "_state.retirements > 0", 0): (
         LIVENESS,
         (
             "reporting rather than deciding: this synthesizes `retired` for a process that shut "
@@ -481,30 +481,54 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "thread has ended answers False here and must, because then nothing is inside it."
         ),
     ),
-    ("Runtime.state", "self.live_worker()", 0): (
+    ("Runtime._move", "self.live_worker()", 0): (
         LIVENESS,
         (
-            "the observer's rule 3 (SPEC-077 FR-002): a worker that still delivers reads RUNNING, "
-            "including one built after a shutdown() returned. Liveness rather than existence "
-            "because a retired worker is still the process worker and must read CLOSED. The "
-            "observer decides nothing, so this is the question asked in order to report it."
+            "the stored state's rule 3 (SPEC-077 FR-002, stored by SPEC-078 FR-003): a worker that "
+            "still delivers is RUNNING, including one built after a shutdown() returned. Liveness "
+            "rather than existence because a retired worker is still the process worker and must "
+            "settle CLOSED. Moved here from `Runtime.state`, which now reads the stored value."
         ),
     ),
-    ("Runtime.state", "self.retirements", 0): (
+    ("Runtime._move", "self.retirements", 0): (
         LIVENESS,
         (
             "the snapshot of the retirement count rule 4 reads, filed as a binding because "
             "rebinding is how a guard changes category with its text unchanged. Reading the count "
-            "to report it is the liveness question asked for a different purpose."
+            "to settle the state is the liveness question asked for a different purpose."
         ),
     ),
-    ("Runtime.state", "retirements > 0", 0): (
+    ("Runtime._move", "retirements > 0", 0): (
         LIVENESS,
         (
-            "the observer's rule 4: retired with no live worker reads CLOSED, which is when "
-            "health().retired is true and nothing is drained. Tested after rule 3 deliberately - "
-            "the other order reads a live worker built after a shutdown() as CLOSED, the mutant "
-            "SPEC-077 FR-004's sequential driver kills."
+            "rule 4: retired with no live worker settles CLOSED, which is when health().retired "
+            "is true and nothing is drained. Tested after rule 3 deliberately - the other order "
+            "settles a live worker built after a shutdown() as CLOSED, the mutant SPEC-077 "
+            "FR-004's sequential driver kills."
+        ),
+    ),
+    (
+        "_swap_sink",
+        "worker is None and _state._column() is State.DRAINING and _state._take_ahead()",
+        0,
+    ): (
+        LIVENESS,
+        (
+            "the one cell of the transition table whose answer is new (SPEC-078 FR-004): a swap "
+            "during a drain with **no live worker** declines at entry while the drain still has a "
+            "take ahead of it, because until then the drain owns every owed close - at `fda134a` "
+            "it released the drained sink onto a daemon. Liveness, from the binding above: a live "
+            "worker in the drain (a late one, or one built in its tail) still swaps, since "
+            "declining there loses the configure; after the drain's last take the swap runs its "
+            "no-worker branch, or a sink re-armed in the tail is left owed and open."
+        ),
+    ),
+    ("_shutdown_worker", "late_worker is None and (not waited)", 0): (
+        EXISTENCE,
+        (
+            "the no-worker drain's last take was its first pass when no late worker was built and "
+            "nothing was waited on, so no second pass follows: the operation is marked drained in "
+            "this section, which bounds the declining swap (SPEC-078 FR-004)."
         ),
     ),
     ("_offer_orphan_signal", "_state.in_flight(sink)", 0): (
@@ -524,7 +548,11 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "which is exactly what must stop the closer taking it (SPEC-027 FR-004)."
         ),
     ),
-    ("_close_owed", "[sink for sink in _state._owed.values() if not _state.held(sink)]", 0): (
+    (
+        "_close_owed",
+        "[sink for sink in _state._closes.owed.values() if not _state.held(sink)]",
+        0,
+    ): (
         MOMENT,
         (
             "the take: every owed sink nothing may be inside, decided in the same critical "
@@ -536,16 +564,68 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_close_owed",
-        "{id(sink) for sink in taken if worker is not None and worker.holds_unfenced(sink)}",
+        "worker is not None and worker.holds_unfenced(sink)",
         0,
     ): (
         MOMENT,
         (
             "asked about a sink the take already let through, so the thread has ended - what it "
-            "decides is **how** the close runs, not whether. A sink swapped out without a "
-            "confirmed fence is released detached and granted only the closer grace, because it "
+            "decides is **how** the close runs, not whether: the rule the take records for the "
+            "entry (SPEC-078 FR-002). A sink swapped out without a confirmed fence is `GRACED`, "
+            "released detached and granted only what is left of the closer grace, because it "
             "already had the swap's whole budget and is far more likely stuck than slow "
-            "(SPEC-050 FR-004)."
+            "(SPEC-050 FR-004); every other is `JOINED`."
+        ),
+    ),
+    ("_close_owed", "_state._closes.bystanders(mine) if bystander_wait else []", 0): (
+        MOMENT,
+        (
+            "the closes somebody else had in flight when this call took, captured in the same "
+            "critical section (SPEC-050 FR-002: a close in flight is waited for, not returned "
+            "through). Filed because `bystanders` reads the registry's `_in_flight`, which the "
+            "`in_flight` token matches - the over-match the roster chooses on purpose. A second "
+            "pass asks no bystanders and so waits for nothing a second time."
+        ),
+    ),
+    ("_CloseRegistry._enter", "self._in_flight.get(id(sink))", 0): (
+        MOMENT,
+        (
+            "is a close of this sink already in flight - if so this release joins it as a "
+            "participant rather than starting a second entry, so the entry outlives an inline "
+            "forwarded release while a detached close of the same sink is still running "
+            "(SPEC-078). A question about the close, not the worker; filed by the `in_flight` "
+            "token's over-match."
+        ),
+    ),
+    ("_CloseRegistry.finish", "done and self._in_flight.get(id(sink)) is close", 0): (
+        MOMENT,
+        (
+            "the last participant removes the entry, and only if it is still the one it was "
+            "handed - a fork's clear followed by the forking thread's late discharge must remove "
+            "nothing (SPEC-054 FR-003). Filed by the `in_flight` token's over-match."
+        ),
+    ),
+    ("_CloseRegistry.in_flight", "id(sink) in self._in_flight", 0): (
+        MOMENT,
+        (
+            "the close half of the moment: is a close of this sink running right now. Both "
+            "`Runtime.in_flight` and `Runtime.held` end in it, so a second caller finding a close "
+            "already running leaves the sink alone (SPEC-044 FR-003, SPEC-054 FR-003)."
+        ),
+    ),
+    (
+        "_CloseRegistry.wait_graced",
+        (
+            "[close for close in self._in_flight.values() if close.rule is _Rule.GRACED and "
+            "any((thread.is_alive() for thread in close.threads))]"
+        ),
+        0,
+    ): (
+        MOMENT,
+        (
+            "every detached close still running, for the shutdown's last graced join - what "
+            "`join_closers` snapshotted from `_closers` before SPEC-078. Thread liveness, so a "
+            "close that already ended costs no grace."
         ),
     ),
     ("_close_owed", "_inline_close_choice(taken, worker) if taken else None", 0): (
@@ -565,7 +645,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "fan-out thread exposes it to the SPEC-028 objection."
         ),
     ),
-    ("_swap_sink", "worker is None and (not _state._owed)", 0): (
+    ("_swap_sink", "worker is None and (not _state._closes.owed)", 0): (
         LIVENESS,
         (
             "the no-worker branch's early return: a `configure(A)` then `configure(B)` with "
@@ -611,12 +691,12 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "asks whether anything else can. `retarget` drops the sink from the worker's held "
             "set when it confirms the fence, and this branch then re-takes the lock — in that "
             "gap the sink is owed and unheld, so a concurrent shutdown() takes it and starts "
-            "closing it, and `_register_closing` hands this branch the *same* registration, so a "
+            "closing it, and the registry hands this branch that *same* entry, so a "
             "detached release starts a second closer into a close already running. Measured at "
             "two overlapping closes with a preemption point, and 13 of 120 seeds unforced."
         ),
     ),
-    ("_swap_sink", "worker.retarget(new_sink, deadline)", 0): (
+    ("_swap_sink", "worker.retarget(new_sink, op.deadline)", 0): (
         LIVENESS,
         (
             "who **performs** the drain-reassign-fence. The verdict comes back as a **value** "
@@ -638,7 +718,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         "_inheritance_roots",
         (
             "(config._live_config().sink, None if worker is None else worker.sink, "
-            "*_state._owed.values())"
+            "*_state._closes.owed.values())"
         ),
         0,
     ): (
@@ -1002,8 +1082,32 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 47, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 54, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived count after SPEC-078's first diff review, 53 -> 54.** The decline now also
+reads `_state._take_ahead()` (re-keyed in place), `_close_owed`'s rule choice is a plain `if` rather
+than a comprehension (re-keyed, one site either way), and one site was added: `_shutdown_worker`'s
+`late_worker is None and (not waited)`, which marks a no-worker drain's last take.
+
+**Raised to the derived count again at SPEC-078 (FR-003, FR-004), 52 -> 53.** `Runtime.state`'s
+three sites moved to `Runtime._move` with their categories, because the stored state is now
+derived there and `state` reads it; the one added site is `_swap_sink`'s decline in `DRAINING`
+with no live worker, which is the state read FR-006 asks to be filed with a category.
+
+**Raised to the derived count at SPEC-078 (FR-001), 47 -> 52.** Measured with this file's
+`_per_module_sites` on the branch, by diffing `_numbered()` against the base. Six rows re-keyed
+in place with their categories unchanged, because their text named the moved record or the
+operation's deadline (`_state._owed` -> `_state._closes.owed`, `deadline` -> `op.deadline`), and
+the detach-set comprehension became the take's rule choice. Five sites were added:
+
+    +4  _CloseRegistry (_enter, finish, in_flight, wait_graced)
+    +1  _close_owed    (the bystander snapshot)
+
+Every one is a question about a close in flight, filed because the `in_flight` token matches the
+registry's `_in_flight` field, and `bystanders` reads that field, so `_accessor_names` derives it
+as an accessor. That is the over-match this roster chooses: classifying them costs a row each,
+skipping a real guard costs a defect.
 
 **Raised to the derived count at SPEC-077, 44 -> 47.** The three added sites are
 `Runtime.state`'s (`self.live_worker()`, the `retirements` binding and `retirements > 0`), the
@@ -1128,7 +1232,7 @@ def test_no_scope_name_is_shared_across_the_walked_modules() -> None:
         }
         for module in _WALKED
     }
-    for (left, right) in itertools.combinations(sorted(scopes), 2):
+    for left, right in itertools.combinations(sorted(scopes), 2):
         shared = scopes[left] & scopes[right]
         assert not shared, f"{left} and {right} share these scopes, which would collide: {shared}"
 
@@ -1232,10 +1336,14 @@ def test_the_roster_finds_a_verdict_carried_by_a_return_value() -> None:
     make an assertion over the real tree read as the opposite of what it means.
     """
     found = _numbered()
-    assert ("_swap_sink", "worker.retarget(new_sink, deadline)", 0) in found
+    assert ("_swap_sink", "worker.retarget(new_sink, op.deadline)", 0) in found
     assert not _sites(
-        ast.parse('def f():\n    outcome = g()\n    if outcome.verdict == "fenced":\n        pass\n')
-    ), "limitation 3: a use carrying no sentinel of its own is not followed, stated rather than assumed"
+        ast.parse(
+            'def f():\n    outcome = g()\n    if outcome.verdict == "fenced":\n        pass\n'
+        )
+    ), (
+        "limitation 3: a use carrying no sentinel of its own is not followed, stated rather than assumed"
+    )
 
 
 def _walk_source(source: str) -> set[str]:

@@ -27,6 +27,15 @@ recorder, a default-resolved one included: ``StdoutSink`` is replaced by a facto
 ``_ensure_sink`` path, stamp and all, builds one. Coverage of every cell is asserted over the seed
 range rather than left to chance (:func:`test_the_seed_range_covers_every_cell`).
 
+**Since SPEC-078 the settled state is stored**, in ``Runtime._current``, and the driver also checks
+it after every step against :func:`derived_current` — rules 3 to 6 without the configured-sink
+term, written here and evaluated over the runtime's own fields, with liveness computed from the
+worker's epoch directly rather than through ``live_worker()``, so the oracle shares no expression
+with the code it checks (SPEC-078 FR-003 AC-2). ``state`` reports that stored value, so the
+invariants below are now checked against the stored state. Deleting any of the three ``_move``
+calls this driver reaches reddens it: the build's and the orphan arm's only here, since ``state``
+already reports ``RUNNING`` from the config.
+
 **What the driver checks, by invariant**: 1 (no step raises, ``BaseException`` included); 2
 (orphans balance after every step, spans after every truthy ``flush()`` and every shutdown); 3,
 the wall-clock half (each step inside its budget plus the slack); 4 (every ``span.end`` arrives on
@@ -821,6 +830,30 @@ def _budget(step: str) -> float:
     }.get(step, 0.0)
 
 
+def derived_current(runtime: Any) -> State:
+    """The settled state the runtime's fields describe, computed here rather than imported.
+
+    Rules 3 to 6 of SPEC-077 without the configured-sink term: a live worker is ``RUNNING``, else a
+    retirement is ``CLOSED``, else something owed is ``RUNNING``, else ``UNCONFIGURED``. Liveness is
+    read from the worker's ``_epoch`` against the retirement count directly, never through
+    ``Runtime.live_worker()``, so a defect in that method cannot hide here.
+
+    Args:
+      runtime: The ``Runtime`` to read, in this process or in a forked child.
+
+    Returns:
+      The settled state its fields describe.
+    """
+    worker = runtime._worker
+    if worker is not None and runtime.retirements <= worker._epoch:
+        return _R
+    if runtime.retirements > 0:
+        return _C
+    if runtime._closes.owed:
+        return _R
+    return _U
+
+
 def _fork_step(run: _Run, expected: State, where: str) -> None:
     """Forks at a step boundary and checks the child's half of invariant 12 and the parent's."""
     before = [(len(s.threads), s.closes) for s in run.sinks]
@@ -830,6 +863,8 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
     def child() -> str:
         closes = [s.closes for s in run.sinks]
         initial = _lifecycle._state.state.name
+        stored = _lifecycle._state._current.name
+        derived = derived_current(_lifecycle._state).name
         started = time.monotonic()
         log_foundry.info("child-orphan")
         log_foundry.flush(timeout=FLUSH_TIMEOUT)
@@ -838,6 +873,8 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
         return json.dumps(
             {
                 "initial": initial,
+                "stored": stored,
+                "derived": derived,
                 "elapsed": elapsed,
                 "in_inherited": sum(s.count("child-orphan") for s in run.sinks[:inherited]),
                 "in_own": sum(s.count("child-orphan") for s in run.sinks[inherited:]),
@@ -851,6 +888,9 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
     assert reaped.finished, f"invariant 12 (the child finished): {reaped.output} {where}"
     report = json.loads(reaped.output)
     assert report["initial"] == expected.name, f"invariant 12 (child state): {report} {where}"
+    assert report["stored"] == report["derived"], (
+        f"SPEC-078 FR-003 (the child's stored state is its derived one): {report} {where}"
+    )
     assert report["elapsed"] < FLUSH_TIMEOUT + SHUTDOWN_TIMEOUT + BOUND_SLACK, (
         f"invariant 12 (the child's three calls returned within a bound): {report} {where}"
     )
@@ -999,7 +1039,9 @@ def _check_invariants(run: _Run, step: str, result: object, driver: int, where: 
         unclosed = [i for i, s in enumerate(run.sinks) if s.events and s.closes == 0]
         overlapped = [i for i, s in enumerate(run.sinks) if s.overlapped]
         assert not unclosed, f"invariant 5 (every sink written to is closed): {unclosed} {where}"
-        assert not _lifecycle._state._owed, f"invariant 5 (nothing owed after a shutdown) {where}"
+        assert not _lifecycle._state._closes.owed, (
+            f"invariant 5 (nothing owed after a shutdown) {where}"
+        )
         assert not overlapped, f"invariant 5 (closed once, never overlapping): {overlapped} {where}"
 
 
@@ -1041,7 +1083,13 @@ def test_the_sequential_driver_holds_the_state_table(
         assert not _lifecycle._state._swaps_running and not _lifecycle._state._stops_running, (
             f"a token outlived its call {where}"
         )
-        assert bool(_lifecycle._state._owed) == model.owed, f"owed is not the model's {where}"
+        assert bool(_lifecycle._state._closes.owed) == model.owed, (
+            f"owed is not the model's {where}"
+        )
+        stored, derived = _lifecycle._state._current, derived_current(_lifecycle._state)
+        assert stored is derived, (
+            f"the stored state {stored.name} is not the derived {derived.name} {where}"
+        )
         assert (_lifecycle._state.live_worker() is not None) == model.live, (
             f"liveness is not the model's {where}"
         )

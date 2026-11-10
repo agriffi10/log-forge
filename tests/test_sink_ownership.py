@@ -32,6 +32,8 @@ from log_foundry.sinks.stdout import StdoutSink
 from log_foundry.sinks.transform import TransformSink
 from test_fork_lifecycle import run_in_child
 
+pytestmark = pytest.mark.usefixtures("no_close_left_in_flight")
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
@@ -376,7 +378,9 @@ def test_a_marking_walk_that_fails_refuses_everything_unrecorded(
     monkeypatch.setattr(_lifecycle, "_inheritance_roots", exploding_roots)
     try:
         _lifecycle._mark_inherited()
-        assert _lifecycle._state._marking_failed is True, "the guard caught it and withdrew the default"
+        assert _lifecycle._state._marking_failed is True, (
+            "the guard caught it and withdrew the default"
+        )
         assert _lifecycle.releasable(unrecorded) is False
         assert _lifecycle.release(unrecorded) is None
         assert unrecorded.closed == 0, "and the refusal is a skip, not a raise"
@@ -448,7 +452,9 @@ def test_a_sink_subclassing_a_builtin_container_is_still_recorded(build: object)
     log_foundry.configure(service="own", sink=wrapper)
 
     with _lifecycle._state._owned_lock:
-        assert id(inner) in _lifecycle._state._owned, "a sink that is also a container is still a sink"
+        assert id(inner) in _lifecycle._state._owned, (
+            "a sink that is also a container is still a sink"
+        )
 
     wrapper.close()
     assert inner.closed == 1, "and its wrapper still closes it"
@@ -478,7 +484,9 @@ def test_the_marking_walk_does_not_escape_through_a_module_reference() -> None:
 
     def in_child() -> str:
         with _lifecycle._state._owned_lock:
-            marked = sum(1 for pid, _ref in _lifecycle._state._owned.values() if pid == _lifecycle._FOREIGN)
+            marked = sum(
+                1 for pid, _ref in _lifecycle._state._owned.values() if pid == _lifecycle._FOREIGN
+            )
         return str(marked)
 
     child = run_in_child(in_child)
@@ -523,7 +531,9 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     )
 
     _lifecycle._mark_inherited()
-    assert _lifecycle._state._marking_failed is True, "the ceiling tripped rather than the walk running on"
+    assert _lifecycle._state._marking_failed is True, (
+        "the ceiling tripped rather than the walk running on"
+    )
     assert _lifecycle.releasable(unrecorded) is False, "and it degraded toward refusing"
 
     # Driven in-process rather than through `run_in_child`: a real child never reaches this code,
@@ -588,7 +598,7 @@ def test_the_record_holds_a_strong_reference() -> None:
     def in_child() -> str:
         config._config = config.Config()
         _lifecycle._state._worker = None
-        _lifecycle._state._owed.clear()
+        _lifecycle._state._closes.owed.clear()
         _lifecycle._state._orphan_closed_sink = None
         gc.collect()
         with _lifecycle._state._owned_lock:
@@ -1273,7 +1283,9 @@ def test_health_reports_an_inherited_sink_through_the_worker_too() -> None:
         log_foundry.info("in-span")
 
     work()
-    assert _lifecycle._state._worker is not None, "the precondition: this test is about the worker path"
+    assert _lifecycle._state._worker is not None, (
+        "the precondition: this test is about the worker path"
+    )
     assert log_foundry.health().inherited_sink is False
 
     def in_child() -> str:

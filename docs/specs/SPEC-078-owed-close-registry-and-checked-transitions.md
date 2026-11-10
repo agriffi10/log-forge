@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-078
 title: "The Owed-Close Registry and Checked Lifecycle Transitions"
 description: "Puts every owed and in-flight sink close in one registry that spends the closer grace once per shutdown, and makes the stored lifecycle State the authority: every lifecycle call checks it under the runtime's lock and has a defined answer in every state."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-066, SPEC-068, SPEC-077]
 arc: stability-redesign
 arc_order: 10
@@ -15,8 +15,10 @@ SPEC-077 gives the lifecycle bookkeeping one holder, `Runtime`, and names the pr
 in `State` — but as an **observer**, read off the flags and deciding nothing. This spec is the next
 step of the arc: `State` becomes the **authority**. It is stored, written in one place under the
 runtime's lock, and every lifecycle call — a sink swap, `flush()`, `shutdown()`, the exit drain, a
-span needing a worker, an orphan log arming a sink, and a forked child's entry — reads it on entry
-and takes the answer the transition table gives for that state. Beside it, the closes the library
+span needing a worker, an orphan log arming a sink, and a forked child's entry — has a defined
+answer for every state in one transition table. The call whose answer depends on the state, the
+sink swap, reads it on entry under the lock; the others give the same answer in every state, so
+their existing code is the table's answer (FR-003, as amended during the build). Beside it, the closes the library
 owes stop living in four structures (`_owed`, `_closing_now`, `_closers` and a local list of
 threads inside `_close_owed`) and live in **one registry**, which records how each close is run and
 waited for, and owns the one grace a shutdown may spend on somebody else's close. SPEC-079 then
@@ -77,7 +79,7 @@ each on purpose:**
 - The close rules kept exactly — inline, fan-out joined in full, detached and graced, a bystander
   waiting — and the grace spent once per call (FR-002).
 - A stored `State` with one writer, SPEC-077's token sets carrying the operation that holds
-  `SWAPPING` or `DRAINING`, and every lifecycle entry reading it under the lock with no new lock
+  `SWAPPING` or `DRAINING`, and the lifecycle entries answering from it under the lock with no new lock
   acquisition (FR-003).
 - The transition table, total over six calls and five states, its one changed cell (a swap during a
   drain with no live worker declines), and the decision that `CLOSED` keeps its arrows (FR-004).
@@ -295,14 +297,20 @@ so the token that holds `SWAPPING` or `DRAINING` also carries that call's deadli
 and their discipline are unchanged: `set[_Operation]`, each token added in the call's first critical
 section, and discarded in a `finally` by one `set.discard`, without the lock.
 
-**Dispatch.** Each lifecycle entry reads, once, in the critical section it already takes,
-`_stops_running`, then `_swaps_running`, then `_current`. The first non-empty set, or else
-`_current`, is the table column FR-004 answers from. Dispatch never reads the config term, so a
-`SWAP` or an `ARM` from cold is in the `UNCONFIGURED` column although `state` already reports
-`RUNNING` there. The entries are `_get_worker`'s inner check (`BUILD`),
-`_note_orphan_emit`'s locked branch (`ARM`), `_swap_sink` (`SWAP`), `_flush_worker` (`FLUSH`, which
-moves nothing), `_shutdown_worker` for `shutdown()` and the exit drain (`STOP`), and
-`_clear_after_fork` (`FORK`). The `FORK` entry empties the token sets (SPEC-077), and the child's
+**Dispatch.** The table column FR-004 answers from is `Runtime._column()`: `_stops_running`, then
+`_swaps_running`, then `_current`, the first non-empty set or else `_current`, read in a critical
+section the caller already holds. Dispatch never reads the config term, so a `SWAP` or an `ARM`
+from cold is in the `UNCONFIGURED` column although `state` already reports `RUNNING` there. The
+entries are `_get_worker`'s inner check (`BUILD`), `_note_orphan_emit`'s locked branch (`ARM`),
+`_swap_sink` (`SWAP`), `_flush_worker` (`FLUSH`, which moves nothing), `_shutdown_worker` for
+`shutdown()` and the exit drain (`STOP`), and `_clear_after_fork` (`FORK`). **Only `_swap_sink`
+reads `_column()`** (amended during the build, 2026-11-09): five of the six rows give the same code
+in every column — `BUILD` × `DRAINING` is split by `_shutdown_running`, kept on purpose (Out of
+Scope), `STOP` × `DRAINING` by `Worker.claim_stop`, and `BUILD`, `ARM`, `FLUSH` and `FORK` do the
+same thing wherever they are — so a read at those entries would decide nothing and be a dead
+binding. `SWAP` × `DRAINING` with no live worker is the one cell whose answer differs, and that is
+where the column is read; the other entries' existing code is the table's answer, and FR-004's
+per-cell tests prove each cell. The `FORK` entry empties the token sets (SPEC-077), and the child's
 `_current` is inherited as the parent had it, which is exact. Its child-repair value is `inherited`.
 `configure()` without `sink=` writes the config and is not a lifecycle call.
 
@@ -374,7 +382,7 @@ stop, the second pass and the grace.
 |---|---|---|---|---|---|
 | `BUILD`: a span needs a worker and none exists | builds, arms its sink → `RUNNING` | builds → `RUNNING` | builds; the swap continues → `SWAPPING`, then as the swap leaves it | inside the `_shutdown_running` window: the late worker this drain stops (SPEC-044 FR-001) → `DRAINING`, then `CLOSED`; in the tail: a live worker the drain does not stop → `DRAINING`, then `RUNNING` | builds a live worker → `RUNNING` |
 | `ARM`: an orphan log reaches a sink not owed | arms → `RUNNING` | arms → `RUNNING` | arms → `SWAPPING`, then as the swap leaves it | arms; owed a further close (SPEC-045 FR-002) → `DRAINING`, then as the drain leaves it | arms → `CLOSED` |
-| `SWAP`: `configure(sink=…)` | nothing to swap → `RUNNING`, since the config has resolved a sink; `_current` stays `UNCONFIGURED` | through `SWAPPING` when it has work, directly when not → `RUNNING` | runs alongside the swap in flight → `SWAPPING`, then the settled state when the last leaves | **no live worker: declines at entry**, with no retarget, no close and no arm; a live worker (a late one, or one built in the tail): swaps as in `RUNNING` → `DRAINING`, then as the drain leaves it | through `SWAPPING` only when something is owed: supersedes the owed sinks and arms the new one → `CLOSED` |
+| `SWAP`: `configure(sink=…)` | nothing to swap → `RUNNING`, since the config has resolved a sink; `_current` stays `UNCONFIGURED` | through `SWAPPING` when it has work, directly when not → `RUNNING` | runs alongside the swap in flight → `SWAPPING`, then the settled state when the last leaves | **no live worker, and the drain still has a take ahead of it: declines at entry**, with no retarget, no close and no arm; after the drain's last take, as in `CLOSED`'s no-worker branch; a live worker (a late one, or one built in the tail): swaps as in `RUNNING` → `DRAINING`, then as the drain leaves it | through `SWAPPING` only when something is owed: supersedes the owed sinks and arms the new one → `CLOSED` |
 | `FLUSH`: `flush()` | touches no sink → unchanged | drains → unchanged | drains → unchanged | answers as at `fda134a` → unchanged | answers as at `fda134a` → unchanged |
 | `STOP`: `shutdown()` or the exit drain | moves the count → `CLOSED` | drains and closes → `CLOSED`, or `RUNNING` when no worker existed and a span built one in the tail | drains and closes; the swap's retarget declines (SPEC-033 FR-002) → `SWAPPING` while the swap is inside, then `CLOSED` | joins as a second caller, as SPEC-068 leaves it → `DRAINING` while the first call is inside, then as the `RUNNING` cell | moves the count, closes what was armed since → `CLOSED`, with the `RUNNING` cell's tail exception |
 | `FORK`: the child's entry | `UNCONFIGURED` | `RUNNING` | `_current`, inherited: `RUNNING` or `CLOSED` | `_current`, inherited | `CLOSED` |
@@ -396,11 +404,16 @@ worker's sink once its drain thread has ended — and arms B. Measured at `fda13
 `_lifecycle._close_owed` so that its first call runs `configure(sink=B)` before delegating, after
 `configure(sink=A)`, one traced call and `flush()`: A's `close()` ran on `log-foundry-sink-close`
 and B's on `MainThread`; without the wrapper A's ran on `MainThread` and B was never closed. With no
-live worker in `DRAINING`, the drain in progress owns every owed close, so the swap does nothing but
-return: the
-config already names B, and the first event that reaches B arms it as any orphan log does. A swap
-that entered before the drain is past its entry and finishes by today's rules, where its retarget
-declines.
+live worker in `DRAINING`, the drain in progress owns every owed close **until its last take**, so
+the swap does nothing but return: the config already names B, and the first event that reaches B
+arms it as any orphan log does. **After the drain's last take the swap runs its no-worker branch as
+at `fda134a`** (amended during the build, 2026-11-09). A sink armed since — an orphan log re-arming
+the drained sink in the drain's tail — is taken by nothing left in that call, and declining there
+left it owed and open after the shutdown returned (measured on the first build: `configure(A)`,
+`info()`, `shutdown(5)` with its last graced join running `info()` then `configure(sink=C)` closed
+A once and left it owed). The drain marks its last take on its operation, in the critical section
+where it becomes known, and the swap reads that under the lock. A swap that entered before the
+drain is past its entry and finishes by today's rules, where its retarget declines.
 
 **`CLOSED` keeps its arrows, and this is the decision.** Measured at `fda134a`: after a `shutdown()`
 that built no worker, a `@trace` call built a live worker and its event was delivered; after a
@@ -442,12 +455,23 @@ by design … nothing restarts") and the public `shutdown()` docstring ("Logging
 
 #### Description:
 
-An `_Operation` is the slow half of a `SWAP` or a `STOP`, and the token SPEC-077's sets hold: added
-under the lock in the call's first critical section, run outside it, and discarded without it. Its
-`deadline` is computed once, when it is built, from the caller's timeout, and every slow
-step reads what remains from it rather than from a local: the swap's `Worker.retarget` and its
-closer joins; the shutdown's `Worker.claim_stop` (which records it for the exit drain's decline,
-SPEC-062 FR-001), `Worker.stop`, the bystander wait and the graced join, through `grace_end`. The
+An `_Operation` is the slow half of a `SWAP` or a `STOP`, and the token SPEC-077's sets hold: built
+once on the call's first line, **before** its first critical section, added to its token set inside
+that section, run outside it, and discarded without it (amended during the build, 2026-11-09:
+building it inside the section would start the budget only after a wait for `_state._lock`, which
+is held across a blocking `Worker(_ensure_sink())`, so a `configure()` queued behind a slow build
+would overrun its timeout by that wait; the deadline is the instant the caller asked, as the local
+it replaces was). Its `deadline` is computed once, when it is built, from the caller's timeout,
+and every slow step reads what remains from it rather than from a local: the swap's
+`Worker.retarget` and its closer joins; the shutdown's `Worker.claim_stop` (which records it for
+the exit drain's decline, SPEC-062 FR-001), `Worker.stop`, the bystander wait and the graced
+join, through `grace_end`. **`Worker.stop` reads it through `claim_stop`** (amended during the
+build, 2026-11-09): passed `claimed=True`, it joins until the `_exit_deadline` that
+`claim_stop(op.deadline)` recorded, and its `timeout` argument — the operation's `budget`, the
+caller's timeout as given — only renders the expiry line, so the line still reads
+`shutdown timed out after 0.5s` (`tests/test_worker_exit_budget.py` pins it through
+`_shutdown_worker`) where passing a remainder would have rendered `0.499998s`. `Worker.stop`'s
+signature does not change. The
 emit on the drain thread is the tracked half of the drain: it is bounded by what SPEC-062 bounds it
 by, the op's deadline as `claim_stop` recorded it. `BUILD`, `ARM` and `FLUSH` hold no state while
 they run and create no operation.
@@ -472,11 +496,15 @@ keep accepting when it released nothing, invariant 7) is that helper's.
 
 #### Acceptance Criteria:
 
-- [ ] Each `_Operation`'s `deadline` is set once, when it is built in the call's first critical
+- [ ] Each `_Operation`'s `deadline` is set once, when it is built, before the call's first critical
   section. In `_swap_sink` and `_shutdown_worker`, an AST scan finds the `timeout` parameter read
-  only in that construction. Every call to `Worker.stop`, `Worker.retarget`, `Worker.claim_stop` or
-  a thread join is passed `op.deadline` or a remainder computed from it, so today's
-  `worker.stop(timeout, …)` (`_lifecycle.py:1866` at `fda134a`) fails the scan.
+  only in that construction. Every call to `Worker.retarget`, `Worker.claim_stop` or a thread join
+  is passed `op.deadline` or a remainder computed from it, and every call to `Worker.stop` is passed
+  either that or the `claimed=` verdict of a `claim_stop(op.deadline)` in the same function, while
+  `Worker.stop`'s join reads the recorded `_exit_deadline` when claimed. So today's
+  `worker.stop(timeout, …)` (`_lifecycle.py:1866` at `fda134a`) fails the scan, and so does a
+  `Worker.stop` whose claimed join reverts to `monotonic() + timeout` (amended during the build,
+  2026-11-09).
 - [ ] A sink whose `emit` blocks on an event the test holds, past `shutdown(timeout=0.3)`: while the
   drain thread is inside it, a second `shutdown(timeout=0.3)`, a `configure(sink=B)` and the exit
   drain's function `_lifecycle._shutdown_worker(timeout=0.3)` each return without calling its
@@ -506,7 +534,12 @@ Tests that pin a removed mechanism are re-expressed, never deleted. Measured at 
 `test_api.py`, `test_concurrent_owed_closes.py`, `test_config.py`, `test_fork_lifecycle.py`,
 `test_lifecycle_races.py`, `test_orphan_sink_handoff.py`, `test_owed_closes.py`,
 `test_shutdown_lifecycle.py`, `test_sink_ownership.py`, `test_sink_release_roster.py`,
-`test_worker.py` and `test_worker_predicate_roster.py`. Most edits are a path. The rest move a
+`test_worker.py` and `test_worker_predicate_roster.py`. Re-measured at the build's base,
+`64d0d039`, after SPEC-077 landed: the same grep names those thirteen and four more, SPEC-077's
+`test_invariants_model.py`, `test_lifecycle_inventory.py`, `test_runtime_holder.py` and
+`test_runtime_state.py`; its four other hits (`test_closed_guard.py`, `test_sink_concurrency.py`,
+`test_sink_post_close.py`, `test_sinks_nats_liveness.py`) are an unrelated `_closing` — a test
+helper and a sink attribute — and are not edited. Most edits are a path. The rest move a
 monkeypatch from `join_closers` to the registry's graced join and keep the assertion.
 
 Four guards are re-derived, never left to shrink. `tests/test_lifecycle_races.py`'s
@@ -514,7 +547,7 @@ under-lock lint keys on names (`_UNDER_LOCK_OFFENDERS = frozenset({"join_closers
 at `fda134a`), so removing `join_closers` would empty half of it silently: the set names the
 registry's join methods instead, and a mutant that calls one under `_state._lock` must fail it.
 `tests/test_worker_predicate_roster.py`'s `_SITE_FLOOR` for `log_foundry._lifecycle` (43 at
-`fda134a`) does not fall, and the state reads in the entries are filed with a category. SPEC-077's
+`fda134a`, 47 at the build's base after SPEC-077) does not fall, and the state reads in the entries are filed with a category. SPEC-077's
 lifecycle inventory test re-declares the moved fields, and its floor of lock and event construction
 sites in `_lifecycle.py` and `worker.py` falls by exactly one, for the merged leaf, in the same
 commit, with the merge named in the table's `reason`. SPEC-077 FR-001's lock-site test holds its
@@ -530,7 +563,8 @@ FR-001 gives, and the token sets keep `reset: _clear_after_fork`.
 - [ ] The directed tests and the totality check pass, and the sequential driver passes over its
   fixed seed range with the stored-versus-derived check of FR-003 after every step.
 - [ ] A mutant calling the registry's graced join under `_state._lock` fails the under-lock lint,
-  and the predicate roster's `_lifecycle` floor is at least 43.
+  and the predicate roster's `_lifecycle` floor is at least 47, its value at the build's base
+  (43 at `fda134a`; SPEC-077 raised it).
 - [ ] SPEC-077 FR-001's lock-site test passes against its re-recorded literal, whose diff from
   SPEC-077's names only the merged leaf lock's sites, `join_closers`' removed sites and the
   registry's join; a mutant that takes `_state._lock` in place of the leaf in one registry method
@@ -562,6 +596,7 @@ class _Op(enum.Enum):                # the table's six rows
 class _Operation:                    # the slow half of a SWAP or a STOP
     kind: _Op                        # SWAP or STOP
     deadline: float | None           # time.monotonic() + timeout, set once when built
+    budget: float | None             # the caller's timeout as given, for Worker.stop's expiry line only
     grace_end: float | None          # STOP only: set at the call's first graced wait, then reused
 
 class _Rule(enum.Enum):
@@ -572,7 +607,7 @@ class _Rule(enum.Enum):
 class _Close:                        # one close in flight; holds no sink
     event: threading.Event           # set when the close ends, however it ended
     rule: _Rule
-    thread: threading.Thread | None  # None for INLINE, and until started
+    threads: list[threading.Thread]  # every detached participant's thread; empty for INLINE and until started
 
 class _CloseRegistry:
     owed: dict[int, Sink]            # was Runtime._owed; guarded by Runtime._lock
@@ -610,7 +645,8 @@ _state._closes.join_joined(closes) -> None        # every JOINED thread, in full
 _state._closes.wait_graced(op, mine) -> None      # bystander wait and GRACED joins, to op.grace_end
 _state._closes.graced_alive() -> int              # Health.closing_sinks
 _state._move() -> None                            # caller holds _state._lock; re-settles _current
-_Operation(kind, timeout)                         # built and added to its token set in the call's first critical section;
+_Operation(kind, timeout)                         # built on the call's first line, before its first critical section;
+                                                  # added to its token set in that section;
                                                   # discarded in a finally with set.discard, no lock (SPEC-077)
 _state.state -> State                             # lock-free; DRAINING / SWAPPING from the token sets, else _current
                                                   # (a stored UNCONFIGURED reported RUNNING once a sink resolved)
@@ -620,7 +656,7 @@ _state.state -> State                             # lock-free; DRAINING / SWAPPI
 
 ```
 src/log_foundry/_lifecycle.py                 # _CloseRegistry, _Close, _Rule, _Op, _Operation; Runtime's stored state
-src/log_foundry/worker.py                     # docstrings only (the moved names)
+src/log_foundry/worker.py                     # docstrings, and Worker.stop's claimed join reading _exit_deadline
 src/log_foundry/__init__.py                   # shutdown()'s docstring (FR-004)
 tests/test_lifecycle_transitions.py           # the directed cell tests and the totality check
 tests/test_invariants_model.py                # the stored-versus-derived check
@@ -704,3 +740,23 @@ row for the registry. The release notes for 1.2.0 carry the two fixes.
   `join_closers` turn red, is added to the Overview's list of SPEC-077 pins this spec changes and to
   FR-006's re-derived guards, with a criterion.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-09, built. Five places were amended during the build, each in the commit that diverged:
+  - FR-006's test-file list and roster floor were re-measured at `64d0d039`, after SPEC-077
+    landed.
+  - FR-003's dispatch: only `_swap_sink` reads `_column()`, because the other five rows give the
+    same code in every column.
+  - FR-005: the `_Operation` is built before the call's first critical section.
+  - FR-005: `Worker.stop` reads the deadline through `claim_stop`'s recorded `_exit_deadline`
+    when claimed, and keeps its signature. Passing a remainder would have rendered
+    `0.499998s` in the expiry line `test_worker_exit_budget.py` pins.
+  - The API comment on `_Operation` and the file plan for `worker.py` were updated to match.
+
+  The plan review also found an edge case: a forwarded release joining a detached close still in
+  flight discharged its entry early. `_Close` counts its participants to close it.
+- 2026-11-09, after the first diff review:
+  - FR-004's changed cell is narrowed to hold only **until the drain's last take**. A swap in a
+    no-worker drain's tail had left a re-armed sink owed and open. `_Operation.drained` records the
+    last take, and `Runtime._take_ahead()` bounds the decline.
+  - The Overview is aligned with FR-003's dispatch amendment.
+  - `_Close.thread` became `threads`, so a second detached participant's thread never overwrites
+    the first's.

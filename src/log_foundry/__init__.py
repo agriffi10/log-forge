@@ -154,16 +154,22 @@ def health() -> Health:
 def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Flushes buffered events and closes the sink, blocking until drained.
 
-    This is terminal — the worker does not come back — and idempotent. Do not call it
-    per-invocation in a serverless handler: the first invocation on a warm container would log
-    and every later one would silently log nothing; use :func:`flush` there. It is also
-    registered via ``atexit``, so call it explicitly only when you want to be certain the tail
-    of the queue reached the sink before a fast process exit (SPEC-004 FR-005).
+    It retires the background worker it stops — that worker never comes back — and it is
+    idempotent. Do not call it per-invocation in a serverless handler: after the first invocation
+    on a warm container, every span on that container is counted rather than delivered; use
+    :func:`flush` there. It is also registered via ``atexit``, so call it explicitly only when you
+    want to be certain the tail of the queue reached the sink before a fast process exit
+    (SPEC-004 FR-005).
 
-    Logging afterwards is **accepted and undeliverable**: those events are queued and nothing
-    will drain them. It is not silent any more — :func:`health` then reports ``retired`` with a
-    non-zero ``submitted_after_shutdown``, and the first such submission writes one stderr line
-    (SPEC-030). That pair is the reading that catches the mistake above.
+    **Logging afterwards takes one of two shapes**, depending on whether this call stopped a
+    worker (SPEC-078 FR-004). After a ``shutdown()`` that **stopped a background worker**, a span
+    is accepted and undeliverable: it is queued on the retired worker, nothing drains it, and it
+    is not silent — :func:`health` reports ``retired`` with a non-zero
+    ``submitted_after_shutdown``, and the first such submission writes one stderr line (SPEC-030).
+    That pair is the reading that catches the mistake above. After a ``shutdown()`` that **found
+    no worker** — a process that only logged outside spans — the next span starts a fresh worker
+    and is delivered (SPEC-044 FR-001), and ``retired`` stays true. In both shapes a level call
+    outside a span reaches the configured sink, as the paragraph below says.
 
     A process that only ever logged **outside** a span built no worker, and this used to be a
     no-op there, leaving the sink open forever: every event lost on a sink whose ``close()`` is
