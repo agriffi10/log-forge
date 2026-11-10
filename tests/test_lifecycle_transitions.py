@@ -654,6 +654,95 @@ def test_a_swap_after_the_drains_last_take_runs_the_no_worker_branch(
     assert id(c) in _lifecycle._state._closes.owed, "and C is armed"
 
 
+class HookCloseRec(Rec):
+    """A recorder that runs a hook inside its first ``close()``, before recording it."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.on_first_close: Callable[[], None] | None = None
+
+    def close(self) -> None:
+        """Runs the hook once, inside the close, then records."""
+        hook, self.on_first_close = self.on_first_close, None
+        if hook is not None:
+            hook()
+        super().close()
+
+
+@cell(_Op.SWAP, State.DRAINING)
+def test_a_swap_during_the_bystander_wait_declines_because_a_second_take_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``waiting`` term of the first pass's last-take guard (second diff review).
+
+    X's swapped-out close is still in flight when the shutdown takes A, so the first pass waits on
+    it as a bystander and a second pass will follow. A swap landing in that wait — after an orphan
+    log re-armed A — must still decline: the second pass takes A again, on the calling thread. A
+    first pass that marked itself the last take let the swap release A onto a daemon and arm B,
+    which the second pass then closed though nothing was ever written to it.
+    """
+    x, a, b = ParkedCloseRec("X"), Rec("A"), Rec("B")
+    orphan_on(x)
+    monkeypatch.setattr(log_foundry.worker, "DEFAULT_SWAP_TIMEOUT", 0.05)
+    log_foundry.configure(sink=a)
+    assert x.entered.wait(GATE_WAIT), "the premise: X's close is in flight"
+    log("to A")
+    real = _lifecycle._CloseRegistry.wait_graced
+    fired: list[bool] = []
+
+    def in_the_bystander_wait(self: Any, op: Any, closes: Any) -> None:
+        if closes is not None and not fired:
+            fired.append(True)
+            log("re-arm A")
+            log_foundry.configure(sink=b)
+            x.release.set()
+        real(self, op, closes)
+
+    monkeypatch.setattr(_lifecycle._CloseRegistry, "wait_graced", in_the_bystander_wait)
+    caller = threading.current_thread().name
+    try:
+        log_foundry.shutdown(timeout=5.0)
+    finally:
+        x.release.set()
+    assert fired, "the premise: the shutdown waited on X as a bystander"
+    assert b.closes == 0, f"B, which nothing was written to, was closed: {b}"
+    assert a.closed_on == [caller, caller], (
+        f"A's re-armed close left the calling thread for a daemon: {a.closed_on}"
+    )
+
+
+@cell(_Op.SWAP, State.DRAINING)
+def test_a_swap_inside_a_no_worker_drains_inline_close_declines_while_a_late_worker_may_come() -> (
+    None
+):
+    """The ``late_possible`` term of the first pass's last-take guard (second diff review).
+
+    In a no-worker drain the first pass cannot be the last take while a late worker may still be
+    registered for it: that is decided only in the section that lowers ``_shutdown_running``. A
+    swap landing inside A's inline close, after an orphan log re-armed A, must decline. Taking the
+    first pass as the last take let it arm B, and the exit drain then closed B unwritten and moved
+    A's second close onto a fan-out thread.
+    """
+    a, b = HookCloseRec("A"), Rec("B")
+    orphan_on(a)
+
+    def inside_the_inline_close() -> None:
+        log("re-arm A")
+        log_foundry.configure(sink=b)
+
+    a.on_first_close = inside_the_inline_close
+    caller = threading.current_thread().name
+    log_foundry.shutdown(timeout=5.0)
+    assert sorted(s.name for s in _lifecycle._state._closes.owed.values()) == ["A"], (
+        "only the re-armed A is owed after the shutdown"
+    )
+    _lifecycle._shutdown_worker(timeout=5.0)
+    assert b.closes == 0, f"B, which nothing was written to, was closed: {b}"
+    assert a.closed_on == [caller, caller], (
+        f"A's second close left the calling thread: {a.closed_on}"
+    )
+
+
 class SamplingRec(Rec):
     """A recorder that notes the lifecycle state at each close."""
 
