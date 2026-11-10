@@ -88,8 +88,12 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
 
 - **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec
   is ready when it is `Draft` on `origin/main` (the status a spec takes once reviewed, `spec-lifecycle.md`),
-  `spec-lint` reports no failure for it there, and every earlier spec in `arc_order` that it is not
-  independent of has landed. With no independent specs this is one session at a time, in
+  `spec-lint` reports no failure for it there, every earlier spec in `arc_order` that it is not
+  independent of has landed, and nobody is building it. A spec being built still reads `Draft` on
+  `origin/main`, so check that last condition separately: this orchestrator has started no session
+  for it, and no local branch carries it `In Progress` — list the branches with
+  `git for-each-ref --format='%(refname:short)' refs/heads` and read each candidate's status with
+  `git show <branch>:<spec path>`. With no independent specs this is one session at a time, in
   `arc_order`. Start every ready spec before stopping to ask about one that is not.
 - **Two specs are independent** when neither needs the other's result, whether through `depends_on`
   or through something the earlier one builds, and they touch different source files. The files every
@@ -119,10 +123,9 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   - `main` is red: start nothing until it is green again, and ask before the chain resumes. The
     session whose merge turned it red fixes it, through the queue's red-trunk exception
     (`scripts/pr-queue/PROTOCOL.md`); start a fix session only if that one has ended;
-  - the next spec is `In Progress` from a session this orchestrator did not start — a status that
-    shows only on that session's branch, never on `origin/main`, so look with `git worktree list`
-    and `git branch -a` (`spec-lifecycle.md`); name its branch, its PR and any queue lock it
-    holds — is neither `Draft` nor `Completed`, fails `spec-lint`, or
-    depends on a spec outside the arc that is not `Completed`.
+  - the next spec is `In Progress` on a branch from a session this orchestrator did not start
+    (found the way the readiness bullet above says; name its branch, its PR and any queue lock it
+    holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or depends on a spec outside the
+    arc that is not `Completed`.
 - **When the arc's last spec lands,** archive its session and report the arc done to Andrew,
   with the lessons its sessions reported.

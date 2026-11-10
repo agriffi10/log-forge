@@ -11,11 +11,11 @@ is one edit and a regeneration, never two edits kept in step by hand.
   whatever its `spec_status` says. Being told to build an arc is being told to build each of its
   specs, and the session told orchestrates them (`several-agents.md`).
 - **In Progress** — exactly one spec at a time is in flight. Set when you branch to build it. The
-  status is set on the spec's build branch and reaches `main` only in the squash merge that also
-  marks it `Completed`, so what is in flight is read from the spec branches in this repo
-  (`git worktree list`, `git branch`), never from the index on `main`. A deliberate multi-agent
-  run, an arc run whose independent specs build in parallel among them, is the exception
-  (`several-agents.md`).
+  status is set on the spec's build branch and reaches `main` with the spec's first PR, so for a
+  one-PR spec only in the merge that marks it `Completed`. What is in flight is therefore read from
+  the spec branches in this repo, as `several-agents.md` says, not from the index on `main` alone.
+  A deliberate multi-agent run, an arc run whose independent specs build in parallel among them, is
+  the exception (`several-agents.md`).
 - **Completed** — set by the completion ritual on the spec's own branch, with its delivery doc,
   before the diff reviews; the spec has landed once that PR merges on green CI (`completion-ritual.md`).
 

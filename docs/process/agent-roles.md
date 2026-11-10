@@ -34,19 +34,22 @@ the shared checkout's HEAD (observed: `main`), not from the caller's branch. Git
 check out a branch another worktree holds. So the delegated implementer owns the branch the spec
 is pushed from:
 
-- The orchestrator commits the `In Progress` transition (`session-rhythm.md`, step 4) in its own
-  worktree, then briefs the implementer with that commit's exact SHA and a branch name that is the
-  implementer's own, never the orchestrator's session branch, which git would refuse. Committing
-  before delegating is enough to make the SHA reachable, because every worktree shares the repo's
-  object store.
-- The implementer creates that branch from that SHA in its own worktree (`git switch -c <name>
-  <sha>`), confirms it with `git log --oneline -1`, builds there, and names in its report the SHA
-  it started from.
+- The orchestrator cuts the implementer's branch, under a name for the implementer and never its own
+  session branch, from a freshly fetched `origin/main` in its own worktree
+  (`git switch -c <name> origin/main`), and commits the `In Progress` transition there
+  (`session-rhythm.md`, step 4). It then runs `git switch --detach origin/main`, which frees the
+  branch for the implementer and leaves its own worktree holding no unpushed commit: after the
+  squash merge, `scripts/supervisor/done_check.py` reads any commit in `origin/main..HEAD` there as
+  unmerged and never prints `ARCHIVABLE`. Every worktree shares the repo's object store, so the
+  commit stays reachable.
+- The orchestrator briefs the implementer with the branch name and that commit's SHA. The
+  implementer runs `git switch <name>` in its own worktree, confirms `git log --oneline -1` shows
+  that SHA, builds there, and names the SHA in its report.
 - The completion ritual (`completion-ritual.md`) is committed on the implementer's branch, in the
-  implementer's worktree, before the diff reviews, because that is the branch that is pushed; the
-  `spec-author` has no worktree of its own and would otherwise commit on the orchestrator's unpushed
-  session branch. The orchestrator briefs the `spec-author` with that worktree's absolute path and
-  the branch name, and the reviewers then review the head that includes the ritual.
+  implementer's worktree, before the diff reviews, because that is the branch that is pushed. The
+  `spec-author` has no worktree of its own, so the orchestrator briefs it with that worktree's
+  absolute path and the branch name, and the `spec-author` commits the ritual there. The reviewers
+  then review the head that includes the ritual.
 - The orchestrator runs both diff reviews against that branch's head SHA. Each reviewer is briefed
   with the exact SHA, checks it out detached in its own worktree and confirms its tree with
   `git log --oneline -1` before reviewing.

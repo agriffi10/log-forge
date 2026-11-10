@@ -44,9 +44,10 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   is the point of no return for the review, as the merge is for CI. **Green CI is not a review** —
   why pushing first inverts the gate, and the green merge that proved it: `reviewer-contract.md` →
   *The review gates the push, not the merge*.
-- **Once the phases are built, run the completion ritual (`completion-ritual.md`) on this branch**,
-  before the gates and the two diff reviews, so the reviewers see its edits and they land in the
-  spec's own squash merge.
+- **Once the phases are built, run the completion ritual (`completion-ritual.md`) on the branch that
+  will be pushed** (the implementer's, when the build is delegated: `agent-roles.md`), before the
+  gates and the two diff reviews, so the reviewers see its edits and they land in the spec's PR (its
+  last, if it needs several).
 - Before pushing, run **this repo's six gates** locally and get them green: `poetry run ruff check .`,
   `poetry run mypy`, `poetry run pytest`, `sh scripts/spec-lint.sh`, `sh scripts/docs-lint.sh`,
   `poetry run python scripts/docstring-lint.py`, and each linter's `-test.sh` corpus if you touched that
