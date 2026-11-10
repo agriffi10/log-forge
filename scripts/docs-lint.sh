@@ -77,8 +77,8 @@ cd "$ROOT"
 # trap: what remains is fences and routing, not accretion, so a budget left at the new
 # measurement leaves the next change that legitimately needs a line nothing to spend —
 # and it takes those bytes from somewhere else. The first two below are set after such a
-# cut (the method moved out of CLAUDE.md into docs/process/ behind a router) and carry
-# room deliberately, stated in words rather than as a second number that goes stale.
+# cut (the most recent is described beside them) and carry room deliberately, stated in
+# words rather than as a second number that goes stale.
 #
 # RE-DERIVE, DON'T RE-CHECK, after any further structural change. A cap that can no longer
 # fire is still advertised as a fence: `DIGEST_MAX_BYTES` was an inherited 1400, and the cut
@@ -87,21 +87,29 @@ cd "$ROOT"
 # checking it and finding it green. A check that passes proves nothing about a cap that
 # cannot fail.
 
-# CLAUDE.md alone. Measured at the routing cut, where the file went from the always-loaded
-# archive to a router over docs/process/ and docs/decisions/: room above that for a
-# current-work paragraph, a Tech Stack row and a couple of area rows, which is roughly a
-# fifth. It is the one budget here that is NOT pinned at its measurement, and the reason is
-# the paragraph above.
-CLAUDE_MAX_BYTES=21000
-
-# The whole always-loaded set — CLAUDE.md plus every file the router's "Loaded every
-# session" table names (the same files CLAUDE.md imports). The SET is derived from that
-# table at run time, never transcribed here: a transcribed copy would go stale the first
-# time a row moved. It started with the same fifth of room plus one router row; what has been
-# added since spent most of that, and the move to one file per decision added the knowledge-layout
-# router row by cutting restatements rather than by raising this. A closing spec rarely adds anything
-# here — a decision is a file in its area — so the little room left is for a change that needs a line.
-ALWAYS_LOADED_MAX_BYTES=38000
+# CLAUDE.md alone, and the whole always-loaded set — CLAUDE.md plus every file the router's
+# "Loaded every session" table names (the same files CLAUDE.md imports). The SET is derived from
+# that table at run time, never transcribed here: a transcribed copy would go stale the first time
+# a row moved.
+#
+# BOTH RE-DERIVED AT THE DEDUPLICATION CUT, which took the start, gates and landing procedure out
+# of CLAUDE.md's Session Workflow (session-rhythm.md is now its one copy) and the evidence
+# narratives out of the rhythm into reviewer-contract.md and operational-traps.md. The set was
+# 37758 against the old 38000 at `44db79a6`, the parent of the cut; the cut took nearly five
+# kilobytes from it and over two and a half from CLAUDE.md, so the old caps (38000, 21000) would
+# have sat that far above what they govern — the cap-that-cannot-fire trap the paragraph above
+# describes. Each run's success line prints today's measurement against each cap.
+#
+# The set carries about two kilobytes: room for one paragraph the size of CLAUDE.md's *Review*
+# paragraph, the longest in the Session Workflow at about 1.4 KB, with a line or two to spare, and
+# not for a second, so the change after that one must cut something first. CLAUDE.md carries a
+# little over one kilobyte,
+# deliberately LESS than the set's room, so that growth in CLAUDE.md alone — where accretion
+# historically happened, a Specs section appended one spec at a time — fires its own cap before it
+# spends the room the rhythm and the router share. Were the two caps given the same room, this one
+# could fire only when the imports had shrunk, and would be a fence in name only.
+CLAUDE_MAX_BYTES=17000
+ALWAYS_LOADED_MAX_BYTES=35000
 
 # The whole Key Decisions section, measured as bytes. Since the fences left CLAUDE.md the
 # section is an intro paragraph and one row per AREA, so this bounds the number of AREAS,

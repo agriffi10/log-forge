@@ -116,7 +116,7 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   - a session ends blocked, or ends with its spec not landed by the check above;
   - a session is waiting on Andrew's answer: relay its question verbatim;
   - `main` is red: start nothing until it is green again, and ask before the chain resumes. The
-    session whose merge turned it red fixes it (`CLAUDE.md`); start a fix session only if that one
+    session whose merge turned it red fixes it (`session-rhythm.md`); start a fix session only if that one
     has ended;
   - the next spec is `In Progress` from a session this orchestrator did not start (name its branch,
     its PR and any queue lock it holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or
