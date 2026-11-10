@@ -30,9 +30,9 @@ another by its brief, its tools and its isolation, never by its model.
 ## The implementer's branch
 
 The `implementer` and `reviewer` roles run in a worktree of their own, and that worktree is cut from
-the shared checkout's HEAD — observed to be `main`, or the parent of the caller's commit — never from
-the orchestrator's branch. Git also refuses to check out a branch another worktree holds. So the
-delegated implementer owns the branch the spec is pushed from:
+the shared checkout's HEAD (observed: `main`), not from the caller's branch. Git also refuses to
+check out a branch another worktree holds. So the delegated implementer owns the branch the spec
+is pushed from:
 
 - The orchestrator commits the `In Progress` transition (`session-rhythm.md`, step 4) in its own
   worktree, then briefs the implementer with that commit's exact SHA and a branch name that is the
@@ -42,6 +42,11 @@ delegated implementer owns the branch the spec is pushed from:
 - The implementer creates that branch from that SHA in its own worktree (`git switch -c <name>
   <sha>`), confirms it with `git log --oneline -1`, builds there, and names in its report the SHA
   it started from.
+- The completion ritual (`completion-ritual.md`) is committed on the implementer's branch, in the
+  implementer's worktree, before the diff reviews, because that is the branch that is pushed; the
+  `spec-author` has no worktree of its own and would otherwise commit on the orchestrator's unpushed
+  session branch. The orchestrator briefs the `spec-author` with that worktree's absolute path and
+  the branch name, and the reviewers then review the head that includes the ritual.
 - The orchestrator runs both diff reviews against that branch's head SHA. Each reviewer is briefed
   with the exact SHA, checks it out detached in its own worktree and confirms its tree with
   `git log --oneline -1` before reviewing.

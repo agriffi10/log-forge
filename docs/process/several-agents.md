@@ -119,8 +119,10 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   - `main` is red: start nothing until it is green again, and ask before the chain resumes. The
     session whose merge turned it red fixes it, through the queue's red-trunk exception
     (`scripts/pr-queue/PROTOCOL.md`); start a fix session only if that one has ended;
-  - the next spec is `In Progress` from a session this orchestrator did not start (name its branch,
-    its PR and any queue lock it holds), is neither `Draft` nor `Completed`, fails `spec-lint`, or
+  - the next spec is `In Progress` from a session this orchestrator did not start — a status that
+    shows only on that session's branch, never on `origin/main`, so look with `git worktree list`
+    and `git branch -a` (`spec-lifecycle.md`); name its branch, its PR and any queue lock it
+    holds — is neither `Draft` nor `Completed`, fails `spec-lint`, or
     depends on a spec outside the arc that is not `Completed`.
 - **When the arc's last spec lands,** archive its session and report the arc done to Andrew,
   with the lessons its sessions reported.

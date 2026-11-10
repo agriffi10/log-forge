@@ -17,7 +17,6 @@ disagree, CLAUDE.md wins** — fix the drift here in the same session you notice
    `origin/main`, never the shared checkout — and set the spec's frontmatter `spec_status: In Progress` and
    regenerate the index in the same commit — that transition is what makes "exactly one spec in flight" (`spec-lifecycle.md`) legible
    to the next session, and nothing gates it, so it is missed by being skipped rather than by failing.
-   A delegated implementer builds from that commit's SHA on a branch of its own (`agent-roles.md`).
 5. **Generate and validate a plan before writing code.** Turn the spec's Implementation Phases into a
    concrete implementation plan, then validate it against the spec — every FR + acceptance criterion is
    covered, reuse from `component-inventory.md` is used, and nothing out of scope crept in. The plan —
