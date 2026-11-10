@@ -828,7 +828,8 @@ owed record, never the config — written only by `Runtime._move` at the end of 
 sections that can change it. `Runtime._column()` reads the token sets and then `_current`, under
 the lock the caller holds, and is the column of the transition table, which is total over six
 calls by five states. Only `_swap_sink` consults it, because its `DRAINING` cell is the one whose
-answer differs: with no live worker a swap during a drain declines. `Runtime.state` stays the
+answer differs: with no live worker a swap during a drain declines, while that drain still has a
+take of the owed record ahead of it (its `_Operation.drained` is unset; `Runtime._take_ahead()`). `Runtime.state` stays the
 lock-free reporting view and still reports a resolved-but-unwritten config as `RUNNING`; no guard
 selects it. `CLOSED` keeps its arrows (a span after a worker-less `shutdown()` builds a live
 worker). `Runtime` holds three locks, `_state._lock`, the registry's leaf and `_owned_lock`, and

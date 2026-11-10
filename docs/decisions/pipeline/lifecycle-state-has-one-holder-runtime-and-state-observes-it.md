@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "Lifecycle state has one holder, Runtime, and the stored State decides the transitions"
-description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside critical sections the calls already take, and the transition table is total over six calls and five states, with one changed cell — a swap during a drain with no live worker declines. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry (`Runtime._closes`). Three locks remain, not one. The token sets are added under `_lock` and discarded lock-free, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078; arch §9.2)"
+description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside critical sections the calls already take, and the transition table is total over six calls and five states, with one changed cell — a swap during a drain with no live worker declines while the drain still has a take ahead of it. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry (`Runtime._closes`). Three locks remain, not one. The token sets are added under `_lock` and discarded lock-free, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078; arch §9.2)"
 ---
 
 **One holder.** SPEC-040 put the orphan side's seven globals on one object, `_lifecycle._state`,
@@ -40,7 +40,11 @@ has resolved; it stays lock-free and is the reporting view. The library reads `R
 
 **The transition table is total, and one cell changed.** Six calls (`BUILD`, `ARM`, `SWAP`,
 `FLUSH`, `STOP`, `FORK`) by five states; every cell is today's behaviour except one: **a swap
-during a drain with no live worker declines at entry** — no retarget, no close, no arm. At
+during a drain with no live worker declines at entry, while the drain still has a take of the
+owed record ahead of it** — no retarget, no close, no arm. After the drain's last take, which the
+drain marks on its `_Operation` under the lock, the swap runs its no-worker branch: a sink re-armed
+in the tail is taken by nothing left in that call, and declining there left it owed and open (found
+by the first diff review). At
 `fda134a` such a swap moved the drained sink's close onto a daemon that exit kills, and closed the
 new sink, which nothing had been written to. A live worker in the drain (a late one, or one built
 in the drain's tail) still swaps, because declining there loses the configure. Only `_swap_sink`
@@ -101,7 +105,7 @@ SPEC-078 FR-001 to FR-004)
 
 - **Refined** by SPEC-078: `State` is stored (`_current`, one writer, `_move`) and decides, the
   transition table is total with one changed cell (a swap during a drain with no live worker
-  declines), `CLOSED` keeps its arrows, every close lives in one registry (`Runtime._closes`),
+  declines while the drain has a take ahead), `CLOSED` keeps its arrows, every close lives in one registry (`Runtime._closes`),
   and the two leaf locks merged, leaving three. The title changed from "State observes it until
   transitions are checked"; the file name stays, as a decision's file name never changes.
 

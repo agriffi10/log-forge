@@ -29,11 +29,13 @@ import pathlib
 import re
 import threading
 import time
+from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import log_foundry
+from conftest import join_graced
 from log_foundry import _lifecycle
 from log_foundry._lifecycle import State, _Op
 from log_foundry.worker import Worker
@@ -48,6 +50,48 @@ GATE_WAIT = 10.0
 
 CELLS: dict[tuple[_Op, State], list[str]] = {}
 """Every test that drives a cell of the table, by cell."""
+
+RECORDERS: list[Rec] = []
+"""Every recorder the running test built, for the accounting check after it."""
+
+SENT: list[str] = []
+"""Every message the running test logged, through :func:`span` or :func:`log`."""
+
+
+@pytest.fixture(autouse=True)
+def every_event_is_accounted_for_and_every_written_sink_closed() -> Any:
+    """FR-004 AC-7, after every test in this file: invariants 2 and 5 hold in every cell.
+
+    After the test, and after everything it parked has been released, the process is shut down
+    and its detached closes given the grace. Then every message the test logged is either
+    delivered to a recorder, at most once, or counted once — a span by
+    ``submitted_after_shutdown``, an orphan log or a span's buffered event by ``orphan_lost`` or
+    ``in_span_lost`` — and every recorder something was written to has been closed. A cell whose
+    event vanished, or whose sink was left open, fails here even when its own assertions pass.
+    """
+    RECORDERS.clear()
+    SENT.clear()
+    yield
+    log_foundry.shutdown(timeout=5.0)
+    join_graced(5.0)
+    sent = Counter(SENT)
+    delivered = Counter(
+        str(event.get("message"))
+        for recorder in RECORDERS
+        for event in recorder.events
+        if event.get("message") in sent
+    )
+    twice = {message: n for message, n in delivered.items() if n > sent[message]}
+    assert not twice, f"invariant 2: delivered more often than logged: {twice}"
+    health = log_foundry.health()
+    counted = health.submitted_after_shutdown + health.orphan_lost + health.in_span_lost
+    undelivered = sum((sent - delivered).values())
+    assert undelivered == counted, (
+        f"invariant 2: {undelivered} logged event(s) were neither delivered nor counted once "
+        f"(counted {counted}); sent {dict(sent)}, delivered {dict(delivered)}"
+    )
+    unclosed = [recorder for recorder in RECORDERS if recorder.events and not recorder.closes]
+    assert not unclosed, f"invariant 5: written to and never closed: {unclosed}"
 
 
 def cell(op: _Op, state: State) -> Callable[[Callable[..., None]], Callable[..., None]]:
@@ -69,6 +113,7 @@ class Rec:
         self.name = name
         self.events: list[dict[str, object]] = []
         self.closed_on: list[str] = []
+        RECORDERS.append(self)
 
     @property
     def closes(self) -> int:
@@ -122,8 +167,19 @@ class Gate:
 
 
 @log_foundry.trace
+def _traced(message: str) -> None:
+    log_foundry.info(message)
+
+
 def span(message: str = "span") -> None:
-    """One traced call carrying one event."""
+    """One traced call carrying one event, recorded for the accounting check."""
+    SENT.append(message)
+    _traced(message)
+
+
+def log(message: str) -> None:
+    """One orphan log, recorded for the accounting check."""
+    SENT.append(message)
     log_foundry.info(message)
 
 
@@ -207,7 +263,7 @@ def worker_on(sink: Rec) -> Worker:
 def orphan_on(sink: Rec) -> None:
     """Configures ``sink`` and arms it through one orphan log, with no worker."""
     log_foundry.configure(service="cells", sink=sink)
-    log_foundry.info("orphan")
+    log("orphan")
     assert _lifecycle._state.worker_exists() is None
 
 
@@ -255,7 +311,7 @@ def test_build_during_a_swap_builds_and_the_swap_continues() -> None:
     try:
         assert old.entered.wait(GATE_WAIT), "the swap is inside its join of the superseded close"
         assert state() is State.SWAPPING
-        span()
+        span("built")
         worker = _lifecycle._state.worker_exists()
         assert worker is not None and worker.sink is new, "a worker built, on the configured sink"
         assert state() is State.SWAPPING, "the swap is still inside"
@@ -263,6 +319,9 @@ def test_build_during_a_swap_builds_and_the_swap_continues() -> None:
         old.release.set()
     finish(swap)
     assert state() is State.RUNNING
+    log_foundry.flush(timeout=5.0)
+    assert any(event.get("message") == "built" for event in new.events), new
+    assert old.closes == 1, "the superseded sink was closed once the swap left"
 
 
 @cell(_Op.BUILD, State.DRAINING)
@@ -340,7 +399,7 @@ def test_a_span_after_a_workers_shutdown_is_counted_and_stays_closed() -> None:
 def test_arm_from_unconfigured_arms() -> None:
     a = Rec("A")
     log_foundry.configure(service="cells", sink=a)
-    log_foundry.info("first")
+    log("first")
     assert id(a) in _lifecycle._state._closes.owed
     assert state() is State.RUNNING and current() is State.RUNNING
 
@@ -394,7 +453,7 @@ def test_arm_after_a_shutdown_arms_again_and_stays_closed() -> None:
     a = Rec("A")
     orphan_on(a)
     log_foundry.shutdown(timeout=5.0)
-    log_foundry.info("after")
+    log("after")
     assert id(a) in _lifecycle._state._closes.owed, "owed a further close (SPEC-045 FR-002)"
     assert state() is State.CLOSED and current() is State.CLOSED
 
@@ -413,27 +472,51 @@ def test_swap_from_unconfigured_has_nothing_to_swap() -> None:
 
 
 @cell(_Op.SWAP, State.RUNNING)
-def test_swap_in_running_retargets() -> None:
+def test_swap_in_running_retargets(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = worker_on(Rec("A"))
     b = Rec("B")
+    inside: list[State] = []
+    real = Worker.retarget
+
+    def sampled(self: Worker, new_sink: Any, deadline: float | None = None) -> Any:
+        inside.append(state())
+        return real(self, new_sink, deadline)
+
+    monkeypatch.setattr(Worker, "retarget", sampled)
     log_foundry.configure(sink=b)
+    assert inside == [State.SWAPPING], "a swap with work passes through SWAPPING"
     assert worker.sink is b
     assert state() is State.RUNNING
 
 
 @cell(_Op.SWAP, State.SWAPPING)
 def test_a_second_swap_runs_alongside_the_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    worker_on(Rec("A"))
+    worker = worker_on(Rec("A"))
+    b, c = Rec("B"), Rec("C")
     gate = park_retarget(monkeypatch)
-    swap = background(lambda: log_foundry.configure(sink=Rec("B")))
+    swap = background(lambda: log_foundry.configure(sink=b))
     try:
         assert gate.entered.wait(GATE_WAIT)
-        log_foundry.configure(sink=Rec("C"))
+        log_foundry.configure(sink=c)
+        assert worker.sink is c, "the second swap retargeted the worker while the first waited"
+        assert id(c) in _lifecycle._state._closes.owed, "and armed its sink"
         assert state() is State.SWAPPING, "the first swap is still inside"
     finally:
         gate.release.set()
     finish(swap)
+    assert worker.sink is b, "the first swap, released, retargeted after it"
     assert state() is State.RUNNING
+
+
+class SlowCloseRec(Rec):
+    """A recorder whose close takes long enough that a swap joining it is visible."""
+
+    CLOSE_SECONDS = 2.0
+
+    def close(self) -> None:
+        """Takes its time, then records."""
+        time.sleep(self.CLOSE_SECONDS)
+        super().close()
 
 
 class _Recording(set):  # type: ignore[type-arg]
@@ -460,7 +543,7 @@ def test_a_swap_during_a_drain_with_no_live_worker_declines(
     closed on the calling thread and B never. The swap now declines at entry: no token, no
     retarget, no close and no arm.
     """
-    a, b = Rec("A"), Rec("B")
+    a, b = SlowCloseRec("A"), Rec("B")
     if path == "worker":
         worker_on(a)
     else:
@@ -473,7 +556,9 @@ def test_a_swap_during_a_drain_with_no_live_worker_declines(
     def swap_first(*args: Any, **kwargs: Any) -> bool:
         if not seen:
             seen["column"] = _lifecycle._state._column()
+            started = time.monotonic()
             log_foundry.configure(sink=b)
+            seen["took"] = time.monotonic() - started
             seen["owed"] = id(b) in _lifecycle._state._closes.owed
             seen["tokens"] = list(recording.added)
         return real(*args, **kwargs)
@@ -484,6 +569,10 @@ def test_a_swap_during_a_drain_with_no_live_worker_declines(
 
     assert seen["column"] is State.DRAINING, "the premise: the swap landed inside the drain"
     assert seen["tokens"] == [] and seen["owed"] is False, "the swap declined at entry"
+    assert seen["took"] < 1.0, (
+        f"configure(sink=B) took {seen['took']:.2f}s: a swap that did not decline joins A's "
+        f"{SlowCloseRec.CLOSE_SECONDS}s close"
+    )
     assert a.closed_on == [caller], f"A's close stayed on the calling thread: {a}"
     assert b.closes == 0, f"B, which nothing was written to, was closed: {b}"
 
@@ -539,16 +628,56 @@ def test_a_swap_in_a_drains_tail_retargets_the_worker_built_there(
     assert state() is State.RUNNING
 
 
+@cell(_Op.SWAP, State.DRAINING)
+def test_a_swap_after_the_drains_last_take_runs_the_no_worker_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The decline holds only while the drain has a take ahead of it (first diff review).
+
+    In a no-worker drain's tail, after its last take, an orphan log re-arms A and a
+    ``configure(sink=C)`` lands. Nothing left in that drain takes A, so declining there left A
+    closed once and then owed and open after ``shutdown()`` returned. The swap runs its
+    no-worker branch instead: A is released, detached, and C is armed.
+    """
+    a, c = Rec("A"), Rec("C")
+    orphan_on(a)
+
+    def in_the_tail() -> None:
+        log("re-armed in the tail")
+        log_foundry.configure(sink=c)
+
+    park_the_tail(monkeypatch, then=in_the_tail)
+    log_foundry.shutdown(timeout=5.0)
+    join_graced(5.0)
+    assert id(a) not in _lifecycle._state._closes.owed, f"A was left owed and open: {a}"
+    assert a.closes == 2, f"closed by the drain, and again once the swap superseded it: {a}"
+    assert id(c) in _lifecycle._state._closes.owed, "and C is armed"
+
+
+class SamplingRec(Rec):
+    """A recorder that notes the lifecycle state at each close."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.states: list[State] = []
+
+    def close(self) -> None:
+        """Records the state the close ran in, then the close."""
+        self.states.append(state())
+        super().close()
+
+
 @cell(_Op.SWAP, State.CLOSED)
 def test_swap_after_a_shutdown_supersedes_what_is_owed_and_arms_the_new_sink() -> None:
-    a, b = Rec("A"), Rec("B")
+    a, b = SamplingRec("A"), Rec("B")
     orphan_on(a)
     log_foundry.shutdown(timeout=5.0)
-    log_foundry.info("after")
+    log("after")
     log_foundry.configure(sink=b)
     _lifecycle._state._closes.wait_graced(_lifecycle._Operation(_Op.STOP, 5.0), None)
     assert id(b) in _lifecycle._state._closes.owed and id(a) not in _lifecycle._state._closes.owed
     assert a.closes == 2, "closed at the shutdown, and again once superseded (SPEC-045 FR-002)"
+    assert a.states == [State.DRAINING, State.SWAPPING], "the supersede ran inside SWAPPING"
     assert state() is State.CLOSED and current() is State.CLOSED
 
 
@@ -581,6 +710,7 @@ def test_flush_during_a_swap_leaves_the_state(monkeypatch: pytest.MonkeyPatch) -
     finally:
         gate.release.set()
     finish(swap)
+    assert state() is State.RUNNING, "then as the swap leaves it"
 
 
 @cell(_Op.FLUSH, State.DRAINING)
@@ -595,6 +725,7 @@ def test_flush_during_a_drain_leaves_the_state(monkeypatch: pytest.MonkeyPatch) 
     finally:
         gate.release.set()
     finish(stop)
+    assert state() is State.CLOSED, "then as the drain leaves it"
 
 
 @cell(_Op.FLUSH, State.CLOSED)
@@ -613,7 +744,7 @@ def test_a_worker_a_flush_sweep_builds_moves_the_state_by_the_build_row() -> Non
 
     @log_foundry.trace
     def flushes_inside_a_span() -> None:
-        log_foundry.info("buffered on the open span")
+        log("buffered on the open span")
         assert current() is State.UNCONFIGURED, "the premise: nothing built yet"
         log_foundry.flush(timeout=5.0)
         inside["worker"] = _lifecycle._state.worker_exists()
@@ -687,7 +818,7 @@ def test_stop_after_a_shutdown_closes_what_was_armed_since() -> None:
     a = Rec("A")
     orphan_on(a)
     log_foundry.shutdown(timeout=5.0)
-    log_foundry.info("after")
+    log("after")
     log_foundry.shutdown(timeout=5.0)
     assert a.closes == 2
     assert _lifecycle._state.retirements == 2

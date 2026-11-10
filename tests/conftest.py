@@ -802,7 +802,7 @@ def no_close_left_in_flight():
             return {
                 key: close
                 for key, close in _lifecycle._state._closes._in_flight.items()
-                if close.thread is None or not close.thread.is_alive()
+                if not any(thread.is_alive() for thread in close.threads)
             }
 
     yield

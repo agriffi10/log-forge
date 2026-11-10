@@ -15,8 +15,10 @@ SPEC-077 gives the lifecycle bookkeeping one holder, `Runtime`, and names the pr
 in `State` — but as an **observer**, read off the flags and deciding nothing. This spec is the next
 step of the arc: `State` becomes the **authority**. It is stored, written in one place under the
 runtime's lock, and every lifecycle call — a sink swap, `flush()`, `shutdown()`, the exit drain, a
-span needing a worker, an orphan log arming a sink, and a forked child's entry — reads it on entry
-and takes the answer the transition table gives for that state. Beside it, the closes the library
+span needing a worker, an orphan log arming a sink, and a forked child's entry — has a defined
+answer for every state in one transition table. The call whose answer depends on the state, the
+sink swap, reads it on entry under the lock; the others give the same answer in every state, so
+their existing code is the table's answer (FR-003, as amended during the build). Beside it, the closes the library
 owes stop living in four structures (`_owed`, `_closing_now`, `_closers` and a local list of
 threads inside `_close_owed`) and live in **one registry**, which records how each close is run and
 waited for, and owns the one grace a shutdown may spend on somebody else's close. SPEC-079 then
@@ -380,7 +382,7 @@ stop, the second pass and the grace.
 |---|---|---|---|---|---|
 | `BUILD`: a span needs a worker and none exists | builds, arms its sink → `RUNNING` | builds → `RUNNING` | builds; the swap continues → `SWAPPING`, then as the swap leaves it | inside the `_shutdown_running` window: the late worker this drain stops (SPEC-044 FR-001) → `DRAINING`, then `CLOSED`; in the tail: a live worker the drain does not stop → `DRAINING`, then `RUNNING` | builds a live worker → `RUNNING` |
 | `ARM`: an orphan log reaches a sink not owed | arms → `RUNNING` | arms → `RUNNING` | arms → `SWAPPING`, then as the swap leaves it | arms; owed a further close (SPEC-045 FR-002) → `DRAINING`, then as the drain leaves it | arms → `CLOSED` |
-| `SWAP`: `configure(sink=…)` | nothing to swap → `RUNNING`, since the config has resolved a sink; `_current` stays `UNCONFIGURED` | through `SWAPPING` when it has work, directly when not → `RUNNING` | runs alongside the swap in flight → `SWAPPING`, then the settled state when the last leaves | **no live worker: declines at entry**, with no retarget, no close and no arm; a live worker (a late one, or one built in the tail): swaps as in `RUNNING` → `DRAINING`, then as the drain leaves it | through `SWAPPING` only when something is owed: supersedes the owed sinks and arms the new one → `CLOSED` |
+| `SWAP`: `configure(sink=…)` | nothing to swap → `RUNNING`, since the config has resolved a sink; `_current` stays `UNCONFIGURED` | through `SWAPPING` when it has work, directly when not → `RUNNING` | runs alongside the swap in flight → `SWAPPING`, then the settled state when the last leaves | **no live worker, and the drain still has a take ahead of it: declines at entry**, with no retarget, no close and no arm; after the drain's last take, as in `CLOSED`'s no-worker branch; a live worker (a late one, or one built in the tail): swaps as in `RUNNING` → `DRAINING`, then as the drain leaves it | through `SWAPPING` only when something is owed: supersedes the owed sinks and arms the new one → `CLOSED` |
 | `FLUSH`: `flush()` | touches no sink → unchanged | drains → unchanged | drains → unchanged | answers as at `fda134a` → unchanged | answers as at `fda134a` → unchanged |
 | `STOP`: `shutdown()` or the exit drain | moves the count → `CLOSED` | drains and closes → `CLOSED`, or `RUNNING` when no worker existed and a span built one in the tail | drains and closes; the swap's retarget declines (SPEC-033 FR-002) → `SWAPPING` while the swap is inside, then `CLOSED` | joins as a second caller, as SPEC-068 leaves it → `DRAINING` while the first call is inside, then as the `RUNNING` cell | moves the count, closes what was armed since → `CLOSED`, with the `RUNNING` cell's tail exception |
 | `FORK`: the child's entry | `UNCONFIGURED` | `RUNNING` | `_current`, inherited: `RUNNING` or `CLOSED` | `_current`, inherited | `CLOSED` |
@@ -402,11 +404,16 @@ worker's sink once its drain thread has ended — and arms B. Measured at `fda13
 `_lifecycle._close_owed` so that its first call runs `configure(sink=B)` before delegating, after
 `configure(sink=A)`, one traced call and `flush()`: A's `close()` ran on `log-foundry-sink-close`
 and B's on `MainThread`; without the wrapper A's ran on `MainThread` and B was never closed. With no
-live worker in `DRAINING`, the drain in progress owns every owed close, so the swap does nothing but
-return: the
-config already names B, and the first event that reaches B arms it as any orphan log does. A swap
-that entered before the drain is past its entry and finishes by today's rules, where its retarget
-declines.
+live worker in `DRAINING`, the drain in progress owns every owed close **until its last take**, so
+the swap does nothing but return: the config already names B, and the first event that reaches B
+arms it as any orphan log does. **After the drain's last take the swap runs its no-worker branch as
+at `fda134a`** (amended during the build, 2026-11-09). A sink armed since — an orphan log re-arming
+the drained sink in the drain's tail — is taken by nothing left in that call, and declining there
+left it owed and open after the shutdown returned (measured on the first build: `configure(A)`,
+`info()`, `shutdown(5)` with its last graced join running `info()` then `configure(sink=C)` closed
+A once and left it owed). The drain marks its last take on its operation, in the critical section
+where it becomes known, and the swap reads that under the lock. A swap that entered before the
+drain is past its entry and finishes by today's rules, where its retarget declines.
 
 **`CLOSED` keeps its arrows, and this is the decision.** Measured at `fda134a`: after a `shutdown()`
 that built no worker, a `@trace` call built a live worker and its event was delivered; after a
@@ -600,7 +607,7 @@ class _Rule(enum.Enum):
 class _Close:                        # one close in flight; holds no sink
     event: threading.Event           # set when the close ends, however it ended
     rule: _Rule
-    thread: threading.Thread | None  # None for INLINE, and until started
+    threads: list[threading.Thread]  # every detached participant's thread; empty for INLINE and until started
 
 class _CloseRegistry:
     owed: dict[int, Sink]            # was Runtime._owed; guarded by Runtime._lock
@@ -746,3 +753,10 @@ row for the registry. The release notes for 1.2.0 carry the two fixes.
 
   The plan review also found an edge case: a forwarded release joining a detached close still in
   flight discharged its entry early. `_Close` counts its participants to close it.
+- 2026-11-09, after the first diff review:
+  - FR-004's changed cell is narrowed to hold only **until the drain's last take**. A swap in a
+    no-worker drain's tail had left a re-armed sink owed and open. `_Operation.drained` records the
+    last take, and `Runtime._take_ahead()` bounds the decline.
+  - The Overview is aligned with FR-003's dispatch amendment.
+  - `_Close.thread` became `threads`, so a second detached participant's thread never overwrites
+    the first's.

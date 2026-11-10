@@ -15,7 +15,8 @@
 - **A stored, checked state** (FR-003, FR-004). `Runtime._current` is written only by `_move`, in
   four critical sections. `_column()` is the transition table's column.
   - The table is total over six calls by five states.
-  - One cell changed: a swap during a drain with no live worker declines.
+  - One cell changed: a swap during a drain with no live worker declines, while the drain still
+    has a take of the owed record ahead of it.
   - `CLOSED` keeps its arrows.
 - **Operations** (FR-005). A `SWAP` or `STOP` builds one `_Operation` before its first critical
   section, and every slow step reads its deadline.
@@ -31,6 +32,9 @@
     and `timeout` only renders the expiry line (ruling B1).
   - `_Close` counts its participants, so a forwarded release cannot discharge a detached close
     still running. The plan review found this edge case.
+  - `_Close` keeps every participant's thread (`threads`), and the graced wait waits on the
+    entry's event, found by the first diff review. The same review narrowed the decline to the
+    drain's last take, after a swap in a no-worker drain's tail left a re-armed sink owed and open.
 
 ## What changed from earlier specs?
 

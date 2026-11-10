@@ -831,3 +831,62 @@ def test_a_forwarded_release_does_not_end_a_detached_close_still_running() -> No
     thread.join(5.0)
     assert not _lifecycle._state._closes.in_flight(sink), "the last participant discharges it"
     assert entry.event.is_set()
+
+
+def test_a_second_detached_participant_keeps_the_first_thread_in_view() -> None:
+    """A detached release joining a close already running on a thread adds its own, never swaps.
+
+    With one thread slot, the second participant's ``attach`` overwrote the first: once the
+    second's quick close ended, ``health().closing_sinks`` read zero and the graced join saw
+    nothing alive, while the first thread was still inside ``close()``.
+    """
+    sink = GatedCloseSink("child")
+    log_foundry.configure(service="t", sink=sink)
+    with _lifecycle._state._lock:
+        _lifecycle._state._closes.arm(sink)
+        entry = _lifecycle._state._closes.take(sink, _lifecycle._Rule.GRACED)
+        first = _lifecycle.release(sink, detached=True, closing=entry)
+    assert first is not None and sink.entered.wait(5.0), "the first close is running"
+    try:
+        second = _lifecycle.release(sink, detached=True)
+        assert second is not None
+        second.join(5.0)
+        assert sink.calls == 2, "the premise: the second participant's close ran and returned"
+        assert entry.threads == [first, second], "the first thread was overwritten"
+        assert log_foundry.health().closing_sinks == 1, "the running close dropped from view"
+    finally:
+        sink.release.set()
+    first.join(5.0)
+    assert not _lifecycle._state._closes.in_flight(sink)
+
+
+def test_the_graced_wait_waits_for_a_forwarded_participant_still_inside_close() -> None:
+    """The graced wait ends at the entry's event, set by the last participant, not at a thread.
+
+    A forwarded release is inside ``close()`` when the detached thread's own close returns and
+    the thread ends. Joining the thread returned at once, through a close still running; waiting
+    on the event waits for the forwarded participant too, to the grace.
+    """
+    sink = GatedCloseSink("child")
+    log_foundry.configure(service="t", sink=sink)
+    with _lifecycle._state._lock:
+        _lifecycle._state._closes.arm(sink)
+        entry = _lifecycle._state._closes.take(sink, _lifecycle._Rule.GRACED)
+    forwarded = threading.Thread(target=lambda: _lifecycle.release(sink), daemon=True)
+    forwarded.start()
+    assert sink.entered.wait(5.0), "the forwarded participant is inside close()"
+    thread = _lifecycle.release(sink, detached=True, closing=entry)
+    assert thread is not None
+    thread.join(5.0)
+    assert not thread.is_alive() and not entry.event.is_set(), "the premise: one still closing"
+    releaser = threading.Timer(0.3, sink.release.set)
+    releaser.start()
+    try:
+        _lifecycle._state._closes.wait_graced(
+            _lifecycle._Operation(_lifecycle._Op.STOP, 5.0), [entry]
+        )
+        assert entry.event.is_set(), "the graced wait returned through a close still running"
+    finally:
+        sink.release.set()
+        releaser.cancel()
+    forwarded.join(5.0)

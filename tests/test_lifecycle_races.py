@@ -635,6 +635,23 @@ def test_no_close_or_drain_is_performed_under_the_lifecycle_lock() -> None:
     assert not offenders, f"these run under _state._lock and must not: {sorted(set(offenders))}"
 
 
+def test_every_under_lock_offender_names_something_that_exists() -> None:
+    """The offender list cannot go quietly empty: each name is still bound in ``_lifecycle``.
+
+    The lint above matches on names, so a rename leaves a dead entry that guards nothing, with the
+    suite green — the way SPEC-054's rename of ``Worker.shutdown`` to ``Worker.stop`` silenced the
+    suffix rule. Each name must be a module-level binding or an attribute of ``_CloseRegistry`` or
+    ``Runtime``, so a rename fails here and the list is updated with it.
+    """
+    holders = (_lifecycle, _lifecycle._CloseRegistry, _lifecycle.Runtime)
+    dead = sorted(
+        name
+        for name in _UNDER_LOCK_OFFENDERS
+        if not any(hasattr(holder, name) for holder in holders)
+    )
+    assert not dead, f"the under-lock lint names what no longer exists: {dead}"
+
+
 # --------------------------------------------------------------------------- FR-002
 
 

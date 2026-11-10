@@ -507,14 +507,28 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "FR-004's sequential driver kills."
         ),
     ),
-    ("_swap_sink", "worker is None and _state._column() is State.DRAINING", 0): (
+    (
+        "_swap_sink",
+        "worker is None and _state._column() is State.DRAINING and _state._take_ahead()",
+        0,
+    ): (
         LIVENESS,
         (
             "the one cell of the transition table whose answer is new (SPEC-078 FR-004): a swap "
-            "during a drain with **no live worker** declines at entry, because the drain owns every "
-            "owed close - at `fda134a` it released the drained sink onto a daemon. Liveness, from "
-            "the binding above: a live worker in the drain (a late one, or one built in its tail) "
-            "still swaps, since declining there loses the configure."
+            "during a drain with **no live worker** declines at entry while the drain still has a "
+            "take ahead of it, because until then the drain owns every owed close - at `fda134a` "
+            "it released the drained sink onto a daemon. Liveness, from the binding above: a live "
+            "worker in the drain (a late one, or one built in its tail) still swaps, since "
+            "declining there loses the configure; after the drain's last take the swap runs its "
+            "no-worker branch, or a sink re-armed in the tail is left owed and open."
+        ),
+    ),
+    ("_shutdown_worker", "late_worker is None and (not waited)", 0): (
+        EXISTENCE,
+        (
+            "the no-worker drain's last take was its first pass when no late worker was built and "
+            "nothing was waited on, so no second pass follows: the operation is marked drained in "
+            "this section, which bounds the declining swap (SPEC-078 FR-004)."
         ),
     ),
     ("_offer_orphan_signal", "_state.in_flight(sink)", 0): (
@@ -550,10 +564,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_close_owed",
-        (
-            "[(sink, _state._closes.take(sink, _Rule.GRACED if worker is not None and "
-            "worker.holds_unfenced(sink) else _Rule.JOINED)) for sink in taken]"
-        ),
+        "worker is not None and worker.holds_unfenced(sink)",
         0,
     ): (
         MOMENT,
@@ -606,7 +617,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         "_CloseRegistry.wait_graced",
         (
             "[close for close in self._in_flight.values() if close.rule is _Rule.GRACED and "
-            "close.thread is not None and close.thread.is_alive()]"
+            "any((thread.is_alive() for thread in close.threads))]"
         ),
         0,
     ): (
@@ -1071,8 +1082,13 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 53, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 54, "log_foundry.decorator": 2}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived count after SPEC-078's first diff review, 53 -> 54.** The decline now also
+reads `_state._take_ahead()` (re-keyed in place), `_close_owed`'s rule choice is a plain `if` rather
+than a comprehension (re-keyed, one site either way), and one site was added: `_shutdown_worker`'s
+`late_worker is None and (not waited)`, which marks a no-worker drain's last take.
 
 **Raised to the derived count again at SPEC-078 (FR-003, FR-004), 52 -> 53.** `Runtime.state`'s
 three sites moved to `Runtime._move` with their categories, because the stored state is now

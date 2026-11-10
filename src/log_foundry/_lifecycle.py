@@ -156,11 +156,24 @@ class _Operation:
     of a ``STOP``, and every later graced wait of the same call ends at it, which is what makes
     the closer grace spent once per call (FR-002).
 
+    ``drained`` records that a ``STOP`` has made its **last take** of the owed record, and it is
+    what bounds the one changed cell of the transition table: a swap during a drain with no live
+    worker declines only while some drain still has a take ahead of it, because only then does
+    the drain own every owed close. It is written under ``_state._lock``, in the critical section
+    where the last take becomes known — the second pass's take; the first pass's, when no
+    bystander was waited on and no late worker can still be registered; or the section that
+    reads the late worker, when there is none and nothing was waited on — and read by
+    :meth:`Runtime._take_ahead` under the same lock. ``late_possible`` is whether a worker built
+    now would still be registered as this call's late worker: true from a no-worker shutdown's
+    entry until the section that lowers ``_shutdown_running``.
+
     Attributes:
       kind: ``_Op.SWAP`` or ``_Op.STOP``.
       deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None``.
       budget: The caller's timeout as given, for a diagnostic only.
       grace_end: The instant every graced wait of this call ends, once one has started.
+      drained: Whether this ``STOP`` has made its last take of the owed record.
+      late_possible: Whether a worker built now would be this ``STOP``'s late worker.
     """
 
     def __init__(self, kind: _Op, timeout: float | None) -> None:
@@ -180,6 +193,8 @@ class _Operation:
         self.budget = timeout
         self.deadline: float | None = None if timeout is None else monotonic() + timeout
         self.grace_end: float | None = None
+        self.drained = False
+        self.late_possible = False
 
 
 class _Close:
@@ -204,7 +219,10 @@ class _Close:
     Attributes:
       event: Set when the last participant in this close has finished, however it finished.
       rule: Which rule runs and waits for it.
-      thread: The thread performing it, or ``None`` for an inline close and until one starts.
+      threads: Every thread performing it, one per detached participant, in the order they
+        started; empty for an inline close and until one starts. A list rather than one slot so
+        that a second participant's thread never overwrites the first's: the full join, the
+        graced wait and ``health().closing_sinks`` each see all of them.
       participants: How many releases are performing this close; guarded by the registry's lock.
     """
 
@@ -222,7 +240,7 @@ class _Close:
         """
         self.event = threading.Event()
         self.rule = rule
-        self.thread: threading.Thread | None = None
+        self.threads: list[threading.Thread] = []
         self.participants = 1
 
 
@@ -425,7 +443,12 @@ class _CloseRegistry:
             return id(sink) in self._in_flight
 
     def attach(self, close: _Close, thread: threading.Thread) -> None:
-        """Records the thread performing a close, once it has started.
+        """Records a thread performing a close, once it has started, beside any already there.
+
+        Appended, never assigned: a detached release that joins an entry another participant is
+        already performing on a thread of its own must not overwrite that thread, or the full
+        join, the graced wait and ``health().closing_sinks`` would stop seeing a close that is
+        still running.
 
         Args:
           close: The entry the thread discharges.
@@ -438,7 +461,7 @@ class _CloseRegistry:
           None.
         """
         with self._lock:
-            close.thread = thread
+            close.threads = [*close.threads, thread]
 
     def bystanders(self, mine: set[int]) -> list[_Close]:
         """Every close in flight that the caller did not take, for its bystander wait.
@@ -477,8 +500,7 @@ class _CloseRegistry:
           None.
         """
         for close in closes:
-            thread = close.thread
-            if thread is not None:
+            for thread in close.threads:
                 thread.join()
 
     def _open_grace(self, op: _Operation) -> float:
@@ -506,11 +528,15 @@ class _CloseRegistry:
         """Waits on closes the caller did not perform, all ending at the call's one grace.
 
         Two callers. :func:`_close_owed` passes the bystander entries it captured at its take —
-        closes somebody else had in flight, whatever their rule — and waits on each entry's event.
-        :func:`_shutdown_worker` passes ``None`` at its end, which means every ``GRACED`` close in
-        flight whose thread is alive, and joins each thread; that is the last chance a detached
-        close gets before the process exits. A list with nothing in it spends no grace and sets no
-        ``grace_end``.
+        closes somebody else had in flight, whatever their rule. :func:`_shutdown_worker` passes
+        ``None`` at its end, which means every ``GRACED`` close in flight with a thread still
+        alive; that is the last chance a detached close gets before the process exits. A list with
+        nothing in it spends no grace and sets no ``grace_end``.
+
+        **Every wait is on the entry's event, never on a thread.** The event is set when the
+        **last** participant finishes, so a close a forwarded release is still performing after
+        the detached thread has ended is still waited for; joining the thread returned through
+        it.
 
         Args:
           op: The ``STOP`` this wait belongs to.
@@ -529,19 +555,13 @@ class _CloseRegistry:
                     close
                     for close in self._in_flight.values()
                     if close.rule is _Rule.GRACED
-                    and close.thread is not None
-                    and close.thread.is_alive()
+                    and any(thread.is_alive() for thread in close.threads)
                 ]
         if not closes:
             return
         end = self._open_grace(op)
         for close in closes:
-            thread = close.thread
-            remaining = max(0.0, end - monotonic())
-            if close.rule is _Rule.GRACED and thread is not None:
-                thread.join(remaining)
-            else:
-                close.event.wait(remaining)
+            close.event.wait(max(0.0, end - monotonic()))
 
     def graced_alive(self) -> int:
         """Counts the detached closes running right now, backing ``Health.closing_sinks``.
@@ -554,7 +574,7 @@ class _CloseRegistry:
           None.
 
         Returns:
-          The number of ``GRACED`` entries whose thread is alive.
+          The number of ``GRACED`` entries with a thread still alive.
 
         Raises:
           None.
@@ -563,9 +583,7 @@ class _CloseRegistry:
             return sum(
                 1
                 for close in self._in_flight.values()
-                if close.rule is _Rule.GRACED
-                and close.thread is not None
-                and close.thread.is_alive()
+                if close.rule is _Rule.GRACED and any(thread.is_alive() for thread in close.threads)
             )
 
 
@@ -773,14 +791,17 @@ class Runtime:
 
         A set of tokens rather than a counter or a flag, for ``_shutdown_running``'s reason: two
         concurrent ``configure(sink=...)`` calls are documented as normal, and a boolean cleared by
-        the first to finish would misreport the second. A token is a fresh ``object()``, **added**
+        the first to finish would misreport the second. A token is the call's
+        :class:`_Operation` (SPEC-078; a bare ``object()`` before it), **added**
         under ``_lock`` in a critical section the call already has and **discarded without the
         lock** in its ``finally`` — one ``set.discard``, which CPython performs atomically, where an
         ``int -= 1`` outside the lock is a read-modify-write that can lose a decrement. That is
         what keeps the observer from adding a lock acquisition to any call (SPEC-077 FR-002).
         ``python.md`` §13 says not to rely on a builtin's atomicity across threads; this is the
-        deliberate exception, and a lost discard would only misreport an observer nothing in
-        ``src/`` reads. A forked child empties it in :func:`_clear_after_fork`.
+        deliberate exception. Since SPEC-078 a library call does read the stop tokens — the swap's
+        decline asks :meth:`_take_ahead` under ``_lock`` — and a discard that lagged would make it
+        see a drain that had already made its last take, which ``drained`` already answers. A
+        forked child empties it in :func:`_clear_after_fork`.
         """
         self._stops_running: set[_Operation] = set()
         """One token per ``_shutdown_worker`` call inside its body; non-empty reads ``DRAINING``.
@@ -1050,6 +1071,31 @@ class Runtime:
             return State.SWAPPING
         return self._current
 
+    def _take_ahead(self) -> bool:
+        """Whether some drain in progress still has a take of the owed record ahead of it.
+
+        The bound of the one changed cell (SPEC-078 FR-004): a swap during a drain with no live
+        worker declines only while this is true, because only then does the drain own every owed
+        close — it will take what is owed when it gets there. After a drain's last take, a sink
+        armed since (an orphan log re-arming it) is taken by nothing in that call, and declining a
+        swap then left it owed and open after the shutdown returned, where the swap's own
+        no-worker branch releases it. The caller holds ``_lock``; each flag is written under it.
+
+        The token set is copied into a tuple before it is read: its discard runs without the
+        lock, and the copy is one C-level pass that runs no Python code, so it cannot see the set
+        change size under it.
+
+        Args:
+          None.
+
+        Returns:
+          Whether any ``STOP`` in :attr:`_stops_running` has not yet made its last take.
+
+        Raises:
+          None.
+        """
+        return any(not op.drained for op in tuple(self._stops_running))
+
     @property
     def state(self) -> State:
         """The lifecycle state: the token sets, then the stored state; takes no lock (SPEC-078).
@@ -1099,10 +1145,11 @@ _state = Runtime()
 """The process's one lifecycle owner.
 
 A module global rather than a lazily-built singleton, so ``_fork``'s repair walk reaches it in a
-forked child without having to know it might not exist yet. The instance itself is walked:
-only the two records named in :attr:`Runtime._FORK_SKIP`, which pin superseded sinks, are kept
-out, and everything else on it is live state a child needs repaired — the locks and the stop
-event above all.
+forked child without having to know it might not exist yet. The instance itself is walked: only
+the two records that pin superseded sinks are kept out — the ownership record, named in
+:attr:`Runtime._FORK_SKIP`, and the owed record, named in :attr:`_CloseRegistry._FORK_SKIP` on the
+close registry that holds it — and everything else on it is live state a child needs repaired,
+the locks and the stop event above all.
 """
 
 
@@ -2233,6 +2280,11 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     FR-002 accepted for the count this replaced, and for the same reason: it contains no call, so
     nothing but a real signal storm can land in it.
 
+    **It records the call's last take** (SPEC-078 FR-004): in the take's own critical section,
+    ``op.drained`` is set when no further take of this call can follow — the second pass, or a
+    first pass that waits on nobody once no late worker can still be registered for the call.
+    That is what bounds the declining swap.
+
     Args:
       op: The ``STOP`` this closer runs for, whose deadline bounds the grace and which carries the
         call's one ``grace_end``. ``None`` only for a direct call from a test, which gets an
@@ -2252,23 +2304,19 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     """
     operation = _Operation(_Op.STOP, None) if op is None else op
     joined: list[_Close] = []
+    entries: list[tuple[Sink, _Close]] = []
     with _state._lock:
         worker = _state.worker_exists()
         taken = [sink for sink in _state._closes.owed.values() if not _state.held(sink)]
-        entries = [
-            (
-                sink,
-                _state._closes.take(
-                    sink,
-                    _Rule.GRACED
-                    if worker is not None and worker.holds_unfenced(sink)
-                    else _Rule.JOINED,
-                ),
-            )
-            for sink in taken
-        ]
+        for sink in taken:
+            rule = _Rule.JOINED
+            if worker is not None and worker.holds_unfenced(sink):
+                rule = _Rule.GRACED
+            entries.append((sink, _state._closes.take(sink, rule)))
         mine = {id(sink) for sink in taken}
         waiting = _state._closes.bystanders(mine) if bystander_wait else []
+        if not bystander_wait or not (waiting or operation.late_possible):
+            operation.drained = True
     undischarged = {id(sink): (sink, close) for sink, close in entries}
     try:
         inline = _inline_close_choice(taken, worker) if taken else None
@@ -2354,6 +2402,12 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     measured, a worker built at that instant was registered nowhere and the second call returned
     having stopped nothing, which is the original defect verbatim.
 
+    **Every wait of the worker's stop ends at this call's deadline** (SPEC-078 FR-005). A caller
+    that won the claim passes its ``budget`` only for the expiry line; :meth:`Worker.stop` joins
+    until the deadline :meth:`Worker.claim_stop` recorded. A caller that lost the claim passes
+    what remains of its own deadline, which is what bounds its wait for the winner's drain, and
+    a losing caller writes no expiry line, so no rendered text depends on it.
+
     **The stored state moves with the count** (SPEC-078 FR-003): :meth:`Runtime._move` is the
     last statement of the entry's critical section and of the late worker's, the two sections of
     this call that change the retirement count.
@@ -2417,13 +2471,15 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             worker = _state.worker_exists()
             if worker is None:
                 _state._shutdown_running += 1
+                op.late_possible = True
             else:
                 claimed = worker.claim_stop(op.deadline)
             _state._stop.set()
             _state._move()
         late_worker: Worker | None = None
+        waited = False
         if worker is not None:
-            worker.stop(op.budget, claimed=claimed)
+            worker.stop(op.budget if claimed else _remaining(op.deadline), claimed=claimed)
             waited = _close_owed(op)
         else:
             try:
@@ -2433,6 +2489,9 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
                     late_worker = _state._late_worker
                     _state._late_worker = None
                     _state._shutdown_running -= 1
+                    op.late_possible = False
+                    if late_worker is None and not waited:
+                        op.drained = True
             if late_worker is not None:
                 with _state._lock:
                     _state.retirements += 1
@@ -2513,9 +2572,10 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     critical section under ``_state._lock``, so a preempted orphan emit cannot re-arm a sink in a
     gap where it is neither owed nor in flight (FR-003).
 
-    **During a drain with no live worker it declines at entry** (SPEC-078 FR-004): no retarget,
-    no close and no arm, from its first critical section. The drain in progress owns every owed
-    close, and at ``fda134a`` a swap landing there — after the worker's stop had retired it —
+    **During a drain with no live worker it declines at entry, while the drain still has a take
+    ahead of it** (SPEC-078 FR-004, :meth:`Runtime._take_ahead`): no retarget, no close and no
+    arm, from its first critical section. Until its last take the drain in progress owns every
+    owed close, and at ``fda134a`` a swap landing there — after the worker's stop had retired it —
     released the worker's sink detached once its drain thread had ended (measured: A's close ran
     on ``log-foundry-sink-close``, a daemon joined only for the grace and killed at exit wherever
     it has reached, the SPEC-028 objection SPEC-030 and SPEC-046 keep the live sink's close inline
@@ -2524,8 +2584,12 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     any orphan log does. **A live worker in the drain still swaps**: a late worker the drain will
     stop, or one built in the drain's tail that it will not, which delivers (SPEC-044 FR-001);
     declining there would leave a live worker on the old sink with no ``incomplete_swaps`` and no
-    line — the lost configure this function's ``Raises:`` disowns. A swap that entered before the
-    drain is past this check and finishes by the rules above, where its retarget declines.
+    line — the lost configure this function's ``Raises:`` disowns. **After the drain's last take
+    the swap runs its no-worker branch as before**: a sink armed since — an orphan log re-arming
+    the drained sink, say — is taken by nothing left in that call, so declining there left it owed
+    and open after the shutdown returned, where this branch releases it detached and arms the new
+    one. A swap that entered before the drain is past this check and finishes by the rules above,
+    where its retarget declines.
 
     **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no
@@ -2553,7 +2617,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             old = None if worker is None else worker.sink
             if worker is None and not _state._closes.owed:
                 return
-            if worker is None and _state._column() is State.DRAINING:
+            if worker is None and _state._column() is State.DRAINING and _state._take_ahead():
                 return
             _state._swaps_running.add(op)
             for stale in list(_state._closes.owed.values()):
