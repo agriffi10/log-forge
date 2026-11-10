@@ -8,6 +8,12 @@ description: "the record is stamped when the library is *handed* a sink, over th
 
 ## History
 
+### 2026-11-10
+
+- **Refined by SPEC-079**: the marking now runs inside the one walk a forked child runs, as its
+  marking frontier (`_lifecycle._walk_after_fork`), and its reach is unchanged: forwarded seeds from
+  the live roots, then the owed and ownership records.
+
 ### 2026-09-02
 
 - **Settled.**

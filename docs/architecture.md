@@ -968,14 +968,6 @@ close it.
 
 ### Open
 
-- **`configure(sink=object())` is accepted, and every batch is then lost on the drain thread**
-  (SPEC-080 frame-2 review; invariant 13). `Sink` is structural, so nothing tests the sink at
-  `configure()`; reproduced at `4f0c5741`, a traced call's three events end in `lost 3 event(s);
-  batch abandoned after 4 emit attempts`, `flush()` returns `reason='abandoned'` and
-  `failed_batches=1`. Counted and announced, so invariant 2 holds; refused nowhere, so 13 does
-  not. **Closed by** refusing at `configure()` a sink with no callable `emit` and `close`, read
-  through the type rather than the instance.
-
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
   outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it
@@ -1147,6 +1139,16 @@ close it.
   per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
 
 ### Resolved
+
+- ~~**`configure(sink=object())` is accepted, and every batch is then lost on the drain
+  thread**~~ (SPEC-080 frame-2 review; invariant 13) → **closed by SPEC-079 for what `configure()`
+  can decide.** Reproduced at `4f0c5741`: a traced call's three events ended in `lost 3 event(s);
+  batch abandoned after 4 emit attempts`. `configure(sink=…)`, and the inner sinks of
+  `FilteringSink`, `TransformSink` and `MultiSink`, now refuse a value that can never be a sink —
+  exactly one of a closed list of builtin types, `_sink_arg._UNPATCHABLE` — with a `TypeError`
+  naming the argument and the type. A missing `close` is never refused, and a value that could
+  still gain an `emit` is accepted (Andrew's decisions of 2026-11-05); the user-class case that
+  never gains one is §13's constraint.
 
 - ~~**`_fork._reinit_primitives` can exhaust memory, not merely hang.**~~ → **closed by SPEC-079.**
   Its container read was `list(container)`, so a `list` subclass with a non-terminating
@@ -1944,6 +1946,15 @@ and a third copy is a fork with no merge.
     starts from the runtime's roots, and such a sink is reachable from none of them. Same accepted
     boundary the locks already carry; `sink_factory=` is the library's way to build the sink in
     the worker process instead.
+
+- **A sink `configure()` cannot prove unpatchable is accepted, and if it never gains an `emit`
+  its batches are lost counted and announced** (SPEC-079 FR-005). Only exactly one of a closed list
+  of builtin types is refused at `configure(sink=…)` and in the wrappers. A user-defined class
+  with no `emit` is a heap type, which can always gain one, so it is accepted: on the worker path
+  its batches are counted in `failed_batches`, on the orphan path in `orphan_lost`, and both are
+  announced. Another unpatchable C type — `memoryview`, an extension type — is accepted the same
+  way. The rejected predicate, "not a heap type and no instance `__dict__`", refused
+  `weakref.proxy(sink)` and `super(Sub, inst)`, which deliver.
 
 - **The ownership record grows for the life of the process, and a forked child walks all of it**
   (SPEC-079). `_state._owned` holds a strong reference to every sink the process ever stamped

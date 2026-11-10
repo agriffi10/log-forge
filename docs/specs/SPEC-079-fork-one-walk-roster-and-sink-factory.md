@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-079
 title: "Fork: One Walk From the Runtime's Roots, the Global Lock Roster, and sink_factory="
 description: "Repairs a forked child by re-creating the package's global locks from one explicit roster and reaching every sink through one bounded walk from the runtime's roots, deletes the module-wide walk and the separate inheritance marking, and adds sink_factory= so each process can build a sink of its own."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-039, SPEC-042, SPEC-044, SPEC-053, SPEC-054, SPEC-068, SPEC-072, SPEC-077, SPEC-078, SPEC-080]
 arc: stability-redesign
 arc_order: 11

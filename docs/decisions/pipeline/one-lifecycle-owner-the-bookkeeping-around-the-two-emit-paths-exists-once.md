@@ -65,6 +65,11 @@ The registration is held on a small object rather than as a bare `Event` in the 
 because `_fork`'s repair walk assigns a replacement back **by name** and cannot reach a primitive
 that is only a dict value. (SPEC-054 FR-003)
 
+> **Superseded in part by SPEC-079.** A forked child no longer repairs an in-flight close's event:
+> its one walk starts from the runtime's roots, `_state` is not one, and `_clear_after_fork` drops
+> every in-flight entry with its event. The registration's shape is unchanged. The fork order lives
+> in `docs/decisions/pipeline/only-the-forked-child-is-repaired-and-its-order-of-work-is-the-contract.md`.
+
 **`health()` is assembled once, and every field has one authority** — the worker's counters where a
 worker exists, `retired` from the count, `sink` from the **configured** sink, `closing_sinks` from
 the closer registry, `inherited_sink` from the config, the loss counters from `decorator`. Two

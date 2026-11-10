@@ -8,6 +8,12 @@ description: "`dup2` to `/dev/null` *and* reopen in **append** mode: rebinding a
 
 ## History
 
+### 2026-11-10
+
+- **Refined by SPEC-079**: the hooks are collected from the repair frontier and from the marking
+  frontier's forwarded seeds, so a live sink behind a third-party holder, or two containers below a
+  package holder, is now stranded too; a sink reached only from the records is never hooked.
+
 ### 2026-08-10
 
 - **Settled.**
