@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-078
 title: "The Owed-Close Registry and Checked Lifecycle Transitions"
 description: "Puts every owed and in-flight sink close in one registry that spends the closer grace once per shutdown, and makes the stored lifecycle State the authority: every lifecycle call checks it under the runtime's lock and has a defined answer in every state."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-066, SPEC-068, SPEC-077]
 arc: stability-redesign
 arc_order: 10
@@ -733,3 +733,16 @@ row for the registry. The release notes for 1.2.0 carry the two fixes.
   `join_closers` turn red, is added to the Overview's list of SPEC-077 pins this spec changes and to
   FR-006's re-derived guards, with a criterion.
 - 2026-11-05: rebased onto main after v1.1.0; the landed peer specs are now in depends_on.
+- 2026-11-09, built. Five places were amended during the build, each in the commit that diverged:
+  - FR-006's test-file list and roster floor were re-measured at `64d0d039`, after SPEC-077
+    landed.
+  - FR-003's dispatch: only `_swap_sink` reads `_column()`, because the other five rows give the
+    same code in every column.
+  - FR-005: the `_Operation` is built before the call's first critical section.
+  - FR-005: `Worker.stop` reads the deadline through `claim_stop`'s recorded `_exit_deadline`
+    when claimed, and keeps its signature. Passing a remainder would have rendered
+    `0.499998s` in the expiry line `test_worker_exit_budget.py` pins.
+  - The API comment on `_Operation` and the file plan for `worker.py` were updated to match.
+
+  The plan review also found an edge case: a forwarded release joining a detached close still in
+  flight discharged its entry early. `_Close` counts its participants to close it.

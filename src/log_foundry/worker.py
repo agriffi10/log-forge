@@ -320,9 +320,8 @@ class Worker:
     back-pressure the app: the queue is bounded and overflow is dropped-newest with a counter
     (arch §9). Two drains are deliberately distinct (SPEC-013) — :meth:`stop` retires this worker
     and it never comes back, while :meth:`flush` drains on demand and leaves everything running,
-    which a process that is frozen rather than exited needs. Retiring a worker is not retiring the
-    process: a ``shutdown()`` that found no worker leaves the next span free to build one. This class owns delivery
-    mechanics only, and knows nothing about spans or context.
+    which a process that is frozen rather than exited needs. This class owns delivery mechanics
+    only, and knows nothing about spans or context.
     """
 
     _FORK_SKIP = ("_held", "_taken_markers")

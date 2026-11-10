@@ -1,78 +1,109 @@
 ---
 type: Decision
-title: "Lifecycle state has one holder, Runtime, and State observes it until transitions are checked"
-description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; `State` is derived lock-free from today's flags and nothing in `src/` reads it until a later spec makes transitions checked. Four locks remain, not one, because merging any changes the lock order. The swap and stop token sets are added under `_lock` and discarded lock-free, a deliberate, bounded exception to `python.md` §13. (SPEC-077; arch §9.2)"
+title: "Lifecycle state has one holder, Runtime, and the stored State decides the transitions"
+description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside critical sections the calls already take, and the transition table is total over six calls and five states, with one changed cell — a swap during a drain with no live worker declines. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry (`Runtime._closes`). Three locks remain, not one. The token sets are added under `_lock` and discarded lock-free, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078; arch §9.2)"
 ---
 
 **One holder.** SPEC-040 put the orphan side's seven globals on one object, `_lifecycle._state`,
 and SPEC-054 merged the twin bookkeeping (*One lifecycle owner*). Seven more names still sat at
-module scope in `_lifecycle.py`, each with its own lock where it had one. They were the closer
-roster, the in-flight-close registry, the ownership record and its marking flag, and their three
-locks. SPEC-077 renamed `_Lifecycle` to `Runtime` and moved all seven onto it. No alias was left
-at module scope, because a second home is the defect the move removes. `_state` stays the module
-global and the one instance, so the `@trace` hot path and `worker.py`'s binding are untouched. The
-fork opt-out moved with `_owned`. `_fork._skipped_names` reads `_FORK_SKIP` from whatever holds
-the attribute, so `Runtime._FORK_SKIP` is now `("_owed", "_owned")` and the module declares none.
+module scope in `_lifecycle.py`, each with its own lock where it had one. SPEC-077 renamed
+`_Lifecycle` to `Runtime` and moved all seven onto it. No alias was left at module scope, because
+a second home is the defect the move removes. `_state` stays the module global and the one
+instance, so the `@trace` hot path and `worker.py`'s binding are untouched.
 `tests/test_lifecycle_inventory.py` makes "nothing else holds lifecycle state" a gate rather than a
-sentence. It derives every lock or event construction, every `Runtime` and `Worker` field and every
-module-level state binding, and fails on one that has no declared home.
+sentence: it derives every lock or event construction, every `Runtime`, `Worker` and
+`_CloseRegistry` field and every module-level state binding, and fails on one with no declared
+home.
 
-**`State` is an observer.** `Runtime.state` names one of five states (`UNCONFIGURED`, `RUNNING`,
-`SWAPPING`, `DRAINING`, `CLOSED`) from fields the runtime already keeps, using six rules in a fixed
-order. Nothing in `src/` reads it, so a wrong derivation can fail a test and cannot change a
-delivery. It records where today's code departs from the stability plan's diagram rather than
-fixing it. `CLOSED` is not terminal, because a `@trace` after a no-worker `shutdown()` builds a live
-worker. `SWAPPING` is entered from `CLOSED` as well as from `RUNNING`. `state` takes no lock, which
-makes it a fourth lock-free reader beside the three worker questions, for their reason: several
-guards ask with `_lock` held, and that lock is not reentrant.
+**One close registry** (SPEC-078 FR-001). A close passed through three facts — owed, in flight,
+and for a detached close its thread — held in four places (`_owed`, `_closing_now`, `_closers` and
+`_close_owed`'s local thread list), with the moves between them written out at each site.
+`_CloseRegistry`, held as `Runtime._closes`, owns all of them: `arm`, `take` (owed to in flight in
+one call under `_lock`, so no instant has a sink neither owed nor in flight), `put_back`,
+`register`, `finish`, and the reads. Each in-flight entry, a `_Close`, records its rule —
+`INLINE`, `JOINED` (a shutdown's fan-out, joined in full, SPEC-046) or `GRACED` (detached, given
+the call's one grace) — and its thread, and holds no sink, because the fork walk reaches the
+registry. An entry counts its participants, so a forwarded release joining a detached close still
+in flight does not discharge it while that thread is inside `close()`. The owed record's fork
+opt-out moved with it: `_CloseRegistry._FORK_SKIP = ("owed",)`, and `Runtime._FORK_SKIP` is
+`("_owned",)`.
 
-**Four locks, not one.** `_lock` guards the worker, the owed record, the retirement count and the
-stop event. `_closers_lock`, `_closing_now_lock` and `_owned_lock` each guard the one structure they
-are named for. Folding `_closing_now_lock` into `_lock` deadlocks `in_flight` and `held`, which are
-asked with `_lock` held and take that leaf by design. `_closers_lock` and `_owned_lock` are taken
-beneath `_lock` and also on closer threads beside it. `_lock` is also held across a blocking
-`Worker(_ensure_sink())` build, so merging either of them into it changes the lock order, and the
-lock order is behaviour. The order stays as `Runtime`'s docstring states it: `_lock`, then
-`_config_lock`, then `_owned_lock`; and `_lock` with `Worker._lock`, `_closers_lock` and
-`_closing_now_lock` as leaves beneath it. Nothing acquires `_lock` beneath any of them.
+**`State` is stored and decides** (SPEC-078 FR-003, FR-004). SPEC-077 introduced it as an
+observer derived from the flags. Now `Runtime._current` stores the settled part — rules 3 to 6 of
+SPEC-077's derivation **without** the configured-sink term, because the config is not the
+runtime's and `configure()` must not take its lock — written only by `Runtime._move`, at the end of
+the four critical sections that can change it (the build, the orphan arm, and the shutdown's entry
+and late-worker sections). No other section calls it, because none can change the value. `state`
+reads the token sets, then `_current`, and reports a stored `UNCONFIGURED` as `RUNNING` once a sink
+has resolved; it stays lock-free and is the reporting view. The library reads `Runtime._column()`
+— the token sets, then `_current` — under the lock it already holds.
+
+**The transition table is total, and one cell changed.** Six calls (`BUILD`, `ARM`, `SWAP`,
+`FLUSH`, `STOP`, `FORK`) by five states; every cell is today's behaviour except one: **a swap
+during a drain with no live worker declines at entry** — no retarget, no close, no arm. At
+`fda134a` such a swap moved the drained sink's close onto a daemon that exit kills, and closed the
+new sink, which nothing had been written to. A live worker in the drain (a late one, or one built
+in the drain's tail) still swaps, because declining there loses the configure. Only `_swap_sink`
+reads the column, because the other five rows give the same code in every column.
+
+**`CLOSED` keeps its arrows, by decision.** After a `shutdown()` that built no worker, a `@trace`
+builds a live worker and delivers (SPEC-044 FR-001); after one that stopped a worker, the same call
+is counted in `submitted_after_shutdown` and the state stays `CLOSED` (SPEC-019, SPEC-030); an
+orphan log after either is delivered and re-arms the sink (SPEC-032). Making `CLOSED` terminal
+would reclassify the first case's delivered events in a minor release, and no invariant needs it.
+
+**Three locks, not one.** `_lock` guards the worker, the owed record, the retirement count and the
+stop event; the registry's leaf lock guards the closes in flight; `_owned_lock` guards the ownership
+record. SPEC-078 merged the two former leaves (`_closing_now_lock`, `_closers_lock`) into the
+registry's one, which changed no acquisition order, since they never nested. Folding the leaf into
+`_lock` would deadlock `in_flight` and `held`, which are asked with `_lock` held, and closer
+threads discharge it without `_lock`. The order: `_lock`, then `_config_lock`, then `_owned_lock`;
+and `_lock` with `Worker._lock` and the registry's lock as leaves. Nothing acquires `_lock` beneath
+any of them.
 
 **The token sets are discarded without the lock, and that departs from `python.md` §13 on
-purpose.** `_swap_sink` and `_shutdown_worker` each add a fresh `object()` to `_swaps_running` or
-`_stops_running` inside a critical section they already have. Each discards it in a `finally` with
-one `set.discard`. A token's hash runs no Python code, so under the GIL the discard is one
-operation. They are sets, not booleans, because two concurrent `configure(sink=…)` or `shutdown()`
-calls are documented as normal, and the first to finish would clear a boolean while the second
-still runs. They are sets, not `int` counters, because the worker branch of `_shutdown_worker` has
-no critical section after `worker.stop()`, so a counter's decrement would need a new lock
-acquisition or would be a read-modify-write that can lose an update. The `_state._lock` counts per
-call are pinned in `tests/test_runtime_state.py`, measured at `fda134a` and again at `3d65cf32`
-before the sets existed, and no call gained an acquisition. §13 says not to rely on a builtin's
-atomicity across threads. The consequence of breaking that rule here is bounded: a lost discard
-would misreport an observer that nothing in `src/` reads. A forked child empties both sets in
-`_clear_after_fork`, because the calls that added the tokens did not survive the fork.
+purpose.** `_swap_sink` and `_shutdown_worker` each add their `_Operation` to `_swaps_running` or
+`_stops_running` inside a critical section they already have, and discard it in a `finally` with
+one `set.discard`. An `_Operation` hashes by identity and runs no Python code, so under the GIL the
+discard is one operation. They are sets, not booleans or counters, because two concurrent
+`configure(sink=…)` or `shutdown()` calls are documented as normal, and the worker branch of
+`_shutdown_worker` has no critical section after `worker.stop()`. The `_state._lock` counts per call
+are pinned in `tests/test_runtime_state.py`, and SPEC-078 moved none of them. **The exception now
+carries a decision** — the one changed cell reads `DRAINING` off `_stops_running` — and it stays
+sound: the token is added before anything the swap could decline over, inside the critical section
+the swap reads it in, and a stale discard can only make a later read see `DRAINING` end late,
+which costs that one swap a decline of a drain already over, never a close under a drain.
 
 **Rejected:**
 
 - **One lock**, the stability plan's target. It deadlocks or reorders, for the reasons above.
 - **A `Runtime.sink` field.** The live sink is held twice already, by `Worker.sink` and by the
-  config, and the two differ on purpose after a declined swap. A third copy would turn that
-  deliberate divergence into a three-way one.
+  config, and the two differ on purpose after a declined swap.
 - **Moving `Worker`'s drain state onto `Runtime`.** `_stopped`, `_join_owed` and the drain events
-  belong to one worker, and there can be two (`_worker` and `_late_worker`), so a field on
-  `Runtime` would need keying by worker.
-- **Module-level aliases for the moved names**, kept for compatibility. An alias would be a second
-  home, which is the defect the move removes.
+  belong to one worker, and there can be two (`_worker` and `_late_worker`).
+- **Module-level aliases for the moved names.** An alias would be a second home.
+- **A terminal `CLOSED`** (the stability plan's diagram): it reclassifies delivered events.
+- **A `_column()` read at every entry**: five of six rows give one answer in every column, so the
+  read would decide nothing.
+- **Grace-capping the fan-out joins**: SPEC-046 measured it losing data.
 
-**Do NOT** let code in `src/` branch on `Runtime.state` or on the token sets while the sets are
-discarded lock-free. The §13 exception holds only while the state is an observer. A later spec
-that makes `State` decide must also put the sets' writes under a lock, or replace them. Do NOT add
-lifecycle state at module scope in `_lifecycle.py`, or a field to `Runtime` or `Worker`, without a
-row in the inventory test. Do NOT merge the four locks without re-deriving the lock order. (SPEC-077
-FR-001 to FR-003)
+**Do NOT** write `_current` outside `Runtime._move`, or call `_move` outside the four sections that
+can change it — `tests/test_lifecycle_transitions.py` scans both. Do NOT let a library call decide
+on `Runtime.state`; it reads `_column()` under its own lock. Do NOT add lifecycle state at module
+scope in `_lifecycle.py`, or a field to `Runtime`, `Worker` or `_CloseRegistry`, without a row in
+the inventory test. Do NOT merge the three locks without re-deriving the lock order. Do NOT touch
+the owed record outside `_CloseRegistry.arm`, `take` and `put_back`. (SPEC-077 FR-001 to FR-003,
+SPEC-078 FR-001 to FR-004)
 
 ## History
 
 ### 2026-11-09
+
+- **Refined** by SPEC-078: `State` is stored (`_current`, one writer, `_move`) and decides, the
+  transition table is total with one changed cell (a swap during a drain with no live worker
+  declines), `CLOSED` keeps its arrows, every close lives in one registry (`Runtime._closes`),
+  and the two leaf locks merged, leaving three. The title changed from "State observes it until
+  transitions are checked"; the file name stays, as a decision's file name never changes.
 
 - **Settled** by SPEC-077: one holder, `Runtime`; `State` as a lock-free observer; four locks kept;
   the token sets' lock-free discard as a bounded exception to `python.md` §13.

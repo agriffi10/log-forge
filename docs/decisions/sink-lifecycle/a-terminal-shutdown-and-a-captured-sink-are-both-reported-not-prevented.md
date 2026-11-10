@@ -8,6 +8,10 @@ description: "logging after `shutdown()` is still *accepted* — refusing would 
 
 ## History
 
+### 2026-11-09
+
+- **Confirmed** by SPEC-078 FR-004 as the transition table's `CLOSED` column, with no reversal: after a `shutdown()` that stopped a worker, a span is counted in `submitted_after_shutdown` and announced, and the state stays `CLOSED`; after one that built no worker, a span builds a live worker and delivers, and the state returns to `RUNNING`. `CLOSED` keeps those arrows by decision, and `log_foundry.shutdown`'s docstring now states both shapes.
+
 ### 2026-08-07
 
 - **Settled.**

@@ -807,16 +807,33 @@ through all of its callers), so a non-reentrant acquire inside a question would 
 them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
 read is a single atomic reference load, and a caller needing consistency across two reads takes
 the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span. The two
-moment predicates do take the leaf `_state._closing_now_lock`, which is the order the shipped code
-already established — `_offer_orphan_signal` reached that lock under the lifecycle lock before
-SPEC-054 folded the read into the question — and nothing acquires the lifecycle lock beneath it.
+moment predicates do take a leaf lock — the close registry's, `_state._closes._lock`, since
+SPEC-078 merged `_closing_now_lock` and `_closers_lock` into it — which is the order the shipped
+code already established: `_offer_orphan_signal` reached that lock under the lifecycle lock before
+SPEC-054 folded the read into the question, and nothing acquires the lifecycle lock beneath it.
 
-**`Runtime.state` is a fourth lock-free reader, but it is not a fourth question** (SPEC-077). It
-names which of five `State` members (`UNCONFIGURED`, `RUNNING`, `SWAPPING`, `DRAINING`, `CLOSED`)
-today's flags describe. It takes no lock, for the reason the three questions take none, and
-nothing in `src/` reads it, so no guard may select it. `Runtime` still holds four locks,
-`_state._lock` and the three leaves beside it, and `docs/decisions/pipeline/` → *Lifecycle state
-has one holder, Runtime* says why they are not one.
+**The close registry holds every owed close and every close in flight** (SPEC-078 FR-001).
+`Runtime._closes`, a `_CloseRegistry`, replaced `_owed`, `_closing_now`, `_closers` and the
+closer's local thread list. `take` moves a sink from owed to in flight in one call under the
+lifecycle lock, and each in-flight entry records its rule — `INLINE` on the calling thread,
+`JOINED` (a shutdown's fan-out, joined in full, SPEC-046) or `GRACED` (detached, given the
+shutdown's one grace) — and its thread, and holds no sink. Both moment predicates end in
+`_CloseRegistry.in_flight`; `health().closing_sinks` counts the `GRACED` entries whose thread is
+alive. **A shutdown spends the closer grace once**: every graced wait of one call ends at that
+call's `grace_end`, fixed at its first graced wait.
+
+**`State` is stored and decides** (SPEC-078 FR-003, FR-004). `Runtime._current` holds the
+settled state — `RUNNING`, `CLOSED` or `UNCONFIGURED`, from the worker, the retirement count and the
+owed record, never the config — written only by `Runtime._move` at the end of the four critical
+sections that can change it. `Runtime._column()` reads the token sets and then `_current`, under
+the lock the caller holds, and is the column of the transition table, which is total over six
+calls by five states. Only `_swap_sink` consults it, because its `DRAINING` cell is the one whose
+answer differs: with no live worker a swap during a drain declines. `Runtime.state` stays the
+lock-free reporting view and still reports a resolved-but-unwritten config as `RUNNING`; no guard
+selects it. `CLOSED` keeps its arrows (a span after a worker-less `shutdown()` builds a live
+worker). `Runtime` holds three locks, `_state._lock`, the registry's leaf and `_owned_lock`, and
+`docs/decisions/pipeline/` → *Lifecycle state has one holder, Runtime* says why they are not
+one.
 
 **The moment is one category with two predicates, and a transition**, and that is stated here rather than left to
 be rediscovered at a site. The transition is `worker.claim_stop(deadline)` (SPEC-062): it asks the moment as an act, setting `_stopped`, recording the deadline and taking `Worker._lock`, so it is not a third predicate. `in_flight(sink)` asks whether the worker is *draining* into it, so
@@ -1702,8 +1719,11 @@ and a third copy is a fork with no merge.
   FR-004, and the narrowing is SPEC-028's doing: `close()` now takes the sink's emit lock, so an
   application thread parked on the orphan path inside a driver call with no timeout of its own
   delays the close with no ceiling. `shutdown(timeout=...)` bounds `thread.join()` and, since
-  SPEC-030, the grace it grants a swapped-out sink's close — but not this close, the live sink's,
-  which stays inline and unbounded. **The cost does not multiply by the number of sinks owed a
+  SPEC-030, the grace it grants a swapped-out sink's close — **one grace per call** since
+  SPEC-078, whose close registry ends every graced wait of a `shutdown()` at one instant, where two
+  waits each computing their own had measured 4.00 s against a 2.0 s grace — but not this close,
+  the live sink's, which stays inline and unbounded, nor a shutdown's own fan-out closes, which are
+  joined in full (SPEC-046). **The cost does not multiply by the number of sinks owed a
   close** (SPEC-046): they run concurrently and are all joined, so this limit is one close, not
   their sum. **It reaches the orphan path as well as the worker's**
   (SPEC-044 FR-006): a process that only ever logged outside a span closes through
