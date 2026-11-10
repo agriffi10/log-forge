@@ -1956,13 +1956,37 @@ and a third copy is a fork with no merge.
   way. The rejected predicate, "not a heap type and no instance `__dict__`", refused
   `weakref.proxy(sink)` and `super(Sub, inst)`, which deliver.
 
+- **After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink
+  owns it and closes it** (SPEC-042, SPEC-079). A marking that trips `_MARKING_CEILING` sets
+  `_marking_failed`, which refuses the close of every sink that stays unrecorded. But a child
+  that hands such a sink to `configure()` again — a bare re-hand, with the parent having held it
+  only inside a third-party wrapper the tripped marking never reached — has `stamp` record it as
+  the child's own, and the child's `shutdown()` then closes the parent's transport. Measured
+  identically at `9b238733` and at SPEC-079's head; the fix is work of its own.
+
+- **A sink behind a `weakref.proxy` configured as the sink is not repaired in a forked child**
+  (SPEC-079). FR-005 accepts a `weakref.proxy` as `sink=`, and the child records it, so it is
+  never claimed; but its referent is reachable only by calling into the proxy, which the repair
+  never does, so a lock the referent holds stays held by a thread that does not exist, and with
+  a parent thread inside it at the fork the child's first emit blocks. A `super(Sub, inst)` is
+  repaired: its `__self__` is read in C and the walk passes through it. Configure the sink
+  itself, or build it in the worker process with `sink_factory=`.
+
+- **A caller-wrapped, unbuilt factory sink builds in a child a sink nothing closes** (SPEC-079).
+  If a caller wraps `get_config().sink` — the private `_FactorySink` — in a wrapper of its own
+  and configures that, the config carries no factory, so a forked child inherits the parent's
+  wrapper rather than adopting its own. Its first emit builds and stamps a sink of the child's,
+  which the inherited, parent-owned wrapper chain never releases: a leaked handle per child.
+  Configure `sink_factory=` itself rather than wrapping what it installs.
+
 - **The ownership record grows for the life of the process, and a forked child walks all of it**
   (SPEC-079). `_state._owned` holds a strong reference to every sink the process ever stamped
   (SPEC-042 FR-001), and a child's marking frontier seeds from every one of those references,
   bounded by `_MARKING_CEILING`. A long-lived process that reconfigures with buffering sinks and
   then forks therefore grows the walk until every child trips the ceiling, announces it, and
-  refuses every sink it has no record of — a leaked handle in each child, never a destructive
-  close. Measured in the suite at `44db79a6`: one xdist worker's record had grown to 92,940
+  refuses to close an inherited sink it has no record of — a leaked handle — with one exception
+  that is a destructive close: a sink the child hands to `configure()` again itself, which the
+  next item states. Measured in the suite at `44db79a6`: one xdist worker's record had grown to 92,940
   marking visits by the end of a run, which is how
   `test_a_child_of_a_process_that_built_no_worker_is_silent` failed; the suite's own reset now
   clears the record between tests. The remedy — the record seeds not descending into a

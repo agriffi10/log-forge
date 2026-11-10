@@ -4106,12 +4106,14 @@ def test_without_the_container_branch_the_multisink_child_blocks(
     """The positive control: only the container member's reach is taken away, and it hangs.
 
     Re-derived at SPEC-079: the repair frontier's one-level container read is
-    ``_lifecycle._push_members``, and with the marking ceiling at one nothing behind the
-    repair frontier repairs the wrapper's child either, so taking the read away leaves the
-    ``FileSink``'s guard lock dead.
+    ``_lifecycle._push_members``, and since the record-by-position change the ``MultiSink``'s
+    declared ``_sinks`` slot pushes its members too (``_lifecycle._positional_sinks``); with both
+    taken away and the marking ceiling at one, nothing behind the repair frontier repairs the
+    wrapper's child either, so the ``FileSink``'s guard lock stays dead.
     """
     monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", 1)
     monkeypatch.setattr(_lifecycle, "_push_members", lambda container, stack: None)
+    monkeypatch.setattr(_lifecycle, "_positional_sinks", lambda holder, items: [])
     child = _forked_owned_multisink_run(tmp_path)
     assert child.output.startswith("at-the-call;"), f"never reached the call: {child.output!r}"
     assert child.blocked, f"the unrepaired child did not block: it {child.ending}, {child.output!r}"

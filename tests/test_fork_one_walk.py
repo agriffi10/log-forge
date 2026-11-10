@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 import gc
-import os
 import pathlib
 from typing import Any
 
@@ -360,16 +359,9 @@ def test_a_forked_child_does_not_hook_a_superseded_sink_the_worker_holds() -> No
     worker = _lifecycle._state.worker_exists()
     assert worker is not None
     worker._held = [worker.sink, superseded]
-    read_fd, write_fd = os.pipe()
-    gc.collect()
-    pid = os.fork()
-    if pid == 0:  # pragma: no cover - the child never returns to pytest
-        os.close(read_fd)
-        os.write(write_fd, ",".join(sorted(_HOOKED)).encode())
-        os._exit(0)
-    os.close(write_fd)
-    os.waitpid(pid, 0)
-    hooked = os.read(read_fd, 4096).decode()
-    os.close(read_fd)
-    worker._held = [worker.sink]
+    try:
+        child = run_in_child(lambda: ",".join(sorted(_HOOKED)))
+    finally:
+        worker._held = [worker.sink]
+    hooked = child.output
     assert hooked == "live", f"the child's walk reached {hooked!r}, not the live sink alone"

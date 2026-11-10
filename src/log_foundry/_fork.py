@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import types
+import weakref
 from typing import TYPE_CHECKING, Any, cast
 
 from log_foundry import _diag
@@ -256,6 +257,117 @@ def _is_container(value: object) -> bool:
       None.
     """
     return _container_base(value) is not None
+
+
+_CHILD_SINK_SLOTS: dict[tuple[str, str], dict[str, str]] = {
+    ("config", "Config"): {"sink": "one"},
+    ("worker", "Worker"): {"sink": "one"},
+    ("worker", "SwapOutcome"): {"previous": "one"},
+    ("sinks.multi", "MultiSink"): {"_sinks": "many"},
+    ("sinks.filtering", "FilteringSink"): {"_inner": "one"},
+    ("sinks.transform", "TransformSink"): {"_inner": "one"},
+    ("sinks._factory", "_FactorySink"): {"_inner": "one"},
+}
+"""Where a package class holds a sink it was handed, by ``(module, qualname)`` and slot name.
+
+**Ownership is recorded by position, not by shape** (SPEC-079). A value in one of these slots was
+handed to the library as a sink — ``require_sink`` admitted it, or a factory built it — so the
+walks record it the way ``stamp`` records the root, unconditionally, whatever a static read says
+it looks like. A ``weakref.proxy``, a ``super(Sub, inst)`` or a ``__getattr__`` proxy there reads
+as not sink-shaped, because no static read follows a C type's own forwarding, and recording by
+shape left it unrecorded: its wrapper then refused its close in the parent, and a forked child
+could claim it and close the parent's transport. ``one`` is a slot holding one sink, ``many`` a
+container of them. The shape test, ``_sink_shaped``, is kept only where position is unknown, in
+holders this package does not define. ``tests/test_child_sink_slots.py`` derives the slots from
+the source and fails on one missing here or named here and gone.
+"""
+
+_QUALNAME = type.__dict__["__qualname__"].__get__
+"""``type.__qualname__``, unbound, so a metaclass property of that name never runs."""
+
+_SUPER_SELF = super.__dict__["__self__"].__get__
+"""A ``super`` object's ``__self__``, read through ``super``'s own member, in C."""
+
+
+def _child_sink_slots(holder: object) -> dict[str, str]:
+    """Returns the child-sink slots a package holder declares, through its MRO, read statically.
+
+    Args:
+      holder: Any object the walk reached.
+
+    Returns:
+      Slot name to ``one`` or ``many``; empty for anything that declares none.
+
+    Raises:
+      None.
+    """
+    slots: dict[str, str] = {}
+    if _is_class(holder):
+        return slots
+    prefix = f"{_PACKAGE}."
+    for base in _MRO(type(holder)):
+        if not _defined_here(base):
+            continue
+        module = _NAMESPACE(base).get("__module__")
+        qualname = _QUALNAME(base)
+        if type(module) is not str or type(qualname) is not str:
+            continue
+        key = (module.removeprefix(prefix), qualname)
+        slots.update(_CHILD_SINK_SLOTS.get(key, {}))
+    return slots
+
+
+def _super_target(value: object) -> object | None:
+    """Returns the object a ``super`` value is bound to, read in C, or ``None`` for anything else.
+
+    A ``super(Sub, inst)`` configured as a sink forwards every member to ``inst``, so the walk
+    treats it as transparent and reaches ``inst`` through it: a ``FileSink`` behind it is then
+    repaired and re-acquired in a child like one configured directly (SPEC-079). The exact type is
+    compared by identity and ``__self__`` read through ``super``'s own member, so nothing of the
+    value runs. A ``weakref.proxy``'s referent cannot be reached without calling into it, so a
+    sink behind one is not repaired (``architecture.md`` §13).
+
+    Args:
+      value: Any object.
+
+    Returns:
+      The bound object, or ``None``.
+
+    Raises:
+      None.
+    """
+    if type(value) is not super:
+        return None
+    try:
+        target: object = _SUPER_SELF(value)
+    except Exception:
+        return None
+    return target
+
+
+_WEAK_PROXY_TYPE_IDS = frozenset({id(weakref.ProxyType), id(weakref.CallableProxyType)})
+"""The ids of the two ``weakref`` proxy types, compared by identity so nothing of a value runs."""
+
+
+def _is_weak_proxy(value: object) -> bool:
+    """Whether a value is exactly a ``weakref`` proxy, which no static read sees through.
+
+    The marking frontier, where position is unknown, records one as it records a sink-shaped
+    object (SPEC-079): ``isinstance`` followed a proxy's forwarded ``__class__`` and recorded it,
+    the static test cannot, and an unrecorded proxy a third-party holder kept was claimable by a
+    child that re-configured it. Recording runs nothing; over-recording a proxy that is no sink
+    only makes it unclaimable in that child.
+
+    Args:
+      value: Any object.
+
+    Returns:
+      Whether its exact type is ``weakref.ProxyType`` or ``weakref.CallableProxyType``.
+
+    Raises:
+      None.
+    """
+    return id(type(value)) in _WEAK_PROXY_TYPE_IDS
 
 
 def _sink_shaped(value: object) -> bool:
@@ -819,7 +931,8 @@ def _reacquire_transports(holders: list[Any]) -> list[Any]:
             _diag.absorbed(
                 "re-acquiring a transport after a fork",
                 exc,
-                f"{type(holder).__name__} may write the parent's pending bytes again, and this "
+                f"{_diag._STR_STR(_diag._STORED_NAME(type(holder)))} may write the parent's "
+                f"pending bytes again, and this "
                 f"child will not release it",
             )
     return reacquired

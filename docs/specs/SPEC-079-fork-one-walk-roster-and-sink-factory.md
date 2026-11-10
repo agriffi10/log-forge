@@ -267,12 +267,21 @@ subclass's; `_FORK_SKIP` and `reacquire_after_fork` through `sinks.base._static_
 container subclass is read both ways: its builtin storage and its namespace. The sink-shape test
 is `_fork._sink_shaped`, the static twin of `isinstance(x, Sink)`; it differs from `isinstance`
 for a class carrying `emit` and `close`, for a value whose `__class__` lies, and for a
-`weakref.proxy`, whose C attribute forwarding no static read follows. Recording a root runs
-none of its code, so `stamp` records the sink it was handed whether or not it reads as
-sink-shaped, and `_walk_after_fork` records the live delivery sinks that the runtime holds — the configured sink, the
-live and late worker's `sink`, and a factory wrapper's built sink — unconditionally. A
-`weakref.proxy`, a `super(Sub, inst)` or a `__getattr__` proxy configured as `sink=` is therefore
-recorded in the parent and stays the parent's in a child, which refuses its close.
+`weakref.proxy`, whose C attribute forwarding no static read follows.
+
+**Ownership is recorded by position where position is known, and by shape only where it is
+not.** Recording runs none of a value's code — an `id` and a reference — so a value the library
+was handed as a sink is recorded unconditionally, whatever a static read says it looks like: the
+root `stamp` is handed; a value in a package wrapper's child-sink slot, named in
+`_fork._CHILD_SINK_SLOTS` (`MultiSink._sinks`, `_inner` on `FilteringSink`, `TransformSink` and
+`_FactorySink`, `Worker.sink`, `Config.sink`, `SwapOutcome.previous`), on both frontiers; and the
+live delivery sinks the runtime holds (`_live_sinks`). `tests/test_child_sink_slots.py` derives
+the slots from the source and fails on one missing from the table. `_fork._sink_shaped` decides
+only inside holders this package does not define, where the marking frontier also records a
+value whose exact type is a `weakref` proxy. A `super(Sub, inst)` is transparent: its `__self__`
+is read in C and walked. A `weakref.proxy`, a `super(...)` or a `__getattr__` proxy configured as
+`sink=` or held by a package wrapper is therefore recorded in the parent, closed by the parent,
+and stays the parent's in a child, which refuses its close.
 
 **The roots** are the runtime's live delivery targets: the config's sink
 (`config._live_config().sink`), `_state._worker` and `_state._late_worker`. A worker is a
@@ -391,7 +400,8 @@ How the marking frontier reads and what it changes:
   then forks grows the record the same way, which `architecture.md` §13 records as a constraint
   and a separate session fixes.
 
-After both frontiers, each sink-shaped object that the walk recorded is written with
+After both frontiers, every object that the walk recorded — by position or, in a foreign
+holder, by shape — is written with
 `_owned.setdefault(id(sink), (_FOREIGN, sink))` under `_state._owned_lock`, as `_mark_inherited`
 writes it today. A sink the parent stamped keeps the parent's pid. An escaping exception sets
 `_marking_failed`, exactly as today.
@@ -445,7 +455,7 @@ first.
   `test_without_the_container_branch_the_multisink_child_blocks` and
   `test_without_the_reach_the_same_child_blocks` are re-derived as positive controls with
   `_MARKING_CEILING` patched in the parent, so the repair frontier is observed alone: the first
-  takes away the repair frontier's one-level container read on a `MultiSink(FileSink)`, at a
+  takes away the repair frontier's one-level container read, and the `MultiSink`'s positional slot read, on a `MultiSink(FileSink)`, at a
   ceiling of one with the `MultiSink` holding one child (the ceiling also bounds every container
   read); the second removes the counters registry read, at a ceiling of zero (at one the marking
   frontier visits the forwarded counters first and repairs them).
@@ -1245,3 +1255,13 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   is handed, and the walk records every live delivery sink, both unconditionally; the earlier
   sentence saying such a proxy was refused its close was false and is replaced. The same review
   made a class never offer `reacquire_after_fork`, and pinned three `sink_factory` behaviours.
+- Build, after the second diff review: a static shape predicate answering differently from
+  `isinstance` changed an ownership record for the third time, now for a `weakref.proxy` held as a
+  package wrapper's member (closed by nobody in the parent, claimable in a child). The mechanism
+  changed rather than one more position being patched: ownership is recorded by position wherever
+  position is known — the root, a package wrapper's child-sink slot from `_fork._CHILD_SINK_SLOTS`,
+  a live delivery sink — and by shape only inside foreign holders, where a `weakref` proxy is
+  recorded by its exact type. A slot roster and a differential corpus over every recording site
+  and degenerate shape hold it. `super(Sub, inst)` became transparent to the walk, so a sink behind
+  one is repaired; a sink behind a `weakref.proxy`, and a child's bare re-hand of an unrecorded
+  sink after a tripped ceiling, are recorded as constraints.

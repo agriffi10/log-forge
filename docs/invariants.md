@@ -539,7 +539,13 @@ the walk's repair frontier forwards to its marking frontier and is repaired and 
 repaired from a registry the walk reads rather than searches, whatever holds it, so an engine
 sink's counters no longer hang a child however they are held. A package object reachable only
 through a bound method, a closure cell or a `functools.partial` is neither repaired nor marked
-(`architecture.md` §13). A sink's closed guard
+(`architecture.md` §13). A sink handed to the library — the configured sink, a value in a package
+wrapper's child-sink slot, a live worker's sink — is recorded by position whatever it looks like,
+so a `weakref.proxy`, `super(Sub, inst)` or `__getattr__` proxy there is never claimed by a child;
+but a sink **behind a `weakref.proxy`** is not repaired, because its referent is reachable only by
+calling into the proxy, so a lock it holds at the fork stays held in the child (`architecture.md`
+§13). After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink owns
+it and closes it (§13, pre-existing). A sink's closed guard
 (SPEC-076) is on the walk at `self._guard`, so its locks and its event are replaced, and its state
 is adopted lazily by pid: the child counts no parent section inside, turns a `CLOSING` it
 inherited back to `OPEN`, since no parent closer runs there, and keeps `CLOSED`.

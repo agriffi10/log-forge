@@ -12,8 +12,14 @@ configured sink and calls the factory on its **first emit in each process**, on 
 emits, under a build lock, then stamps, hands the stop signal to and stores what it built. A
 forked child is given a new wrapper by `_lifecycle._adopt_factory_after_fork`, which calls no
 factory, does no I/O and waits on nothing, so the child's first emit builds the child's own sink,
-which the child owns and closes. The parent's wrapper and what it built stay inherited, owed and
-refused their close. A same-thread emit from inside the factory is refused rather than re-entering
+which the child owns and closes. The parent's wrapper stays inherited, owed and refused its
+close. What it built is inherited too and is refused its close, unless it re-acquires its
+transport in the child — a built `FileSink` does, so the child's record names the child and the
+sink reads releasable there — yet the child never closes even that one, because only the
+inherited wrapper reaches it and the child does not release that; its descriptor stays open for
+the child's life. A caller that wraps the installed wrapper itself in a wrapper of its own leaves
+the config without a factory, so a child inherits rather than adopts, builds its own sink on its
+first emit, and nothing closes it (`architecture.md` §13). A same-thread emit from inside the factory is refused rather than re-entering
 or deadlocking.
 
 **Lazy in every process is Andrew's decision of 2026-11-04**, taken with two costs stated. A

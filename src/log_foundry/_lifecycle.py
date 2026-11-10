@@ -1421,7 +1421,10 @@ def _reachable_sinks(root: object, *, after_fork: _fork._Repair | None = None) -
         if _fork._sink_shaped(holder):
             found.append(holder)
         if not _fork._is_owned(holder):
-            if after_fork is not None:
+            target = _fork._super_target(holder)
+            if target is not None:
+                stack.append(target)
+            elif after_fork is not None:
                 _forward_foreign(holder, after_fork)
             continue
         if after_fork is None:
@@ -1432,6 +1435,9 @@ def _reachable_sinks(root: object, *, after_fork: _fork._Repair | None = None) -
                 after_fork.hooked.append(holder)
             if _fork._is_container(holder):
                 _push_members(holder, stack)
+        positional = _positional_sinks(holder, items)
+        found.extend(positional)
+        stack.extend(positional)
         for _name, value in items:
             if _is_candidate(value):
                 stack.append(value)
@@ -1442,6 +1448,37 @@ def _reachable_sinks(root: object, *, after_fork: _fork._Repair | None = None) -
             elif after_fork is not None and _may_be_a_sink(value):
                 after_fork.forwarded.append(value)
     return found
+
+
+def _positional_sinks(holder: object, items: list[tuple[str, object]]) -> list[object]:
+    """Returns the sinks a package holder holds in its declared child-sink slots, by position.
+
+    Read from ``_fork._CHILD_SINK_SLOTS``: a value in such a slot was handed to the library as a
+    sink, so it is recorded unconditionally, as ``stamp`` records its root, and pushed so its own
+    graph is walked (SPEC-079). Nothing of the value runs: a ``one`` slot contributes its value, a
+    ``many`` slot the members of its container, read through ``_bounded_children``.
+
+    Args:
+      holder: A package-owned object the walk entered.
+      items: Its namespace pairs, as the walk read them.
+
+    Returns:
+      The sinks in its declared slots, ``None`` dropped.
+
+    Raises:
+      None.
+    """
+    slots = _fork._child_sink_slots(holder)
+    if not slots:
+        return []
+    sinks: list[object] = []
+    for name, value in items:
+        kind = slots.get(name)
+        if kind == "one":
+            sinks.append(value)
+        elif kind == "many":
+            sinks.extend(_bounded_children(value))
+    return [sink for sink in sinks if sink is not None]
 
 
 def _push_members(container: object, stack: list[object]) -> None:
@@ -1500,6 +1537,9 @@ def _holder_members(holder: object) -> list[object]:
     Raises:
       None.
     """
+    target = _fork._super_target(holder)
+    if target is not None:
+        return [target]
     skip = _fork._skipped_names(holder)
     members = [
         value
@@ -1685,7 +1725,7 @@ def _mark_frontier(
         if not _may_be_a_sink(holder):
             queue.extend(member for member in _bounded_children(holder) if _worth_visiting(member))
             continue
-        if _fork._sink_shaped(holder):
+        if _fork._sink_shaped(holder) or _fork._is_weak_proxy(holder):
             found.append(holder)
         if not _fork._is_owned(holder):
             queue.extend(_holder_members(holder))
@@ -1694,7 +1734,11 @@ def _mark_frontier(
             queue.extend(member for member in _bounded_children(holder) if _worth_visiting(member))
         if hook and _fork._offers_reacquire(holder):
             repair.hooked.append(holder)
-        queue.extend(value for _name, value in repair.repair(holder) if _worth_visiting(value))
+        items = repair.repair(holder)
+        positional = _positional_sinks(holder, items)
+        found.extend(positional)
+        queue.extend(positional)
+        queue.extend(value for _name, value in items if _worth_visiting(value))
     return visits
 
 
@@ -1788,8 +1832,8 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
                 "object",
                 len(queue),
                 f"the walk marking a forked child's inherited sinks passed "
-                f"{_MARKING_CEILING} objects and stopped; this child will refuse to close "
-                f"any sink it has no record of",
+                f"{_MARKING_CEILING} objects and stopped; this child will not close an "
+                f"inherited sink it has no record of unless it configures that sink itself",
             )
         with _state._owned_lock:
             for inherited in found:
@@ -1799,7 +1843,8 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
         _diag.absorbed(
             "marking the sinks a forked child inherited",
             exc,
-            "this child will refuse to close any sink it has no record of",
+            "this child will not close an inherited sink it has no record of unless it "
+            "configures that sink itself",
         )
 
 

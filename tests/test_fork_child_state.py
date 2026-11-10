@@ -354,21 +354,100 @@ def test_a_child_does_not_call_a_hook_on_a_class_a_wrapper_holds(tmp_path: pathl
 def test_a_child_records_a_live_proxy_sink_the_parent_never_stamped() -> None:
     """The child's walk records every live delivery sink itself, whatever the parent's record says.
 
-    A worker installed directly on a ``weakref.proxy`` never passed through ``stamp``, so only the
-    walk's unconditional record of the worker's sink keeps the child from closing it.
+    A ``weakref.proxy`` bound into the config without ``stamp`` was never recorded by the parent,
+    and as a root the walk's static shape test does not record it; only ``_live_sinks``'
+    unconditional record of the configured sink keeps the child from claiming it.
     """
-    from conftest import install_worker
-    from log_foundry.worker import Worker
+    from log_foundry import config
 
     configured, target = _proxied("weakref-proxy")
-    install_worker(Worker(configured, batch_size=1, flush_interval=0.01))
+    config._rebind(sink=configured)
     with _lifecycle._state._owned_lock:
         assert id(configured) not in _lifecycle._state._owned, "the precondition: never stamped"
 
     def in_child() -> str:
-        releasable = _lifecycle.releasable(configured)
-        log_foundry.shutdown(3.0)
-        return f"releasable={releasable} closes={target.closes}"
+        record = _lifecycle._state._owned.get(id(configured), (None,))[0]
+        return f"record={record} releasable={_lifecycle.releasable(configured)}"
 
     child = run_in_child(in_child)
-    assert child.output == "releasable=False closes=0", child.output
+    assert child.output == f"record={_lifecycle._FOREIGN} releasable=False", child.output
+    assert target.closes == 0
+
+
+def test_a_file_sink_behind_super_is_repaired_in_the_child(tmp_path: pathlib.Path) -> None:
+    """A ``super(Sub, fs)`` configured as the sink is transparent to the walk (SPEC-079).
+
+    ``__self__`` is read through ``super``'s own member, in C, so the ``FileSink`` behind it is
+    repaired and re-acquired in a child like one configured directly, and the child's first emit
+    returns while a parent thread holds its lock. A ``weakref.proxy``'s referent cannot be reached
+    without calling into it; that residual is recorded in ``architecture.md`` §13.
+    """
+
+    class _SubFile(FileSink):
+        pass
+
+    inner = _SubFile(str(tmp_path / "super.ndjson"))
+    _KEEP.append(inner)
+    log_foundry.configure(service="super", sink=super(_SubFile, inner))
+    released, holder = _held_by_a_parent_thread(inner._lock)
+
+    def in_child() -> str:
+        log_foundry.info("child")
+        record = _lifecycle._state._owned.get(id(inner), (None,))[0]
+        return f"returned record={'child' if record == os.getpid() else record}"
+
+    try:
+        child = run_in_child(in_child, timeout=5)
+    finally:
+        released.set()
+        holder.join(5.0)
+    assert child.output == "returned record=child", f"{child.ending}: {child.output!r}"
+
+
+class _NameRaises(type):
+    """A metaclass whose ``__name__`` raises, as a hostile sink class's may."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("name")
+
+
+def test_a_failing_hook_on_a_class_whose_name_raises_still_runs_the_handlers(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The hook-failure diagnostic names the type by its stored name, so it cannot escape.
+
+    ``type(holder).__name__`` ran a metaclass property; raising there escaped the at-fork handler,
+    so no handler ran and the child had no drain thread.
+    """
+    import io
+    import sys
+
+    parent = os.getpid()
+
+    class _HookRaises(FileSink, metaclass=_NameRaises):
+        def reacquire_after_fork(self) -> None:
+            if os.getpid() != parent:
+                raise OSError("cannot reopen")
+            super().reacquire_after_fork()
+
+    log_foundry.configure(service="hook", sink=_HookRaises(str(tmp_path / "h.log")))
+    _traced()
+    log_foundry.flush(timeout=5.0)
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+
+    def in_child() -> str:
+        worker = _lifecycle._state.worker_exists()
+        thread = None if worker is None else worker._thread
+        return f"drain={bool(thread and thread.is_alive())}|{buffer.getvalue()}"
+
+    try:
+        child = run_in_child(in_child)
+    finally:
+        sys.stderr = saved
+    drain, _, stderr = child.output.partition("|")
+    assert drain == "drain=True", child.output
+    assert "re-acquiring a transport after a fork (OSError)" in stderr, stderr
+    assert "_HookRaises" in stderr, stderr

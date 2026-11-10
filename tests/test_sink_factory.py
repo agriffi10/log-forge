@@ -719,3 +719,33 @@ def test_a_factory_child_owns_its_wrapper_when_the_marking_failed(
     the child built, the child's to close.
     """
     assert _child_of_a_traced_factory(monkeypatch, ceiling=0).endswith("closed=1")
+
+
+def test_a_build_mark_inherited_across_a_fork_does_not_refuse_the_childs_thread() -> None:
+    """The re-entry mark is keyed by process and thread, so an inherited mark matches no child thread.
+
+    The fork is taken from inside the factory, on the parent's main thread, so the child inherits
+    the wrapper mid-build: its build lock held (the walk replaces it) and its re-entry mark naming
+    the thread that called ``fork``, which is the child's own main thread. The caller wrapped the
+    factory's sink itself, so the config carries no factory and the child keeps the inherited
+    wrapper rather than adopting a new one. Keyed on the thread ident alone, every emit in that
+    child was refused as a re-entry, forever.
+    """
+    outcome: list[str] = []
+
+    def factory() -> RecordingSink:
+        if not outcome:
+            outcome.append("forking")
+            child = run_in_child(
+                lambda: (log_foundry.info("child"), f"lost={log_foundry.health().orphan_lost}")[1]
+            )
+            outcome.append(child.output)
+        return RecordingSink()
+
+    log_foundry.configure(service="factory", sink_factory=factory)
+    inherited = log_foundry.get_config().sink
+    assert inherited is not None
+    log_foundry.configure(sink=FilteringSink(inherited))
+    assert log_foundry.get_config().sink_factory is None
+    log_foundry.info("parent")
+    assert outcome == ["forking", "lost=0"], outcome

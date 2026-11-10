@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import TYPE_CHECKING
 
@@ -41,7 +42,10 @@ class _FactorySink:
     trust. A ``BaseException`` from the factory propagates unchanged (SPEC-025).
 
     **An emit from inside the factory**, on the same thread, raises ``SinkDeliveryError`` at once
-    rather than calling the factory again or waiting on the lock its own thread holds.
+    rather than calling the factory again or waiting on the lock its own thread holds. The thread
+    is keyed by process and thread ident, because a wrapper a forked child inherited mid-build
+    carries the parent's mark, and a child thread reusing that ident would otherwise be refused
+    forever.
 
     It takes **no** transport lock (SPEC-028 FR-002): it holds no transport of its own, and the
     built sink serialises its own delivery. It **adds no post-close guard** (SPEC-032 FR-003):
@@ -75,7 +79,7 @@ class _FactorySink:
         self._factory = factory
         self._build_lock = threading.Lock()
         self._inner: Sink | None = None
-        self._building: int | None = None
+        self._building: tuple[int, int] | None = None
         self._failures = 0
         vars(self)["log_foundry_stop_signal"] = None
 
@@ -110,7 +114,7 @@ class _FactorySink:
           SinkDeliveryError: When this thread is already inside the factory, or the factory
             raises ``Exception`` or returns something that is not a ``Sink``.
         """
-        me = threading.get_ident()
+        me = (os.getpid(), threading.get_ident())
         if self._building == me:
             raise SinkDeliveryError("sink_factory emitted from inside itself; the event is lost")
         with self._build_lock:
