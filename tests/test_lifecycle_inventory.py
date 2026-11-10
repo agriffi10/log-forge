@@ -962,7 +962,11 @@ INVENTORY: dict[Key, Row] = {
     ),
     _rt("_swaps_running"): Row("Runtime", TOKEN_SETS_CHILD, "swap tokens, observer-only"),
     _rt("_stops_running"): Row("Runtime", TOKEN_SETS_CHILD, "stop tokens, observer-only"),
-    _wk("sink"): Row("Worker", _INH, "the delivering sink; no Runtime.sink is added"),
+    _wk("sink"): Row(
+        "Worker",
+        ("inherited", "reset: _lifecycle._adopt_factory_after_fork"),
+        "the delivering sink; a factory child points it at its own (SPEC-079 FR-006)",
+    ),
     _wk("batch_size"): Row("Worker", _INH, "a tunable, set once"),
     _wk("flush_interval"): Row("Worker", _INH, "a tunable, set once"),
     _wk("max_retries"): Row("Worker", _INH, "a tunable, set once"),

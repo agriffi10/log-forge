@@ -7,6 +7,7 @@ import threading
 from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _lifecycle
+from log_foundry._sink_arg import require_sink
 from log_foundry.sanitize import _coerce_unbounded
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import ReadOnlyCount, ReadOnlySeconds, require_callable
@@ -189,9 +190,11 @@ class TransformSink:
           None.
 
         Raises:
-          TypeError: If ``fn`` is not callable, refused here rather than raised out of every
-            ``emit`` (SPEC-071 FR-005).
+          TypeError: If ``inner`` is an unpatchable builtin value that can never be a sink
+            (``_sink_arg.require_sink``, SPEC-079 FR-005), or ``fn`` is not callable, each
+            refused here rather than raised out of every ``emit`` (SPEC-071 FR-005).
         """
+        require_sink(inner, "TransformSink inner")
         require_callable(fn, "fn", type(self).__name__, optional=False)
         self._inner = inner
         vars(self)["log_foundry_stop_signal"] = None

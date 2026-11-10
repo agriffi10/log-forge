@@ -709,11 +709,17 @@ parameter's stored type name. The build adds exactly those two to that guard's p
 
 - `tests/test_public_surface.py` pins `[f.name for f in fields(Config)][-1] == "sink_factory"`, pins
   `sink_factory` as the last keyword-only parameter of `configure` with default `None`, and keeps
-  every existing pin unedited. `len(log_foundry.__all__)` is unchanged.
+  every existing pin unedited but one. `len(log_foundry.__all__)` is unchanged. The one is
+  `test_configure_and_config_gain_nothing`, whose promise was another spec's "nothing added": it
+  pinned the whole parameter list, so appending `sink_factory` reddens it by design, and it now
+  pins the nine names unchanged and in order and the list as exactly those nine plus
+  `sink_factory`.
 - `tests/typed_consumer/accepts.py` gains `configure(sink_factory=lambda: MemorySink())`,
   `Config(sink_factory=None)` and a read of `get_config().sink_factory`.
-- `tests/typed_consumer/rejects.py` gains `configure(sink_factory=3)` and
-  `configure(sink_factory=lambda x: MemorySink())`, each with its `want:` line.
+- `tests/typed_consumer/rejects.py` gains `configure(sink_factory=3)` and a one-argument factory,
+  each with its `want:` line. The one-argument factory is a `def`, not `lambda x: MemorySink()`:
+  an unannotated lambda adds mypy's own "Cannot infer type of lambda" beside the planted error,
+  and that corpus counts one error per planted line.
 - `tests/test_config.py` gains each refusal above, and a test that a refused call leaves
   `get_config()` and the ownership record unchanged.
 
@@ -759,11 +765,14 @@ refused by one helper, so they cannot drift apart. A sink that is accepted but n
   `weakref.ProxyType` and `super` are not members.
 - [ ] During `configure()` and the three wrapper constructors, no `__getattr__`, `__getattribute__`,
   `__class__` getter, metaclass `__name__` or metaclass `__eq__` of the value runs, each counted by
-  a probe.
+  a probe. `configure(sink=h)` is probed with no logging started and on the swap path; on the swap
+  path the one exception is the stop-signal offer, `_lifecycle.offer_stop_signal`, which reads
+  `log_foundry_stop_signal` by name and is delivery machinery, excepted by that name.
 - [ ] `tests/test_type_door_roster.py`'s pinned door set gains exactly `_sink_arg.require_sink` and
   `config._require_factory`.
 - [ ] `tests/test_public_surface.py` and `tests/typed_consumer/` pass with the additions above, and
-  every pin that existed at the build's base passes unedited.
+  every pin that existed at the build's base passes unedited, except
+  `test_configure_and_config_gain_nothing` as re-expressed above.
 - [ ] Invariants 10, 13 and 6: the surface only grows, every refusal above is raised at the
   `configure()` call that supplied the argument, naming it, and `sink=` and `sink_factory=`, and the
   worker and no-worker paths, behave alike.
@@ -773,17 +782,18 @@ refused by one helper, so they cannot drift apart. A sink that is accepted but n
 #### Description:
 
 `_FactorySink` is a private wrapper sink in `src/log_foundry/sinks/_factory.py`. It holds the
-factory, a `_lock`, and at most one built sink, `_inner`, which starts as `None`. Its
+factory, a `_build_lock`, and at most one built sink, `_inner`, which starts as `None`. Its
 `__init__` assigns those fields and nothing else.
 
 **When the factory runs.** It runs on the first `emit` in each process. That is on whichever thread
 emits: the drain thread for span events and the caller's thread on the orphan path. So inside a
 span the caller's thread still carries no sink construction (invariant 4).
 
-- The first emit takes `_lock`, calls the factory once, checks the result, calls `stamp` on it
+- The first emit takes `_build_lock`, calls the factory once, checks the result, calls `stamp` on it
   (so the process that built it owns it), forwards the stop signal it was offered, and stores it.
   Later emits read `_inner` without the lock and call `_inner.emit(batch)`.
-- Concurrent first emits wait on `_lock` and call the factory once between them.
+- Concurrent first emits wait on `_build_lock` and call the factory once between them. It is a
+  build lock, not a transport lock: held across the one factory call, never across a delivery.
 - An emit made **from inside the factory**, on the same thread, raises `SinkDeliveryError` at once
   rather than calling the factory again, and does not deadlock. On the orphan path that one event
   is counted in `orphan_lost` and announced.
@@ -826,7 +836,8 @@ instead: the failure is counted, announced and retried, and it never reaches the
 
 **What it forwards.**
 
-- `flush()` calls `flush_sink(_inner)` when a sink has been built and returns `True` otherwise.
+- `flush()` calls `flush_sink(_inner)` when a sink has been built and does nothing otherwise,
+  returning `None` as every shipped wrapper's `flush` does.
 - `losses()` returns `read_losses(_inner)` when a sink has been built and `SinkLosses()`
   otherwise. It counts nothing of its own.
 - `close()` calls `_lifecycle.release(_inner, owner=self)` when a sink has been built, as the five
@@ -966,10 +977,10 @@ class Config:
 // src/log_foundry/sinks/_factory.py
 class _FactorySink:                        # private; a Sink
     _factory: Callable[[], Sink]
-    _lock: threading.Lock                  # held across the one factory call
+    _build_lock: threading.Lock            # held across the one factory call; not a transport lock
     _inner: Sink | None                    # at most one per instance; set once
     _building: int | None                  # thread ident inside the factory call, else None
-    _stop_signal: threading.Event | None   # forwarded to _inner once built
+    log_foundry_stop_signal = ForwardedStopSignal()  # stored in __dict__, forwarded once built
     _failures: int                         # build failures, for the throttled line
 ```
 
@@ -1214,3 +1225,12 @@ carry `sink_factory=` under *New* and the third-party-wrapper repair under *Fixe
   arm left a live worker's sink unowed (a re-acquired `FileSink` then never closed by the child).
   `_clear_after_fork` re-settles both, which makes it a fifth `_move` site, and the lifecycle-state
   decision's fence is rewritten to name it (A2).
+- Build: one public-surface pin is edited. `test_configure_and_config_gain_nothing` pinned the
+  whole parameter list, so appending `sink_factory` reddens it by design; it now pins the prefix
+  and the one appended name (A8).
+- Build: FR-005's no-hook criterion keeps the swap path and excepts the stop-signal offer by name,
+  since that offer is delivery machinery (A9 as revised by the plan review).
+- Build: `_FactorySink`'s lock is `_build_lock`, a build lock rather than a transport lock, so the
+  sink-concurrency lints read it as what it is; its stop signal is stored through
+  `ForwardedStopSignal`, as `FilteringSink`'s is; its `flush` returns `None` as every shipped
+  wrapper's does; and the typed consumer's one-argument factory is a `def` (A12).

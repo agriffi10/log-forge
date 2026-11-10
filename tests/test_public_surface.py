@@ -2570,13 +2570,29 @@ def test_emit_via_deliver_forwards_sink_batch_and_deliver_to_the_engine(monkeypa
 
 
 def test_configure_and_config_gain_nothing() -> None:
-    """FR-001 AC8: no ``configure()`` parameter and no ``Config`` field, as at ``39a3f08c``."""
+    """FR-001 AC8: no ``configure()`` parameter and no ``Config`` field, as at ``39a3f08c``.
+
+    Re-expressed at SPEC-079 (its amendment A8), whose ``sink_factory`` is the one appended name:
+    the promise kept is that the nine names are unchanged and in order, and that the list is
+    exactly those nine plus ``sink_factory``, so anything else added still reddens here.
+    """
     names = [
         "service", "version", "env", "sink", "defaults", "max_value_bytes", "max_stack_bytes",
         "max_keys", "max_depth",
     ]
-    assert list(inspect.signature(log_foundry.configure).parameters) == names
-    assert [f.name for f in dataclasses.fields(log_foundry.Config)] == names
+    assert list(inspect.signature(log_foundry.configure).parameters) == [*names, "sink_factory"]
+    assert [f.name for f in dataclasses.fields(log_foundry.Config)] == [*names, "sink_factory"]
+
+
+def test_sink_factory_is_appended_last_with_default_none() -> None:
+    """SPEC-079 FR-005: the last ``Config`` field and the last keyword-only ``configure`` parameter."""
+    assert [f.name for f in dataclasses.fields(log_foundry.Config)][-1] == "sink_factory"
+    assert log_foundry.Config().sink_factory is None
+    last = list(inspect.signature(log_foundry.configure).parameters.values())[-1]
+    assert last.name == "sink_factory"
+    assert last.kind is inspect.Parameter.KEYWORD_ONLY
+    assert last.default is None
+    assert "sink_factory" not in log_foundry.__all__
 
 
 # --- SPEC-074 FR-006: what each engine sink adds to its surface ---------------------------------

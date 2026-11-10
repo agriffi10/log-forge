@@ -191,6 +191,20 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "order to prove there is nothing to drain."
         ),
     ),
+    ("_adopt_factory_after_fork", "_state.worker_exists()", 0): (
+        EXISTENCE,
+        (
+            "whether a worker is there to point at the child's own factory sink (SPEC-079 "
+            "FR-006). Existence, not liveness: a retired child's worker still names a sink, and "
+            "the child's sink must replace the inherited one wherever the inherited one is named."
+        ),
+    ),
+    ("_adopt_factory_after_fork", "worker is not None", 0): (
+        EXISTENCE,
+        (
+            "the guard on the result of the call above: the same existence question, asked once."
+        ),
+    ),
     ("_clear_after_fork", "_state.live_worker()", 0): (
         LIVENESS,
         (

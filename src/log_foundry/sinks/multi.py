@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from log_foundry import _diag, _lifecycle
+from log_foundry._sink_arg import require_sink
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks.base import SinkLosses, flush_sink, read_losses
 
@@ -56,8 +57,12 @@ class MultiSink:
           None.
 
         Raises:
-          None.
+          TypeError: If a child is an unpatchable builtin value that can never be a sink, named
+            ``MultiSink sinks[i]`` (``_sink_arg.require_sink``, SPEC-079 FR-005), before anything
+            is stored.
         """
+        for index, child in enumerate(sinks):
+            require_sink(child, f"MultiSink sinks[{index}]")
         self._sinks = sinks
         self.failed = 0
         self._absorbed = 0

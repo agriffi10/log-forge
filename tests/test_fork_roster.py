@@ -87,6 +87,7 @@ _PRIMITIVE_HOMES = {
     "TransformSink": "walk",
     "SinkCounters": "walk",
     "Worker": "walk",
+    "_FactorySink": "walk",
     "_Close": "dropped: _lifecycle._clear_after_fork",
     "_FlushMarker": "dropped: _lifecycle._rebuild_worker_after_fork",
 }

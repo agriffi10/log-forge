@@ -193,6 +193,15 @@ def _sentry_wrapping(inner: object) -> object:
     return wrapper
 
 
+def _factory_wrapping(inner: object) -> object:
+    """Builds a `_FactorySink` whose factory returns the given sink, built by one empty emit."""
+    from log_foundry.sinks._factory import _FactorySink
+
+    wrapper = _FactorySink(lambda: inner)  # type: ignore[arg-type,return-value]
+    wrapper.emit([])
+    return wrapper
+
+
 @pytest.mark.parametrize(
     "build",
     [
@@ -201,10 +210,11 @@ def _sentry_wrapping(inner: object) -> object:
         pytest.param(lambda inner: TransformSink(inner, lambda event: event), id="TransformSink"),
         pytest.param(_logstash_wrapping, id="LogstashSink"),
         pytest.param(_sentry_wrapping, id="SentrySink"),
+        pytest.param(_factory_wrapping, id="_FactorySink"),
     ],
 )
 def test_every_wrapper_forwards_its_own_identity_as_the_owner(build: object) -> None:
-    """FR-001 AC-6 is decided by `owner=`, and it is hand-written at five sites.
+    """FR-001 AC-6 is decided by `owner=`, and it is hand-written at six sites (SPEC-079's sixth).
 
     Four of the five were caught being tested by nothing: dropping `owner=self` from
     `FilteringSink`, `TransformSink`, `LogstashSink` or `SentrySink` survived the entire suite.

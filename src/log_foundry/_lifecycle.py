@@ -2276,6 +2276,51 @@ def _note_orphan_emit(sink: Sink) -> None:
         _state._move()
 
 
+def _adopt_factory_after_fork() -> None:
+    """Gives a forked child a sink factory wrapper of its own, so it builds its own sink.
+
+    Registered after :func:`_clear_after_fork` and before :func:`_rebuild_worker_after_fork`
+    (SPEC-079 FR-006). When the inherited config carries a ``sink_factory``, it builds a new
+    ``_FactorySink`` for it — which calls no factory — stamps it for this child, rebinds the
+    child's config to it, and when a worker exists points the worker at it and arms it in the owed
+    record, under ``_state._lock``, which the roster replaced. The worker rebuild that follows
+    offers it the child's stop signal. The child's first emit then builds the child's own sink,
+    which the child owns and closes; the parent's wrapper and whatever it built stay inherited,
+    owed, refused their close and sent nothing.
+
+    It calls no factory, does no I/O and waits on nothing, so it cannot delay ``fork``. With a
+    worker present the stored state follows the worker, so the arm changes no state and no
+    ``_move`` is needed; without one, nothing is armed until the child's first orphan emit. The
+    wrapper class is read from ``sys.modules``: it is loaded whenever a factory was configured,
+    and a child must not import.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None. A failure is absorbed by ``_fork`` like any handler's.
+    """
+    from log_foundry import config
+
+    factory = config._live_config().sink_factory
+    if factory is None:
+        return
+    module = sys.modules.get(f"{_fork._PACKAGE}.sinks._factory")
+    if module is None or not _fork._is_module(module):
+        return
+    adopted = _fork._MODULE_DICT(module)["_FactorySink"](factory)
+    stamp(adopted)
+    config._rebind(sink=adopted)
+    worker = _state.worker_exists()
+    if worker is not None:
+        with _state._lock:
+            worker.sink = adopted
+            _state._closes.arm(adopted)
+
+
 def _rebuild_worker_after_fork() -> None:
     """Gives a forked child a drain thread of its own, or a retired worker (SPEC-039 FR-002).
 
@@ -3152,4 +3197,5 @@ def _worker_health() -> Health:
 _fork.register_walk(_walk_after_fork)
 _fork.register_child_handler(_reclaim_after_fork)
 _fork.register_child_handler(_clear_after_fork)
+_fork.register_child_handler(_adopt_factory_after_fork)
 _fork.register_child_handler(_rebuild_worker_after_fork)

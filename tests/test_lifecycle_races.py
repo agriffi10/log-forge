@@ -842,6 +842,11 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
         ),
         ("_note_orphan_emit", "arm", 0): "armed — the emit that landed owns the close",
+        ("_adopt_factory_after_fork", "arm", 0): (
+            "armed — a child given its own `_FactorySink` points the worker at it, and a worker "
+            "delivering to a sink owes it a close, which is the worker path's rule; the parent's "
+            "wrapper stays owed as inherited and is refused its close (SPEC-079 FR-006)"
+        ),
         ("_clear_after_fork", "arm", 0): (
             "armed — a child forked inside `_get_worker`'s section, between `_worker =` and the "
             "arm, has a live worker whose sink is unowed; the child re-arms it so its own "
