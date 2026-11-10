@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-078
 title: "The Owed-Close Registry and Checked Lifecycle Transitions"
 description: "Puts every owed and in-flight sink close in one registry that spends the closer grace once per shutdown, and makes the stored lifecycle State the authority: every lifecycle call checks it under the runtime's lock and has a defined answer in every state."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-045, SPEC-046, SPEC-050, SPEC-054, SPEC-062, SPEC-066, SPEC-068, SPEC-077]
 arc: stability-redesign
 arc_order: 10
