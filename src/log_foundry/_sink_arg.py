@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import weakref
 from itertools import islice
 
 from log_foundry import _diag, _fork
-from log_foundry.sinks.base import _instance_dict
+from log_foundry.sinks.base import _MRO, _NAMESPACE, _instance_dict
 
 _UNPATCHABLE: tuple[type, ...] = (
     object,
@@ -41,12 +42,24 @@ _LOOP_CEILING = 10_000
 
 A walk that gives up **accepts** the graph unexamined, which is the behaviour before the loop
 refusal existed, so the bound trades a missed loop in a graph of more than ten thousand sinks for a
-construction that never stalls. Ten thousand is far above any fan-out written by hand and still a
-few milliseconds of static reads, so the headroom is deliberate in both directions.
+construction that never stalls. Ten thousand is far above any fan-out written by hand, and a walk
+that reaches it was measured at about 27 ms at ``7ecfbad1``, so the headroom is deliberate in both
+directions. Each wrapper constructor walks its own subgraph, so building a chain one wrapper at a
+time costs quadratically in its depth; a chain deep enough for that to matter already hits
+``RecursionError`` on its first ``emit``.
 """
 
 _END = object()
 """The sentinel ``next`` returns when a node's forwarded sinks are exhausted."""
+
+_THIS_CLASS = super.__dict__["__thisclass__"].__get__
+"""A ``super`` object's ``__thisclass__``, read through ``super``'s own member, in C."""
+
+_SELF_CLASS = super.__dict__["__self_class__"].__get__
+"""A ``super`` object's ``__self_class__``, whose MRO its lookups search, read in C."""
+
+_PROXY_TYPES: tuple[type, ...] = (weakref.ProxyType, weakref.CallableProxyType)
+"""The exact types of a ``weakref.proxy``, which forwards every call to its referent."""
 
 
 def unpatchable(value: object) -> bool:
@@ -72,9 +85,9 @@ def unpatchable(value: object) -> bool:
 def _forwards_to(node: object) -> list[object]:
     """Returns the sinks a node forwards every call to, read statically: its slots, or a target.
 
-    Only two kinds of node forward: a ``super`` object, which forwards every member to the object
-    it is bound to, and a package wrapper, which forwards ``emit``, ``flush``, ``close`` and
-    ``losses`` to the sinks in its ``_fork._CHILD_SINK_SLOTS`` positions. Anything else forwards
+    Only two kinds of node forward: a ``super`` object whose ``emit`` resolves to a package
+    wrapper's (:func:`_super_forwarded`), and a package wrapper, which forwards ``emit``,
+    ``flush``, ``close`` and ``losses`` to the sinks in its ``_fork._CHILD_SINK_SLOTS`` positions. Anything else forwards
     nothing **as far as this walk knows**: a third-party sink holding another sink in an
     attribute may only keep a back-reference it never calls, so following its attributes would
     refuse graphs that work. The slot values are read from the instance ``__dict__`` through
@@ -93,9 +106,9 @@ def _forwards_to(node: object) -> list[object]:
       None. A node that cannot be read is announced and contributes nothing, so the walk accepts
         what lies beneath it, which is the behaviour before the loop refusal existed.
     """
-    target = _fork._super_target(node)
-    if target is not None:
-        return [target]
+    if type(node) is super:
+        target = _super_forwarded(node)
+        return [] if target is None else [target]
     slots = _fork._child_sink_slots(node)
     if not slots:
         return []
@@ -121,6 +134,73 @@ def _forwards_to(node: object) -> list[object]:
         return []
 
 
+def _super_forwarded(node: object) -> object | None:
+    """Returns the object a ``super`` node forwards into the package wrapper graph of, or ``None``.
+
+    ``super(T, inst)`` searches ``inst``'s MRO **after** ``T``, so it forwards back into
+    ``inst``'s wrapped sinks only when the first class after ``T`` that defines ``emit`` is a
+    package wrapper with forwarding positions. A cooperative mixin — ``class Both(MultiSink,
+    Recorder)`` handing ``super(MultiSink, self)`` as a child — resolves to ``Recorder.emit``,
+    the caller's own code, and delivers; following every ``super`` to its bound object refused it.
+    ``__thisclass__`` and ``__self_class__`` are read through ``super``'s own members, the MRO
+    through ``sinks.base._MRO`` and each namespace through ``_NAMESPACE``, compared by identity,
+    so nothing of the node or its classes runs.
+
+    Args:
+      node: An object whose exact type is ``super``.
+
+    Returns:
+      Its bound object when the call it forwards lands in a package wrapper, else ``None``.
+
+    Raises:
+      None. A node whose classes cannot be read is announced and forwards nothing as far as the
+        walk knows, which is the behaviour before the loop refusal existed.
+    """
+    target = _fork._super_target(node)
+    if target is None:
+        return None
+    try:
+        this = _THIS_CLASS(node)
+        after = False
+        for cls in _MRO(_SELF_CLASS(node)):
+            if cls is this:
+                after = True
+            elif after and _NAMESPACE(cls).get("emit") is not None:
+                return target if _fork._declared_slots(cls) else None
+    except Exception as exc:
+        _diag.absorbed(
+            "reading a super object's classes for a sink loop",
+            exc,
+            "the sinks beneath it are not checked for one",
+        )
+    return None
+
+
+def _proxied_on_path(child: object, path: list[object]) -> object | None:
+    """Returns the node on the current path a ``weakref.proxy`` child refers to, or ``None``.
+
+    A proxy forwards every call to its referent, but the referent cannot be read from the proxy
+    without calling into it. The other direction is static: ``weakref.getweakrefs`` lists, in C,
+    the weak references and proxies to an object, so a proxy to a node on the path is found by
+    identity among that node's. A proxy to a node **off** the path is not followed, so a loop
+    that only closes beneath one is not found (``architecture.md`` §13).
+
+    Args:
+      child: A value whose exact type is a ``weakref`` proxy type.
+      path: The nodes on the walk's current path, the ``back_to`` owner first when there is one.
+
+    Returns:
+      The node it refers to, or ``None``.
+
+    Raises:
+      None.
+    """
+    for node in path:
+        if any(ref is child for ref in weakref.getweakrefs(node)):
+            return node
+    return None
+
+
 def loop_in(root: object, *, back_to: object | None = None) -> object | None:
     """Returns a forwarding node the graph from ``root`` reaches again, or ``None`` when none does.
 
@@ -133,10 +213,12 @@ def loop_in(root: object, *, back_to: object | None = None) -> object | None:
     wrapper under construction asks whether its new children reach it before it stores them.
 
     The walk is static (:func:`_forwards_to`), bounded by :data:`_LOOP_CEILING` visits, and
-    follows only package forwarding positions. So four loops are **not** found, and are recorded
-    in ``architecture.md`` §13: one that runs through a third-party sink's own code, one closed
-    through a ``weakref.proxy`` (whose referent no static read reaches), one formed by mutating a
-    slot after the last check ran, and one deeper than the ceiling.
+    follows only package forwarding positions, a ``super`` that resolves into one, and a
+    ``weakref.proxy`` back to a node on the path (:func:`_proxied_on_path`). So four loops are
+    **not** found, and are recorded in ``architecture.md`` §13: one that runs through a
+    third-party sink's own code, one that closes only beneath a ``weakref.proxy`` to a node off
+    the path, one formed after the last check ran — a slot assigned later, or two factory
+    wrappers each building around the other at once — and one deeper than the ceiling.
 
     Args:
       root: The sink graph to examine.
@@ -150,10 +232,14 @@ def loop_in(root: object, *, back_to: object | None = None) -> object | None:
     Raises:
       None.
     """
-    on_path: set[int] = set() if back_to is None else {id(back_to)}
+    path: list[object] = [] if back_to is None else [back_to]
+    on_path = {id(node) for node in path}
     if id(root) in on_path:
         return root
+    if any(type(root) is kind for kind in _PROXY_TYPES):
+        return _proxied_on_path(root, path)
     finished: set[int] = set()
+    path.append(root)
     on_path.add(id(root))
     stack = [(root, iter(_forwards_to(root)))]
     visits = 1
@@ -162,6 +248,7 @@ def loop_in(root: object, *, back_to: object | None = None) -> object | None:
         child = next(edges, _END)
         if child is _END:
             stack.pop()
+            path.pop()
             on_path.discard(id(node))
             finished.add(id(node))
             continue
@@ -169,9 +256,14 @@ def loop_in(root: object, *, back_to: object | None = None) -> object | None:
             return child
         if id(child) in finished:
             continue
+        if any(type(child) is kind for kind in _PROXY_TYPES):
+            referent = _proxied_on_path(child, path)
+            if referent is not None:
+                return referent
         visits += 1
         if visits > _LOOP_CEILING:
             return None
+        path.append(child)
         on_path.add(id(child))
         stack.append((child, iter(_forwards_to(child))))
     return None

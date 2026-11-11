@@ -1959,12 +1959,15 @@ and a third copy is a fork with no merge.
 
 - **A sink loop is refused only where the library can see it** (the sink-loop fix, 2026-11-11).
   `_sink_arg.loop_in` follows the package wrappers' forwarding positions and `super` objects,
-  statically, at a wrapper's constructor, at `configure(sink=…)` and at a factory build. Four loops
-  are not found and still recurse until `RecursionError`, duplicating an `emit`'s batch on the way:
-  one through a third-party sink's own code, since a sink that merely keeps a reference to its
-  parent must not be refused; one closed through a `weakref.proxy`, whose referent no static read
-  reaches; one formed by assigning a slot after the last check ran; and one deeper than
-  `_LOOP_CEILING` visits. The rejected runtime re-entry guard would catch them at a cost on every
+  statically, at a wrapper's constructor, at `configure(sink=…)` and at a factory build; a `super`
+  is followed only when its `emit` resolves to a package wrapper's, and a `weakref.proxy` is caught
+  only when it points back at a node already on the walk's path. Four loops are not found and still
+  recurse until `RecursionError`, duplicating an `emit`'s batch on the way: one through a
+  third-party sink's own code, since a sink that merely keeps a reference to its parent must not be
+  refused; one that closes only beneath a `weakref.proxy` to a node off the path, whose referent no
+  static read reaches; one formed after the last check ran — a slot assigned later, or two factory
+  wrappers whose factories each wrap the other, building at the same moment on two threads; and one
+  deeper than `_LOOP_CEILING` visits. The rejected runtime re-entry guard would catch them at a cost on every
   wrapper call (`docs/decisions/sink-lifecycle/`).
 
 - **After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink

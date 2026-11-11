@@ -143,8 +143,13 @@ class _FactorySink:
             looped = _sink_arg.loop_in(result, back_to=self)
             if looped is not None:
                 stored = _diag._STR_STR(_diag._STORED_NAME(type(looped)))
+                where = (
+                    "leads back to the sink_factory= wrapper"
+                    if looped is self
+                    else f"holds a {stored} that leads back to itself"
+                )
                 refusal = SinkDeliveryError("sink_factory returned a sink that contains itself")
-                self._announce(refusal, f"what it returned leads back to a {stored}")
+                self._announce(refusal, f"what it returned {where}")
                 raise refusal
             _lifecycle.stamp(result)
             signal = vars(self).get("log_foundry_stop_signal")

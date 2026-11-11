@@ -16,6 +16,7 @@ import ast
 import io
 import pathlib
 import sys
+import weakref
 from typing import Any
 
 import pytest
@@ -132,6 +133,53 @@ def test_a_loop_through_super_is_refused() -> None:
         sub.__init__(super(Sub, sub))
 
 
+@pytest.mark.parametrize("kind", _KINDS)
+def test_a_proxy_back_to_the_wrapper_is_refused(kind: str) -> None:
+    """A ``weakref.proxy`` forwards every call to its referent, so a proxy to the wrapper loops."""
+    wrapper = _wrap(kind, MemorySink())
+    with pytest.raises(ValueError, match=rf"^{_NAMES[kind]} leads back to this \w+Sink, so"):
+        _reinit(kind, wrapper, weakref.proxy(wrapper))
+
+
+def test_a_proxy_back_to_a_node_on_the_path_is_refused() -> None:
+    """A proxy deeper in the graph pointing at an ancestor wrapper is found among its weakrefs."""
+    middle = FilteringSink(MemorySink())
+    vars(middle)["_inner"] = _bare_multi(MemorySink(), weakref.proxy(middle))
+    assert _sink_arg.loop_in(middle) is middle
+    with pytest.raises(ValueError, match=r"^sink holds a FilteringSink that leads back to itself"):
+        log_foundry.configure(sink=_bare_multi(middle))
+
+
+def test_a_proxy_to_a_sink_off_the_path_is_not_a_loop() -> None:
+    """A proxy to a sibling wrapper reached on another path is a DAG edge, accepted."""
+    mem = MemorySink()
+    shared = FilteringSink(mem)
+    diamond = MultiSink(shared, weakref.proxy(shared))
+    diamond.emit(_BATCH)
+    assert len(mem.events) == 2
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_a_cooperative_mixin_super_is_not_a_loop(kind: str) -> None:
+    """``super(Wrapper, self)`` resolving to the caller's own ``emit`` delivers; it is accepted.
+
+    ``super(T, inst)`` searches the MRO after ``T``, so here it lands in ``Recorder.emit`` and never
+    comes back into the wrapper. Each event reaches the recorder exactly once.
+    """
+
+    class Recorder:
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            vars(self).setdefault("seen", []).extend(batch)
+
+    class Both(_CLASSES[kind], Recorder):  # type: ignore[valid-type, misc]
+        def __init__(self) -> None:
+            _reinit(kind, self, super(_CLASSES[kind], self))
+
+    both = Both()
+    both.emit(_BATCH)
+    assert vars(both)["seen"] == _BATCH
+
+
 def test_a_child_holding_a_loop_of_its_own_is_refused_by_the_looping_wrapper_name() -> None:
     """A child that already contains a loop is refused naming the wrapper on that loop."""
     looped = FilteringSink(MemorySink())
@@ -177,7 +225,7 @@ def test_a_factory_wrapping_the_configured_sink_is_a_counted_failed_build() -> N
         sys.stderr = saved
     assert factory_sink._inner is None, "the looped build was stored"
     assert mem.events == [], "the looped build was delivered to"
-    assert "what it returned leads back to a _FactorySink" in buffer.getvalue()
+    assert "what it returned leads back to the sink_factory= wrapper" in buffer.getvalue()
     assert "1 build(s) failed so far" in buffer.getvalue()
 
 
@@ -242,6 +290,20 @@ def test_the_walk_gives_up_at_its_ceiling_and_accepts(monkeypatch: pytest.Monkey
     assert _sink_arg.loop_in(top) is bottom
     monkeypatch.setattr(_sink_arg, "_LOOP_CEILING", 3)
     assert _sink_arg.loop_in(top) is None
+
+
+def test_a_finished_sink_is_walked_once_so_a_wide_diamond_does_not_hide_a_loop() -> None:
+    """Without the ``finished`` memo, 2**20 paths through a diamond chain exhaust the ceiling first.
+
+    The diamond comes first in the children, so a walk that re-entered a finished sink on every path
+    would give up and accept before it reached the looped sibling.
+    """
+    shared: Any = MultiSink(MemorySink())
+    for _ in range(20):
+        shared = MultiSink(shared, shared)
+    looped = FilteringSink(MemorySink())
+    vars(looped)["_inner"] = looped
+    assert _sink_arg.loop_in(_bare_multi(shared, looped)) is looped
 
 
 def test_an_unreadable_wrapper_is_announced_and_its_children_accepted(

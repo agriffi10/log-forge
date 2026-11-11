@@ -53,8 +53,10 @@ could still gain an `emit` — a class with `emit = None` whose `start()` binds 
 
 **A sink graph that contains itself is refused too** (Andrew's decision of 2026-11-11, the
 sink-loop fix, no spec). `require_sink` runs `_sink_arg.loop_in` after the type test: a static,
-bounded depth-first walk over the forwarding positions `_fork._CHILD_SINK_SLOTS` names, and through
-a `super` object to what it is bound to. A wrapper's constructor passes itself as `owner=`, so a
+bounded depth-first walk over the forwarding positions `_fork._CHILD_SINK_SLOTS` names, through a
+`super` object whose `emit` resolves to a package wrapper's (a cooperative mixin's `super` resolving
+to the caller's own `emit` delivers, and is not followed), and back from a `weakref.proxy` to a node
+already on the path, found among that node's `weakref.getweakrefs`. A wrapper's constructor passes itself as `owner=`, so a
 child leading back to it is a `ValueError` before anything is stored — the re-run `__init__` and the
 subclass passing `self` to its base; `configure(sink=…)` refuses a graph holding any wrapper that
 leads back to itself; and `_FactorySink`'s build treats a built graph that leads back to it, or
@@ -68,8 +70,9 @@ and a `MemorySink` wrote the batch 998 times, and every `flush()` raised `Recurs
   works. Only package positions are known to forward every call.
 - **Rejected: a runtime re-entry guard** on every wrapper call. It would catch the loops below, at a
   thread-local read per wrapper call across some two dozen methods.
-- **Accepted limits** (arch §13): a loop through a third-party sink's own code, one closed through a
-  `weakref.proxy`, one formed by mutating a slot after the last check, and one deeper than
+- **Accepted limits** (arch §13): a loop through a third-party sink's own code, one closing only
+  beneath a `weakref.proxy` to a node off the path, one formed after the last check (a slot assigned
+  later, or two factory wrappers building around each other at once), and one deeper than
   `_LOOP_CEILING` (10,000 visits) are not found, and recurse as before.
 
 **Do NOT** call the factory in `configure()` or in any fork handler. **Do NOT** refuse a sink for a
