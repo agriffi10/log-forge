@@ -285,7 +285,8 @@ def configure(
     types ``_sink_arg._UNPATCHABLE`` lists, such as ``object()``, a ``str`` or a ``dict`` — since
     every batch would otherwise be lost on the drain thread. A sink with no ``close`` is accepted,
     and so is one that has no ``emit`` yet but could gain one; a user class that never does loses
-    its batches counted and announced.
+    its batches counted and announced. A ``sink=`` that contains itself — a wrapper sink whose
+    wrapped sinks lead back to it — is refused too, since every call into it would recurse.
 
     This is still a startup call, and it is **not thread-safe**. A span finishing on another
     thread during a swap may land on either sink, and two threads calling this at once can leave
@@ -316,8 +317,10 @@ def configure(
       None.
 
     Raises:
-      ValueError: If any ceiling is less than 1, a stamp does not encode as UTF-8, or both
-        ``sink`` and ``sink_factory`` are given.
+      ValueError: If any ceiling is less than 1, a stamp does not encode as UTF-8, both
+        ``sink`` and ``sink_factory`` are given, or ``sink`` holds a ``MultiSink``,
+        ``FilteringSink`` or ``TransformSink`` that leads back to itself, so every call into it
+        would recurse (``_sink_arg.require_sink``).
       TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001), a
         ceiling is not an ``int`` (SPEC-065 FR-001), ``sink`` is a value that can never be a sink,
         or ``sink_factory`` is not callable with no arguments (SPEC-079 FR-005).

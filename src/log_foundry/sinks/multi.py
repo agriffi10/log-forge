@@ -60,9 +60,14 @@ class MultiSink:
           TypeError: If a child is an unpatchable builtin value that can never be a sink, named
             ``MultiSink sinks[i]`` (``_sink_arg.require_sink``, SPEC-079 FR-005), before anything
             is stored.
+          ValueError: If a child leads back to this ``MultiSink`` through the package wrappers —
+            itself, a wrapper holding it, ``super`` bound to it — or holds a wrapper that leads
+            back to itself, so every call into it would recurse (``_sink_arg.require_sink``).
+            Refused before anything is stored, so a re-run ``__init__`` leaves the children it
+            had.
         """
         for index, child in enumerate(sinks):
-            require_sink(child, f"MultiSink sinks[{index}]")
+            require_sink(child, f"MultiSink sinks[{index}]", owner=self)
         self._sinks = sinks
         self.failed = 0
         self._absorbed = 0

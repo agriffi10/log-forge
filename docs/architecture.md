@@ -1948,13 +1948,24 @@ and a third copy is a fork with no merge.
     the worker process instead.
 
 - **A sink `configure()` cannot prove unpatchable is accepted, and if it never gains an `emit`
-  its batches are lost counted and announced** (SPEC-079 FR-005). Only exactly one of a closed list
-  of builtin types is refused at `configure(sink=…)` and in the wrappers. A user-defined class
+  its batches are lost counted and announced** (SPEC-079 FR-005). Of the values themselves, only
+  exactly one of a closed list of builtin types is refused at `configure(sink=…)` and in the
+  wrappers; a graph that contains itself is refused as well, under the next item. A user-defined class
   with no `emit` is a heap type, which can always gain one, so it is accepted: on the worker path
   its batches are counted in `failed_batches`, on the orphan path in `orphan_lost`, and both are
   announced. Another unpatchable C type — `memoryview`, an extension type — is accepted the same
   way. The rejected predicate, "not a heap type and no instance `__dict__`", refused
   `weakref.proxy(sink)` and `super(Sub, inst)`, which deliver.
+
+- **A sink loop is refused only where the library can see it** (the sink-loop fix, 2026-11-11).
+  `_sink_arg.loop_in` follows the package wrappers' forwarding positions and `super` objects,
+  statically, at a wrapper's constructor, at `configure(sink=…)` and at a factory build. Four loops
+  are not found and still recurse until `RecursionError`, duplicating an `emit`'s batch on the way:
+  one through a third-party sink's own code, since a sink that merely keeps a reference to its
+  parent must not be refused; one closed through a `weakref.proxy`, whose referent no static read
+  reaches; one formed by assigning a slot after the last check ran; and one deeper than
+  `_LOOP_CEILING` visits. The rejected runtime re-entry guard would catch them at a cost on every
+  wrapper call (`docs/decisions/sink-lifecycle/`).
 
 - **After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink
   owns it and closes it** (SPEC-042, SPEC-079). A marking that trips `_MARKING_CEILING` sets

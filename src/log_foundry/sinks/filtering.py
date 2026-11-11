@@ -105,9 +105,12 @@ class FilteringSink:
             (``_sink_arg.require_sink``, SPEC-079 FR-005), or ``predicate`` is neither callable
             nor ``None``, each refused here rather than raised out of every ``emit``
             (SPEC-071 FR-005).
-          ValueError: If the minimum level is not one of the five standard names.
+          ValueError: If the minimum level is not one of the five standard names, or ``inner``
+            leads back to this wrapper or holds a wrapper that leads back to itself, so every
+            call into it would recurse (``_sink_arg.require_sink``), refused before anything is
+            stored.
         """
-        require_sink(inner, "FilteringSink inner")
+        require_sink(inner, "FilteringSink inner", owner=self)
         require_callable(predicate, "predicate", type(self).__name__)
         self._inner = inner
         vars(self)["log_foundry_stop_signal"] = None

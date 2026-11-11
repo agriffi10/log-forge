@@ -284,6 +284,10 @@ holders this package does not define. ``tests/test_child_sink_slots.py`` holds t
 by behaviour — a class that stores a ``Sink``-annotated value on ``self`` however it is written,
 calls ``require_sink`` or releases a sink with ``owner=self`` must have an entry — and checks each
 entry at run time by building its class around a sentinel sink and requiring it recorded.
+
+The same positions are the only edges ``_sink_arg.loop_in`` follows when it refuses a sink graph
+that contains itself, so an entry here is also what makes a new wrapper's loop refusable
+(``tests/test_sink_loops.py`` builds every entry around itself).
 """
 
 _QUALNAME = type.__dict__["__qualname__"].__get__
