@@ -750,6 +750,14 @@ class Runtime:
         entry's event are replaced, and its owed record is opted out by
         :attr:`_CloseRegistry._FORK_SKIP`.
         """
+        self._signal_owed = False
+        """Whether this child still owes its owed sinks the child's own stop signal.
+
+        Set by :func:`_clear_after_fork` and settled by :func:`_offer_owed_after_fork`, which
+        carries the reasoning: the roster gives a child a fresh ``_stop``, a sink no live worker
+        delivers to still holds the parent's copy, and the offer is deferred out of the at-fork
+        window to the child's first call that can reach a sink's code.
+        """
         self._marking_failed = False
         """Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
 
@@ -1214,6 +1222,12 @@ def _clear_after_fork() -> None:
     only because this is the critical section the handler already has; the sets themselves need
     none.
 
+    **It marks the child's stop signal as owed to its sinks**, through
+    :attr:`Runtime._signal_owed`, which :func:`_offer_owed_after_fork` settles on the child's
+    first orphan log or ``flush()``. It writes only the flag, so no sink's code runs here. It is
+    set unconditionally, including in a grandchild and when a worker exists, because the offer
+    skips a sink a live worker is draining into and the cost is one locked branch per fork.
+
     Args:
       None.
 
@@ -1230,6 +1244,7 @@ def _clear_after_fork() -> None:
             _state._stops_running.clear()
         _state._shutdown_running = 0
         _state._late_worker = None
+        _state._signal_owed = True
         worker = _state.live_worker()
         if worker is not None and id(worker.sink) not in _state._closes.owed:
             _state._closes.arm(worker.sink)
@@ -2337,6 +2352,11 @@ def _note_orphan_emit(sink: Sink) -> None:
     it also reaches a sink that is latched closed and still being emitted to; an arming-keyed
     offer would leave that one holding the shutdown's set event and backing off not at all.
 
+    **A forked child's first orphan log also takes the locked branch**, through
+    :attr:`Runtime._signal_owed`. The child's ``_stop`` is fresh and unset while the inherited
+    sink is owed, so the fast path would return and leave the sink holding the parent's copy of
+    the event; :func:`_offer_owed_after_fork` says why, and what the branch then offers.
+
     Args:
       sink: The sink this call is about to emit to.
 
@@ -2346,10 +2366,11 @@ def _note_orphan_emit(sink: Sink) -> None:
     Raises:
       None.
     """
-    if id(sink) in _state._closes.owed and not _state._stop.is_set():
+    if id(sink) in _state._closes.owed and not _state._stop.is_set() and not _state._signal_owed:
         return
     with _state._lock:
         _offer_orphan_signal(sink)
+        _offer_owed_after_fork()
         if id(sink) in _state._closes.owed:
             return
         _register_exit_handler()
@@ -2495,6 +2516,56 @@ def _offer_orphan_signal(sink: Sink) -> None:
     if _state.in_flight(sink):
         return
     offer_stop_signal(sink, _state.refresh_stop_signal())
+
+
+def _offer_owed_after_fork() -> None:
+    """Hands every owed sink the child's own stop signal, once per fork (invariant 3).
+
+    The roster gives a forked child a fresh ``_stop``. A sink of the package's own classes is
+    repaired by the at-fork walk, whose memo hands it that same fresh event, but a sink of the
+    caller's own class that no live worker delivers to still holds the parent's copy, which the
+    child's ``shutdown()`` never sets. Measured with no
+    live worker, a thread inside such a sink's backoff waited it out in full after the child's
+    ``shutdown()``, where an unforked process is cut short at once. That held for a child
+    forked after the parent's worker had been shut down too, and for a sink inside
+    ``MultiSink``, ``FilteringSink`` or ``TransformSink``.
+
+    The offer is not made at fork, because handing a signal runs the sink's own code. Nothing
+    waits on such a sink's signal before the child's first call that delivers to it: an orphan
+    log, through :func:`_note_orphan_emit`, or a ``flush()``, through :func:`_flush_live_sink`,
+    which calls each owed sink's own ``flush``. A ``shutdown()`` reaches owed sinks' ``close``
+    without settling first, and is safe for a different reason: a sink of the caller's own class
+    inherited from the parent is refused its close in the child, and the only inherited sinks a
+    child may close are the package's own, which already hold the child's event. The log and the
+    flush call this under ``_state._lock`` before reaching any sink. They are twins (invariant
+    6): settling the
+    debt in the log alone left a ``flush()`` before the first log waiting on the parent's event.
+
+    It offers to every owed sink, not only the one a log is about to reach, because a sink is
+    owed for as long as the child may still deliver to it. Each offer goes through
+    :func:`_offer_orphan_signal`, so a sink a resumed worker is draining into keeps the event
+    the worker's rebuild handed it, and a sink whose close is in flight keeps the one the close
+    waits on. A close of an owed sink is in flight only inside a ``shutdown()``, which has
+    already set ``_stop`` so a later log refreshes that sink anyway, or inside a swap, whose
+    close takes a sink the swap has already replaced as the one logs reach. The flag
+    is cleared once the pass ends, so the locked branch is paid once per fork, not once per call.
+
+    Callers hold ``_state._lock``.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if not _state._signal_owed:
+        return
+    for sink in list(_state._closes.owed.values()):
+        _offer_orphan_signal(sink)
+    _state._signal_owed = False
 
 
 def _close_taken(sink: Sink, closing: _Close) -> None:
@@ -3075,6 +3146,7 @@ def _flush_live_sink() -> bool:
     from log_foundry.sinks.base import flush_sink
 
     with _state._lock:
+        _offer_owed_after_fork()
         pending = list(_state._closes.owed.values())
     if not pending:
         return True

@@ -549,6 +549,7 @@ def _reset_worker() -> None:
     _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
     _lifecycle._state._late_worker = None
+    _lifecycle._state._signal_owed = False
     _lifecycle._state._swaps_running.clear()
     _lifecycle._state._stops_running.clear()
     decorator._orphan_lost = 0
