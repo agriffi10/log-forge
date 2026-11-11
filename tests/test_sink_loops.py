@@ -180,6 +180,26 @@ def test_a_cooperative_mixin_super_is_not_a_loop(kind: str) -> None:
     assert vars(both)["seen"] == _BATCH
 
 
+@pytest.mark.parametrize("kind", ["multi", "filtering"])
+def test_a_super_into_a_user_subclass_of_a_wrapper_is_followed(kind: str) -> None:
+    """``Mid(Wrapper)`` overriding ``emit`` still inherits the wrapper's forwarding ``flush``.
+
+    ``super(Leaf, leaf)`` resolves ``emit`` to ``Mid.emit``, the caller's code, but ``flush`` to the
+    package wrapper's, so ``flush`` loops with no user code on the path; it is refused.
+    """
+
+    class Mid(_CLASSES[kind]):  # type: ignore[valid-type, misc]
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            _CLASSES[kind].emit(self, batch)
+
+    class Leaf(Mid):
+        pass
+
+    leaf = Leaf(MemorySink())
+    with pytest.raises(ValueError, match=r"leads back to this Leaf, so every call"):
+        _reinit(kind, leaf, super(Leaf, leaf))
+
+
 def test_a_child_holding_a_loop_of_its_own_is_refused_by_the_looping_wrapper_name() -> None:
     """A child that already contains a loop is refused naming the wrapper on that loop."""
     looped = FilteringSink(MemorySink())
@@ -306,6 +326,102 @@ def test_a_finished_sink_is_walked_once_so_a_wide_diamond_does_not_hide_a_loop()
     assert _sink_arg.loop_in(_bare_multi(shared, looped)) is looped
 
 
+_ARMED: list[str] = []
+
+
+class _CollidingKey(str):
+    """A ``str`` subclass whose hash collides with a slot name and whose ``__eq__`` is a tripwire."""
+
+    def __new__(cls, text: str, collides_with: str) -> _CollidingKey:  # noqa: PYI034
+        key = super().__new__(cls, text)
+        key.collides_with = collides_with  # type: ignore[attr-defined]
+        return key
+
+    def __hash__(self) -> int:
+        return hash(self.collides_with)  # type: ignore[attr-defined]
+
+    def __eq__(self, other: object) -> bool:
+        if _ARMED:
+            _ARMED.append("__eq__")
+            raise RuntimeError("a planted key's __eq__ ran")
+        return False
+
+
+class _TrippingList(list):  # type: ignore[type-arg]
+    """A ``list`` subclass whose own ``__iter__`` is a tripwire."""
+
+    def __iter__(self) -> Any:
+        _ARMED.append("__iter__")
+        raise RuntimeError("a container's own __iter__ ran")
+
+
+@pytest.fixture
+def armed() -> Any:
+    """Arms the tripwires for the test body only; construction compares keys before arming."""
+    _ARMED.clear()
+    _ARMED.append("armed")
+    yield _ARMED
+    _ARMED.clear()
+
+
+def test_the_walk_runs_no_planted_key_or_container_code(armed: list[str]) -> None:
+    """A colliding non-``str`` key in a wrapper's ``__dict__`` and a ``list`` subclass's ``__iter__``.
+
+    The loop is still found through the real ``_inner`` and the ``list`` storage, and neither
+    tripwire runs: the slot keys are compared only when exactly ``str``, and a ``many`` slot is
+    read through its builtin base's own iteration.
+    """
+    armed.clear()
+    looped = FilteringSink(MemorySink())
+    vars(looped)[_CollidingKey("planted", "_inner")] = 1
+    vars(looped)["_inner"] = looped
+    fan = _bare_multi()
+    vars(fan)["_sinks"] = _TrippingList([MemorySink(), fan])
+    armed.append("armed")
+    assert _sink_arg.loop_in(looped) is looped
+    assert _sink_arg.loop_in(fan) is fan
+    assert armed == ["armed"], f"user code ran during the walk: {armed[1:]}"
+
+
+def test_a_class_with_a_raising_namespace_key_costs_only_its_own_check(armed: list[str]) -> None:
+    """A key colliding with ``__module__`` whose ``__eq__`` raises is absorbed, never raised.
+
+    Before the read moved inside the ``try`` this escaped ``require_sink``, ``configure()`` and the
+    factory build, where a sink that delivers lost every batch as an unannounced failure.
+    """
+    armed.clear()
+
+    class Meta(type):
+        @classmethod
+        def __prepare__(
+            mcs, name: str, bases: tuple[type, ...], **kwargs: Any
+        ) -> dict[str, object]:
+            return {_CollidingKey("planted", "__module__"): 1}
+
+    class Hostile(metaclass=Meta):
+        def __init__(self) -> None:
+            self.seen: list[dict[str, object]] = []
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            self.seen.extend(batch)
+
+        def close(self) -> None:
+            pass
+
+    armed.append("armed")
+    buffer, saved = io.StringIO(), sys.stderr
+    sys.stderr = buffer
+    try:
+        _sink_arg.require_sink(Hostile(), "sink")
+        MultiSink(MemorySink(), Hostile())
+        factory_sink = _FactorySink(Hostile)
+        factory_sink.emit(_BATCH)
+    finally:
+        sys.stderr = saved
+    assert factory_sink._inner is not None and factory_sink._inner.seen == _BATCH  # type: ignore[attr-defined]
+    assert "reading a sink's children for a loop (RuntimeError)" in buffer.getvalue()
+
+
 def test_an_unreadable_wrapper_is_announced_and_its_children_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -323,7 +439,7 @@ def test_an_unreadable_wrapper_is_announced_and_its_children_accepted(
         assert _sink_arg.loop_in(looped) is None
     finally:
         sys.stderr = saved
-    assert "reading a wrapper sink's children for a loop" in buffer.getvalue()
+    assert "reading a sink's children for a loop" in buffer.getvalue()
     assert "RuntimeError" in buffer.getvalue()
 
 
@@ -365,10 +481,8 @@ def test_every_wrapper_constructor_passes_itself_as_the_owner() -> None:
     calls: dict[str, list[ast.Call]] = {}
     for path in sorted(root.rglob("*.py")):
         for node in ast.walk(ast.parse(path.read_text())):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "require_sink"
+            if isinstance(node, ast.Call) and ast.unparse(node.func).rsplit(".", 1)[-1] == (
+                "require_sink"
             ):
                 calls.setdefault(str(path.relative_to(root)), []).append(node)
     wrappers = {name: found for name, found in calls.items() if name.startswith("sinks/")}
@@ -379,3 +493,47 @@ def test_every_wrapper_constructor_passes_itself_as_the_owner() -> None:
             assert len(owners) == 1, f"{name}: require_sink without owner="
             assert isinstance(owners[0], ast.Name) and owners[0].id == "self", name
     assert [kw.arg for call in calls["config.py"] for kw in call.keywords] == []
+
+
+_NOT_HANDED_A_SINK = {
+    ("sinks._factory", "_FactorySink"): "builds its child from the factory; the build is checked",
+    ("sinks.logstash", "LogstashSink"): "builds its HTTPSink itself; no caller hands it one",
+    ("sinks.sentry", "SentrySink"): "builds its HTTPSink itself; no caller hands it one",
+}
+"""Roster wrappers whose constructor is never handed a sink, each with the reason."""
+
+
+@pytest.mark.parametrize(
+    "key",
+    sorted(key for key in _fork._CHILD_SINK_SLOTS if key[0].startswith("sinks.")),
+    ids=lambda key: ".".join(key),
+)
+def test_every_wrapper_handed_a_sink_refuses_itself_when_re_initialised(
+    key: tuple[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each roster wrapper, rebuilt by its real constructor around itself, refuses the loop.
+
+    The builder is ``test_child_sink_slots._BUILDERS``'s, which that file forces for every roster
+    entry, and ``__init__`` is redirected onto an existing instance so the constructor re-runs on it with
+    itself as the child. A new wrapper that forgets ``require_sink``, or its ``owner=self``, fails
+    here unless it is listed in ``_NOT_HANDED_A_SINK`` with its reason.
+    """
+    from test_child_sink_slots import _BUILDERS
+
+    if key in _NOT_HANDED_A_SINK:
+        return
+    holder = _BUILDERS[key](MemorySink())
+    cls = type(holder)
+    original = vars(cls)["__init__"]
+
+    def onto_holder(self: object, *args: Any, **kwargs: Any) -> None:
+        original(holder, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "__init__", onto_holder)
+    with pytest.raises(ValueError, match=r"leads back to this"):
+        _BUILDERS[key](holder)
+
+
+def test_the_exemptions_name_roster_wrappers() -> None:
+    """An exemption naming no roster wrapper is stale and would hide nothing."""
+    assert set(_NOT_HANDED_A_SINK) <= set(_fork._CHILD_SINK_SLOTS)

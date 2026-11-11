@@ -1960,7 +1960,7 @@ and a third copy is a fork with no merge.
 - **A sink loop is refused only where the library can see it** (the sink-loop fix, 2026-11-11).
   `_sink_arg.loop_in` follows the package wrappers' forwarding positions and `super` objects,
   statically, at a wrapper's constructor, at `configure(sink=…)` and at a factory build; a `super`
-  is followed only when its `emit` resolves to a package wrapper's, and a `weakref.proxy` is caught
+  is followed only when its `emit` resolves to a package wrapper's or a subclass's, and a `weakref.proxy` is caught
   only when it points back at a node already on the walk's path. Four loops are not found and still
   recurse until `RecursionError`, duplicating an `emit`'s batch on the way: one through a
   third-party sink's own code, since a sink that merely keeps a reference to its parent must not be

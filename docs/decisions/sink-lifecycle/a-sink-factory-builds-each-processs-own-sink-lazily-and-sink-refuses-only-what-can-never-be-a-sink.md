@@ -54,8 +54,8 @@ could still gain an `emit` — a class with `emit = None` whose `start()` binds 
 **A sink graph that contains itself is refused too** (Andrew's decision of 2026-11-11, the
 sink-loop fix, no spec). `require_sink` runs `_sink_arg.loop_in` after the type test: a static,
 bounded depth-first walk over the forwarding positions `_fork._CHILD_SINK_SLOTS` names, through a
-`super` object whose `emit` resolves to a package wrapper's (a cooperative mixin's `super` resolving
-to the caller's own `emit` delivers, and is not followed), and back from a `weakref.proxy` to a node
+`super` object whose `emit` resolves to a package wrapper's or a subclass's (a cooperative mixin's
+`super` resolving to the caller's own `emit` delivers, and is not followed), and back from a `weakref.proxy` to a node
 already on the path, found among that node's `weakref.getweakrefs`. A wrapper's constructor passes itself as `owner=`, so a
 child leading back to it is a `ValueError` before anything is stored — the re-run `__init__` and the
 subclass passing `self` to its base; `configure(sink=…)` refuses a graph holding any wrapper that

@@ -46,7 +46,8 @@ construction that never stalls. Ten thousand is far above any fan-out written by
 that reaches it was measured at about 27 ms at ``7ecfbad1``, so the headroom is deliberate in both
 directions. Each wrapper constructor walks its own subgraph, so building a chain one wrapper at a
 time costs quadratically in its depth; a chain deep enough for that to matter already hits
-``RecursionError`` on its first ``emit``.
+``RecursionError`` on its first ``emit``. Each ``MultiSink`` child is walked on its own, so the
+same large subgraph handed as many children is walked once per child.
 """
 
 _END = object()
@@ -93,7 +94,10 @@ def _forwards_to(node: object) -> list[object]:
     refuse graphs that work. The slot values are read from the instance ``__dict__`` through
     ``sinks.base._instance_dict`` and ``dict.items``, keys compared only when exactly ``str``, and a
     ``many`` slot's members through its builtin base's own iteration, so none of the node's code
-    runs (SPEC-079 FR-002's rule for every walk over a handed-over graph).
+    runs (SPEC-079 FR-002's rule for every walk over a handed-over graph). The one residue is
+    ``sinks.base._class_member``'s: a key planted in a class namespace whose hash collides with a
+    name looked up there (``__module__``) has its ``__eq__`` run, so the whole read sits inside the
+    ``try`` and such a node costs only the check beneath it.
 
     Args:
       node: Any object the walk reached.
@@ -109,10 +113,10 @@ def _forwards_to(node: object) -> list[object]:
     if type(node) is super:
         target = _super_forwarded(node)
         return [] if target is None else [target]
-    slots = _fork._child_sink_slots(node)
-    if not slots:
-        return []
     try:
+        slots = _fork._child_sink_slots(node)
+        if not slots:
+            return []
         own = _instance_dict(node)
         if own is None:
             return []
@@ -127,7 +131,7 @@ def _forwards_to(node: object) -> list[object]:
         return [sink for sink in held if sink is not None]
     except Exception as exc:
         _diag.absorbed(
-            "reading a wrapper sink's children for a loop",
+            "reading a sink's children for a loop",
             exc,
             "the sinks beneath it are not checked for one",
         )
@@ -139,12 +143,16 @@ def _super_forwarded(node: object) -> object | None:
 
     ``super(T, inst)`` searches ``inst``'s MRO **after** ``T``, so it forwards back into
     ``inst``'s wrapped sinks only when the first class after ``T`` that defines ``emit`` is a
-    package wrapper with forwarding positions. A cooperative mixin — ``class Both(MultiSink,
+    package wrapper with forwarding positions, or a subclass of one: a user ``Mid(MultiSink)``
+    whose ``emit`` calls ``MultiSink.emit`` still inherits ``MultiSink.flush``, which forwards
+    with no user code on the loop. A cooperative mixin — ``class Both(MultiSink,
     Recorder)`` handing ``super(MultiSink, self)`` as a child — resolves to ``Recorder.emit``,
     the caller's own code, and delivers; following every ``super`` to its bound object refused it.
     ``__thisclass__`` and ``__self_class__`` are read through ``super``'s own members, the MRO
     through ``sinks.base._MRO`` and each namespace through ``_NAMESPACE``, compared by identity,
-    so nothing of the node or its classes runs.
+    so nothing of the node runs; of its classes, only a namespace key planted to collide with
+    ``emit`` or ``__module__`` can run its ``__eq__`` (``sinks.base._class_member``'s residue),
+    which is caught here.
 
     Args:
       node: An object whose exact type is ``super``.
@@ -166,7 +174,8 @@ def _super_forwarded(node: object) -> object | None:
             if cls is this:
                 after = True
             elif after and _NAMESPACE(cls).get("emit") is not None:
-                return target if _fork._declared_slots(cls) else None
+                wrapper = any(_fork._declared_slots(base) for base in _MRO(cls))
+                return target if wrapper else None
     except Exception as exc:
         _diag.absorbed(
             "reading a super object's classes for a sink loop",

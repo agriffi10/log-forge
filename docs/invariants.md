@@ -581,7 +581,9 @@ the first emit in each process (Andrew's decision of 2026-11-04, SPEC-079 FR-006
 raises or returns no sink is accepted by `configure()`, and each emit until it builds fails,
 counted and announced, and the next retries. A `sink=` that `configure()` cannot prove unpatchable
 is accepted (SPEC-079 FR-005): only exactly one of a closed list of builtin types is refused, so a
-user class that never gains an `emit` loses its batches counted and announced.
+user class that never gains an `emit` loses its batches counted and announced. A sink graph that
+loops back through a package wrapper is refused where it is formed, but four loops the static walk
+cannot see are accepted and recurse (`architecture.md` §13, the sink-loop item).
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
 non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
@@ -595,6 +597,7 @@ measured list of what still constructs and should not; `tests/test_numeric_doors
 `int` doors and the `flush()`/`shutdown()` `timeout`, and `tests/test_numeric_door_roster.py`,
 which derives the `int` doors from the AST and fails naming one left unjudged (SPEC-066);
 `tests/test_config.py` and `tests/test_sink_factory.py` for `sink=` and `sink_factory=` (SPEC-079);
+`tests/test_sink_loops.py` for a sink graph that contains itself (the sink-loop fix);
 `tests/test_type_doors.py` for a value lying about its type at every argument door, the HTTP
 sinks' `auth` and the seven callable arguments, and `tests/test_type_door_roster.py`, which derives
 the doors from the AST and fails naming one that asks the value rather than its type;
