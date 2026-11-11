@@ -471,23 +471,33 @@ class _BackingOff:
         self.entered: list[int] = []
         self.waited: list[float] = []
 
-    def emit(self, batch: list[dict[str, Any]]) -> None:
+    def _back_off_once(self) -> None:
         signal = self.log_foundry_stop_signal
-        if self.back_off and signal is not None:
+        if self.back_off and signal is not None and os.getpid() not in self.entered:
             self.entered.append(os.getpid())
             began = time.monotonic()
             signal.wait(BACKOFF)
             self.waited.append(time.monotonic() - began)
 
+    def emit(self, batch: list[dict[str, Any]]) -> None:
+        self._back_off_once()
+
+    def flush(self) -> None:
+        self._back_off_once()
+
     def close(self) -> None:
         pass
 
 
-def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff) -> str:
-    """Runs in a child: an orphan log backs off, then ``shutdown()`` must cut that wait short."""
+def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff, via: str) -> str:
+    """Runs in a child: a log or a flush backs off, then ``shutdown()`` must cut that wait short.
+
+    Only the child's first entry backs off, so ``shutdown()`` reaching the sink itself does not.
+    """
     no_worker = _lifecycle._state.live_worker() is None
     sink.back_off = True
-    emitter = threading.Thread(target=log_foundry.info, args=("child",), daemon=True)
+    call = (lambda: log_foundry.info("child")) if via == "log" else (lambda: log_foundry.flush())
+    emitter = threading.Thread(target=call, daemon=True)
     emitter.start()
     for _ in range(500):
         if os.getpid() in sink.entered:
@@ -506,12 +516,12 @@ def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff) -> str:
 
 
 @pytest.mark.parametrize(
-    ("depth", "retired"),
-    [(1, False), (2, False), (1, True)],
-    ids=["child", "grandchild", "retired-worker"],
+    ("depth", "retired", "via"),
+    [(1, False, "log"), (2, False, "log"), (1, True, "log"), (1, False, "flush")],
+    ids=["child", "grandchild", "retired-worker", "flush-first"],
 )
 def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
-    depth: int, retired: bool
+    depth: int, retired: bool, via: str
 ) -> None:
     """Invariant 3 on the orphan path: a child's ``shutdown()`` interrupts a sink's backoff.
 
@@ -522,7 +532,10 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
     whole backoff, where an unforked process is cut short at once. The grandchild row is the same
     fork taken twice, so the repair must be re-armed by every fork rather than by the first.
     The retired-worker row forks after the parent's worker was shut down, so the child has a
-    worker but no live one, and orphan logs are the only thing that reaches the sink.
+    worker but no live one, and orphan logs are the only thing that reaches the sink. The
+    flush-first row backs off in the sink's own ``flush``, reached by a ``flush()`` before the
+    child logs anything: the twin of the log (invariant 6), which settling the debt only in the
+    log left waiting on the parent's event.
 
     ``own_signal`` is the reason and ``cut`` the consequence: the ceiling is half the backoff
     the defect leaves uncut (``tests/README.md``).
@@ -540,8 +553,8 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
 
     def in_child() -> str:
         if depth == 1:
-            return _shutdown_cuts_an_orphan_backoff(sink)
-        grandchild = run_in_child(lambda: _shutdown_cuts_an_orphan_backoff(sink), timeout=20)
+            return _shutdown_cuts_an_orphan_backoff(sink, via)
+        grandchild = run_in_child(lambda: _shutdown_cuts_an_orphan_backoff(sink, via), timeout=20)
         return grandchild.output
 
     child = run_in_child(in_child, timeout=25)

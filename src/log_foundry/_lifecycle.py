@@ -751,17 +751,12 @@ class Runtime:
         :attr:`_CloseRegistry._FORK_SKIP`.
         """
         self._signal_owed = False
-        """Whether this child still owes its orphan sink the child's own stop signal.
+        """Whether this child still owes its owed sinks the child's own stop signal.
 
-        Set by :func:`_clear_after_fork` and cleared by the first orphan log that takes
-        :func:`_note_orphan_emit`'s locked branch. The roster gives a child a fresh ``_stop``,
-        and handing it to a sink runs the sink's own code, which the fork handlers keep out of
-        the at-fork window wherever nothing needs it there. An orphan sink has no drain thread
-        to start, so nothing waits on its signal before the child's first orphan log, and the
-        offer is made then. Without this flag that log took
-        :func:`_note_orphan_emit`'s unlocked fast path, since the sink was already owed and
-        the child's event was unset. The sink then kept the parent's copy, and the child's
-        ``shutdown()`` set an event no backoff waited on.
+        Set by :func:`_clear_after_fork` and settled by :func:`_offer_owed_after_fork`, which
+        carries the reasoning: the roster gives a child a fresh ``_stop``, a sink no live worker
+        delivers to still holds the parent's copy, and the offer is deferred out of the at-fork
+        window to the child's first call that can reach a sink's code.
         """
         self._marking_failed = False
         """Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
@@ -1227,15 +1222,11 @@ def _clear_after_fork() -> None:
     only because this is the critical section the handler already has; the sets themselves need
     none.
 
-    **It marks the child's stop signal as owed to its orphan sink**, through
-    :attr:`Runtime._signal_owed`. The roster gave the child a fresh ``_stop``, and a sink that
-    no worker owns still holds the parent's copy, which the child's ``shutdown()`` never sets.
-    Handing the sink the child's event runs the sink's own code. A resumed worker's rebuild does
-    that at fork because it starts a drain thread that waits on the event at once, but an orphan
-    sink has nothing waiting yet, so the flag defers the offer to :func:`_note_orphan_emit` on the
-    child's first orphan log and keeps the sink's code out of the at-fork window. It is
-    set unconditionally, including in a grandchild and when a worker exists, because the orphan
-    log is what reaches the configured sink and the cost is one locked branch per fork.
+    **It marks the child's stop signal as owed to its sinks**, through
+    :attr:`Runtime._signal_owed`, which :func:`_offer_owed_after_fork` settles on the child's
+    first orphan log or ``flush()``. It writes only the flag, so no sink's code runs here. It is
+    set unconditionally, including in a grandchild and when a worker exists, because the offer
+    skips a sink a live worker is draining into and the cost is one locked branch per fork.
 
     Args:
       None.
@@ -2364,16 +2355,7 @@ def _note_orphan_emit(sink: Sink) -> None:
     **A forked child's first orphan log also takes the locked branch**, through
     :attr:`Runtime._signal_owed`. The child's ``_stop`` is fresh and unset while the inherited
     sink is owed, so the fast path would return and leave the sink holding the parent's copy of
-    the event. Measured: with no live worker, the child's ``shutdown()`` then left the emitting
-    thread waiting out its whole backoff, where an unforked process is cut short at once
-    (invariant 3). The offer is not made at fork, because handing a signal runs the sink's own
-    code and nothing waits on an orphan sink's signal before its first log, so it is made here,
-    on the first log that could wait. The flag is cleared even when
-    :func:`_offer_orphan_signal` skips, because neither skip leaves the sink waiting on an event the child cannot set. A
-    worker draining into it was offered the child's event when it was resumed. A close of the
-    live sink is in flight only inside a ``shutdown()``, which has set ``_stop``, and a set
-    ``_stop`` sends every later log down this branch anyway. So the locked branch is paid once
-    per fork, not once per log.
+    the event; :func:`_offer_owed_after_fork` says why, and what the branch then offers.
 
     Args:
       sink: The sink this call is about to emit to.
@@ -2388,7 +2370,7 @@ def _note_orphan_emit(sink: Sink) -> None:
         return
     with _state._lock:
         _offer_orphan_signal(sink)
-        _state._signal_owed = False
+        _offer_owed_after_fork()
         if id(sink) in _state._closes.owed:
             return
         _register_exit_handler()
@@ -2534,6 +2516,50 @@ def _offer_orphan_signal(sink: Sink) -> None:
     if _state.in_flight(sink):
         return
     offer_stop_signal(sink, _state.refresh_stop_signal())
+
+
+def _offer_owed_after_fork() -> None:
+    """Hands every owed sink the child's own stop signal, once per fork (invariant 3).
+
+    The roster gives a forked child a fresh ``_stop``, but a sink no live worker delivers to
+    still holds the parent's copy, which the child's ``shutdown()`` never sets. Measured with no
+    live worker, a thread inside such a sink's backoff waited it out in full after the child's
+    ``shutdown()``, where an unforked process is cut short at once. That held for a child
+    forked after the parent's worker had been shut down too, and for a sink inside
+    ``MultiSink``, ``FilteringSink`` or ``TransformSink``.
+
+    The offer is not made at fork, because handing a signal runs the sink's own code, and
+    nothing waits on these sinks' signal before the child's first call that reaches a sink:
+    an orphan log, through :func:`_note_orphan_emit`, or a ``flush()``, through
+    :func:`_flush_live_sink`, which calls each owed sink's own ``flush``. Both call this under
+    ``_state._lock`` before reaching any sink. The two are twins (invariant 6): settling the
+    debt in the log alone left a ``flush()`` before the first log waiting on the parent's event.
+
+    It offers to every owed sink, not only the one a log is about to reach, because a sink is
+    owed for as long as the child may still deliver to it. Each offer goes through
+    :func:`_offer_orphan_signal`, so a sink a resumed worker is draining into keeps the event
+    the worker's rebuild handed it, and a sink whose close is in flight keeps the one the close
+    waits on. A close of an owed sink is in flight only inside a ``shutdown()``, which has
+    already set ``_stop`` so a later log refreshes that sink anyway, or inside a swap, whose
+    close takes a sink the swap has already replaced as the one logs reach. The flag
+    is cleared once the pass ends, so the locked branch is paid once per fork, not once per call.
+
+    Callers hold ``_state._lock``.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if not _state._signal_owed:
+        return
+    for sink in list(_state._closes.owed.values()):
+        _offer_orphan_signal(sink)
+    _state._signal_owed = False
 
 
 def _close_taken(sink: Sink, closing: _Close) -> None:
@@ -3114,6 +3140,7 @@ def _flush_live_sink() -> bool:
     from log_foundry.sinks.base import flush_sink
 
     with _state._lock:
+        _offer_owed_after_fork()
         pending = list(_state._closes.owed.values())
     if not pending:
         return True
