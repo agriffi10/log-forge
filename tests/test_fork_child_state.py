@@ -11,6 +11,7 @@ import json
 import os
 import socket
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -451,3 +452,88 @@ def test_a_failing_hook_on_a_class_whose_name_raises_still_runs_the_handlers(
     assert drain == "drain=True", child.output
     assert "re-acquiring a transport after a fork (OSError)" in stderr, stderr
     assert "_HookRaises" in stderr, stderr
+
+
+BACKOFF = 20.0
+"""How long :class:`_BackingOff` waits on its stop signal: the wait the defect leaves uncut."""
+
+
+class _BackingOff:
+    """A third-party sink whose armed ``emit`` backs off on ``log_foundry_stop_signal``.
+
+    Its state is plain lists and a bool rather than events, so the at-fork walk has nothing of
+    its own to replace and the only signal in play is the one the library offered.
+    """
+
+    def __init__(self) -> None:
+        self.log_foundry_stop_signal: threading.Event | None = None
+        self.back_off = False
+        self.entered: list[int] = []
+        self.waited: list[float] = []
+
+    def emit(self, batch: list[dict[str, Any]]) -> None:
+        signal = self.log_foundry_stop_signal
+        if self.back_off and signal is not None:
+            self.entered.append(os.getpid())
+            began = time.monotonic()
+            signal.wait(BACKOFF)
+            self.waited.append(time.monotonic() - began)
+
+    def close(self) -> None:
+        pass
+
+
+def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff) -> str:
+    """Runs in a child: an orphan log backs off, then ``shutdown()`` must cut that wait short."""
+    no_worker = _lifecycle._state.worker_exists() is None
+    sink.back_off = True
+    emitter = threading.Thread(target=log_foundry.info, args=("child",), daemon=True)
+    emitter.start()
+    for _ in range(500):
+        if os.getpid() in sink.entered:
+            break
+        time.sleep(0.01)
+    inside = os.getpid() in sink.entered
+    began = time.monotonic()
+    log_foundry.shutdown(5.0)
+    emitter.join(BACKOFF * 0.6)
+    elapsed = time.monotonic() - began
+    own = sink.log_foundry_stop_signal is _lifecycle._state._stop
+    return (
+        f"no_worker={no_worker} inside={inside} own_signal={own} "
+        f"done={not emitter.is_alive()} cut={elapsed < BACKOFF / 2} elapsed={elapsed:.2f}"
+    )
+
+
+@pytest.mark.parametrize("depth", [1, 2], ids=["child", "grandchild"])
+def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(depth: int) -> None:
+    """Invariant 3 on the orphan path: a child's ``shutdown()`` interrupts a sink's backoff.
+
+    The parent's orphan log hands the sink the parent's stop signal; the roster gives the child a
+    fresh ``_state._stop``. The child's orphan log took ``_note_orphan_emit``'s unlocked fast
+    path — the sink was already owed and the child's event unset — so the sink kept the parent's
+    copy, and ``shutdown()`` set an event nobody was waiting on: the emitting thread served the
+    whole backoff, where an unforked process is cut short at once. The grandchild row is the same
+    fork taken twice, so the repair must be re-armed by every fork rather than by the first.
+
+    ``own_signal`` is the reason and ``cut`` the consequence: the ceiling is half the backoff
+    the defect leaves uncut (``tests/README.md``).
+    """
+    sink = _BackingOff()
+    _KEEP.append(sink)
+    log_foundry.configure(service="orphan-backoff", sink=sink)
+    log_foundry.info("parent")
+    assert _lifecycle._state.worker_exists() is None, "the precondition: the orphan path"
+    assert sink.log_foundry_stop_signal is _lifecycle._state._stop, "the parent's offer landed"
+
+    def in_child() -> str:
+        if depth == 1:
+            return _shutdown_cuts_an_orphan_backoff(sink)
+        grandchild = run_in_child(lambda: _shutdown_cuts_an_orphan_backoff(sink), timeout=20)
+        return grandchild.output
+
+    child = run_in_child(in_child, timeout=25)
+    report = child.output
+    assert report.startswith("no_worker=True inside=True "), f"{child.ending}: {report!r}"
+    assert "own_signal=True" in report, f"the child's sink kept the parent's signal: {report!r}"
+    assert "done=True cut=True" in report, f"the backoff was not cut short: {report!r}"

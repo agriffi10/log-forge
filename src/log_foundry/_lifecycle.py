@@ -750,6 +750,17 @@ class Runtime:
         entry's event are replaced, and its owed record is opted out by
         :attr:`_CloseRegistry._FORK_SKIP`.
         """
+        self._signal_owed = False
+        """Whether this child still owes its orphan sink the child's own stop signal.
+
+        Set by :func:`_clear_after_fork` and cleared by the first orphan log that offers.
+        The roster gives a child a fresh ``_stop``, but a sink cannot be handed it at fork,
+        because handing it runs the sink's code and no object code may run there. So the
+        offer happens later, on the child's first orphan log. Without this flag that log took
+        :func:`_note_orphan_emit`'s unlocked fast path, since the sink was already owed and
+        the child's event was unset. The sink then kept the parent's copy, and the child's
+        ``shutdown()`` set an event no backoff waited on.
+        """
         self._marking_failed = False
         """Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
 
@@ -1214,6 +1225,14 @@ def _clear_after_fork() -> None:
     only because this is the critical section the handler already has; the sets themselves need
     none.
 
+    **It marks the child's stop signal as owed to its orphan sink**, through
+    :attr:`Runtime._signal_owed`. The roster gave the child a fresh ``_stop``, and a sink that
+    no worker owns still holds the parent's copy, which the child's ``shutdown()`` never sets.
+    Handing the sink the child's event runs the sink's code, which no handler may do at fork, so
+    the flag defers the offer to :func:`_note_orphan_emit` on the child's first orphan log. It is
+    set unconditionally, including in a grandchild and when a worker exists, because the orphan
+    log is what reaches the configured sink and the cost is one locked branch per fork.
+
     Args:
       None.
 
@@ -1230,6 +1249,7 @@ def _clear_after_fork() -> None:
             _state._stops_running.clear()
         _state._shutdown_running = 0
         _state._late_worker = None
+        _state._signal_owed = True
         worker = _state.live_worker()
         if worker is not None and id(worker.sink) not in _state._closes.owed:
             _state._closes.arm(worker.sink)
@@ -2337,6 +2357,19 @@ def _note_orphan_emit(sink: Sink) -> None:
     it also reaches a sink that is latched closed and still being emitted to; an arming-keyed
     offer would leave that one holding the shutdown's set event and backing off not at all.
 
+    **A forked child's first orphan log also takes the locked branch**, through
+    :attr:`Runtime._signal_owed`. The child's ``_stop`` is fresh and unset while the inherited
+    sink is owed, so the fast path would return and leave the sink holding the parent's copy of
+    the event. Measured: with no worker, the child's ``shutdown()`` then left the emitting thread
+    inside a 20 s backoff, where an unforked process is cut short at once (invariant 3). The offer
+    cannot be made at fork, because handing a signal runs the sink's code, so it is made here, on
+    the first log that could wait. The flag is cleared even when :func:`_offer_orphan_signal`
+    skips, because neither skip leaves the sink waiting on an event the child cannot set. A
+    worker draining into it was offered the child's event when it was resumed. A close of the
+    live sink is in flight only inside a ``shutdown()``, which has set ``_stop``, and a set
+    ``_stop`` sends every later log down this branch anyway. So the locked branch is paid once
+    per fork, not once per log.
+
     Args:
       sink: The sink this call is about to emit to.
 
@@ -2346,10 +2379,11 @@ def _note_orphan_emit(sink: Sink) -> None:
     Raises:
       None.
     """
-    if id(sink) in _state._closes.owed and not _state._stop.is_set():
+    if id(sink) in _state._closes.owed and not _state._stop.is_set() and not _state._signal_owed:
         return
     with _state._lock:
         _offer_orphan_signal(sink)
+        _state._signal_owed = False
         if id(sink) in _state._closes.owed:
             return
         _register_exit_handler()

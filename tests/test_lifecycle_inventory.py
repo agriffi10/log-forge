@@ -935,6 +935,11 @@ INVENTORY: dict[Key, Row] = {
         ("reset: _lifecycle._clear_after_fork",),
         "no-worker shutdown depth; no such call survives a fork (SPEC-079 FR-004)",
     ),
+    _rt("_signal_owed"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the child owes its orphan sink its own stop signal, offered on the first orphan log",
+    ),
     _rt("_stop"): Row(
         "Runtime",
         ("roster", _REBUILD),
