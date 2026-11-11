@@ -485,7 +485,7 @@ class _BackingOff:
 
 def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff) -> str:
     """Runs in a child: an orphan log backs off, then ``shutdown()`` must cut that wait short."""
-    no_worker = _lifecycle._state.worker_exists() is None
+    no_worker = _lifecycle._state.live_worker() is None
     sink.back_off = True
     emitter = threading.Thread(target=log_foundry.info, args=("child",), daemon=True)
     emitter.start()
@@ -500,13 +500,19 @@ def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff) -> str:
     elapsed = time.monotonic() - began
     own = sink.log_foundry_stop_signal is _lifecycle._state._stop
     return (
-        f"no_worker={no_worker} inside={inside} own_signal={own} "
+        f"no_live_worker={no_worker} inside={inside} own_signal={own} "
         f"done={not emitter.is_alive()} cut={elapsed < BACKOFF / 2} elapsed={elapsed:.2f}"
     )
 
 
-@pytest.mark.parametrize("depth", [1, 2], ids=["child", "grandchild"])
-def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(depth: int) -> None:
+@pytest.mark.parametrize(
+    ("depth", "retired"),
+    [(1, False), (2, False), (1, True)],
+    ids=["child", "grandchild", "retired-worker"],
+)
+def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
+    depth: int, retired: bool
+) -> None:
     """Invariant 3 on the orphan path: a child's ``shutdown()`` interrupts a sink's backoff.
 
     The parent's orphan log hands the sink the parent's stop signal; the roster gives the child a
@@ -515,6 +521,8 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(depth: int)
     copy, and ``shutdown()`` set an event nobody was waiting on: the emitting thread served the
     whole backoff, where an unforked process is cut short at once. The grandchild row is the same
     fork taken twice, so the repair must be re-armed by every fork rather than by the first.
+    The retired-worker row forks after the parent's worker was shut down, so the child has a
+    worker but no live one, and orphan logs are the only thing that reaches the sink.
 
     ``own_signal`` is the reason and ``cut`` the consequence: the ceiling is half the backoff
     the defect leaves uncut (``tests/README.md``).
@@ -522,8 +530,12 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(depth: int)
     sink = _BackingOff()
     _KEEP.append(sink)
     log_foundry.configure(service="orphan-backoff", sink=sink)
+    if retired:
+        _traced()
+        log_foundry.shutdown(5.0)
     log_foundry.info("parent")
-    assert _lifecycle._state.worker_exists() is None, "the precondition: the orphan path"
+    assert (_lifecycle._state.worker_exists() is not None) is retired, "the precondition: a worker"
+    assert _lifecycle._state.live_worker() is None, "the precondition: the orphan path"
     assert sink.log_foundry_stop_signal is _lifecycle._state._stop, "the parent's offer landed"
 
     def in_child() -> str:
@@ -534,6 +546,6 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(depth: int)
 
     child = run_in_child(in_child, timeout=25)
     report = child.output
-    assert report.startswith("no_worker=True inside=True "), f"{child.ending}: {report!r}"
+    assert report.startswith("no_live_worker=True inside=True "), f"{child.ending}: {report!r}"
     assert "own_signal=True" in report, f"the child's sink kept the parent's signal: {report!r}"
     assert "done=True cut=True" in report, f"the backoff was not cut short: {report!r}"
