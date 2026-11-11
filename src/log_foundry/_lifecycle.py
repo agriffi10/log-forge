@@ -2521,18 +2521,24 @@ def _offer_orphan_signal(sink: Sink) -> None:
 def _offer_owed_after_fork() -> None:
     """Hands every owed sink the child's own stop signal, once per fork (invariant 3).
 
-    The roster gives a forked child a fresh ``_stop``, but a sink no live worker delivers to
-    still holds the parent's copy, which the child's ``shutdown()`` never sets. Measured with no
+    The roster gives a forked child a fresh ``_stop``. A sink of the package's own classes is
+    repaired by the at-fork walk, whose memo hands it that same fresh event, but a sink of the
+    caller's own class that no live worker delivers to still holds the parent's copy, which the
+    child's ``shutdown()`` never sets. Measured with no
     live worker, a thread inside such a sink's backoff waited it out in full after the child's
     ``shutdown()``, where an unforked process is cut short at once. That held for a child
     forked after the parent's worker had been shut down too, and for a sink inside
     ``MultiSink``, ``FilteringSink`` or ``TransformSink``.
 
-    The offer is not made at fork, because handing a signal runs the sink's own code, and
-    nothing waits on these sinks' signal before the child's first call that reaches a sink:
-    an orphan log, through :func:`_note_orphan_emit`, or a ``flush()``, through
-    :func:`_flush_live_sink`, which calls each owed sink's own ``flush``. Both call this under
-    ``_state._lock`` before reaching any sink. The two are twins (invariant 6): settling the
+    The offer is not made at fork, because handing a signal runs the sink's own code. Nothing
+    waits on such a sink's signal before the child's first call that delivers to it: an orphan
+    log, through :func:`_note_orphan_emit`, or a ``flush()``, through :func:`_flush_live_sink`,
+    which calls each owed sink's own ``flush``. A ``shutdown()`` reaches owed sinks' ``close``
+    without settling first, and is safe for a different reason: a sink of the caller's own class
+    inherited from the parent is refused its close in the child, and the only inherited sinks a
+    child may close are the package's own, which already hold the child's event. The log and the
+    flush call this under ``_state._lock`` before reaching any sink. They are twins (invariant
+    6): settling the
     debt in the log alone left a ``flush()`` before the first log waiting on the parent's event.
 
     It offers to every owed sink, not only the one a log is about to reach, because a sink is

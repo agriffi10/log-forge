@@ -938,7 +938,7 @@ INVENTORY: dict[Key, Row] = {
     _rt("_signal_owed"): Row(
         "Runtime",
         ("reset: _lifecycle._clear_after_fork",),
-        "the child owes its orphan sink its own stop signal, offered on the first orphan log",
+        "the child owes its owed sinks its own stop signal, offered on its first log or flush",
     ),
     _rt("_stop"): Row(
         "Runtime",

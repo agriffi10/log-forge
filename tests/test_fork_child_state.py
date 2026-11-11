@@ -19,6 +19,7 @@ import pytest
 import log_foundry
 from log_foundry import _lifecycle
 from log_foundry.sinks.file import FileSink
+from log_foundry.sinks.multi import MultiSink
 from test_fork_lifecycle import _held_by_a_parent_thread, run_in_child
 from test_invariants_model import derived_current
 from test_sink_ownership import BuriedHolder, RecordingSink, ThirdPartyWrapper
@@ -516,12 +517,18 @@ def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff, via: str) -> str:
 
 
 @pytest.mark.parametrize(
-    ("depth", "retired", "via"),
-    [(1, False, "log"), (2, False, "log"), (1, True, "log"), (1, False, "flush")],
-    ids=["child", "grandchild", "retired-worker", "flush-first"],
+    ("depth", "retired", "via", "wrapped"),
+    [
+        (1, False, "log", False),
+        (2, False, "log", False),
+        (1, True, "log", False),
+        (1, False, "flush", False),
+        (1, False, "log", True),
+    ],
+    ids=["child", "grandchild", "retired-worker", "flush-first", "inside-multisink"],
 )
 def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
-    depth: int, retired: bool, via: str
+    depth: int, retired: bool, via: str, wrapped: bool
 ) -> None:
     """Invariant 3 on the orphan path: a child's ``shutdown()`` interrupts a sink's backoff.
 
@@ -535,14 +542,15 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
     worker but no live one, and orphan logs are the only thing that reaches the sink. The
     flush-first row backs off in the sink's own ``flush``, reached by a ``flush()`` before the
     child logs anything: the twin of the log (invariant 6), which settling the debt only in the
-    log left waiting on the parent's event.
+    log left waiting on the parent's event. The inside-multisink row configures the sink
+    inside a ``MultiSink``, so the child's signal must reach it through the wrapper's forward.
 
     ``own_signal`` is the reason and ``cut`` the consequence: the ceiling is half the backoff
     the defect leaves uncut (``tests/README.md``).
     """
     sink = _BackingOff()
     _KEEP.append(sink)
-    log_foundry.configure(service="orphan-backoff", sink=sink)
+    log_foundry.configure(service="orphan-backoff", sink=MultiSink(sink) if wrapped else sink)
     if retired:
         _traced()
         log_foundry.shutdown(5.0)
