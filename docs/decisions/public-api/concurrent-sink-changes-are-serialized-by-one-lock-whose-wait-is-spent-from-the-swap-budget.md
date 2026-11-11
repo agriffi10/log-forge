@@ -27,12 +27,19 @@ sink.
 
 **The wait is spent from the call's budget, not added to it** (invariant 3). The budget is resolved
 once, before the wait, and the swap gets what is left. A holder started earlier and runs inside its
-own budget, which ends first, so the wait ends in time unless the holder overruns. In that case the
-call proceeds without the lock and writes one `pending` line, since it cannot know whether the call
-it overtook will close a sink twice. Waiting without bound would break the bound, and giving up
+own budget, which ends first, so with two callers the wait ends in time unless the holder overruns.
+With three or more it can also run out when nobody overruns, because `threading.Lock` grants no
+arrival order and a later caller, whose budget ends later, can be granted the lock first; a
+three-caller probe with slow closes granted it in arrival order 8 of 8 times on macOS, so the case
+is reasoned rather than reproduced. Either way the call proceeds without the lock and writes one
+`pending` line, since running alongside the holder is the unserialized pair again: a sink may be
+closed twice, or the config may name another sink than delivery. Waiting without bound would break the bound, and giving up
 would lose the configure, which `configure()`'s `Raises:` disowns. A squeezed second swap may find
 too little budget left to confirm its drain, and then records `incomplete_swaps` as any unconfirmed
-swap does.
+swap does. A budget above `threading.TIMEOUT_MAX`, `inf` included, waits without bound as `None`
+does, `sinks._retry.wait_budget`'s rule (SPEC-066), because `acquire` raises `OverflowError` for it;
+it reaches the swap as `None` too, where `inf` had made the swap absorb an `OverflowError` of its own
+and leave the worker on the old sink.
 
 **Rejected: re-checking the post-retarget decision inside `_swap_sink`.** Arming the new sink only
 while it is still the worker's looks local, but an unfenced second swap leaves its displaced sink in
@@ -42,7 +49,8 @@ pair into the sequential case the swap already handles.
 
 **The lock is outermost and not taken on the orphan path.** `stamp`, `_rebind`, `_ensure_sink` and
 the swap take `_owned_lock`, `_config_lock`, `_state._lock` and the worker's lock beneath it, and
-nothing holding any of those takes it. A `configure()` with neither argument does not take it. It is
+nothing holding any of those takes it. A `configure()` with neither argument, or whose
+`sink_factory` is already the configured one, does not take it. It is
 on `_fork._GLOBAL_PRIMITIVES`, so a child forked while a parent thread held it starts unlocked.
 
 ## History

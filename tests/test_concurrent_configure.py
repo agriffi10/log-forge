@@ -1,4 +1,4 @@
-"""Two ``configure(sink=...)`` calls at once close each sink once and leave config and delivery agreed.
+"""Two ``configure(sink=...)`` calls at once close each sink once, and config and delivery agree.
 
 Both swaps retarget the live worker, which ``Worker.retarget`` serializes, so the worker goes A to C
 and then C to B. Each swap then decides what to arm and what to release from what its own retarget
@@ -12,6 +12,7 @@ write to the end of the swap. Serves invariants 5 and 3.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from typing import Any
@@ -28,7 +29,7 @@ from test_fork_lifecycle import _held_by_a_parent_thread, run_in_child
 pytestmark = pytest.mark.usefixtures("no_close_left_in_flight")
 
 BUDGET = 1.0
-"""The patched swap budget where a test waits it out: a second, so half of it clears the stall rule."""
+"""The patched swap budget where a test waits it out: a second, so half clears the stall rule."""
 
 STRESS_ROUNDS = 60
 """Unforced rounds in the stress test.
@@ -72,6 +73,15 @@ class CountingSink:
     def __repr__(self) -> str:
         """Names the sink and its closes, so a failure reads without a debugger."""
         return f"<{self.name} closes at events {self.at_close}>"
+
+
+class SlowCloseSink(CountingSink):
+    """A sink whose close takes twice the patched budget, so a swap joining it shows its budget."""
+
+    def close(self) -> None:
+        """Takes its time, then records."""
+        time.sleep(2 * BUDGET)
+        super().close()
 
 
 @log_foundry.trace
@@ -191,8 +201,11 @@ def test_a_wait_for_the_lock_is_spent_from_the_swap_budget_and_then_proceeds(
 
     The call proceeds without the lock rather than hang or drop the configure: the config and the
     worker both move to the new sink, and one ``pending`` line says the call ran unserialized.
+    The displaced sink's close outlasts the budget, so the swap's join of it spends whatever the
+    wait left: handed the whole budget again instead of the remainder, this call took 2.01 s
+    against 1.00 s (frame-1 review), which the ceiling below refuses.
     """
-    a, b = CountingSink("A"), CountingSink("B")
+    a, b = SlowCloseSink("A"), CountingSink("B")
     worker = _worker_on(a)
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", BUDGET)
     released, holder = _held_by_a_parent_thread(config._sink_lock)
@@ -204,7 +217,7 @@ def test_a_wait_for_the_lock_is_spent_from_the_swap_budget_and_then_proceeds(
     finally:
         released.set()
         holder.join(5.0)
-    assert 0.9 * BUDGET <= wall < BUDGET + 1.0, f"waited {wall:.2f}s against a {BUDGET}s budget"
+    assert 0.9 * BUDGET <= wall < 1.5 * BUDGET, f"took {wall:.2f}s against a {BUDGET}s budget"
     assert cpu.spent < 0.5 * BUDGET, f"the wait spun: {cpu.spent:.2f}s of CPU"
     assert worker.sink is b and log_foundry.get_config().sink is b, "the configure still landed"
     err = capsys.readouterr().err
@@ -229,8 +242,51 @@ def test_a_configure_that_changes_no_sink_does_not_take_the_lock(
     finally:
         released.set()
         holder.join(5.0)
-    assert elapsed < 0.5 * BUDGET, f"a call that changes no sink waited {elapsed:.2f}s on the lock"
+    assert elapsed < 0.5 * BUDGET, f"a call that changes no sink waited {elapsed:.2f}s"
     assert log_foundry.get_config().service == "stamp-only"
+
+
+def test_a_configure_passing_the_factory_already_configured_does_not_take_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing the configured factory again changes nothing, so it waits on nothing either."""
+
+    def factory() -> CountingSink:
+        return CountingSink("built")
+
+    log_foundry.configure(sink_factory=factory)
+    built = log_foundry.get_config().sink
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", BUDGET)
+    released, holder = _held_by_a_parent_thread(config._sink_lock)
+    try:
+        start = time.monotonic()
+        log_foundry.configure(sink_factory=factory)
+        elapsed = time.monotonic() - start
+    finally:
+        released.set()
+        holder.join(5.0)
+    assert elapsed < 0.5 * BUDGET, f"a call that changes nothing waited {elapsed:.2f}s"
+    assert log_foundry.get_config().sink is built, "and it built no second sink"
+
+
+@pytest.mark.parametrize("budget", [math.inf, 1e12], ids=["inf", "above-TIMEOUT_MAX"])
+def test_a_budget_above_the_lock_maximum_waits_without_bound_rather_than_raising(
+    budget: float, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invariant 1: ``acquire`` raises ``OverflowError`` past ``threading.TIMEOUT_MAX``.
+
+    Frame-1 review measured every ``configure(sink=...)`` raising it from the timed acquire with
+    the budget at ``inf`` or ``1e12``. At ``641dfc86`` the call returned, but the swap absorbed an
+    ``OverflowError`` of its own and left the worker on the old sink. Such a budget is read as
+    ``None``, ``sinks._retry.wait_budget``'s rule, for the wait and for the swap.
+    """
+    a, b = CountingSink("A"), CountingSink("B")
+    worker = _worker_on(a)
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", budget)
+    log_foundry.configure(sink=b)
+    assert worker.sink is b and log_foundry.get_config().sink is b
+    err = capsys.readouterr().err
+    assert "could not wait" not in err and "absorbed" not in err, err
 
 
 def test_an_uncontended_sink_change_takes_the_lock_and_leaves_it_free() -> None:

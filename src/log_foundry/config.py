@@ -89,24 +89,32 @@ closes C a second time with nothing written to it in between. Each swap's two cr
 are correct for a swap alone; what breaks is a decision taken in the second on facts the other
 swap changed after the first. The same gap has a second shape: B's first critical section finds
 A, already displaced by C's retarget and no longer held, owed and releases it as stale, and C's
-swap then releases A again as the sink it displaced. Held across the config write, the default-sink step and the swap,
-this lock makes two concurrent calls the two sequential ones the swap already handles, and it
-also ends the second race a concurrent pair had, the config naming one sink while delivery went
-to the other, because the call that writes the config last is now the one that swaps last.
+swap then releases A again as the sink it displaced. Held across the config write, the
+default-sink step and the swap, this lock makes two concurrent calls the two sequential ones the
+swap already handles, and it also ends the second race a concurrent pair had, the config naming
+one sink while delivery went to the other, because the call that writes the config last is now
+the one that swaps last.
 
 **The wait is bounded by the call's one swap budget, not added to it** (invariant 3). The budget
 is taken once, before the wait, and the swap gets what is left. A swap already holding the lock
-started earlier and runs inside its own budget, which ends first, so the wait ends within this
-call's budget in every case but a holder overrunning its own. In that case the call proceeds
-without the lock and says so on stderr: a call that waited forever would break the bound, and
-one that gave up would lose the configure, the worse outcome by the measure ``configure()``'s
-``Raises:`` takes.
+started earlier and runs inside its own budget, which ends first, so with two callers the wait
+ends within this call's budget unless the holder overruns its own. With three or more it can
+also end without the lock when no holder overruns: ``threading.Lock`` grants no arrival order,
+so a caller that came later, whose budget ends later, can take the lock ahead of this one.
+Either way the call proceeds without the lock and says so on stderr: a call that waited forever
+would break the bound, and one that gave up would lose the configure, the worse outcome by the
+measure ``configure()``'s ``Raises:`` takes. Running alongside the holder, it is back to the
+unserialized pair, so a sink may be closed twice or the config may name one sink while delivery
+goes to the other, and the line says both. A budget above ``threading.TIMEOUT_MAX``, ``inf``
+included, waits without bound, as ``None`` does, which is ``sinks._retry.wait_budget``'s rule
+(SPEC-066): passed to ``acquire`` it would raise ``OverflowError`` out of ``configure()``.
 
 It is outermost. ``stamp`` takes ``_lifecycle._state._owned_lock`` under it, :func:`_rebind`
 and :func:`_ensure_sink` take :data:`_config_lock`, and the swap takes ``_lifecycle._state._lock``
 and the worker's own lock, all released before it is; nothing that holds any of them takes this.
-A ``configure()`` without ``sink`` or ``sink_factory`` does not take it, so the orphan path and a
-call that only changes a stamp pay nothing. A forked child re-creates it from
+A ``configure()`` without ``sink`` or ``sink_factory``, or whose ``sink_factory`` is already the
+configured one, does not take it, so the orphan path, a call that only changes a stamp and a
+call that changes nothing pay nothing. A forked child re-creates it from
 ``_fork._GLOBAL_PRIMITIVES``, so a parent thread holding it at the fork leaves no child waiting.
 """
 
@@ -322,10 +330,11 @@ def configure(
     wrapped sinks lead back to it — is refused too, since every call into it would recurse.
 
     This is still a startup call, but two threads passing ``sink`` or ``sink_factory`` at once
-    are safe: the calls run one after the other, whichever runs second wins both the
-    config and delivery, and every sink involved is closed once. The second call waits for the first, and
-    that wait is spent from its own swap budget rather than added to it. A span finishing on
-    another thread during a swap may still land on either sink.
+    are safe: the calls run one after the other, whichever runs second wins both the config and
+    delivery, and every sink involved is closed once. The second call waits for the first, and
+    that wait is spent from its own swap budget rather than added to it; a wait that outlasts
+    that budget runs alongside the first instead, with a line on stderr saying the guarantee did
+    not hold. A span finishing on another thread during a swap may still land on either sink.
 
     Args:
       service: The service name stamped onto every event.
@@ -388,7 +397,7 @@ def configure(
         )
         if value is not None
     }
-    if sink is None and sink_factory is None:
+    if sink is None and (sink_factory is None or sink_factory is _config.sink_factory):
         _rebind(**changed)
         _ensure_sink()
         return
@@ -406,7 +415,12 @@ def _change_sink(
     is resolved here, once, when the call runs, and the wait for the lock is spent from it; the
     swap gets what is left. A wait that outlasts the budget proceeds without the lock and writes
     one ``pending`` line, since it cannot know whether the call it overtook will close a sink
-    twice.
+    twice or leave the config naming another sink than delivery. A budget of ``None``, or above
+    ``threading.TIMEOUT_MAX``, waits without bound and reaches the swap as ``None``: passed on as
+    ``inf``, the swap's own deadline arithmetic raised ``OverflowError``, which it absorbed and
+    announced while the worker stayed on the old sink, as it did at ``641dfc86``. :func:`configure` routes a factory that is
+    already the configured one around this, without the lock; the comparison is made again here,
+    under it, because a concurrent call may have changed the factory in between.
 
     Args:
       changed: The validated fields :func:`configure` is about to write.
@@ -423,11 +437,13 @@ def _change_sink(
 
     budget = DEFAULT_SWAP_TIMEOUT
     started = time.monotonic()
-    serialized = _sink_lock.acquire(timeout=-1 if budget is None else max(0.0, budget))
+    unbounded = budget is None or budget > threading.TIMEOUT_MAX
+    serialized = _sink_lock.acquire(timeout=-1 if unbounded else max(0.0, budget))
     if not serialized:
         _diag.pending(
             "configure(sink=...) could not wait for a concurrent sink change within its swap "
-            "budget and proceeded alongside it; a sink both calls touched may be closed twice"
+            "budget and proceeded alongside it; a sink both calls touched may be closed twice, "
+            "and the config may name another sink than the one delivered to"
         )
     try:
         if sink is not None:
@@ -446,7 +462,7 @@ def _change_sink(
         _ensure_sink()
 
         if sink is not None:
-            remaining = None if budget is None else max(0.0, budget - (time.monotonic() - started))
+            remaining = None if unbounded else max(0.0, budget - (time.monotonic() - started))
             _swap_live_sink(sink, remaining)
     finally:
         if serialized:

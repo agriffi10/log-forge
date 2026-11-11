@@ -803,8 +803,9 @@ class Runtime:
 
         A set of tokens rather than a counter or a flag, for ``_shutdown_running``'s reason: two
         swaps can still be inside at once, and a boolean cleared by the first to finish would
-        misreport the second. ``config._sink_lock`` serializes two ``configure(sink=...)`` calls,
-        but a call whose wait for it outlasted its budget proceeds alongside the holder. A token is the call's
+        misreport the second. ``config._sink_lock`` serializes two ``configure(sink=...)``
+        calls, but a call whose wait for it outlasted its budget proceeds alongside the
+        holder. A token is the call's
         :class:`_Operation` (SPEC-078; a bare ``object()`` before it), **added**
         under ``_lock`` in a critical section the call already has and **discarded without the
         lock** in its ``finally`` — one ``set.discard``, which CPython performs atomically, where an

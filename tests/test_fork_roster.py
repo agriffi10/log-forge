@@ -400,7 +400,7 @@ def test_each_roster_value_is_replaced_in_the_child() -> None:
 def test_a_missing_roster_attribute_is_announced_and_the_rest_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-001: a pair naming a missing attribute is announced by type, and every real pair replaced."""
+    """FR-001: a pair naming a missing attribute is announced by type, every real pair replaced."""
     import io
     import sys
 
