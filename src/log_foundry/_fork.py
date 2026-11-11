@@ -765,6 +765,7 @@ _GLOBAL_PRIMITIVES: tuple[tuple[str, str], ...] = (
     ("_lifecycle", "_state._owned_lock"),
     ("_lifecycle", "_state._closes._lock"),
     ("config", "_config_lock"),
+    ("config", "_sink_lock"),
     ("decorator", "_sweep_lock"),
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),

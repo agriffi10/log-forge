@@ -101,9 +101,11 @@ each on purpose:**
   (SPEC-046)", and the plan's wording is corrected here.
 - **Bounding `Sink.close`.** The inline close stays unbounded on both paths (`architecture.md` §13).
 - **Making `CLOSED` terminal**, for the reason the Overview gives and FR-004 records.
-- **Serialising concurrent `configure(sink=…)` calls.** `configure()` is documented as not
+- ~~**Serialising concurrent `configure(sink=…)` calls.** `configure()` is documented as not
   thread-safe, with every sink involved still closed (SPEC-045); a second swap runs alongside the
-  first, as today.
+  first, as today.~~ **Superseded 2026-11-11:** this spec's review measured the pair closing a
+  sink twice, and a later fix serialized them with `config._sink_lock`; the `SWAP` row's
+  `SWAPPING` cell below is superseded with it.
 - **Tracking an emit or a flush on an application thread.** The orphan path emits on the caller's
   thread and `flush()` drains each owed sink's own buffer on it; the library cannot serialise them
   against a close (SPEC-028), and what a sink does when one overlaps its close is SPEC-076's
@@ -382,7 +384,7 @@ stop, the second pass and the grace.
 |---|---|---|---|---|---|
 | `BUILD`: a span needs a worker and none exists | builds, arms its sink → `RUNNING` | builds → `RUNNING` | builds; the swap continues → `SWAPPING`, then as the swap leaves it | inside the `_shutdown_running` window: the late worker this drain stops (SPEC-044 FR-001) → `DRAINING`, then `CLOSED`; in the tail: a live worker the drain does not stop → `DRAINING`, then `RUNNING` | builds a live worker → `RUNNING` |
 | `ARM`: an orphan log reaches a sink not owed | arms → `RUNNING` | arms → `RUNNING` | arms → `SWAPPING`, then as the swap leaves it | arms; owed a further close (SPEC-045 FR-002) → `DRAINING`, then as the drain leaves it | arms → `CLOSED` |
-| `SWAP`: `configure(sink=…)` | nothing to swap → `RUNNING`, since the config has resolved a sink; `_current` stays `UNCONFIGURED` | through `SWAPPING` when it has work, directly when not → `RUNNING` | runs alongside the swap in flight → `SWAPPING`, then the settled state when the last leaves | **no live worker, and the drain still has a take ahead of it: declines at entry**, with no retarget, no close and no arm; after the drain's last take, as in `CLOSED`'s no-worker branch; a live worker (a late one, or one built in the tail): swaps as in `RUNNING` → `DRAINING`, then as the drain leaves it | through `SWAPPING` only when something is owed: supersedes the owed sinks and arms the new one → `CLOSED` |
+| `SWAP`: `configure(sink=…)` | nothing to swap → `RUNNING`, since the config has resolved a sink; `_current` stays `UNCONFIGURED` | through `SWAPPING` when it has work, directly when not → `RUNNING` | ~~runs alongside the swap in flight~~ waits for the swap in flight on `config._sink_lock`, within its own budget, then swaps as in `RUNNING` (superseded 2026-11-11) → `SWAPPING`, then the settled state when the last leaves | **no live worker, and the drain still has a take ahead of it: declines at entry**, with no retarget, no close and no arm; after the drain's last take, as in `CLOSED`'s no-worker branch; a live worker (a late one, or one built in the tail): swaps as in `RUNNING` → `DRAINING`, then as the drain leaves it | through `SWAPPING` only when something is owed: supersedes the owed sinks and arms the new one → `CLOSED` |
 | `FLUSH`: `flush()` | touches no sink → unchanged | drains → unchanged | drains → unchanged | answers as at `fda134a` → unchanged | answers as at `fda134a` → unchanged |
 | `STOP`: `shutdown()` or the exit drain | moves the count → `CLOSED` | drains and closes → `CLOSED`, or `RUNNING` when no worker existed and a span built one in the tail | drains and closes; the swap's retarget declines (SPEC-033 FR-002) → `SWAPPING` while the swap is inside, then `CLOSED` | joins as a second caller, as SPEC-068 leaves it → `DRAINING` while the first call is inside, then as the `RUNNING` cell | moves the count, closes what was armed since → `CLOSED`, with the `RUNNING` cell's tail exception |
 | `FORK`: the child's entry | `UNCONFIGURED` | `RUNNING` | `_current`, inherited: `RUNNING` or `CLOSED` | `_current`, inherited | `CLOSED` |

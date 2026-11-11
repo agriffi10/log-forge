@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, cast
 
@@ -75,6 +76,38 @@ so the per-event path pays nothing (SPEC-034 FR-003 AC-6). Lock ordering is one-
 that way: ``_ensure_sink`` is called with ``_lifecycle._state._lock`` held, and ``configure()``
 releases this lock before ``_swap_live_sink`` takes that one, so nothing acquires
 the lifecycle lock underneath this.
+"""
+
+_sink_lock = threading.Lock()
+"""Serializes the calls to :func:`configure` that change the sink, from the write to the swap.
+
+Two ``configure(sink=...)`` calls at once with a live worker closed one sink twice: measured
+in 10 of 50 runs at ``641dfc86``. Both swaps retarget the worker, which ``Worker.retarget``
+serializes, so the worker goes A to C and then C to B. B's swap then closes C as the sink it
+displaced, and C's swap, deciding afterwards on what its retarget saw, re-arms C, so the exit
+closes C a second time with nothing written to it in between. Each swap's two critical sections
+are correct for a swap alone; what breaks is a decision taken in the second on facts the other
+swap changed after the first. The same gap has a second shape: B's first critical section finds
+A, already displaced by C's retarget and no longer held, owed and releases it as stale, and C's
+swap then releases A again as the sink it displaced. Held across the config write, the default-sink step and the swap,
+this lock makes two concurrent calls the two sequential ones the swap already handles, and it
+also ends the second race a concurrent pair had, the config naming one sink while delivery went
+to the other, because the call that writes the config last is now the one that swaps last.
+
+**The wait is bounded by the call's one swap budget, not added to it** (invariant 3). The budget
+is taken once, before the wait, and the swap gets what is left. A swap already holding the lock
+started earlier and runs inside its own budget, which ends first, so the wait ends within this
+call's budget in every case but a holder overrunning its own. In that case the call proceeds
+without the lock and says so on stderr: a call that waited forever would break the bound, and
+one that gave up would lose the configure, the worse outcome by the measure ``configure()``'s
+``Raises:`` takes.
+
+It is outermost. ``stamp`` takes ``_lifecycle._state._owned_lock`` under it, :func:`_rebind`
+and :func:`_ensure_sink` take :data:`_config_lock`, and the swap takes ``_lifecycle._state._lock``
+and the worker's own lock, all released before it is; nothing that holds any of them takes this.
+A ``configure()`` without ``sink`` or ``sink_factory`` does not take it, so the orphan path and a
+call that only changes a stamp pay nothing. A forked child re-creates it from
+``_fork._GLOBAL_PRIMITIVES``, so a parent thread holding it at the fork leaves no child waiting.
 """
 
 
@@ -288,10 +321,11 @@ def configure(
     its batches counted and announced. A ``sink=`` that contains itself — a wrapper sink whose
     wrapped sinks lead back to it — is refused too, since every call into it would recurse.
 
-    This is still a startup call, and it is **not thread-safe**. A span finishing on another
-    thread during a swap may land on either sink, and two threads calling this at once can leave
-    the config naming one sink while delivery goes to another. What is unconditional is that
-    every sink involved is closed; where its events went is not.
+    This is still a startup call, but two threads passing ``sink`` or ``sink_factory`` at once
+    are safe: the calls run one after the other, whichever runs second wins both the
+    config and delivery, and every sink involved is closed once. The second call waits for the first, and
+    that wait is spent from its own swap budget rather than added to it. A span finishing on
+    another thread during a swap may still land on either sink.
 
     Args:
       service: The service name stamped onto every event.
@@ -354,26 +388,72 @@ def configure(
         )
         if value is not None
     }
-    if sink is not None:
-        changed["sink_factory"] = None
-    elif sink_factory is not None and sink_factory is not _config.sink_factory:
-        from log_foundry.sinks._factory import _FactorySink
-
-        sink = _FactorySink(sink_factory)
-        changed["sink"] = sink
-        changed["sink_factory"] = sink_factory
-    if sink is not None:
-        _lifecycle.stamp(sink)
-
-    _rebind(**changed)
-
-    _ensure_sink()
-
-    if sink is not None:
-        _swap_live_sink(sink)
+    if sink is None and sink_factory is None:
+        _rebind(**changed)
+        _ensure_sink()
+        return
+    _change_sink(changed, sink, sink_factory)
 
 
-def _swap_live_sink(sink: Sink) -> None:
+def _change_sink(
+    changed: dict[str, object], sink: Sink | None, sink_factory: Callable[[], Sink] | None
+) -> None:
+    """Writes a new sink or factory into the config and swaps delivery to it, under one lock.
+
+    The tail of :func:`configure` for a call that passes ``sink`` or ``sink_factory``, held under
+    :data:`_sink_lock` from the factory comparison to the end of the swap, so two such calls at
+    once run one after the other and the config names the sink delivery goes to. The swap budget
+    is resolved here, once, when the call runs, and the wait for the lock is spent from it; the
+    swap gets what is left. A wait that outlasts the budget proceeds without the lock and writes
+    one ``pending`` line, since it cannot know whether the call it overtook will close a sink
+    twice.
+
+    Args:
+      changed: The validated fields :func:`configure` is about to write.
+      sink: The sink passed, or ``None`` when only a factory was.
+      sink_factory: The factory passed, or ``None``.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry.worker import DEFAULT_SWAP_TIMEOUT
+
+    budget = DEFAULT_SWAP_TIMEOUT
+    started = time.monotonic()
+    serialized = _sink_lock.acquire(timeout=-1 if budget is None else max(0.0, budget))
+    if not serialized:
+        _diag.pending(
+            "configure(sink=...) could not wait for a concurrent sink change within its swap "
+            "budget and proceeded alongside it; a sink both calls touched may be closed twice"
+        )
+    try:
+        if sink is not None:
+            changed["sink_factory"] = None
+        elif sink_factory is not None and sink_factory is not _config.sink_factory:
+            from log_foundry.sinks._factory import _FactorySink
+
+            sink = _FactorySink(sink_factory)
+            changed["sink"] = sink
+            changed["sink_factory"] = sink_factory
+        if sink is not None:
+            _lifecycle.stamp(sink)
+
+        _rebind(**changed)
+
+        _ensure_sink()
+
+        if sink is not None:
+            remaining = None if budget is None else max(0.0, budget - (time.monotonic() - started))
+            _swap_live_sink(sink, remaining)
+    finally:
+        if serialized:
+            _sink_lock.release()
+
+
+def _swap_live_sink(sink: Sink, timeout: float | None) -> None:
     """Points an already-running worker at a newly configured sink (SPEC-030 FR-003).
 
     The import is local for the reason ``_ensure_sink``'s is: ``_lifecycle`` reaches this
@@ -385,10 +465,12 @@ def _swap_live_sink(sink: Sink) -> None:
     The budget is passed explicitly rather than left to the parameter default, so that the
     bound this call actually applies is resolved when it runs. A default argument is bound at
     definition time, which would leave the end-to-end bound untestable without reaching past
-    the function under test.
+    the function under test. :func:`_change_sink` resolves it, and passes what its wait for
+    :data:`_sink_lock` left of it.
 
     Args:
       sink: The sink just written to the config.
+      timeout: Seconds left of the call's swap budget, or ``None``.
 
     Returns:
       None.
@@ -397,9 +479,8 @@ def _swap_live_sink(sink: Sink) -> None:
       None.
     """
     from log_foundry._lifecycle import _swap_sink
-    from log_foundry.worker import DEFAULT_SWAP_TIMEOUT
 
-    _swap_sink(sink, DEFAULT_SWAP_TIMEOUT)
+    _swap_sink(sink, timeout)
 
 
 def get_config() -> Config:

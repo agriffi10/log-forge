@@ -889,6 +889,9 @@ INVENTORY: dict[Key, Row] = {
     _c("config.py", "<module>", "_config_lock", "Lock"): Row(
         "config", _R, "no lifecycle state; guards the config rebinding"
     ),
+    _c("config.py", "<module>", "_sink_lock", "Lock"): Row(
+        "config", _R, "serializes concurrent sink changes; outermost, held across the swap"
+    ),
     _c("console.py", "ConsoleWriter.__init__", "self._lock", "Lock"): Row(
         "ConsoleWriter", _R, "no lifecycle state; serialises console writes (as api._console)"
     ),
