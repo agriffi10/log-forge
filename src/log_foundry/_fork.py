@@ -284,6 +284,10 @@ holders this package does not define. ``tests/test_child_sink_slots.py`` holds t
 by behaviour — a class that stores a ``Sink``-annotated value on ``self`` however it is written,
 calls ``require_sink`` or releases a sink with ``owner=self`` must have an entry — and checks each
 entry at run time by building its class around a sentinel sink and requiring it recorded.
+
+The same positions are the only edges ``_sink_arg.loop_in`` follows when it refuses a sink graph
+that contains itself, so an entry here is also what makes a new wrapper's loop refusable
+(``tests/test_sink_loops.py`` builds every entry around itself).
 """
 
 _QUALNAME = type.__dict__["__qualname__"].__get__
@@ -308,17 +312,30 @@ def _child_sink_slots(holder: object) -> dict[str, str]:
     slots: dict[str, str] = {}
     if _is_class(holder):
         return slots
-    prefix = f"{_PACKAGE}."
     for base in _MRO(type(holder)):
-        if not _defined_here(base):
-            continue
-        module = _NAMESPACE(base).get("__module__")
-        qualname = _QUALNAME(base)
-        if type(module) is not str or type(qualname) is not str:
-            continue
-        key = (module.removeprefix(prefix), qualname)
-        slots.update(_CHILD_SINK_SLOTS.get(key, {}))
+        slots.update(_declared_slots(base))
     return slots
+
+
+def _declared_slots(cls: type) -> dict[str, str]:
+    """Returns the child-sink slots one class itself declares in the roster, read statically.
+
+    Args:
+      cls: A class from a holder's MRO.
+
+    Returns:
+      Its own ``_CHILD_SINK_SLOTS`` entry, or empty when it has none or is not this package's.
+
+    Raises:
+      None.
+    """
+    if not _defined_here(cls):
+        return {}
+    module = _NAMESPACE(cls).get("__module__")
+    qualname = _QUALNAME(cls)
+    if type(module) is not str or type(qualname) is not str:
+        return {}
+    return _CHILD_SINK_SLOTS.get((module.removeprefix(f"{_PACKAGE}."), qualname), {})
 
 
 def _super_target(value: object) -> object | None:

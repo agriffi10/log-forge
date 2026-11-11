@@ -1,7 +1,7 @@
 ---
 type: Decision
-title: "A sink factory builds each process's own sink lazily, and sink= refuses only what can never be a sink"
-description: "`configure(sink_factory=f)` never calls `f`: the first emit in each process does, through a private wrapper, and a forked child is handed a new wrapper and builds its own — never in the at-fork handler. A failed build is a counted delivery failure the next emit retries. `sink=` and the wrappers' inner sinks are refused only when exactly one of a closed list of builtin types; a missing `close` is never refused. (SPEC-079; arch §13; invariants §13)"
+title: "A sink factory builds each process's own sink lazily, and sink= refuses only what can never work"
+description: "`configure(sink_factory=f)` never calls `f`: the first emit in each process does, through a private wrapper, and a forked child is handed a new wrapper and builds its own — never in the at-fork handler. A failed build is a counted delivery failure the next emit retries. `sink=` and the wrappers' inner sinks are refused only when exactly one of a closed list of builtin types, or when the graph loops back through a package wrapper; a missing `close` is never refused. (SPEC-079, sink-loop fix; arch §13; invariants §13)"
 ---
 
 **`sink_factory=` is where a process's sink comes from when each process must build its own**
@@ -51,11 +51,44 @@ could still gain an `emit` — a class with `emit = None` whose `start()` binds 
 - **Accepted limit:** a user class with no `emit` is a heap type, which can always gain one, so it
   is accepted; if it never does, its batches are lost counted and announced (arch §13).
 
+**A sink graph that contains itself is refused too** (Andrew's decision of 2026-11-11, the
+sink-loop fix, no spec). `require_sink` runs `_sink_arg.loop_in` after the type test: a static,
+bounded depth-first walk over the forwarding positions `_fork._CHILD_SINK_SLOTS` names, through a
+`super` object whose `emit` resolves to a package wrapper's or a subclass's (a cooperative mixin's
+`super` resolving to the caller's own `emit` delivers, and is not followed), and back from a `weakref.proxy` to a node
+already on the path, found among that node's `weakref.getweakrefs`. A wrapper's constructor passes itself as `owner=`, so a
+child leading back to it is a `ValueError` before anything is stored — the re-run `__init__` and the
+subclass passing `self` to its base; `configure(sink=…)` refuses a graph holding any wrapper that
+leads back to itself; and `_FactorySink`'s build treats a built graph that leads back to it, or
+loops on its own, as a failed build, announced and raised as `SinkDeliveryError`, the result dropped
+unclosed. No such graph worked: measured at `641dfc86`, one `emit` on a `MultiSink` holding itself
+and a `MemorySink` wrote the batch 998 times, and every `flush()` raised `RecursionError`; a
+`FilteringSink` or `TransformSink` holding itself raised it from `emit`, `flush` and `close`.
+
+- **Rejected: following every attribute**, as the fork walk's marking frontier does. A sink of the
+  caller's own that keeps a reference to its parent and never calls it would be refused while it
+  works. Only package positions are known to forward every call.
+- **Rejected: a runtime re-entry guard** on every wrapper call. It would catch the loops below, at a
+  thread-local read per wrapper call across some two dozen methods.
+- **Accepted limits** (arch §13): a loop through a third-party sink's own code, one closing only
+  beneath a `weakref.proxy` to a node off the path, one formed after the last check (a slot assigned
+  later, or two factory wrappers building around each other at once), and one deeper than
+  `_LOOP_CEILING` (10,000 visits) are not found, and recurse as before.
+
 **Do NOT** call the factory in `configure()` or in any fork handler. **Do NOT** refuse a sink for a
 missing `close`, or by a rule rather than the closed list. **Do NOT** test the sink argument with
-`isinstance` or read any of its attributes at `configure()`. (SPEC-079 FR-005, FR-006)
+`isinstance` or read any of its attributes at `configure()` other than statically, through the
+package forwarding positions. **Do NOT** follow a third-party sink's attributes when looking for a
+loop. (SPEC-079 FR-005, FR-006; the sink-loop fix)
 
 ## History
+
+### 2026-11-11
+
+- **Widened** by the sink-loop fix (no spec), on Andrew's decision of 2026-11-11: a sink graph that
+  loops back through a package wrapper is refused at a wrapper's constructor and at
+  `configure(sink=…)`, and is a failed build in `_FactorySink`. The title, the fence and the last
+  **Do NOT** say so; following third-party attributes and a runtime guard were rejected.
 
 ### 2026-11-10
 

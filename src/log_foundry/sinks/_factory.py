@@ -6,7 +6,7 @@ import os
 import threading
 from typing import TYPE_CHECKING
 
-from log_foundry import _diag, _lifecycle
+from log_foundry import _diag, _lifecycle, _sink_arg
 from log_foundry.sinks._wrapper import ForwardedStopSignal
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses, flush_sink, read_losses
 
@@ -35,11 +35,15 @@ class _FactorySink:
     ``Sink`` — is announced here through ``_diag.absorbed``, naming the exception's type or the
     returned object's type and never a value (invariant 11), on the first failure and every
     ``WARN_EVERY``-th after it with the running total, because a factory that keeps failing fails
-    once per emit. It then raises ``SinkDeliveryError`` chained from the cause, which the path
+    once per emit. **A built sink that contains itself is a failed build too**: one leading back
+    to this wrapper — the factory wrapped ``get_config().sink`` — or holding a wrapper that leads
+    back to itself, found by ``_sink_arg.loop_in``, because storing it would make every emit
+    recurse. It then raises ``SinkDeliveryError`` chained from the cause, which the path
     that made the call counts and announces as any sink's failure: the worker retries under its
     ``max_retries``, the orphan path counts ``orphan_lost``. The next emit calls the factory
     again. A non-sink result is dropped unclosed, since it has no ``close`` the library can
-    trust. A ``BaseException`` from the factory propagates unchanged (SPEC-025).
+    trust, and so is a looped one, since the library cannot tell which of its sinks the caller
+    still holds elsewhere. A ``BaseException`` from the factory propagates unchanged (SPEC-025).
 
     **An emit from inside the factory**, on the same thread, raises ``SinkDeliveryError`` at once
     rather than calling the factory again or waiting on the lock its own thread holds. The thread
@@ -112,7 +116,9 @@ class _FactorySink:
 
         Raises:
           SinkDeliveryError: When this thread is already inside the factory, or the factory
-            raises ``Exception`` or returns something that is not a ``Sink``.
+            raises ``Exception``, returns something that is not a ``Sink``, or returns a sink
+            that leads back to this wrapper or to a wrapper of its own
+            (``_sink_arg.loop_in``).
         """
         me = (os.getpid(), threading.get_ident())
         if self._building == me:
@@ -133,6 +139,17 @@ class _FactorySink:
                 stored = _diag._STR_STR(_diag._STORED_NAME(type(result)))
                 refusal = SinkDeliveryError("sink_factory did not return a sink")
                 self._announce(refusal, f"it returned {stored}, not a sink")
+                raise refusal
+            looped = _sink_arg.loop_in(result, back_to=self)
+            if looped is not None:
+                stored = _diag._STR_STR(_diag._STORED_NAME(type(looped)))
+                where = (
+                    "leads back to the sink_factory= wrapper"
+                    if looped is self
+                    else f"holds a {stored} that leads back to itself"
+                )
+                refusal = SinkDeliveryError("sink_factory returned a sink that contains itself")
+                self._announce(refusal, f"what it returned {where}")
                 raise refusal
             _lifecycle.stamp(result)
             signal = vars(self).get("log_foundry_stop_signal")

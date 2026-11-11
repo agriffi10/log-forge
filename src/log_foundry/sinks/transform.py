@@ -193,8 +193,11 @@ class TransformSink:
           TypeError: If ``inner`` is an unpatchable builtin value that can never be a sink
             (``_sink_arg.require_sink``, SPEC-079 FR-005), or ``fn`` is not callable, each
             refused here rather than raised out of every ``emit`` (SPEC-071 FR-005).
+          ValueError: If ``inner`` leads back to this wrapper or holds a wrapper that leads back
+            to itself, so every call into it would recurse (``_sink_arg.require_sink``), refused
+            before anything is stored.
         """
-        require_sink(inner, "TransformSink inner")
+        require_sink(inner, "TransformSink inner", owner=self)
         require_callable(fn, "fn", type(self).__name__, optional=False)
         self._inner = inner
         vars(self)["log_foundry_stop_signal"] = None
