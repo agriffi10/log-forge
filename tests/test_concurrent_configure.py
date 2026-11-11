@@ -12,7 +12,15 @@ write to the end of the swap. Serves invariants 5 and 3.
 
 from __future__ import annotations
 
+import ast
+import gc
+import io
 import math
+import os
+import pathlib
+import select
+import signal
+import sys
 import threading
 import time
 from typing import Any
@@ -362,3 +370,221 @@ def test_without_its_roster_entry_a_child_waits_out_its_budget(
     assert float(elapsed) >= 0.9 * BUDGET, (
         f"the child did not wait on the inherited lock: {elapsed}s"
     )
+
+
+class _ReenteringSink(CountingSink):
+    """A sink whose own code calls ``configure(sink=target)`` once, from the hook it is built for.
+
+    ``where`` is ``"setter"`` (its ``log_foundry_stop_signal`` setter, run by the retarget on the
+    thread holding the lock), ``"close"`` (on a closer thread the swap joins) or ``"emit"`` (on the
+    drain thread a retarget's flush waits for).
+    """
+
+    def __init__(self, name: str, where: str, target: CountingSink) -> None:
+        super().__init__(name)
+        self.where = where
+        self.target = target
+        self.fired = False
+
+    def _reenter(self, where: str) -> None:
+        if self.where == where and not self.fired:
+            self.fired = True
+            log_foundry.configure(sink=self.target)
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        """Holds nothing; the setter is the hook."""
+        return None
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, value: threading.Event | None) -> None:
+        if value is not None:
+            self._reenter("setter")
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Counts, then re-enters once if built for it."""
+        super().emit(batch)
+        self._reenter("emit")
+
+    def close(self) -> None:
+        """Re-enters once if built for it, then records the close."""
+        self._reenter("close")
+        super().close()
+
+
+@pytest.mark.parametrize("budget", [BUDGET, None], ids=["bounded", "unbounded"])
+@pytest.mark.parametrize("where", ["setter", "close", "emit"])
+def test_a_sinks_own_code_reentering_configure_neither_waits_nor_closes_twice(
+    where: str, budget: float | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-entrant call does not wait on the swap waiting on it, and swaps unconfirmed.
+
+    Waiting would stall the outer call a whole budget past its own, or hang it with ``None``
+    (frame-2 review, measured). At ``641dfc86``, which had no lock, the setter case closed B at
+    events ``[0, 0]`` and the unbounded ``emit`` case stalled 5 s and never closed A. Here every
+    case returns at once, closes each sink once, and leaves config and delivery agreed.
+
+    The scenario runs in a forked child, because the regression it guards is a hang: measured
+    with the re-entry rule removed, the unbounded case hung the test process past its failed
+    assertion, in teardown, where no timeout reaches. ``run_in_child`` kills a child that hangs.
+    """
+    monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", budget)
+
+    def scenario() -> str:
+        sys.stderr = io.StringIO()
+        x = CountingSink("X")
+        a = _ReenteringSink("A", where, x) if where in ("close", "emit") else CountingSink("A")
+        b = _ReenteringSink("B", where, x) if where == "setter" else CountingSink("B")
+        _worker_on(a)
+
+        def act() -> None:
+            if where == "emit":
+                _traced()
+                log_foundry.flush(timeout=5.0)
+            else:
+                log_foundry.configure(sink=b)
+
+        start = time.monotonic()
+        call = threading.Thread(target=act, daemon=True)
+        call.start()
+        call.join(5.0)
+        elapsed = time.monotonic() - start
+        if call.is_alive():
+            return "hung"
+        live = _lifecycle._state.live_worker()
+        agreed = live is None or live.sink is log_foundry.get_config().sink
+        log_foundry.shutdown(timeout=2.0)
+        defects = _defects([s for s in (a, b, x) if s.events or s.closes])
+        announced = "was called by a sink's own code" in sys.stderr.getvalue()
+        return f"{elapsed:.3f}|{agreed}|{defects}|{announced}"
+
+    child = run_in_child(scenario)
+    assert child.finished, f"the child hung: it {child.ending}, {child.output!r}"
+    assert child.output != "hung", "the outer call hung on its own re-entrant configure()"
+    elapsed, agreed, defects, announced = child.output.split("|")
+    assert float(elapsed) < 0.5 * BUDGET, f"the outer call stalled {elapsed}s"
+    assert defects == "[]", defects
+    assert agreed == "True", "the config names the sink delivery goes to"
+    assert announced == "True", "the re-entrant call says it ran unserialized"
+
+
+def test_a_thread_that_forks_inside_a_sink_change_leaves_the_childs_configure_returning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Invariant 1 in a child: the release goes to the lock that was acquired, not the global.
+
+    The fork repair rebinds ``config._sink_lock`` to a fresh, unlocked lock. A child forked by the
+    thread inside ``_change_sink`` continues into its ``finally``, which, releasing through the
+    global, raised ``RuntimeError: release unlocked lock`` out of ``configure()`` (frame-2 review,
+    measured with a stop-signal setter that forked). The fork here is planted after the retarget.
+    """
+    a, b = CountingSink("A"), CountingSink("B")
+    _worker_on(a)
+    parent = os.getpid()
+    read_end, write_end = os.pipe()
+    forked: list[int] = []
+    real = Worker.retarget
+
+    def forking(self: Worker, new_sink: Any, deadline: float | None = None) -> Any:
+        outcome = real(self, new_sink, deadline)
+        if not forked:
+            gc.collect()
+            forked.append(os.fork())
+            if os.getpid() != parent:
+                signal.alarm(10)
+        return outcome
+
+    monkeypatch.setattr(Worker, "retarget", forking)
+    try:
+        try:
+            log_foundry.configure(sink=b)
+            result = "returned"
+        except BaseException as exc:
+            result = f"raised {type(exc).__name__}"
+        if os.getpid() != parent:
+            os.write(write_end, result.encode())
+            os._exit(0)
+    finally:
+        if os.getpid() != parent:
+            os._exit(1)
+    os.close(write_end)
+    child = forked[0]
+    try:
+        ready, _, _ = select.select([read_end], [], [], 15.0)
+        report = os.read(read_end, 200).decode() if ready else "no report"
+    finally:
+        os.close(read_end)
+        if not ready:
+            os.kill(child, signal.SIGKILL)
+        os.waitpid(child, 0)
+    assert result == "returned", f"the parent's configure(): {result}"
+    assert report == "returned", f"the child's configure(): {report}"
+
+
+def _sink_lock_sites(source: dict[str, str]) -> list[str]:
+    """Every place a module in ``source`` reads ``_sink_lock``, as ``file:function:shape``.
+
+    A bare name and an attribute both count, so ``config._sink_lock`` reached from another module
+    is seen as well as the global inside ``config``. The function is the innermost one enclosing
+    the read, ``<module>`` for none. The shape is ``bind`` for a plain assignment of the name to a
+    local and ``use`` for anything else.
+    """
+    sites = []
+    for path, text in sorted(source.items()):
+        tree = ast.parse(text)
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            hit = (isinstance(node, ast.Name) and node.id == "_sink_lock") or (
+                isinstance(node, ast.Attribute) and node.attr == "_sink_lock"
+            )
+            if not hit or not isinstance(getattr(node, "ctx", None), ast.Load):
+                continue
+            parent = parents.get(node)
+            bound = (
+                isinstance(parent, ast.Assign)
+                and parent.value is node
+                and all(isinstance(target, ast.Name) for target in parent.targets)
+            )
+            scope = parent
+            while scope is not None and not isinstance(
+                scope, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                scope = parents.get(scope)
+            name = scope.name if scope is not None else "<module>"
+            sites.append(f"{path}:{name}:{'bind' if bound else 'use'}")
+    return sorted(sites)
+
+
+def test_the_lock_is_taken_at_one_site_through_a_local() -> None:
+    """The one site, pinned: ``_change_sink`` binds the lock to a local and uses nothing else.
+
+    ``tests/test_runtime_holder.py``'s ``LOCK_SITES_AT_BASE`` sees only ``with`` statements in
+    ``_lifecycle.py`` and ``worker.py``, so it can see neither this module nor an
+    ``acquire``/``release`` pair. A second site would serialize something the docs do not say, and
+    a use of the global past the bind would release the child's fresh lock after a fork.
+    """
+    src = pathlib.Path(config.__file__).resolve().parent
+    source = {
+        str(path.relative_to(src)): path.read_text(encoding="utf-8") for path in src.rglob("*.py")
+    }
+    assert _sink_lock_sites(source) == ["config.py:_change_sink:bind"]
+
+
+@pytest.mark.parametrize(
+    ("planted", "site"),
+    [
+        ("    _sink_lock.release()\n", "config.py:_change_sink:use"),
+        ("    with config._sink_lock:\n        pass\n", "_lifecycle.py:planted:use"),
+    ],
+    ids=["a-use-past-the-bind", "a-second-site"],
+)
+def test_the_site_pin_sees_a_planted_site(planted: str, site: str) -> None:
+    """The pin's control: a planted use of the global, here or in another module, is seen."""
+    text = pathlib.Path(config.__file__).read_text(encoding="utf-8")
+    source = {"config.py": text}
+    if site.startswith("config.py"):
+        anchor = "    lock = _sink_lock\n"
+        source["config.py"] = text.replace(anchor, anchor + planted, 1)
+    else:
+        source["_lifecycle.py"] = "def planted():\n" + planted
+    assert site in _sink_lock_sites(source)

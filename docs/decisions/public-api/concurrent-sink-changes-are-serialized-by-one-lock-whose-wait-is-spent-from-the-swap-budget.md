@@ -26,20 +26,29 @@ is the call that swaps last. Andrew chose the wider scope on 2026-11-11; it narr
 sink.
 
 **The wait is spent from the call's budget, not added to it** (invariant 3). The budget is resolved
-once, before the wait, and the swap gets what is left. A holder started earlier and runs inside its
-own budget, which ends first, so with two callers the wait ends in time unless the holder overruns.
-With three or more it can also run out when nobody overruns, because `threading.Lock` grants no
-arrival order and a later caller, whose budget ends later, can be granted the lock first; a
-three-caller probe with slow closes granted it in arrival order 8 of 8 times on macOS, so the case
-is reasoned rather than reproduced. Either way the call proceeds without the lock and writes one
+once, before the wait, and the swap gets what is left. That wait can run out while the holder is
+still finishing, even with two callers: each clock starts before its own wait, `threading.Lock`
+grants no arrival order, and a holder that spends its whole budget overruns it by its last critical
+section and the release. Measured by the frame-2 review, two callers with a sink whose `emit` takes
+0.1 s against a 0.3 s budget fell back in 75 of 150 rounds, none defective, and with a 0.02 s `emit`
+against 1.0 s in none of 60. A call whose wait ran out proceeds without the lock and writes one
 `pending` line, since running alongside the holder is the unserialized pair again: a sink may be
-closed twice, or the config may name another sink than delivery. Waiting without bound would break the bound, and giving up
-would lose the configure, which `configure()`'s `Raises:` disowns. A squeezed second swap may find
-too little budget left to confirm its drain, and then records `incomplete_swaps` as any unconfirmed
-swap does. A budget above `threading.TIMEOUT_MAX`, `inf` included, waits without bound as `None`
-does, `sinks._retry.wait_budget`'s rule (SPEC-066), because `acquire` raises `OverflowError` for it;
-it reaches the swap as `None` too, where `inf` had made the swap absorb an `OverflowError` of its own
+closed twice, or the config may name another sink than delivery. Its swap runs with nothing left,
+so its drain is unconfirmed and counted in `incomplete_swaps`. Waiting without bound would break
+the bound, and giving up would lose the configure, which `configure()`'s `Raises:` disowns; giving
+the waiter a fresh budget after the wait was rejected for the same bound. A budget above
+`threading.TIMEOUT_MAX`, `inf` included, waits without bound as `None` does,
+`sinks._retry.wait_budget`'s rule (SPEC-066), because `acquire` raises `OverflowError` for it; it
+reaches the swap as `None` too, where `inf` had made the swap absorb an `OverflowError` of its own
 and leave the worker on the old sink.
+
+**A sink's own code re-entering `configure()` never waits.** On the thread already holding the lock
+(a stop-signal setter during the retarget), or on one of the library's own `log-foundry-` threads
+(the drain, a closer), the swap is waiting on that very thread, so a wait is a stall of the whole
+budget, or with an unbounded one a hang the base commit did not have. Such a call tries the lock
+once and otherwise runs unserialized, announced. The lock is bound to a local and released through
+it, so a thread that forks from inside the call does not release the child's fresh copy and raise
+`RuntimeError` out of `configure()` there (frame-2 review, measured).
 
 **Rejected: re-checking the post-retarget decision inside `_swap_sink`.** Arming the new sink only
 while it is still the worker's looks local, but an unfenced second swap leaves its displaced sink in
