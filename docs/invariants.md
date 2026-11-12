@@ -546,7 +546,11 @@ and closes no transport the parent opened.
 `close()` returns without touching anything, because the child acquired no thread, loop or
 connection and `reacquire_after_fork` is not implemented (SPEC-061 FR-001; `architecture.md` §12
 names what would close it). The pid is compared before the sink's lock, since a lock a caller
-held at fork time stays held in the child. The walk replaces locks only on this package's
+held at fork time stays held in the child. A forked child's `SQLiteSink` refuses every `emit` and
+its `close()` returns without touching the connection, for the same reason and with the pid read
+before the lock, and a fork handler strands every live sink's inherited connection so the child
+never finalizes it, because on macOS both using and freeing it fault inside `os_log`
+(`architecture.md` §12 names what would close it). The walk replaces locks only on this package's
 objects, so a sink of your own is repaired only if it subclasses `Sink` or a shipped sink. Since
 SPEC-079 a package object behind a third-party holder, or two containers down, is reached from what
 the walk's repair frontier forwards to its marking frontier and is repaired and re-acquired
@@ -570,6 +574,8 @@ the closed guard driven through `configure()`, SPEC-076), `tests/test_fork_roste
 `tests/test_fork_child_state.py` (SPEC-079),
 `tests/test_sink_ownership.py`,
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
+`tests/test_sinks_sqlite_fork.py` (the `SQLiteSink` child, under a real `os.fork` and through a
+child's interpreter exit),
 `tests/test_invariants_model.py` (a child forked at a step boundary of the sequential driver,
 from each lifecycle state, SPEC-077).
 

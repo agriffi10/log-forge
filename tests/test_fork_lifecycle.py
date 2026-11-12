@@ -1122,7 +1122,9 @@ def test_a_child_does_not_block_on_a_driver_sinks_inherited_counter_lock(
 
     The child's ``emit`` really hits a driver error, so it counts ``failed`` under the counter
     lock before raising — the only route to that lock for a clean batch — and ``losses()``
-    takes it again.
+    takes it again. A forked child's ``SQLiteSink`` refuses before it reaches the driver, since a
+    SQLite connection cannot cross a fork, so for it ``losses()`` is the only route to the lock:
+    the refusal is reported, not counted, and the read must still return.
     """
     sink = _driver_failing_sink(build, tmp_path)
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
@@ -1136,10 +1138,13 @@ def test_a_child_does_not_block_on_a_driver_sinks_inherited_counter_lock(
         except (OSError, sqlite3.Error) as err:
             if not isinstance(err, SinkDeliveryError):
                 return f"raised a plain {type(err).__name__}"
+            prefix = ""
+        except SinkDeliveryError as err:
+            prefix = f"refused={'forked child' in str(err)};"
         else:
             return "returned"
         losses = sink.losses()
-        return f"failed={losses.failed if losses else None}"
+        return f"{prefix}failed={losses.failed if losses else None}"
 
     try:
         child = run_in_child(emit_then_read)
@@ -1148,7 +1153,8 @@ def test_a_child_does_not_block_on_a_driver_sinks_inherited_counter_lock(
         holder.join(5.0)
 
     assert child.finished, f"the child {child.ending}, having written {child.output!r}"
-    assert child.output == "failed=2", child.output
+    expected = "refused=True;failed=None" if build == "sqlite" else "failed=2"
+    assert child.output == expected, child.output
 
 
 def test_a_forked_syslog_child_stamps_its_own_pid(monkeypatch: pytest.MonkeyPatch) -> None:
