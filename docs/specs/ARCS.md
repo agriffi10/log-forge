@@ -406,3 +406,9 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   which spec-lint refuses as a dependency, so each arc spec named them in its Overview only. Once
   the branch was rebased onto 1.1.0, each arc spec that builds on one gained it in `depends_on`.
 
+  SPEC-081 joined the arc after SPEC-079 landed, to fix two defects in the ownership record that
+  SPEC-079's flake fix had exposed: the record pinned every sink ever handed over, so a long-lived
+  process that reconfigured grew without bound and its children tripped the marking ceiling, and a
+  child whose marking tripped could still claim a parent's sink it handed over again. Andrew chose
+  its heap fallback with the question tool on 2026-11-12.
+
