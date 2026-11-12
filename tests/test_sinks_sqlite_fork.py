@@ -13,6 +13,7 @@ inherited connection by a reference nothing releases.
 
 from __future__ import annotations
 
+import gc
 import os
 import sqlite3
 import subprocess
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import log_foundry
+from log_foundry.sinks import sqlite as sqlite_sink
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.sqlite import SQLiteSink
 from test_fork_lifecycle import run_in_child
@@ -119,20 +121,28 @@ def test_a_forked_child_refuses_its_inherited_sqlite_sink_and_survives(
 
 
 def test_a_forked_child_holds_the_inherited_connection_by_a_reference_nothing_releases() -> None:
-    """The fork handler leaks exactly one reference to the inherited connection, in the child.
+    """The fork handler leaks exactly one reference to the inherited connection, held by nothing.
 
     That reference is the fix for the crash at the child's exit: a connection the child can never
     drop is never finalized there, so ``sqlite3_close`` never reaches ``os_log``. It is asserted
     as a count because that is the one observable of it on a platform where the crash does not
-    happen. A sink the application holds and the library was never handed is stranded too,
-    since the handler reads its registry of live sinks rather than walking the runtime's roots.
+    happen — and as the count of references **no object holds**, the reference count less the
+    referrers the collector can see, because a container holding it would raise the plain count
+    by one too, and a container is cleared at finalization, which is the remedy measured not to
+    work. A sink the application holds and the library was never handed is stranded too, since
+    the handler reads its registry of live sinks rather than walking the runtime's roots.
     """
     held = SQLiteSink(":memory:")
+
+    def unheld() -> int:
+        conn = held._conn
+        return sys.getrefcount(conn) - len(gc.get_referrers(conn))
+
     try:
-        before = sys.getrefcount(held._conn)
+        before = unheld()
 
         def work() -> str:
-            return str(sys.getrefcount(held._conn) - before)
+            return str(unheld() - before)
 
         child = run_in_child(work, timeout=10)
     finally:
@@ -182,6 +192,12 @@ _EXIT_SCRIPT = textwrap.dedent(
         statuses.append(os.waitpid(pid, 0)[1])
     log_foundry.shutdown()
     print(statuses)
+    if database != ":memory:":
+        import sqlite3
+        reader = sqlite3.connect(database)
+        rows = reader.execute("SELECT json_extract(event, '$.message') FROM log_events").fetchall()
+        reader.close()
+        print(sorted({row[0] for row in rows if row[0] is not None}))
     """
 )
 
@@ -198,8 +214,9 @@ def test_a_forked_child_exits_normally_without_freeing_the_inherited_connection(
     macOS that close faulted inside ``os_log`` — before the fix every child of this script died
     of ``SIGSEGV``. ``run_in_child`` cannot see it, since its children leave through
     ``os._exit``, so this runs a fresh interpreter whose children exit through ``sys.exit``, three
-    per run, including a child that forks again. It discriminates on macOS only; on Linux the
-    reference count above is the same mechanism's guard.
+    per run, including a child that forks again. The exit itself discriminates on macOS only;
+    on Linux the file rows of the logging children do, since there the child's row used to land in
+    the parent's database, and the unheld reference count above is the exit fix's guard.
     """
     target = str(tmp_path / "events.db") if database == "file" else database
     result = subprocess.run(  # noqa: S603
@@ -211,4 +228,29 @@ def test_a_forked_child_exits_normally_without_freeing_the_inherited_connection(
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "[0, 0, 0]", result.stdout + result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == "[0, 0, 0]", result.stdout + result.stderr
+    if database == "file":
+        assert lines[1:] == ["['parent']"], result.stdout
+
+
+def test_a_connection_is_held_in_a_list_where_py_incref_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback for an interpreter without ``ctypes.pythonapi`` still holds the connection.
+
+    The weaker remedy, kept rather than doing nothing: it stops the collector freeing the
+    connection while the child runs, which is the crash a child that keeps running would hit.
+    """
+    conn = sqlite3.connect(":memory:")
+    monkeypatch.setattr(sqlite_sink, "_INCREF", None)
+    monkeypatch.setattr(sqlite_sink, "_STRANDED", [])
+    before = sys.getrefcount(conn)
+    try:
+        sqlite_sink._strand(conn)
+        assert len(sqlite_sink._STRANDED) == 1
+        assert sqlite_sink._STRANDED[0] is conn
+        assert sys.getrefcount(conn) == before + 1
+    finally:
+        sqlite_sink._STRANDED.clear()
+        conn.close()

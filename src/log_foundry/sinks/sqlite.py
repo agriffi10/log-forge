@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import sqlite3
 import threading
 import weakref
+from typing import Any
 
 from log_foundry import _diag, _fork
 from log_foundry.sinks._chunk import valid_identifier
@@ -36,6 +36,42 @@ reused ``id`` is safe because the dictionary removes only an entry whose weak re
 """
 
 
+def _resolve_incref() -> Any:
+    """Finds ``Py_IncRef`` and ``py_object`` once, in the parent, or ``None`` where it cannot.
+
+    Resolved at import rather than in the child, so the fork handler makes no ``dlsym`` call after
+    the fork, and guarded, so a CPython built without ``_ctypes`` or an interpreter with no
+    ``pythonapi`` still imports this module and falls back to :data:`_STRANDED`.
+
+    Args:
+      None.
+
+    Returns:
+      ``(Py_IncRef, py_object)``, or ``None`` when either is unavailable.
+
+    Raises:
+      None.
+    """
+    try:
+        import ctypes
+
+        return (ctypes.pythonapi.Py_IncRef, ctypes.py_object)
+    except (ImportError, AttributeError):
+        return None
+
+
+_INCREF: Any = _resolve_incref()
+"""``Py_IncRef`` and the wrapper it takes, or ``None`` where ``ctypes`` cannot provide them."""
+
+_STRANDED: list[object] = []
+"""Where a connection is held when ``Py_IncRef`` is unavailable, the weaker of the two remedies.
+
+It keeps the connection alive while the child runs, but interpreter finalization clears it, so on
+macOS a child exiting through ``sys.exit`` can still fault. Only an interpreter without
+``ctypes.pythonapi`` uses it.
+"""
+
+
 def _strand(conn: object) -> None:
     """Leaks one reference to a connection another process opened, so this one never frees it.
 
@@ -52,7 +88,8 @@ def _strand(conn: object) -> None:
 
     The cost is one connection object and its descriptor, held until the child exits, which is
     what a child that never touched the sink held anyway. A second call leaks a second reference
-    to the same object, which costs a count and nothing else.
+    to the same object, which costs a count and nothing else. Where ``Py_IncRef`` could not be
+    resolved, the connection goes to :data:`_STRANDED` instead.
 
     Args:
       conn: The inherited connection, or whatever a subclass stored in its place.
@@ -63,7 +100,11 @@ def _strand(conn: object) -> None:
     Raises:
       None.
     """
-    ctypes.pythonapi.Py_IncRef(ctypes.py_object(conn))
+    if _INCREF is None:
+        _STRANDED.append(conn)
+        return
+    incref, wrap = _INCREF
+    incref(wrap(conn))
 
 
 def _strand_after_fork() -> None:
@@ -77,8 +118,10 @@ def _strand_after_fork() -> None:
     makes either.
 
     Both attributes are read with ``_static_value``, so no property or ``__getattr__`` of a
-    subclass runs in the fork handler (SPEC-079 FR-002); a sink missing either, or whose
-    connection was opened in this process, is left alone. A grandchild strands again, which leaks
+    subclass runs in the fork handler (SPEC-079 FR-002), and the pid is compared only once its
+    type is exactly ``int``, so a value whose ``__eq__`` is a subclass's own never runs there
+    either. A sink missing either attribute, holding a pid of any other type, or whose connection
+    was opened in this process, is left alone. A grandchild strands again, which leaks
     one more reference to an object already leaked.
 
     Args:
@@ -94,7 +137,7 @@ def _strand_after_fork() -> None:
     for sink in list(_LIVE.values()):
         opened_in = _static_value(sink, "_pid")
         conn = _static_value(sink, "_conn")
-        if opened_in is _ABSENT or conn is _ABSENT or opened_in == pid:
+        if conn is _ABSENT or type(opened_in) is not int or opened_in == pid:
             continue
         _strand(conn)
 
