@@ -183,7 +183,9 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     Args:
       timeout: Seconds bounding the wait for the background thread and, carved from the same
         budget, a short grace for any sink still closing after a late ``configure(sink=...)``
-        (SPEC-027 FR-004, SPEC-030 FR-003). It does **not** bound the live sink's own
+        (SPEC-027 FR-004, SPEC-030 FR-003). The same grace, spent once, also bounds a wait for a
+        ``configure(sink=...)`` still in flight on another thread to take effect, so the sink it
+        installs is closed by this call rather than left open. It does **not** bound the live sink's own
         ``close()``, which runs inline on either delivery path and is unbounded — so a sink
         blocked in a network call inside ``close()`` holds this call, and the process, open for
         as long as it blocks, whatever ``timeout`` says (measured 6.01 s against

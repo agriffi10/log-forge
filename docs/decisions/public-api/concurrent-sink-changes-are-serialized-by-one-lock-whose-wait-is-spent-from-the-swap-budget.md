@@ -64,6 +64,17 @@ on `_fork._GLOBAL_PRIMITIVES`, so a child forked while a parent thread held it s
 
 ## History
 
+### 2026-11-12
+
+- **Refined, not reversed.** A `shutdown()` deliberately does not take this lock, or wait on it:
+  holding it broke six shipped tests and held a stop-signal backoff behind the swap, and as a
+  barrier it also waited out the swap's slow displaced closes, since the lock is held through the
+  closer join. A shutdown landing mid-swap instead waits on each swap's `_Operation.decided`, within
+  its closer grace (`docs/decisions/pipeline/`). The swap's fenced branch now releases its displaced
+  sink only while the record still owes it, and that is not the decision re-check rejected above:
+  skipping an *arm* can orphan a sink, while skipping a *release* of a sink the record no longer
+  owes cannot, because every route out of the record is a take whose taker closes it.
+
 ### 2026-11-11
 
 - **Settled**, as a fix after SPEC-079. Supersedes SPEC-078's out-of-scope line and the `SWAP` row's

@@ -90,6 +90,7 @@ _PRIMITIVE_HOMES = {
     "Worker": "walk",
     "_FactorySink": "walk",
     "_Close": "dropped: _lifecycle._clear_after_fork",
+    "_Operation": "dropped: _lifecycle._clear_after_fork",
     "_FlushMarker": "dropped: _lifecycle._rebuild_worker_after_fork",
 }
 """Every class that assigns a primitive to ``self``, with the one mechanism that handles it.

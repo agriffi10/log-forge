@@ -719,7 +719,8 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         "_swap_sink",
         (
             "outcome.verdict == 'fenced' and previous is not None and "
-            "(previous is not new_sink) and (not _state.held(previous))"
+            "(previous is not new_sink) and (not _state.held(previous)) and "
+            "_state._closes.owes(previous)"
         ),
         0,
     ): (
@@ -731,7 +732,14 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "gap the sink is owed and unheld, so a concurrent shutdown() takes it and starts "
             "closing it, and the registry hands this branch that *same* entry, so a "
             "detached release starts a second closer into a close already running. Measured at "
-            "two overlapping closes with a preemption point, and 13 of 120 seeds unforced."
+            "two overlapping closes with a preemption point, and 13 of 120 seeds unforced. "
+            "The `owes` term is the same gap after that shutdown's take has *finished*: the "
+            "close already ran inline, nothing is in flight for `held` to see, and a take that "
+            "popped the absent sink with a default released it a second time (20 of 20 forced "
+            "at `624d817f`, for shutdown() and the exit drain). A question about the record, not "
+            "the worker; filed in this row because it is a term of the same boolean. Skipping a "
+            "release of a sink the record no longer owes cannot orphan it: every route out of "
+            "the record is a take whose taker closes it."
         ),
     ),
     ("_swap_sink", "worker.retarget(new_sink, op.deadline)", 0): (

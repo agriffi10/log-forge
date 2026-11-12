@@ -7,7 +7,7 @@ import time
 import pytest
 
 import log_foundry
-from conftest import release_after_clock
+from conftest import install_worker, release_after_clock
 from log_foundry import _lifecycle, config
 from log_foundry import _lifecycle as lifecycle
 from log_foundry import worker as worker_mod
@@ -773,7 +773,7 @@ def test_the_worker_still_records_its_own_unconfirmed_drain() -> None:
 
     wedged, new = Wedged(), CountingSink("new")
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     try:
         worker.submit([{"message": "wedges the drain"}])
         assert wedged.in_emit.wait(5.0)
@@ -897,7 +897,7 @@ def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> No
 
     hung, live = SlowCloseSink("hung"), CountingSink("live")
     worker = worker_mod.Worker(hung, batch_size=1000, flush_interval=100.0)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     try:
         log_foundry.configure(service="t", sink=live)  # worker swap; the close hangs
         assert hung.in_close.wait(5.0)
@@ -1089,7 +1089,7 @@ def test_a_swap_does_not_close_a_sink_an_expired_shutdown_left_open() -> None:
     log_foundry.info("orphan, arming the record")
 
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     try:
         worker.submit([{"message": "wedges the drain thread"}])
         assert wedged.in_emit.wait(5.0)

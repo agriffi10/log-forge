@@ -602,7 +602,15 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
 
     The in-process tests can show the sink is armed, but the arming and the close both run
     through functions the test could call itself. Here nothing is invoked by hand: the child
-    exits normally and the library's own ``atexit`` handler is the only thing that could close B.
+    exits normally, and only the library's own ``shutdown()`` and ``atexit`` handler close B.
+
+    Re-premised by the fix after SPEC-079 for a shutdown landing mid-swap: a ``shutdown()`` now
+    waits for each swap in flight to take its decision. The swap's flush used to *join* the
+    shutdown it started, which now waits on that very swap and would run out its closer grace;
+    so the flush returns once the shutdown has retired the process, the retarget declines, the
+    swap arms B, and the shutdown — joined by the interpreter before ``atexit`` — closes B
+    itself. B is still closed exactly once before the process exits, which is the criterion,
+    and nothing passes through the shutdown's not-decided fallback.
     """
     import subprocess
     import sys
@@ -635,7 +643,6 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
             t.start()
             while not log_foundry.health().retired:
                 pass
-            t.join(30.0)
             return r
         worker.flush = flush_then_shut_down
 
@@ -652,6 +659,7 @@ def test_a_declined_swaps_sink_is_closed_by_the_time_the_process_exits() -> None
         f"{result.stdout}\n{result.stderr[-800:]}"
     )
     assert result.stdout.count("CLOSED A") == 1, f"and A exactly once:\n{result.stdout}"
+    assert "could not wait for a sink change" not in result.stderr, result.stderr[-800:]
 
 
 # -- SPEC-050 FR-002: the orphan path's half of the in-flight-close wait -----------------

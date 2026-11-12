@@ -837,7 +837,14 @@ lifecycle lock, and each in-flight entry records its rule — `INLINE` on the ca
 shutdown's one grace) — and its thread, and holds no sink. Both moment predicates end in
 `_CloseRegistry.in_flight`; `health().closing_sinks` counts the `GRACED` entries whose thread is
 alive. **A shutdown spends the closer grace once**: every graced wait of one call ends at that
-call's `grace_end`, fixed at its first graced wait.
+call's `grace_end`, fixed at its first graced wait, less whatever the call already spent waiting
+for a swap in flight to take its decision (`_Operation.grace_spent`). That wait comes first: a
+`shutdown()` landing between a swap's retarget and its decision drained into a sink the swap had
+installed but not yet armed and returned with it open, so it waits on each such swap's
+`_Operation.decided`, within the grace, before it drains. A swap releases the sink it displaced
+only while the owed record still owes it (`_CloseRegistry.owes`), since a sink the record no
+longer owes was taken, and closed, by somebody else. `docs/decisions/pipeline/` → *A shutdown
+waits for a swap in flight to decide* has the measurements.
 
 **`State` is stored and decides** (SPEC-078 FR-003, FR-004). `Runtime._current` holds the
 settled state — `RUNNING`, `CLOSED` or `UNCONFIGURED`, from the worker, the retirement count and the

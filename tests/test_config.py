@@ -370,7 +370,7 @@ def test_an_unconfirmable_drain_is_bounded_counted_and_leaves_the_old_sink_open(
     """A hung sink must not make ``configure()`` hang, and must not be closed under its writer."""
     wedged, new = WedgedSink(), SwapSink()
     worker = worker_mod.Worker(wedged, batch_size=1, flush_interval=100.0)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     try:
         worker.submit(_span("stuck"))
         assert wedged.in_emit.wait(5.0), "the drain thread must be inside emit"
@@ -633,7 +633,7 @@ def test_an_expired_first_shutdown_still_grants_the_grace_on_the_next_call() -> 
     # batch_size=1 here rather than the shared helper's 1000: this test needs one submission to
     # reach the sink, because wedging the drain thread is how the first shutdown is made to expire.
     worker = worker_mod.Worker(slow, batch_size=1, flush_interval=100.0)
-    _lifecycle._state._worker = worker
+    install_worker(worker)
     wedge = threading.Event()
     wedged = _WedgedEmitSink(wedge)
     try:
