@@ -11,10 +11,17 @@ mark is written only in ``_get_worker``'s section under the same lock, so nothin
 between; and the one discharge under the lock that can meet a mark, ``put_back``, reports it and
 lets ``_close_owed`` pay after releasing the lock. This file holds that shape over the source.
 
-Four checks, each a reason a finding names, and a roster of the sites the real module has, so a
-rename or a lost ``with`` detection cannot make the audit pass by finding nothing. The corpus at
-the bottom asserts each check's reason on a case written to trip it, and silence on the shapes
-that must pass. Serves invariants 3 and 5.
+Five checks, each a reason a finding names, and a roster of the sites the real module has, so a
+rename or a lost ``with`` detection cannot make the audit pass by finding nothing. Four hold the
+discharges under the lock; the fifth holds the premise they rest on, that every
+``defer_hand`` call sits inside a ``with _state._lock:`` body. The corpus at the bottom asserts
+each check's reason on a case written to trip it, and silence on the shapes that must pass.
+
+**The scan is lexical.** It sees a call written inside a ``with _state._lock:`` body of the
+function that holds the lock, and nothing else: a discharge reached through a helper that a
+locked section calls, or a ``defer_hand`` reached that way, is invisible to it, and so is a lock
+held through any spelling other than ``_state._lock``. A new helper on such a path needs this
+module's reasoning checked by hand. Serves invariants 3 and 5.
 """
 
 from __future__ import annotations
@@ -33,15 +40,21 @@ RELEASE_NOT_TAKEN = "a release under the state lock discharges an entry it did n
 FINISH_NOT_TAKEN = "a finish under the state lock discharges an entry it did not take there"
 PUT_BACK_DISCARDED = "a put_back under the state lock discards the deferred hand it reports"
 PAID_UNDER_LOCK = "a deferred hand is paid under the state lock, which the payment takes itself"
+MARKED_OUTSIDE_LOCK = (
+    "a hand is deferred outside the state lock, so a locked discharge could meet it"
+)
 
 LOCK_HELD_SITES = {
     ("_swap_sink", "release"): 2,
     ("_close_owed", "put_back"): 1,
+    ("_get_worker", "defer_hand"): 1,
 }
-"""Every discharge made under ``_state._lock`` in ``_lifecycle.py``, by function and call.
+"""Every discharge made under ``_state._lock`` in ``_lifecycle.py``, and every mark, by function.
 
 ``_swap_sink`` releases a stale sink and its displaced one detached, each taken in the same
-section; ``_close_owed`` puts back what an interrupt left untaken. A new site is a new row, after
+section; ``_close_owed`` puts back what an interrupt left untaken; ``_get_worker`` marks a close in
+flight, the one writer of the mark. The ``defer_hand`` row counts every call, under the lock or
+not, so moving the call is a roster change as well as a finding. A new site is a new row, after
 the reasoning in this module's docstring has been checked for it.
 """
 
@@ -122,17 +135,31 @@ def _bound_from_take(body: list[ast.stmt]) -> set[str]:
     return names
 
 
-def audit(source: str) -> tuple[list[str], dict[tuple[str, str], int]]:
-    """Runs the four checks over one module's source.
+def _defer_calls(tree: ast.Module) -> list[tuple[str, ast.Call]]:
+    """Every ``defer_hand(...)`` call in the module, with the function it is written in."""
+    return [
+        (func.name, node)
+        for func in ast.walk(tree)
+        if isinstance(func, ast.FunctionDef | ast.AsyncFunctionDef)
+        for node in _own_nodes(func)
+        if isinstance(node, ast.Call) and _called(node) == "defer_hand"
+    ]
 
-    Returns the findings, each ``"<function>: <reason>"``, and the lock-held discharge sites
-    found, by function and call, for the roster.
+
+def audit(source: str) -> tuple[list[str], dict[tuple[str, str], int]]:
+    """Runs the five checks over one module's source.
+
+    Returns the findings, each ``"<function>: <reason>"``, and the sites found, by function and
+    call, for the roster: the lock-held discharges and every ``defer_hand`` call.
     """
     findings: list[str] = []
     sites: dict[tuple[str, str], int] = {}
-    for function, body in _locked_bodies(ast.parse(source)):
+    tree = ast.parse(source)
+    locked_calls: set[int] = set()
+    for function, body in _locked_bodies(tree):
         taken = _bound_from_take(body)
         for call, parent in _calls_in(body):
+            locked_calls.add(id(call))
             name = _called(call)
             if name in {"release", "finish", "put_back"}:
                 sites[(function, name)] = sites.get((function, name), 0) + 1
@@ -149,6 +176,10 @@ def audit(source: str) -> tuple[list[str], dict[tuple[str, str], int]]:
                     findings.append(f"{function}: {PUT_BACK_DISCARDED}")
             elif name == "_hand_after_close":
                 findings.append(f"{function}: {PAID_UNDER_LOCK}")
+    for function, call in _defer_calls(tree):
+        sites[(function, "defer_hand")] = sites.get((function, "defer_hand"), 0) + 1
+        if id(call) not in locked_calls:
+            findings.append(f"{function}: {MARKED_OUTSIDE_LOCK}")
     return findings, sites
 
 
@@ -175,6 +206,14 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
         """,
         [f"site: {RELEASE_NOT_TAKEN}"],
     ),
+    "release-closing-from-a-call-that-is-not-a-take": (
+        """
+        with _state._lock:
+            release(stale, detached=True, closing=_state._closes._in_flight.get(id(stale)))
+            release(other, detached=True, closing=_state._closes.register(other, _Rule.GRACED))
+        """,
+        [f"site: {RELEASE_NOT_TAKEN}", f"site: {RELEASE_NOT_TAKEN}"],
+    ),
     "release-closing-from-elsewhere": (
         """
         entry = _state._closes.take(stale, rule)
@@ -189,6 +228,15 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
             _state._closes.finish(sink, close)
         """,
         [f"site: {FINISH_NOT_TAKEN}"],
+    ),
+    "finish-of-an-entry-taken-in-the-same-block": (
+        """
+        with _state._lock:
+            entry = _state._closes.take(sink, rule)
+            _state._closes.finish(sink, entry)
+            _state._closes.finish(other, _state._closes.take(other, rule))
+        """,
+        [],
     ),
     "put-back-discarded": (
         """
@@ -228,6 +276,37 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
             def later():
                 release(sink)
                 _hand_after_close(sink)
+        """,
+        [],
+    ),
+    "a-lock-held-in-a-nested-definition-is-its-own": (
+        """
+        def inner():
+            with _state._lock:
+                release(stale, detached=True)
+        """,
+        [f"inner: {RELEASE_NOT_TAKEN}"],
+    ),
+    "a-mark-outside-the-state-lock": (
+        """
+        with _state._lock:
+            worker = _state.worker_exists()
+        deferred = _state._closes.defer_hand(sink)
+        """,
+        [f"site: {MARKED_OUTSIDE_LOCK}"],
+    ),
+    "a-mark-under-another-lock-only": (
+        """
+        with _state._closes._lock:
+            deferred = _state._closes.defer_hand(sink)
+        """,
+        [f"site: {MARKED_OUTSIDE_LOCK}"],
+    ),
+    "a-mark-inside-the-state-lock-passes": (
+        """
+        with _state._lock:
+            sink = _ensure_sink()
+            deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
         """,
         [],
     ),
