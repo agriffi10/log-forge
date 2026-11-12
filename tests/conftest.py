@@ -554,6 +554,7 @@ def _reset_worker() -> None:
     _lifecycle._state._stops_running.clear()
     _lifecycle._state._hands_running.clear()
     _lifecycle._state._handing_here = threading.local()
+    _lifecycle._state._building_here = threading.local()
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
     with _lifecycle._state._closes._lock:

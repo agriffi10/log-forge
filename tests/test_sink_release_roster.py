@@ -73,11 +73,15 @@ _EXPECTED_CLOSERS = {
     ("sinks/logstash", "LogstashSink.close"),
     ("sinks/sentry", "SentrySink.close"),
     ("sinks/_factory", "_FactorySink.close"),
+    ("sinks/_factory", "_FactorySink._discard"),
 }
-"""The eight sites that close a sink, named so a ninth is a decision somebody takes.
+"""The nine sites that close a sink, named so a tenth is a decision somebody takes.
 
 ``_FactorySink.close`` is the eighth (SPEC-079 FR-006): the private wrapper behind
 ``sink_factory=``, releasing the sink it built through the helper as the shipped wrappers do.
+``_FactorySink._discard`` is the ninth (the factory build-lock fix): a build whose claim another
+thread took over, which only a forked child resuming its factory can reach, releases what it built,
+which nothing recorded or wrote to, through the same helper.
 
 The first is the *thread body* of a detached close rather than the caller that starts one:
 `_lifecycle._swap_sink` and `_lifecycle._close_owed` request a close and hand the thread on to a
@@ -643,6 +647,10 @@ _LATCH_DISPOSITIONS = {
     ("sinks/sentry", "SentrySink.close"): "not a lifecycle close — a sink releasing its own",
     ("sinks/_factory", "_FactorySink.close"): (
         "not a lifecycle close — a wrapper forwarding to the sink its factory built"
+    ),
+    ("sinks/_factory", "_FactorySink._discard"): (
+        "not a lifecycle close — a wrapper releasing a sink its factory built that nothing "
+        "recorded or wrote to"
     ),
 }
 """What each close site does about the closed-sink latch, and why (SPEC-044 FR-004 AC-2).

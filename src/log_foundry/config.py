@@ -350,6 +350,11 @@ def configure(
     sink's own code from inside a swap, which does not wait at all. A span finishing on another
     thread during a swap may still land on either sink.
 
+    Called from inside a ``sink_factory`` with a ``sink`` or a different ``sink_factory``, an emit
+    on another thread that would wait for that factory's build refuses instead, for the length of
+    the sink change: the change can wait on a drain thread that is itself waiting for the factory
+    (``_lifecycle.yielding``).
+
     Args:
       service: The service name stamped onto every event.
       version: The service version stamped onto every event.
@@ -415,7 +420,8 @@ def configure(
         _rebind(**changed)
         _ensure_sink()
         return
-    _change_sink(changed, sink, sink_factory)
+    with _lifecycle.yielding():
+        _change_sink(changed, sink, sink_factory)
 
 
 def _change_sink(

@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A stop-signal setter runs under no lock its own calls would wait on: the owner decides, then hands"
-description: "the library never runs a sink's `log_foundry_stop_signal` setter, or the `hasattr` probe before it, under a lock a call from inside the setter would wait on: the owner decides under `_state._lock`, opens a hand token before the section publishes an arm, a refreshed `_stop` or a cleared debt (never otherwise), hands after releasing, and re-checks lock-free that the sink holds the current signal; the factory wrapper builds under its lock and hands after it, and any thread finding the built sink pending hands it before use. Never hand inside a lifecycle critical section, never publish before the token, never open a token for a hand that published nothing. (fix after SPEC-079)"
+description: "the library never runs a sink's `log_foundry_stop_signal` setter, or the `hasattr` probe before it, under a lock a call from inside the setter would wait on: the owner decides under `_state._lock`, opens a hand token before the section publishes an arm, a refreshed `_stop` or a cleared debt (never otherwise), hands after releasing, and re-checks lock-free that the sink holds the current signal; the factory wrapper hands what it built after recording it, under no lock, and any thread finding the built sink pending hands it before use. Never hand inside a lifecycle critical section, never publish before the token, never open a token for a hand that published nothing. (fix after SPEC-079)"
 ---
 
 **A setter is the sink's own code, and the library ran it under its own locks.** The orphan log,
@@ -72,7 +72,8 @@ the one a shutdown sets.
 - A setter that swaps the sink or shuts down can close the sink its log then writes to; the log
   re-arms it on a lock-free miss (invariant 5).
 - The sweep builds its worker outside `_sweep_lock`, still before any detach.
-- The factory wrapper builds under its lock and records the sink as pending, hands it outside the
+- The factory wrapper builds and records the sink as pending (since 2026-11-12 with no lock held
+  across the factory call: *A sink factory runs under no lock…*), hands it outside the
   lock, publishes it only after its hand, and re-reads its own signal after publishing; its
   `close()` releases a pending sink, and after its hand it re-arms itself if something closed it
   meanwhile, but only when the library owed it a close as the emit began: a wrapper held inside a
@@ -124,3 +125,5 @@ own emit loses its event.
 ### 2026-11-12
 
 - **Settled**, as a fix after SPEC-079.
+- **Refined** the same day: the factory wrapper no longer holds its build lock across the factory
+  call (*A sink factory runs under no lock, and a build that calls back releases its waiters*).

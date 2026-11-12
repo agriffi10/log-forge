@@ -987,6 +987,11 @@ INVENTORY: dict[Key, Row] = {
         _INH,
         "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
     ),
+    _rt("_building_here"): Row(
+        "Runtime",
+        _INH,
+        "the factory builds this thread runs; a forking thread's own finally clears its",
+    ),
     _wk("sink"): Row(
         "Worker",
         ("inherited", "reset: _lifecycle._adopt_factory_after_fork"),

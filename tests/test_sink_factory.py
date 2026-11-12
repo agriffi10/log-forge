@@ -725,7 +725,8 @@ def test_a_build_mark_inherited_across_a_fork_does_not_refuse_the_childs_thread(
     """The re-entry mark is keyed by process and thread, so an inherited mark matches no child thread.
 
     The fork is taken from inside the factory, on the parent's main thread, so the child inherits
-    the wrapper mid-build: its build lock held (the walk replaces it) and its re-entry mark naming
+    the wrapper mid-build: its claim naming the thread that called ``fork`` (once its build lock,
+    held, which the walk replaced) and its re-entry mark naming
     the thread that called ``fork``, which is the child's own main thread. The caller wrapped the
     factory's sink itself, so the config carries no factory and the child keeps the inherited
     wrapper rather than adopting a new one. Keyed on the thread ident alone, every emit in that
