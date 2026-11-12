@@ -408,7 +408,10 @@ def test_the_swap_budget_is_the_documented_default(monkeypatch) -> None:
 
     config.configure(sink=SwapSink())
 
-    assert seen == [1.25]
+    assert len(seen) == 1 and seen[0] is not None, seen
+    assert 1.0 < seen[0] <= 1.25, (
+        "the patched budget, less the uncontended wait for config._sink_lock, reaches the swap"
+    )
 
 
 def test_a_swap_that_raises_does_not_fail_configure(monkeypatch, capsys) -> None:

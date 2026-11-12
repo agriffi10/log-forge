@@ -380,9 +380,14 @@ logging again still closes what it swapped to. The one writer neither path can f
 orphan emitter on another application thread, which is why `sinks/base.py` requires `close()` to
 tolerate a concurrent `emit` (§9, SPEC-028).
 
-`configure()` remains a startup call and is not thread-safe. A span finishing on another thread
-during a swap may land on either sink; what is guaranteed is that everything submitted *before* the
-call reached the old one. The `_worker` read that selects between the two paths *is* taken under
+`configure()` remains a startup call. Two calls passing a sink at once are serialized by
+`config._sink_lock`, held from the config write to the end of the swap, so whichever runs second
+wins both the config and delivery and every sink is closed once; the wait comes out of the second
+call's swap budget, and a wait that outlasts it proceeds unserialized with a `pending` line. Before
+the lock, the two swaps' post-retarget decisions interleaved: measured at `641dfc86`, 12 of 100
+runs closed a sink twice and 15 of 100 left the config naming one sink while delivery went to the
+other. A span finishing on another thread during a swap may land on either sink; what is
+guaranteed is that everything submitted *before* the call reached the old one. The `_worker` read that selects between the two paths *is* taken under
 the process lock, because it decides whether this call may close a sink at all — unlocked, a first
 `@trace` mid-construction on another thread would have its sink closed underneath it.
 
@@ -1654,6 +1659,9 @@ and a third copy is a fork with no merge.
   explanation. `_orphan_owed` now holds every owed sink and needs no record of *closed* ones,
   so the pinning objection this entry used to carry never applied.
   Full reasoning in [SPEC-045](spec-delivery/SPEC-045-every-owed-close-is-performed.md).
+  **The concurrent half was real after all** (2026-11-11): SPEC-078's review measured two
+  concurrent `configure(sink=…)` calls closing one sink twice with nothing written in between,
+  which `config._sink_lock` now prevents (§7).
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

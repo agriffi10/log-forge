@@ -59,6 +59,7 @@ _EXPECTED_ROSTER = (
     ("_lifecycle", "_state._owned_lock"),
     ("_lifecycle", "_state._closes._lock"),
     ("config", "_config_lock"),
+    ("config", "_sink_lock"),
     ("decorator", "_sweep_lock"),
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),
@@ -183,8 +184,12 @@ def live_findings(
     return findings
 
 
-def test_the_roster_is_the_eight_pairs() -> None:
-    """FR-001: exactly the eight pairs, in the Data Model's order."""
+def test_the_roster_is_the_nine_pairs() -> None:
+    """FR-001: exactly the nine pairs, in the Data Model's order.
+
+    Eight at SPEC-079; ``config._sink_lock`` joined beside ``_config_lock`` when concurrent
+    ``configure(sink=...)`` calls were serialized.
+    """
     assert _fork._GLOBAL_PRIMITIVES == _EXPECTED_ROSTER
 
 
@@ -395,7 +400,7 @@ def test_each_roster_value_is_replaced_in_the_child() -> None:
 def test_a_missing_roster_attribute_is_announced_and_the_rest_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-001: a pair naming a missing attribute is announced by type, and the other seven replaced."""
+    """FR-001: a pair naming a missing attribute is announced by type, every real pair replaced."""
     import io
     import sys
 
@@ -424,18 +429,27 @@ def test_a_missing_roster_attribute_is_announced_and_the_rest_replaced(
     assert "KeyError" in announced and "replacing a global lock after a fork" in announced, (
         announced
     )
-    assert replaced == ",".join(["True"] * 8), replaced
+    assert replaced == ",".join(["True"] * len(_EXPECTED_ROSTER)), replaced
 
 
 # -- each roster lock held across the fork --------------------------------------------------------
 
 _HELD = [pair for pair in _EXPECTED_ROSTER if pair != ("_lifecycle", "_state._stop")]
 
+_BLOCKS = [pair for pair in _HELD if pair != ("config", "_sink_lock")]
+"""The held locks whose absence from the roster blocks the child outright.
+
+``config._sink_lock`` is acquired with a timeout, the call's swap budget, so a child holding an
+unrepaired copy is delayed by that budget and then proceeds rather than blocking. Its control is
+``tests/test_concurrent_configure.py``'s, which asserts the delay instead.
+"""
+
 
 def _child_session() -> str:
     """Every call FR-001's criterion names, in a child; returns once all of them have."""
     report_from_child("started;")
     log_foundry.configure(service="roster-child")
+    log_foundry.configure(sink=MemorySink())
     log_foundry.info("orphan")
 
     @log_foundry.trace
@@ -482,13 +496,16 @@ def _forked_while_held(module: str, path: str, monkeypatch: pytest.MonkeyPatch) 
 def test_a_child_returns_while_a_parent_holds_a_roster_lock(
     module: str, path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """FR-001: configure, an orphan, a trace, flush, health, shutdown and an echo return in 5 s."""
+    """FR-001: configure, a sink change, an orphan, a trace, flush, health, shutdown and an echo.
+
+    Each returns within 5 s.
+    """
     child = _forked_while_held(module, path, monkeypatch)
     assert child.finished, f"the child did not return: it {child.ending}, {child.output!r}"
     assert child.output.endswith("returned"), child.output
 
 
-@pytest.mark.parametrize(("module", "path"), _HELD, ids=[f"{m}.{p}" for m, p in _HELD])
+@pytest.mark.parametrize(("module", "path"), _BLOCKS, ids=[f"{m}.{p}" for m, p in _BLOCKS])
 def test_without_its_entry_the_child_blocks(
     module: str, path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -536,7 +553,7 @@ def test_the_sinks_and_the_workers_stop_signal_are_the_rosters_in_the_child() ->
 def test_a_missing_later_hop_is_announced_and_the_rest_replaced(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """FR-001: a pair whose later hop is missing is announced by type, the other eight replaced."""
+    """FR-001: a pair whose later hop is missing is announced by type, every real pair replaced."""
     import io
     import sys
 
@@ -565,4 +582,4 @@ def test_a_missing_later_hop_is_announced_and_the_rest_replaced(
     assert (
         "(AttributeError)" in announced and "replacing a global lock after a fork" in announced
     ), announced
-    assert replaced == ",".join(["True"] * 8), replaced
+    assert replaced == ",".join(["True"] * len(_EXPECTED_ROSTER)), replaced

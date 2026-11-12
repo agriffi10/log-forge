@@ -670,7 +670,9 @@ class Runtime:
     :meth:`held`, which are asked with ``_lock`` held and take that leaf by design, and closer
     threads discharge it without ``_lock``. The order is ``_lock`` then ``_config_lock`` then
     ``_owned_lock``, and ``_lock`` then ``Worker._lock`` and the registry's lock as leaves, with
-    nothing acquiring ``_lock`` beneath any of them.
+    nothing acquiring ``_lock`` beneath any of them. ``config._sink_lock`` sits above them all: a
+    ``configure()`` that changes the sink holds it from the config write to the end of
+    :func:`_swap_sink`, and nothing holding any of these takes it.
 
     Args:
       None.
@@ -800,8 +802,10 @@ class Runtime:
         """One token per ``_swap_sink`` call inside its work; non-empty reads ``SWAPPING``.
 
         A set of tokens rather than a counter or a flag, for ``_shutdown_running``'s reason: two
-        concurrent ``configure(sink=...)`` calls are documented as normal, and a boolean cleared by
-        the first to finish would misreport the second. A token is the call's
+        swaps can still be inside at once, and a boolean cleared by the first to finish would
+        misreport the second. ``config._sink_lock`` serializes two ``configure(sink=...)``
+        calls, but a call whose wait for it outlasted its budget proceeds alongside the
+        holder. A token is the call's
         :class:`_Operation` (SPEC-078; a bare ``object()`` before it), **added**
         under ``_lock`` in a critical section the call already has and **discarded without the
         lock** in its ``finally`` — one ``set.discard``, which CPython performs atomically, where an
@@ -3039,6 +3043,20 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     and open after the shutdown returned, where this branch releases it detached and arms the new
     one. A swap that entered before the drain is past this check and finishes by the rules above,
     where its retarget declines.
+
+    **It is correct for one swap at a time, and its one caller holds ``config._sink_lock``** so
+    that two are never interleaved. The decision after the retarget — arm the new sink, release
+    the one displaced — is taken on what this call's retarget saw, and a second swap retargeting
+    in between makes that stale: the worker went A to C and then C to B, B's swap closed C as the
+    sink it displaced, and C's swap then re-armed C, which the exit closed again with nothing
+    written in between (measured in 10 of 50 runs at ``641dfc86``, and 0 of 100 with the lock).
+    The stale-sink loop above is the second route: B's swap found A, displaced and no longer
+    held, still owed and released it, and C's swap then released A as the sink it displaced.
+    Re-checking that decision here was rejected: an unfenced second swap leaves its displaced sink
+    for a later ``shutdown()``, so a first swap that skipped arming a sink no longer current would
+    leave that sink owed by nobody, and each further guard of that kind answers one interleaving.
+    The lock makes the pair the sequential case this function already gets right. A call whose
+    wait for it outlasted the budget still runs here alongside the holder, announced.
 
     **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no

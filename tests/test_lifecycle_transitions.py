@@ -490,22 +490,37 @@ def test_swap_in_running_retargets(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @cell(_Op.SWAP, State.SWAPPING)
-def test_a_second_swap_runs_alongside_the_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    worker = worker_on(Rec("A"))
+def test_a_second_swap_waits_for_the_first_then_swaps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cell's answer since ``config._sink_lock``: wait for the swap in flight, then swap.
+
+    It was "runs alongside the swap in flight" at SPEC-078, and that interleaving is what closed a
+    sink twice (``tests/test_concurrent_configure.py``). The second call is held on the lock while
+    the first is parked inside its retarget, so neither the worker nor the config moves to it;
+    released, the first finishes and the second swaps as in ``RUNNING``.
+    """
+    a = Rec("A")
+    worker = worker_on(a)
     b, c = Rec("B"), Rec("C")
     gate = park_retarget(monkeypatch)
-    swap = background(lambda: log_foundry.configure(sink=b))
+    first = background(lambda: log_foundry.configure(sink=b))
     try:
         assert gate.entered.wait(GATE_WAIT)
-        log_foundry.configure(sink=c)
-        assert worker.sink is c, "the second swap retargeted the worker while the first waited"
-        assert id(c) in _lifecycle._state._closes.owed, "and armed its sink"
+        second = background(lambda: log_foundry.configure(sink=c))
+        second.join(0.3)
+        assert second.is_alive(), "the second swap waits for the first rather than running"
+        assert worker.sink is a, "nothing has retargeted the worker yet"
+        assert log_foundry.get_config().sink is b, "the config names the first call's sink"
         assert state() is State.SWAPPING, "the first swap is still inside"
     finally:
         gate.release.set()
-    finish(swap)
-    assert worker.sink is b, "the first swap, released, retargeted after it"
+    finish(first)
+    finish(second)
+    assert worker.sink is c, "the second swap, run after the first, retargeted last"
+    assert log_foundry.get_config().sink is c, "and the config names the sink delivery goes to"
     assert state() is State.RUNNING
+    log_foundry.shutdown(timeout=5.0)
+    join_graced(5.0)
+    assert (a.closes, b.closes, c.closes) == (1, 1, 1), "each sink closed once"
 
 
 class SlowCloseRec(Rec):
