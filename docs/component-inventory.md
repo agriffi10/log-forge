@@ -25,7 +25,7 @@ index to find it. Add a row as part of the completion ritual when a spec ships s
 | `TransformSink` | `src/log_foundry/sinks/transform.py` | Per-event reshape/redact before forwarding; `None` drops; never mutates the caller's batch. Offers `deliver` exactly when its inner sink does, running the function once per event per engine run (SPEC-075). |
 | `LoggingSink` | `src/log_foundry/sinks/logging_sink.py` | Bridge events into stdlib `logging` — one `LogRecord`/event through a configurable logger; level-mapped, verbatim message, reserved-attr-safe fields (flat + nested). |
 | `FileSink` / `RotatingFileSink` | `src/log_foundry/sinks/file.py` | Append NDJSON to a file; rotating variant adds size/time triggers + numbered backup retention (rotate-before-exceed, no event lost). |
-| `SQLiteSink` | `src/log_foundry/sinks/sqlite.py` | Batch-insert events (full JSON + projected columns) into an embedded SQLite DB; injectable connection, `create_table` opt-out, owned-vs-borrowed close. |
+| `SQLiteSink` | `src/log_foundry/sinks/sqlite.py` | Batch-insert events (full JSON + projected columns) into an embedded SQLite DB; injectable connection, `create_table` opt-out, owned-vs-borrowed close; a forked child refuses every `emit` and a fork handler (`_strand_after_fork`, over the `_LIVE` registry) strands its inherited connection, never freeing it. |
 | `StderrSink` | `src/log_foundry/sinks/stdout.py` | NDJSON to stderr (twelve-factor); a variant of `StdoutSink`, which is why it sits beside it. |
 | `NullSink` | `src/log_foundry/sinks/null.py` | Discard everything; `.dropped` counts events. |
 | `MemorySink` | `src/log_foundry/sinks/memory.py` | In-process `.events` list with optional `maxlen` ring — the sink a downstream test suite imports. |

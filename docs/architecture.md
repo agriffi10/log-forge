@@ -1024,6 +1024,22 @@ close it.
   the fork handler, where a connect blocks for up to the driver's whole reconnect budget on the
   child's first instruction. **Closed by** a hook that connects lazily on the child's first call,
   under a bound of its own, and a decision on what the child does while that connect is pending.
+- **A forked child's `SQLiteSink` refuses rather than reopens** (invariant 12; no spec — a defect
+  fix). A SQLite connection cannot cross a fork, so the child refuses every `emit` with
+  `SinkDeliveryError` before taking any lock, `close()` returns having touched nothing, and the
+  inherited connection is stranded at the fork, never freed (§13). Unlike `NATSSink`'s `REJECTED`
+  verdict, the refusal reaches the worker as a raised `SinkDeliveryError` from an emit-only sink,
+  which it retries like any other failure before abandoning the batch, so a busy child's `flush()`
+  is slow — the same retry a closed emit-only sink's refusal gets. Reopening the database in the
+  child is what SQLite asks for and what Linux allows, and it was built and measured rather than
+  assumed: on macOS a fresh connection in the child faulted in `os_log` too, once the parent had
+  used SQLite, in anything from none to every child of a run depending on timing, because the
+  hazard is Apple's `libsqlite3` logging after a fork rather than the connection. Refusing is the
+  one answer that holds on both platforms. A child that wants a database of its own builds a sink
+  of its own with `configure(sink_factory=...)` — on Linux; on macOS that sink's fresh connection
+  carries the same `os_log` hazard, which no sink can remove. **Closed by** a way to tell, before the first
+  statement, that the `libsqlite3` in use does not log through `os_log`, and a decision that a
+  child on such a build reopens.
 - **A driver reader that dies while the status stays CONNECTED is invisible to the probe**
   (SPEC-061 FR-002, the residual; invariant 7). The driver still cancels PONG futures of its own
   (`drain()`, `Subscription._drain`, and after a reconnect), and a reader task that ends while
@@ -2095,7 +2111,8 @@ and a third copy is a fork with no merge.
   `GooglePubSubSink` do not deliver their buffer, `NATSSink` does not drain its loop, and
   `SQLiteSink` and `PostgresSink` do not **commit** — for those two the child's inserts are left
   uncommitted on a connection the parent also holds, which is nonetheless the safer outcome,
-  since committing there writes into a transaction the parent may be mid-way through. A
+  since committing there writes into a transaction the parent may be mid-way through. A child's
+  `SQLiteSink` no longer inserts anything to leave uncommitted: it refuses every `emit` (§12). A
   flush-without-release hook **shipped in SPEC-036 FR-002**, which was handed this roster of five
   rather than the two its own FR named. Of the five, three implement it — `KafkaSink`,
   `GooglePubSubSink` and `NATSSink` — while `SQLiteSink` and `PostgresSink` do not, because both
@@ -2106,8 +2123,9 @@ and a third copy is a fork with no merge.
 
 - **A sink shared across a fork is shared, and both processes act on it** (SPEC-039 FR-005
   AC-1). Beyond the buffer discard the library neither clones nor re-opens the inherited sink,
-  so one socket, one SQLite handle or one file is now written by two processes — see §9 for the
-  caller's remedy. Two consequences are worth naming because they are not obvious from that
+  so one socket or one file is now written by two processes — see §9 for the caller's remedy.
+  A SQLite handle is the exception: a child's `SQLiteSink` refuses every `emit` rather than
+  write through it (§12). Two consequences are worth naming because they are not obvious from that
   sentence. `RotatingFileSink` lets **both** processes rotate: a child can rename the file the
   parent is writing to, and each keeps its own `_size`, which is why the discard hook leaves
   that counter alone rather than claiming a precision a shared file cannot support. And both
@@ -2214,7 +2232,16 @@ and a third copy is a fork with no merge.
   collectable (measured 0/20, against 13/20 for the same connection made garbage on the main
   thread). A sink the library was handed is safe for a second, independent reason — `_state._owned` in
   `_lifecycle.py` holds a strong reference to every one, superseded sinks included, and never
-  shrinks — so a live `SQLiteSink` is never finalized in a child at all.
+  shrinks — so a live `SQLiteSink` is never finalized in a child while it *runs*. ~~That held at
+  the child's exit too~~ — it did not: interpreter finalization clears module globals and runs the
+  cyclic collector, which finalized the inherited connection there, and a child of a process that
+  had configured a `SQLiteSink` and logged died of `SIGSEGV` on a plain `sys.exit`, with no call
+  into the sink at all. **Closed** by a fork handler in `sinks/sqlite.py` that leaks one reference
+  to every live sink's inherited connection the moment the child exists, so it is never
+  unreachable and never finalized; a `__del__` cannot do it, since the collector runs every
+  finalizer in an unreachable set before it looks for resurrection. The same fix makes the child
+  refuse every `emit`, because the connection's *use* faulted in `os_log` as well (§12). A
+  connection the application itself leaked before the fork is still the caller's, as above.
 
   What the library **does** supply is the moment. `_reinit_after_fork` is the first *substantial*
   allocating work in the child — `threading._after_fork` is registered earlier and allocates a

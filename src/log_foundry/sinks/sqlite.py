@@ -3,20 +3,146 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
+import weakref
+from typing import Any
 
-from log_foundry import _diag
+from log_foundry import _diag, _fork
 from log_foundry.sinks._chunk import valid_identifier
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks.base import _ABSENT, SinkDeliveryError, SinkLosses, _static_value
 
 __all__ = ["SQLiteSink"]
 
 _COLUMNS = ("log_id", "trace_id", "span_id", "timestamp", "level", "function")
+
+_FORKED = "a forked child acquired no connection"
+"""Why a forked child's ``emit`` refuses, the tail ``NATSSink`` already uses for the same case."""
+
+
+_LIVE: weakref.WeakValueDictionary[int, SQLiteSink] = weakref.WeakValueDictionary()
+"""Every live sink, keyed by ``id`` so registering one never hashes it.
+
+A ``WeakSet`` would call the sink's ``__hash__``, and a subclass defining ``__eq__`` has none, so
+constructing it would raise. The connection cannot be held here instead, since
+``sqlite3.Connection`` takes no weak reference, and a strong one would keep every sink's connection
+open in the parent for the life of the process. An entry leaves when its sink is collected, and a
+reused ``id`` is safe because the dictionary removes only an entry whose weak reference is dead.
+"""
+
+
+def _resolve_incref() -> Any:
+    """Finds ``Py_IncRef`` and ``py_object`` once, in the parent, or ``None`` where it cannot.
+
+    Resolved at import rather than in the child, so the fork handler makes no ``dlsym`` call after
+    the fork, and guarded, so a CPython built without ``_ctypes`` or an interpreter with no
+    ``pythonapi`` still imports this module and falls back to :data:`_STRANDED`.
+
+    Args:
+      None.
+
+    Returns:
+      ``(Py_IncRef, py_object)``, or ``None`` when either is unavailable.
+
+    Raises:
+      None.
+    """
+    try:
+        import ctypes
+
+        return (ctypes.pythonapi.Py_IncRef, ctypes.py_object)
+    except (ImportError, AttributeError):
+        return None
+
+
+_INCREF: Any = _resolve_incref()
+"""``Py_IncRef`` and the wrapper it takes, or ``None`` where ``ctypes`` cannot provide them."""
+
+_STRANDED: list[object] = []
+"""Where a connection is held when ``Py_IncRef`` is unavailable, the weaker of the two remedies.
+
+It keeps the connection alive while the child runs, but interpreter finalization clears it, so on
+macOS a child exiting through ``sys.exit`` can still fault. Only an interpreter without
+``ctypes.pythonapi`` uses it.
+"""
+
+
+def _strand(conn: object) -> None:
+    """Leaks one reference to a connection another process opened, so this one never frees it.
+
+    **Freeing it is the crash.** On macOS a ``sqlite3.Connection`` the child inherited reaches
+    ``sqlite3_close`` when it is finalized, which logs through Apple's ``os_log``, and ``os_log`` is
+    not fork-safe: before this, a child of a process that had configured this sink and logged
+    died of ``SIGSEGV`` on a plain ``sys.exit``, with no call into the sink at all, in every run
+    measured. The native stack puts the free in the cyclic collector inside ``finalize_modules``.
+    Neither a module-level list nor a ``__del__`` prevents it, both measured: interpreter
+    finalization clears module globals, and the collector runs every finalizer in an unreachable
+    set before it looks for resurrection, so the connection's own finalizer closes it whatever a
+    sink's ``__del__`` does. A reference leaked through ``Py_IncRef`` is never reclaimed, so the
+    connection is never unreachable and never finalized.
+
+    The cost is one connection object and its descriptor, held until the child exits, which is
+    what a child that never touched the sink held anyway. A second call leaks a second reference
+    to the same object, which costs a count and nothing else. Where ``Py_IncRef`` could not be
+    resolved, the connection goes to :data:`_STRANDED` instead.
+
+    Args:
+      conn: The inherited connection, or whatever a subclass stored in its place.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if _INCREF is None:
+        _STRANDED.append(conn)
+        return
+    incref, wrap = _INCREF
+    incref(wrap(conn))
+
+
+def _strand_after_fork() -> None:
+    """Strands every live sink's connection in a forked child, the moment the child exists.
+
+    Registered with ``_fork``, so it runs in every child, after the repair walk and before the
+    child runs any code of its own, for every sink this process holds — a configured one, one
+    behind a wrapper, and one only the application holds, which no walk reaches. It has to be this
+    early: the crash ``_strand`` describes happens at the child's exit with no call into the sink
+    at all, so stranding on the child's first ``emit`` or ``close`` would miss the child that never
+    makes either.
+
+    Both attributes are read with ``_static_value``, so no property or ``__getattr__`` of a
+    subclass runs in the fork handler (SPEC-079 FR-002), and the pid is compared only once its
+    type is exactly ``int``, so a value whose ``__eq__`` is a subclass's own never runs there
+    either. A sink missing either attribute, holding a pid of any other type, or whose connection
+    was opened in this process, is left alone. A grandchild strands again, which leaks
+    one more reference to an object already leaked.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None. ``_fork`` absorbs and announces a handler that raises.
+    """
+    pid = os.getpid()
+    for sink in list(_LIVE.values()):
+        opened_in = _static_value(sink, "_pid")
+        conn = _static_value(sink, "_conn")
+        if conn is _ABSENT or type(opened_in) is not int or opened_in == pid:
+            continue
+        _strand(conn)
+
+
+_fork.register_child_handler(_strand_after_fork)
 
 
 class SQLiteSink:
@@ -34,6 +160,20 @@ class SQLiteSink:
     A lock restores the one-writer-at-a-time the guard used to enforce. Cross-*process* writers
     to one database file remain out of scope.
 
+    **A forked child refuses every** ``emit`` **and never touches the connection it inherited.** A
+    SQLite connection cannot cross a fork: used in the child it segfaulted on macOS on the first
+    insert in nearly every child measured, and raised ``disk I/O error`` in the rest. Opening a fresh one in the child is no remedy there, because
+    Apple's ``libsqlite3`` logs through ``os_log``, which is not fork-safe once the parent has used
+    it, and a fresh connection in the child died too, in anything from none to every child of a run
+    depending on timing. So the child owns no connection: ``emit`` refuses with
+    ``SinkDeliveryError`` before taking any lock, ``close`` returns having touched nothing, and the
+    inherited connection is stranded at the fork rather than ever freed (``_strand_after_fork``).
+    This is ``NATSSink``'s answer to the same question (invariant 12), with one difference: this
+    sink has no ``deliver``, so the worker sees only a raised ``SinkDeliveryError`` and retries it
+    like any other failure before abandoning the batch, where ``NATSSink``'s ``REJECTED`` verdict
+    skips the retries. Nothing is lost twice, but a busy child's ``flush()`` takes longer. On Linux a child that wants
+    a SQLite database of its own builds a sink of its own, with ``configure(sink_factory=...)``; on
+    macOS that sink's fresh connection carries the same ``os_log`` hazard, which no sink can remove.
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``emit`` commits its own transaction, so
     nothing is uncommitted once it returns. The commit in ``close`` is belt and braces, not a
@@ -73,12 +213,14 @@ class SQLiteSink:
           sqlite3.Error: If the database cannot be opened or the schema cannot be created.
         """
         self._table = valid_identifier(table)
+        self._pid = os.getpid()
         self._owns_connection = connection is None
         self._conn = (
             connection
             if connection is not None
             else sqlite3.connect(database, check_same_thread=False)
         )
+        _LIVE[id(self)] = self
         self._guard = ClosedGuard(GuardMode.SERIAL)
         self._unencodable = 0
         self._failed = 0
@@ -179,8 +321,11 @@ class SQLiteSink:
           sqlite3.Error: If the insert fails, as an instance of ``SinkDeliveryError`` too, with
             the original as its ``__cause__`` — or the original itself, unchanged, if the
             dual-typed exception cannot be built.
-          SinkDeliveryError: If the sink is closed — whether the close landed while this call
-            was building its rows, or long before it. Either way the batch would otherwise reach
+          SinkDeliveryError: In a forked child, before any lock is taken, since a lock a parent
+            thread held at the fork may stay held in the child and the connection is not the
+            child's to use; nothing is counted, because a refusal is a failure reported to the
+            caller, who counts it. Or if the sink is closed — whether the close landed while this
+            call was building its rows, or long before it. Either way the batch would otherwise reach
             the driver as "Cannot operate on a closed database", and the library has a word of
             its own for "none of this was delivered" (SPEC-026 FR-001). What the library should
             *signal* about logging after a completed shutdown is a separate question, and
@@ -188,6 +333,8 @@ class SQLiteSink:
         """
         if not batch:
             return
+        if os.getpid() != self._pid:
+            raise SinkDeliveryError(f"SQLiteSink inserted none of {len(batch)} event(s): {_FORKED}")
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
         with Deferral(self) as pending:
@@ -258,6 +405,10 @@ class SQLiteSink:
         refused at once, the one ``emit`` inside, if any, is waited for, and the release runs
         once; a second close waits for the first's release, then returns.
 
+        In a forked child it returns at once, before the guard's lock, having committed, closed
+        and marked nothing: the connection is the parent's, and the library does not close a
+        sink a child inherited anyway (invariant 12), so this is the call a caller makes directly.
+
         Args:
           None.
 
@@ -267,6 +418,8 @@ class SQLiteSink:
         Raises:
           sqlite3.Error: If the commit or close fails.
         """
+        if os.getpid() != self._pid:
+            return
         self._guard.close(self._release)
 
     def _release(self) -> None:
