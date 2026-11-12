@@ -169,6 +169,17 @@ class _Operation:
     now would still be registered as this call's late worker: true from a no-worker shutdown's
     entry until the section that lowers ``_shutdown_running``.
 
+    ``decided`` is what a ``STOP`` waits on for a ``SWAP`` in flight (the fix after SPEC-079 for a
+    shutdown landing mid-swap). A swap with a live worker retargets it and then, in a second
+    critical section, arms the sink it installed and releases the one it displaced; a shutdown
+    taking the owed record between the two closed the displaced sink and left the installed one
+    unarmed, so ``shutdown()`` returned with it open. :func:`_swap_sink` sets the event once its
+    last critical section has run, before it joins its closers, and again in its ``finally``, so
+    no exit leaves it unset. ``thread`` is the ``threading.get_ident()`` of the call that built
+    the token, which lets a shutdown on the swap's own thread skip its own token rather than
+    wait on itself. ``grace_spent`` is how long a ``STOP`` waited on those events, which
+    :meth:`_CloseRegistry._open_grace` deducts so the call still spends one closer grace at most.
+
     Attributes:
       kind: ``_Op.SWAP`` or ``_Op.STOP``.
       deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None``.
@@ -176,6 +187,9 @@ class _Operation:
       grace_end: The instant every graced wait of this call ends, once one has started.
       drained: Whether this ``STOP`` has made its last take of the owed record.
       late_possible: Whether a worker built now would be this ``STOP``'s late worker.
+      decided: Set once a ``SWAP`` has taken its decision, so a ``STOP`` may take after it.
+      thread: The ident of the thread that built this token.
+      grace_spent: Seconds this ``STOP`` spent waiting on swaps to decide, carved from its grace.
     """
 
     def __init__(self, kind: _Op, timeout: float | None) -> None:
@@ -197,6 +211,9 @@ class _Operation:
         self.grace_end: float | None = None
         self.drained = False
         self.late_possible = False
+        self.decided = threading.Event()
+        self.thread = threading.get_ident()
+        self.grace_spent = 0.0
 
 
 class _Close:
@@ -318,11 +335,33 @@ class _CloseRegistry:
         """
         self.owed[id(sink)] = sink
 
+    def owes(self, sink: Sink) -> bool:
+        """Whether the record owes *sink* a close right now; the caller holds ``_state._lock``.
+
+        Identity rather than ``in`` or equality: the record is keyed by ``id``, and an ``id`` is
+        reusable once its object dies, so only the stored object being this one says it is this
+        sink that is owed.
+
+        Args:
+          sink: The sink a caller is about to take.
+
+        Returns:
+          Whether the record holds this very object.
+
+        Raises:
+          None.
+        """
+        return self.owed.get(id(sink)) is sink
+
     def take(self, sink: Sink, rule: _Rule) -> _Close:
         """Moves *sink* from owed to in flight in one call; the caller holds ``_state._lock``.
 
-        A sink already absent from the record is taken all the same, which is the ``pop`` with a
-        default the swap's fenced branch always used.
+        Every caller takes only a sink it found owed, under the same lock: :func:`_close_owed`
+        and the swap's stale loop take from the record's own values, and the swap's fenced
+        branch asks :meth:`owes` first. A sink the record no longer owes was taken by somebody
+        else, and its close is theirs. Taking one anyway is how a ``shutdown()`` landing between
+        a swap's retarget and its decision had the displaced sink closed twice, once inline by
+        the shutdown and once detached by the swap.
 
         Args:
           sink: The sink whose close the caller has decided to perform.
@@ -512,6 +551,13 @@ class _CloseRegistry:
         shutdown did not take was waited on by both: ``shutdown(timeout=30)`` measured 4.00 s
         against a 2.0 s grace. Fixed once per call, the second wait gets only what is left.
 
+        **What the call already spent waiting on swaps is deducted**, :attr:`_Operation.grace_spent`
+        (see :func:`_await_swap_decisions`). That wait runs before the drain and comes out of
+        the same grace, so a call that waited on a swap and then on a detached close still spends
+        one grace at most (SPEC-078 FR-002). It is deducted here rather than by opening the grace
+        before the drain, because an end fixed then would charge the drain's own time to it and
+        starve the graced waits that follow; a call that waited on no swap deducts nothing.
+
         Args:
           op: The ``STOP`` whose graced waits share one end.
 
@@ -522,7 +568,8 @@ class _CloseRegistry:
           None.
         """
         if op.grace_end is None:
-            op.grace_end = monotonic() + closer_grace(op.deadline)
+            left = max(0.0, closer_grace(op.deadline) - op.grace_spent)
+            op.grace_end = monotonic() + left
         return op.grace_end
 
     def wait_graced(self, op: _Operation, closes: list[_Close] | None) -> None:
@@ -2815,6 +2862,100 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     return True
 
 
+def _swaps_to_await() -> list[_Operation]:
+    """Every swap in flight a shutdown entering now must let decide; the caller holds ``_lock``.
+
+    Read in the shutdown's entry critical section, after the retirement count has moved and the
+    stop signal is set, and that placement is what makes the snapshot complete. A swap that is not
+    in it reads the worker in a later section, after the retirement, so it finds no live worker
+    and meets the drain at its own entry (SPEC-078 FR-004); a swap that is in it read a live
+    worker, and its retarget, which re-checks the count after its drain, declines unless it had
+    already reassigned. Either way the snapshot holds every swap whose decision may still be
+    ahead of it. No lock acquisition is added: this runs inside a section the call
+    already takes, so the pinned counts hold.
+
+    **A re-entrant shutdown waits on nothing it could be holding up.** On one of the library's own
+    ``log-foundry-`` threads — the drain, whose ``emit`` a retarget's flush is waiting on, or a
+    closer a swap is joining — every swap is skipped, since the swap may be waiting on this very
+    thread. On the swap's own thread — a stop-signal setter run by the retarget, or a signal
+    handler interrupting ``configure()`` — its own token is skipped by ``thread``. Either wait
+    would last the whole closer grace, or until the process is killed with a large one. The
+    ``log-foundry-`` prefix is ``config._change_sink``'s rule for a re-entrant ``configure()``.
+
+    The token set is copied into a tuple first, for :meth:`Runtime._take_ahead`'s reason: its
+    discard runs without the lock.
+
+    Args:
+      None.
+
+    Returns:
+      The tokens of the swaps whose decisions the shutdown waits for, possibly none.
+
+    Raises:
+      None.
+    """
+    if threading.current_thread().name.startswith("log-foundry-"):
+        return []
+    me = threading.get_ident()
+    return [
+        swap
+        for swap in tuple(_state._swaps_running)
+        if swap.thread != me and not swap.decided.is_set()
+    ]
+
+
+def _await_swap_decisions(op: _Operation, swaps: list[_Operation]) -> None:
+    """Waits for each swap in flight to take its decision, all ending within the closer grace.
+
+    The fix after SPEC-079 for a shutdown landing between a swap's retarget and its decision: the
+    sink the swap installed is the worker's but not yet owed there, so the shutdown drained into
+    it and returned with it open, and invariant 5 failed (measured at ``624d817f``, 5 of 5
+    forced runs). Waiting here, before the drain and the take, means the installed sink is owed
+    by the time the record is read, and the displaced one has been released or left owed by the
+    swap's own rules.
+
+    **Bounded by the closer grace, computed now**, because a swap whose retarget is slow to
+    notice the stop is somebody else's slow step, which is what the grace exists to cap: an
+    unbounded ``shutdown(None)`` must not hang on a stuck swap. What it actually waited is
+    recorded as :attr:`_Operation.grace_spent`, in a ``finally`` so an interrupt records it too,
+    and :meth:`_CloseRegistry._open_grace` deducts it: one grace per call at most (SPEC-078
+    FR-002), without charging the drain to it. A swap not decided in time is proceeded past; the
+    displaced sink is still closed once, because the swap releases only a sink the record still
+    owes, and one ``pending`` line says what the shutdown could not settle. An empty list waits on
+    nothing and records nothing, so an uncontended shutdown is unchanged.
+
+    **Not the** ``config._sink_lock`` **barrier.** Holding that lock for the shutdown broke six
+    shipped tests and regressed a backoff cut short by the stop signal; passing it as a barrier
+    waited out the swap's slow displaced closes, since the lock is held through the swap's closer
+    join. The shutdown needs only that no swap is between its retarget and its decision when it
+    takes, so it waits on exactly that.
+
+    Args:
+      op: The ``STOP`` doing the waiting, whose deadline caps the grace.
+      swaps: The tokens :func:`_swaps_to_await` read at the call's entry.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if not swaps:
+        return
+    started = monotonic()
+    end = started + closer_grace(op.deadline)
+    try:
+        for swap in swaps:
+            swap.decided.wait(max(0.0, end - monotonic()))
+    finally:
+        op.grace_spent = monotonic() - started
+    if not all(swap.decided.is_set() for swap in swaps):
+        _diag.pending(
+            "shutdown() could not wait for a sink change in flight to take effect; the sink it "
+            "installs may be left open until the process exits"
+        )
+
+
 def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Drains and closes every sink the library owes, backing ``shutdown()`` on both paths.
 
@@ -2906,6 +3047,17 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     exception. The discard takes no lock: it is one ``set.discard``, so the token adds no
     acquisition to this call's pinned count.
 
+    **Before it drains, it waits for every swap in flight to take its decision**, within the
+    closer grace (:func:`_await_swap_decisions`), from a snapshot read in the entry's critical
+    section (:func:`_swaps_to_await`). A swap between its retarget and its decision has installed
+    a sink it has not yet armed, and a drain there returned with that sink open. The wait sits
+    at the head of each branch — on the worker branch before ``worker.stop``, on the no-worker
+    branch as the first statement inside its ``try``, so an interrupt during the wait still
+    lowers ``_shutdown_running``. A swap that starts after the entry finds the worker retired and
+    meets the drain at its own entry (SPEC-078 FR-004); the one not covered is a swap that starts
+    after the entry and retargets a late worker built during a no-worker shutdown, where the
+    displaced sink is still closed once and the installed one may be left for the exit.
+
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
@@ -2928,14 +3080,17 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             else:
                 claimed = worker.claim_stop(op.deadline)
             _state._stop.set()
+            swaps = _swaps_to_await()
             _state._move()
         late_worker: Worker | None = None
         waited = False
         if worker is not None:
+            _await_swap_decisions(op, swaps)
             worker.stop(op.budget if claimed else _remaining(op.deadline), claimed=claimed)
             waited = _close_owed(op)
         else:
             try:
+                _await_swap_decisions(op, swaps)
                 waited = _close_owed(op)
             finally:
                 with _state._lock:
@@ -2982,6 +3137,17 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       closer into a ``close()`` already in flight. Measured with an injected preemption point at
       two overlapping closes, and at 13 of 120 seeds unforced against a 2 ms ``close()``;
       ``sinks/base.py`` documents tolerance for a *sequential* second close, never two at once.
+
+      **The** ``owes`` **term is the same gap's other half.** A shutdown in that gap whose take
+      has already *finished* — it found the old sink owed and unheld, took it and closed it
+      inline — leaves nothing in flight for ``held`` to see, and the take this branch used to
+      make popped the absent sink with a default and released it a second time on
+      ``log-foundry-sink-close`` (measured at ``624d817f``, 20 of 20 forced runs, and the same
+      for the exit drain). So the old sink is released only while the record still owes it
+      (:meth:`_CloseRegistry.owes`). Skipping the release cannot leave it owed by nobody: every
+      route out of the record is a take whose taker performs the close, and the worker's sink is
+      always armed — the build arms it, this function arms what it installs, a forked child
+      re-arms ``worker.sink`` — so "not owed" here means "taken", never "never armed".
     - **unfenced** — the drain could not be confirmed within the budget, so the old sink stays in
       the record and the worker keeps it among the sinks it may be inside. A later ``shutdown()``
       that finds the drain thread ended closes it (SPEC-050 FR-004); ``incomplete_swaps`` counts
@@ -3042,7 +3208,8 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     the drained sink, say — is taken by nothing left in that call, so declining there left it owed
     and open after the shutdown returned, where this branch releases it detached and arms the new
     one. A swap that entered before the drain is past this check and finishes by the rules above,
-    where its retarget declines.
+    where its retarget declines unless it had already reassigned, and the drain waits for its
+    decision before it takes (see the paragraph on ``decided`` below).
 
     **It is correct for one swap at a time, and its one caller holds ``config._sink_lock``** so
     that two are never interleaved. The decision after the retarget — arm the new sink, release
@@ -3056,7 +3223,23 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     for a later ``shutdown()``, so a first swap that skipped arming a sink no longer current would
     leave that sink owed by nobody, and each further guard of that kind answers one interleaving.
     The lock makes the pair the sequential case this function already gets right. A call whose
-    wait for it outlasted the budget still runs here alongside the holder, announced.
+    wait for it outlasted the budget still runs here alongside the holder, announced. **The**
+    ``owes`` **term on the fenced branch is not that re-check**: skipping an *arm* can orphan a
+    sink, because nothing else may arm it, while skipping a *release* of a sink the record no
+    longer owes cannot, because every route out of the record is a take whose taker closes it.
+    On the unserialized pair it makes the second route close A once, and a second swap that
+    retargets B to C before B's swap has armed B finds B not owed and skips it; B's own swap then
+    arms B, so B is closed once, later, instead of twice.
+
+    **A shutdown waits for this call's decision** (:func:`_await_swap_decisions`). Between the
+    retarget and the decision the sink installed is the worker's but not yet owed, so a
+    ``shutdown()`` taking the record there drained into it and returned with it open (measured at
+    ``624d817f``: six events delivered, never closed). The decision is published on the token's
+    ``decided`` event, set right after the last critical section — the decision on the worker
+    branch, or the absorbed retarget exception; the first section on the no-worker branch — and
+    before the closers are joined, since a shutdown waiting out this call's slow detached closes
+    as well would charge them to its grace twice. The ``finally`` sets it again, so no exit
+    leaves a shutdown waiting on it.
 
     **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no
@@ -3118,6 +3301,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                         and previous is not None
                         and previous is not new_sink
                         and not _state.held(previous)
+                        and _state._closes.owes(previous)
                     )
                     if fenced_out and previous is not None:
                         closer = release(
@@ -3127,9 +3311,11 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                         )
                         if closer is not None:
                             closers.append(closer)
+        op.decided.set()
         for closer in closers:
             closer.join(_remaining(op.deadline))
     finally:
+        op.decided.set()
         _state._swaps_running.discard(op)
 
 

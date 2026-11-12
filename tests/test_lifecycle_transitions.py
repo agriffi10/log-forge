@@ -879,22 +879,35 @@ def test_stop_in_running_drains_and_closes() -> None:
 
 
 @cell(_Op.STOP, State.SWAPPING)
-def test_stop_during_a_swap_closes_and_the_retarget_declines(
+def test_stop_during_a_swap_waits_for_its_decision_and_the_retarget_declines(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    a = Rec("A")
+    """The cell's answer since the fix after SPEC-079: retire, wait for the swap, then drain.
+
+    It was "drains and closes; the swap's retarget declines" at SPEC-078, and a shutdown landing
+    between a swap's retarget and its decision closed the displaced sink twice and left the one
+    installed open (``tests/test_shutdown_mid_swap.py``). The swap is parked on entry to its
+    retarget; the shutdown retires the process, then waits for the swap's decision rather than
+    draining, so it is still inside when the swap is released. The retarget then declines, the
+    swap arms B, and the shutdown closes A and B once each.
+    """
+    a, b = Rec("A"), Rec("B")
     worker = worker_on(a)
     gate = park_retarget(monkeypatch)
-    swap = background(lambda: log_foundry.configure(sink=Rec("B")))
+    swap = background(lambda: log_foundry.configure(sink=b))
     try:
         assert gate.entered.wait(GATE_WAIT)
-        log_foundry.shutdown(timeout=5.0)
-        assert a.closes == 1, "the shutdown drained and closed the worker's sink"
-        assert state() is State.SWAPPING, "while the swap is still inside"
+        assert state() is State.SWAPPING, "the swap is inside"
+        stop = background(lambda: log_foundry.shutdown(timeout=5.0))
+        stop.join(0.3)
+        assert stop.is_alive(), "the shutdown waits for the swap's decision"
+        assert a.closes == 0, "and has drained and closed nothing yet"
     finally:
         gate.release.set()
     finish(swap)
+    finish(stop)
     assert worker.sink is a, "the retarget declined (SPEC-033 FR-002)"
+    assert (a.closes, b.closes) == (1, 1), "the shutdown closed the worker's sink and the armed B"
     assert state() is State.CLOSED
 
 

@@ -874,6 +874,12 @@ INVENTORY: dict[Key, Row] = {
         _NONE,
         "a per-close event, dropped with its in-flight entry by _clear_after_fork (SPEC-079)",
     ),
+    _c("_lifecycle.py", "_Operation.__init__", "self.decided", "Event"): Row(
+        "_Operation",
+        _NONE,
+        "one per SWAP or STOP call, a shutdown's wait on a swap's decision; the token sets "
+        "holding it are emptied by _clear_after_fork",
+    ),
     _c("worker.py", "_FlushMarker.__init__", "self.event", "Event"): Row(
         "_FlushMarker", _NONE, "one per flush() call; it lives in the queue a child replaces"
     ),
