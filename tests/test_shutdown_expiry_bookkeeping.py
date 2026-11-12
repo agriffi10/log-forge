@@ -355,19 +355,34 @@ def test_a_swap_budget_spent_before_retarget_renders_0s(monkeypatch, capsys) -> 
         _release(old, worker)
 
 
-def test_the_unfenced_swap_line_reports_the_budget_at_entry(capsys) -> None:
+def test_the_unfenced_swap_line_reports_the_budget_at_entry(monkeypatch, capsys) -> None:
     """FR-002. `T` is the budget `retarget` was given, not what was left after its drain.
 
     Once the drain times out the remainder is ~0, so a line built from it would read `0s` on
-    every unfenced swap. The floor allows `STALL_ALLOWANCE` (0.5 s, `test_timing_floors.py`) of
-    stall before `retarget`'s entry, so it is deterministic and still refuses that remainder.
+    every unfenced swap. The floor is derived from this test's own clock: the deadline is set no
+    earlier than `started`, and `retarget` reads the clock no later than its first `flush` call,
+    so `T >= 1.0 - (entered - started)` holds by construction however long a runner stalls in
+    between. The `1e-5` covers `:g`'s six significant digits. The 1.0 s budget keeps the floor
+    above zero, and so refusing the post-flush remainder, under up to about a second of stall.
     """
     old, worker = _unfenced_swap(queued=0)
+    entered: list[float] = []
+    original = Worker.flush
+
+    def recording(self: Worker, timeout: float | None = 5.0) -> object:
+        if not entered:
+            entered.append(time.monotonic())
+        return original(self, timeout)
+
+    monkeypatch.setattr(Worker, "flush", recording)
     try:
         new = _SlowFailSink(0.0, fail_times=0)
+        started = time.monotonic()
         _lifecycle._swap_sink(new, timeout=1.0)  # type: ignore[arg-type]
         _, rendered = _swap_line(capsys.readouterr().err, budget=1.0)
-        assert 0.5 < float(rendered[:-1]) <= 1.0, rendered
+        assert entered, "the premise: retarget drained through Worker.flush"
+        floor = 1.0 - (entered[0] - started) - 1e-5
+        assert floor <= float(rendered[:-1]) <= 1.0, (rendered, floor)
     finally:
         old.fail = False
         _release(old, worker)
