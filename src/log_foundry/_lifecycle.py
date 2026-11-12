@@ -3698,10 +3698,12 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       the record and the worker keeps it among the sinks it may be inside. A later ``shutdown()``
       that finds the drain thread ended closes it (SPEC-050 FR-004); ``incomplete_swaps`` counts
       it, as before.
-    - **declined** — the worker retired mid-swap and keeps its old sink forever (SPEC-033 FR-002).
-      The old sink stays owed for the exit, and the new one is armed anyway, because it is what
-      ``configure()`` installed and the orphan path will deliver to it — SPEC-035 FR-003's
-      guarantee that a declined sink is owned by *somebody*.
+    - **declined** — the worker retired mid-swap and keeps its old sink forever (SPEC-033 FR-002),
+      or retired after it had reassigned, when the shutdown that retired it drained into the new
+      sink and took whatever the record owed (:meth:`Worker.retarget`). Either way the old sink
+      is left to the record — owed for the exit, or already taken by that shutdown — and the new
+      one is armed anyway, because it is what ``configure()`` installed and the orphan path will
+      deliver to it — SPEC-035 FR-003's guarantee that a declined sink is owned by *somebody*.
 
       Not arming it was tried and is wrong. It looks like the uniform rule — a sink is armed when
       something takes responsibility for delivering to it — and it satisfies FR-002's "never two

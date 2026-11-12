@@ -910,3 +910,83 @@ def test_a_shutdown_does_not_wait_out_a_no_worker_swaps_slow_setter() -> None:
     assert child.output == (
         "line=False quick=True closed_while_parked=1 stored_the_set_signal=True"
     ), child.output
+
+
+UNFENCED = "could not be confirmed drained"
+"""The fixed part of the line a swap writes when it counts an unconfirmed drain."""
+
+
+def test_a_setter_shutdown_after_the_reassign_is_declined_not_unfenced() -> None:
+    """A retarget whose new sink's setter shuts down reports ``declined``, counting nothing.
+
+    The live worker on P is retargeted at A, and A's setter, run by the retarget after the
+    reassign, calls ``shutdown()``. That shutdown stops the worker, drains into A and closes P, so
+    the retarget's fence flush answers ``retired`` without trying. At ``9f4d4dfd`` the retarget
+    read that as an unconfirmed drain: ``incomplete_swaps`` went to 1 and a line said P "could
+    not be confirmed drained" and was "left open", though nothing timed out and P was closed.
+    A is still owed, for the exit (invariant 5).
+    """
+
+    def scenario() -> str:
+        err = io.StringIO()
+        sys.stderr = err
+        p, a = Sink("P"), _ShutdownFromSetter("A")
+        worker = _worker_on(p)
+        log_foundry.configure(sink=a)
+        return (
+            f"fired={a.fired} incomplete={worker.incomplete_swaps} "
+            f"line={UNFENCED in err.getvalue()} a_owed={_lifecycle.owes_close(a)} "
+            f"p_closes={p.closes}"
+        )
+
+    child = run_in_child(scenario)
+    assert child.output == ("fired=True incomplete=0 line=False a_owed=True p_closes=1"), (
+        child.output
+    )
+
+
+def test_a_shutdown_racing_the_fence_flush_is_declined_not_unfenced() -> None:
+    """A ``shutdown()`` on another thread that retires the worker before the fence flush reads.
+
+    The fence flush is wrapped: before it runs, a ``shutdown()`` is started on another thread
+    and the wrapper waits until the retirement count has moved past the worker's epoch — the
+    token alone is not enough, since the shutdown adds it before it moves the count. The real
+    flush then answers ``retired``. That shutdown waits for this swap's decision, so it closes
+    P and A once each after it. This is the case the fence flush's own verdict covers and a
+    re-check of the retirement right after the stop-signal hand does not: the count had not
+    moved yet when the hand returned. At ``9f4d4dfd`` the swap counted an incomplete swap and
+    wrote the unfenced line here too.
+    """
+
+    def scenario() -> str:
+        err = io.StringIO()
+        sys.stderr = err
+        p, a = Sink("P"), Sink("A")
+        worker = _worker_on(p)
+        real = Worker.flush
+        calls: list[int] = []
+        stopping: list[threading.Thread] = []
+
+        def fenced_late(self_: Worker, timeout: float | None = 5.0) -> Any:
+            calls.append(1)
+            if len(calls) == 2:
+                stopping.append(_start(lambda: log_foundry.shutdown(timeout=5.0)))
+                deadline = time.monotonic() + GATE_WAIT
+                while _lifecycle._state.retirements <= self_._epoch:
+                    if time.monotonic() > deadline:
+                        return "the shutdown never retired the worker"
+                    time.sleep(0.001)
+            return real(self_, timeout)
+
+        Worker.flush = fenced_late  # type: ignore[method-assign]
+        log_foundry.configure(sink=a)
+        Worker.flush = real  # type: ignore[method-assign]
+        for thread in stopping:
+            thread.join(GATE_WAIT)
+        return (
+            f"raced={len(stopping)} incomplete={worker.incomplete_swaps} "
+            f"line={UNFENCED in err.getvalue()} p_closes={p.closes} a_closes={a.closes}"
+        )
+
+    child = run_in_child(scenario)
+    assert child.output == ("raced=1 incomplete=0 line=False p_closes=1 a_closes=1"), child.output
