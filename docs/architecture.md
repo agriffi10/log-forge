@@ -839,7 +839,10 @@ holds its signal. The drain thread is the exception: it can emit a batch to a ju
 sink before the build's hand lands, which the decision records under *What is left*. The factory
 call itself runs under no lock either, and a factory inside `flush()`, `shutdown()` or a
 sink-changing `configure()` makes the emits waiting on its build refuse rather than wait, because
-that call can be waiting on a drain thread that is one of them (`docs/decisions/sink-lifecycle/`).
+that call can be waiting on a drain thread that is one of them. One section publishes with no
+token: during a stop, a worker build whose sink has a close in flight marks that close instead of
+handing, and the close's discharge pays the hand with the current signal, so the close keeps the
+signal the shutdown set (`docs/decisions/sink-lifecycle/`).
 
 **The close registry holds every owed close and every close in flight** (SPEC-078 FR-001).
 `Runtime._closes`, a `_CloseRegistry`, replaced `_owed`, `_closing_now`, `_closers` and the

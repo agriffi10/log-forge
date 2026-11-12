@@ -217,7 +217,7 @@ on the build the factory is running, and the library cannot see a wait in the ca
 backstop and the latch, SPEC-061), `tests/test_sinks_nats_matrix.py` (those waits and both latches
 as a mutation-gated corpus, including the next and the queued caller's latency), `tests/test_worker_exit_budget.py` (the exit drain's
 retries fit the `shutdown()` budget, SPEC-062), `tests/test_concurrent_configure.py` (a
-`configure(sink=…)` waiting on a concurrent one spends its own swap budget, idly), `tests/test_shutdown_mid_swap.py` (a `shutdown()` waiting on a sink change spends its own budget: one closer grace at most, never the drain's share, and never on itself) and `tests/test_delivery_paths.py` (the same cases
+`configure(sink=…)` waiting on a concurrent one spends its own swap budget, idly), `tests/test_shutdown_mid_swap.py` (a `shutdown()` waiting on a sink change spends its own budget: one closer grace at most, never the drain's share, never on itself, and never on a no-worker swap's stop-signal setter) and `tests/test_delivery_paths.py` (the same cases
 through `deliver`, SPEC-072); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight),
 `tests/test_closed_guard.py` and `tests/test_sinks_kafka.py` (a `CLOSE_ONLY` close's bounded wait,
@@ -231,6 +231,10 @@ sink's stop-signal setter on each path that hands a signal, to returning, in a f
 a bounded wait: at `624d817f` fifteen of its twenty rows hung the process.
 `tests/test_factory_reentrant.py` does the same for the calls a `sink_factory` makes that wait on
 the drain thread: at `9f4d4dfd` two of its five rows hung and three stalled for their whole budget.
+`tests/test_reentrant_stop_signal.py` also holds a `shutdown()`'s close to the signal that shutdown
+set when a `@trace` builds the late worker inside it (`9f4d4dfd`: 4.00 s against a 4 s backoff
+under `shutdown(timeout=1)`), and `tests/test_lock_held_discharges.py` holds the shape that keeps
+the hand the build defers from being paid under the state lock.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
