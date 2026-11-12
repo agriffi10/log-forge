@@ -1428,3 +1428,98 @@ def test_a_paid_hand_never_runs_a_setter_inside_itself() -> None:
 
     child = run_in_child(work, timeout=30)
     assert child.output == "deepest=1 holds_late=True", child.output
+
+
+def test_a_paid_hand_delivers_the_current_signal_and_never_refreshes_it() -> None:
+    """The payment hands ``_state._stop`` as it is, set or not, and never replaces it.
+
+    Driven at the discharge itself: S holds E0, a close of S is registered and marked as owing a
+    hand, as a build during a stop marks it, and E0 is set, as a second ``shutdown()`` entering
+    while that close runs sets it. Discharging the close through ``release`` pays the hand. It
+    must hand S that very set E0 and leave the process signal alone. A payment that refreshed
+    would hand S a fresh unset event; on the route where a second shutdown then closes S, that
+    close serves the sink's whole backoff, which is the class SPEC-044 FR-003 closed.
+    """
+
+    def work() -> str:
+        sink = _Recording(backoff=False)
+        sink.in_close.set()
+        sink.go.set()
+        log_foundry.configure(service="t", sink=sink)
+        log_foundry.info("arms it and hands it E0")
+        state = _lifecycle._state
+        e0 = state._stop
+        entry = state._closes.register(sink, _lifecycle._Rule.INLINE)
+        marked = state._closes.defer_hand(sink)
+        e0.set()
+        _lifecycle.release(sink, closing=entry)
+        held = sink.log_foundry_stop_signal
+        return (
+            f"marked={marked} holds_e0={held is e0} set={held is not None and held.is_set()} "
+            f"signal_unchanged={state._stop is e0}"
+        )
+
+    child = run_in_child(work)
+    assert child.output == "marked=True holds_e0=True set=True signal_unchanged=True", child.output
+
+
+def test_a_build_inside_a_setters_hand_still_marks_the_close() -> None:
+    """The mark is asked before ``handing_here``, so a build inside S's own hand still marks.
+
+    A log's hand to S is running on the main thread and its setter is parked when a
+    ``shutdown()`` on another thread takes S and starts closing it. The setter then runs a
+    ``@trace``, which builds the late worker on S on the thread already handing S. The hand
+    already running is no help here: its settle finds the signal moved and S's close in flight,
+    and leaves S alone, and the close is held until it has. So only the mark the build makes
+    gets S the late worker's signal, paid when the close ends. Asked after ``handing_here``, the
+    build marked nothing and S was left on the shutdown's set signal.
+    """
+
+    def work() -> str:
+        in_close, go, settled, entered = (threading.Event() for _ in range(4))
+        first = [True]
+
+        class Inside(Plain):
+            def __init__(self) -> None:
+                super().__init__()
+                self._signal: threading.Event | None = None
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:
+                return self._signal
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+                self._signal = event
+                if first[0] and threading.current_thread() is threading.main_thread():
+                    first[0] = False
+                    entered.set()
+                    in_close.wait(GATE)
+                    _traced()()
+                    go.set()
+
+            def close(self) -> None:
+                if not self.closes:
+                    in_close.set()
+                    go.wait(GATE)
+                    settled.wait(GATE)
+                super().close()
+
+        sink = Inside()
+        log_foundry.configure(service="t", sink=sink)
+
+        def stop() -> None:
+            entered.wait(GATE)
+            log_foundry.shutdown(timeout=GATE)
+
+        stopper = threading.Thread(target=stop, daemon=True)
+        stopper.start()
+        log_foundry.info("hands S; its setter builds inside a shutdown's close")
+        settled.set()
+        stopper.join(GATE * 2)
+        worker = _lifecycle._state.worker_exists()
+        holds = worker is not None and sink.log_foundry_stop_signal is worker._stop
+        return f"holds_late={holds}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == "holds_late=True", child.output
