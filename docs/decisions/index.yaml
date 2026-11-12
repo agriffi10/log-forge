@@ -328,7 +328,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-lifecycle/a-drivers-liveness-flag-is-not-evidence-a-sink-that-cannot-see-the-wire-asks-the-server-and-never-cancels-a-wait-the-server-may-still-answer.md"
       - title: "A hand the worker build declines for a close in flight is paid when that close finishes"
-        fence: "while a stop is running, a worker build whose sink has a close in flight hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it. Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
+        fence: "while a stop is running, a worker build whose sink has a close in flight hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it; a mark whose close outlives the stop is paid by the last stop out (`_pay_marks_after_stop`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
         status: "stable"
         path: "docs/decisions/sink-lifecycle/a-hand-the-worker-build-declines-for-a-close-in-flight-is-paid-when-that-close-finishes.md"
       - title: "A process releases only a transport it acquired *here*, and unrecorded must be unclaimable rather than merely unreleasable"

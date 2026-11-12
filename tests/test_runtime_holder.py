@@ -43,6 +43,11 @@ takes the registry's leaf, asked by the build with ``_state._lock`` held, which 
 ``in_flight`` already uses; and ``_hand_after_close`` takes ``_state._lock`` with nothing held,
 after a close's discharge. No acquisition moved, and no ``LOCK_COUNTS`` row in
 ``test_runtime_state.py`` changed: none of those calls reaches a marked entry.
+In the same fix the last stop out pays a mark whose close outlives it: ``_CloseRegistry.marked``
+and ``_CloseRegistry.unmark`` take the registry's leaf, the first with no lock held and the second
+under ``_state._lock``, the order ``in_flight`` uses, and ``_pay_marks_after_stop`` takes
+``_state._lock`` after the stop has discarded its token, only when a mark exists, so the pinned
+shutdown counts do not move.
 """
 
 from __future__ import annotations
@@ -120,6 +125,9 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_hand_out", "handing(sink)"): 1,
             ("_CloseRegistry.defer_hand", "self._lock"): 1,
             ("_hand_after_close", "_state._lock"): 1,
+            ("_CloseRegistry.marked", "self._lock"): 1,
+            ("_CloseRegistry.unmark", "self._lock"): 1,
+            ("_pay_marks_after_stop", "_state._lock"): 1,
         }
     ),
     "worker.py": collections.Counter(

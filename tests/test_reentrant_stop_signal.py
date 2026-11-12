@@ -1523,3 +1523,138 @@ def test_a_build_inside_a_setters_hand_still_marks_the_close() -> None:
 
     child = run_in_child(work, timeout=30)
     assert child.output == "holds_late=True", child.output
+
+
+class _SwappedOut(Plain):
+    """A sink whose first close — a swap's detached one — parks on ``go``; records its signals.
+
+    ``emit`` backs off up to 0.3 s on the signal it holds and records how long it waited, so a
+    set signal shows as a wait of nothing. With ``build_in_second_close`` its second close builds
+    the worker on another thread first, then backs off up to 4 s on its signal.
+    """
+
+    def __init__(self, *, build_in_second_close: bool = False) -> None:
+        super().__init__()
+        self.build_in_second_close = build_in_second_close
+        self.in_close = threading.Event()
+        self.go = threading.Event()
+        self.waits: list[float] = []
+        self.second_close_held_set: list[bool] = []
+        self._signal: threading.Event | None = None
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        return self._signal
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+        self._signal = event
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        from log_foundry.sinks import _retry
+
+        started = time.monotonic()
+        _retry.wait(0.3, self._signal)
+        self.waits.append(round(time.monotonic() - started, 1))
+        super().emit(batch)
+
+    def close(self) -> None:
+        if not self.closes:
+            self.in_close.set()
+            self.go.wait(GATE * 2)
+        elif self.build_in_second_close:
+            from log_foundry.sinks import _retry
+
+            tracer = threading.Thread(target=lambda: _traced()(), daemon=True)
+            tracer.start()
+            tracer.join(GATE)
+            held = self._signal
+            self.second_close_held_set.append(held is not None and held.is_set())
+            _retry.wait(4.0, held)
+        super().close()
+
+
+def _swapped_out_and_back(sink: _SwappedOut) -> None:
+    """Arms ``sink``, swaps it out — its close parks on a detached thread — and configures it again."""
+    from log_foundry import worker as worker_mod
+
+    worker_mod.DEFAULT_SWAP_TIMEOUT = 0.2
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("arms it")
+    log_foundry.configure(sink=Plain())
+    if not sink.in_close.wait(GATE):
+        raise AssertionError("the swap never started closing the sink")
+    log_foundry.configure(sink=sink)
+
+
+def test_a_worker_built_in_a_stops_tail_is_handed_its_signal_when_the_stop_ends() -> None:
+    """A build deferred in a stop's tail is paid by the last stop out, not by a close it outlives.
+
+    S's close is a swap's, parked on its own thread. A ``shutdown()`` runs; in its tail, after it
+    has lowered ``_shutdown_running``, a ``@trace`` builds a worker on S. That worker is live, and
+    no stop will stop it. The build defers, since a stop is running and S's close is in flight;
+    but that close outlives the stop, so the hand cannot wait for it. When the stop ends it hands
+    S the live worker's own unset signal, while S's close is still parked, and S's backoffs wait
+    again. Without that, S stayed on the shutdown's set signal until the close ended, and three
+    0.3 s backoffs waited nothing — against 0.3 s each before the deferral existed.
+    """
+
+    def work() -> str:
+        sink = _SwappedOut()
+        _swapped_out_and_back(sink)
+        real = _lifecycle._announce_unsettled
+
+        def build_in_the_tail(op: object) -> None:
+            _traced()()
+            real(op)  # type: ignore[arg-type]
+
+        _lifecycle._announce_unsettled = build_in_the_tail  # type: ignore[assignment]
+        log_foundry.shutdown(timeout=1.0)
+        _lifecycle._announce_unsettled = real
+        live = _lifecycle._state.live_worker()
+        held = sink.log_foundry_stop_signal
+        holds = live is not None and held is live._stop and not held.is_set()
+        in_flight = _lifecycle._state._closes.in_flight(sink)
+        sink.waits.clear()
+        _traced()()
+        log_foundry.flush(timeout=GATE)
+        sink.go.set()
+        return f"in_flight={in_flight} holds_live_unset={holds} waited={sink.waits[:1]}"
+
+    child = run_in_child(work, timeout=40)
+    assert child.output == "in_flight=True holds_live_unset=True waited=[0.3]", child.output
+
+
+def test_a_build_inside_a_stops_second_pass_close_keeps_that_close_short() -> None:
+    """A build inside a no-worker shutdown's second-pass close is deferred like one in its first.
+
+    S's first close is a swap's, parked on its own thread, so the shutdown's first pass takes
+    nothing and waits on it as a bystander; once it is released, the second pass — after
+    ``_shutdown_running`` has dropped — takes S and closes it inline. A ``@trace`` inside that
+    close builds a worker on S, and the build must still leave the close the shutdown's set
+    signal, since a stop is running and is closing S. Gating the deferral on
+    ``_shutdown_running`` instead handed the close the worker's fresh signal and it served its
+    whole 4 s backoff: measured 4.92 s against 0.91 s.
+    """
+
+    def work() -> str:
+        sink = _SwappedOut(build_in_second_close=True)
+        _swapped_out_and_back(sink)
+
+        def release_first_close() -> None:
+            deadline = time.monotonic() + GATE
+            while not _lifecycle._state._stops_running and time.monotonic() < deadline:
+                time.sleep(0.005)
+            time.sleep(0.2)
+            sink.go.set()
+
+        releaser = threading.Thread(target=release_first_close, daemon=True)
+        releaser.start()
+        started = time.monotonic()
+        log_foundry.shutdown(timeout=6.0)
+        elapsed = time.monotonic() - started
+        releaser.join(GATE)
+        return f"second_close_held_set={sink.second_close_held_set} quick={elapsed < 2.0}"
+
+    child = run_in_child(work, timeout=40)
+    assert child.output == "second_close_held_set=[True] quick=True", child.output

@@ -510,6 +510,48 @@ class _CloseRegistry:
             close.hand_owed = True
             return True
 
+    def marked(self) -> bool:
+        """Whether any close in flight carries a hand a worker build declined on it.
+
+        The cheap gate :func:`_pay_marks_after_stop` asks before it takes ``_state._lock``, so a
+        ``shutdown()`` that left no mark behind — every one but a build in a stop's tail — adds
+        no acquisition of that lock to its pinned count. One acquisition of the leaf.
+
+        Args:
+          None.
+
+        Returns:
+          Whether some in-flight entry has :attr:`_Close.hand_owed` set.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return any(close.hand_owed for close in self._in_flight.values())
+
+    def unmark(self, sink: Sink) -> bool:
+        """Clears the declined-hand mark on the close of *sink* in flight, if it carries one.
+
+        The caller pays the hand itself, so the discharge that ends that close later finds the
+        mark gone and pays nothing: under the leaf lock, a mark is consumed exactly once, by this
+        or by :meth:`finish`.
+
+        Args:
+          sink: The sink whose close in flight may carry a mark.
+
+        Returns:
+          Whether a mark was there and is now cleared.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            close = self._in_flight.get(id(sink))
+            if close is None or not close.hand_owed:
+                return False
+            close.hand_owed = False
+            return True
+
     def in_flight(self, sink: Sink) -> bool:
         """Whether a close of *sink* is in flight on some thread right now.
 
@@ -2299,6 +2341,70 @@ def _hand_after_close(sink: Sink) -> None:
     _hand_out([sink], event)
 
 
+def _pay_marks_after_stop() -> None:
+    """Pays a hand the build declined in a stop, once no stop is left, if its close outlives it.
+
+    The build defers while any stop is running (:attr:`Runtime._stops_running`), which reaches
+    past the window where its worker is that stop's late worker: a build in a no-worker stop's
+    tail, after ``_shutdown_running`` has dropped, is deferred too, and the worker it built is
+    live and stopped by nobody. Deferring there is still right while the stop runs, because the
+    stop's second pass may yet close the sink inline — measured, gating the deferral on
+    ``_shutdown_running`` instead let a build inside that second-pass close hand its fresh signal
+    into it, and the ``shutdown()`` took 4.92 s against 0.91 s. But when the close the build
+    marked is not one this stop performs — a swap's displaced close still running after it —
+    the live worker delivered into a sink still on the shutdown's set signal until that close
+    ended: measured, three 0.3 s backoffs during it waited 0.00 s each, against 0.30 s each
+    before the deferral existed.
+
+    So the **last** stop out — run by :func:`_shutdown_worker` after it discards its token, and
+    only when it finds no other stop running under ``_state._lock`` — hands the live worker's
+    sink the worker's own signal and clears the mark (:meth:`_CloseRegistry.unmark`), so the
+    close's own discharge later pays nothing. Two stops finishing together each ask under the
+    lock, and the mark is consumed once, so only one hands. With no stop left, nothing awaits
+    that close on the signal, which is the moment the build would have handed it before the
+    deferral; so this skips only :func:`_will_hand`'s refusal of a sink whose close is in flight,
+    and keeps every other term: the worker is live and draining into the sink, its ``_stop`` is
+    the current signal and unset, and this thread is not already handing the sink. It **never
+    refreshes**: it hands the event the next ``shutdown()`` sets. A mark the terms refuse is left
+    for the close's discharge to pay. A fork while this hand runs leaves the child to its own
+    repair, as for any hand: the child drops every in-flight entry with its mark, owes its sinks
+    its own signal, and a continuing settle re-reads the child's signal under the child's lock.
+
+    A ``shutdown()`` with no mark left behind — every one but this case — asks only a lock-free
+    read of the stop tokens and one acquisition of the registry's leaf
+    (:meth:`_CloseRegistry.marked`), so its pinned count of ``_state._lock`` acquisitions does not
+    move.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: What the sink's setter raised that :func:`offer_stop_signal` does not absorb.
+    """
+    if _state._stops_running or not _state._closes.marked():
+        return
+    with _state._lock:
+        if _state._stops_running:
+            return
+        worker = _state.live_worker()
+        if worker is None:
+            return
+        sink = worker.sink
+        stop = _state._stop
+        if (
+            worker._stop is not stop
+            or stop.is_set()
+            or not worker.draining
+            or handing_here(sink)
+            or not _state._closes.unmark(sink)
+        ):
+            return
+    _hand_out([sink], stop)
+
+
 def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
     """Starts a daemon close of a sink no longer being delivered to (SPEC-030 FR-003).
 
@@ -2502,6 +2608,11 @@ def _get_worker() -> Worker:
     there and emit with the sink still on the shutdown's set event. Limited to a stop in progress
     (:attr:`Runtime._stops_running`, read here under the lock): outside one, a close in flight is
     a swap's or a wrapper's that no shutdown cuts short, and the build hands at once, as before.
+    The gate is the whole stop rather than ``_shutdown_running``, because the stop's second pass
+    still closes the sink inline after that count drops; so a build in the stop's tail, whose
+    worker that stop never stops, is deferred too, and if the marked close outlives the stop the
+    last stop out pays the hand (:func:`_pay_marks_after_stop`) rather than leave the live worker
+    delivering into a sink on the set event until that close ends.
     The mark is asked before :func:`handing_here`, because a build inside a setter's hand to this
     sink would otherwise leave the hand to an outer settle that refuses on that close and leaves
     nobody to pay.
@@ -3723,7 +3834,9 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     :attr:`Runtime.state` reads ``DRAINING`` for the whole body on both branches, the late
     worker's stop and the second ``_close_owed`` pass included — and is never left there by an
     exception. The discard takes no lock: it is one ``set.discard``, so the token adds no
-    acquisition to this call's pinned count.
+    acquisition to this call's pinned count. After it, the last stop out pays any hand a worker
+    build declined during the stop on a close that outlives it (:func:`_pay_marks_after_stop`),
+    which takes ``_state._lock`` only when such a mark exists.
 
     **Before it drains, it waits for every swap in flight to take its decision**, within the
     closer grace (:func:`_await_swap_decisions`), from a snapshot read in the entry's critical
@@ -3792,6 +3905,7 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         _state._closes.wait_graced(op, None)
     finally:
         _state._stops_running.discard(op)
+        _pay_marks_after_stop()
 
 
 def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
@@ -3835,8 +3949,10 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       that finds the drain thread ended closes it (SPEC-050 FR-004); ``incomplete_swaps`` counts
       it, as before.
     - **declined** — the worker retired mid-swap and keeps its old sink forever (SPEC-033 FR-002),
-      or retired after it had reassigned, when the shutdown that retired it drained into the new
-      sink and took whatever the record owed (:meth:`Worker.retarget`). Either way the old sink
+      or retired after it had reassigned, when the shutdown that retired it had already stopped
+      its drain thread, drained into the new sink and taken whatever the record owed
+      (:meth:`Worker.retarget`); a retirement after the reassign with the drain thread still
+      alive is reported ``unfenced``. Either way the old sink
       is left to the record — owed for the exit, or already taken by that shutdown — and the new
       one is armed anyway, because it is what ``configure()`` installed and the orphan path will
       deliver to it — SPEC-035 FR-003's guarantee that a declined sink is owned by *somebody*.
