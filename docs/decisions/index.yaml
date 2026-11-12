@@ -59,6 +59,10 @@ areas:
     path: "docs/decisions/pipeline/pipeline.md"
     governs: ["src/log_foundry/worker.py", "src/log_foundry/_lifecycle.py", "src/log_foundry/_fork.py"]
     decisions:
+      - title: "A shutdown waits for a swap in flight to decide, and a swap releases only what the record owes"
+        fence: "a `shutdown()` or the exit drain waits on each swap in flight's `_Operation.decided`, snapshotted in its entry section, within its one closer grace and never on its own thread or a `log-foundry-` thread, before it drains; and a swap's fenced branch releases the displaced sink only while `_CloseRegistry.owes` it. Never hold or wait on `config._sink_lock` for this. (fix after SPEC-079)"
+        status: "stable"
+        path: "docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md"
       - title: "A value the child inherits is stranded, never merely detached"
         fence: "`dup2` to `/dev/null` *and* reopen in **append** mode: rebinding alone leaves the old object flushing to the real file, and `\"w\"` truncates a log shared with the parent. The hook is **per-sink** on purpose: `StdoutSink` has the same window and must *not* be fixed. (SPEC-039)"
         status: "stable"

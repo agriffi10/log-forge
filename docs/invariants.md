@@ -214,7 +214,7 @@ declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in
 backstop and the latch, SPEC-061), `tests/test_sinks_nats_matrix.py` (those waits and both latches
 as a mutation-gated corpus, including the next and the queued caller's latency), `tests/test_worker_exit_budget.py` (the exit drain's
 retries fit the `shutdown()` budget, SPEC-062), `tests/test_concurrent_configure.py` (a
-`configure(sink=…)` waiting on a concurrent one spends its own swap budget, idly) and `tests/test_delivery_paths.py` (the same cases
+`configure(sink=…)` waiting on a concurrent one spends its own swap budget, idly), `tests/test_shutdown_mid_swap.py` (a `shutdown()` waiting on a sink change spends its own budget: one closer grace at most, never the drain's share, and never on itself) and `tests/test_delivery_paths.py` (the same cases
 through `deliver`, SPEC-072); the CPU half by `tests/test_sinks_pubsub.py`,
 `tests/test_concurrent_owed_closes.py` (a `shutdown()` with no close in flight),
 `tests/test_closed_guard.py` and `tests/test_sinks_kafka.py` (a `CLOSE_ONLY` close's bounded wait,
@@ -263,10 +263,15 @@ later `shutdown()` finds the drain thread ended (SPEC-050); an expired `shutdown
 open, and only a later call that finds the drain thread ended closes it — so in an `atexit` exit
 after an expired call, a sink still inside an emit is not closed at all (SPEC-027 FR-004, decided
 final by SPEC-068); a sink written to after its close is owed a second close, which is correct
-rather than a double (SPEC-045).
+rather than a double (SPEC-045); a `shutdown()` that a sink change in flight does not let take
+its decision within the closer grace, or a sink change that starts after it and retargets a worker
+built during it, may leave the sink that change installs open until the exit, the first with a
+`pending` line (`docs/decisions/pipeline/`).
 *Guarded:* `tests/test_owed_closes.py`, `tests/test_shutdown_lifecycle.py`,
 `tests/test_sink_ownership.py`; `tests/test_concurrent_configure.py` that two concurrent
-`configure(sink=…)` calls close each sink once; `tests/test_invariants_model.py` asserts the first observable;
+`configure(sink=…)` calls close each sink once; `tests/test_shutdown_mid_swap.py` that a
+`shutdown()` or the exit drain landing mid-swap closes the displaced sink once and the installed
+one before it returns; `tests/test_invariants_model.py` asserts the first observable;
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
 lock, its connection released once, and a forked child releases nothing (SPEC-061);
 `tests/test_closed_guard.py`, `tests/test_sink_post_close.py` and `tests/test_sinks_kafka.py` that
