@@ -1170,3 +1170,261 @@ def test_the_worker_build_hands_the_sink_it_built_the_worker_on() -> None:
 
     child = run_in_child(work)
     assert child.output == "verdicts=['fenced'] a_holds=True", child.output
+
+
+# -- a worker built while a close of its sink is in flight -------------------------------------
+
+
+class _Recording(Plain):
+    """Records every offer and every close as ``(kind, event, set?, thread)``, in order.
+
+    The first close parks on ``go`` once it has said so on ``in_close``, so a test can build the
+    worker strictly inside it. With ``backoff`` each close then waits up to 4 s on the signal it
+    holds, as a sink's close cut short by the stop signal does, and records whether that wait was
+    cut short.
+    """
+
+    def __init__(self, *, backoff: bool) -> None:
+        super().__init__()
+        self.backoff = backoff
+        self.in_close = threading.Event()
+        self.go = threading.Event()
+        self.log: list[tuple[str, object, bool, str]] = []
+        self._signal: threading.Event | None = None
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        return self._signal
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+        assert event is not None
+        self.log.append(("offer", event, event.is_set(), threading.current_thread().name))
+        self._signal = event
+
+    def close(self) -> None:
+        if not self.closes:
+            self.in_close.set()
+            self.go.wait(GATE)
+        held = self._signal
+        assert held is not None
+        was_set = held.is_set()
+        started = time.monotonic()
+        if self.backoff:
+            from log_foundry.sinks import _retry
+
+            _retry.wait(4.0, held)
+        kind = "close" if time.monotonic() - started < 1.0 else "close-long"
+        self.log.append((kind, held, was_set, threading.current_thread().name))
+        super().close()
+
+    def render(self) -> str:
+        """The log as ``kind:event:set|unset:thread``, naming the first event E0, the worker's W1."""
+        names: dict[int, str] = {}
+        if self.log:
+            names[id(self.log[0][1])] = "E0"
+        worker = _lifecycle._state.worker_exists()
+        if worker is not None:
+            names.setdefault(id(worker._stop), "W1")
+        return " ".join(
+            f"raised:{getattr(event, '__name__', event)}:{thread}"
+            if kind == "raised"
+            else f"{kind}:{names.get(id(event), 'X')}:{'set' if is_set else 'unset'}:{thread}"
+            for kind, event, is_set, thread in self.log
+        )
+
+
+def _built_during_a_close(site: str) -> str:
+    """Builds the worker while a close of its sink is in flight, and reports what the sink saw.
+
+    ``inline``: a no-worker ``shutdown(timeout=1.0)`` on the ``stopper`` thread closes the sink
+    inline and a ``@trace`` builds the late worker inside that close. ``put_back``: that
+    shutdown's take is interrupted, after the build, by a ``KeyboardInterrupt`` at the inline
+    choice, so the entry is put back. ``refused``: the release is refused once, after the build,
+    so the entry is discharged without a close. ``no_stop``: the close is a bare release on the
+    ``closer`` thread with no ``shutdown()`` running.
+    """
+    sink = _Recording(backoff=site != "no_stop")
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("arms it and hands it E0")
+    if site == "put_back":
+
+        def interrupted(*args: object, **kwargs: object) -> object:
+            sink.in_close.set()
+            sink.go.wait(GATE)
+            raise KeyboardInterrupt
+
+        _lifecycle._inline_close_choice = interrupted  # type: ignore[assignment]
+    elif site == "refused":
+        real_releasable = _lifecycle.releasable
+        refused: list[bool] = []
+
+        def refuse_once(target: object, *, owner: object = None) -> bool:
+            if target is sink and not refused:
+                refused.append(True)
+                sink.in_close.set()
+                sink.go.wait(GATE)
+                return False
+            return real_releasable(target, owner=owner)
+
+        _lifecycle.releasable = refuse_once  # type: ignore[assignment]
+    took: list[float] = []
+
+    def stop() -> None:
+        started = time.monotonic()
+        try:
+            log_foundry.shutdown(timeout=1.0)
+        except BaseException as exc:
+            sink.log.append(("raised", type(exc), False, threading.current_thread().name))
+        took.append(time.monotonic() - started)
+
+    if site == "no_stop":
+        closer = threading.Thread(target=lambda: _lifecycle.release(sink), name="closer")
+    else:
+        closer = threading.Thread(target=stop, name="stopper")
+    closer.daemon = True
+    closer.start()
+    if not sink.in_close.wait(GATE):
+        return "the close never started"
+    _traced()()
+    sink.go.set()
+    closer.join(GATE * 2)
+    quick = "" if not took else f" quick={took[0] < 1.0}"
+    return sink.render() + quick
+
+
+def test_a_worker_built_during_a_close_leaves_that_close_the_shutdowns_signal() -> None:
+    """Invariant 3: a ``@trace`` landing in a ``shutdown()``'s close does not hold that close.
+
+    The shutdown set E0, the signal the sink holds, and is closing the sink when a ``@trace``
+    builds the late worker, whose ``Worker.__init__`` refreshes the set E0 to an unset W1. The
+    build must not hand the sink W1 there: the close is already waiting on the sink's signal. At
+    ``9f4d4dfd`` it did, on the main thread, and the close then waited out its whole 4 s backoff on
+    W1, so ``shutdown(timeout=1)`` took 4.00 s, against 0.00 s for an ``info()`` in the same place.
+    """
+    child = run_in_child(lambda: _built_during_a_close("inline"), timeout=30)
+    first_close = child.output.split(" ")[1]
+    assert first_close == "close:E0:set:stopper", child.output
+    assert child.output.endswith("quick=True"), child.output
+
+
+def test_the_hand_a_build_declined_is_paid_when_the_close_finishes() -> None:
+    """The close that the build declined for hands the sink the late worker's signal, after it.
+
+    Declining alone left the late worker delivering into a sink on the shutdown's set E0, whose
+    backoff then collapses to nothing (SPEC-033 FR-004). So the discharge of that close hands the
+    sink W1, the current signal and unset, on the closing thread once the close is over; the
+    shutdown's second pass then stops the late worker, setting W1, and closes the sink on it. At
+    ``9f4d4dfd`` the build handed W1 itself, on the main thread and inside the close.
+    """
+    child = run_in_child(lambda: _built_during_a_close("inline"), timeout=30)
+    assert child.output == (
+        "offer:E0:unset:MainThread close:E0:set:stopper offer:W1:unset:stopper "
+        "close:W1:set:stopper quick=True"
+    ), child.output
+
+
+def test_a_put_back_pays_the_hand_its_entry_carried() -> None:
+    """An interrupted take puts the entry back, and pays the hand the build declined on it.
+
+    The interrupt lands after the build, so the sink is never closed and is still on the set E0;
+    the late worker is never stopped either, since the interrupt leaves the call. ``put_back``
+    runs under the state lock, so the payment waits for the lock to be released and the fan-out
+    joined, and then hands W1 on the stopper thread, before the interrupt reaches the caller. At
+    ``9f4d4dfd`` the build handed W1 on the main thread instead.
+    """
+    child = run_in_child(lambda: _built_during_a_close("put_back"), timeout=30)
+    assert child.output == (
+        "offer:E0:unset:MainThread offer:W1:unset:stopper raised:KeyboardInterrupt:stopper quick=True"
+    ), child.output
+
+
+def test_a_refused_release_pays_the_hand_its_entry_carried() -> None:
+    """A release refused after the build discharges the entry with no close, and still pays.
+
+    The refusal is planted once, as for a sink a forked child did not acquire; the payment hands
+    W1 on the stopper thread, and the second pass, released normally, closes the sink on W1 once
+    the late worker's stop has set it. At ``9f4d4dfd`` the build handed W1 on the main thread.
+    """
+    child = run_in_child(lambda: _built_during_a_close("refused"), timeout=30)
+    assert child.output == (
+        "offer:E0:unset:MainThread offer:W1:unset:stopper close:W1:set:stopper quick=True"
+    ), child.output
+
+
+def test_a_build_with_no_stop_running_hands_at_once_during_a_close() -> None:
+    """The decline is limited to a stop in progress; any other close in flight keeps the old hand.
+
+    A bare release of the sink is in flight on the ``closer`` thread with no ``shutdown()``
+    running, so nothing will set the sink's signal and the close is not waiting for one. The
+    build hands the sink its signal at once, on the main thread, inside the close, exactly as at
+    ``9f4d4dfd``. The worker's signal is E0 itself here, since nothing set it.
+    """
+    child = run_in_child(lambda: _built_during_a_close("no_stop"), timeout=30)
+    assert child.output == (
+        "offer:E0:unset:MainThread offer:E0:unset:MainThread close:E0:unset:closer"
+    ), child.output
+
+
+def test_a_paid_hand_never_runs_a_setter_inside_itself() -> None:
+    """The payment asks ``handing_here`` like every decision, so a setter is never nested.
+
+    S's setter, on its first hand, calls ``shutdown()``, which closes S inline on the same thread
+    while that hand is still running; a ``@trace`` on another thread builds the late worker inside
+    the close, and the build declines. When the close is discharged, the payment runs on the
+    thread still inside S's setter, so it must leave the hand to the settle already running there
+    rather than run the setter again inside itself. That settle then finds the signal moved and
+    hands S the late worker's W1. Without the test the payment re-entered the setter one level
+    deeper.
+    """
+
+    def work() -> str:
+        in_close, go = threading.Event(), threading.Event()
+        depth = [0, 0]
+
+        class Nesting(Plain):
+            def __init__(self) -> None:
+                super().__init__()
+                self._signal: threading.Event | None = None
+                self.fired = False
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:
+                return self._signal
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+                depth[0] += 1
+                depth[1] = max(depth[1], depth[0])
+                try:
+                    self._signal = event
+                    if not self.fired:
+                        self.fired = True
+                        log_foundry.shutdown(timeout=1.0)
+                finally:
+                    depth[0] -= 1
+
+            def close(self) -> None:
+                if not self.closes:
+                    in_close.set()
+                    go.wait(GATE)
+                super().close()
+
+        sink = Nesting()
+        log_foundry.configure(service="t", sink=sink)
+
+        def build() -> None:
+            in_close.wait(GATE)
+            _traced()()
+            go.set()
+
+        builder = threading.Thread(target=build, daemon=True)
+        builder.start()
+        log_foundry.info("hands S, whose setter shuts down")
+        builder.join(GATE)
+        worker = _lifecycle._state.worker_exists()
+        holds = worker is not None and sink.log_foundry_stop_signal is worker._stop
+        return f"deepest={depth[1]} holds_late={holds}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == "deepest=1 holds_late=True", child.output

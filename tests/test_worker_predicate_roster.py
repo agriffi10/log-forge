@@ -751,6 +751,23 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "nothing (SPEC-054 FR-003). Filed by the `in_flight` token's over-match."
         ),
     ),
+    ("_CloseRegistry.defer_hand", "self._in_flight.get(id(sink))", 0): (
+        MOMENT,
+        (
+            "the close half of the moment, asked by the worker build during a stop: is a close of "
+            "this sink running, so the build marks it and hands nothing, and the close's "
+            "discharge pays the hand (fix after SPEC-079). One leaf acquisition for the check and "
+            "the mark, so no hand is lost between the build and the discharge."
+        ),
+    ),
+    ("_hand_after_close", "not _will_hand(sink)", 0): (
+        MOMENT,
+        (
+            "whether the discharge of a close pays the hand the build declined on it: the refresh "
+            "predicate through `_will_hand`, so the payment hands the current signal only where "
+            "nothing in flight relies on the one the sink holds."
+        ),
+    ),
     ("_CloseRegistry.in_flight", "id(sink) in self._in_flight", 0): (
         MOMENT,
         (
