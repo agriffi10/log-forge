@@ -162,13 +162,16 @@ class SQLiteSink:
 
     **A forked child refuses every** ``emit`` **and never touches the connection it inherited.** A
     SQLite connection cannot cross a fork: used in the child it segfaulted on macOS on the first
-    insert in every child measured. Opening a fresh one in the child is no remedy there, because
+    insert in nearly every child measured, and raised ``disk I/O error`` in the rest. Opening a fresh one in the child is no remedy there, because
     Apple's ``libsqlite3`` logs through ``os_log``, which is not fork-safe once the parent has used
     it, and a fresh connection in the child died too, in anything from none to every child of a run
     depending on timing. So the child owns no connection: ``emit`` refuses with
     ``SinkDeliveryError`` before taking any lock, ``close`` returns having touched nothing, and the
     inherited connection is stranded at the fork rather than ever freed (``_strand_after_fork``).
-    This is ``NATSSink``'s answer to the same question (invariant 12). On Linux a child that wants
+    This is ``NATSSink``'s answer to the same question (invariant 12), with one difference: this
+    sink has no ``deliver``, so the worker sees only a raised ``SinkDeliveryError`` and retries it
+    like any other failure before abandoning the batch, where ``NATSSink``'s ``REJECTED`` verdict
+    skips the retries. Nothing is lost twice, but a busy child's ``flush()`` takes longer. On Linux a child that wants
     a SQLite database of its own builds a sink of its own, with ``configure(sink_factory=...)``; on
     macOS that sink's fresh connection carries the same ``os_log`` hazard, which no sink can remove.
 

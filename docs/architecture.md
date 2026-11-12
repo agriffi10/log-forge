@@ -1027,7 +1027,10 @@ close it.
 - **A forked child's `SQLiteSink` refuses rather than reopens** (invariant 12; no spec — a defect
   fix). A SQLite connection cannot cross a fork, so the child refuses every `emit` with
   `SinkDeliveryError` before taking any lock, `close()` returns having touched nothing, and the
-  inherited connection is stranded at the fork, never freed (§13). Reopening the database in the
+  inherited connection is stranded at the fork, never freed (§13). Unlike `NATSSink`'s `REJECTED`
+  verdict, the refusal reaches the worker as a raised `SinkDeliveryError` from an emit-only sink,
+  which it retries like any other failure before abandoning the batch, so a busy child's `flush()`
+  is slow — the same retry a closed emit-only sink's refusal gets. Reopening the database in the
   child is what SQLite asks for and what Linux allows, and it was built and measured rather than
   assumed: on macOS a fresh connection in the child faulted in `os_log` too, once the parent had
   used SQLite, in anything from none to every child of a run depending on timing, because the
