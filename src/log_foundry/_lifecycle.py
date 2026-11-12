@@ -2874,13 +2874,18 @@ def _swaps_to_await() -> list[_Operation]:
     ahead of it. No lock acquisition is added: this runs inside a section the call
     already takes, so the pinned counts hold.
 
-    **A re-entrant shutdown waits on nothing it could be holding up.** On one of the library's own
-    ``log-foundry-`` threads — the drain, whose ``emit`` a retarget's flush is waiting on, or a
-    closer a swap is joining — every swap is skipped, since the swap may be waiting on this very
-    thread. On the swap's own thread — a stop-signal setter run by the retarget, or a signal
-    handler interrupting ``configure()`` — its own token is skipped by ``thread``. Either wait
-    would last the whole closer grace, or until the process is killed with a large one. The
-    ``log-foundry-`` prefix is ``config._change_sink``'s rule for a re-entrant ``configure()``.
+    **A re-entrant shutdown waits on nothing it could be holding up.** On the drain thread — a
+    sink's ``emit``, which a retarget's flush may be waiting on — every swap is skipped, since an
+    undecided swap may be waiting on this very thread. On the swap's own thread — a stop-signal
+    setter run by the retarget, or a signal handler interrupting ``configure()`` — its own token
+    is skipped by ``thread``. Either wait would last the whole closer grace, or until the process
+    is killed with a large one. The rule is written as ``config._change_sink``'s prefix,
+    ``log-foundry-``, so it also covers a closer thread; that half is harmless rather than needed,
+    because a swap joins its closers only after it has set ``decided``, and a decided swap is
+    never in the snapshot. **The cost**: a re-entrant shutdown landing between a swap's retarget
+    and its decision drains and returns with the installed sink not yet owed, so that sink is
+    left open until a later ``shutdown()`` or the exit closes it, and no line says so; the
+    displaced one is still closed once, because the swap releases only what the record owes.
 
     The token set is copied into a tuple first, for :meth:`Runtime._take_ahead`'s reason: its
     discard runs without the lock.
@@ -3237,9 +3242,11 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     ``624d817f``: six events delivered, never closed). The decision is published on the token's
     ``decided`` event, set right after the last critical section — the decision on the worker
     branch, or the absorbed retarget exception; the first section on the no-worker branch — and
-    before the closers are joined, since a shutdown waiting out this call's slow detached closes
-    as well would charge them to its grace twice. The ``finally`` sets it again, so no exit
-    leaves a shutdown waiting on it.
+    before the closers are joined. Set after the join instead, a shutdown would wait out this
+    call's slow detached closes before it drains: the grace would be spent ahead of the drain, a
+    close slower than the grace would make it write a false ``pending`` line saying the change
+    had not taken effect, and the drain and the take would start that much later. The
+    ``finally`` sets it again, so no exit leaves a shutdown waiting on it.
 
     **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no

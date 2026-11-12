@@ -432,11 +432,13 @@ class _ParkFor:
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, target: object, seconds: float) -> None:
         self.parked = threading.Event()
+        self.until = 0.0
         real = Worker.retarget
 
         def parked_after(self_: Worker, new_sink: Any, deadline: float | None = None) -> Any:
             outcome = real(self_, new_sink, deadline)
             if new_sink is target and not self.parked.is_set():
+                self.until = time.monotonic() + seconds
                 self.parked.set()
                 time.sleep(seconds)
             return outcome
@@ -525,14 +527,166 @@ def test_the_wait_and_the_graced_closes_share_one_grace(monkeypatch: pytest.Monk
         assert _lifecycle._state._closes.graced_alive() == 1, "the premise: y's close is stuck"
         start = time.monotonic()
         log_foundry.shutdown(timeout=30.0)
-        elapsed = time.monotonic() - start
+        returned = time.monotonic()
         _finish(swap)
     finally:
         y.release.set()
     _lifecycle._state._closes.wait_graced(_lifecycle._Operation(_lifecycle._Op.STOP, 5.0), None)
     grace = _lifecycle.DEFAULT_CLOSER_GRACE
-    assert elapsed >= 1.4, f"the premise: the shutdown waited for the swap ({elapsed:.2f}s)"
+    elapsed = returned - start
+    assert returned >= park.until, (
+        f"the premise: the shutdown returned {park.until - returned:.2f}s before the swap decided"
+    )
     assert elapsed < grace + 0.9, f"spent {elapsed:.2f}s, more than one {grace}s grace"
+
+
+class _GatedSlowClose(Sink):
+    """A sink whose close parks on an event, for up to ``seconds``, then records."""
+
+    def __init__(self, name: str, seconds: float) -> None:
+        super().__init__(name)
+        self.seconds = seconds
+        self.release = threading.Event()
+
+    def close(self) -> None:
+        """Parks, then records."""
+        self.release.wait(self.seconds)
+        super().close()
+
+
+def test_a_swaps_slow_displaced_close_is_not_waited_out_before_the_drain(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invariant 3: a swap publishes its decision before it joins the close it started.
+
+    A's close takes longer than the 2 s grace. The swap decides 0.2 s after the shutdown starts
+    waiting and releases A detached; had it set ``decided`` only after joining that close, the
+    shutdown would spend its whole grace before the drain and write a false line saying the change
+    had not taken effect. Here the wait records about 0.2 s and nothing is announced; A's close is
+    then a bystander the rest of the grace covers.
+    """
+    spent: list[float] = []
+    real_close_owed = _lifecycle._close_owed
+
+    def recording(op: Any = None, **kwargs: Any) -> bool:
+        if op is not None and kwargs.get("bystander_wait", True):
+            spent.append(getattr(op, "grace_spent", 0.0))
+        return real_close_owed(op, **kwargs)
+
+    monkeypatch.setattr(_lifecycle, "_close_owed", recording)
+    a, b = _GatedSlowClose("A", 4.0), Sink("B")
+    _worker_on(a)
+    gate = _ParkAfterRetarget(monkeypatch, b)
+    swap = _start(lambda: log_foundry.configure(sink=b))
+    try:
+        assert gate.parked.wait(GATE_WAIT), "the swap reached its window"
+        capsys.readouterr()
+        shutdown = _start(lambda: log_foundry.shutdown(timeout=10.0))
+        time.sleep(0.2)
+        gate.release.set()
+        _finish(shutdown)
+        err = capsys.readouterr().err
+    finally:
+        gate.release.set()
+        a.release.set()
+    _finish(swap)
+    _lifecycle._state._closes.wait_graced(_lifecycle._Operation(_lifecycle._Op.STOP, 5.0), None)
+    grace = _lifecycle.DEFAULT_CLOSER_GRACE
+    assert NOT_DECIDED not in err, f"a false not-decided line: {err}"
+    assert spent and spent[0] < grace / 2, (
+        f"the shutdown spent {spent} of its {grace}s grace waiting before the drain"
+    )
+    assert _once(a), f"A was not closed exactly once: {a}"
+    assert _once(b), f"B was not closed exactly once: {b}"
+
+
+def test_the_exit_closes_a_sink_the_swap_installed_after_a_shutdown_ran_out() -> None:
+    """Invariant 5 on the fallback, at exit: what a late decision armed is closed by ``atexit``.
+
+    The subprocess variant of the wait-runs-out test. The grace is 0.3 s and the swap stays parked
+    past it, so the explicit ``shutdown()`` returns with B not yet owed; the swap is then released
+    and arms B, and the main thread falls off the end. The library's ``atexit`` handler is the only
+    thing left to close B, and the probe handler, registered before ``import log_foundry`` so it
+    runs last, reports that it did, exactly once. This is the path the not-decided ``pending``
+    line promises ("left open until the process exits").
+    """
+    program = textwrap.dedent(
+        """
+        import atexit
+        import threading
+
+        a_closes = []
+        b_closes = []
+        at_return = []
+        atexit.register(
+            lambda: print(f"PROBE A={a_closes} B={b_closes} AT_RETURN={at_return}", flush=True)
+        )
+
+        import log_foundry
+        from log_foundry import _lifecycle
+        from log_foundry.worker import Worker
+
+        _lifecycle.DEFAULT_CLOSER_GRACE = 0.3
+
+
+        class Sink:
+            log_foundry_stop_signal = None
+
+            def __init__(self, closes):
+                self.events = 0
+                self.closes = closes
+
+            def emit(self, batch):
+                self.events += len(batch)
+
+            def close(self):
+                self.closes.append((self.events, threading.current_thread().name))
+
+
+        a, b = Sink(a_closes), Sink(b_closes)
+        parked, go = threading.Event(), threading.Event()
+        real = Worker.retarget
+
+
+        def parked_after(self, new_sink, deadline=None):
+            outcome = real(self, new_sink, deadline)
+            if new_sink is b:
+                parked.set()
+                go.wait(10)
+            return outcome
+
+
+        Worker.retarget = parked_after
+        log_foundry.configure(service="exit-after-fallback", sink=a)
+
+
+        @log_foundry.trace
+        def traced():
+            log_foundry.info("x")
+
+
+        traced()
+        swapper = threading.Thread(target=lambda: log_foundry.configure(sink=b), daemon=True)
+        swapper.start()
+        assert parked.wait(10)
+        log_foundry.shutdown(timeout=5.0)
+        at_return.append(len(b_closes))
+        go.set()
+        swapper.join(10)
+        print("EXITING", flush=True)
+        """
+    )
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", program], capture_output=True, text=True, timeout=90
+    )
+    assert "EXITING" in result.stdout, f"the child never got there: {result.stderr[-800:]}"
+    probe = re.search(r"PROBE A=(\[.*?\]) B=(\[.*?\]) AT_RETURN=(\[.*?\])", result.stdout)
+    assert probe is not None, f"the probe handler did not run:\n{result.stdout}"
+    a_closes, b_closes, at_return = probe.group(1), probe.group(2), probe.group(3)
+    assert at_return == "[0]", f"the premise: shutdown() returned with B already closed: {b_closes}"
+    assert NOT_DECIDED in result.stderr, result.stderr[-800:]
+    assert a_closes.count("(") == 1, f"A was not closed exactly once: {a_closes}"
+    assert b_closes.count("(") == 1, f"B was not closed exactly once, by the exit: {b_closes}"
 
 
 # -- 7. a backoff the stop signal cuts short is not held up ---------------------------------------

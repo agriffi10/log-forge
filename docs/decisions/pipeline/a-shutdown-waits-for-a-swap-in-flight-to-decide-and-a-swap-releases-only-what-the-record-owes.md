@@ -50,10 +50,12 @@ nothing. A swap that does not decide in time is proceeded past: Part 1 still clo
 `pending` line says the installed sink may be left open until the process exits.
 
 **Re-entrant never waits.** A shutdown on the swap's own thread (a stop-signal setter run by the
-retarget, a signal handler interrupting `configure()`) skips its own token; one on a library thread
-(the drain's `emit`, which a retarget's flush is waiting on; a closer a swap is joining) waits on no
-swap. Either wait is on a thread that is waiting on it, so it would last the whole grace. The
-`log-foundry-` prefix is `config._change_sink`'s rule for a re-entrant `configure()`.
+retarget, a signal handler interrupting `configure()`) skips its own token; one on the drain thread
+(a sink's `emit`, which a retarget's flush may be waiting on) waits on no swap. Either wait is on a
+thread an undecided swap may be waiting on, so it would last the whole grace. The rule is written as
+`config._change_sink`'s `log-foundry-` prefix, so it also covers a closer thread, which is harmless
+rather than needed: a swap joins its closers only after it sets `decided`, and a decided swap is
+never in the snapshot.
 
 **Rejected: holding `config._sink_lock` for the shutdown (v1).** The plan review built it: six
 shipped tests broke, and a backoff that the stop signal should cut short was held behind the lock
@@ -67,8 +69,12 @@ retarget and its decision when it takes — so it waits on exactly that.
 
 **Not covered, recorded.** A swap that starts after the shutdown's entry and retargets a *late*
 worker (one built during a no-worker shutdown) is not in the snapshot. Part 1 keeps the displaced
-sink once; the installed one may be left owed until the exit closes it. `invariants.md` §5 records it
-beside the not-decided fallback.
+sink once; the installed one may be left owed until the exit closes it. Nor is a re-entrant
+shutdown (on the drain thread, on the swap's own thread, or in a signal handler) landing between the
+retarget and the decision: it drains and returns with the installed sink not yet owed, so that sink
+is left open until a later `shutdown()` or the exit closes it, and no line says so; the displaced
+one is still closed once. `invariants.md` §5 records both beside the not-decided fallback, the only
+one of the three that writes a `pending` line.
 
 ## History
 
