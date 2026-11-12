@@ -846,3 +846,67 @@ def test_an_interrupt_during_the_wait_still_lowers_the_shutdown_count() -> None:
         _lifecycle._state._swaps_running.discard(token)
     assert _lifecycle._state._shutdown_running == 0, "an interrupted wait left the count raised"
     assert not _lifecycle._state._stops_running, "and its draining token in place"
+
+
+# -- 10. a swap's stop-signal hand neither holds a shutdown nor mislabels its verdict -------------
+
+
+class _ParkedSetter(Sink):
+    """A sink whose stop-signal setter parks until ``release`` is set, recording what it stored."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.handing = threading.Event()
+        self.release = threading.Event()
+        self.stored: threading.Event | None = None
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:  # type: ignore[override]
+        """The signal the setter last stored."""
+        return self.stored
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, value: threading.Event | None) -> None:
+        self.handing.set()
+        self.release.wait(GATE_WAIT)
+        self.stored = value
+
+
+def test_a_shutdown_does_not_wait_out_a_no_worker_swaps_slow_setter() -> None:
+    """Invariant 3: a no-worker swap has decided before it hands its sink the signal.
+
+    A sink P is owed through an orphan log, then ``configure(sink=S)`` runs a no-worker swap whose
+    first section arms S and whose hand then parks in S's setter. A ``shutdown()`` on the main
+    thread snapshots that swap; it must find it decided and go on, closing S while the setter is
+    still parked, and the setter then stores the very event that shutdown set. At ``9f4d4dfd``
+    the swap published ``decided`` only after the hand, so the shutdown waited out its whole
+    2.00 s closer grace and wrote the not-decided ``pending`` line for a decision taken long
+    before. Run in a forked child, so the parked setter cannot outlive the test.
+    """
+
+    def scenario() -> str:
+        err = io.StringIO()
+        sys.stderr = err
+        p, s = Sink("P"), _ParkedSetter("S")
+        log_foundry.configure(service="shutdown-mid-swap", sink=p)
+        log_foundry.info("owes P")
+        swap = _start(lambda: log_foundry.configure(sink=s))
+        if not s.handing.wait(GATE_WAIT):
+            return "the swap never reached the hand"
+        start = time.monotonic()
+        log_foundry.shutdown(timeout=5.0)
+        elapsed = time.monotonic() - start
+        closed_while_parked = s.closes
+        s.release.set()
+        swap.join(GATE_WAIT)
+        stored = s.stored
+        current = stored is _lifecycle._state._stop and stored is not None and stored.is_set()
+        return (
+            f"line={NOT_DECIDED in err.getvalue()} quick={elapsed < 1.0} "
+            f"closed_while_parked={closed_while_parked} stored_the_set_signal={current}"
+        )
+
+    child = run_in_child(scenario)
+    assert child.output == (
+        "line=False quick=True closed_while_parked=1 stored_the_set_signal=True"
+    ), child.output

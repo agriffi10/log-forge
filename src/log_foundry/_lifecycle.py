@@ -3803,6 +3803,16 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     :meth:`Worker.retarget` already hands outside every lock but ``config._sink_lock``, which a
     re-entrant ``configure()`` never waits on.
 
+    **``decided`` is set before that hand, not after it.** The no-worker decision is whole when
+    the first section ends — the stale sinks taken, ``new_sink`` armed, the signal chosen — so a
+    shutdown on another thread has nothing left to wait for. Set after the hand, it waited out
+    the setter: measured, a ``shutdown(timeout=5)`` behind a setter parked for 3 s took the whole
+    2.00 s closer grace and wrote the not-decided ``pending`` line for a decision that had long
+    been taken. The shutdown that now proceeds may close ``new_sink`` while its setter is still
+    running here, which is the window the stop-signal decision records for a close that starts
+    before a pending hand lands: the event this hand delivers is the one that shutdown set at its
+    entry, so the setter stores a set signal and the close is not held by it.
+
     **The swapping token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._swaps_running` in the first critical section — after the early return for no
     live worker and nothing owed, so a swap with no work never enters ``SWAPPING``, and before any
@@ -3851,6 +3861,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 if hand:
                     event = _state.refresh_stop_signal()
         if event is not None:
+            op.decided.set()
             _hand_out([new_sink], event)
         if worker is not None:
             try:
