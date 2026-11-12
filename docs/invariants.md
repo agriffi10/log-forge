@@ -264,7 +264,7 @@ open, and only a later call that finds the drain thread ended closes it — so i
 after an expired call, a sink still inside an emit is not closed at all (SPEC-027 FR-004, decided
 final by SPEC-068); a sink written to after its close is owed a second close, which is correct
 rather than a double (SPEC-045); a `shutdown()` that a sink change in flight does not let take
-its decision within the closer grace, a sink change that starts after it and retargets a worker
+its decision within the closer grace, nor by the call's last take, a sink change that starts after it and retargets a worker
 built during it, or a re-entrant `shutdown()` (from a sink's own code on the drain thread or the
 changing thread, or a signal handler) landing between that change's retarget and its decision, may
 leave the sink that change installs open until a later `shutdown()` or the exit closes it — only

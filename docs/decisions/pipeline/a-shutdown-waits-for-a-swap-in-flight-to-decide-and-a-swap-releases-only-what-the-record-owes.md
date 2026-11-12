@@ -46,8 +46,13 @@ and as the first statement inside the no-worker branch's `try`, so an interrupt 
 is recorded as `op.grace_spent`, and `_open_grace` fixes `grace_end` at
 `now + max(0, closer_grace(deadline) - grace_spent)`, so the call spends at most one grace (SPEC-078
 FR-002) and the drain in between is not charged to it. A free snapshot waits on nothing and records
-nothing. A swap that does not decide in time is proceeded past: Part 1 still closes A once, and one
-`pending` line says the installed sink may be left open until the process exits.
+nothing. A swap that does not decide in time is proceeded past: Part 1 still closes A once. The swap
+may yet decide during the drain, and then its arm lands before the call's take and the call closes
+B, so the `pending` line saying the installed sink may be left open until the process exits is
+written only after the call's last take, and only for a swap that had still not decided in that
+take's critical section (`_Operation.unsettled`, narrowed by `_close_owed`). Written at the wait, it
+was false on the frame-2 review's reproduction: a swap stuck in its first flush behind a 3 s `emit`
+declined and armed B in time for the same call to close it.
 
 **Re-entrant never waits.** A shutdown on the swap's own thread (a stop-signal setter run by the
 retarget, a signal handler interrupting `configure()`) skips its own token; one on the drain thread
@@ -74,7 +79,11 @@ shutdown (on the drain thread, on the swap's own thread, or in a signal handler)
 retarget and the decision: it drains and returns with the installed sink not yet owed, so that sink
 is left open until a later `shutdown()` or the exit closes it, and no line says so; the displaced
 one is still closed once. `invariants.md` §5 records both beside the not-decided fallback, the only
-one of the three that writes a `pending` line.
+one of the three that writes a `pending` line. And a `shutdown()` nested in a sink's `close()`, or
+in a signal handler on a thread that is not the swap's, waits its own grace on the same stuck swap,
+so the outer call can spend two graces and the line prints twice (measured 1.01 s at a 0.5 s
+grace); accepted, because invariant 3 still bounds it and a fix needs a thread-local flag in user
+code.
 
 ## History
 

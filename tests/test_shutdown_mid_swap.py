@@ -212,6 +212,72 @@ def test_a_shutdown_whose_wait_runs_out_still_closes_the_displaced_sink_once(
     assert _once(b), f"B was not closed exactly once by the next shutdown: {b}"
 
 
+# -- 2b. the wait runs out, but the swap decides during the drain ---------------------------------
+
+
+class _SlowEmit(Sink):
+    """A sink whose ``emit`` holds the drain thread for ``seconds`` once armed."""
+
+    def __init__(self, name: str, seconds: float) -> None:
+        super().__init__(name)
+        self.seconds = seconds
+        self.armed = False
+        self.entered = threading.Event()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Sleeps once if armed, then counts."""
+        if self.armed:
+            self.armed = False
+            self.entered.set()
+            time.sleep(self.seconds)
+        super().emit(batch)
+
+
+def test_a_swap_that_decides_during_the_drain_is_not_announced_as_left_open(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invariant 5 and its line agree: a swap that decides before the take is closed, unannounced.
+
+    A's ``emit`` holds the drain for 1.5 s, and the swap to B is stuck in its first flush behind
+    it. The closer grace is 0.3 s, so the shutdown gives up waiting; but the drain then ends, the
+    retarget declines, and the swap arms B before the call takes. The swap thread is joined at the
+    take's entry so that order is forced rather than raced. B is then closed by this very call, so
+    the line saying it may be left open must not be written. Measured on the frame-2 review's
+    reproduction, the line was written at the wait, before the drain, and was false.
+    """
+    monkeypatch.setattr(_lifecycle, "DEFAULT_CLOSER_GRACE", 0.3)
+    a, b = _SlowEmit("A", 1.5), Sink("B")
+    _worker_on(a)
+    swap_thread: list[threading.Thread] = []
+    real_close_owed = _lifecycle._close_owed
+
+    def after_the_swap(op: Any = None, **kwargs: Any) -> bool:
+        if swap_thread:
+            swap_thread[0].join(GATE_WAIT)
+        return real_close_owed(op, **kwargs)
+
+    monkeypatch.setattr(_lifecycle, "_close_owed", after_the_swap)
+    a.armed = True
+    _traced()
+    swap = _start(lambda: log_foundry.configure(sink=b))
+    assert a.entered.wait(GATE_WAIT), "the drain is inside A's slow emit"
+    deadline = time.monotonic() + GATE_WAIT
+    while not _lifecycle._state._swaps_running and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _lifecycle._state._swaps_running, "the premise: the swap is in flight"
+    capsys.readouterr()
+    swap_thread.append(swap)
+    log_foundry.shutdown(timeout=6.0)
+    b_at_return = b.closes
+    _finish(swap)
+    err = capsys.readouterr().err
+    assert b_at_return == 1, f"the call did not close the B the swap armed during its drain: {b}"
+    assert NOT_DECIDED not in err, f"a false not-decided line: {err}"
+    assert _once(a), f"A was not closed exactly once: {a}"
+    log_foundry.shutdown(timeout=2.0)
+    assert _once(b), f"B was not closed exactly once: {b}"
+
+
 # -- 3. a re-entrant shutdown never waits on itself -----------------------------------------------
 
 

@@ -190,6 +190,8 @@ class _Operation:
       decided: Set once a ``SWAP`` has taken its decision, so a ``STOP`` may take after it.
       thread: The ident of the thread that built this token.
       grace_spent: Seconds this ``STOP`` spent waiting on swaps to decide, carved from its grace.
+      unsettled: The swaps this ``STOP`` gave up waiting on and had not seen decide by its last
+        take, for the one line that says so.
     """
 
     def __init__(self, kind: _Op, timeout: float | None) -> None:
@@ -214,6 +216,7 @@ class _Operation:
         self.decided = threading.Event()
         self.thread = threading.get_ident()
         self.grace_spent = 0.0
+        self.unsettled: list[_Operation] = []
 
 
 class _Close:
@@ -2783,7 +2786,10 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     **It records the call's last take** (SPEC-078 FR-004): in the take's own critical section,
     ``op.drained`` is set when no further take of this call can follow — the second pass, or a
     first pass that waits on nobody once no late worker can still be registered for the call.
-    That is what bounds the declining swap.
+    That is what bounds the declining swap. In the same section it drops from
+    :attr:`_Operation.unsettled` every swap the call gave up waiting on that has decided since:
+    that swap's arm landed before this take, so the sink it installed is closed here, and
+    :func:`_announce_unsettled` must not say it may be left open.
 
     Args:
       op: The ``STOP`` this closer runs for, whose deadline bounds the grace and which carries the
@@ -2814,6 +2820,7 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
                 rule = _Rule.GRACED
             entries.append((sink, _state._closes.take(sink, rule)))
         mine = {id(sink) for sink in taken}
+        operation.unsettled = [swap for swap in operation.unsettled if not swap.decided.is_set()]
         waiting = _state._closes.bystanders(mine) if bystander_wait else []
         if not bystander_wait or not (waiting or operation.late_possible):
             operation.drained = True
@@ -2926,8 +2933,13 @@ def _await_swap_decisions(op: _Operation, swaps: list[_Operation]) -> None:
     and :meth:`_CloseRegistry._open_grace` deducts it: one grace per call at most (SPEC-078
     FR-002), without charging the drain to it. A swap not decided in time is proceeded past; the
     displaced sink is still closed once, because the swap releases only a sink the record still
-    owes, and one ``pending`` line says what the shutdown could not settle. An empty list waits on
-    nothing and records nothing, so an uncontended shutdown is unchanged.
+    owes. The swaps given up on are recorded as :attr:`_Operation.unsettled` rather than
+    announced here: one may still decide during the drain, and its arm then lands before this
+    call's take, which closes the sink it installed — measured with a swap stuck in its first
+    flush behind a 3 s ``emit``, whose decline armed B in time for the call to close it while a
+    line written at this point said B might be left open. :func:`_close_owed` narrows the record
+    at each take and :func:`_announce_unsettled` writes the line after the last. An empty list
+    waits on nothing and records nothing, so an uncontended shutdown is unchanged.
 
     **Not the** ``config._sink_lock`` **barrier.** Holding that lock for the shutdown broke six
     shipped tests and regressed a backoff cut short by the stop signal; passing it as a barrier
@@ -2954,7 +2966,31 @@ def _await_swap_decisions(op: _Operation, swaps: list[_Operation]) -> None:
             swap.decided.wait(max(0.0, end - monotonic()))
     finally:
         op.grace_spent = monotonic() - started
-    if not all(swap.decided.is_set() for swap in swaps):
+    op.unsettled = [swap for swap in swaps if not swap.decided.is_set()]
+
+
+def _announce_unsettled(op: _Operation) -> None:
+    """Writes the not-decided line, once, if a swap given up on had not decided by the last take.
+
+    Called by :func:`_shutdown_worker` after its last take of the owed record. What is left in
+    :attr:`_Operation.unsettled` is a swap that had still not decided when the call last took, in
+    that take's own critical section, so whatever it installs is armed after this call has
+    finished taking and is left for a later ``shutdown()`` or the exit. A swap that decided in
+    time for a take was dropped from the record there, and its sink was closed by this call, so
+    no line is written for it. The residual window runs from the end of a swap's decision
+    section to its ``decided.set()``, a few bytecodes with no call in them, and a swap caught
+    there writes a line that was not needed, which is the safe direction.
+
+    Args:
+      op: The ``STOP`` whose wait gave up on some swaps, or on none.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if op.unsettled:
         _diag.pending(
             "shutdown() could not wait for a sink change in flight to take effect; the sink it "
             "installs may be left open until the process exits"
@@ -3061,7 +3097,10 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     lowers ``_shutdown_running``. A swap that starts after the entry finds the worker retired and
     meets the drain at its own entry (SPEC-078 FR-004); the one not covered is a swap that starts
     after the entry and retargets a late worker built during a no-worker shutdown, where the
-    displaced sink is still closed once and the installed one may be left for the exit.
+    displaced sink is still closed once and the installed one may be left for the exit. A swap
+    the wait gave up on is announced only after the call's last take, by
+    :func:`_announce_unsettled`, and only if it had still not decided by then: one that decides
+    during the drain has its sink closed by this call.
 
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
@@ -3112,6 +3151,7 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
                 late_worker.stop(_remaining(op.deadline))
         if waited or late_worker is not None:
             _close_owed(op, bystander_wait=False)
+        _announce_unsettled(op)
         _state._closes.wait_graced(op, None)
     finally:
         _state._stops_running.discard(op)
