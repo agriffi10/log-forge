@@ -1035,11 +1035,13 @@ class Worker:
         The unconfirmed-swap diagnostic reports the budget the drain was **given**, the remainder
         of the deadline when this method read it, not what was left after the flush: once that
         flush has timed out the remainder is always ~0, which would say nothing about what the
-        drain was allowed. The budget given is the caller's whole budget less the time between the
+        drain was allowed. The budget given is the caller's budget less the time between the
         deadline being set and this method reading the clock, whatever spent it. The line reads
-        "within 0s", truthfully, for either of two causes: that time used up the whole budget, or
-        the caller passed none on purpose, as a ``configure()`` re-entered from a sink's own code
-        does (``config._change_sink`` passes ``0.0`` there and writes its own line saying why).
+        "within 0s", truthfully, whenever nothing was left by that read: the caller's budget was
+        already spent upstream (a ``configure()`` whose wait for ``config._sink_lock`` used it up
+        passes ``0.0``), that time used up the rest, or the caller passed none on purpose, as a
+        ``configure()`` re-entered from a sink's own code does. ``config._change_sink`` writes a
+        line of its own when it gave up waiting for that lock and when it is re-entered.
 
         Args:
           new_sink: The sink to deliver to from now on.
