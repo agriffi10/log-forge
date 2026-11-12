@@ -1024,8 +1024,9 @@ class Worker:
         **Three verdicts, and the owner does something different with each.** ``declined`` — this
         worker retired mid-swap, so it keeps its sink forever (SPEC-033 FR-002) and the owner owes
         both a close; or it retired after the reassign, holding ``new_sink``, which the shutdown
-        that retired it drained into. ``fenced`` — a ``flush()`` after the reassign confirmed the drain reached
-        the new sink, so nothing can still be inside the old one and the owner may release it.
+        that retired it drained into. ``fenced`` — a ``flush()`` after the reassign confirmed the
+        drain reached the new sink, so nothing can still be inside the old one and the owner may
+        release it.
         ``unfenced`` — that confirmation did not arrive within the budget, so the old sink stays
         among the ones this thread may be inside and a later ``shutdown()`` that finds the thread
         ended closes it (SPEC-050 FR-004).

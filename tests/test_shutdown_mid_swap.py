@@ -966,6 +966,7 @@ def test_a_shutdown_racing_the_fence_flush_is_declined_not_unfenced() -> None:
         real = Worker.flush
         calls: list[int] = []
         stopping: list[threading.Thread] = []
+        retired_in_time: list[bool] = []
 
         def fenced_late(self_: Worker, timeout: float | None = 5.0) -> Any:
             calls.append(1)
@@ -974,8 +975,9 @@ def test_a_shutdown_racing_the_fence_flush_is_declined_not_unfenced() -> None:
                 deadline = time.monotonic() + GATE_WAIT
                 while _lifecycle._state.retirements <= self_._epoch:
                     if time.monotonic() > deadline:
-                        return "the shutdown never retired the worker"
+                        break
                     time.sleep(0.001)
+                retired_in_time.append(_lifecycle._state.retirements > self_._epoch)
             return real(self_, timeout)
 
         Worker.flush = fenced_late  # type: ignore[method-assign]
@@ -984,9 +986,11 @@ def test_a_shutdown_racing_the_fence_flush_is_declined_not_unfenced() -> None:
         for thread in stopping:
             thread.join(GATE_WAIT)
         return (
-            f"raced={len(stopping)} incomplete={worker.incomplete_swaps} "
+            f"raced={retired_in_time} incomplete={worker.incomplete_swaps} "
             f"line={UNFENCED in err.getvalue()} p_closes={p.closes} a_closes={a.closes}"
         )
 
     child = run_in_child(scenario)
-    assert child.output == ("raced=1 incomplete=0 line=False p_closes=1 a_closes=1"), child.output
+    assert child.output == ("raced=[True] incomplete=0 line=False p_closes=1 a_closes=1"), (
+        child.output
+    )

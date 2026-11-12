@@ -3119,8 +3119,9 @@ def _hand_out(sinks: list[Sink], event: threading.Event) -> None:
     no-worker swap's ``configure()``, handing its new sink, and a deferred hand paid
     (:func:`_hand_after_close`) by a ``shutdown()`` that a sink's own code ran on a swap's thread,
     which holds that lock across the whole swap. Each sink is marked as being handed on this
-    thread (:func:`handing`) for the length of its hand, so a setter that logs to it, or builds the worker on it, does not hand it again. Every
-    caller has already asked :func:`handing_here`, through :func:`_will_hand` or directly.
+    thread (:func:`handing`) for the length of its hand, so a setter that logs to it, or builds
+    the worker on it, does not hand it again. Every caller has already asked
+    :func:`handing_here`, through :func:`_will_hand` or directly.
 
     Args:
       sinks: The sinks to hand it to.
