@@ -272,17 +272,26 @@ def _unfenced_swap(queued: int) -> tuple[_GatedSink, Worker]:
     return old, worker
 
 
-def _swap_line(err: str) -> tuple[str, str]:
+_UNSIGNED_SECONDS = re.compile(r"\d+(?:\.\d+)?(?:e-\d+)?s")
+"""An unsigned `:g` rendering of a budget: refuses `-0s`, any negative, `?`, `nan` and `inf`."""
+
+
+def _swap_line(err: str, budget: float = 0.05) -> tuple[str, str]:
     """Returns the swap line and the `T` it rendered, checking `T` is within the swap's budget.
 
-    `retarget` recomputes the budget from the deadline, so `T` is a hair under the 0.05 given.
+    `T` is the remainder of the deadline at `retarget`'s entry, clamped at zero, so it is at most
+    the `budget` given and reads `0s` when a slow runner spends the whole budget before `retarget`
+    reads the clock. That is a correct rendering, not a defect: a strict `0.0 <` floor here once
+    failed a Release run with `AssertionError: 0s`. The floor that tells the entry budget from the
+    post-flush remainder lives in its own test, with a margin wide enough to be deterministic.
     """
     lines = [line for line in err.splitlines() if "could not be confirmed drained" in line]
     assert len(lines) == 1, err
     match = _SWAP_T.search(lines[0])
     assert match is not None, lines[0]
     rendered = match.group(1)
-    assert rendered.endswith("s") and 0.0 < float(rendered[:-1]) <= 0.05, rendered
+    assert _UNSIGNED_SECONDS.fullmatch(rendered), rendered
+    assert 0.0 <= float(rendered[:-1]) <= budget, rendered
     return lines[0], rendered
 
 
@@ -314,6 +323,66 @@ def test_the_unfenced_swap_line_with_only_its_marker_has_no_queued_clause(capsys
         line, rendered = _swap_line(err)
         assert line == _SWAP.format(T=rendered)
         assert "lost" not in err
+    finally:
+        old.fail = False
+        _release(old, worker)
+
+
+def test_a_swap_budget_spent_before_retarget_renders_0s(monkeypatch, capsys) -> None:
+    """FR-002. A budget gone before `retarget` reads the clock renders `0s`, which is correct.
+
+    The wrapper stalls past the 0.05 s deadline before `retarget` runs, so its entry remainder is
+    clamped to zero. The stall only lengthens a wait past a deadline already passed, so the
+    outcome is fixed and no timing bound is asserted. This pins the slow path the Release flake
+    hit: a strict `0.0 <` floor in `_swap_line` fails here.
+    """
+    original = Worker.retarget
+
+    def stalled(self: Worker, new_sink: object, deadline: float | None) -> object:
+        threading.Event().wait(0.08)
+        return original(self, new_sink, deadline)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Worker, "retarget", stalled)
+    old, worker = _unfenced_swap(queued=0)
+    try:
+        new = _SlowFailSink(0.0, fail_times=0)
+        _lifecycle._swap_sink(new, timeout=0.05)  # type: ignore[arg-type]
+        line, rendered = _swap_line(capsys.readouterr().err)
+        assert rendered == "0s"
+        assert line == _SWAP.format(T="0s")
+    finally:
+        old.fail = False
+        _release(old, worker)
+
+
+def test_the_unfenced_swap_line_reports_the_budget_at_entry(monkeypatch, capsys) -> None:
+    """FR-002. `T` is the budget `retarget` was given, not what was left after its drain.
+
+    Once the drain times out the remainder is ~0, so a line built from it would read `0s` on
+    every unfenced swap. The floor is derived from this test's own clock: the deadline is set no
+    earlier than `started`, and `retarget` reads the clock no later than its first `flush` call,
+    so `T >= 1.0 - (entered - started)` holds by construction however long a runner stalls in
+    between. The `1e-5` covers `:g`'s six significant digits. The 1.0 s budget keeps the floor
+    above zero, and so refusing the post-flush remainder, under up to about a second of stall.
+    """
+    old, worker = _unfenced_swap(queued=0)
+    entered: list[float] = []
+    original = Worker.flush
+
+    def recording(self: Worker, timeout: float | None = 5.0) -> object:
+        if not entered:
+            entered.append(time.monotonic())
+        return original(self, timeout)
+
+    monkeypatch.setattr(Worker, "flush", recording)
+    try:
+        new = _SlowFailSink(0.0, fail_times=0)
+        started = time.monotonic()
+        _lifecycle._swap_sink(new, timeout=1.0)  # type: ignore[arg-type]
+        _, rendered = _swap_line(capsys.readouterr().err, budget=1.0)
+        assert entered, "the premise: retarget drained through Worker.flush"
+        floor = 1.0 - (entered[0] - started) - 1e-5
+        assert floor <= float(rendered[:-1]) <= 1.0, (rendered, floor)
     finally:
         old.fail = False
         _release(old, worker)
