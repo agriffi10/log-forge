@@ -206,7 +206,10 @@ bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 An engine run whose stop event's `wait` raises announces it once and sleeps the rest of its waits,
 each still capped, rather than letting the exception out or skipping a wait; and an engine sink that
 declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in the adapter, as a
-1.x sink without the attribute backs off uninterruptibly (SPEC-072).
+1.x sink without the attribute backs off uninterruptibly (SPEC-072). A `sink_factory` that starts
+a thread of its own which logs, and joins it with no timeout, hangs: the thread's first emit waits
+on the build the factory is running, and the library cannot see a wait in the caller's code
+(`docs/decisions/sink-lifecycle/`).
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
 `tests/test_sink_retry.py` (only the engine waits, derived over `sinks/`, SPEC-074),
 `tests/test_sinks_db_engine.py`, `tests/test_sinks_broker_engine.py` and `tests/test_socket_engine.py`
@@ -226,6 +229,8 @@ SPEC-072) and `tests/test_delivery_paths.py` — `flush()` has no CPU-time asser
 gap is visible. `tests/test_reentrant_stop_signal.py` holds the calls in its table, made from inside a
 sink's stop-signal setter on each path that hands a signal, to returning, in a forked child with
 a bounded wait: at `624d817f` fifteen of its twenty rows hung the process.
+`tests/test_factory_reentrant.py` does the same for the calls a `sink_factory` makes that wait on
+the drain thread: at `9f4d4dfd` two of its five rows hung and three stalled for their whole budget.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 

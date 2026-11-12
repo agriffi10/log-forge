@@ -812,6 +812,8 @@ span the caller's thread still carries no sink construction (invariant 4).
   Later emits read `_inner` without the lock and call `_inner.emit(batch)`.
 - Concurrent first emits wait on `_build_lock` and call the factory once between them. It is a
   build lock, not a transport lock: held across the one factory call, never across a delivery.
+  (Superseded 2026-11-12: the lock is no longer held across the factory call; see
+  `docs/decisions/sink-lifecycle/a-sink-factory-runs-under-no-lock-and-a-build-that-calls-back-releases-its-waiters.md`.)
 - An emit made **from inside the factory**, on the same thread, raises `SinkDeliveryError` at once
   rather than calling the factory again, and does not deadlock. On the orphan path that one event
   is counted in `orphan_lost` and announced.

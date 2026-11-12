@@ -9,7 +9,8 @@ description: "`configure(sink_factory=f)` never calls `f`: the first emit in eac
 `ValueError`, a later `sink=` clears the factory and a later factory replaces the sink. The
 factory is installed behind a private wrapper, `sinks._factory._FactorySink`, which is the
 configured sink and calls the factory on its **first emit in each process**, on whichever thread
-emits, under a build lock, then stamps, hands the stop signal to and stores what it built. A
+emits, one build at a time and with no lock held across the factory call (*A sink factory runs
+under no lock…*), then stamps, hands the stop signal to and stores what it built. A
 forked child is given a new wrapper by `_lifecycle._adopt_factory_after_fork`, which calls no
 factory, does no I/O and waits on nothing, so the child's first emit builds the child's own sink,
 which the child owns and closes. The parent's wrapper stays inherited, owed and refused its
@@ -82,6 +83,11 @@ package forwarding positions. **Do NOT** follow a third-party sink's attributes 
 loop. (SPEC-079 FR-005, FR-006; the sink-loop fix)
 
 ## History
+
+### 2026-11-12
+
+- **Refined** by *A sink factory runs under no lock, and a build that calls back releases its
+  waiters*: the build lock is no longer held across the factory call.
 
 ### 2026-11-11
 

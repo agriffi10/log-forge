@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from log_foundry import _diag, _fork, _sink_arg
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from log_foundry.results import FlushResult
     from log_foundry.sinks.base import Sink
@@ -852,6 +852,15 @@ class Runtime:
         "is this thread inside that call right now", not context propagation. A context variable
         would also be inherited by a task or thread started from inside the setter, which is not
         inside the hand.
+        """
+        self._building_here = threading.local()
+        """The sink-factory builds whose factory is running on this thread, as ``yielders``.
+
+        Each entry is a factory wrapper's way to release the threads waiting on that build
+        (:func:`building`, :func:`yielding`). Per thread, for the reason :attr:`_handing_here`
+        gives: what it records is a call on this thread's stack, the factory call, and a thread or
+        task the factory starts is not inside it. A forked child keeps the forking thread's
+        entries, which that thread's own ``finally`` removes.
         """
         self._marking_failed = False
         """Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
@@ -2718,6 +2727,97 @@ def handing(sink: object) -> Iterator[None]:
             ids[key] = left
         else:
             del ids[key]
+
+
+def _builds_here() -> list[tuple[Callable[[], None], Callable[[], None]]]:
+    """Returns this thread's stack of factory builds in progress, as their yield callbacks.
+
+    Args:
+      None.
+
+    Returns:
+      The live list of ``(start, end)`` pairs, innermost build last.
+
+    Raises:
+      None.
+    """
+    local = _state._building_here
+    stack: list[tuple[Callable[[], None], Callable[[], None]]] | None = getattr(
+        local, "yielders", None
+    )
+    if stack is None:
+        stack = []
+        local.yielders = stack
+    return stack
+
+
+@contextlib.contextmanager
+def building(start: Callable[[], None], end: Callable[[], None]) -> Iterator[None]:
+    """Marks this thread as running a sink factory for the length of the block.
+
+    The factory wrapper runs its factory inside this, with no lock held, so a call the factory
+    makes back into the library can find the build and release the threads waiting on it
+    (:func:`yielding`).
+
+    Args:
+      start: Called by :func:`yielding` as a yield begins: threads waiting on this build stop
+        waiting and refuse their emit, and threads arriving at it refuse too.
+      end: Called as that yield ends, so threads arriving afterwards wait for the build again.
+
+    Returns:
+      A context manager; the mark is removed when the block exits, however it exits.
+
+    Raises:
+      None.
+    """
+    stack = _builds_here()
+    entry = (start, end)
+    stack.append(entry)
+    try:
+        yield
+    finally:
+        stack.remove(entry)
+
+
+@contextlib.contextmanager
+def yielding() -> Iterator[None]:
+    """Releases the threads waiting on any factory build this thread is running, for the block.
+
+    ``flush()``, ``shutdown()`` and a ``configure()`` that changes the sink wrap the part of
+    themselves that can wait on the drain thread in this. Called from inside a sink factory, that
+    wait may be on a drain thread that is itself waiting for the factory to finish, which is a
+    cycle no lock order breaks: the factory must not finish before the call returns, and the drain
+    thread cannot run before the factory finishes. So for the length of the call every thread
+    waiting on this thread's builds, and every thread arriving at one, refuses its emit as a
+    delivery failure instead of waiting; the worker retries the batch under ``max_retries`` and
+    the orphan path counts it lost. When the call returns, threads arriving at the build wait for
+    it again. Outside a factory the stack is empty and this is one thread-local read.
+
+    Each build's ``end`` runs for exactly the builds whose ``start`` ran, innermost first, however
+    the block exits.
+
+    Args:
+      None.
+
+    Returns:
+      A context manager.
+
+    Raises:
+      None.
+    """
+    stack = getattr(_state._building_here, "yielders", None)
+    if not stack:
+        yield
+        return
+    started: list[Callable[[], None]] = []
+    try:
+        for start, end in list(stack):
+            start()
+            started.append(end)
+        yield
+    finally:
+        for end in reversed(started):
+            end()
 
 
 def _will_hand(sink: Sink) -> bool:

@@ -836,7 +836,10 @@ the lifecycle lock, the sweep lock or the factory wrapper's build lock. Each pat
 the lock and hands after releasing it, with a hand token covering what the deciding section
 published, so no orphan log and no `flush()` reaches a sink that section armed before the sink
 holds its signal. The drain thread is the exception: it can emit a batch to a just-built worker's
-sink before the build's hand lands, which the decision records under *What is left*.
+sink before the build's hand lands, which the decision records under *What is left*. The factory
+call itself runs under no lock either, and a factory inside `flush()`, `shutdown()` or a
+sink-changing `configure()` makes the emits waiting on its build refuse rather than wait, because
+that call can be waiting on a drain thread that is one of them (`docs/decisions/sink-lifecycle/`).
 
 **The close registry holds every owed close and every close in flight** (SPEC-078 FR-001).
 `Runtime._closes`, a `_CloseRegistry`, replaced `_owed`, `_closing_now`, `_closers` and the

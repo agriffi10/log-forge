@@ -49,6 +49,10 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
     :func:`shutdown` the background worker stays alive and the sink stays open, so logging
     continues normally afterwards.
 
+    Called from inside a ``sink_factory``, while the factory runs, an emit on another thread
+    that would wait for that build refuses instead, for the length of this call: the wait here can
+    be on a drain thread that is itself waiting for the factory (``_lifecycle.yielding``).
+
     Args:
       timeout: Seconds to wait for the drain. ``None`` waits indefinitely, which is unsafe in
         any environment with an execution deadline — it converts "some logs were lost" into
@@ -71,11 +75,12 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
       TypeError: If ``timeout`` is not an ``int``, a ``float`` or ``None``.
       ValueError: If ``timeout`` is NaN.
     """
-    from log_foundry._lifecycle import _flush_worker
+    from log_foundry._lifecycle import _flush_worker, yielding
     from log_foundry.sinks._retry import wait_budget
 
     timeout = wait_budget(timeout, "timeout")
-    return _flush_worker(timeout)
+    with yielding():
+        return _flush_worker(timeout)
 
 
 def health() -> Health:
@@ -180,6 +185,10 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     refuses it and one stderr line is written; a stateless one such as ``StdoutSink`` still
     accepts it (SPEC-032).
 
+    Called from inside a ``sink_factory``, while the factory runs, an emit on another thread
+    that would wait for that build refuses instead, for the length of this call: the wait here can
+    be on a drain thread that is itself waiting for the factory (``_lifecycle.yielding``).
+
     Args:
       timeout: Seconds bounding the wait for the background thread and, carved from the same
         budget, a short grace for any sink still closing after a late ``configure(sink=...)``
@@ -213,11 +222,12 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
       TypeError: If ``timeout`` is not an ``int``, a ``float`` or ``None``.
       ValueError: If ``timeout`` is NaN.
     """
-    from log_foundry._lifecycle import _shutdown_worker
+    from log_foundry._lifecycle import _shutdown_worker, yielding
     from log_foundry.sinks._retry import wait_budget
 
     timeout = wait_budget(timeout, "timeout")
-    _shutdown_worker(timeout)
+    with yielding():
+        _shutdown_worker(timeout)
 
 
 __all__ = [
