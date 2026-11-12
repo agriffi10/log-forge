@@ -463,6 +463,7 @@ class _Sentinel:
 def _build_factory(x: object) -> object:
     """The factory wrapper's build refuses a non-``Sink``, so its slot is filled as a build leaves it."""
     wrapper = _FactorySink(MemorySink)
+    vars(wrapper)["_pending"] = x
     vars(wrapper)["_inner"] = x
     return wrapper
 
@@ -669,6 +670,7 @@ _WRAPPERS: dict[str, Any] = {
 def _wrapped(kind: str, value: object) -> object:
     if kind == "_FactorySink":
         wrapper = _FactorySink(MemorySink)
+        vars(wrapper)["_pending"] = value
         vars(wrapper)["_inner"] = value
         return wrapper
     return _WRAPPERS[kind](value)

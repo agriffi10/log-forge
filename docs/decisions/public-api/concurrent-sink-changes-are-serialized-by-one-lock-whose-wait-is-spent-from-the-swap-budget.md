@@ -46,7 +46,12 @@ and leave the worker on the old sink.
 (a stop-signal setter during the retarget), or on one of the library's own `log-foundry-` threads
 (the drain, a closer), the swap is waiting on that very thread, so a wait is a stall of the whole
 budget, or with an unbounded one a hang the base commit did not have. Such a call tries the lock
-once and otherwise runs unserialized, announced. The lock is bound to a local and released through
+once and otherwise runs unserialized, announced. The no-worker swap's hand is the same case: it
+runs after the swap's first section but still inside this lock, so a setter's `configure()` there
+tries the lock once, swaps unconfirmed and announces it. A setter's `configure()` from the hands
+outside a sink change — the first log, `flush()`, the worker build — is not re-entrant in this
+sense and waits like any caller, because no library lock is held across those hands
+(`docs/decisions/sink-lifecycle/a-stop-signal-setter-runs-under-no-lock-its-own-calls-would-wait-on-the-owner-decides-then-hands.md`). The lock is bound to a local and released through
 it, so a thread that forks from inside the call does not release the child's fresh copy and raise
 `RuntimeError` out of `configure()` there (frame-2 review, measured).
 
@@ -74,6 +79,8 @@ on `_fork._GLOBAL_PRIMITIVES`, so a child forked while a parent thread held it s
   sink only while the record still owes it, and that is not the decision re-check rejected above:
   skipping an *arm* can orphan a sink, while skipping a *release* of a sink the record no longer
   owes cannot, because every route out of the record is a take whose taker closes it.
+- A sentence on a setter's `configure()` from the hands that no longer run under a lock, which
+  waits like any caller (the stop-signal fix after SPEC-079).
 
 ### 2026-11-11
 

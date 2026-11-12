@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     import contextvars
     from collections.abc import Mapping
 
+    from log_foundry.worker import Worker
+
 
 __all__ = ["continue_trace", "trace"]
 
@@ -426,6 +428,13 @@ def _sweep_open_spans() -> None:
     another thread's or task's context, so a ``flush()`` in a handler that fanned out does not
     reach what those tasks buffered.
 
+    **The worker is resolved outside** ``_sweep_lock``, as :func:`_flush` resolves it, and still
+    before any detach. Building it hands the sink its stop signal, which runs the sink's setter,
+    and a setter that calls ``flush()`` or finishes a ``@trace`` span takes this lock: under it,
+    that setter waited on its own thread. So a pass that meets a buffer with no worker resolved
+    stops before detaching anything, releases the lock, resolves the worker and sweeps again; a
+    flush that finds nothing buffered still builds nothing.
+
     Args:
       None.
 
@@ -436,16 +445,24 @@ def _sweep_open_spans() -> None:
       Exception: Whatever building the worker raises. :func:`_flush_worker` guards it, because a
         flush is the call most likely to be made in a ``finally``.
     """
-    with _sweep_lock:
-        for span in context._live_span_stack():
-            if not span.events:
+    worker: Worker | None = None
+    while True:
+        with _sweep_lock:
+            needs_worker = False
+            for span in context._live_span_stack():
+                if not span.events:
+                    span.swept = True
+                    continue
+                if worker is None:
+                    needs_worker = True
+                    break
+                backfill_baggage(span, context._live_baggage())
                 span.swept = True
-                continue
-            worker = _lifecycle._get_worker()
-            backfill_baggage(span, context._live_baggage())
-            span.swept = True
-            buffered, span.events = span.events, []
-            worker.submit(buffered)
+                buffered, span.events = span.events, []
+                worker.submit(buffered)
+            if not needs_worker:
+                return
+        worker = _lifecycle._get_worker()
 
 
 

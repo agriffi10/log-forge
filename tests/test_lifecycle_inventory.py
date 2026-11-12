@@ -72,7 +72,7 @@ declare them would read as stale and a field added to it later would need no row
 STATE_CLASS = "Runtime"
 MODULE_STATE_FILE = "_lifecycle.py"
 WALKABLE = frozenset({"Lock", "RLock", "Event"})
-TOKEN_SETS = ("_swaps_running", "_stops_running")
+TOKEN_SETS = ("_swaps_running", "_stops_running", "_hands_running")
 TOKEN_SETS_CHILD = ("reset: _lifecycle._clear_after_fork",)
 REPAIR_ITSELF = ("_fork", "_reinit_after_fork")
 CHILD_VALUE = re.compile(r"^(walk|roster|inherited|none|reset: [A-Za-z_][\w]*\.[A-Za-z_]\w*)$")
@@ -947,7 +947,8 @@ INVENTORY: dict[Key, Row] = {
     _rt("_signal_owed"): Row(
         "Runtime",
         ("reset: _lifecycle._clear_after_fork",),
-        "the child owes its owed sinks its own stop signal, offered on its first log or flush",
+        "an owed sink may hold another signal (a fork, or a hand that could not settle); handed on "
+        "the next log or flush",
     ),
     _rt("_stop"): Row(
         "Runtime",
@@ -976,6 +977,16 @@ INVENTORY: dict[Key, Row] = {
     ),
     _rt("_swaps_running"): Row("Runtime", TOKEN_SETS_CHILD, "swap tokens, observer-only"),
     _rt("_stops_running"): Row("Runtime", TOKEN_SETS_CHILD, "stop tokens, observer-only"),
+    _rt("_hands_running"): Row(
+        "Runtime",
+        TOKEN_SETS_CHILD,
+        "hand tokens; non-empty sends every orphan emit to the locked branch",
+    ),
+    _rt("_handing_here"): Row(
+        "Runtime",
+        _INH,
+        "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
+    ),
     _wk("sink"): Row(
         "Worker",
         ("inherited", "reset: _lifecycle._adopt_factory_after_fork"),

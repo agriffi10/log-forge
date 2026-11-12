@@ -231,7 +231,7 @@ def test_a_sink_that_merely_compares_equal_is_not_taken_for_the_configured_one()
         counter unset.
 
         `log_foundry_stop_signal` is `compare=False` because the library **writes** it on the
-        sink it arms (`_offer_orphan_signal`), so a generated `__eq__` that included it would
+        sink it arms (`_lifecycle._hand_out`), so a generated `__eq__` that included it would
         make the two objects stop comparing equal before the close is chosen — and this test
         would then pass against the value-equality bug it exists to catch. Measured: it did.
         """

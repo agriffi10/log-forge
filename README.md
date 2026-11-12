@@ -1120,6 +1120,10 @@ your retry backoff** — pass it to `Event.wait(timeout)` instead of calling `ti
             time.sleep(delay)
 ```
 
+The library assigns it with none of its locks held that a call from your setter would wait on,
+so a setter of yours may log or call `configure()`, `flush()` or `shutdown()`. It may be assigned more than once, from more than one
+thread at the same moment, so keep the setter safe to run that way.
+
 There is one drain thread, so your backoff pauses *all* log delivery, and it is held across
 `shutdown()` — which joins that thread. A sink that sleeps through a 30-second backoff holds
 process exit for 30 seconds. The name is prefixed because the library assigns this attribute onto
