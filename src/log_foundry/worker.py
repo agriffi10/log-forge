@@ -1032,10 +1032,13 @@ class Worker:
         landing in between would otherwise install a sink nothing will ever close, and report an
         ``incomplete_swaps`` whose line says the old sink was left open when it was in fact closed.
 
-        The unconfirmed-swap diagnostic reports the budget as it stood at **entry**, not what was
-        left of it by then: by that point the remainder is ~0 and the line would read "could not
-        be confirmed drained within 0s", which is true of the last attempt and false about what
-        the caller allowed.
+        The unconfirmed-swap diagnostic reports the budget the drain was **given**, the remainder
+        of the deadline when this method read it, not what was left after the flush: once that
+        flush has timed out the remainder is always ~0, which would say nothing about what the
+        drain was allowed. The budget given is the caller's whole budget less whatever was spent
+        before this method began (the wait for ``config._sink_lock``, the swap's work before the
+        retarget), so the line reads "within 0s" when nothing was left by then. That is true, and
+        it tells the operator the budget went upstream of the drain.
 
         Args:
           new_sink: The sink to deliver to from now on.

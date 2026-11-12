@@ -406,11 +406,14 @@ def test_the_swap_budget_is_the_documented_default(monkeypatch) -> None:
     monkeypatch.setattr(worker_mod, "DEFAULT_SWAP_TIMEOUT", 1.25)
     monkeypatch.setattr(_lifecycle, "_swap_sink", lambda sink, timeout: seen.append(timeout))
 
+    started = time.monotonic()
     config.configure(sink=SwapSink())
+    spent = time.monotonic() - started
 
     assert len(seen) == 1 and seen[0] is not None, seen
-    assert 1.0 < seen[0] <= 1.25, (
-        "the patched budget, less the uncontended wait for config._sink_lock, reaches the swap"
+    assert 1.25 - spent <= seen[0] <= 1.25, (
+        "the patched budget, less no more than the time configure() took around it, reaches the "
+        f"swap ({spent=:.3f}s)"
     )
 
 
