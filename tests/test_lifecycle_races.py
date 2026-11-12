@@ -841,7 +841,14 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "armed — a worker built on a sink owes it a close whether or not anything is emitted "
             "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
         ),
-        ("_note_orphan_emit", "arm", 0): "armed — the emit that landed owns the close",
+        ("_arm_and_hand", "arm", 0): (
+            "armed — the emit that landed owns the close (`_note_orphan_emit`'s locked branch)"
+        ),
+        ("rearm_if_released", "arm", 0): (
+            "armed again — a stop-signal setter released the sink before the emit after its hand "
+            "wrote to it, and a sink written to after its close is owed a second close "
+            "(invariant 5, SPEC-045)"
+        ),
         ("_adopt_factory_after_fork", "arm", 0): (
             "armed — a child given its own `_FactorySink` points the worker at it, and a worker "
             "delivering to a sink owes it a close, which is the worker path's rule; the parent's "
@@ -1073,7 +1080,7 @@ def test_a_release_that_raises_still_drops_its_in_flight_registration() -> None:
     `Health.sink.failed` (SPEC-042 FR-002). `FilteringSink`, `TransformSink` and `LogstashSink`
     all propagate, so this path is reached by shipped code.
 
-    A leaked id is permanent and silent: every later `_offer_orphan_signal` for that object
+    A leaked id is permanent and silent: every later signal refresh (`_will_hand`) for that object
     returns early, so the sink keeps a stale — possibly set — stop event and backs off not at
     all, which is the SPEC-033 FR-004 failure the in-flight discriminator was chosen to avoid.
     """

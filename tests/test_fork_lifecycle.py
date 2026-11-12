@@ -1673,7 +1673,7 @@ def test_a_retired_child_does_not_pay_the_shutdown_budget_at_exit(tmp_path: path
 def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib.Path) -> None:
     """The retired path's drain events reach further than the exit budget they were added for.
 
-    ``_offer_orphan_signal`` skips handing a fresh signal when ``worker.sink is sink and
+    The signal refresh (``_lifecycle._will_hand``) skips handing a fresh signal when ``worker.sink is sink and
     worker.draining`` (SPEC-035 FR-001). A retired child that inherited ``_drain_settled``
     **unset** reads as draining, so the skip applies, and the sink keeps the parent's **set**
     ``_stop`` — every ``sinks/_retry`` backoff then returns instantly, which against a
@@ -2168,7 +2168,7 @@ def _namespace_stores(tree: ast.AST) -> set[int]:
     threading.Lock()`` inside a function, and treating every ``Name`` as reachable made the rule
     accept a lock no walk could ever find. So the scope is carried down — module and class
     bodies write to a namespace, a function body does not unless the name is declared ``global``,
-    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilds ``_stop``.
+    which is how ``_lifecycle._offer_orphan_signal`` legitimately rebuilt ``_stop`` before SPEC-040.
 
     Args:
       tree: The parsed module.

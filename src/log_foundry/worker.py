@@ -359,8 +359,9 @@ class Worker:
         flush_interval: float = 1.0,
         max_queue: int = 10_000,
         max_retries: int = 3,
+        offer_signal: bool = True,
     ) -> None:
-        """Starts the drain thread and offers the sink this worker's stop signal.
+        """Starts the drain thread and, unless told otherwise, offers the sink its stop signal.
 
         The lock guards the ``dropped`` counter, incremented from any caller thread, and the
         shutdown once-only flag, since ``shutdown`` may be called concurrently by ``atexit``
@@ -409,6 +410,10 @@ class Worker:
             declined when it is predicted to end after the ``shutdown()`` deadline (SPEC-062),
             so the retries a failing batch sees there are bounded by the
             caller's budget as well as by this count; the first attempt is always made.
+          offer_signal: ``False`` when the owner hands the sink this worker's ``_stop`` itself,
+            after releasing its lock. The library's own build does: the offer runs the sink's
+            setter, and a setter that logs or calls ``configure()`` waited on the lock the build
+            held (``_lifecycle._get_worker``).
 
         Returns:
           None.
@@ -440,7 +445,8 @@ class Worker:
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()
-        _lifecycle.offer_stop_signal(sink, self._stop)
+        if offer_signal:
+            _lifecycle.offer_stop_signal(sink, self._stop)
         self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         self._thread.start()
 
@@ -521,7 +527,7 @@ class Worker:
         ``shutdown()`` was mid-join otherwise inherits them unset with nothing to settle them.
         Two consequences, both measured: that child paid the whole 30 s budget at exit and with
         ``shutdown(timeout=None)`` would never exit at all, and — reaching further —
-        ``_offer_orphan_signal`` reads it as still draining and skips, leaving the sink holding
+        ``_lifecycle._will_hand`` reads it as still draining and skips, leaving the sink holding
         a **set** stop event, so every later backoff returns instantly against a destination
         that is already refusing (SPEC-033 FR-004). ``_drain_finished`` has no reader on a
         retired worker and is set for the invariant rather than for an observable: settled with

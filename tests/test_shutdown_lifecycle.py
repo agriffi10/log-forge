@@ -6,6 +6,7 @@ import re
 import textwrap
 import threading
 import time
+import types
 
 import pytest
 
@@ -83,13 +84,25 @@ def test_the_offer_does_not_consult_liveness() -> None:
     docstring explaining the distinction, so a substring check over ``getsource`` asserts the
     prose and would fail against a correct implementation.
     """
-    tree = ast.parse(textwrap.dedent(inspect.getsource(_lifecycle._offer_orphan_signal)))
-    called = {
-        node.func.id
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-    }
-    assert "_live_worker" not in called, "the offer must key on the moment, not on liveness"
+
+    def called(function: types.FunctionType) -> set[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        return {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name | ast.Attribute)
+        }
+
+    moment = called(_lifecycle._may_replace)
+    assert "in_flight" in moment, "_may_replace must ask the moment predicate"
+    for decision in (_lifecycle._will_hand, _lifecycle._settle_signal):
+        assert "_may_replace" in called(decision), (
+            f"{decision.__name__} must ask the moment test, _may_replace"
+        )
+    for function in (_lifecycle._may_replace, _lifecycle._will_hand, _lifecycle._settle_signal):
+        assert not called(function) & {"_live_worker", "live_worker", "in_flight"} - (
+            {"in_flight"} if function is _lifecycle._may_replace else set()
+        ), f"{function.__name__} must key on the moment through _may_replace, not on liveness"
 
 
 def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:

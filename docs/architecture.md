@@ -819,15 +819,24 @@ decorator and the span machinery and reaches the worker only through `_lifecycle
 | **Moment** | `_state.in_flight(sink)` for the signal refresh, `_state.held(sink)` for the close; `worker.claim_stop(deadline)` for the stop | is anything using this sink **now**, or is a stop already under way. Two predicates in one category, because an abandoned drain answers them oppositely; `claim_stop` is the same question asked as a transition |
 
 **None of the three takes the lifecycle lock.** Several guards ask a question with it already
-held (`_get_worker`'s inner check, `_close_owed`, `_swap_sink`, and `_offer_orphan_signal`
-through all of its callers), so a non-reentrant acquire inside a question would deadlock
-them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
+held (`_get_worker`'s inner check, `_close_owed`, `_swap_sink`, and `_will_hand` through all
+of its callers), so a non-reentrant acquire inside a question would deadlock them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
 read is a single atomic reference load, and a caller needing consistency across two reads takes
 the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span. The two
 moment predicates do take a leaf lock — the close registry's, `_state._closes._lock`, since
 SPEC-078 merged `_closing_now_lock` and `_closers_lock` into it — which is the order the shipped
-code already established: `_offer_orphan_signal` reached that lock under the lifecycle lock before
-SPEC-054 folded the read into the question, and nothing acquires the lifecycle lock beneath it.
+code already established: the signal refresh (`_offer_orphan_signal` then, `_will_hand` now)
+reached that lock under the lifecycle lock before SPEC-054 folded the read into the question,
+and nothing acquires the lifecycle lock beneath it.
+
+**No sink's stop-signal setter runs under a library lock a call from inside it would wait on**
+(fix after SPEC-079; `docs/decisions/sink-lifecycle/`). The setter is the sink's own code, and
+one calling back into the library on the same thread hung the process wherever the hand ran under
+the lifecycle lock, the sweep lock or the factory wrapper's build lock. Each path now decides under
+the lock and hands after releasing it, with a hand token covering what the deciding section
+published, so no orphan log and no `flush()` reaches a sink that section armed before the sink
+holds its signal. The drain thread is the exception: it can emit a batch to a just-built worker's
+sink before the build's hand lands, which the decision records under *What is left*.
 
 **The close registry holds every owed close and every close in flight** (SPEC-078 FR-001).
 `Runtime._closes`, a `_CloseRegistry`, replaced `_owed`, `_closing_now`, `_closers` and the
@@ -1912,6 +1921,11 @@ and a third copy is a fork with no merge.
   the shape to copy if a fourth site ever sits on a hot path. Found as C5 by the 2026-08-07
   audit; the AC that recorded it named two sites, and re-auditing the rule rather than the line
   (`docs/process/reviewer-contract.md`) found the third.
+
+  **Narrowed when the stop-signal hand left the lock** (fix after SPEC-079): `offer_stop_signal`
+  now runs with no lifecycle lock held on every path, so its `_diag.absorbed` no longer writes
+  under it. Of the paths above, only `_swap_sink`'s detached release, which writes on a
+  thread-start failure, still writes while holding it.
 
 - **A fork's repair stops at the library's own objects, and the things below sit outside it**
   (SPEC-039 FR-005, SPEC-079). The child's one walk starts from the runtime's roots — the

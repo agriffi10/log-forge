@@ -26,6 +26,16 @@ them enter (``_record_seeds``, reading the record as a seed, and ``_walk_after_f
 the marks). ``_clear_after_fork`` also takes ``_state._lock``, outside the registry's leaf, to
 reset the shutdown count and the late worker and re-settle the stored state (FR-004), and
 ``_adopt_factory_after_fork`` takes it to install a factory's sink on the worker (FR-006).
+
+**Re-recorded when the stop-signal hand left the lock** (fix after SPEC-079). The diff from
+SPEC-079's literal is exactly three sites entering, none leaving: ``_settle_signal`` takes
+``_state._lock`` when a hand finds the process signal moved under it, ``rearm_if_released`` takes
+it when a setter released the sink a log is about to write to, and ``_hand_out``'s
+``with handing(sink)``, which is no lock at all but the thread-local mark the walker reads as a
+``with`` site like any other. No acquisition moved: each new ``_state._lock`` site runs after the
+deciding section has released the lock, never inside it, so the order is unchanged. In the same
+fix ``_note_orphan_emit``'s one site moved, unchanged, into ``_arm_and_hand``, the locked branch
+it calls, so the fast path is its condition alone.
 """
 
 from __future__ import annotations
@@ -92,12 +102,15 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_CloseRegistry.wait_graced", "self._lock"): 1,
             ("_CloseRegistry.graced_alive", "self._lock"): 1,
             ("_get_worker", "_state._lock"): 1,
-            ("_note_orphan_emit", "_state._lock"): 1,
+            ("_arm_and_hand", "_state._lock"): 1,
             ("_close_owed", "_state._lock"): 2,
             ("_CloseRegistry.bystanders", "self._lock"): 1,
             ("_shutdown_worker", "_state._lock"): 3,
             ("_swap_sink", "_state._lock"): 2,
             ("_flush_live_sink", "_state._lock"): 1,
+            ("_settle_signal", "_state._lock"): 1,
+            ("rearm_if_released", "_state._lock"): 1,
+            ("_hand_out", "handing(sink)"): 1,
         }
     ),
     "worker.py": collections.Counter(

@@ -266,7 +266,7 @@ _CHILD_SINK_SLOTS: dict[tuple[str, str], dict[str, str]] = {
     ("sinks.multi", "MultiSink"): {"_sinks": "many"},
     ("sinks.filtering", "FilteringSink"): {"_inner": "one"},
     ("sinks.transform", "TransformSink"): {"_inner": "one"},
-    ("sinks._factory", "_FactorySink"): {"_inner": "one"},
+    ("sinks._factory", "_FactorySink"): {"_inner": "one", "_pending": "one"},
     ("sinks.logstash", "LogstashSink"): {"_http": "one"},
     ("sinks.sentry", "SentrySink"): {"_http": "one"},
 }

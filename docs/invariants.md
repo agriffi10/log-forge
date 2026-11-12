@@ -223,7 +223,9 @@ through the measuring helper, SPEC-076),
 through one measuring helper), and through that helper `tests/test_delivery_engine.py` (a stop cuts
 a hinted engine wait short, idly; the 1.x schedule, the hint's bounds and a raising stop event,
 SPEC-072) and `tests/test_delivery_paths.py` — `flush()` has no CPU-time assertion, listed so the
-gap is visible.
+gap is visible. `tests/test_reentrant_stop_signal.py` holds the calls in its table, made from inside a
+sink's stop-signal setter on each path that hands a signal, to returning, in a forked child with
+a bounded wait: at `624d817f` fifteen of its twenty rows hung the process.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -327,7 +329,11 @@ verdict as one event through the worker and through the orphan path and holds th
 `SinkLosses`, and drives `emit` and `deliver` of one sink through a real `Worker` (SPEC-072);
 `tests/test_wrapper_verdicts.py` holds each wrapper's `deliver` path to its `emit` path row by row,
 and the wrapped sink to the bare one on rounds, requests, `losses()` and `failed_batches`
-(SPEC-075).
+(SPEC-075); `tests/test_reentrant_stop_signal.py` holds every path that hands a sink its stop
+signal — the orphan log, `flush()`, the no-worker swap, the worker build, a sweep's build, the
+factory wrapper's build and `Worker.retarget` — to returning when the setter calls back into the
+library, and holds `flush()` to the orphan log's rule that no sink is reached before it holds
+its signal.
 
 ## 7. A sink that delivered nothing raises; one that delivered something reports
 
