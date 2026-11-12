@@ -285,8 +285,8 @@ the first with a `pending` line (`docs/decisions/pipeline/`).
 `configure(sink=…)` calls close each sink once; `tests/test_shutdown_mid_swap.py` that a
 `shutdown()` or the exit drain landing mid-swap closes the displaced sink once and the installed
 one before it returns, and that a swap whose worker such a `shutdown()` retires after the
-reassign — from the new sink's stop-signal setter or racing the fence flush — closes the displaced
-sink once, leaves the installed one owed, and counts no incomplete swap; `tests/test_invariants_model.py` asserts the first observable;
+reassign closes the displaced sink once and leaves the installed one owed, counting no incomplete
+swap when the drain thread has ended and one when it has not; `tests/test_invariants_model.py` asserts the first observable;
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
 lock, its connection released once, and a forked child releases nothing (SPEC-061);
 `tests/test_closed_guard.py`, `tests/test_sink_post_close.py` and `tests/test_sinks_kafka.py` that

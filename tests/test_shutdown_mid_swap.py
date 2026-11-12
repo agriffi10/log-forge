@@ -945,17 +945,17 @@ def test_a_setter_shutdown_after_the_reassign_is_declined_not_unfenced() -> None
     )
 
 
-def test_a_shutdown_racing_the_fence_flush_is_declined_not_unfenced() -> None:
-    """A ``shutdown()`` on another thread that retires the worker before the fence flush reads.
+def test_a_shutdown_racing_the_fence_flush_with_the_drain_alive_stays_unfenced() -> None:
+    """A ``shutdown()`` on another thread retires the worker before the fence flush, drain alive.
 
     The fence flush is wrapped: before it runs, a ``shutdown()`` is started on another thread
     and the wrapper waits until the retirement count has moved past the worker's epoch — the
     token alone is not enough, since the shutdown adds it before it moves the count. The real
-    flush then answers ``retired``. That shutdown waits for this swap's decision, so it closes
-    P and A once each after it. This is the case the fence flush's own verdict covers and a
-    re-check of the retirement right after the stop-signal hand does not: the count had not
-    moved yet when the hand returned. At ``9f4d4dfd`` the swap counted an incomplete swap and
-    wrote the unfenced line here too.
+    flush then answers ``retired``, but that shutdown is waiting for this swap's decision and
+    has not stopped the drain thread, which is still alive. So the verdict stays ``unfenced``,
+    with its count and line, as at ``9f4d4dfd``: only a drain thread that has ended says nothing
+    of the drain can still be inside the displaced sink. The shutdown then closes P and A once
+    each after the swap decides.
     """
 
     def scenario() -> str:
@@ -991,6 +991,84 @@ def test_a_shutdown_racing_the_fence_flush_is_declined_not_unfenced() -> None:
         )
 
     child = run_in_child(scenario)
-    assert child.output == ("raced=[True] incomplete=0 line=False p_closes=1 a_closes=1"), (
+    assert child.output == ("raced=[True] incomplete=1 line=True p_closes=1 a_closes=1"), (
+        child.output
+    )
+
+
+def test_a_retiring_shutdown_that_expires_inside_the_old_sink_leaves_the_swap_unfenced() -> None:
+    """A fence flush that finds the worker retired, by a shutdown that expired, counts and says so.
+
+    After the retarget's first flush the drain thread is sent into a 2 s ``emit`` on A. B's
+    setter, run after the reassign, starts a ``shutdown(timeout=0.3)`` on another thread and
+    waits until it has retired the worker, so the fence flush answers ``retired``; that shutdown
+    then expires with the thread still inside A, and leaves A open. The swap is an unconfirmed
+    one, and its line — A is "left open until a shutdown() finds the drain thread ended" — is
+    true: the verdict must be ``unfenced``, counting one incomplete swap. Reading ``retired`` alone
+    as ``declined`` wrote nothing and counted nothing here, for a sink really left open.
+    """
+
+    def scenario() -> str:
+        err = io.StringIO()
+        sys.stderr = err
+        inside = threading.Event()
+
+        class SlowA(Sink):
+            slow = False
+
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                if self.slow:
+                    inside.set()
+                    time.sleep(2.0)
+                super().emit(batch)
+
+        class StopsOthers(Sink):
+            fired = False
+            stopper: threading.Thread | None = None
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:  # type: ignore[override]
+                return None
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, value: threading.Event | None) -> None:
+                if self.fired or threading.current_thread() is not threading.main_thread():
+                    return
+                self.fired = True
+                live = _lifecycle._state.worker_exists()
+                self.stopper = _start(lambda: log_foundry.shutdown(timeout=0.3))
+                deadline = time.monotonic() + GATE_WAIT
+                while live is not None and _lifecycle._state.retirements <= live._epoch:
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.001)
+
+        a, b = SlowA("A"), StopsOthers("B")
+        worker = _worker_on(a)
+        real = Worker.flush
+        calls: list[int] = []
+
+        def slow_after_first(self_: Worker, timeout: float | None = 5.0) -> Any:
+            calls.append(1)
+            result = real(self_, timeout)
+            if len(calls) == 1:
+                a.slow = True
+                _traced()
+                inside.wait(GATE_WAIT)
+            return result
+
+        Worker.flush = slow_after_first  # type: ignore[method-assign]
+        log_foundry.configure(sink=b)
+        Worker.flush = real  # type: ignore[method-assign]
+        if b.stopper is not None:
+            b.stopper.join(GATE_WAIT)
+        return (
+            f"incomplete={worker.incomplete_swaps} line={UNFENCED in err.getvalue()} "
+            f"a_closes={a.closes} a_held={_lifecycle._state.held(a)} "
+            f"b_owed={_lifecycle.owes_close(b)}"
+        )
+
+    child = run_in_child(scenario)
+    assert child.output == ("incomplete=1 line=True a_closes=0 a_held=True b_owed=True"), (
         child.output
     )
