@@ -549,6 +549,12 @@ specs:
     spec_status: "Draft"
     depends_on: ["SPEC-048", "SPEC-069", "SPEC-070", "SPEC-072", "SPEC-074", "SPEC-075", "SPEC-076"]
     path: "docs/specs/SPEC-082-file-sinks-on-the-delivery-engine.md"
+  - id: "SPEC-084"
+    title: "Stream Sinks on the Delivery Engine: Never Resend What the Stream Took"
+    description: "Moves StdoutSink and StderrSink onto deliver, so a stream that raises partway reports each event by what the stream was handed, counts what did not land once per run, and is never handed a line again that it already took, which closes the duplicate lines the worker's whole-batch retry writes today."
+    spec_status: "Draft"
+    depends_on: ["SPEC-028", "SPEC-031", "SPEC-032", "SPEC-069", "SPEC-070", "SPEC-072", "SPEC-074", "SPEC-076", "SPEC-082"]
+    path: "docs/specs/SPEC-084-stream-sinks-on-the-delivery-engine.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
