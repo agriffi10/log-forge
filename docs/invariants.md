@@ -440,8 +440,8 @@ write that fails partway can land events twice, accepted for 1.2.0 (Andrew's rul
 A `FileSink` or `RotatingFileSink` write, or a `StdoutSink` or `StderrSink` stream, that raises
 after the file or the stream took earlier lines of the batch leaves them there and raises, and the
 worker's retry writes the whole batch again, so a fault that clears between the attempts
-duplicates those lines (69 to 200 of a 200-event batch, measured at `a8e91fac` with the file size
-capped) and, at some caps, leaves one unparseable line where a partly written line was glued to
+duplicates the batch's lines, up to all of them, since the lines still buffered land on the
+retry too (69 to 200 of a 200-event batch, measured at `a8e91fac` with the file size capped) and, at some caps, leaves one unparseable line where a partly written line was glued to
 the retry's first. The measurement, the two rejected remedies and the closure — the file sinks on
 `deliver`, specified after 1.2.0 — are in *A sink's own driver error is counted, announced and
 raised as both types* (`docs/decisions/sink-delivery/`).
@@ -508,7 +508,9 @@ assembly marks the same substitutions; a repair is not a loss and is neither cou
 container, and for SQLite an integer outside the signed 64-bit range — as its JSON text; the event
 is unchanged, so it is not marked, and nothing is counted (SPEC-069 follow-up fix, 2026-11-13). A
 lone surrogate, which only a direct `emit` can bring, is not repaired: `PostgresSink`, and
-`SQLiteSink` when it sits in a projected column, drop that event alone, counted and announced.
+`SQLiteSink` when it sits in a projected column, drop that event alone, counted and announced, and
+`PostgresSink` does the same for a non-finite float, which JSONB refuses and assembly and
+`TransformSink` replace with their marker.
 The three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
 (invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). A boundary

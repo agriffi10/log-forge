@@ -221,3 +221,17 @@ def test_postgres_binds_a_container_column_as_its_json_text() -> None:
     assert row[1] == '{"x": 1}'
     assert row[5] == '[1, "a"]'
     assert json.loads(str(row[6])) == {"level": {"x": 1}, "service": [1, "a"]}
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")], ids=repr)
+def test_postgres_drops_only_the_event_with_a_non_finite_float(
+    value: float, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """JSONB refuses ``NaN`` and ``Infinity`` as it refuses a lone surrogate: one event, not all."""
+    conn = _Connection()
+    sink = PostgresSink("logs", connection=conn, max_retries=0)
+    sink.emit([{"n": 1}, {"n": 2, "fields": {"x": value}}, {"n": 3}])
+
+    assert [json.loads(str(row[-1]))["n"] for row in conn.rows] == [1, 3]
+    assert (sink.losses().dropped, sink.losses().failed) == (1, 0)
+    assert "PostgresSink, encoding raised ValueError" in capsys.readouterr().err

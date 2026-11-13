@@ -195,6 +195,24 @@ def test_a_lone_surrogate_costs_only_its_event_against_a_real_server(
     assert "PostgresSink, encoding raised UnicodeEncodeError" in capsys.readouterr().err
 
 
+def test_a_non_finite_float_costs_only_its_event_against_a_real_server(
+    services_are_up: dict[str, Endpoint], table: str
+) -> None:
+    """Frame 2 of the SPEC-069 follow-up review: JSONB refused ``NaN`` and cost the batch."""
+    endpoint = services_are_up["postgres"]
+    sink = PostgresSink(table, dsn=dsn(endpoint), create_table=True, max_retries=0)
+    sink.emit([event(1), {**event(2), "x": float("nan")}, {**event(3), "y": float("inf")}, event(4)])
+    losses = sink.losses()
+    sink.close()
+
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT event FROM {table} ORDER BY id")
+        rows = cur.fetchall()
+
+    assert [row[0]["n"] for row in rows] == [1, 4]
+    assert (losses.dropped, losses.failed) == (2, 0)
+
+
 def test_a_container_in_a_column_lands_as_its_json_text_against_a_real_server(
     services_are_up: dict[str, Endpoint], table: str
 ) -> None:

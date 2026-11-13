@@ -739,11 +739,14 @@ class PostgresSink:
 
         **A lone surrogate costs only its event** (``_encode.refuse_surrogate``): JSONB refuses
         its escape and psycopg the string, and either used to roll back the whole transaction.
-        Only a direct ``emit`` brings one, so it is dropped rather than repaired. **A container
-        in a projected column is bound as its JSON text** (``_encode.column_value``): psycopg
-        cannot adapt a ``dict``, or a ``list`` that is mixed, ragged or holds a ``dict``, and a
-        ``TransformSink`` can put any of them there; a list it did bind as an array literal
-        (``{1,2}``) now reads as JSON (``[1, 2]``) too.
+        Only a direct ``emit`` brings one, so it is dropped rather than repaired. **So does a
+        non-finite float**: a bare ``json.dumps`` writes ``NaN`` or ``Infinity``, which JSONB
+        refuses as it refuses a lone surrogate, and assembly and ``TransformSink`` turn one into
+        ``<float: nan>``, so the text is built with ``allow_nan=False`` and the event dropped
+        alone. **A container in a projected column is bound as its JSON text**
+        (``_encode.column_value``): psycopg cannot adapt a ``dict``, or a ``list`` that is mixed,
+        ragged or holds a ``dict``, and a ``TransformSink`` can put any of them there; a list it
+        did bind as an array literal (``{1,2}``) now reads as JSON (``[1, 2]``) too.
 
         Args:
           event: The event to convert.
@@ -758,13 +761,14 @@ class PostgresSink:
             returns (SPEC-058 FR-001).
           UnicodeEncodeError: If a string value or key holds a lone surrogate, which
             ``encode_round`` turns into a drop of this one event.
+          ValueError: If the event holds a non-finite float, dropped the same way.
         """
-        text = json.dumps(event)
+        text = json.dumps(event, allow_nan=False)
         source = event
         if NUL_ESCAPE.search(text):
             repaired = repair_nul(event)
             if repaired is not None:
-                source, text = repaired, json.dumps(repaired)
+                source, text = repaired, json.dumps(repaired, allow_nan=False)
         refuse_surrogate(source, text)
         return (*(column_value(source.get(col), int64=False) for col in _COLUMNS), text)
 

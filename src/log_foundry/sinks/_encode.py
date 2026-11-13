@@ -48,8 +48,6 @@ destination accepts, so a match only sends the event to :func:`refuse_surrogate`
 re-encode, which decides (SPEC-069 follow-up).
 """
 
-_INT64_MIN = -(2**63)
-_INT64_MAX = 2**63 - 1
 _NUL = "\x00"
 _REPLACEMENT = "\ufffd"
 _TRUNCATED = "truncated"
