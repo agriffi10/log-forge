@@ -152,16 +152,22 @@ only overlap with SPEC-061 is that SPEC-061 rewrites `NATSSink.emit`. This spec 
   after earlier lines of the batch were written. Either way the earlier lines stay, and the
   worker's retry writes them again. This spec closes the *encode* route to that duplicate, not the
   I/O route. FR-004 counts and types a file driver error; it does not make a partial write atomic.
+  *Settled 2026-11-13: an accepted edge for 1.2.0, recorded in the driver-error decision and as an
+  exception to invariant 7 (delivery doc, Follow-ups).*
 - **SQLite column values that cannot be bound.** An integer past 64 bits raises the builtin
   `OverflowError` and a `dict` raises `sqlite3.ProgrammingError` when `SQLiteSink` binds its
   projected columns, and either still costs the batch. Only a direct `emit` can hand the sink one,
   since assembly cannot produce them in those columns, and neither is measured or handled here.
+  *Resolved 2026-11-13: a `TransformSink` can produce them too, and each is now bound as its JSON
+  text (delivery doc, Follow-ups).*
 - **Oversize.** `dropped_oversized` and every size decision stay as they are. An event that is both
   unencodable and oversized counts once, as unencodable, because the encode step runs first.
 - **Refusals no one has measured.** Only the PostgreSQL and MongoDB refusals above are repaired, on
   FR-003's admission rule. That leaves one known route. A lone surrogate reaching `PostgresSink`
   through a direct `emit` becomes an escape JSONB may refuse. Assembly and `TransformSink` both
   replace lone surrogates, so it is outside the pipeline, and it is not measured here.
+  *Resolved 2026-11-13: measured costing the batch, and now dropped alone (delivery doc,
+  Follow-ups).*
 - **New public names beyond these.** Every class that gains a counter gets a public `losses()`
   method: `StdoutSink`, `StderrSink`, `FileSink`, `RotatingFileSink` and `SQLiteSink`. That grows
   the surface, which invariant 10 allows, and freezes the method for 1.x. Everything else this spec
