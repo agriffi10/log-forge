@@ -58,9 +58,11 @@ does not own:
    `REJECTED`, which is an over-count in the direction of the recorded upper bound on `failed`.
 5. **The latch can hand a line to a whole-batch catcher.** When a latched run fails, a catcher
    that resends whole resends those `REJECTED` lines too: a `MultiSink` whose every child raised,
-   which the worker's 1.x loop resends, or a caller's own retry of the inline raise. That
-   duplicates a line only when a partial write landed it while the fault persisted and the fault
-   clears before the resend.
+   which the worker's 1.x loop resends; the worker's 1.x loop resending a subclass that overrides
+   `emit`; or a caller's own retry of the inline raise. That duplicates a line only when a partial
+   write landed it while the fault persisted and the fault clears before the resend. Probed through
+   an `emit` override, over a stream that landed 2 lines per call and then raised `ENOSPC` until
+   its third fault: `b1e0` and `b1e1` landed twice, and with the latch never set, nothing did.
 6. **Another writer's fault.** Another writer on the same stream, such as the application's own
    `print()` to a redirected stdout, can hit a fault that makes the text layer drop this section's
    pending lines. This section's final `flush()` then returns, and those lines are called
@@ -192,7 +194,9 @@ shape `python -u` and `PYTHONUNBUFFERED=1` give `sys.stdout`: `type(stream) is i
 `stream.write_through` is true, and `type(stream.buffer) is io.FileIO`. The types are compared
 exactly, so no caller code runs, and the check is read only after a raise, so a clean round pays
 nothing. On that shape each `write` is one `write(2)`. A `write` that returned put its line in the
-kernel, and one that raised took nothing, so the rows after the pre-flush change:
+kernel, and one that raised took nothing, so the rows after the pre-flush change. On this shape
+its table wins for every raise, one that is not an `OSError` included, so the lines before `i` are
+`ACCEPTED` there too:
 
 | What happened, on the unbuffered shape | Encodable events |
 |---|---|
@@ -326,7 +330,9 @@ events `When.LAST`. Each line names the sink's class, the round's exception type
 `OSError`, `errno=N` (`_diag.errno_of`), never event data. The `UNKNOWN` group's line ends with
 `; they may have landed`, the clause the HTTP family's `UNKNOWN` line already writes
 (`"<Class>, outcome unknown; they may have landed"` in `sinks/http.py`), so it does not read as a
-loss. The engine and the worker's abandon line add nothing to these lines.
+loss. A handed line the latch made `REJECTED` gets its own `Lost` group, `When.ALWAYS`, under a
+key of its own, and its line also ends with `; they may have landed`, since residue 4 says it may
+have. The engine and the worker's abandon line add nothing to these lines.
 
 #### Acceptance Criteria:
 
@@ -477,6 +483,14 @@ What each listed test change is for:
   `log-foundry: absorbed a failure while transforming a batch (ValueError); TransformSink did not
   forward 1 event(s) its function failed on`, in place of `log-foundry: lost 1 event(s);
   TransformSink, the transform failed with ValueError`, and asserts it. Its counts are unchanged.
+  `test_model_b_a_wrapper_turning_reporting_loses_nothing` asserts `SinkLosses(dropped=1,
+  failed=15)` in place of `failed=9`. Its `_BreaksAfter(2)` raises `OSError("the stream broke")`,
+  which has no `errno` and is rejected, under a `TransformSink` inside a `MultiSink`. Batch 2
+  settles, counting 3. Batches 3 and 4 are latched and fail: the engine counts 3 for each, the
+  inline `emit` raises, and `MultiSink` absorbs 3 more for each (3 + 6 + 6 = 15). That is the
+  engine child under `MultiSink` double count invariant 2 already records and `test_model_c`
+  asserts. Its docstring's premise, "the wrapper raises having counted nothing", becomes: the
+  inner sink counted before the raise.
 - `tests/test_fork_roster.py`: once `_counter_lock` retires, `StdoutSink` assigns no primitive to
   `self`, so its `_PRIMITIVE_HOMES` row is stale and `test_every_class_holding_a_primitive_has_a_home`
   reports it as `STALE_HOME` until the row leaves.
@@ -549,7 +563,9 @@ What each listed test change is for:
     TransformSink, the transform failed with ValueError`, and `FilteringSink` writes its twin
     (`filtering a batch`, `its predicate failed on`);
   - a subclass that overrides `emit` and calls `super().emit` runs one round per call, so a
-    `RETRYABLE` tail is counted lost where 1.x's worker resent the whole batch.
+    `RETRYABLE` tail is counted lost where 1.x's worker resent the whole batch, and under a
+    sustained fault that clears between the worker's attempts such a subclass can also duplicate
+    lines (residue 5).
 
 ---
 
@@ -615,4 +631,8 @@ What each listed test change is for:
   `StringIO` failed on every batch, and the `RLIMIT_FSIZE` table across all three modes still showed
   no duplicate. The review also fixed the subprocess proof's line length at 120 bytes, made the
   timing bound a median over interleaved pairs, and pinned the pre-flush double to its first flush,
-  since a double raising on every flush passes on 1.x too.
+  since a double raising on every flush passes on 1.x too. A final build pass over the latch
+  changed nothing in the built result: a never-set and a never-cleared latch mutant each redden a
+  criterion, 1.x reddens all seven new tests, and the pass corrected four records (the
+  `test_model_b` count, the override catcher, the unbuffered shape's precedence, and the latched
+  group's line).
