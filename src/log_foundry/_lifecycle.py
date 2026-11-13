@@ -567,6 +567,24 @@ class _CloseRegistry:
         with self._lock:
             return id(sink) in self._in_flight
 
+    def in_flight_ids(self) -> set[int]:
+        """The ids of every sink whose close is in flight, for ``_repin``'s strong set (SPEC-081).
+
+        One acquisition of the leaf, taken with no other library lock held, so the re-pin never
+        nests it under the record lock.
+
+        Args:
+          None.
+
+        Returns:
+          A snapshot of the in-flight ids.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return set(self._in_flight)
+
     def attach(self, close: _Close, thread: threading.Thread) -> None:
         """Records a thread performing a close, once it has started, beside any already there.
 
@@ -735,6 +753,95 @@ def _remaining(deadline: float | None) -> float | None:
     return None if deadline is None else max(0.0, deadline - monotonic())
 
 
+class _Entry:
+    """One ownership-record entry: who acquired a sink, and how the record holds it (SPEC-081).
+
+    Written under :attr:`Runtime._owned_lock` and read through a snapshot. The entry holds its sink
+    **strongly** only while the library still holds the sink — the sink is reachable from a live
+    delivery root, owed a close, or being closed — and **weakly** afterwards, so a superseded sink
+    is collected once the application drops it (FR-001). An entry naming another process, which in
+    a child is every inherited one, is held strongly for the child's life (FR-004).
+
+    **Its shape never tears.** ``weak`` is created once, when the entry is written, carries no
+    callback (a callback runs inside the collector, on whatever thread allocates), and is kept for
+    the entry's life; only ``strong`` toggles between the sink and ``None``. A fork landing in the
+    middle of a write can therefore see a stale ``strong``, never an entry with neither reference.
+    A sink whose type cannot be weakly referenced — no ``__weakref__`` slot, a ``weakref.proxy``
+    among them — has ``weak`` ``None`` and is held strongly for life; creating the reference runs
+    none of the sink's code either way.
+
+    **A dead entry answers for nothing** (FR-003): an ``id`` is free for reuse the moment its
+    object dies, so an entry whose :meth:`referent` is gone, or is not the object asked about, is
+    read as absent by every reader and overwritten by every writer, and pruned by ``_repin``.
+
+    Attributes:
+      pid: ``os.getpid()`` at the write, or ``_FOREIGN``.
+      strong: The sink while the record pins it, otherwise ``None``.
+      weak: A weak reference to the sink, or ``None`` when it cannot be weakly referenced.
+      closed: Whether a close this process performed on the sink has finished, returned or raised.
+      captured: Whether the capture before a demotion wrote this entry, rather than a stamp, a
+        reclaim or the fork walk.
+      epoch: ``Runtime._owned_clock`` at this entry's last stamp or reclaim.
+    """
+
+    __slots__ = ("captured", "closed", "epoch", "pid", "strong", "weak")
+
+    pid: int
+    strong: object | None
+    weak: weakref.ReferenceType[object] | None
+    closed: bool
+    captured: bool
+    epoch: int
+
+    def __init__(
+        self, sink: object, pid: int, epoch: int, *, strong: bool, captured: bool = False
+    ) -> None:
+        """Records one sink, weakly where its type allows and strongly when asked or forced to.
+
+        Args:
+          sink: The sink being recorded.
+          pid: The acquiring process, or ``_FOREIGN``.
+          epoch: The record's epoch at this write.
+          strong: Whether the record pins the sink now; a sink that cannot be weakly referenced is
+            pinned whatever this says.
+          captured: Whether the capture before a demotion is writing it.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        weak: weakref.ReferenceType[object] | None
+        try:
+            weak = weakref.ref(sink)
+        except TypeError:
+            weak = None
+        self.weak = weak
+        self.strong = sink if strong or weak is None else None
+        self.pid = pid
+        self.epoch = epoch
+        self.closed = False
+        self.captured = captured
+
+    def referent(self) -> object | None:
+        """Returns the recorded sink while it is alive, the strong reference first.
+
+        Args:
+          None.
+
+        Returns:
+          The sink, or ``None`` once a weakly held sink has died.
+
+        Raises:
+          None.
+        """
+        if self.strong is not None:
+            return self.strong
+        weak = self.weak
+        return None if weak is None else weak()
+
+
 class Runtime:
     """The process's delivery lifecycle: one owner, one state, three locks (SPEC-040, SPEC-078).
 
@@ -806,6 +913,15 @@ class Runtime:
     ``configure()`` that changes the sink holds it from the config write to the end of
     :func:`_swap_sink`, and nothing holding any of these takes it.
 
+    **The record's lock is re-entrant, the only one of the three that is** (SPEC-081 FR-003).
+    Since an entry holds a sink the library no longer holds only weakly, a collection can run a
+    sink's finalizer on a thread inside a record section, and a finalizer that forwards a close
+    into a library wrapper reaches :func:`releasable` and :func:`release` on that same thread. Each
+    section under it iterates a snapshot, so a re-entrant write is safe. That path is the one place
+    the order can invert: such a close whose entry carries a hand a worker build declined reaches
+    :func:`_hand_after_close`, which takes ``_lock`` with ``_owned_lock`` held (``architecture.md``
+    §13, a recorded residual).
+
     **No sink's stop-signal setter runs under** :attr:`_lock`. A setter is the sink's own code
     and may call back into the library on the same thread, which a non-reentrant lock turns into
     a self-deadlock: measured at ``624d817f``, a setter calling ``configure()``, ``info()``,
@@ -824,10 +940,12 @@ class Runtime:
     """
 
     _FORK_SKIP = ("_owned",)
-    """Keeps the ownership record, which pins superseded sinks, out of the repair walk's descent.
+    """Keeps the ownership record, which can pin superseded sinks, out of the repair walk's descent.
 
-    ``_owned`` strongly references every sink this process ever acquired (SPEC-042 FR-001),
-    including sinks it abandoned several ``configure()`` calls ago. Without the opt-out the walk
+    ``_owned`` references every sink this process acquired that is still alive (SPEC-042 FR-001,
+    SPEC-081), strongly while the library holds it and weakly after, and in a forked child it
+    holds every inherited one strongly, including sinks the parent abandoned several
+    ``configure()`` calls before the fork. Without the opt-out the walk
     reaches them and calls their fork hooks — measured, a child of ``configure(A)`` → ``info()`` →
     ``configure(B)`` ran ``reacquire_after_fork()`` on both, a child announced a buffer discard for
     a superseded sink, and a ``FileSink`` in that place would have its file re-opened on every fork
@@ -845,11 +963,11 @@ class Runtime:
     ``sinks.base._static_value``, which finds a class attribute as ``getattr`` would.
 
     Marking is not narrowed: :func:`_record_seeds` reads the ownership and owed records directly,
-    so the marking frontier still reaches an inherited superseded sink, never hooked, and it is
-    still refused (SPEC-042 FR-001) — on the stamp ``configure()`` left, since
-    :func:`_walk_after_fork` ``setdefault``s and leaves an existing record alone rather than
-    writing ``_FOREIGN`` over it — or on ``_FOREIGN``, for a sink held inside it that the bounded
-    stamp walk never reached.
+    so the marking frontier still reaches an inherited superseded sink that is still a seed, never
+    hooked, and it is still refused (SPEC-042 FR-001) — on the stamp ``configure()`` left, since
+    :func:`_walk_after_fork` leaves an existing live record alone rather than writing ``_FOREIGN``
+    over it — or on ``_FOREIGN``, for a sink held inside it that the bounded stamp walk never
+    reached.
     """
 
     def __init__(self) -> None:
@@ -942,32 +1060,35 @@ class Runtime:
         entries, which that thread's own ``finally`` removes.
         """
         self._marking_failed = False
-        """Whether the child's marking walk could not finish, so nothing unrecorded may be trusted.
+        """Whether this child cannot tell what it inherited, so it trusts no unrecorded sink.
 
-        The walk is what makes an inherited sink recorded; if it did not complete, an unrecorded
-        sink in this child may be one it missed rather than one this process built. Refusing every
-        unrecorded sink then costs a leaked handle, which is the direction FR-001 requires a gap to
-        fail in.
+        Set when the child's walk raised, or when its marking tripped :data:`_MARKING_CEILING` and
+        the heap scan that falls back for it failed or met a frozen heap (SPEC-081 FR-005, FR-006).
+        An unrecorded sink in such a child may be one it missed rather than one it built, so
+        :func:`releasable` refuses an unrecorded sink, and :func:`stamp` records a sink it is
+        handed that has no record as ``_FOREIGN``, unless it is a root the library built: a leaked handle rather than a closed
+        transport, the direction SPEC-042 FR-001 requires a gap to fail in. Inherited by a
+        grandchild, whose walk then scans its heap and clears the flag when that scan succeeds.
         """
-        self._owned: dict[int, tuple[int, object]] = {}
+        self._owned: dict[int, _Entry] = {}
         """Which sinks this process acquired, keyed by ``id``, with the pid that acquired each.
 
         **No record means refused** (FR-001), and that default is the whole mechanism: a sink the
         library was never handed was never its to release, so every gap fails toward a leaked handle
         rather than toward closing a transport another process is still using.
 
-        The value holds a **strong reference beside the pid**, which is load-bearing twice. An
-        ``id`` is reusable the moment its object dies, so a bare pid could be handed to an unrelated
-        later object that happened to land on the address; and a garbage-collected sink closes
-        itself, which is the same destructive close by another route. ``_fork._fresh_primitive``
-        already pairs an id with a keepalive for the first of those reasons.
-
-        It therefore grows by one entry per sink ever handed to the library and never shrinks. That
-        is accepted rather than bounded: ``configure()`` is a startup call, so the count is
-        startup-scale, and evicting an entry is exactly the "no record" state that makes a sink
-        unreleasable.
+        **An entry pins its sink only while the library still holds it** (SPEC-081 FR-001): while
+        the sink is reachable from a live delivery root, owed a close or being closed. After a
+        performed close, or a supersession with nothing owed, the entry keeps only a weak reference,
+        so a superseded sink is collected once the application drops it; before it goes weak, the
+        sinks beneath it are recorded (``_capture``). The two reasons the reference used to be
+        strong for life are kept another way. An ``id`` is reusable the moment its object dies, so
+        an entry whose sink is dead, or is not the object asked about, answers for nothing
+        (:func:`_entry_for`) and is pruned by ``_repin``. A collected sink can close itself from a
+        finalizer, which in a forked child would be a destructive close, so a child pins every
+        inherited entry whose sink is alive before anything else runs (``_pin_inherited``).
         """
-        self._owned_lock = threading.Lock()
+        self._owned_lock = threading.RLock()
         """Guards :attr:`Runtime._owned`, and is the **last** lock in the process's order.
 
         ``_state._lock`` → ``_config_lock`` → this, never the reverse in any pair (FR-001 AC-12).
@@ -976,8 +1097,38 @@ class Runtime:
         before it can stamp. The criterion states the two-term version, which is true but skips the
         middle term.
 
+        **Re-entrant** (SPEC-081 FR-003): a sink the record holds only weakly can be collected
+        while a thread is inside a section, and a finalizer forwarding a close into a library
+        wrapper then reaches :func:`releasable` and :func:`release` on that thread; with a plain
+        ``Lock`` that thread hung. Every section iterates a snapshot of :attr:`_owned`, so a
+        re-entrant write during it is safe. On the roster, where ``_fork._fresh_primitive`` mints
+        an ``RLock`` for it.
+
         The orphan logging path is the opposite constraint and takes **no** lock at all: it reaches
         ``_ensure_sink``'s fast-path return once per event, which must never stamp (AC-10).
+        """
+        self._owned_clock = 0
+        """Bumped by every :func:`stamp` and :func:`reclaim`, and written on the entries they touch.
+
+        ``_repin`` reads it when it begins and demotes only an entry whose epoch is no later, so a
+        sink handed over while a re-pin is walking is never demoted by it; :func:`release` compares
+        an entry's epoch across a close, so a sink handed over again during its own close is left
+        unclosed in the record (SPEC-081 FR-001). Inherited by a child as it stands.
+        """
+        self._stamp_refusal_announced = False
+        """Whether the line for a ``sink=`` a last-resort child refused was written (FR-006).
+
+        Once per process: reset by :func:`_walk_after_fork` in each child.
+        """
+        self._capture_announced = False
+        """Whether the line for a capture that stopped short was written (SPEC-081 FR-002).
+
+        Once per process, for a trip and a raise together: reset by :func:`_walk_after_fork`.
+        """
+        self._repin_announced = False
+        """Whether the line for a re-pin that raised was written (SPEC-081 FR-001).
+
+        Once per process: reset by :func:`_walk_after_fork` in each child.
         """
         self._swaps_running: set[_Operation] = set()
         """One token per ``_swap_sink`` call inside its work; non-empty reads ``SWAPPING``.
@@ -1457,13 +1608,15 @@ destroying the parent's transport. Unrecorded has to be unclaimable, not merely 
 """
 
 _MARKING_CEILING = 100_000
-"""Objects the child's marking walk may visit before it gives up and refuses the unrecorded.
+"""Objects the child's marking walk may visit before it stops and marks the heap instead.
 
 **A cap is right here where SPEC-039 rejected one, and the difference is the fallback.** That
 spec declined to bound its repair walk because an unfound lock is a child that hangs with no
-safe degradation — a cap would trade a certain hazard for an uncertain one. This walk has
-:attr:`Runtime._marking_failed`, built for exactly "it did not finish, so trust nothing
-unrecorded", so tripping the cap degrades to a leaked handle: the direction FR-001 requires.
+safe degradation — a cap would trade a certain hazard for an uncertain one. This walk has one:
+a trip marks the sink-shaped objects on the child's inherited heap instead (:func:`_mark_heap`,
+SPEC-081 FR-005), and where that scan cannot run, :attr:`Runtime._marking_failed` refuses every
+unrecorded sink, a leaked handle rather than a closed transport, the direction FR-001 requires.
+Past a trip the walk neither repairs nor hooks what it did not reach; the heap scan only marks.
 
 The exposure is also larger than the repair frontier's. That frontier enters containers only
 from owned holders and one level deep; the marking frontier enters every container reachable
@@ -1473,10 +1626,13 @@ because the parent was being starved. Since SPEC-079 a subclass's own iteration 
 but a genuinely large graph still exists, and exhausting memory in a child that has not returned
 from ``fork`` is worse than the leak the cap causes.
 
-It counts the marking frontier's own visits, across both of its groups, and bounds every
-container read in either frontier. Set far above any real graph — a sink's is on the order of
+It counts the marking frontier's own visits, across both of its groups, bounds every
+container read in either frontier, and bounds the objects ``_capture`` enters beneath the sinks
+one re-pin demotes (SPEC-081 FR-002). Set far above any real graph — a sink's is on the order of
 hundreds — and above the ~24,000 a module escape once reached before the marking stopped
-descending into modules.
+descending into modules. Before SPEC-081 the record pinned every sink ever handed over and seeded
+the marking with all of them, so a process that reconfigured about 500 times tripped it in every
+child; the record now seeds only what is alive and not a closed shipped sink (:func:`_record_seeds`).
 """
 
 
@@ -1529,10 +1685,7 @@ def _bounded_children(container: object) -> list[object]:
         7's residual otherwise, since absorbing here leaves :attr:`Runtime._marking_failed` clear.
     """
     try:
-        members: list[object] = []
-        for storage in _fork._storage_iterators(container):
-            members.extend(islice(storage, _MARKING_CEILING))
-        return members
+        return _read_members(container)
     except Exception as exc:
         _diag.absorbed(
             "reading a container while marking a forked child's sinks",
@@ -1540,6 +1693,28 @@ def _bounded_children(container: object) -> list[object]:
             "what it holds is not marked by this child",
         )
         return []
+
+
+def _read_members(container: object) -> list[object]:
+    """Reads at most :data:`_MARKING_CEILING` members of one container, letting a fault propagate.
+
+    The read :func:`_bounded_children` guards, through the builtin base type's own iteration so no
+    code of a subclass runs. ``_capture`` calls it directly, so a container that raises in the
+    parent is announced under the capture's own line rather than the marking's (SPEC-081 FR-002).
+
+    Args:
+      container: Any value ``_fork._is_container`` accepted.
+
+    Returns:
+      Its members, keys included for a mapping, truncated at the ceiling.
+
+    Raises:
+      Exception: Whatever reading the container's storage raises.
+    """
+    members: list[object] = []
+    for storage in _fork._storage_iterators(container):
+        members.extend(islice(storage, _MARKING_CEILING))
+    return members
 
 
 def _reachable_sinks(root: object, *, after_fork: _fork._Repair | None = None) -> list[object]:
@@ -1653,7 +1828,11 @@ def _reachable_sinks(root: object, *, after_fork: _fork._Repair | None = None) -
     return found
 
 
-def _positional_sinks(holder: object, items: list[tuple[str, object]]) -> list[object]:
+def _positional_sinks(
+    holder: object,
+    items: list[tuple[str, object]],
+    read: Callable[[object], list[object]] = _bounded_children,
+) -> list[object]:
     """Returns the sinks a package holder holds in its declared child-sink slots, by position.
 
     Read from ``_fork._CHILD_SINK_SLOTS``: a value in such a slot was handed to the library as a
@@ -1664,12 +1843,14 @@ def _positional_sinks(holder: object, items: list[tuple[str, object]]) -> list[o
     Args:
       holder: A package-owned object the walk entered.
       items: Its namespace pairs, as the walk read them.
+      read: How a ``many`` slot's container is read: :func:`_bounded_children` for the walks,
+        :func:`_read_members` for ``_capture``, which announces a fault under its own line.
 
     Returns:
       The sinks in its declared slots, ``None`` dropped.
 
     Raises:
-      None.
+      Exception: Only what ``read`` lets through; the walks' default raises nothing.
     """
     slots = _fork._child_sink_slots(holder)
     if not slots:
@@ -1680,7 +1861,7 @@ def _positional_sinks(holder: object, items: list[tuple[str, object]]) -> list[o
         if kind == "one":
             sinks.append(value)
         elif kind == "many":
-            sinks.extend(_bounded_children(value))
+            sinks.extend(read(value))
     return [sink for sink in sinks if sink is not None and not _sink_arg.unpatchable(sink)]
 
 
@@ -1870,7 +2051,8 @@ def _record_seeds() -> list[object]:
     """
     seeds: list[object] = list(_state._closes.owed.values())
     with _state._owned_lock:
-        seeds.extend([reference for _pid, reference in _state._owned.values()])
+        alive = [entry.referent() for entry in list(_state._owned.values())]
+    seeds.extend(referent for referent in alive if referent is not None)
     return seeds
 
 
@@ -2015,6 +2197,9 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
         is for a fault in resolving the roots or the seeds. The hooks collected before a raise
         still run, and ``_reclaim_after_fork`` runs either way.
     """
+    _state._capture_announced = False
+    _state._stamp_refusal_announced = False
+    _state._repin_announced = False
     try:
         found: list[object] = _live_sinks()
         for root in _live_roots():
@@ -2035,8 +2220,10 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
                 f"inherited sink it has no record of unless it configures that sink itself",
             )
         with _state._owned_lock:
+            epoch = _state._owned_clock
             for inherited in found:
-                _state._owned.setdefault(id(inherited), (_FOREIGN, inherited))
+                if _entry_for(inherited) is None:
+                    _state._owned[id(inherited)] = _Entry(inherited, _FOREIGN, epoch, strong=True)
     except Exception as exc:
         _state._marking_failed = True
         _diag.absorbed(
@@ -2073,8 +2260,8 @@ def reclaim(sink: object) -> None:
 
     The one write that **overrides** an existing record, and it has to be: an inherited sink
     **the marking walk reached** carries another process's pid by the time the hook roster is
-    read — the parent's own stamp, or the ``_FOREIGN`` :func:`_walk_after_fork` ``setdefault``s
-    where the parent recorded nothing — so a ``setdefault`` here would leave a sink that provably
+    read — the parent's own stamp, or the ``_FOREIGN`` :func:`_walk_after_fork` writes where the
+    parent recorded nothing — so a write-once here would leave a sink that provably
     holds its own descriptor refused forever. Where the walk did *not* reach it the record is
     empty and this write is the one that fills it — a walk can miss a sink with no exception at
     all, and the loop calling this sits outside that walk's ``try`` so it also runs when the walk
@@ -2087,6 +2274,9 @@ def reclaim(sink: object) -> None:
     and loses nothing, since ``FileSink.emit`` flushes at the end of every batch, but it is
     stated rather than discovered.
 
+    It writes a fresh strong entry naming this process and bumps :attr:`Runtime._owned_clock`
+    onto it, as :func:`stamp` does, so a re-pin already walking cannot demote it (SPEC-081).
+
     Args:
       sink: The sink whose hook returned normally.
 
@@ -2098,7 +2288,8 @@ def reclaim(sink: object) -> None:
     """
     pid = os.getpid()
     with _state._owned_lock:
-        _state._owned[id(sink)] = (pid, sink)
+        _state._owned_clock += 1
+        _state._owned[id(sink)] = _Entry(sink, pid, _state._owned_clock, strong=True)
 
 
 def stamp(sink: object) -> None:
@@ -2111,7 +2302,11 @@ def stamp(sink: object) -> None:
     **Write-once per object.** A stamp naming another process is never overwritten, so a forked
     child cannot claim an inherited sink by configuring its way back to it, and the answer
     survives a second fork. Overwriting on every ``configure()`` satisfies every other criterion
-    in FR-001 and fails AC-4.
+    in FR-001 and fails AC-4. "Per object" is checked through :func:`_entry_for`, so an entry whose
+    sink is dead, left on an ``id`` a new sink now occupies, is overwritten rather than kept
+    (SPEC-081 FR-003). An entry this process already holds for the sink is made strong again, its
+    ``closed`` cleared and its epoch bumped: the sink is handed over afresh, possibly while its
+    earlier close is still running, and :func:`release` then leaves it unclosed in the record.
 
     The walk runs **outside** the lock and only the record write takes it, so an arbitrary
     object graph is never traversed while holding a process-wide lock.
@@ -2140,8 +2335,17 @@ def stamp(sink: object) -> None:
         _diag.absorbed("recording which sinks this process owns", exc, "they will not be closed")
     pid = os.getpid()
     with _state._owned_lock:
+        _state._owned_clock += 1
+        epoch = _state._owned_clock
         for found in reachable:
-            _state._owned.setdefault(id(found), (pid, found))
+            entry = _entry_for(found)
+            if entry is None:
+                _state._owned[id(found)] = _Entry(found, pid, epoch, strong=True)
+            elif entry.pid == pid:
+                entry.strong = found
+                entry.closed = False
+                entry.captured = False
+                entry.epoch = epoch
 
 
 def releasable(sink: object, *, owner: object = None) -> bool:
@@ -2186,9 +2390,16 @@ def releasable(sink: object, *, owner: object = None) -> bool:
     :attr:`Runtime._marking_failed` withdraws the assumption entirely and every unrecorded sink is
     refused.
 
-    Identity is re-checked against the strong reference rather than trusting the ``id``. The
-    reference is what makes an id collision impossible while a record stands, so this can only
-    fail if that invariant breaks — and answering ``False`` there is the safe direction.
+    **An entry whose sink is dead answers for nothing** (SPEC-081 FR-003), for the sink and for
+    its ``owner`` alike: an ``id`` is free for reuse once its object dies, and a new object of the
+    same type lands on it almost every time (measured 99.93%), so a dead entry read as a record
+    would refuse a fresh sink or lend it a dead sink's verdict. :func:`_entry_for` reads it as
+    absent. A closed sink the caller still holds keeps its entry, weakly, so it answers exactly as
+    before: recorded, and releasable again by the process that closed it.
+
+    Identity is still re-checked against a strong reference rather than trusting the ``id``. While
+    the reference stands an id collision is impossible, so this can only fail if that invariant
+    breaks — and answering ``False`` there is the safe direction.
 
     Args:
       sink: The sink a caller is about to close.
@@ -2203,11 +2414,38 @@ def releasable(sink: object, *, owner: object = None) -> bool:
     """
     pid = os.getpid()
     with _state._owned_lock:
-        record = _state._owned.get(id(sink))
-        owner_record = None if owner is None else _state._owned.get(id(owner))
+        at_id = _state._owned.get(id(sink))
+        record = _entry_for(sink)
+        owner_record = None if owner is None else _entry_for(owner)
+    if at_id is not None and at_id.strong is not None and at_id.strong is not sink:
+        return False
     if record is not None:
-        return record[1] is sink and record[0] == pid
+        return record.pid == pid
     return owner_record is None and not _state._marking_failed
+
+
+def _entry_for(sink: object) -> _Entry | None:
+    """Returns the record's live entry for this very object; the caller holds the record lock.
+
+    The one reader of an entry (SPEC-081 FR-003). An entry whose sink has died, or whose sink is
+    not this object, is read as absent: an ``id`` is free for reuse once its object dies, so such
+    an entry describes some other object entirely. Every writer overwrites what this reads as
+    absent, and ``_repin`` prunes it. Nothing here runs an object's code: a dictionary lookup by an
+    ``int`` and a weak-reference dereference.
+
+    Args:
+      sink: The object asked about.
+
+    Returns:
+      The entry, or ``None`` when there is none, its sink is dead, or its sink is another object.
+
+    Raises:
+      None.
+    """
+    entry = _state._owned.get(id(sink))
+    if entry is None or entry.referent() is not sink:
+        return None
+    return entry
 
 
 def release(
@@ -2254,6 +2492,14 @@ def release(
     holds that shape. The inline exit pays inside its ``finally``, so a ``close()`` that raised
     still hands the sink the worker's signal.
 
+    **A performed close settles the record** (SPEC-081 FR-001), after the entry is discharged and
+    any deferred hand paid, so no lifecycle lock is held, and whether ``close()`` returned or
+    raised: the sink's entry is marked ``closed`` — unless the sink was handed over again while
+    this close ran, which bumped the entry's epoch past the one read just before the close — and
+    ``_repin`` runs, demoting what the library no longer holds. Neither raises, so neither can
+    replace what ``close()`` raised. A refused release and a detached one perform no close here;
+    the detached one's thread comes back through this inline path.
+
     Args:
       sink: The sink to close.
       detached: Whether to close on a daemon thread rather than inline. Detached is for a sink
@@ -2294,13 +2540,349 @@ def release(
         if closer is None and _state._closes.finish(sink, entry):
             _hand_after_close(sink)
         return closer
+    epoch = _close_clock(sink)
     registration = closing if closing is not None else _state._closes.register(sink, _Rule.INLINE)
     try:
         sink.close()
     finally:
-        if _state._closes.finish(sink, registration):
-            _hand_after_close(sink)
+        try:
+            if _state._closes.finish(sink, registration):
+                _hand_after_close(sink)
+        finally:
+            _settle_close(sink, epoch)
     return None
+
+
+def _close_clock(sink: object) -> int | None:
+    """Reads the epoch of a sink's entry just before its close, for :func:`_settle_close`.
+
+    Args:
+      sink: The sink about to be closed.
+
+    Returns:
+      Its live entry's epoch, or ``None`` when it has no live entry.
+
+    Raises:
+      None.
+    """
+    with _state._owned_lock:
+        entry = _entry_for(sink)
+        return None if entry is None else entry.epoch
+
+
+def _settle_close(sink: object, epoch: int | None) -> None:
+    """Marks a sink this process closed as closed, then re-pins the record (SPEC-081 FR-001).
+
+    The entry is marked only when it is still the live entry naming this process **at the epoch
+    read before the close**. A ``configure(sink=s)`` landing while ``s``'s earlier close ran has
+    made the entry strong again and bumped its epoch, and marking it then would leave a sink the
+    library holds again looking finished — so it is left as that stamp made it.
+
+    Args:
+      sink: The sink whose close has just ended, returned or raised.
+      epoch: What :func:`_close_clock` read before the close.
+
+    Returns:
+      None.
+
+    Raises:
+      None. ``_repin`` absorbs its own faults, so the exception ``close()`` raised is never
+        replaced from here.
+    """
+    pid = os.getpid()
+    with _state._owned_lock:
+        entry = _entry_for(sink)
+        if entry is not None and entry.pid == pid and entry.epoch == epoch:
+            entry.closed = True
+    _repin()
+
+
+def _repin() -> None:
+    """Holds strongly what the library still holds, and weakly the rest (SPEC-081 FR-001).
+
+    Run on every exit of :func:`_swap_sink` and at the end of every :func:`release` that performed
+    a close. It works out which sinks the library still holds — reachable by the stamp walk from a
+    live delivery root (:func:`_delivering_sinks`), owed a close, or being closed — promotes this
+    process's entries for them, demotes this process's other entries to weak after recording the
+    sinks beneath them (``_capture``), and prunes every entry whose sink has died. Entries naming
+    another process are never promoted or demoted: in a child those are what it inherited.
+
+    **It never raises.** A fault is absorbed and announced once per process
+    (:attr:`Runtime._repin_announced`): a swap must still install its sink, and a release must
+    still raise what ``close()`` raised.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    try:
+        _repin_record()
+    except Exception as exc:
+        announced, _state._repin_announced = _state._repin_announced, True
+        if not announced:
+            _diag.absorbed(
+                "re-pinning the ownership record",
+                exc,
+                "sinks this process no longer holds may stay in memory until a later swap or close",
+            )
+
+
+def _repin_record() -> None:
+    """The work of :func:`_repin`: three short sections under the record lock, the walks outside.
+
+    1. The epoch is read under the lock, so an entry written at or before it is a whole write.
+    2. With no lock held, the sinks the library still holds are worked out: the stamp walk from
+       each of :func:`_delivering_sinks`, the owed record's snapshot (read unlocked, as
+       :func:`_record_seeds` reads it) and the ids of the closes in flight. A take landing
+       between those two reads can be missed by both; that is benign, because the closing
+       thread holds the sink alive and its own release re-pins after the close.
+    3. Under the lock, over a snapshot: a dead entry is pruned (no weak-reference callback does
+       it, since a callback runs inside the collector on any thread); this process's entry for a
+       held sink is made strong; this process's strong entry for any other sink, when its sink
+       can be weakly referenced and its epoch is no later than the one read in step 1, is put on
+       a local list that holds the sink, so a concurrent stamp is never demoted.
+    4. With no lock held, ``_capture`` records what lies beneath the sinks on that list.
+    5. Under the lock, the captured sinks with no live entry are written weakly, naming this
+       process — or ``_FOREIGN`` in a child that cannot tell what it inherited — and each listed
+       entry still at its epoch is demoted. The list goes out of scope only after that section,
+       so the last strong reference to a demoted sink drops with no library lock held and any
+       finalizer it runs meets none of them.
+
+    A finalizer that re-enters here on a thread already inside a section (FR-003) runs the whole
+    body re-entrantly, its capture included; the record lock is an ``RLock`` and each section
+    iterates its own snapshot.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      Exception: Whatever resolving the roots or reading the registry raises; :func:`_repin`
+        absorbs it.
+    """
+    pid = os.getpid()
+    with _state._owned_lock:
+        start = _state._owned_clock
+    pinned: set[int] = set()
+    for root in _delivering_sinks():
+        pinned.add(id(root))
+        pinned.update(id(found) for found in _reachable_sinks(root))
+    owed = list(_state._closes.owed.values())
+    pinned.update(id(sink) for sink in owed)
+    pinned.update(_state._closes.in_flight_ids())
+    demoted: list[tuple[int, _Entry, object]] = []
+    with _state._owned_lock:
+        for key, entry in list(_state._owned.items()):
+            referent = entry.referent()
+            if referent is None:
+                if _state._owned.get(key) is entry:
+                    del _state._owned[key]
+            elif entry.pid != pid:
+                continue
+            elif key in pinned:
+                entry.strong = referent
+            elif entry.strong is not None and entry.weak is not None and entry.epoch <= start:
+                demoted.append((key, entry, referent))
+    captured, _visits = _capture([sink for _key, _entry, sink in demoted])
+    writer = _FOREIGN if _state._marking_failed else pid
+    with _state._owned_lock:
+        epoch = _state._owned_clock
+        for sink in captured:
+            if _entry_for(sink) is None:
+                _state._owned[id(sink)] = _Entry(sink, writer, epoch, strong=False, captured=True)
+        for key, entry, sink in demoted:
+            if _state._owned.get(key) is entry and entry.epoch <= start and entry.strong is sink:
+                entry.strong = None
+
+
+def _delivering_sinks() -> list[object]:
+    """Returns the sinks the library delivers to now: the roots of the re-pin's walk.
+
+    The configured sink, the **live** worker's sink and the late worker's sink, each when it
+    exists. Not :func:`_live_sinks`, which counts a retired worker's sink too — a retired worker's
+    closed sink is no longer held — and not :func:`_live_roots`, the fork walk's seam.
+
+    Args:
+      None.
+
+    Returns:
+      The sinks, ``None`` dropped.
+
+    Raises:
+      Exception: Whatever resolving the config raises; :func:`_repin` absorbs it.
+    """
+    from log_foundry import config
+
+    sinks: list[object] = [config._live_config().sink]
+    worker = _state.live_worker()
+    if worker is not None:
+        sinks.append(worker.sink)
+    late_worker = _state._late_worker
+    if late_worker is not None:
+        sinks.append(late_worker.sink)
+    return [sink for sink in sinks if sink is not None]
+
+
+_CAPTURE_SHORT = (
+    "recording the sinks beneath a superseded sink stopped short; a forked child may close one "
+    "of them if it configures that sink itself"
+)
+"""The detail of the capture's once-only line (SPEC-081 FR-002)."""
+
+
+def _capture(demoted: list[object]) -> tuple[list[object], int]:
+    """Records what lies beneath sinks about to be demoted, so a child can still refuse it (FR-002).
+
+    A strong entry is what kept a superseded wrapper alive, and a forked child's marking reached
+    the sink beneath it from there. Once the wrapper can be collected, that sink needs an entry of
+    its own, so before ``_repin`` demotes an entry this walks beneath its sink and returns every
+    sink-shaped object and every ``weakref`` proxy it meets, the demoted sinks themselves left
+    out; ``_repin`` records those that have no live entry.
+
+    **Its reach** is the stamp walk's, extended into third-party holders. A holder this package
+    owns (``_fork._is_owned``, which a ``Sink`` subclass satisfies) is entered as the stamp walk
+    enters it: its namespace and its declared child-sink slots, a container read one level and
+    only candidates pushed — so a ``MemorySink``'s plain event dicts are skipped. A third-party
+    holder is read as the marking reads one: its namespace and its own container members, and one
+    level into each plain container there; every object found that is not a plain builtin is
+    entered in turn. A plain container is never entered, so a sink two containers below a
+    third-party holder is not reached (the record keeps that holder as a seed while it lives).
+    Every read is static; no code of a sink runs.
+
+    **Its bound** is :data:`_MARKING_CEILING` objects entered; a plain member read and skipped is
+    not one. A trip or a raise stops it with what it had found, and is announced once per process
+    (:attr:`Runtime._capture_announced`), a trip through ``_diag.pending`` and a raise through
+    ``_diag.absorbed``. It takes no lock: it runs between ``_repin``'s sections.
+
+    Args:
+      demoted: The sinks whose entries are about to go weak.
+
+    Returns:
+      The objects to record, and how many objects it entered.
+
+    Raises:
+      None.
+    """
+    roots = {id(sink) for sink in demoted}
+    seen: set[int] = set()
+    stack: list[object] = list(demoted)
+    found: list[object] = []
+    visits = 0
+    tripped = False
+    try:
+        while stack:
+            holder = stack.pop()
+            if id(holder) in seen or not _may_be_a_sink(holder) or _fork._is_module(holder):
+                continue
+            if visits >= _MARKING_CEILING:
+                tripped = True
+                break
+            seen.add(id(holder))
+            visits += 1
+            if id(holder) not in roots and (
+                _fork._sink_shaped(holder) or _fork._is_weak_proxy(holder)
+            ):
+                found.append(holder)
+            stack.extend(_beneath(holder, found))
+    except Exception as exc:
+        _announce_capture(exc)
+        return found, visits
+    if tripped:
+        _announce_capture(None)
+    return found, visits
+
+
+def _beneath(holder: object, found: list[object]) -> list[object]:
+    """Returns what ``_capture`` enters next beneath one holder, recording its positional sinks.
+
+    Args:
+      holder: An object ``_capture`` has just entered.
+      found: Where a package holder's declared child-sink slots are recorded, by position.
+
+    Returns:
+      The members to enter.
+
+    Raises:
+      Exception: Whatever reading a container raises; ``_capture`` announces it.
+    """
+    target = _fork._super_target(holder)
+    if target is not None:
+        return [target]
+    if _fork._is_owned(holder):
+        items = _fork._namespace_items(holder)
+        positional = _positional_sinks(holder, items, _read_members)
+        found.extend(positional)
+        members: list[object] = list(positional)
+        for _name, value in items:
+            if _is_candidate(value):
+                members.append(value)
+            elif _fork._is_container(value):
+                members.extend(child for child in _read_members(value) if _is_candidate(child))
+        return members
+    skip = _fork._skipped_names(holder)
+    direct = [value for name, value in _fork._namespace_items(holder) if name not in skip]
+    if _fork._is_container(holder):
+        direct.extend(_read_members(holder))
+    members = []
+    for value in direct:
+        if _may_be_a_sink(value):
+            members.append(value)
+        elif _fork._is_container(value):
+            members.extend(child for child in _read_members(value) if _may_be_a_sink(child))
+    return members
+
+
+def _announce_capture(exc: Exception | None) -> None:
+    """Writes the capture's line once per process: a trip as ``pending``, a raise as ``absorbed``.
+
+    Args:
+      exc: What the capture raised, or ``None`` for a trip of the ceiling.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    announced, _state._capture_announced = _state._capture_announced, True
+    if announced:
+        return
+    if exc is None:
+        _diag.pending(_CAPTURE_SHORT)
+    else:
+        _diag.absorbed("recording the sinks beneath a superseded sink", exc, _CAPTURE_SHORT)
+
+
+def _pin_inherited() -> None:
+    """Holds strongly every entry a forked child inherited whose sink is alive (SPEC-081 FR-004).
+
+    Registered with ``_fork.register_pin`` and run **first** in the child's handler, before the
+    roster replaces any lock and before anything else can drop a reference, so no sink the
+    application stops referencing in the child is collected there and no finalizer sends a
+    goodbye on the parent's transport: the second reason the record once held every sink strongly
+    for life, kept for exactly what was alive at the fork. It takes no lock — the child is
+    single-threaded until a handler starts a thread, and the record lock may still be a parent
+    thread's — and reads a snapshot.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    for entry in list(_state._owned.values()):
+        if entry.strong is None:
+            entry.strong = entry.referent()
 
 
 def _hand_after_close(sink: Sink) -> None:
@@ -4082,6 +4664,12 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     discarded in the outer ``finally``, after the closers are joined, with no lock: one
     ``set.discard``, so the token adds no acquisition to this call's pinned count.
 
+    **The outer ``finally`` ends with ``_repin``** (SPEC-081 FR-001), on every exit, both early
+    returns included: a ``configure(sink=…)`` with nothing ever logged returns early and still
+    supersedes a sink, which must go weak in the record or the record grows without bound. It
+    runs last, after ``decided`` is set, so a waiting ``shutdown()`` is not held by its walk, and
+    with no lifecycle lock held — only ``config._sink_lock``, where the caller took it.
+
     Args:
       new_sink: The sink to deliver to from now on.
       timeout: Seconds for the drain and the detached closes, or ``None``.
@@ -4162,6 +4750,7 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
         _state._swaps_running.discard(op)
         if token is not None:
             _state._hands_running.discard(token)
+        _repin()
 
 
 def _flush_live_sink() -> bool:
@@ -4424,6 +5013,7 @@ def _worker_health() -> Health:
     )
 
 
+_fork.register_pin(_pin_inherited)
 _fork.register_walk(_walk_after_fork)
 _fork.register_child_handler(_reclaim_after_fork)
 _fork.register_child_handler(_clear_after_fork)

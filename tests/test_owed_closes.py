@@ -592,15 +592,21 @@ def test_health_answers_the_inherited_question_from_the_config_not_the_record() 
     log_foundry.info("to A")
     _lifecycle._note_orphan_emit(owed_only)
     with _lifecycle._state._owned_lock:
-        _lifecycle._state._owned[id(configured)] = (_lifecycle._FOREIGN, configured)
-        _lifecycle._state._owned[id(owed_only)] = (_lifecycle._FOREIGN, owed_only)
+        _lifecycle._state._owned[id(configured)] = _lifecycle._Entry(
+            configured, _lifecycle._FOREIGN, 0, strong=True
+        )
+        _lifecycle._state._owned[id(owed_only)] = _lifecycle._Entry(
+            owed_only, _lifecycle._FOREIGN, 0, strong=True
+        )
 
     assert log_foundry.health().inherited_sink is True, (
         "the reader consults the configured sink, which is stamped as another process's"
     )
 
     with _lifecycle._state._owned_lock:
-        _lifecycle._state._owned[id(configured)] = (os.getpid(), configured)
+        _lifecycle._state._owned[id(configured)] = _lifecycle._Entry(
+            configured, os.getpid(), 0, strong=True
+        )
     assert log_foundry.health().inherited_sink is False, (
         "and only the configured sink: B is still owed and still stamped foreign, so a reader "
         "that consulted the record at all would answer True here"

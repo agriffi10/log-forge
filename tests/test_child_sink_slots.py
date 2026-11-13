@@ -635,7 +635,7 @@ def _base(value: object) -> bool:
 
 def _recorded(value: object) -> bool:
     with _lifecycle._state._owned_lock:
-        return id(value) in _lifecycle._state._owned
+        return _lifecycle._entry_for(value) is not None
 
 
 @pytest.mark.parametrize("shape", list(_SHAPES))

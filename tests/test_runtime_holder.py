@@ -48,6 +48,14 @@ and ``_CloseRegistry.unmark`` take the registry's leaf, the first with no lock h
 under ``_state._lock``, the order ``in_flight`` uses, and ``_pay_marks_after_stop`` takes
 ``_state._lock`` after the stop has discarded its token, only when a mark exists, so the pinned
 shutdown counts do not move.
+
+**Re-recorded at SPEC-081.** Six sites enter, none leave, and none nests inside another library
+lock. ``_repin_record`` takes ``_state._owned_lock`` three times — to read the epoch, to prune,
+promote and pick what to demote, and to write the captured sinks and demote — with its walks and
+its capture between them, holding nothing; ``_close_clock`` takes it just before a performed
+``close()`` and ``_settle_close`` just after, once the entry is discharged and any deferred hand
+paid; and ``_CloseRegistry.in_flight_ids`` takes the registry's leaf with nothing held, for the
+re-pin's snapshot. The record lock is an ``RLock`` since SPEC-081 FR-003, which changes no site.
 """
 
 from __future__ import annotations
@@ -128,6 +136,10 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_CloseRegistry.marked", "self._lock"): 1,
             ("_CloseRegistry.unmark", "self._lock"): 1,
             ("_pay_marks_after_stop", "_state._lock"): 1,
+            ("_repin_record", "_state._owned_lock"): 3,
+            ("_close_clock", "_state._owned_lock"): 1,
+            ("_settle_close", "_state._owned_lock"): 1,
+            ("_CloseRegistry.in_flight_ids", "self._lock"): 1,
         }
     ),
     "worker.py": collections.Counter(

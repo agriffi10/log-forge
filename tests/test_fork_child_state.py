@@ -153,7 +153,7 @@ def _probe(sink: FileSink) -> str:
     acquirable = lock.acquire(timeout=1)
     if acquirable:
         lock.release()
-    record = _lifecycle._state._owned.get(id(sink), (None,))[0]
+    record = getattr(_lifecycle._state._owned.get(id(sink)), "pid", None)
     owner = (
         "child"
         if record == os.getpid()
@@ -305,14 +305,14 @@ def test_a_child_does_not_close_an_inherited_proxy_sink(shape: str, path: str) -
         recorded = _lifecycle._state._owned.get(id(configured))
 
     def in_child() -> str:
-        record = _lifecycle._state._owned.get(id(configured), (None,))[0]
+        record = getattr(_lifecycle._state._owned.get(id(configured)), "pid", None)
         releasable = _lifecycle.releasable(configured)
         log_foundry.shutdown(3.0)
         return f"record={'parent' if record == parent else record} releasable={releasable} closes={target.closes}"
 
     child = run_in_child(in_child)
     assert child.output.endswith("releasable=False closes=0"), child.output
-    assert recorded is not None and recorded[0] == parent, (
+    assert recorded is not None and recorded.pid == parent, (
         "the parent recorded the sink it was handed"
     )
     assert child.output == "record=parent releasable=False closes=0", child.output
@@ -368,7 +368,7 @@ def test_a_child_records_a_live_proxy_sink_the_parent_never_stamped() -> None:
         assert id(configured) not in _lifecycle._state._owned, "the precondition: never stamped"
 
     def in_child() -> str:
-        record = _lifecycle._state._owned.get(id(configured), (None,))[0]
+        record = getattr(_lifecycle._state._owned.get(id(configured)), "pid", None)
         return f"record={record} releasable={_lifecycle.releasable(configured)}"
 
     child = run_in_child(in_child)
@@ -395,7 +395,7 @@ def test_a_file_sink_behind_super_is_repaired_in_the_child(tmp_path: pathlib.Pat
 
     def in_child() -> str:
         log_foundry.info("child")
-        record = _lifecycle._state._owned.get(id(inner), (None,))[0]
+        record = getattr(_lifecycle._state._owned.get(id(inner)), "pid", None)
         return f"returned record={'child' if record == os.getpid() else record}"
 
     try:

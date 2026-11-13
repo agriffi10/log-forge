@@ -260,9 +260,10 @@ class HTTPRecorder(HTTPSink):
     and the orphan path deliver to it through ``deliver``, as to any shipped family sink.
 
     **Its records are dropped when the test ends** (:meth:`forget`, from :func:`_forget_records`).
-    A sink handed to the library stays in ``_lifecycle._state._owned`` for the life of the process, and
-    a forked child's marking walk visits the objects that record reaches, up to a cap of 100,000. Sixteen seeds of decoded events kept here added about 140,000 objects to
-    that walk in the pytest worker that ran them, measured, enough to trip the cap in
+    A forked child's marking walk visits the objects the ownership record reaches from a live
+    entry, up to a cap of 100,000, and :attr:`live` keeps a recorder alive, so its entry with
+    it. Sixteen seeds of decoded events kept here added about 140,000 objects to that walk in
+    the pytest worker that ran them, measured before SPEC-081, enough to trip the cap in
     ``tests/test_fork_lifecycle.py`` when it ran later in the same worker.
     """
 
@@ -335,9 +336,9 @@ class HTTPRecorder(HTTPSink):
 def _forget_records() -> Any:
     """Clears every recorder's records once its test has asserted on them.
 
-    A recorder handed to the library stays in ``_lifecycle._state._owned`` for the life of the
-    process, and a later fork test's marking walk visits the objects that record reaches, up to
-    ``_MARKING_CEILING``. :class:`HTTPRecorder` measured that hazard; the sequential driver hands
+    A recorder handed to the library keeps an entry in ``_lifecycle._state._owned`` while it is
+    alive, and a later fork test's marking walk visits the objects a live, unclosed entry
+    reaches, up to ``_MARKING_CEILING``. :class:`HTTPRecorder` measured that hazard; the sequential driver hands
     the library a recorder per ``configure`` and per default resolution, so both kinds are cleared.
     """
     yield
