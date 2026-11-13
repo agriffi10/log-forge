@@ -751,6 +751,68 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "nothing (SPEC-054 FR-003). Filed by the `in_flight` token's over-match."
         ),
     ),
+    ("_CloseRegistry.defer_hand", "self._in_flight.get(id(sink))", 0): (
+        MOMENT,
+        (
+            "the close half of the moment, asked by the worker build during a stop: is a close of "
+            "this sink running, so the build marks it and hands nothing, and the close's "
+            "discharge pays the hand (fix after SPEC-079). One leaf acquisition for the check and "
+            "the mark, so no hand is lost between the build and the discharge."
+        ),
+    ),
+    ("_hand_after_close", "not _will_hand(sink)", 0): (
+        MOMENT,
+        (
+            "whether the discharge of a close pays the hand the build declined on it: the refresh "
+            "predicate through `_will_hand`, so the payment hands the current signal only where "
+            "nothing in flight relies on the one the sink holds."
+        ),
+    ),
+    ("_CloseRegistry.unmark", "self._in_flight.get(id(sink))", 0): (
+        MOMENT,
+        (
+            "the close half of the moment, asked when the last stop ends: is a close of the live "
+            "worker's sink still in flight with a mark on it, so the stop pays the hand and the "
+            "close's discharge, finding the mark gone, pays nothing."
+        ),
+    ),
+    ("_pay_marks_after_stop", "_state._stops_running or not _state._closes.marked()", 0): (
+        MOMENT,
+        (
+            "the lock-free gate before the stop-end payment: a stop still running, or no mark in "
+            "flight, means nothing to pay, and the pinned shutdown counts keep their numbers."
+        ),
+    ),
+    ("_pay_marks_after_stop", "_state.live_worker()", 0): (
+        LIVENESS,
+        (
+            "who delivers once the last stop has ended: only a live worker's sink is handed the "
+            "worker's signal there; a retired worker delivers nothing and needs none."
+        ),
+    ),
+    ("_pay_marks_after_stop", "worker is None", 0): (
+        LIVENESS,
+        "no live worker, so no deliverer to hand a signal for; the mark is left to the discharge.",
+    ),
+    ("_pay_marks_after_stop", "worker.sink", 0): (
+        LIVENESS,
+        "the sink the live worker delivers to, which is the one whose mark the stop may pay.",
+    ),
+    (
+        "_pay_marks_after_stop",
+        (
+            "worker._stop is not stop or stop.is_set() or (not worker.draining) "
+            "or handing_here(sink) or (not _state._closes.unmark(sink))"
+        ),
+        0,
+    ): (
+        MOMENT,
+        (
+            "the payment's terms: every one of _will_hand's but the close-in-flight refusal, which "
+            "no stop needs once none is running - the worker drains into the sink and holds the "
+            "current, unset signal, this thread is not handing it, and the mark is consumed here."
+        ),
+    ),
     ("_CloseRegistry.in_flight", "id(sink) in self._in_flight", 0): (
         MOMENT,
         (

@@ -41,6 +41,19 @@ its own entry (SPEC-078 FR-004). The wait sits at the head of each branch — be
 and as the first statement inside the no-worker branch's `try`, so an interrupt there still lowers
 `_shutdown_running`.
 
+**On the no-worker branch the decision is published before the stop-signal hand.** That branch's
+decision is whole when its first section ends — the stale sinks taken, the new sink armed, the
+signal chosen — and the hand after it runs the sink's own setter. Published only after the hand,
+a slow setter held a `shutdown()` on another thread for the whole grace: measured, a setter parked
+3 s made `shutdown(timeout=5)` take 2.00 s and write the not-decided line for a decision taken
+long before; published first, 0.00 s and no line. The shutdown may then close the new sink while
+its setter still runs, the window the stop-signal decision records under *What is left*; the
+setter stores the event that shutdown set. **The worker branch keeps the wait**: its retarget
+hands the new sink its signal before the decision arms it, so a slow setter there still holds a
+shutdown on another thread for the grace, measured at 2.00 s with the line. That is this
+decision's bound for somebody else's slow step, not a gap, because returning before the arm is
+the defect Part 2 exists to prevent.
+
 **Bounded by the call's one closer grace, and charged to it, not to the drain.** The wait ends at
 `now + closer_grace(op.deadline)`, so `shutdown(None)` cannot hang on a stuck swap. What it waited
 is recorded as `op.grace_spent`, and `_open_grace` fixes `grace_end` at
@@ -61,6 +74,26 @@ thread an undecided swap may be waiting on, so it would last the whole grace. Th
 `config._change_sink`'s `log-foundry-` prefix, so it also covers a closer thread, which is harmless
 rather than needed: a swap joins its closers only after it sets `decided`, and a decided swap is
 never in the snapshot.
+
+**A retirement after the retarget's reassign is a declined swap once the displaced sink is no
+longer owed.** A re-entrant `shutdown()` from the new sink's stop-signal setter, or a cross-thread
+one that retires the worker before the retarget's fence flush reads the count, makes that flush
+answer `retired` without trying. The verdict turns on the fact the unconfirmed-swap line reports:
+whether the displaced sink is still owed, read after that flush. Not owed, the retiring shutdown
+took it — a take happens only once nothing of the drain can be inside it, and the taker closes it
+— so `Worker.retarget` reports `declined`; it used to read `unfenced`, so `incomplete_swaps` went
+to 1 and a line said the displaced sink "could not be confirmed drained" and was "left open"
+though it had been closed. **Still owed, it stays `unfenced`**, line and count as before: a
+cross-thread shutdown waiting for this swap's decision has not taken it yet, and one that expired
+with the drain inside it left it open until a later `shutdown()` finds the thread ended, where the
+line is true. The owner's path is the same for both verdicts. A first rule keyed on the drain
+thread's liveness was wrong in a measured case: read after the setter returned, it found a thread
+that had left the displaced sink only after the retiring shutdown had expired, reported `declined`
+and wrote nothing, for a sink left owed and open. **A first drain that failed stays `unfenced`**
+too, deliberately, even when such a shutdown lands after the reassign: that drain really was
+unconfirmed, and the verdict reports it. Its line then still says the displaced sink is "left
+open", which is false if that shutdown already closed it; reading the record there too would bury
+the failed drain under the shutdown's verdict.
 
 **Rejected: holding `config._sink_lock` for the shutdown (v1).** The plan review built it: six
 shipped tests broke, and a backoff that the stop signal should cut short was held behind the lock
@@ -89,5 +122,12 @@ code.
 
 ### 2026-11-12
 
+- **Refined**: the no-worker swap sets `decided` before its stop-signal hand again, as this file
+  always stated; #341 had moved it after the hand, and a slow setter held a cross-thread
+  `shutdown()` for the grace. The worker branch's wait, unchanged, is recorded beside it.
+- **Refined**: a retarget whose fence flush finds the worker retired and the displaced sink no
+  longer owed reports `declined`, so a setter's `shutdown()` no longer counts `incomplete_swaps` or
+  writes the unfenced line; with the sink still owed, or after a failed first drain, it stays
+  `unfenced`. Keyed first on the drain thread's liveness, which a late-leaving thread fooled.
 - **Settled**, as a fix after SPEC-079. Supersedes SPEC-078's `STOP` row's `SWAPPING` cell ("drains
   and closes; the swap's retarget declines"), marked in that spec.

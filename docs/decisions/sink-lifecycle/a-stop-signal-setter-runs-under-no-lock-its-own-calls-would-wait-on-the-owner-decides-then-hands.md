@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A stop-signal setter runs under no lock its own calls would wait on: the owner decides, then hands"
-description: "the library never runs a sink's `log_foundry_stop_signal` setter, or the `hasattr` probe before it, under a lock a call from inside the setter would wait on: the owner decides under `_state._lock`, opens a hand token before the section publishes an arm, a refreshed `_stop` or a cleared debt (never otherwise), hands after releasing, and re-checks lock-free that the sink holds the current signal; the factory wrapper hands what it built after recording it, under no lock, and any thread finding the built sink pending hands it before use. Never hand inside a lifecycle critical section, never publish before the token, never open a token for a hand that published nothing. (fix after SPEC-079)"
+description: "the library never runs a sink's `log_foundry_stop_signal` setter, or the `hasattr` probe before it, under a lock a call from inside the setter would wait on: the owner decides under `_state._lock`, opens a hand token before the section publishes an arm, a refreshed `_stop` or a cleared debt, hands after releasing, and re-checks lock-free that the sink holds the current signal. One section publishes with no token: a worker build that, during a stop, defers its hand to a close of its sink in flight, since `_will_hand` refuses that sink to every thread a token would redirect. The factory wrapper hands what it built under no lock. Never hand inside a lifecycle critical section, never publish before the token but there, never open a token for a hand that published nothing. (fix after SPEC-079)"
 ---
 
 **A setter is the sink's own code, and the library ran it under its own locks.** The orphan log,
@@ -37,6 +37,13 @@ every owed sink while a token is open (invariant 6). **A section that publishes 
 token**: a token per hand made every log that met one hand again under a token of its own, and
 `tests/test_reentrant_stop_signal.py`'s concurrency case measured 2399 setter calls for 2400 logs
 that way, against 8 or 9 with tokens opened only on a publication.
+
+**One section publishes with no token: the worker build that defers its hand.** During a stop, a
+build whose sink has a close in flight marks that close instead of handing, and the close's
+discharge pays the hand (`docs/decisions/sink-lifecycle/a-hand-the-worker-build-declines-for-a-close-in-flight-is-paid-when-that-close-finishes.md`).
+That section still publishes the worker, the arm and a refreshed `_stop`, and opens no token,
+because every thread a token would send to the locked branch would meet `_will_hand`'s refusal of
+a sink whose close is in flight and hand it nothing there either. The cost is under *What is left*.
 
 **Two hands to one sink are settled by a lock-free re-check.** One thread decides `E`, a shutdown
 sets `E`, another refreshes to `F` and hands it, and the first thread's late hand would leave the
@@ -74,7 +81,8 @@ the one a shutdown sets.
 - The sweep builds its worker outside `_sweep_lock`, still before any detach.
 - The factory wrapper builds and records the sink as pending (since 2026-11-12 with no lock held
   across the factory call: *A sink factory runs under no lock…*), hands it outside the
-  lock, publishes it only after its hand, and re-reads its own signal after publishing; its
+  lock, publishes it only after its hand, and re-reads its own signal after publishing; any
+  thread that finds the built sink pending hands it the signal itself before using it; its
   `close()` releases a pending sink, and after its hand it re-arms itself if something closed it
   meanwhile, but only when the library owed it a close as the emit began: a wrapper held inside a
   caller's `MultiSink` is closed through that wrapper, and arming it too closed the built sink
@@ -113,7 +121,15 @@ own emit loses its event.
   still fail.
 - **A `shutdown()` whose close starts before a pending hand lands.** Its close runs against a sink
   that does not hold the signal yet, so a backoff the sink began before the hand landed is not cut
-  short. One begun after it is: the hand delivers the very event the shutdown set.
+  short. One begun after it is: the hand delivers the very event the shutdown set. Since the
+  no-worker swap publishes its decision before its hand, a `shutdown()` on another thread reaches
+  this window on purpose rather than waiting out the setter
+  (`docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md`).
+- **An orphan log between a deferred hand's discharge and its payment.** The discharge deletes the
+  close's entry before the payment's section reads the moment, and the deferred build opened no
+  token, so in that interval an orphan log on another thread takes the fast path (the sink is
+  owed, the signal is the late worker's and unset) and emits with the sink still on the
+  shutdown's set signal: any backoff in that one emit is not a wait.
 - **Concurrent setters.** A sink's setter can run on two threads at once, as duplicate hands of one
   signal; a sink tolerates concurrent callers already (SPEC-028), and the README says so.
 - **The factory wrapper's re-read cap.** A setter on the built sink that changes the wrapper's
@@ -124,6 +140,12 @@ own emit loses its event.
 
 ### 2026-11-12
 
-- **Settled**, as a fix after SPEC-079.
+- **Refined**: the fence now names the one section that publishes with no token, a worker build
+  that during a stop defers its hand to a close of its sink in flight, and why; the window it
+  leaves is under *What is left*, beside the no-worker swap's hand, which a cross-thread
+  `shutdown()` now meets by design. To fit the fence's length cap, its clause that any thread
+  finding the factory's built sink pending hands it before use moved to the body's factory bullet,
+  unchanged in meaning.
 - **Refined** the same day: the factory wrapper no longer holds its build lock across the factory
   call (*A sink factory runs under no lock, and a build that calls back releases its waiters*).
+- **Settled**, as a fix after SPEC-079.
