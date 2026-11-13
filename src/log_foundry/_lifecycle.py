@@ -1086,17 +1086,25 @@ class Runtime:
 
         Read by :func:`handing_here`, the one test of it, so a setter that logs, or builds the
         worker, on the thread already handing it that sink is not handed it again, which would
-        recurse. Per thread, so a forked child keeps the forking thread's entries, which that
-        thread's own ``finally`` removes. A ``threading.local`` rather than the ``contextvars``
-        ``python.md`` §13 prefers, because what it records is a call on this thread's stack: a hand
-        is synchronous and never crosses an ``await`` or a context copy, so the question is "is this
-        thread inside that call right now", not context propagation. A context variable would also
-        be inherited by a task or thread started from inside the setter, which is not inside the
-        hand. It also carries ``payment_owed``: a stop-end payment that found this thread handing
-        the very sink it would pay (:func:`_pay_marks_after_stop`), which :func:`handing` runs again
-        when the thread leaves a hand of a sink, until that sink's hand is over. A forked child
-        keeping the forking thread's flag pays nothing, since the child drops every in-flight entry
-        and its mark.
+        recurse. Per thread, so a forked child keeps the forking thread's entries. A child that
+        unwinds out of the hand removes them in that thread's own ``finally``; a child that leaves
+        through ``os._exit``, as a fork-context ``multiprocessing.Process`` started from a setter
+        does, keeps them for life, and that is deliberate (SPEC-083 FR-004). The mark is true: the
+        child's code runs from the setter's frame, so clearing it in the fork handler makes the
+        child's first log run the setter inside the setter call that forked. Measured at
+        ``53b68203`` with a setter holding its own ``threading.Lock`` across its body, the child
+        returned with the mark kept and hung on the sink's own lock with it cleared, and at
+        ``c21755f1`` the reset gave a child that unwinds a nested setter call it never had.
+        :attr:`_offering_here` is kept for the same reason. A ``threading.local`` rather than the
+        ``contextvars`` ``python.md`` §13 prefers, because what it records is a call on this
+        thread's stack: a hand is synchronous and never crosses an ``await`` or a context copy, so
+        the question is "is this thread inside that call right now", not context propagation. A
+        context variable would also be inherited by a task or thread started from inside the
+        setter, which is not inside the hand. It also carries ``payment_owed``: a stop-end payment
+        that found this thread handing the very sink it would pay (:func:`_pay_marks_after_stop`),
+        which :func:`handing` runs again when the thread leaves a hand of a sink, until that sink's
+        hand is over. A forked child keeping the forking thread's flag pays nothing, since the
+        child drops every in-flight entry and its mark.
         """
         self._offering_here = threading.local()
         """The stop signals this thread is offering a sink right now, as ``offers`` (SPEC-083).
@@ -1144,7 +1152,15 @@ class Runtime:
         (:func:`building`, :func:`yielding`). Per thread, for the reason :attr:`_handing_here`
         gives: what it records is a call on this thread's stack, the factory call, and a thread or
         task the factory starts is not inside it. A forked child keeps the forking thread's
-        entries, which that thread's own ``finally`` removes.
+        entries. A child that unwinds out of the factory removes them in that thread's own
+        ``finally``; a child that leaves through ``os._exit``, forked from inside a
+        ``sink_factory`` callable, keeps the factory build's entry for life, and that is harmless
+        (SPEC-083 FR-005; measured at ``53b68203``). The child's ``flush()`` and ``shutdown()``
+        each yield the parent's build, so its ``yielded`` count goes from 0 to 2, but nothing in
+        the child waits on that build. A wrapper the child reaches claims a new build over it,
+        because the claim's owner pid is the parent's. And with another parent thread holding the
+        old wrapper's ``_build_lock`` across the fork, the child reads that lock as unlocked,
+        because the fork repair replaced it, and its ``flush()`` returns ok.
         """
         self._marking_failed = False
         """Whether this child cannot tell what it inherited, so it trusts no unrecorded sink.

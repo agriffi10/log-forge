@@ -1011,7 +1011,7 @@ INVENTORY: dict[Key, Row] = {
     _rt("_handing_here"): Row(
         "Runtime",
         _INH,
-        "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
+        "the sinks this thread is handing a signal to; a child forked mid-hand keeps them",
     ),
     _rt("_offering_here"): Row(
         "Runtime",
@@ -1036,7 +1036,7 @@ INVENTORY: dict[Key, Row] = {
     _rt("_building_here"): Row(
         "Runtime",
         _INH,
-        "the factory builds this thread runs; a forking thread's own finally clears its",
+        "the factory builds this thread runs; a child forked mid-build keeps them, harmlessly",
     ),
     _wk("sink"): Row(
         "Worker",

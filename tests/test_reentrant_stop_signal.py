@@ -1622,7 +1622,7 @@ def test_a_build_with_no_stop_running_hands_at_once_during_a_close() -> None:
 
 
 def test_a_paid_hand_never_runs_a_setter_inside_itself() -> None:
-    """The payment asks ``handing_here`` like every decision, so a setter is never nested.
+    """The payment asks whether this thread is handing S, so a setter is never nested.
 
     S's setter, on its first hand, calls ``shutdown()``, which closes S inline on the same thread
     while that hand is still running; a ``@trace`` on another thread builds the late worker inside
