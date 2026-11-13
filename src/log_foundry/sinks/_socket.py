@@ -15,6 +15,7 @@ from log_foundry.sinks._classify import is_retryable
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, run_context
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import (
     exact_int,
     floor_count,
@@ -22,7 +23,6 @@ from log_foundry.sinks._retry import (
     require_timeout,
 )
 from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
-from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -389,7 +389,8 @@ class SocketTransport:
         with self._guard.enter() as section:
             if not section:
                 run_context().refuse(
-                    SinkDeliveryError(
+                    final_refusal(
+                        self,
                         f"SocketTransport delivered none of {len(batch)} message(s): "
                         f"the transport is closed"
                     )

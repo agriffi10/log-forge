@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from log_foundry import _diag, _lifecycle
 from log_foundry._sink_arg import require_sink
 from log_foundry.sinks._deferral import Deferral
+from log_foundry.sinks._refusal import is_final_refusal
 from log_foundry.sinks.base import SinkLosses, flush_sink, read_losses
 
 if TYPE_CHECKING:
@@ -118,6 +119,14 @@ class MultiSink:
         the diagnostic's detail rather than in the ``where``, because only the detail is bounded
         and a class name is a runtime value (SPEC-029 FR-002).
 
+        **A refusal no retry can cure is re-raised only when every child's raise was one.** The
+        worker abandons a batch at once when the error it catches is a shipped sink's final
+        refusal (:func:`~log_foundry.sinks._refusal.is_final_refusal`: closed, closing, or a
+        forked child that acquired nothing). Re-raising the first child's error unconditionally
+        would let one closed child stop the worker's resend for a sibling whose failure was
+        transient, so the first error that is **not** a final refusal is re-raised instead, and
+        the first child's only when all of them were final.
+
         Args:
           batch: The events to forward.
 
@@ -125,13 +134,15 @@ class MultiSink:
           None.
 
         Raises:
-          Exception: The first child's exception when every child failed, so the worker's
-            bounded retry sees the total loss (SPEC-017 FR-004). It is raised outside any
+          Exception: The first child's exception that is not a final refusal, or the first
+            child's when every one is, when every child failed, so the worker's bounded retry
+            sees the total loss (SPEC-017 FR-004). It is raised outside any
             ``except`` block, so ``__context__`` is untouched and it propagates by identity with
             its original traceback. An empty ``MultiSink`` stays a no-op rather than raising,
             which is what stops a misconfigured fan-out retrying every batch to exhaustion.
         """
         first_error: Exception | None = None
+        first_curable: Exception | None = None
         delivered = 0
         with Deferral(self) as pending:
             for sink in self._sinks:
@@ -143,13 +154,15 @@ class MultiSink:
                     pending.count("_absorbed", len(batch))
                     if first_error is None:
                         first_error = err
+                    if first_curable is None and not is_final_refusal(err, sink):
+                        first_curable = err
                     _diag.absorbed(
                         "emitting to a MultiSink child", err, f"{type(sink).__name__} skipped"
                     )
                 else:
                     delivered += 1
             if delivered == 0 and first_error is not None:
-                raise first_error
+                raise first_curable if first_curable is not None else first_error
 
     @property
     def log_foundry_stop_signal(self) -> threading.Event | None:

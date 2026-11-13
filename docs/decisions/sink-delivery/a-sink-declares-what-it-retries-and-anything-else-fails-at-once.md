@@ -112,7 +112,9 @@ SPEC-073 the worker calls the HTTP family's `deliver` instead of its `emit`, so 
 request is sent once and counted once (*The HTTP family delivers in rounds on the engine*); a
 third-party subclass not offered `deliver` keeps this resend. Since SPEC-074 the same holds for the
 SDK, driver and socket sinks: a refused event is sent once in total, and only a subclass that
-overrides `emit` keeps the resend, counted once per `emit` call.
+overrides `emit` keeps the resend, counted once per `emit` call. A closed, closing or forked-child
+shipped sink's refusal is not resent either, through `emit` or not: it carries a private mark the
+worker reads (*A refusal no retry can cure is marked, and the worker abandons it at once*).
 
 **Rejected: naming the transient classes in each `except` clause.** It cannot import a driver the
 caller has not installed, it gives SPEC-072's engine nothing to take as an argument, and it would
@@ -129,6 +131,12 @@ through `_exchange` inside an engine round, holds SQS and SNS to reading `Sender
 predicate resolves exists in the installed driver, so a rename cannot empty a set unnoticed.
 
 ## History
+
+### 2026-11-12
+
+- **Refined**: a shipped sink's closed, closing or forked-child refusal is marked final and the
+  worker does not resend it; the resend this entry describes stays for every other raise. Fence
+  unchanged.
 
 ### 2026-11-09
 

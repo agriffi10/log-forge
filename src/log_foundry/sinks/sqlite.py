@@ -15,7 +15,8 @@ from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
-from log_foundry.sinks.base import _ABSENT, SinkDeliveryError, SinkLosses, _static_value
+from log_foundry.sinks._refusal import final_refusal
+from log_foundry.sinks.base import _ABSENT, SinkLosses, _static_value
 
 __all__ = ["SQLiteSink"]
 
@@ -168,10 +169,10 @@ class SQLiteSink:
     depending on timing. So the child owns no connection: ``emit`` refuses with
     ``SinkDeliveryError`` before taking any lock, ``close`` returns having touched nothing, and the
     inherited connection is stranded at the fork rather than ever freed (``_strand_after_fork``).
-    This is ``NATSSink``'s answer to the same question (invariant 12), with one difference: this
-    sink has no ``deliver``, so the worker sees only a raised ``SinkDeliveryError`` and retries it
-    like any other failure before abandoning the batch, where ``NATSSink``'s ``REJECTED`` verdict
-    skips the retries. Nothing is lost twice, but a busy child's ``flush()`` takes longer. On Linux a child that wants
+    This is ``NATSSink``'s answer to the same question (invariant 12). This sink has no
+    ``deliver``, so where ``NATSSink`` answers ``REJECTED`` it raises, and the refusal is a final
+    one (``sinks/_refusal.py``): the worker abandons the batch at its first attempt, counted and
+    announced once, rather than resending it ``max_retries`` times. On Linux a child that wants
     a SQLite database of its own builds a sink of its own, with ``configure(sink_factory=...)``; on
     macOS that sink's fresh connection carries the same ``os_log`` hazard, which no sink can remove.
 
@@ -334,7 +335,9 @@ class SQLiteSink:
         if not batch:
             return
         if os.getpid() != self._pid:
-            raise SinkDeliveryError(f"SQLiteSink inserted none of {len(batch)} event(s): {_FORKED}")
+            raise final_refusal(
+                self, f"SQLiteSink inserted none of {len(batch)} event(s): {_FORKED}"
+            )
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
         with Deferral(self) as pending:
@@ -342,7 +345,8 @@ class SQLiteSink:
             try:
                 with self._guard.enter() as section:
                     if not section:
-                        raise SinkDeliveryError(
+                        raise final_refusal(
+                            self,
                             f"SQLiteSink inserted none of {len(batch)} event(s): "
                             "the sink is closed"
                         )

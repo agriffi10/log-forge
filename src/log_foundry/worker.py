@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal, cast
 from log_foundry import _diag, _lifecycle
 from log_foundry.results import FlushResult
 from log_foundry.sinks import _engine
+from log_foundry.sinks._refusal import is_final_refusal
 from log_foundry.sinks._retry import floor_count
 
 if TYPE_CHECKING:
@@ -1839,6 +1840,21 @@ class Worker:
         warning goes through ``_diag`` so a broken stderr cannot kill the thread and cost every
         batch after it (SPEC-029 FR-003).
 
+        **A refusal no retry can cure is abandoned at the attempt that raised it.** A shipped sink
+        that is closed or closing, or a forked child's ``SQLiteSink`` or ``NATSSink``, raises the
+        error :func:`~log_foundry.sinks._refusal.final_refusal` built, and resending it cannot
+        succeed: it only cost the batch ``max_retries`` backoff waits, measured at 17.3 s for a
+        forked child's ``flush()`` over 2000 ``@trace`` calls, 4 ``emit`` calls a batch, at
+        ``2ff9de9e`` (#342). Such a
+        batch moves ``failed_batches`` once and writes the abandoned line with the attempts it
+        actually made, as an exhausted batch does and as an engine sink's ``REJECTED`` run
+        already did. Any other exception, a third-party sink's ``SinkDeliveryError`` included,
+        keeps the 1.x resend, and so does a shipped sink's final refusal that reached the worker
+        through a sink of the caller's own, whether that sink re-raised it (its frame is in the
+        traceback) or only forwarded ``emit`` to the shipped sink (it is in the sink graph): the
+        mark is private and is honoured only for the package's own sinks, so the ``emit`` contract
+        for a sink of the caller's own is unchanged.
+
         ``max_retries`` is floored at zero so the loop always makes at least one attempt: a
         negative value otherwise skipped the emit entirely and discarded the batch with no
         attempt, no counter and nothing on stderr — reachable only by misconfiguration, but
@@ -1916,18 +1932,19 @@ class Worker:
                 return
             for attempt in range(retries + 1):
                 started = time.monotonic()
+                sink = self.sink
                 try:
-                    self.sink.emit(batch)
+                    sink.emit(batch)
                     return
-                except Exception:
+                except Exception as err:
                     longest = max(longest, time.monotonic() - started)
-                    if attempt >= retries:
+                    if attempt >= retries or is_final_refusal(err, sink):
                         with self._lock:
                             self.failed_batches += 1
                         _diag.lost(
                             "event",
                             len(batch),
-                            f"batch abandoned after {retries + 1} emit attempts",
+                            f"batch abandoned after {attempt + 1} emit attempts",
                         )
                         return
                 self._stop.wait(_engine.cycle_backoff(attempt))

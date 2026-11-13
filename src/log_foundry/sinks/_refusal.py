@@ -1,0 +1,124 @@
+"""A shipped sink's refusal that no retry can cure, marked so the worker does not resend it."""
+
+from __future__ import annotations
+
+from typing import Final
+
+from log_foundry._sink_arg import package_graph
+from log_foundry.sinks.base import SinkDeliveryError, _instance_dict
+
+__all__ = ["final_refusal", "is_final_refusal"]
+
+_MARK: Final = "_log_foundry_final_refusal"
+"""The instance attribute the mark is stored under, read back only by :func:`is_final_refusal`."""
+
+_REFUSER: Final = "_log_foundry_refuser"
+"""The instance attribute holding the ``id`` of the sink that refused, an ``int`` so the error pickles."""
+
+_PACKAGE: Final = "log_foundry"
+"""The package whose frames alone may carry a final refusal from its raise to its catcher."""
+
+
+def final_refusal(refuser: object, message: str) -> SinkDeliveryError:
+    """Builds the ``SinkDeliveryError`` a shipped sink raises for a batch no retry can deliver.
+
+    A closed or closing sink refuses every batch for the rest of its life (SPEC-032, SPEC-076),
+    and a forked child's ``SQLiteSink`` or ``NATSSink`` acquired nothing to deliver with
+    (invariant 12), so a resend cannot succeed and only costs the batch its backoff waits. The
+    worker re-sends a raised batch up to its ``max_retries``, which is the 1.x ``emit`` contract
+    for every sink and stays so for a third-party one; an error built here carries a private mark
+    the worker reads to abandon the batch at the attempt that raised it instead, counted and
+    announced as an exhausted batch is, provided only this package's code carried it there
+    (:func:`is_final_refusal`).
+
+    The error is exactly ``SinkDeliveryError``, with the message given and no other difference a
+    caller can see: ``type(err) is SinkDeliveryError``, ``str(err)`` and every diagnostic that
+    names its type are unchanged. The mark is an instance attribute, never a class, so nothing in
+    the public surface grows (invariant 10), and a sink of the caller's own cannot opt in by
+    accident.
+
+    The refusing sink is recorded by ``id``, never by reference, so the error still pickles and
+    keeps no sink alive; :func:`is_final_refusal` honours the mark only when that sink is one the
+    library itself forwarded the batch to.
+
+    Args:
+      refuser: The sink that refuses, ``self`` at every call site.
+      message: The refusal's text, which names a type and counts, never a value (invariant 11).
+
+    Returns:
+      The marked error, for the caller to raise or to hand to ``RunContext.refuse``.
+
+    Raises:
+      None.
+    """
+    err = SinkDeliveryError(message)
+    vars(err)[_MARK] = True
+    vars(err)[_REFUSER] = id(refuser)
+    return err
+
+
+def is_final_refusal(err: BaseException, sink: object) -> bool:
+    """Answers whether an exception is a final refusal that only the library's own code carried.
+
+    Three tests, all required. The error is exactly ``SinkDeliveryError`` carrying the mark
+    :func:`final_refusal` sets: a subclass is never one, which keeps SPEC-069's dual-typed driver
+    errors, a transient ``database is locked`` among them, on the worker's resend. And every frame
+    of its traceback below the catcher's own, the first entry, down to the raise, belongs to a
+    module of this package: a sink of the caller's own that catches a shipped sink's refusal and
+    re-raises it by identity puts its own frame in that chain, so the batch keeps the 1.x resend,
+    which that sink may have arranged to succeed (swapping in a fresh sink before it re-raised,
+    say), and so does a subclass whose ``emit`` override calls ``super().emit``. The catcher's own
+    frame is skipped because it is the one asking, the worker or ``MultiSink``. Measured on the
+    shipped paths, the chain holds only the catcher's frame and this package's, with no
+    ``contextlib`` frame for the closed guard's ``with``: a direct closed sink, and one behind
+    ``MultiSink`` or ``TransformSink``. An error never raised has no traceback and passes.
+
+    **And the sink that refused is one the library forwarded the batch to**
+    (:func:`~log_foundry._sink_arg.package_graph`): the graph the catcher called is the package's
+    own all the way down, and it holds the refuser. The traceback alone cannot see a sink of the
+    caller's own that chooses where ``emit`` goes and returns before the call, leaving no frame —
+    a ``__getattr__`` proxy, a rebound ``self.emit``, a property, a ``CallbackSink`` callable that
+    dispatches through one — and measured on each, 1.x's resend reached the fresh sink the caller
+    had swapped in. A refuser the library did not forward to is never in the graph, whatever
+    routed the call to it. The traceback half stays for a caller's code that runs during the call
+    and re-raises a refusal it caught from a sink inside the graph.
+
+    Total, and it runs no caller code. The exact-type test runs first and cannot raise, so an
+    exception of any other class is never read further. An exact ``SinkDeliveryError`` can still
+    carry a caller's ``__dict__`` subclass, and a frame a caller's ``f_globals`` subclass (a
+    function built with ``types.FunctionType(code, globals)``), whose overridden ``get`` once
+    escaped the worker and stopped it for good; so both are read through the builtin
+    ``dict.get``, unbound, a frame's ``__name__`` is compared only when exactly a ``str``, and the
+    whole reading sits inside a ``try`` that answers False, which costs only the 1.x resend.
+
+    Args:
+      err: The exception a sink's ``emit`` raised, as its catcher holds it.
+      sink: The sink whose ``emit`` the catcher called.
+
+    Returns:
+      True only for an exact marked ``SinkDeliveryError`` raised and carried by this package, by
+      a sink in a graph that is the package's own and that the catcher called.
+
+    Raises:
+      None.
+    """
+    if type(err) is not SinkDeliveryError:
+        return False
+    try:
+        own = _instance_dict(err)
+        if own is None or dict.get(own, _MARK) is not True:
+            return False
+        caught = err.__traceback__
+        frame = None if caught is None else caught.tb_next
+        while frame is not None:
+            module = dict.get(frame.tb_frame.f_globals, "__name__")
+            if type(module) is not str or not (
+                module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
+            ):
+                return False
+            frame = frame.tb_next
+        refuser = dict.get(own, _REFUSER)
+        graph = package_graph(sink)
+        return graph is not None and type(refuser) is int and refuser in graph
+    except Exception:
+        return False

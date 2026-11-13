@@ -12,6 +12,7 @@ from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -295,7 +296,8 @@ class KafkaSink:
         accepted = 0
         with self._guard.enter() as section:
             if not section:
-                raise SinkDeliveryError(
+                raise final_refusal(
+                    self,
                     f"KafkaSink produced none of {len(batch)} message(s): the sink is closed"
                 )
             with Deferral(self) as pending:
@@ -425,7 +427,7 @@ class KafkaSink:
         """
         with self._guard.enter() as section:
             if not section:
-                raise SinkDeliveryError("KafkaSink cannot flush: the sink is closed")
+                raise final_refusal(self, "KafkaSink cannot flush: the sink is closed")
             remaining = self.producer.flush(self.flush_timeout)
         if type(remaining) is int and remaining > 0:
             raise SinkDeliveryError(

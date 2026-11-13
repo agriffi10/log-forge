@@ -17,9 +17,9 @@ from log_foundry.sinks._encode import encode_round, encoded_landed, repair_bson
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_timeout
 from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
-from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -407,7 +407,8 @@ class MongoDBSink:
         with self._guard.enter() as section:
             if not section:
                 run_context().refuse(
-                    SinkDeliveryError(
+                    final_refusal(
+                        self,
                         f"MongoDBSink inserted none of {len(batch)} document(s): "
                         "the sink is closed"
                     )
