@@ -1,21 +1,25 @@
 """No discharge of a close under ``_state._lock`` can owe a deferred stop-signal hand.
 
-A worker build that meets a close of its sink in flight during a stop marks the close's entry
-instead of handing the sink its signal (``_CloseRegistry.defer_hand``), and whoever discharges
-the entry pays the hand through ``_lifecycle._hand_after_close`` — which takes ``_state._lock``.
-A discharge that runs with that lock held and finds the mark would therefore deadlock the
-thread on its own lock, or, if it skipped the payment, leave the late worker delivering into a
-sink on the shutdown's set signal. That cannot happen today only because of a **shape**: every
-release made under the lock discharges an entry it took in the same critical section, and the
-mark is written only in ``_get_worker``'s section under the same lock, so nothing can mark it in
-between; and the one discharge under the lock that can meet a mark, ``put_back``, reports it and
-lets ``_close_owed`` pay after releasing the lock. This file holds that shape over the source.
+A worker build, or a retarget's hand of the worker's new sink, that meets a close of that sink in
+flight during a stop marks the close's entry instead of handing the sink its signal
+(``_CloseRegistry.defer_hand``), and whoever discharges the entry pays the hand through
+``_lifecycle._hand_after_close`` — which takes ``_state._lock``. A discharge that runs with that
+lock held and finds the mark would therefore deadlock the thread on its own lock, or, if it skipped
+the payment, leave the late worker delivering into a sink on the shutdown's set signal. That cannot
+happen today only because of a **shape**: every release made under the lock discharges an entry it
+took in the same critical section, and the mark is written only in ``_get_worker``'s and
+``_hand_retargeted``'s sections under the same lock, so nothing can mark it in between; and the one
+discharge under the lock that can meet a mark, ``put_back``, reports it and lets ``_close_owed`` pay
+after releasing the lock. This file holds that shape over the source.
 
-Five checks, each a reason a finding names, and a roster of the sites the real module has, so a
+Six checks, each a reason a finding names, and a roster of the sites the real module has, so a
 rename or a lost ``with`` detection cannot make the audit pass by finding nothing. Four hold the
-discharges under the lock; the fifth holds the premise they rest on, that every
-``defer_hand`` call sits inside a ``with _state._lock:`` body. The corpus at the bottom asserts
-each check's reason on a case written to trip it, and silence on the shapes that must pass.
+discharges under the lock; the fifth holds the premise they rest on, that every ``defer_hand`` call
+sits inside a ``with _state._lock:`` body. The payment check covers every payer (:data:`PAYERS`): a
+close's discharge, the last stop's end, and a writer paying a mark the stop's end missed; and a
+sixth holds that set to names the module defines, so a payer renamed there cannot leave the payment
+check matching nothing. The corpus at the bottom asserts each check's reason on a case written to
+trip it, and silence on the shapes that must pass.
 
 **The scan is lexical.** It sees a call written inside a ``with _state._lock:`` body of the
 function that holds the lock, and nothing else: a discharge reached through a helper that a
@@ -40,6 +44,14 @@ RELEASE_NOT_TAKEN = "a release under the state lock discharges an entry it did n
 FINISH_NOT_TAKEN = "a finish under the state lock discharges an entry it did not take there"
 PUT_BACK_DISCARDED = "a put_back under the state lock discards the deferred hand it reports"
 PAID_UNDER_LOCK = "a deferred hand is paid under the state lock, which the payment takes itself"
+
+PAYERS = frozenset({"_hand_after_close", "_pay_marks_after_stop", "_pay_a_mark_the_stop_missed"})
+"""Every function that pays a deferred hand, each taking ``_state._lock`` itself to decide it.
+
+``_hand_after_close`` pays at a close's discharge, ``_pay_marks_after_stop`` at the last stop's
+end, and ``_pay_a_mark_the_stop_missed`` is a writer's own payment of a mark it made after that end
+looked; a call to any of them under the lock would wait on the lock its own thread holds.
+"""
 MARKED_OUTSIDE_LOCK = (
     "a hand is deferred outside the state lock, so a locked discharge could meet it"
 )
@@ -48,14 +60,16 @@ LOCK_HELD_SITES = {
     ("_swap_sink", "release"): 2,
     ("_close_owed", "put_back"): 1,
     ("_get_worker", "defer_hand"): 1,
+    ("_hand_retargeted", "defer_hand"): 1,
 }
 """Every discharge made under ``_state._lock`` in ``_lifecycle.py``, and every mark, by function.
 
-``_swap_sink`` releases a stale sink and its displaced one detached, each taken in the same
-section; ``_close_owed`` puts back what an interrupt left untaken; ``_get_worker`` marks a close in
-flight, the one writer of the mark. The ``defer_hand`` row counts every call, under the lock or
-not, so moving the call is a roster change as well as a finding. A new site is a new row, after
-the reasoning in this module's docstring has been checked for it.
+``_swap_sink`` releases a stale sink and its displaced one detached, each taken in the same section;
+``_close_owed`` puts back what an interrupt left untaken; ``_get_worker`` and ``_hand_retargeted``
+mark a close in flight, the two writers of the mark — a worker build, and the hand
+``Worker.retarget`` makes of its new sink. The ``defer_hand`` rows count every call, under the lock
+or not, so moving a call is a roster change as well as a finding. A new site is a new row, after the
+reasoning in this module's docstring has been checked for it.
 """
 
 
@@ -174,7 +188,7 @@ def audit(source: str) -> tuple[list[str], dict[tuple[str, str], int]]:
             elif name == "put_back":
                 if isinstance(parent, ast.Expr):
                     findings.append(f"{function}: {PUT_BACK_DISCARDED}")
-            elif name == "_hand_after_close":
+            elif name in PAYERS:
                 findings.append(f"{function}: {PAID_UNDER_LOCK}")
     for function, call in _defer_calls(tree):
         sites[(function, "defer_hand")] = sites.get((function, "defer_hand"), 0) + 1
@@ -254,6 +268,15 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
         """,
         [f"site: {PAID_UNDER_LOCK}"],
     ),
+    "a-stop-end-payment-under-the-lock": (
+        """
+        with _state._lock:
+            deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
+            _pay_a_mark_the_stop_missed()
+            _pay_marks_after_stop()
+        """,
+        [f"site: {PAID_UNDER_LOCK}", f"site: {PAID_UNDER_LOCK}"],
+    ),
     "the-shipped-shapes-pass": (
         """
         with _state._lock:
@@ -267,6 +290,11 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
         for sink in owed:
             _hand_after_close(sink)
         release(sink, closing=close)
+        with _state._lock:
+            deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
+        if deferred:
+            _pay_a_mark_the_stop_missed()
+        _pay_marks_after_stop()
         """,
         [],
     ),
@@ -327,3 +355,59 @@ def test_the_audit_names_the_reason_or_stays_silent(case: str) -> None:
     body, expected = CORPUS[case]
     findings, _ = audit(_wrap(body))
     assert findings == expected, findings
+
+
+def missing_payers(source: str) -> list[str]:
+    """Every name in :data:`PAYERS` that is not a module-level function defined in ``source``."""
+    defined = {
+        node.name
+        for node in ast.parse(textwrap.dedent(source)).body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    return sorted(PAYERS - defined)
+
+
+PAYER_CORPUS: dict[str, tuple[str, list[str]]] = {
+    "every-payer-defined": (
+        """
+        def _hand_after_close(sink): ...
+        def _pay_marks_after_stop(): ...
+        def _pay_a_mark_the_stop_missed(): ...
+        """,
+        [],
+    ),
+    "a-payer-renamed": (
+        """
+        def _hand_after_close(sink): ...
+        def _pay_marks_once_stopped(): ...
+        def _pay_a_mark_the_stop_missed(): ...
+        """,
+        ["_pay_marks_after_stop"],
+    ),
+    "a-payer-only-as-a-method": (
+        """
+        def _hand_after_close(sink): ...
+        def _pay_marks_after_stop(): ...
+        class Holder:
+            def _pay_a_mark_the_stop_missed(self): ...
+        """,
+        ["_pay_a_mark_the_stop_missed"],
+    ),
+}
+"""Each source and the payers it must report missing: one renamed away, or none."""
+
+
+def test_every_payer_is_a_function_the_module_defines() -> None:
+    """A payer renamed in ``_lifecycle.py`` fails here, rather than leaving the payment check quiet.
+
+    :data:`PAYERS` is a hand list of names the payment check matches calls against, so a payer
+    renamed in the module would simply stop matching and the check would go silent.
+    """
+    assert missing_payers(_SOURCE.read_text()) == []
+
+
+@pytest.mark.parametrize("case", list(PAYER_CORPUS))
+def test_the_payer_check_names_what_is_missing_or_stays_silent(case: str) -> None:
+    """The payer check reports a renamed payer by name, and nothing when every payer is defined."""
+    source, expected = PAYER_CORPUS[case]
+    assert missing_payers(source) == expected

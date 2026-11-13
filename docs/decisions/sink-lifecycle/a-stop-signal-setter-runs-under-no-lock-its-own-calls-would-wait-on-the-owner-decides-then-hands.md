@@ -20,8 +20,8 @@ probe in `offer_stop_signal` runs a property getter or `__getattr__`, so it is s
 leaves the lock with the assignment.
 
 **Each path decides under the lock and hands after it.** `_will_hand` and `_owed_candidates`
-choose the sinks, the section refreshes `_stop` and arms as before, and `_hand_out` runs with no
-lifecycle lock held. The no-worker swap's hand and `Worker.retarget`'s still run inside
+choose the sinks, the section refreshes `_stop` (since 2026-11-13, not while a stop has a take
+ahead) and arms as before, and `_hand_out` runs with no lifecycle lock held. The no-worker swap's hand and `Worker.retarget`'s still run inside
 `config._sink_lock`, so a setter's `configure()` there is re-entrant: it tries that lock once,
 swaps unconfirmed and announces it, which the public-api decision on concurrent sink changes
 records. Arming stays in the same section as before, so the swap's stale releases, the
@@ -66,6 +66,12 @@ its close — measured, `shutdown(timeout=2)` took 8.00 s against the sink's 8 s
 `flush()` refreshes it, since the fast path declines on a set signal. So a late hand never
 delivers an unset event into a shutdown's close (SPEC-044 FR-003): every event a hand delivers is
 the one a shutdown sets.
+
+> **Refined 2026-11-13** (fix after SPEC-079): the deciding sections did refresh between a stop
+> setting the signal and its take, so the log or `flush()` above handed an unset event into that
+> take's close. They now hand the current signal while a take is ahead, and refresh only after it;
+> one case remains, a late worker's build publishing its own unset signal. See
+> `docs/decisions/sink-lifecycle/a-hand-while-a-stop-has-a-take-ahead-hands-the-current-signal-and-never-refreshes-it.md`.
 
 **The rest of the shape.**
 

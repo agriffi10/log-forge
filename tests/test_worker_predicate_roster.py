@@ -826,17 +826,16 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_pay_marks_after_stop",
-        (
-            "worker._stop is not stop or stop.is_set() or (not worker.draining) "
-            "or handing_here(sink) or (not _state._closes.unmark(sink))"
-        ),
+        "worker._stop is not stop or stop.is_set() or (not worker.draining)",
         0,
     ): (
         MOMENT,
         (
-            "the payment's terms: every one of _will_hand's but the close-in-flight refusal, which "
-            "no stop needs once none is running - the worker drains into the sink and holds the "
-            "current, unset signal, this thread is not handing it, and the mark is consumed here."
+            "the payment's worker terms: every one of _will_hand's but the close-in-flight "
+            "refusal, which no stop needs once none is running - the worker drains into the sink "
+            "and holds the current, unset signal. The this-thread term follows on its own: a "
+            "payment reached inside a hand of this very sink is owed to that hand's exit rather "
+            "than refused, and the mark is consumed only after it."
         ),
     ),
     ("_CloseRegistry.in_flight", "id(sink) in self._in_flight", 0): (

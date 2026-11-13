@@ -386,6 +386,9 @@ def configure(
       TypeError: If ``service``, ``version`` or ``env`` is not a ``str`` (SPEC-055 FR-001), a
         ceiling is not an ``int`` (SPEC-065 FR-001), ``sink`` is a value that can never be a sink,
         or ``sink_factory`` is not callable with no arguments (SPEC-079 FR-005).
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` raised by a sink's own
+        ``log_foundry_stop_signal`` setter while the sink change hands it a stop signal. The
+        setter is the sink's code, and an ``Exception`` from it is absorbed and announced.
     """
     if sink is not None and sink_factory is not None:
         raise ValueError("configure() takes sink or sink_factory, not both")
@@ -472,7 +475,9 @@ def _change_sink(
       None.
 
     Raises:
-      None.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from a sink's own
+        ``log_foundry_stop_signal`` setter while the swap hands it a stop signal
+        (``_lifecycle._swap_sink``); an ``Exception`` from it is absorbed.
     """
     global _sink_holder
     from log_foundry.worker import DEFAULT_SWAP_TIMEOUT
@@ -555,7 +560,9 @@ def _swap_live_sink(sink: Sink, timeout: float | None) -> None:
       None.
 
     Raises:
-      None.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from a sink's own
+        ``log_foundry_stop_signal`` setter while the swap hands it a stop signal
+        (``_lifecycle._swap_sink``); an ``Exception`` from it is absorbed.
     """
     from log_foundry._lifecycle import _swap_sink
 

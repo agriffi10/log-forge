@@ -332,7 +332,8 @@ SPEC-030, updating `get_config().sink` while every event continued to the sink c
    that destination and are not carried over;
 2. reassigns the worker's sink, which keeps the queue, the drain thread, the counters and the
    `atexit` registration intact (rebuilding the worker would drop what was queued and register a
-   second drain), and hands the new sink the worker's stop signal (§9, SPEC-027);
+   second drain), and hands the new sink the worker's stop signal (§9, SPEC-027) — or, while a
+   `shutdown()` is closing that sink, once that close is over (`docs/decisions/sink-lifecycle/`);
 3. drains once more — a fence, not a delivery: it proves the drain thread is not still inside the
    old sink's `emit`, the one way `close()` could be called under a writer (SPEC-028);
 4. closes the previous sink.

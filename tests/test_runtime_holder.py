@@ -140,6 +140,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_close_clock", "_state._owned_lock"): 1,
             ("_settle_close", "_state._owned_lock"): 1,
             ("_CloseRegistry.in_flight_ids", "self._lock"): 1,
+            ("_hand_retargeted", "_state._lock"): 1,
         }
     ),
     "worker.py": collections.Counter(
