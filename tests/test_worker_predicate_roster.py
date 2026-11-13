@@ -828,7 +828,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         "_pay_marks_after_stop",
         (
             "worker._stop is not stop or stop.is_set() or (not worker.draining) "
-            "or handing_here(sink) or (not _state._closes.unmark(sink))"
+            "or (not _state._closes.unmark(sink))"
         ),
         0,
     ): (
@@ -836,7 +836,8 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         (
             "the payment's terms: every one of _will_hand's but the close-in-flight refusal, which "
             "no stop needs once none is running - the worker drains into the sink and holds the "
-            "current, unset signal, this thread is not handing it, and the mark is consumed here."
+            "current, unset signal, and the mark is consumed here. This thread is handing nothing, "
+            "since a payment reached inside a hand is deferred to that thread's last hand's exit."
         ),
     ),
     ("_CloseRegistry.in_flight", "id(sink) in self._in_flight", 0): (

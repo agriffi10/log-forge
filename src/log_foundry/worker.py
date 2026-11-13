@@ -1095,7 +1095,10 @@ class Worker:
           What it did, and the sink it displaced.
 
         Raises:
-          None.
+          BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from the new sink's own
+            ``log_foundry_stop_signal`` setter, while it is handed this worker's signal or while a
+            mark that hand made is paid (``_lifecycle._hand_retargeted``);
+            ``_lifecycle.offer_stop_signal`` absorbs an ``Exception`` from it.
         """
         with self._lock:
             if _lifecycle_state.retirements > self._epoch:

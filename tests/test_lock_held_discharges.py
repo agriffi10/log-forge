@@ -12,13 +12,14 @@ took in the same critical section, and the mark is written only in ``_get_worker
 discharge under the lock that can meet a mark, ``put_back``, reports it and lets ``_close_owed`` pay
 after releasing the lock. This file holds that shape over the source.
 
-Five checks, each a reason a finding names, and a roster of the sites the real module has, so a
+Six checks, each a reason a finding names, and a roster of the sites the real module has, so a
 rename or a lost ``with`` detection cannot make the audit pass by finding nothing. Four hold the
 discharges under the lock; the fifth holds the premise they rest on, that every ``defer_hand`` call
 sits inside a ``with _state._lock:`` body. The payment check covers every payer (:data:`PAYERS`): a
-close's discharge, the last stop's end, and a writer paying a mark the stop's end missed. The corpus
-at the bottom asserts each check's reason on a case written to trip it, and silence on the shapes
-that must pass.
+close's discharge, the last stop's end, and a writer paying a mark the stop's end missed; and a
+sixth holds that set to names the module defines, so a payer renamed there cannot leave the payment
+check matching nothing. The corpus at the bottom asserts each check's reason on a case written to
+trip it, and silence on the shapes that must pass.
 
 **The scan is lexical.** It sees a call written inside a ``with _state._lock:`` body of the
 function that holds the lock, and nothing else: a discharge reached through a helper that a
@@ -354,3 +355,59 @@ def test_the_audit_names_the_reason_or_stays_silent(case: str) -> None:
     body, expected = CORPUS[case]
     findings, _ = audit(_wrap(body))
     assert findings == expected, findings
+
+
+def missing_payers(source: str) -> list[str]:
+    """Every name in :data:`PAYERS` that is not a module-level function defined in ``source``."""
+    defined = {
+        node.name
+        for node in ast.parse(textwrap.dedent(source)).body
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    return sorted(PAYERS - defined)
+
+
+PAYER_CORPUS: dict[str, tuple[str, list[str]]] = {
+    "every-payer-defined": (
+        """
+        def _hand_after_close(sink): ...
+        def _pay_marks_after_stop(): ...
+        def _pay_a_mark_the_stop_missed(): ...
+        """,
+        [],
+    ),
+    "a-payer-renamed": (
+        """
+        def _hand_after_close(sink): ...
+        def _pay_marks_once_stopped(): ...
+        def _pay_a_mark_the_stop_missed(): ...
+        """,
+        ["_pay_marks_after_stop"],
+    ),
+    "a-payer-only-as-a-method": (
+        """
+        def _hand_after_close(sink): ...
+        def _pay_marks_after_stop(): ...
+        class Holder:
+            def _pay_a_mark_the_stop_missed(self): ...
+        """,
+        ["_pay_a_mark_the_stop_missed"],
+    ),
+}
+"""Each source and the payers it must report missing: one renamed away, or none."""
+
+
+def test_every_payer_is_a_function_the_module_defines() -> None:
+    """A payer renamed in ``_lifecycle.py`` fails here, rather than leaving the payment check quiet.
+
+    :data:`PAYERS` is a hand list of names the payment check matches calls against, so a payer
+    renamed in the module would simply stop matching and the check would go silent.
+    """
+    assert missing_payers(_SOURCE.read_text()) == []
+
+
+@pytest.mark.parametrize("case", list(PAYER_CORPUS))
+def test_the_payer_check_names_what_is_missing_or_stays_silent(case: str) -> None:
+    """The payer check reports a renamed payer by name, and nothing when every payer is defined."""
+    source, expected = PAYER_CORPUS[case]
+    assert missing_payers(source) == expected

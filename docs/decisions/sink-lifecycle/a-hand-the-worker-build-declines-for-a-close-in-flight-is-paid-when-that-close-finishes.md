@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A hand the worker build or a retarget declines for a close in flight is paid when that close finishes"
-description: "while a stop is running, a worker build whose sink has a close in flight, or a `Worker.retarget` onto such a sink (`_hand_retargeted`), hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it; a mark whose close outlives the stop is paid by the last stop out (`_pay_marks_after_stop`), or by its writer when it lands after that stop's end looked (`_pay_a_mark_the_stop_missed`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
+description: "while a stop is running, a worker build whose sink has a close in flight, or a `Worker.retarget` onto such a sink (`_hand_retargeted`), hands it no stop signal and marks that close (`_CloseRegistry.defer_hand`); the entry's discharge hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`; `put_back` pays after releasing `_state._lock`); a mark whose close outlives the stop is paid by the last stop out or, landing after that stop looked, by its writer (`_pay_marks_after_stop`), and a payment reached inside a stop-signal hand runs when its thread leaves its last hand (`handing`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
 ---
 
 **The defect.** A no-worker `shutdown()` sets the stop signal and closes the configured sink; a
@@ -90,8 +90,8 @@ run by `_shutdown_worker` after it discards its token): finding no stop left und
 that sink the worker's own signal with no lock held. It skips only `_will_hand`'s refusal of a sink
 whose close is in flight — no stop awaits that close any more, which is the moment the build
 handed it before this fix — and keeps every other term: the worker live and draining into the
-sink, its `_stop` the current signal and unset, this thread not already handing the sink. It never
-refreshes. The mark is consumed once under the registry's leaf, so of two stops finishing together
+sink, its `_stop` the current signal and unset; and it never runs inside a stop-signal hand on its
+own thread (below). It never refreshes. The mark is consumed once under the registry's leaf, so of two stops finishing together
 only one hands, and the close's own discharge, finding no mark, pays nothing. A `shutdown()` that
 left no mark asks a lock-free read and one leaf acquisition (`_CloseRegistry.marked`), so no pinned
 count of `_state._lock` moves. A fork during that hand leaves the child its own repair, as for any
@@ -118,6 +118,25 @@ unconditional, the whole suite stayed green), since `_pay_marks_after_stop` make
 first, so it was dropped. `tests/test_lock_held_discharges.py` counts both stop-end payers among
 the payments it refuses under `_state._lock`. The re-read takes no lock and the payment takes it
 only when a mark exists, so no pinned lock count moves.
+
+**A payment reached inside a stop-signal hand runs when that hand ends.** The stop-end payment
+declined while its thread was handing the sink (`handing_here`), so the setter would not run inside
+itself, and the hand already running declined too, because its settle refuses a sink whose close is
+in flight. Two routes reach that: a setter calls `shutdown()` and a build in that stop's tail, on
+the same thread, marks the sink's swap close, so the stop's own end runs inside the hand; or a build
+a setter runs marks after the last stop's end looked, so its writer's payment does. Either way
+nothing paid, and the live worker delivered into the sink on the stop's set signal until the close
+ended: in a forked child, a 0.3 s backoff waited 0.0 s with the mark still set, at `ab7f620d` and at
+`a8e91fac` alike, the stop's own route unforced and the writer's forced. Paying at once instead runs
+the setter nested inside itself. So `_pay_marks_after_stop`, finding a mark while its thread is
+inside any hand (`_mid_hand`), sets `payment_owed` on that thread and returns, and `handing()`'s
+exit runs it when the thread leaves its last hand, with no setter on its stack: every caller of
+`handing()` exits with no lifecycle lock held. The payment's `handing_here` term went with it, since
+it can no longer refuse. An ordinary hand pays one thread-local read at its last exit, and no pinned
+lock count moves. `test_a_stop_end_payment_inside_a_hand_is_paid_when_the_hand_ends` holds both
+routes, asserting the signal S holds, the mark gone, the backoff waiting 0.3 s, and that the hand
+came after the setter's own hand rather than inside it; never setting the flag, never paying at the
+exit, and paying at once with no deferral each redden it.
 
 **Rejected: declining without paying.** The late worker then delivers into a sink still on the
 shutdown's set signal, so any backoff of the sink's own collapses to nothing — SPEC-033 FR-004's
@@ -188,6 +207,9 @@ fence names this as its one tokenless publication.
 - **Refined** the same day, after the diff review: a writer that marks after the last stop's end
   looked for marks pays the mark itself (`_pay_a_mark_the_stop_missed`), closing a race the
   stop-end payment left open for both writers.
+- **Refined** again, after the second system-frame round: a stop-end payment reached inside a
+  stop-signal hand on its thread is owed to that thread and runs when it leaves its last hand
+  (`handing`), rather than declining with nothing left to pay it; the fence now says so.
 
 ### 2026-11-12
 
