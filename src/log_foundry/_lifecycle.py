@@ -3227,9 +3227,10 @@ def _hand_retargeted(sink: Sink, stop: threading.Event) -> None:
 
     **A swap with no stop running adds no acquisition of** ``_state._lock``: the stop tokens are
     read without it first, and re-read under it before marking. A stop entering just after the
-    lock-free read sets ``_state._stop``, which is this live worker's ``_stop``, so the hand made
-    here is of an event that stop sets; and that stop cannot take the sink before its worker
-    stop, since the worker now holds it. ``defer_hand`` is called inside the lock's section, the
+    lock-free read sets ``_state._stop``, which is this live worker's ``_stop`` unless the worker
+    was stopped directly (``Worker.stop``), whose ``_stop`` is then already set; so the hand made
+    here is of an event that is set or that stop sets, and that stop cannot take the sink before
+    its worker stop, since the worker now holds it. ``defer_hand`` is called inside the lock's section, the
     shape ``tests/test_lock_held_discharges.py`` requires of every mark.
 
     Called by ``Worker.retarget`` with no library lock held but ``config._sink_lock``, which a

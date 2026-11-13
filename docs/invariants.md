@@ -233,8 +233,12 @@ a bounded wait: at `624d817f` fifteen of its twenty rows hung the process.
 the drain thread: at `9f4d4dfd` two of its five rows hung and three stalled for their whole budget.
 `tests/test_reentrant_stop_signal.py` also holds a `shutdown()`'s close to the signal that shutdown
 set when a `@trace` builds the late worker inside it (`9f4d4dfd`: 4.00 s against a 4 s backoff
-under `shutdown(timeout=1)`), and `tests/test_lock_held_discharges.py` holds the shape that keeps
-the hand the build defers from being paid under the state lock.
+under `shutdown(timeout=1)`), and the same close when a `configure(sink=…)` retargets a worker onto
+the sink inside it (`a8e91fac`: 4.01 s); it holds the shutdown's take to that signal when an orphan
+log or a `flush()` lands between the stop setting the signal and the take
+(`test_a_hand_before_the_take_leaves_the_close_the_shutdowns_signal`, `a8e91fac`: 4.00 s to 4.01 s
+on all four of its rows), and `tests/test_lock_held_discharges.py` holds the shape that keeps the
+hand the build or the retarget defers from being paid under the state lock.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 

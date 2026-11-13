@@ -1,7 +1,7 @@
 ---
 type: Decision
-title: "A hand the worker build declines for a close in flight is paid when that close finishes"
-description: "while a stop is running, a worker build whose sink has a close in flight hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it; a mark whose close outlives the stop is paid by the last stop out (`_pay_marks_after_stop`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
+title: "A hand the worker build or a retarget declines for a close in flight is paid when that close finishes"
+description: "while a stop is running, a worker build whose sink has a close in flight, or a `Worker.retarget` onto such a sink (`_hand_retargeted`), hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it; a mark whose close outlives the stop is paid by the last stop out (`_pay_marks_after_stop`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
 ---
 
 **The defect.** A no-worker `shutdown()` sets the stop signal and closes the configured sink; a
@@ -49,11 +49,35 @@ on it.
 `tests/test_lock_held_discharges.py` holds the second and third bullets' shape over the source,
 with a fixture corpus naming each reason.
 
+**A retarget's hand declines and marks the same way.** `Worker.retarget` reassigns, then hands its
+new sink the worker's `_stop`, and that hand asked nothing about a close of the sink in flight. A
+swap during a `shutdown()` that moved a late or tail worker onto a sink the stop was closing handed
+that close the worker's unset event, and the close served its backoff: measured at `a8e91fac`, a
+no-worker `shutdown(timeout=1)` parked in its inline close of S, the late worker retargeted onto S
+by `configure(sink=S)`, took 4.01 s whether the worker was built on S and swapped away and back,
+or built on another sink and moved onto S. So `retarget` hands through `_hand_retargeted`, which,
+while a stop is running, takes `_state._lock` and asks `defer_hand(sink)`; if it marked, it hands
+nothing, and the mark is paid exactly as a build's is, by the close's discharge or by the last stop
+out. Measured with the fix: S's close waits on the stop's set signal (0.00 s), and the worker's
+event reaches S on the closing thread once the close is over. The gate is the whole stop, for the
+build's reason below: a tail worker retargeted onto S inside the second pass's inline close is
+deferred too, and gating on `_shutdown_running` instead let that hand into the close
+(`test_a_retarget_inside_a_stops_second_pass_close_keeps_that_close_short` reddens). A swap with no
+stop running reads the stop tokens without the lock and makes no added acquisition; a stop entering
+just after that read sets `_state._stop`, which is the live worker's own `_stop` unless that worker
+was stopped directly, when its `_stop` is already set; so the hand made then delivers an event that
+is set or that stop sets, and the stop cannot take the sink while the worker holds it.
+The mark has two writers now, both under `_state._lock`, so the shape above holds for both, and
+`tests/test_lock_held_discharges.py` rosters both. `_close_owed`'s `GRACED` start-failure exit,
+which no build could mark while a worker exists, can now be marked by a retarget; that release
+runs with no lock held, so it pays as the inline exit does.
+
 **Only during a stop, and paid at the stop's end if the close outlives it.** Outside a
 `shutdown()` a close in flight is a swap's or a wrapper's, which nothing will cut short with the
 signal, so the build hands at once, as it always did;
-`test_a_build_with_no_stop_running_hands_at_once_during_a_close` pins that boundary. The gate is
-the whole stop (`_state._stops_running`), not the window in which the build's worker is that
+`test_a_build_with_no_stop_running_hands_at_once_during_a_close` pins that boundary, and
+`test_a_retarget_with_no_stop_running_hands_at_once_during_a_close` pins it for the retarget. The
+gate is the whole stop (`_state._stops_running`), not the window in which the build's worker is that
 stop's late worker (`_shutdown_running`): a no-worker stop's second pass closes the sink inline
 after that count drops, and a build inside that close, handed at once, made the close serve its
 whole backoff — measured 4.92 s against 0.91 s. So a build in the stop's tail defers too, though
@@ -112,17 +136,32 @@ fence names this as its one tokenless publication.
   one in-flight call, and the setter is that call; the close-end payment already runs a setter
   inside the `shutdown()` that discharged the close, the same way. `test_reentrant_stop_signal.py`'s
   `stop-end` and `close-end` rows hold all five re-entrant calls to returning.
-- **`Worker.retarget`'s hand is the twin this does not cover.** A retarget hands its new sink the
-  worker's own `_stop` after the reassign, asking nothing about a close of that sink in flight; a
-  late worker built during a shutdown's close of S and retargeted back onto S while that close
-  still runs hands S the worker's unset signal, and the close serves its backoff — measured 4.01 s
-  at the base and on this fix alike. Older than this fix, and left to a session of its own.
-- **The orphan path's own window**, between a shutdown setting the signal and its take — an
-  `info()` there refreshes and hands an unset event the close then waits on, measured at 4.00 s, and
-  so does one between a late worker's stop and the second take — is older than this fix and not
-  closed by it.
+- ~~**`Worker.retarget`'s hand is the twin this does not cover.**~~ Covered since 2026-11-13: the
+  retarget defers through `_hand_retargeted`, above.
+- ~~**The orphan path's own window**, between a shutdown setting the signal and its take.~~ Closed
+  since 2026-11-13, with `flush()`'s twin of it: while a stop has a take ahead, those sections hand
+  the current signal and never refresh it
+  (`docs/decisions/sink-lifecycle/a-hand-while-a-stop-has-a-take-ahead-hands-the-current-signal-and-never-refreshes-it.md`).
+- **A late worker built during a no-worker stop's take-ahead makes the current signal unset.** Its
+  build publishes its own unset `_stop` as `_state._stop`, which that stop sets only at the late
+  worker's stop, after its first pass. So a hand of the current signal to another owed sink R before
+  the first pass takes R — a settle re-reading the signal, `flush()` under the build's token, and
+  this decision's payment alike — delivers an unset event that R's close then waits on. Measured
+  with a 4 s backoff by the plan reviewer's probes `late_build_settle` and `late_build_flush`: 4.00
+  s to 4.01 s at `a8e91fac` and with the 2026-11-13 fixes alike. It is a different source from the
+  two windows closed here — a build publishing a signal the pending take will not see set — and
+  the answer is structural (a stop's close not depending on the last event the sink was handed), so
+  it is left to a session of its own.
 
 ## History
+
+### 2026-11-13
+
+- **Refined**: the fence extends to `Worker.retarget`, whose hand of its new sink now defers into a
+  stop's close in flight through `_hand_retargeted` and is paid by the same discharge or stop-end
+  payment; measured at `a8e91fac` that hand held a `shutdown(timeout=1)` 4.01 s. *What is left*
+  loses the retarget twin and the orphan window, now closed (the latter by its own decision), and
+  gains the late-build case the plan review found, with its measurement.
 
 ### 2026-11-12
 
