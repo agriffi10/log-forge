@@ -462,6 +462,60 @@ def test_a_sink_that_received_an_event_is_closed_once_with_a_weak_record() -> No
     assert (first.closes, second.closes) == (1, 1)
 
 
+def test_a_library_driven_wrapper_close_re_pins_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-001's "where it runs": only the outermost performed release on a thread re-pins.
+
+    A ``MultiSink`` forwards a release for each child from inside its own ``close()``, and a re-pin
+    walks the live graph; measured with a 100k-event ``MemorySink`` live, re-pinning per child made
+    a 20-member shutdown take 112 ms against 5.5 ms re-pinning once (0.05 ms before SPEC-081).
+    """
+    children = [RecordingSink() for _ in range(20)]
+    log_foundry.configure(sink=MultiSink(*children))
+    log_foundry.info("owed to the wrapper")
+    calls: list[int] = []
+    original = _lifecycle._repin
+    monkeypatch.setattr(_lifecycle, "_repin", lambda: (calls.append(1), original())[1])
+    log_foundry.shutdown(3.0)
+    assert [child.closes for child in children] == [1] * 20
+    assert len(calls) == 1, f"the shutdown re-pinned {len(calls)} times"
+    assert all(entry_for(child).closed for child in children), "each child still settles"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("when", ["during-the-capture", "during-the-walk"])
+def test_a_sink_handed_over_while_a_repin_runs_stays_strong(
+    when: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-001's epoch guard: a stamp landing inside a re-pin is never demoted by it.
+
+    The sink is stamped, unheld, so the re-pin would demote it; a ``stamp`` of it lands between the
+    re-pin's epoch read and its demotion — inside the capture, after the sink was picked, or inside
+    the walk, before it was. The demotion's own epoch test is what saves the first; either test
+    saves the second.
+    """
+    sink = RecordingSink()
+    _lifecycle.stamp(sink)
+    if when == "during-the-capture":
+        original_capture = _lifecycle._capture
+
+        def capture_then_stamp(demoted: list[object]) -> tuple[list[object], int]:
+            if any(item is sink for item in demoted):
+                _lifecycle.stamp(sink)
+            return original_capture(demoted)
+
+        monkeypatch.setattr(_lifecycle, "_capture", capture_then_stamp)
+    else:
+        original_roots = _lifecycle._delivering_sinks
+
+        def roots_then_stamp() -> list[object]:
+            _lifecycle.stamp(sink)
+            return original_roots()
+
+        monkeypatch.setattr(_lifecycle, "_delivering_sinks", roots_then_stamp)
+    _lifecycle._repin()
+    entry = entry_for(sink)
+    assert entry is not None and entry.strong is sink, "a sink handed over again stays strong"
+
+
 # -- FR-002: before an entry is demoted, the sinks beneath it are captured ----------------------
 
 

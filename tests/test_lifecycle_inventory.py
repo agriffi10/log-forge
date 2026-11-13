@@ -1013,6 +1013,11 @@ INVENTORY: dict[Key, Row] = {
         _INH,
         "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
     ),
+    _rt("_releasing_here"): Row(
+        "Runtime",
+        _INH,
+        "how many performed releases this thread is inside; only the outermost re-pins (SPEC-081)",
+    ),
     _rt("_building_here"): Row(
         "Runtime",
         _INH,

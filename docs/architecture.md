@@ -2141,7 +2141,7 @@ and a third copy is a fork with no merge.
      sink only while the library holds it (SPEC-081), and a dead entry answers for nothing and is
      pruned, so the record follows the sinks still alive. What that leaves — a sink that cannot be
      weakly referenced, a sink the capture did not reach once its holder is gone, and the rest —
-     is the bounded record's eight residuals, the next item.
+     is the bounded record's nine residuals, the next item.
 
   What a refused close costs, measured from the shipped `close()` bodies: `KafkaSink` and
   `GooglePubSubSink` do not deliver their buffer, `NATSSink` does not drain its loop, and
@@ -2157,7 +2157,7 @@ and a third copy is a fork with no merge.
   bodies alone. Its own population sweep then found three more: `SentrySink`, `LoggingSink`, and
   the three wrapper sinks, which forwarded no flush at all.
 
-- **The bounded ownership record leaves eight residuals** (SPEC-081). The record pins a sink
+- **The bounded ownership record leaves nine residuals** (SPEC-081). The record pins a sink
   only while the library holds it, captures the sinks beneath one before it goes weak, reads a
   dead entry as absent, is pinned first in a child, and falls back to the heap when a child's
   marking trips. What that does not settle:
@@ -2215,6 +2215,11 @@ and a third copy is a fork with no merge.
      do the same to an inherited sink that was already unreachable cyclic garbage in the parent,
      before the pin reaches it. The repair is never wrapped in `gc.disable()` (the order-of-work
      decision), so this is stated, not closed.
+  9. **A re-pin costs a stamp walk of the live graph, and a wrapper the caller closes directly
+     re-pins once per child.** Only the outermost performed release on a thread re-pins, so a
+     wrapper the library closes re-pins once. Measured with a configured `MemorySink` holding
+     100k events: one re-pin about 5 ms, a 20-member `MultiSink` shutdown 5.5 ms (0.05 ms before
+     SPEC-081), and the same wrapper closed by the caller about 99 ms.
 
 - **A sink shared across a fork is shared, and both processes act on it** (SPEC-039 FR-005
   AC-1). Beyond the buffer discard the library neither clones nor re-opens the inherited sink,

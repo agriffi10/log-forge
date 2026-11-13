@@ -5,7 +5,8 @@
 - **A bounded record** (FR-001 to FR-003), in `_lifecycle.py`. Each `Runtime._owned` entry is an
   `_Entry` that holds its sink strongly only while the library still holds it, and weakly after a
   performed close or a supersession. `_repin` runs on every exit of `_swap_sink` and after every
-  close `release` performs, and never raises. Before it demotes an entry, `_capture` records the
+  close `release` performs that is not nested inside another on its thread (a thread-local depth,
+  `Runtime._releasing_here`), and never raises. Before it demotes an entry, `_capture` records the
   sinks beneath it. `_entry_for` reads a dead entry as absent everywhere, and `_repin` prunes dead
   entries without any weak-reference callback. `Runtime._owned_lock` is an `RLock`, and
   `Runtime._owned_clock` is the epoch that guards a re-pin and a close's settle.
@@ -27,7 +28,9 @@
   fault is announced under the capture's own line. The `id`-reuse tests build live ballast first.
   The spec's revision history records where the code says more than the text.
 - Commits: `b1ebbf0b` (In Progress), `ba36616a` (Phase 1: FR-001 to FR-003), `f8dc19a1`
-  (Phase 2: FR-004 to FR-006), then the completion commit.
+  (Phase 2: FR-004 to FR-006), `9bf54950` (the completion commit), then the frame-1 fixes: the
+  heap scan's proxy branch, the root-only refusal line, the epoch guards and the per-child flag
+  reset each pinned by a test, and the re-pin coalesced to the outermost release on a thread.
 
 ## What changed from earlier specs?
 
@@ -60,14 +63,23 @@
   entry and `releasable`'s owner. M7 the `_mark_heap` call removed. M8 the freeze check removed. M9
   the inherited-flag scan removed. M10a `built` exempting every root, M10b `built` ignored. M11 the
   re-pin's absorb removed. M12 the demoted list not outliving the locks. M13 the `RLock` made a
-  `Lock`.
+  `Lock`. After the frame-1 review, eight more reddened: the heap scan's `_is_weak_proxy` branch,
+  the refusal line made non-root-only, the demotion's epoch test, both epoch tests, each of the
+  three once-only flag resets, and the re-pin made per-release. The re-pin's pre-filter epoch test
+  removed alone survives by design: it only saves a capture.
 - **Owed to CI:** the full suite on 3.12 and 3.13, whose fork tests run real `os.fork()`
   children on Linux.
 
 ## Open and accepted edges
 
+- **A re-pin's cost** (Known residual 9), measured on macOS with Python 3.13 and a configured
+  `MemorySink` of 100k events: one re-pin about 5 ms, dominated by the stamp walk's read of the
+  events list; a library-driven 20-member `MultiSink` shutdown 5.5 ms (112 ms before coalescing,
+  0.05 ms at `a8e91fac`); a `MultiSink` the caller closes itself still re-pins per child, about
+  99 ms. Accepted.
+
 - A heap scan's copy-on-write cost is reasoned from how CPython stores reference counts, not
   measured.
-- The eight residuals are in `architecture.md` §13, under *The bounded ownership record leaves
-  eight residuals*. The ones a caller can hit: a frozen heap sends a tripped child to the last
+- The nine residuals are in `architecture.md` §13, under *The bounded ownership record leaves
+  nine residuals*. The ones a caller can hit: a frozen heap sends a tripped child to the last
   resort, and a last-resort child's `sink=` is never closed (use `sink_factory=`).

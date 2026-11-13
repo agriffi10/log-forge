@@ -133,7 +133,10 @@ the dead ones (FR-003). It runs the stamp walk outside `_owned_lock`, as `stamp`
 under it.
 
 - **Where it runs.** On every exit of `_swap_sink`, the early return included, from its outer
-  `finally`. And at the end of every `release` that performed a close, after `_closes.finish`.
+  `finally`. And at the end of every `release` that performed a close, after `_closes.finish`,
+  unless that release is nested inside another performed release's `close()` on the same thread:
+  then it marks its sink and leaves the re-pin to the release that encloses it, which runs after
+  every nested one has settled, so a library-driven wrapper close re-pins once.
 - **It never raises.** A fault is absorbed and announced once per process through
   `_diag.absorbed`, guarded by `Runtime._repin_announced`. In `release` it runs inside the
   `finally` and must never replace the exception `close()` raised.
@@ -640,7 +643,7 @@ At build time, the completion ritual rewrites these, each against the code as bu
     SPEC-081", as §12 marks a closed item.
   - Rewrite item 8 of the "eight things" list ("The record never shrinks"), and item 7, which says
     `_marking_failed` catches the visit ceiling.
-  - Add *Known residuals* items 1 to 8 below.
+  - Add *Known residuals* items 1 to 9 below.
   - Rewrite the sentence on callables that says a trip would "refuse every unrecorded sink in every
     child".
   - The third-party-sink item's "past a tripped ceiling it is neither" stays, because it is about
@@ -678,7 +681,7 @@ At build time, the completion ritual rewrites these, each against the code as bu
   or `unless it configures that sink itself`.
 - [ ] `docs/invariants.md` §12 names the pin first, no longer carries the tripped-ceiling exception
   for a child that re-configures, and still carries "past a tripped ceiling it is not".
-- [ ] §13 carries the eight *Known residuals* below, and both retired items are struck through and
+- [ ] §13 carries the nine *Known residuals* below, and both retired items are struck through and
   name SPEC-081.
 - [ ] `sh scripts/docs-lint.sh` and `poetry run python scripts/docstring-lint.py` exit 0.
 - [ ] Invariant 12: the page's statement and recorded exceptions match the code as built, so a
@@ -867,6 +870,12 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
    collection the child's own first allocations trigger can do the same to an inherited sink that
    was already unreachable cyclic garbage in the parent, before the pin reaches it. The repair is
    never wrapped in `gc.disable()` (the order-of-work decision), so this is stated, not closed.
+9. **A re-pin costs a stamp walk of the live graph, and a wrapper the caller closes directly
+   re-pins once per child.** Measured with a configured `MemorySink` holding 100k events: one
+   re-pin takes about 5 ms, dominated by the walk's one-level read of the events list, and a
+   20-member `MultiSink` that the caller closes itself took about 99 ms, because each child's
+   release is outermost on its thread. The same wrapper closed by the library at `shutdown()`
+   re-pins once, 5.5 ms against 112 ms re-pinning per child (0.05 ms before this spec).
 
 ## Revision history
 
@@ -925,3 +934,8 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
     record which thread holds them, and the `id`-reuse tests build live ballast of the same types
     first, because a sink alone in its allocator pool empties the pool when it dies and the next
     build is then served from another.
+- **Revised at the frame-1 diff review (2026-11-13, against `9bf54950`).** A performed release
+  nested inside another's `close()` on the same thread leaves the re-pin to the one that encloses
+  it (FR-001's "Where it runs"), because each forwarded child release re-pinning made a
+  library-driven 20-member `MultiSink` shutdown take 112 ms with a large live sink; Known residual
+  9 records what is left.

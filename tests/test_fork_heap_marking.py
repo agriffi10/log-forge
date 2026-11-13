@@ -446,6 +446,43 @@ def test_a_tripped_child_closes_what_it_builds(
     assert child.output == ("False,1" if kind == "built" else "True,1"), child.output
 
 
+def test_a_tripped_child_refuses_a_weakref_proxy_it_finds_on_its_heap(
+    trip: Callable[[], None],
+) -> None:
+    """FR-005: the heap scan records a ``weakref`` proxy, as the marking frontier does.
+
+    A proxy is not sink-shaped to a static read, so only ``_fork._is_weak_proxy`` keeps it; without
+    it the child stamps the proxy as its own and its ``shutdown()`` closes the parent's sink
+    through it (the frame-1 review's probe).
+    """
+    inner = parent_sink_behind_a_wrapper()
+    kept = [weakref.proxy(inner)]
+    trip()
+
+    def in_child() -> str:
+        failed = _lifecycle._state._marking_failed
+        hand_over_and_shut_down(kept[0])
+        return f"{failed},{inner.closes}"
+
+    child = run_in_child(in_child)
+    assert child.output == "False,0", child.output
+
+
+def test_a_child_announces_for_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The three once-only lines are once per **process**: each child's walk resets their flags."""
+    for flag in ("_capture_announced", "_stamp_refusal_announced", "_repin_announced"):
+        monkeypatch.setattr(_lifecycle._state, flag, True)
+    log_foundry.configure(sink=RecordingSink())
+
+    def in_child() -> str:
+        state = _lifecycle._state
+        flags = (state._capture_announced, state._stamp_refusal_announced, state._repin_announced)
+        return ",".join(str(flag) for flag in flags)
+
+    child = run_in_child(in_child)
+    assert child.output == "False,False,False", child.output
+
+
 def test_a_tripped_child_refuses_a_sink_the_parent_never_handed_over(
     trip: Callable[[], None],
 ) -> None:
@@ -599,13 +636,14 @@ def test_a_last_resort_child_announces_its_first_refused_configure_once(
     assert child.output == "True,1,0,0", child.output
 
     def factory(err: io.StringIO) -> str:
+        failed = _lifecycle._state._marking_failed
         log_foundry.configure(sink_factory=RecordingSink)
         log_foundry.info("child")
         log_foundry.shutdown(3.0)
-        return str(err.getvalue().count(_REFUSED_SINK))
+        return f"{failed},{err.getvalue().count(_REFUSED_SINK)}"
 
     child = fork_reading_stderr(factory)
-    assert child.output == "0", child.output
+    assert child.output == "True,0", child.output
 
 
 def test_a_last_resort_child_refuses_an_unrecorded_parent_sink_handed_over_bare(
@@ -624,19 +662,24 @@ def test_a_last_resort_child_refuses_an_unrecorded_parent_sink_handed_over_bare(
 
 
 def test_a_last_resort_childs_factory_wrapper_members_are_refused(roots_fail: None) -> None:
-    """Known residual 3, asserted: only the root a factory returns is the child's."""
+    """Known residual 3, asserted: only the root a factory returns is the child's.
+
+    Its members are refused, and silently: the refused-``sink=`` line is about a root, and a
+    factory's root was built by the library, so no ``configure(sink=...)`` was refused here.
+    """
     inner = parent_sink_behind_a_wrapper()
 
-    def in_child() -> str:
+    def in_child(err: io.StringIO) -> str:
         built: list[MultiSink] = []
         log_foundry.configure(sink_factory=lambda: built.append(MultiSink(inner)) or built[-1])
         log_foundry.info("child")
         root = _lifecycle.releasable(built[0])
         log_foundry.shutdown(3.0)
-        return f"{_lifecycle._state._marking_failed},{root},{inner.closes}"
+        said = err.getvalue().count(_REFUSED_SINK)
+        return f"{_lifecycle._state._marking_failed},{root},{inner.closes},{said}"
 
-    child = run_in_child(in_child)
-    assert child.output == "True,True,0", child.output
+    child = fork_reading_stderr(in_child)
+    assert child.output == "True,True,0,0", child.output
 
 
 def test_built_is_passed_at_exactly_the_four_library_built_roots() -> None:

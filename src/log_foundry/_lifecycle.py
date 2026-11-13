@@ -1051,6 +1051,15 @@ class Runtime:
         would also be inherited by a task or thread started from inside the setter, which is not
         inside the hand.
         """
+        self._releasing_here = threading.local()
+        """How many performed releases this thread is inside, as ``depth`` (SPEC-081 FR-001).
+
+        Read by :func:`release` so that only the outermost one on a thread re-pins the ownership
+        record: a release a wrapper forwards from inside another release's ``close()`` leaves the
+        re-pin to it. Per thread, for :attr:`_handing_here`'s reason: what it records is a call on
+        this thread's stack. A forked child keeps the forking thread's depth, which that thread's
+        own ``finally`` restores.
+        """
         self._building_here = threading.local()
         """The sink-factory builds whose factory is running on this thread, as ``yielders``.
 
@@ -2625,7 +2634,8 @@ def release(
     any deferred hand paid, so no lifecycle lock is held, and whether ``close()`` returned or
     raised: the sink's entry is marked ``closed`` — unless the sink was handed over again while
     this close ran, which bumped the entry's epoch past the one read just before the close — and
-    ``_repin`` runs, demoting what the library no longer holds. Neither raises, so neither can
+    ``_repin`` runs, demoting what the library no longer holds, once per outermost release on the
+    thread (:func:`_settle_close`). Neither raises, so neither can
     replace what ``close()`` raised. A refused release and a detached one perform no close here;
     the detached one's thread comes back through this inline path.
 
@@ -2670,16 +2680,35 @@ def release(
             _hand_after_close(sink)
         return closer
     epoch = _close_clock(sink)
+    depth = _release_depth()
     registration = closing if closing is not None else _state._closes.register(sink, _Rule.INLINE)
     try:
+        _state._releasing_here.depth = depth + 1
         sink.close()
     finally:
+        _state._releasing_here.depth = depth
         try:
             if _state._closes.finish(sink, registration):
                 _hand_after_close(sink)
         finally:
-            _settle_close(sink, epoch)
+            _settle_close(sink, epoch, repin=depth == 0)
     return None
+
+
+def _release_depth() -> int:
+    """How many performed releases this thread is inside right now, for :func:`_settle_close`.
+
+    Args:
+      None.
+
+    Returns:
+      The depth, zero outside every one.
+
+    Raises:
+      None.
+    """
+    depth: int = getattr(_state._releasing_here, "depth", 0)
+    return depth
 
 
 def _close_clock(sink: object) -> int | None:
@@ -2699,7 +2728,7 @@ def _close_clock(sink: object) -> int | None:
         return None if entry is None else entry.epoch
 
 
-def _settle_close(sink: object, epoch: int | None) -> None:
+def _settle_close(sink: object, epoch: int | None, *, repin: bool) -> None:
     """Marks a sink this process closed as closed, then re-pins the record (SPEC-081 FR-001).
 
     The entry is marked only when it is still the live entry naming this process **at the epoch
@@ -2707,9 +2736,19 @@ def _settle_close(sink: object, epoch: int | None) -> None:
     made the entry strong again and bumped its epoch, and marking it then would leave a sink the
     library holds again looking finished — so it is left as that stamp made it.
 
+    **Only the outermost performed release on a thread re-pins.** A wrapper's ``close()`` forwards
+    a release for each of its children, and a re-pin walks the live graph, which a configured
+    ``MemorySink`` of 100k events makes about 5 ms: measured, ``MultiSink(20 sinks).close()`` took
+    105 ms re-pinning once per child against 0.06 ms before SPEC-081. A release nested inside
+    another's ``close()`` on the same thread therefore marks its sink and leaves the re-pin to the
+    release that encloses it, which runs after every child has settled, so a library-driven
+    wrapper close re-pins once. A wrapper the caller closes directly has no enclosing release, so
+    each child's release re-pins, as before.
+
     Args:
       sink: The sink whose close has just ended, returned or raised.
       epoch: What :func:`_close_clock` read before the close.
+      repin: Whether this release is the outermost on its thread, and so re-pins.
 
     Returns:
       None.
@@ -2723,14 +2762,15 @@ def _settle_close(sink: object, epoch: int | None) -> None:
         entry = _entry_for(sink)
         if entry is not None and entry.pid == pid and entry.epoch == epoch:
             entry.closed = True
-    _repin()
+    if repin:
+        _repin()
 
 
 def _repin() -> None:
     """Holds strongly what the library still holds, and weakly the rest (SPEC-081 FR-001).
 
     Run on every exit of :func:`_swap_sink` and at the end of every :func:`release` that performed
-    a close. It works out which sinks the library still holds — reachable by the stamp walk from a
+    a close and is not nested inside another on its thread (:func:`_settle_close`). It works out which sinks the library still holds — reachable by the stamp walk from a
     live delivery root (:func:`_delivering_sinks`), owed a close, or being closed — promotes this
     process's entries for them, demotes this process's other entries to weak after recording the
     sinks beneath them (``_capture``), and prunes every entry whose sink has died. Entries naming
@@ -2774,11 +2814,14 @@ def _repin_record() -> None:
        it, since a callback runs inside the collector on any thread); this process's entry for a
        held sink is made strong; this process's strong entry for any other sink, when its sink
        can be weakly referenced and its epoch is no later than the one read in step 1, is put on
-       a local list that holds the sink, so a concurrent stamp is never demoted.
+       a local list that holds the sink. The epoch test here only saves a capture beneath a sink
+       stamped while the walks ran; step 5's is the binding one.
     4. With no lock held, ``_capture`` records what lies beneath the sinks on that list.
     5. Under the lock, the captured sinks with no live entry are written weakly, naming this
        process — or ``_FOREIGN`` in a child that cannot tell what it inherited — and each listed
-       entry still at its epoch is demoted. The list goes out of scope only after that section,
+       entry is demoted only while its epoch is still no later than step 1's: a sink handed over
+       again during the capture has had its entry made strong and its epoch bumped by that stamp,
+       and demoting it would leave a sink the library holds again weakly recorded. The list goes out of scope only after that section,
        so the last strong reference to a demoted sink drops with no library lock held and any
        finalizer it runs meets none of them.
 
