@@ -405,7 +405,10 @@ def _unwound(holder: Holder) -> str:
     return f"before={before} own={own} cut={cut}"
 
 
-def test_a_child_that_unwinds_out_of_a_retarget_hand_is_cut_short_and_then_handed_its_own() -> None:
+@pytest.mark.parametrize("payer", ["none", "another-thread"])
+def test_a_child_that_unwinds_out_of_a_retarget_hand_is_cut_short_and_then_handed_its_own(
+    payer: str,
+) -> None:
     """AC5: a bare ``os.fork()`` in the setter ``Worker.retarget`` runs, whose child returns.
 
     The child unwinds out of the setter, so its own ``finally`` blocks pop the offer record. It
@@ -413,6 +416,11 @@ def test_a_child_that_unwinds_out_of_a_retarget_hand_is_cut_short_and_then_hande
     ``_hand_retargeted`` has no settle loop. A thread waits on that event, and the child's
     ``flush()`` hands the sink its own signal, settling the fork's debt. Only the set of the kept
     event can end the wait, at the child's ``shutdown()``.
+
+    With ``payer=another-thread``, another thread of the child flushes first, while the forking
+    thread is still inside the setter: it pays the fork's debt, leaving out the sink still being
+    offered, and clears it. Leaving that offer re-owes the debt, so the later ``flush()`` still
+    hands the sink its own signal; at ``471eef5e`` nothing did, and the sink kept the parent's.
     """
 
     def work() -> str:
@@ -420,19 +428,25 @@ def test_a_child_that_unwinds_out_of_a_retarget_hand_is_cut_short_and_then_hande
         parent = os.getpid()
         holder = Holder()
         forked: list[int] = []
+        paid: list[str] = []
 
         def fork(_offered: threading.Event) -> None:
             gc.collect()
             pid = os.fork()
             if pid == 0:
                 signal.alarm(int(GATE * 3))
+                if payer == "another-thread":
+                    thread = threading.Thread(target=lambda: log_foundry.flush(timeout=1))
+                    thread.start()
+                    thread.join(GATE)
+                    paid.append(f"alive={thread.is_alive()} debt={_lifecycle._state._signal_owed} ")
             forked.append(pid)
 
         holder.act = fork
         _hand("retarget", holder)
         if os.getpid() != parent:
             try:
-                line = _unwound(holder)
+                line = "".join(paid) + _unwound(holder)
             except BaseException as exc:
                 line = f"!{type(exc).__name__}: {exc}"
             os.write(write_fd, line.encode())
@@ -446,7 +460,8 @@ def test_a_child_that_unwinds_out_of_a_retarget_hand_is_cut_short_and_then_hande
         return line
 
     child = run_in_child(work, timeout=30)
-    assert child.output == "before=False own=True cut=True", child.output
+    paid = "alive=False debt=False " if payer == "another-thread" else ""
+    assert child.output == f"{paid}before=False own=True cut=True", child.output
 
 
 # -- FR-004: a child never runs a sink's setter inside the setter call that forked it ------------

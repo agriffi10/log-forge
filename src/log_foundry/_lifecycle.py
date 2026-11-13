@@ -3606,6 +3606,22 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
     treating an offer as live once the forking thread has returned from it, and never count one
     that thread makes after the fork.
 
+    **Leaving an inherited offer re-owes the fork's signal debt** (:attr:`Runtime._signal_owed`).
+    While the forking thread is inside the offer, another thread of the child that pays the debt,
+    its first orphan log or ``flush()``, leaves this sink out because :func:`handing_here` is
+    true for it, and clears the debt. On the retarget path, which has no settle loop, nothing
+    then handed the sink the child's own signal once the forking thread returned: measured at
+    ``471eef5e``, a later ``flush()`` left it on the parent's event. So the count and the flag are
+    written together, under ``_state._lock``: a payer computes its candidates and clears the flag
+    in one locked section, so it either sees the sink as left, and hands it, or runs before this
+    and has its clear undone here, and the next orphan log or ``flush()`` hands it. It writes only
+    the flag, so no sink code runs here. The lock is taken only on this branch, which runs only in
+    a child, on the forking thread, once per inherited level, so no ordinary path's count of
+    acquisitions moves. No caller holds ``_state._lock`` across an offer, since a setter never
+    runs under a lifecycle lock (``docs/decisions/sink-lifecycle/``), so taking it here cannot
+    deadlock; the inherited frames are hand paths that offer after releasing it, and the fork
+    handler's resumed hand holds no lock.
+
     Args:
       sink: The sink to offer the signal to.
       stop: The event that is set when delivery should stop waiting.
@@ -3632,7 +3648,9 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
     finally:
         offers.pop()
         if offers is _state._fork_offers and len(offers) < _state._fork_inherited:
-            _state._fork_inherited = len(offers)
+            with _state._lock:
+                _state._fork_inherited = len(offers)
+                _state._signal_owed = True
 
 
 def _offers_here() -> list[tuple[int, threading.Event]]:
