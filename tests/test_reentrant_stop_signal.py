@@ -2427,6 +2427,52 @@ def test_a_stop_keeps_its_take_ahead_through_the_join_of_a_worker_its_take_decli
     assert child.output == "take_ahead=True ['close:E0:set'] quick=True", child.output
 
 
+def test_a_late_workers_expiry_line_names_the_timeout_the_caller_gave() -> None:
+    """A late worker's join that expires writes the caller's ``timeout``, as the worker path does.
+
+    A no-worker ``shutdown(timeout=1.0)`` takes and closes the configured sink in its first pass;
+    as that pass returns, ``configure(sink=S)`` and a ``@trace`` build the late worker on S, whose
+    ``emit`` sleeps 3 s, so the stop's join of that worker expires at the call's deadline. The
+    stop claims that worker in the section that retires it and joins with ``op.budget``, so the
+    line reads ``after 1s``. At ``864d71e5`` the late worker claimed inside ``Worker.stop`` with
+    what was left of the deadline, and the line named that remainder — ``after 0.998545s`` here,
+    ``after 0.490264s`` in a probe that built the worker half a second later — which a caller
+    cannot match to the timeout it passed; joining with ``_remaining(op.deadline)`` again reddens
+    this (``after 0.998934s``).
+    """
+
+    def work() -> str:
+        import re
+
+        class Slow(Plain):
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                time.sleep(3.0)
+                super().emit(batch)
+
+        log_foundry.configure(service="t", sink=Plain())
+        log_foundry.info("arms the first sink")
+        real_close = _lifecycle._close_owed
+        built: list[bool] = []
+
+        def close_owed(*args: object, **kwargs: object) -> bool:
+            result = real_close(*args, **kwargs)  # type: ignore[arg-type]
+            if not built:
+                built.append(True)
+                log_foundry.configure(sink=Slow())
+                _traced()()
+            return result
+
+        _lifecycle._close_owed = close_owed  # type: ignore[assignment]
+        captured = _stderr()
+        log_foundry.shutdown(timeout=1.0)
+        sys.stderr = sys.__stderr__
+        found = re.findall(r"shutdown timed out after (\S+?);", captured.getvalue())
+        return f"built={bool(built)} expiry={found}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == "built=True expiry=['1s']", child.output
+
+
 def test_a_stop_that_declined_keeps_its_take_ahead_after_the_stop_that_popped_its_worker_ends() -> (
     None
 ):

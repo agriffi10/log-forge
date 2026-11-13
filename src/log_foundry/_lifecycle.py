@@ -167,12 +167,12 @@ class _Operation:
     worker declines only while some drain still has a take ahead of it, because only then does
     the drain own every owed close. It is written under ``_state._lock``, in the critical section
     where the last take becomes known — the final pass's take; the first pass's, when no
-    bystander was waited on and no late worker can still be registered; or the section that
-    reads the late worker, when there is none, nothing was waited on and no take declined — and
-    read by
-    :meth:`Runtime._take_ahead` under the same lock. ``late_possible`` is whether a worker built
-    now would still be registered as this call's late worker: true from a no-worker shutdown's
-    entry until the section that lowers ``_shutdown_running``.
+    bystander was waited on, no late worker can still be registered and the take did not
+    decline; or the section that reads the late worker, when there is none, nothing was waited
+    on and no take declined — and read by :meth:`Runtime._take_ahead` under the same lock.
+    ``late_possible`` is whether a worker built now would still be registered as this call's late
+    worker: true from a no-worker shutdown's entry until the section that lowers
+    ``_shutdown_running``.
 
     ``publishing_worker`` is the worker a take of this ``STOP`` declined for
     (:func:`_take_declines`): the current signal was that worker's unset event, published by its
@@ -4925,8 +4925,9 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     sink, as the second pass always did. Joining first was measured: a 0.5 s close of the owed
     sink behind a late worker whose ``emit`` slept 3 s took ``shutdown(timeout=1)`` to 1.51 s,
     the close starting after the deadline, against 1.01 s in this order and 1.00 s to 1.01 s at
-    ``864d71e5``, which closed that sink before stopping the worker. Setting the event in the section rather than inside :meth:`Worker.stop` is the
-    same order as before, a few bytecodes earlier. The join passes the call's ``budget`` when
+    ``864d71e5``, which closed that sink before stopping the worker. Setting the event in the
+    section rather than inside :meth:`Worker.stop` is the same order as before, a few bytecodes
+    earlier. The join passes the call's ``budget`` when
     it won the claim, as the worker branch does, so a late worker's expiry line names the
     caller's timeout rather than what was left of it. **No lock site and no** ``_move`` **site
     moved**: the section is the one that already retired a late worker, made conditional and
@@ -4972,10 +4973,9 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     discarded in the outer ``finally`` once the graced join has returned, so
     :attr:`Runtime.state` reads ``DRAINING`` for the whole body on both branches, the stop of a
     worker built since the entry and the later ``_close_owed`` passes included — and is never
-    left there by an
-    exception. The discard takes no lock: it is one ``set.discard``, so the token adds no
-    acquisition to this call's pinned count. After it, the last stop out pays any hand a worker
-    build or a retarget declined during the stop on a close that outlives it
+    left there by an exception. The discard takes no lock: it is one ``set.discard``, so the
+    token adds no acquisition to this call's pinned count. After it, the last stop out pays any
+    hand a worker build or a retarget declined during the stop on a close that outlives it
     (:func:`_pay_marks_after_stop`), which takes ``_state._lock`` only when such a mark exists.
 
     **Before it drains, it waits for every swap in flight to take its decision**, within the
