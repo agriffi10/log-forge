@@ -248,7 +248,9 @@ class FileSink:
         (``_driver_error.delivery_error``), so ``except OSError``, ``except PermissionError``
         and ``except SinkDeliveryError`` all still catch it. A write that fails partway leaves
         the earlier lines of the batch on disk, and the worker's retry writes them again: this
-        counts and types the failure, it does not make a partial write atomic.
+        counts and types the failure, it does not make a partial write atomic. Those duplicates
+        are an accepted edge for 1.2.0, recorded as an exception to invariant 7 in the
+        driver-error decision, which says why truncating the file back is unsafe.
 
         Args:
           batch: The events to write.
@@ -580,7 +582,9 @@ class RotatingFileSink:
         (``_driver_error.delivery_error``), so ``except OSError``, ``except PermissionError``
         and ``except SinkDeliveryError`` all still catch it. A write that fails partway leaves
         the earlier lines of the batch on disk, and the worker's retry writes them again: this
-        counts and types the failure, it does not make a partial write atomic.
+        counts and types the failure, it does not make a partial write atomic. Those duplicates
+        are an accepted edge for 1.2.0, recorded as an exception to invariant 7 in the
+        driver-error decision, which says why truncating the file back is unsafe.
 
         Args:
           batch: The events to write.

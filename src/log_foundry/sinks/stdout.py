@@ -93,7 +93,8 @@ class StdoutSink:
         deferral helper; before, the lines ahead of it were already written when the encode
         raised, and the worker's retry wrote them again. A batch of nothing encodable touches
         the stream not at all and returns (FR-002). A stream that raises partway through still
-        leaves the lines it took, which the retry writes again: that I/O route is not closed.
+        leaves the lines it took, which the retry writes again: an accepted edge for 1.2.0,
+        recorded as an exception to invariant 7 in the driver-error decision.
 
         Args:
           batch: The events to write.

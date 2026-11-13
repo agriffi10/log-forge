@@ -70,10 +70,22 @@ sinks gain a public `losses()`; no other public name, argument or `configure()` 
 
 - **Owed until the PR's CI is green:** FR-003's real-service criterion settles on the Integration
   job against the compose PostgreSQL and MongoDB, not before the push.
-- **Out of scope, still open:** a partial file or stream write leaves earlier lines for the retry
+- ~~**Out of scope, still open:** a partial file or stream write leaves earlier lines for the retry
   to write again; a SQLite column value that cannot be bound (an integer past 64 bits, a `dict`)
   from a direct `emit` still costs the batch; a lone surrogate reaching `PostgresSink` through a
-  direct `emit` is unmeasured.
+  direct `emit` is unmeasured.~~ All three resolved on 2026-11-13 by the SPEC-069 follow-up fix
+  (no spec):
+  - **The partial write:** ruled an accepted edge for 1.2.0 by Andrew, measured (69 to 100 of a
+    200-event batch landed twice when the fault cleared before the retry) and recorded in
+    `docs/decisions/sink-delivery/a-sinks-own-driver-error-is-counted-announced-and-raised-as-both-types.md` and as an exception to invariant 7; the closure, the file sinks on `deliver`, is
+    to be specified after 1.2.0.
+  - **The SQLite column:** fixed. A container, or an integer outside the signed 64-bit range, is
+    bound as its JSON text (`sinks/_encode.column_value`); `PostgresSink` takes the same rule for
+    the `dict` and mixed or ragged `list` psycopg cannot adapt. Recorded in `docs/decisions/event-assembly/a-destinations-refusal-is-repaired-at-the-sink-and-marked-as-assembly-marks.md`.
+  - **The lone surrogate:** measured against PostgreSQL 17.11, where it cost the batch, and fixed:
+    the event is dropped alone, counted and announced (`sinks/_encode.refuse_surrogate`), in the
+    same decision. Guarded by `tests/test_sinks_column_binding.py` and
+    `tests/integration/test_postgres.py`.
 
 ## Verification
 

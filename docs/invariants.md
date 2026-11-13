@@ -427,6 +427,14 @@ the worker calls the family's `deliver` and a `REJECTED` event is final. A core
 flight to a server that may yet process them, and the next call is refused by the probe or its
 latch, so a sustained stall is still reported as failed batches and only the one batch that
 straddles its onset is counted rather than raised.
+A file or stream write that fails partway can land events twice, accepted for 1.2.0 (Andrew's
+ruling, 2026-11-13): a `FileSink` or `RotatingFileSink` write, or a `StdoutSink` or `StderrSink`
+stream, that raises after earlier lines of the batch reached the file leaves them there and
+raises, and the worker's retry writes the whole batch again, so a fault that clears between the
+attempts duplicates those lines (69 to 100 of a 200-event batch, measured with the file size
+capped). The measurement, the two rejected remedies and the closure — the file sinks on `deliver`,
+specified after 1.2.0 — are in *A sink's own driver error is counted, announced and raised as both
+types* (`docs/decisions/sink-delivery/`).
 The recorded exception extends to `deliver` (SPEC-072 FR-004): a run whose verdict marks an event
 `UNKNOWN`, or whose verdict cannot be read — not a `Verdict`, outcomes that are not exact `Outcome`
 members, the wrong length, or a field that raises when read — settles even when nothing else was
@@ -494,6 +502,11 @@ JSONB and its text columns refuse it; `MongoDBSink` replaces an integer outside 
 range with assembly's `<int: ~N digits>` placeholder (`sanitize.int_placeholder`) and a NUL in a
 key with U+FFFD, because `bson.encode` refuses them. Each repaired event carries `truncated`, as
 assembly marks the same substitutions; a repair is not a loss and is neither counted nor announced.
+`SQLiteSink` and `PostgresSink` bind a projected column value their driver cannot bind — a
+container, and for SQLite an integer outside the signed 64-bit range — as its JSON text; the event
+is unchanged, so it is not marked, and nothing is counted (SPEC-069 follow-up fix, 2026-11-13). A
+lone surrogate, which only a direct `emit` can bring, is not repaired: `PostgresSink`, and
+`SQLiteSink` when it sits in a projected column, drop that event alone, counted and announced.
 The three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
 (invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). A boundary
@@ -523,7 +536,8 @@ which holds both budgets exactly and the reads to the ceiling;
 routes and the real-type routing (SPEC-063); a transform's output by
 `tests/test_transform_coercion.py` (SPEC-058); the sink-side repairs by `tests/test_encode.py`,
 `tests/test_sinks_encode.py`, `tests/integration/test_postgres.py` and `test_mongo.py`
-(SPEC-069).
+(SPEC-069); the projected-column binding and the lone-surrogate drop by
+`tests/test_sinks_column_binding.py` and `tests/integration/test_postgres.py`.
 
 ## 9. Context is scoped, and an adopted context confers nothing
 
