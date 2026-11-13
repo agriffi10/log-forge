@@ -323,6 +323,10 @@ areas:
     path: "docs/decisions/sink-lifecycle/sink-lifecycle.md"
     governs: ["src/log_foundry/sinks/**"]
     decisions:
+      - title: "A child forked inside a stop-signal setter keeps its mark and the event it was offered, and its shutdown sets that event"
+        fence: "`offer_stop_signal` records each offer on the offering thread (`Runtime._offering_here`); a forked child keeps the forking thread's offered events, exact `threading.Event` only and re-initialised, and its `shutdown()` sets them where it sets its own signal; `handing_here` also reads the offer record, and the resumed worker's fork-handler hand skips a sink it reports; the stop-end payment asks the `handing` mark alone. Never reset either mark in a child, never hand an offered sink from the fork handler, keep no per-sink history of hands. (SPEC-083)"
+        status: "stable"
+        path: "docs/decisions/sink-lifecycle/a-child-forked-inside-a-stop-signal-setter-keeps-its-mark-and-the-event-it-was-offered-and-its-shutdown-sets-that-event.md"
       - title: "A closing sink refuses at once; a SERIAL close waits for the one call inside, a CLOSE_ONLY close waits a bounded time"
         fence: "a close sets `CLOSING` before it takes the transport lock, so every later caller is refused; a `SERIAL` close then waits for the one section holding the lock and never releases under it, and a `CLOSE_ONLY` close waits at most `CLOSE_OVERLAP_WAIT` (0.5 s) and releases, telling the section it overtook (`released_during`), which `KafkaSink` counts. Never an `RLock`; never a release handed to the call inside. (SPEC-076)"
         status: "stable"

@@ -131,7 +131,8 @@ nothing paid, and the live worker delivered into the sink on the stop's set sign
 ended: in a forked child, a 0.3 s backoff waited 0.0 s with the mark still set, at `ab7f620d` and at
 `a8e91fac` alike, the stop's own route unforced and the writer's forced. Paying at once instead runs
 the setter nested inside itself. So `_pay_marks_after_stop`, finding under the lock that its thread
-is handing the very sink it would pay (`handing_here`), sets `payment_owed` on that thread and
+is handing the very sink it would pay (the `handing` mark alone, `_in_handing`, since SPEC-083
+widened `handing_here` to the offer record), sets `payment_owed` on that thread and
 returns before consuming the mark, and `handing()` runs it again at the exit of each of the thread's
 hands, until no hand of that sink is open; every caller of `handing()` exits with no lifecycle lock
 held. A first version deferred for any hand on the thread (`_mid_hand`), which made a payment inside
@@ -171,7 +172,7 @@ fence names this as its one tokenless publication.
 - **Between the discharge and the payment.** The discharge deletes the entry before the payment's
   section reads the moment, and no token is open, so an orphan log on another thread can take the
   fast path there and emit with the sink still on the set signal.
-- **The payment's moment check is not separately held.** Its `handing_here` half is
+- **The payment's moment check is not separately held.** Its `_in_handing` half is
   (`test_a_paid_hand_never_runs_a_setter_inside_itself`: without it the setter ran nested); its
   `_may_replace` half survived mutation over every shipped test, because each interleaving that
   reaches it hands an event a shutdown has already set. It stays, as the one test every hand asks.
@@ -209,6 +210,11 @@ fence names this as its one tokenless publication.
   `a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`;
   a tail build before the stop's last take is now stopped by that stop, and the tail paragraph says
   so.
+- **Refined** by SPEC-083: `handing_here` now also reads the offer record, so the payment's
+  check is named `_in_handing`, the `handing` mark alone, and its behaviour is unchanged. A
+  payment parked on the wider read inside `Worker.retarget`'s unmarked offer would have no
+  `handing()` exit to pay it. No reachable state tells the two reads apart (*A child forked inside
+  a stop-signal setter keeps its mark…*).
 - **Refined**: the fence extends to `Worker.retarget`, whose hand of its new sink now defers into a
   stop's close in flight through `_hand_retargeted` and is paid by the same discharge or stop-end
   payment; measured at `a8e91fac` that hand held a `shutdown(timeout=1)` 4.01 s. *What is left*

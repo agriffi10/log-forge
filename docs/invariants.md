@@ -209,7 +209,10 @@ declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in
 1.x sink without the attribute backs off uninterruptibly (SPEC-072). A `sink_factory` that starts
 a thread of its own which logs, and joins it with no timeout, hangs: the thread's first emit waits
 on the build the factory is running, and the library cannot see a wait in the caller's code
-(`docs/decisions/sink-lifecycle/`).
+(`docs/decisions/sink-lifecycle/`). A child forked from inside a sink's stop-signal setter has its
+backoff on the event that sink holds cut short by its `shutdown()` (SPEC-083). However, a setter
+that forks before it stores the event leaves that wait uncut. After the child's `shutdown()`, that
+sink keeps the set event, so its later backoffs do not wait (`architecture.md` §13).
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
 `tests/test_sink_retry.py` (only the engine waits, derived over `sinks/`, SPEC-074),
 `tests/test_sinks_db_engine.py`, `tests/test_sinks_broker_engine.py` and `tests/test_socket_engine.py`
@@ -243,6 +246,10 @@ its own unset one and a hand delivered it to the sink
 4.0 s on its settle, `flush()` and tail rows, 1.01 s for each of two stops); and
 `tests/test_lock_held_discharges.py` holds the
 shape that keeps the hand the build or the retarget defers from being paid under the state lock.
+`tests/test_fork_mid_hand.py` holds a child forked inside a setter to a wait cut short by its
+`shutdown()`, on the orphan path, inside a `FilteringSink`, on the worker build and on
+`Worker.retarget`, and holds a setter that holds its own lock to never being run again inside
+itself, in the child and, during a retarget, in the parent (SPEC-083).
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -630,6 +637,8 @@ the closed guard driven through `configure()`, SPEC-076), `tests/test_fork_roste
 `tests/test_fork_child_state.py` (SPEC-079),
 `tests/test_sink_ownership.py`, `tests/test_ownership_record.py` and
 `tests/test_fork_heap_marking.py` (SPEC-081),
+`tests/test_fork_mid_hand.py` (a child forked inside a stop-signal setter: the handler re-initialises
+the events it keeps and runs no sink code, SPEC-083),
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
 `tests/test_sinks_sqlite_fork.py` (the `SQLiteSink` child, under a real `os.fork` and through a
 child's interpreter exit),

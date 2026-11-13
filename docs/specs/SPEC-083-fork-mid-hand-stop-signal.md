@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-083
 title: "Fork Mid-Hand: A Child Forked Inside a Stop-Signal Setter Has Its Backoff Cut Short and Never Re-Enters the Setter"
 description: "Makes a forked child's shutdown() cut short a backoff on the stop signal a sink was being handed when its setter forked, and keeps the child from ever running that setter again inside the call that forked it, for applications whose sinks start a process from their log_foundry_stop_signal setter."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-027, SPEC-033, SPEC-039, SPEC-054, SPEC-068, SPEC-079, SPEC-081]
 ---
 
