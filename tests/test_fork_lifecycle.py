@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import ast
 import collections
+import ctypes
 import faulthandler
 import gc
 import io
 import os
 import pathlib
+import resource
 import select
 import signal
 import sys
@@ -631,6 +633,48 @@ def _diagnose(child: _Child, *, reached: bool) -> str:
     return f"it {child.ending} without reaching `os.kill`, leaving no exception report behind"
 
 
+_PR_SET_DUMPABLE = 4
+
+
+def _refuse_core_dump() -> None:
+    """Makes this process unable to dump core, so a deliberate crash ends it at once.
+
+    A process killed by ``SIGSEGV`` is not gone when the signal lands: the kernel first writes
+    its core, and while it does the process holds every descriptor it had open, takes no other
+    signal but ``SIGKILL``, and has not exited. When ``core_pattern`` pipes the core to a helper
+    (``apport``, ``systemd-coredump``), that write lasts as long as the helper takes to read
+    it, which on a loaded CI runner can outlast the parent's deadline in :func:`run_in_child`.
+    The parent then sends ``SIGKILL`` mid-dump, and Linux lets that one signal replace the
+    exit code the crash had already set, so the child is reaped as ``SIGKILL`` and reads as
+    :attr:`_Child.blocked` -- a watchdog -- although the crash was all that happened to it.
+    That is the failure ``test_a_crashed_child_does_not_read_as_blocked`` kept producing.
+    Measured: under ``core_pattern`` set to ``|/bin/sleep 8`` in a Linux container, with no
+    load at all, the test failed on every run with "it reached `os.kill`, and was still alive
+    at the parent's deadline", the reading CI kept reporting, and passed with this call.
+
+    ``RLIMIT_CORE`` alone is not enough, because the kernel ignores it for a piped
+    ``core_pattern``. ``PR_SET_DUMPABLE`` set to 0 is what the kernel checks before any dump,
+    piped or not, so on Linux both are set. Elsewhere only the limit is set, since ``prctl``
+    is Linux's and no CI leg runs anywhere else.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      OSError: If ``prctl`` refuses, which the child reports as its ``!Type: msg`` rather than
+        crashing with the dump it was meant to suppress still armed.
+    """
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    if sys.platform == "linux":
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+            errno = ctypes.get_errno()
+            raise OSError(errno, f"prctl(PR_SET_DUMPABLE, 0) failed: {os.strerror(errno)}")
+
+
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
     """A crash and a deadlock are different findings, and one test turns on telling them apart.
 
@@ -650,6 +694,15 @@ def test_a_crashed_child_does_not_read_as_blocked() -> None:
     making it legible. The marker written immediately before ``os.kill`` is what separates the
     premise from the property, and :func:`_diagnose` turns the pair into the reading.
 
+    **The child refuses to dump core before it reports reaching the crash, and that is what
+    makes the property deterministic.** Once legible, the reading on CI was the same each time
+    its log was read (``5202dd34`` and ``717d0c68``, Release): the child reached ``os.kill``
+    and was still alive at the parent's deadline. A core dump piped to a slow helper holds it
+    exactly there, and :func:`_refuse_core_dump` says how and what was measured. With the dump
+    refused, nothing stands between the signal and the exit, so a recurrence of that reading
+    is no longer this mechanism and is worth reading as a finding. The deadline was not
+    widened: a dump helper has no upper bound to widen past.
+
     **The premise is that a signal ended the child, not that it failed to exit cleanly.**
     ``not finished`` is satisfied by a non-zero exit, so a ``work`` that reached the marker and
     then left without crashing would establish the premise while leaving the property — that a
@@ -665,6 +718,7 @@ def test_a_crashed_child_does_not_read_as_blocked() -> None:
 
     def crash() -> str:
         faulthandler.disable()
+        _refuse_core_dump()
         report_from_child(requested)
         os.kill(os.getpid(), signal.SIGSEGV)
         return "survived"
