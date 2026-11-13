@@ -62,11 +62,7 @@ targets the first release after 1.2.0.
 - **Truncating the file back to where the batch began.** It is rejected because a forked child
   appending to the same path would lose the lines it wrote in between (invariant 12).
 - **Flushing per line and reporting instead of raising.** It is rejected because the unwritten rest
-  of the batch is lost rather than resent. Its cost is a second reason. The 1.2.0 ruling measured a
-  per-line flush at about 11 times a single flush on a write-only basis (1.89 ms against 0.17 ms per
-  1,000-event batch). This spec's review measured a per-line-flush `emit` at about 2.3 times the
-  whole 1.x `emit`, encode included (2.02 ms against 1.48 ms written separately, on one machine in
-  one run).
+  of the batch is lost rather than resent.
 - Cross-process coordination. If another process appends to the same path between a partial write
   and the completion of its torn line, that process's first line joins the torn prefix and does not
   parse. A child forked while a tail is pending is that case too (FR-005). No single process can
@@ -112,8 +108,8 @@ landed. Measured at `c21755f1`, CPython's `BufferedWriter` sometimes kept the un
 wrote them at its next flush. At other caps it discarded them, and the next write was appended to
 a line cut in half. Either way it never says how many bytes reached the file. The unbuffered write
 of the joined bytes measured no slower than today's `emit` (0.84 ms against 0.94 ms per
-1,000-event batch, encode included, on one machine in one run). That is the write alone: the
-engine's per-run bookkeeping around it, mostly `encode_round`'s per-run cache, makes the whole
+1,000-event batch, encode included, on one machine in one run). That is the encode and the write
+without the engine: the engine's per-run bookkeeping around them, mostly `encode_round`'s per-run cache, makes the whole
 `emit` slower than 1.x's, which is what the timing criterion below bounds. A write that the kernel accepts
 partially returns the exact count before the next call raises: under a 10,500-byte cap, one call
 returned `10500` and the next raised `EFBIG`.
@@ -142,9 +138,10 @@ returned `10500` and the next raised `EFBIG`.
 - [ ] `FileSink(path, encoding="no-such-codec")` and `FileSink(path, encoding="base64")` both
       raise `LookupError` at construction.
 - [ ] The delivery doc records at least five interleaved before-and-after pairs of the median time
-      of a 1,000-event batch through `FileSink.emit`, on one machine, each a median of its own runs.
-      The median of the pairs' ratios is no more than 2.0. A prototype measured 1.50 to 1.56 times,
-      so 2.0 leaves the build about a third in headroom (*Revision history*).
+      of a 1,000-event batch through `FileSink.emit`, on one machine, each a median of its own runs,
+      with the events and encoding of the prototype in *Revision history* (lines of 312 to 316
+      bytes, `utf-8`). The median of the pairs' ratios is no more than 2.0. The prototype measured
+      1.50 to 1.56 times, so 2.0 leaves the build about a third in headroom at that event size.
 - [ ] The rule above keeps invariants 7 and 2: no event a round called `ACCEPTED` is written again,
       and no event that did not land is called `ACCEPTED`.
 
@@ -492,8 +489,12 @@ tests/
   `mark_sent`, the joined bytes written in as many write calls as the kernel needed, each event's
   outcome taken from the bytes those calls returned, and the run-notes and tail checks on every
   round. It ran through `emit_via_deliver` against 1.x's `FileSink.emit`, with 1,000 events of
-  313 to 316 bytes each, on Python 3.13.1, macOS, load average about 4. Each figure is the median
-  of its own runs, and pairs alternate which side runs first:
+  312 to 316 bytes per line, newline included, on Python 3.13.1, macOS, load average about 4. Each figure is the median
+  of its own runs, and pairs alternate which side runs first. Event `i` was
+  `{"timestamp": "2026-11-13T12:00:00.000000Z", "level": "info", "event": f"handled.request.{i}",
+  "trace_id": "a" * 32, "span_id": "b" * 16, "parent_span_id": "c" * 16, "status": "ok",
+  "duration_ms": 12.5, "service": "orders", "fields": {"k": i, "route": "/orders/{id}"}}`, written
+  in `utf-8`, with both files emptied before each pair:
 
   | pairs | runs per side | before (ms) | after (ms) | median ratio | range |
   |---|---|---|---|---|---|
@@ -507,5 +508,14 @@ tests/
   bound is now 2.0 times, the same as SPEC-084's, judged on the median ratio of at least five
   interleaved pairs, because SPEC-084's single runs reached 2.49 and 3.52 times under load. The
   gap from 1.56 to 2.0 is headroom for whatever a full build's round carries on the success path
-  that the prototype did not, such as the byte order mark's bookkeeping. The 0.84 against 0.94 ms
-  figure under FR-001 measured the write alone, not the engine around it.
+  that the prototype did not, such as the byte order mark's bookkeeping; the spec review measured
+  an incremental encoder per line at 1.59. The 0.84 against 0.94 ms figure under FR-001 measured
+  the encode and the write without the engine.
+- **2026-11-13, timing bound's spec review.** The review reproduced the ratios (1.56, 1.51, and 1.42
+  without `mark_sent`) and confirmed the attribution: with `encode_round` replaced by a plain list
+  the ratio was 1.20. It found that the engine's cost is per event, so the ratio falls as events
+  grow: 2.11 to 2.13 at 33 to 35-byte lines, 1.85 at 140-byte lines and 1.12 at 2.3 KB lines. The
+  criterion therefore names the prototype's events. The review also found that *Out of Scope* gave a
+  per-line-flush `emit` as about 2.3 times 1.x's from figures (2.02 ms against 1.48 ms) that give
+  1.36. Under a 2.0 bound that cost is no reason to reject per-line flushing, so the bullet now
+  rests on its first reason alone, the unwritten rest of the batch being lost.
