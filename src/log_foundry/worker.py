@@ -261,7 +261,8 @@ class SwapOutcome:
 
     Attributes:
       verdict: ``declined`` when this worker retired mid-swap — before the reassign, keeping its
-        sink, or after it, when the fence flush found it retired and its drain thread ended,
+        sink, or after it, when the fence flush found it retired and the shutdown that retired it
+        had taken the previous sink,
         ``fenced`` when a drain after the reassign confirmed nothing can still be inside the
         previous sink, ``unfenced`` when that confirmation did not arrive within the budget.
       previous: The sink it displaced, which is the new sink itself when there was nothing to do.
@@ -1036,22 +1037,24 @@ class Worker:
         ``incomplete_swaps`` whose line says the old sink was left open when it was in fact closed.
 
         **And a third time, after the reassign, through the fence flush's own verdict and the
-        drain thread's liveness.** A ``shutdown()`` that retires this worker once it holds
-        ``new_sink`` — its setter's own ``shutdown()``, run by the offer above, or one on another
-        thread landing before the fence flush reads the count — makes that flush answer
-        ``retired`` at its first line, without trying. When the drain thread has **also ended**,
-        read after that flush, the shutdown that retired the worker has stopped it and drained
-        into ``new_sink``, and nothing of the drain can be inside the old sink any more: the
-        verdict is ``declined``, with no ``incomplete_swaps`` and no line. Read as ``unfenced``, as
-        it was until this fix, a setter calling ``shutdown()`` counted an incomplete swap and
-        wrote that the previous sink "could not be confirmed drained" and was "left open", though
-        the shutdown had already closed it. **With the thread still alive it stays**
-        ``unfenced``, line and count as before: the retiring shutdown may not have stopped the
-        drain yet (one on another thread waits for this swap's decision first), or it expired
-        with the thread still inside the old sink, which then really is left open until a later
-        ``shutdown()`` finds the thread ended — the line is true there, and dropping it
-        undercounted ``incomplete_swaps`` for a sink left open. The reason is read rather than a
-        sixth ``retirements > self._epoch``, which
+        owed record.** A ``shutdown()`` that retires this worker once it holds ``new_sink`` — its
+        setter's own ``shutdown()``, run by the offer above, or one on another thread landing
+        before the fence flush reads the count — makes that flush answer ``retired`` at its first
+        line, without trying. The verdict then turns on the fact the unconfirmed-swap line
+        reports: whether the previous sink is **still owed**, read after that flush. Not owed, the
+        retiring shutdown took it — a take happens only once nothing of the drain can be inside
+        the sink, and the taker performs the close — so the verdict is ``declined``, with no
+        ``incomplete_swaps`` and no line. Read as ``unfenced``, as it was until this fix, a setter
+        calling ``shutdown()`` counted an incomplete swap and wrote that the previous sink "could
+        not be confirmed drained" and was "left open", though the shutdown had already closed it.
+        **Still owed, it stays** ``unfenced``, line and count as before: the retiring shutdown has
+        not taken it yet (one on another thread waits for this swap's decision first), or it
+        expired with the drain thread inside the sink and left it open, which a later
+        ``shutdown()`` closes once it finds the thread ended — the line is true there. The drain
+        thread's liveness was the first rule and is the wrong fact: read after the setter
+        returns, it found a thread that had left the old sink only after the shutdown that should
+        have closed it had expired, and reported ``declined`` for a sink left owed and open. The
+        reason is read rather than a sixth ``retirements > self._epoch``, which
         :meth:`~log_foundry._lifecycle.Runtime.live_worker` counts; ``flush`` returns ``retired``
         from that comparison and nowhere else. ``old`` stays among the sinks this thread may be
         inside on every verdict but ``fenced``.
@@ -1104,7 +1107,7 @@ class Worker:
             self._record_incomplete_swap(timeout, old)
             return SwapOutcome(verdict="unfenced", previous=old)
         fence = self.flush(remaining)
-        if not fence and fence.reason == "retired" and not self._thread.is_alive():
+        if not fence and fence.reason == "retired" and not _lifecycle.owes_close(old):
             return SwapOutcome(verdict="declined", previous=old)
         if not fence:
             self._record_incomplete_swap(timeout, old)

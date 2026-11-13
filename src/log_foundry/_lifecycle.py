@@ -3949,10 +3949,9 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       that finds the drain thread ended closes it (SPEC-050 FR-004); ``incomplete_swaps`` counts
       it, as before.
     - **declined** — the worker retired mid-swap and keeps its old sink forever (SPEC-033 FR-002),
-      or retired after it had reassigned, when the shutdown that retired it had already stopped
-      its drain thread, drained into the new sink and taken whatever the record owed
-      (:meth:`Worker.retarget`); a retirement after the reassign with the drain thread still
-      alive is reported ``unfenced``. Either way the old sink
+      or retired after it had reassigned, when the shutdown that retired it had already taken
+      the displaced sink from the record (:meth:`Worker.retarget`); a retirement after the
+      reassign that left the displaced sink owed is reported ``unfenced``. Either way the old sink
       is left to the record — owed for the exit, or already taken by that shutdown — and the new
       one is armed anyway, because it is what ``configure()`` installed and the orphan path will
       deliver to it — SPEC-035 FR-003's guarantee that a declined sink is owned by *somebody*.

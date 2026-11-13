@@ -1072,3 +1072,72 @@ def test_a_retiring_shutdown_that_expires_inside_the_old_sink_leaves_the_swap_un
     assert child.output == ("incomplete=1 line=True a_closes=0 a_held=True b_owed=True"), (
         child.output
     )
+
+
+def test_a_setter_shutdown_that_expires_before_the_drain_leaves_stays_unfenced() -> None:
+    """The verdict reads the owed record, not the drain thread's liveness after the setter.
+
+    The drain thread is inside a 0.6 s ``emit`` on A when B's setter, run after the reassign,
+    calls ``shutdown(timeout=0.3)`` itself: that shutdown expires with the thread inside A and
+    leaves A owed and open. The setter then works on for 0.5 s, by which time the thread has left
+    A and ended, so a liveness read after the setter returns found it dead and reported
+    ``declined``, writing nothing for a sink left owed and open. A is still owed, so the swap is
+    an unconfirmed one: ``unfenced``, one incomplete swap, and the line, which is true.
+    """
+
+    def scenario() -> str:
+        err = io.StringIO()
+        sys.stderr = err
+        inside = threading.Event()
+
+        class SlowA(Sink):
+            slow = False
+
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                if self.slow:
+                    inside.set()
+                    time.sleep(0.6)
+                super().emit(batch)
+
+        class ShutsDownThenWorks(Sink):
+            fired = False
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:  # type: ignore[override]
+                return None
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, value: threading.Event | None) -> None:
+                if self.fired or threading.current_thread() is not threading.main_thread():
+                    return
+                self.fired = True
+                log_foundry.shutdown(timeout=0.3)
+                time.sleep(0.5)
+
+        a, b = SlowA("A"), ShutsDownThenWorks("B")
+        worker = _worker_on(a)
+        real = Worker.flush
+        calls: list[int] = []
+
+        def slow_after_first(self_: Worker, timeout: float | None = 5.0) -> Any:
+            calls.append(1)
+            result = real(self_, timeout)
+            if len(calls) == 1:
+                a.slow = True
+                _traced()
+                inside.wait(GATE_WAIT)
+            return result
+
+        Worker.flush = slow_after_first  # type: ignore[method-assign]
+        log_foundry.configure(sink=b)
+        Worker.flush = real  # type: ignore[method-assign]
+        return (
+            f"fired={b.fired} drain_ended={not worker._thread.is_alive()} "
+            f"incomplete={worker.incomplete_swaps} line={UNFENCED in err.getvalue()} "
+            f"a_owed={_lifecycle.owes_close(a)} a_closes={a.closes}"
+        )
+
+    child = run_in_child(scenario)
+    assert child.output == (
+        "fired=True drain_ended=True incomplete=1 line=True a_owed=True a_closes=0"
+    ), child.output
