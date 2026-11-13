@@ -99,10 +99,19 @@ fence names this as its one tokenless publication.
   (`test_a_paid_hand_never_runs_a_setter_inside_itself`: without it the setter ran nested); its
   `_may_replace` half survived mutation over every shipped test, because each interleaving that
   reaches it hands an event a shutdown has already set. It stays, as the one test every hand asks.
-- **The stop-end payment's concurrency terms are argued, not held by a test.** Its re-read of
-  `_stops_running` under the lock (only the last stop out pays) and its refusal of a set or a
-  foreign signal have no test of their own; the mark being consumed once under the leaf is what
-  keeps two payers from both handing.
+- **The stop-end payment's locked re-read of `_stops_running` is unreachable, kept as a guard.**
+  A stop's entry retires the one worker in the same critical section that adds its token, so any
+  stop still running when the payment's section reads the tokens has already made
+  `live_worker()` `None` there, and the payment would return on that term anyway. Its refusal of
+  a set or foreign signal has no test of its own either. The mark being consumed once under the
+  leaf is held: `test_a_mark_paid_at_the_stops_end_is_not_paid_again_by_the_close` reddens when
+  `unmark` leaves the mark set, the close's discharge then handing the setter the signal again.
+- **The stop-end hand runs the setter on the `shutdown()` caller's thread, after the graced
+  wait.** Its time is that call's: a setter that itself calls `shutdown(timeout=1)` there made the
+  outer `shutdown(timeout=1)` take 2.02 s. Invariant 3 bounds a call by its budget plus the sink's
+  one in-flight call, and the setter is that call; the close-end payment already runs a setter
+  inside the `shutdown()` that discharged the close, the same way. `test_reentrant_stop_signal.py`'s
+  `stop-end` and `close-end` rows hold all five re-entrant calls to returning.
 - **`Worker.retarget`'s hand is the twin this does not cover.** A retarget hands its new sink the
   worker's own `_stop` after the reassign, asking nothing about a close of that sink in flight; a
   late worker built during a shutdown's close of S and retargeted back onto S while that close

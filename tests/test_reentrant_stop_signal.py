@@ -317,6 +317,140 @@ def _factory_forward(act: str) -> Callable[[], str]:
     return work
 
 
+class _SwappedOut(Plain):
+    """A sink whose first close — a swap's detached one — parks on ``go``; records its signals.
+
+    ``emit`` backs off up to 0.3 s on the signal it holds and records how long it waited, so a
+    set signal shows as a wait of nothing. With ``build_in_second_close`` its second close builds
+    the worker on another thread first, then backs off up to 4 s on its signal.
+    """
+
+    def __init__(self, *, build_in_second_close: bool = False) -> None:
+        super().__init__()
+        self.build_in_second_close = build_in_second_close
+        self.in_close = threading.Event()
+        self.go = threading.Event()
+        self.waits: list[float] = []
+        self.second_close_held_set: list[bool] = []
+        self.offers: list[threading.Event | None] = []
+        self.act: Callable[[], None] | None = None
+        self.armed = False
+        self._signal: threading.Event | None = None
+
+    @property
+    def log_foundry_stop_signal(self) -> threading.Event | None:
+        return self._signal
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+        self.offers.append(event)
+        self._signal = event
+        if self.armed and self.act is not None:
+            self.armed = False
+            self.act()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        from log_foundry.sinks import _retry
+
+        started = time.monotonic()
+        _retry.wait(0.3, self._signal)
+        self.waits.append(round(time.monotonic() - started, 1))
+        super().emit(batch)
+
+    def close(self) -> None:
+        if not self.closes:
+            self.in_close.set()
+            self.go.wait(GATE * 2)
+        elif self.build_in_second_close:
+            from log_foundry.sinks import _retry
+
+            tracer = threading.Thread(target=lambda: _traced()(), daemon=True)
+            tracer.start()
+            tracer.join(GATE)
+            held = self._signal
+            self.second_close_held_set.append(held is not None and held.is_set())
+            _retry.wait(4.0, held)
+        super().close()
+
+
+def _swapped_out_and_back(sink: _SwappedOut) -> None:
+    """Arms ``sink``, swaps it out — its close parks on a detached thread — and configures it again."""
+    from log_foundry import worker as worker_mod
+
+    worker_mod.DEFAULT_SWAP_TIMEOUT = 0.2
+    log_foundry.configure(service="t", sink=sink)
+    log_foundry.info("arms it")
+    log_foundry.configure(sink=Plain())
+    if not sink.in_close.wait(GATE):
+        raise AssertionError("the swap never started closing the sink")
+    log_foundry.configure(sink=sink)
+
+
+def _build_in_the_tail(sink: _SwappedOut) -> None:
+    """Runs a ``shutdown()`` whose tail builds a worker on ``sink``, whose swapped-out close runs on."""
+    real = _lifecycle._announce_unsettled
+
+    def build_in_the_tail(op: object) -> None:
+        _traced()()
+        real(op)  # type: ignore[arg-type]
+
+    _lifecycle._announce_unsettled = build_in_the_tail  # type: ignore[assignment]
+    try:
+        log_foundry.shutdown(timeout=1.0)
+    finally:
+        _lifecycle._announce_unsettled = real
+
+
+def _stop_end(act: str) -> Callable[[], str]:
+    """A worker built in a stop's tail on S, whose close outlives the stop: the stop's end hands S.
+
+    S's setter makes the call ``act`` names on that hand, which runs on the ``shutdown()``
+    caller's thread after the stop's graced wait, with no lock held.
+    """
+
+    def work() -> str:
+        sink, other = _SwappedOut(), Plain()
+        _swapped_out_and_back(sink)
+        sink.act = {**_acts(other), "trace": _traced()}[act]
+        sink.armed = True
+        report_from_child(ENTERED)
+        _build_in_the_tail(sink)
+        acted = not sink.armed
+        sink.go.set()
+        log_foundry.shutdown(timeout=GATE)
+        return f"acted={acted} other={len(other.events)}/{other.closes}"
+
+    return work
+
+
+def _close_end(act: str) -> Callable[[], str]:
+    """A worker built inside a ``shutdown()``'s inline close of S: that close's discharge hands S.
+
+    S's setter makes the call ``act`` names on that hand, which runs on the ``shutdown()``'s own
+    thread, inside that call, once the close is over.
+    """
+
+    def work() -> str:
+        sink, other = _SwappedOut(), Plain()
+        log_foundry.configure(service="t", sink=sink)
+        log_foundry.info("arms it")
+        stopper = threading.Thread(target=lambda: log_foundry.shutdown(timeout=GATE), daemon=True)
+        stopper.start()
+        if not sink.in_close.wait(GATE):
+            return "the close never started"
+        _traced()()
+        sink.act = {**_acts(other), "trace": _traced()}[act]
+        sink.armed = True
+        report_from_child(ENTERED)
+        sink.go.set()
+        stopper.join(GATE * 2)
+        acted = not sink.armed and not stopper.is_alive()
+        log_foundry.shutdown(timeout=GATE)
+        return f"acted={acted} other={len(other.events)}/{other.closes}"
+
+    return work
+
+
 _ROWS: dict[str, tuple[Callable[[], str], str]] = {
     "orphan-configure": (
         _orphan("configure"),
@@ -355,6 +489,16 @@ _ROWS: dict[str, tuple[Callable[[], str], str]] = {
     "retarget-flush": (_retarget("flush"), "b_named=False a_events=2 b_events=0"),
     **{f"fork-rebuild-{act}": (_fork_rebuild(act), "returned") for act in _acts(Plain())},
     **{f"factory-forward-{act}": (_factory_forward(act), "returned") for act in _acts(Plain())},
+    "stop-end-configure": (_stop_end("configure"), "acted=True other=0/1"),
+    "stop-end-info": (_stop_end("info"), "acted=True other=0/0"),
+    "stop-end-flush": (_stop_end("flush"), "acted=True other=0/0"),
+    "stop-end-shutdown": (_stop_end("shutdown"), "acted=True other=0/0"),
+    "stop-end-trace": (_stop_end("trace"), "acted=True other=0/0"),
+    "close-end-configure": (_close_end("configure"), "acted=True other=0/1"),
+    "close-end-info": (_close_end("info"), "acted=True other=0/0"),
+    "close-end-flush": (_close_end("flush"), "acted=True other=0/0"),
+    "close-end-shutdown": (_close_end("shutdown"), "acted=True other=0/0"),
+    "close-end-trace": (_close_end("trace"), "acted=True other=0/0"),
 }
 """Each path that hands a signal, by the call its setter makes, and what the child reports.
 
@@ -369,7 +513,11 @@ and that build leaves the hand to the one already running, so A's setter runs on
 The swap rows say whether the setter's ``configure()`` wrote the re-entrant ``pending`` line: the
 no-worker swap hands its sink inside ``config._sink_lock``, so a ``configure()`` from that setter
 is the re-entrant kind, which tries the lock once, swaps unconfirmed and announces it.
-The ``fork-rebuild`` rows hand the signal in a forked child's worker rebuild, which runs in the
+The ``stop-end`` rows hand it in the last stop's payment of a hand a worker build in that stop's
+tail declined, on the ``shutdown()`` caller's thread after its graced wait; the ``close-end`` rows
+in a close's discharge paying one a build declined inside a ``shutdown()``'s inline close, on that
+shutdown's own thread. In both, the setter's ``configure()`` closes the sink it installs at the
+final ``shutdown()``, with nothing written to it. The ``fork-rebuild`` rows hand the signal in a forked child's worker rebuild, which runs in the
 fork handler with the repaired locks free, and the ``factory-forward`` rows hand it through the
 factory wrapper's forward to its published sink, from the orphan log's hand; each only has to
 return. The retarget rows returned at ``624d817f`` too: ``Worker.retarget`` already handed outside every
@@ -1525,68 +1673,6 @@ def test_a_build_inside_a_setters_hand_still_marks_the_close() -> None:
     assert child.output == "holds_late=True", child.output
 
 
-class _SwappedOut(Plain):
-    """A sink whose first close — a swap's detached one — parks on ``go``; records its signals.
-
-    ``emit`` backs off up to 0.3 s on the signal it holds and records how long it waited, so a
-    set signal shows as a wait of nothing. With ``build_in_second_close`` its second close builds
-    the worker on another thread first, then backs off up to 4 s on its signal.
-    """
-
-    def __init__(self, *, build_in_second_close: bool = False) -> None:
-        super().__init__()
-        self.build_in_second_close = build_in_second_close
-        self.in_close = threading.Event()
-        self.go = threading.Event()
-        self.waits: list[float] = []
-        self.second_close_held_set: list[bool] = []
-        self._signal: threading.Event | None = None
-
-    @property
-    def log_foundry_stop_signal(self) -> threading.Event | None:
-        return self._signal
-
-    @log_foundry_stop_signal.setter
-    def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
-        self._signal = event
-
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        from log_foundry.sinks import _retry
-
-        started = time.monotonic()
-        _retry.wait(0.3, self._signal)
-        self.waits.append(round(time.monotonic() - started, 1))
-        super().emit(batch)
-
-    def close(self) -> None:
-        if not self.closes:
-            self.in_close.set()
-            self.go.wait(GATE * 2)
-        elif self.build_in_second_close:
-            from log_foundry.sinks import _retry
-
-            tracer = threading.Thread(target=lambda: _traced()(), daemon=True)
-            tracer.start()
-            tracer.join(GATE)
-            held = self._signal
-            self.second_close_held_set.append(held is not None and held.is_set())
-            _retry.wait(4.0, held)
-        super().close()
-
-
-def _swapped_out_and_back(sink: _SwappedOut) -> None:
-    """Arms ``sink``, swaps it out — its close parks on a detached thread — and configures it again."""
-    from log_foundry import worker as worker_mod
-
-    worker_mod.DEFAULT_SWAP_TIMEOUT = 0.2
-    log_foundry.configure(service="t", sink=sink)
-    log_foundry.info("arms it")
-    log_foundry.configure(sink=Plain())
-    if not sink.in_close.wait(GATE):
-        raise AssertionError("the swap never started closing the sink")
-    log_foundry.configure(sink=sink)
-
-
 def test_a_worker_built_in_a_stops_tail_is_handed_its_signal_when_the_stop_ends() -> None:
     """A build deferred in a stop's tail is paid by the last stop out, not by a close it outlives.
 
@@ -1658,3 +1744,30 @@ def test_a_build_inside_a_stops_second_pass_close_keeps_that_close_short() -> No
 
     child = run_in_child(work, timeout=40)
     assert child.output == "second_close_held_set=[True] quick=True", child.output
+
+
+def test_a_mark_paid_at_the_stops_end_is_not_paid_again_by_the_close() -> None:
+    """The stop's end consumes the mark, so the close's own discharge later hands nothing.
+
+    The close of S that the tail build marked is a swap's, still parked when the stop ends; the
+    stop's end hands S the live worker's signal and clears the mark. When the close is released
+    and discharges its entry, it must find no mark and leave S alone, so S's setter sees that
+    signal exactly once. A stop-end payment that left the mark set had the discharge hand it a
+    second time, running the setter again for nothing.
+    """
+
+    def work() -> str:
+        sink = _SwappedOut()
+        _swapped_out_and_back(sink)
+        _build_in_the_tail(sink)
+        live = _lifecycle._state.live_worker()
+        sink.go.set()
+        deadline = time.monotonic() + GATE
+        while _lifecycle._state._closes.in_flight(sink) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        time.sleep(0.1)
+        handed = 0 if live is None else sum(1 for event in sink.offers if event is live._stop)
+        return f"closed={sink.closes} late_signal_handed={handed}"
+
+    child = run_in_child(work, timeout=40)
+    assert child.output == "closed=1 late_signal_handed=1", child.output

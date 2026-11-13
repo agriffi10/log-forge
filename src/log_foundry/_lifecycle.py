@@ -2360,7 +2360,10 @@ def _pay_marks_after_stop() -> None:
     only when it finds no other stop running under ``_state._lock`` — hands the live worker's
     sink the worker's own signal and clears the mark (:meth:`_CloseRegistry.unmark`), so the
     close's own discharge later pays nothing. Two stops finishing together each ask under the
-    lock, and the mark is consumed once, so only one hands. With no stop left, nothing awaits
+    lock, and the mark is consumed once, so only one hands. The locked re-read of the stop tokens
+    is a defensive guard, unreachable as the code stands: a stop's entry retires the one worker
+    in the same section that adds its token, so any stop running when this section reads them
+    leaves :meth:`Runtime.live_worker` already ``None`` here. With no stop left, nothing awaits
     that close on the signal, which is the moment the build would have handed it before the
     deferral; so this skips only :func:`_will_hand`'s refusal of a sink whose close is in flight,
     and keeps every other term: the worker is live and draining into the sink, its ``_stop`` is
@@ -3226,10 +3229,11 @@ def _hand_out(sinks: list[Sink], event: threading.Event) -> None:
     """Hands each sink the stop signal its deciding section chose, holding no lifecycle lock.
 
     The only library lock a caller may still hold across it is ``config._sink_lock``, which a
-    setter's own ``configure()`` never waits on, and it reaches here held by two routes: the
-    no-worker swap's ``configure()``, handing its new sink, and a deferred hand paid
-    (:func:`_hand_after_close`) by a ``shutdown()`` that a sink's own code ran on a swap's thread,
-    which holds that lock across the whole swap. Each sink is marked as being handed on this
+    setter's own ``configure()`` never waits on, and it reaches here held by three routes: the
+    no-worker swap's ``configure()``, handing its new sink; a deferred hand paid at a close's
+    discharge (:func:`_hand_after_close`) by a ``shutdown()`` that a sink's own code ran on a
+    swap's thread, which holds that lock across the whole swap; and a stop-end payment
+    (:func:`_pay_marks_after_stop`) by such a ``shutdown()``, run inside a swap's setter. Each sink is marked as being handed on this
     thread (:func:`handing`) for the length of its hand, so a setter that logs to it, or builds
     the worker on it, does not hand it again. Every caller has already asked
     :func:`handing_here`, through :func:`_will_hand` or directly.
@@ -3859,7 +3863,12 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
       None.
 
     Raises:
-      None.
+      BaseException: What a sink's stop-signal setter raised that :func:`offer_stop_signal` does
+        not absorb, during a deferred hand this call pays — at a close's discharge
+        (:func:`_hand_after_close`) or at the stop's end (:func:`_pay_marks_after_stop`). Both
+        run inside a ``finally``, so such a ``KeyboardInterrupt`` or ``SystemExit`` replaces an
+        exception already unwinding. The same pair raised by an inline ``close()`` escapes too
+        (:func:`_close_owed`).
     """
     op = _Operation(_Op.STOP, timeout)
     claimed = False
