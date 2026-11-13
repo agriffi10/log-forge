@@ -283,7 +283,8 @@ suite also passed under that patch, which gave the payment the widened read too.
 - [ ] A child forked by a thread inside no offer, with a live worker on a sink that does not
   subclass `Sink`, still has its resumed worker hand that sink the child's signal: the sink holds
   `_state._stop` after the fork.
-- [ ] `tests/test_reentrant_stop_signal.py` and `tests/test_fork_lifecycle.py` pass unchanged.
+- [ ] `tests/test_reentrant_stop_signal.py` and `tests/test_fork_lifecycle.py` pass with their
+  assertions unchanged.
 - [ ] Invariants 3, 6 and 12: no child waits forever on a lock its own setter frame holds, on any
   hand path.
 

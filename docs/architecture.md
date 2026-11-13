@@ -1996,9 +1996,10 @@ and a third copy is a fork with no merge.
     sink the walk cannot enter. The one exception is a sink the forking thread was being offered
     (SPEC-083). The child runs nested inside that sink's setter call, so the rebuild skips it, and
     the child's `shutdown()` sets the event that sink holds instead. §13 has the entry *A child
-    forked inside a stop-signal setter keeps the event it was being offered*. A **shipped** sink held inside a third-party wrapper is repaired
-    and re-acquired since SPEC-079, from the forwarded seeds, within the marking ceiling; past a
-    tripped ceiling it is neither. Its `SinkCounters`, and every engine sink's, are repaired
+    forked inside a stop-signal setter keeps the event it was being offered*. A **shipped** sink
+    held inside a third-party wrapper is repaired and re-acquired since SPEC-079, from the
+    forwarded seeds, within the marking ceiling; past a tripped ceiling it is neither. Its
+    `SinkCounters`, and every engine sink's, are repaired
     whatever holds them, from a registry of the live ones.
   - **A package object reachable only through a callable is neither repaired nor marked**
     (SPEC-079). A third-party wrapper that keeps `self._emit = file_sink.emit`, a closure cell or

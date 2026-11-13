@@ -30,8 +30,6 @@
   - One docstring in `tests/test_reentrant_stop_signal.py`
     (`test_a_paid_hand_never_runs_a_setter_inside_itself`) is reworded, with its assertions
     unchanged.
-- Commits: `999c4844` (In Progress), `6bffa5de` (Phase 1), `599b3812` (Phase 2), `bc4bef0a`
-  (FR-005 docstrings), then the completion commit.
 
 ## What changed from earlier specs?
 
@@ -53,6 +51,6 @@
   append, the pop in `finally`, and a resume that never offers. M11, the payment given the widened
   read, survived the full suite. It is equivalent, by the spec's argument that no reachable state
   tells the two readings apart.
-- Gates as the implementer reported them, all exiting 0 at `bc4bef0a`: `pytest` (9800 passed, 34
+- Gates as the implementer reported them, all exiting 0 on the branch's head before the push: `pytest` (9800 passed, 34
   skipped on 3.13.1), the five fork-related files on 3.12.12 (703 passed), ruff, mypy, spec-lint,
   docs-lint and docstring-lint.
