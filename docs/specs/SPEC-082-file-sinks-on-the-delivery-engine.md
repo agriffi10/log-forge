@@ -112,7 +112,9 @@ landed. Measured at `c21755f1`, CPython's `BufferedWriter` sometimes kept the un
 wrote them at its next flush. At other caps it discarded them, and the next write was appended to
 a line cut in half. Either way it never says how many bytes reached the file. The unbuffered write
 of the joined bytes measured no slower than today's `emit` (0.84 ms against 0.94 ms per
-1,000-event batch, encode included, on one machine in one run). A write that the kernel accepts
+1,000-event batch, encode included, on one machine in one run). That is the write alone: the
+engine's per-run bookkeeping around it, mostly `encode_round`'s per-run cache, makes the whole
+`emit` slower than 1.x's, which is what the timing criterion below bounds. A write that the kernel accepts
 partially returns the exact count before the next call raises: under a 10,500-byte cap, one call
 returned `10500` and the next raised `EFBIG`.
 
@@ -139,9 +141,10 @@ returned `10500` and the next raised `EFBIG`.
       resent round writes the byte order mark first and the file holds exactly one.
 - [ ] `FileSink(path, encoding="no-such-codec")` and `FileSink(path, encoding="base64")` both
       raise `LookupError` at construction.
-- [ ] The delivery doc records the median time of a 1,000-event batch through `emit`, before and
-      after this spec, on one machine in one run. The after time is no more than 1.25 times the
-      before.
+- [ ] The delivery doc records at least five interleaved before-and-after pairs of the median time
+      of a 1,000-event batch through `FileSink.emit`, on one machine, each a median of its own runs.
+      The median of the pairs' ratios is no more than 2.0. A prototype measured 1.50 to 1.56 times,
+      so 2.0 leaves the build about a third in headroom (*Revision history*).
 - [ ] The rule above keeps invariants 7 and 2: no event a round called `ACCEPTED` is written again,
       and no event that did not land is called `ACCEPTED`.
 
@@ -481,3 +484,28 @@ tests/
 - **2026-11-13, SPEC-084 authored.** *Out of Scope*'s first bullet said the two specs share no
   code path; SPEC-084 reuses this spec's `raise_on_failure`, so it now says the sibling depends on
   this one and builds after it.
+- **2026-11-13, timing bound measured.** FR-001's timing criterion asked for the after time to be
+  no more than 1.25 times the before, from one measurement. SPEC-084's review had measured its
+  stream-sink prototype at 1.52 to 1.69 times, so this one was measured before the build. The
+  prototype subclassed `FileSink` at `717d0c68` with this spec's round: the unbuffered binary
+  handle, each event encoded once per run through `encode_round`, the round's events passed to
+  `mark_sent`, the joined bytes written in as many write calls as the kernel needed, each event's
+  outcome taken from the bytes those calls returned, and the run-notes and tail checks on every
+  round. It ran through `emit_via_deliver` against 1.x's `FileSink.emit`, with 1,000 events of
+  313 to 316 bytes each, on Python 3.13.1, macOS, load average about 4. Each figure is the median
+  of its own runs, and pairs alternate which side runs first:
+
+  | pairs | runs per side | before (ms) | after (ms) | median ratio | range |
+  |---|---|---|---|---|---|
+  | 9 | 100 | 1.73 to 1.84 | 2.65 to 2.77 | 1.50 | 1.47 to 1.57 |
+  | 7 | 200 | 1.81 to 1.89 | 2.83 to 2.87 | 1.56 | 1.51 to 1.57 |
+
+  Without `mark_sent` the nine pairs gave 1.38 (1.34 to 1.43). A profile put about a third of the
+  after time in `encode_round`'s own bookkeeping and under half in the `json.dumps` it wraps, with
+  `mark_sent` near 7% and the write itself small, so the cost is the engine's per-run cache, as
+  SPEC-084 found, and 1.25 times cannot be met while this spec adds nothing to `encode_round`. The
+  bound is now 2.0 times, the same as SPEC-084's, judged on the median ratio of at least five
+  interleaved pairs, because SPEC-084's single runs reached 2.49 and 3.52 times under load. The
+  gap from 1.56 to 2.0 is headroom for whatever a full build's round carries on the success path
+  that the prototype did not, such as the byte order mark's bookkeeping. The 0.84 against 0.94 ms
+  figure under FR-001 measured the write alone, not the engine around it.
