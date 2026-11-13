@@ -36,12 +36,22 @@ still snapshots and waits on the bystanders as before. `_shutdown_worker`, after
 picks the worker to stop — the late worker it popped, or else the one its take declined for — and,
 in the section that already retired a late worker, moves the retirement count only if that worker
 is still live, claims its stop with the call's deadline, and sets its event, which is the current
-signal. After a decline it then takes again at once without a bystander wait, so the owed sinks
-close on that set event **while the worker drains**; then it joins the worker, passing `op.budget`
-when it won the claim, and the final pass closes the worker's own sink, as the second pass always
-did. Once the section has set the event nothing replaces a set signal while a take is ahead and no
-second worker is built, so no later take of the call declines: at most three takes, the first, the
-retake and the final pass.
+signal. After a decline it then takes again at once, so the owed sinks close on that set event
+**while the worker drains**; then it joins the worker, passing `op.budget` when it won the claim,
+and the final pass closes the worker's own sink, as the second pass always did. The retake is the
+call's first take that takes anything, so it **waits on closes somebody else has in flight, as a
+first pass does** (SPEC-050 FR-002, invariant 5): a second stop entering between the decline and
+the retake can take an owed sink first, and a retake that did not wait returned through that
+close with the sink still open. Its wait ends at the call's one `grace_end`, so no second grace is
+spent; the final pass after the join still never waits.
+
+**At most two rounds and four `_close_owed` calls.** A round with a worker to stop sets that
+worker's event, which is then `_state._stop`; nothing replaces a set signal while a take is ahead
+and no second worker is built, so no later take of the call declines. A round with none, which
+runs because the first pass waited, can meet a decline in its final pass, from a worker built
+after the no-worker `finally` and before that take; the second round stops it. Counted on the
+tail route: the first pass, a final pass that declines, the retake (waiting) and the final pass —
+four calls in two rounds, one of them declining and taking nothing.
 
 `op.drained` is never set while `op.publishing_worker` is, in the take's section and in the
 no-worker `finally` alike, so the hands keep handing the set signal through the worker's join, as
@@ -79,6 +89,9 @@ Mutation, each against the whole test module, a survivor confirmed on the whole 
 - `drained` set in the no-worker `finally` of a stop whose own late worker another stop popped:
   `test_a_stop_that_declined_keeps_its_take_ahead_after_the_stop_that_popped_its_worker_ends` red,
   the same 4 s;
+- the retake without its bystander wait (as at `1e559923`):
+  `test_a_declined_stops_retake_waits_for_a_close_another_stop_started` red, the declined stop
+  returning before another stop's 1 s close of R had finished;
 - the token-set term or the identity term dropped: the whole suite green but for the predicate
   roster's re-keyed text. Both are guards, below.
 
@@ -148,6 +161,10 @@ every parent-process route; its job is the fork exclusion above.
 
 ### 2026-11-13
 
+- **Refined** the same day, after the system-frame diff review: the retake after a decline waits
+  on closes another caller has in flight, as a first pass does, since it is the call's first take
+  that takes anything; and the loop is bounded at two rounds and four `_close_owed` calls, not
+  one round and three takes, which the tail route exceeded.
 - **Settled**, as a fix after SPEC-079, closing the late-build case both
   `a-hand-while-a-stop-has-a-take-ahead-hands-the-current-signal-and-never-refreshes-it.md` and
   `a-hand-the-worker-build-declines-for-a-close-in-flight-is-paid-when-that-close-finishes.md`

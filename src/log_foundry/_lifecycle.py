@@ -4610,7 +4610,12 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     nothing about a close this call did not make. The caller sets the worker's event, which is
     the current signal, and takes again, so every sink this call closes holds a set event when
     its close starts, whichever hand gave it that event and in whatever order the setters
-    finished.
+    finished. That retake is the call's first real take, so it **waits on the closes somebody
+    else has in flight, as a first pass does** (SPEC-050 FR-002): another stop entering between
+    the decline and the retake can take an owed sink first, and a retake that did not wait
+    returned through that close with the sink still open — measured, with a 1 s close, at 0.00 s
+    and ``closes=0``. Its wait ends at the call's one ``grace_end``, so no second grace is spent,
+    and the retake still leaves ``op.drained`` alone, because the final pass follows the join.
 
     **It records the call's last take** (SPEC-078 FR-004): in the take's own critical section,
     ``op.drained`` is set when no further take of this call can follow — the final pass, or a
@@ -4628,8 +4633,9 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
         call's one ``grace_end``. ``None`` only for a direct call from a test, which gets an
         unbounded operation of its own, as the old ``deadline=None`` default gave it.
       bystander_wait: Whether to wait on closes somebody else had in flight. ``False`` for
-        :func:`_shutdown_worker`'s later passes — the retake after a decline and the final pass —
-        which run only when there is something for them to do and must never wait a second time.
+        :func:`_shutdown_worker`'s final pass, which runs only when there is something for it to
+        do and must never wait a second time; the retake after a decline waits, as a first pass
+        does, since it is the call's first take that takes anything.
 
     Returns:
       Whether it waited on a close it did not perform, which is what tells its caller a second
@@ -4919,10 +4925,11 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     current signal was that worker's unset event, which a hand may already have delivered to a
     sink the take would have closed. One critical section moves the count if the worker is still
     live, claims its stop with this call's deadline and sets its event, which is the current signal;
-    after a decline the call then takes again at once, without a bystander wait, so the owed
-    sinks close on that set event **while the worker drains**, inside the call's budget, rather
-    than after its join; then it joins the worker, and the final pass closes the worker's own
-    sink, as the second pass always did. Joining first was measured: a 0.5 s close of the owed
+    after a decline the call then takes again at once, waiting on closes somebody else has in
+    flight as a first pass does, so the owed sinks close on that set event **while the worker
+    drains**, inside the call's budget, rather than after its join; then it joins the worker, and
+    the final pass closes the worker's own sink, as the second pass always did. Joining first was
+    measured: a 0.5 s close of the owed
     sink behind a late worker whose ``emit`` slept 3 s took ``shutdown(timeout=1)`` to 1.51 s,
     the close starting after the deadline, against 1.01 s in this order and 1.00 s to 1.01 s at
     ``864d71e5``, which closed that sink before stopping the worker. Setting the event in the
@@ -4936,15 +4943,19 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     An interrupt raised inside that section between the claim and the set leaves the event
     unset; it is a few bytecodes under ``_state._lock`` and is excluded rather than closed.
 
-    **A later pass runs only when there is something for it to do** — the first waited on a
-    close somebody else held, or a worker built since the entry was stopped — and none waits
+    **A final pass runs only when there is something for it to do** — the first waited on a
+    close somebody else held, or a worker built since the entry was stopped — and it never waits
     itself. Run unconditionally it defeats FR-002's two-caller criterion: the first caller, just
     out of its own inline close, re-takes the re-armed sink before the bystander returns from
-    its wait. The loop ends after one round: once the section has set the worker's event,
-    the event is ``_state._stop``, and nothing replaces a set signal while a take is ahead
-    (:func:`_refreshes`, :func:`_swap_sink`'s decline) and nothing builds a second worker, so no
-    later take of the call can decline. A call therefore takes at most three times: the first
-    pass, the retake after a decline, and the final pass.
+    its wait. **The loop runs at most two rounds.** A round with a worker to stop sets that
+    worker's event, which is then ``_state._stop``; nothing replaces a set signal while a take
+    is ahead (:func:`_refreshes`, :func:`_swap_sink`'s decline) and nothing builds a second
+    worker, so no later take of the call can decline. A round with none — the first pass only
+    waited — can meet a decline in its final pass, from a worker built after the no-worker
+    ``finally`` and before that take, and the second round then stops that worker. So a call
+    makes at most four calls of :func:`_close_owed` — the first pass, a final pass that
+    declines, the retake and the final pass, on that tail route — and at most one of them
+    declines and takes nothing.
 
     **The closer grace is spent once per call** (SPEC-078 FR-002). Every graced wait of the call —
     the first pass's bystander wait and the graced join at the end — ends at the operation's one
@@ -5050,7 +5061,7 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
                     claimed = stopping_worker.claim_stop(op.deadline)
                     stopping_worker._stop.set()
                 if op.publishing_worker is not None:
-                    _close_owed(op, bystander_wait=False)
+                    _close_owed(op)
                 stopping_worker.stop(
                     op.budget if claimed else _remaining(op.deadline), claimed=claimed
                 )

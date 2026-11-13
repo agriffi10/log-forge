@@ -2427,6 +2427,82 @@ def test_a_stop_keeps_its_take_ahead_through_the_join_of_a_worker_its_take_decli
     assert child.output == "take_ahead=True ['close:E0:set'] quick=True", child.output
 
 
+def test_a_declined_stops_retake_waits_for_a_close_another_stop_started() -> None:
+    """The retake after a decline waits on a close in flight, as a first pass does (invariant 5).
+
+    R is owed and its ``close()`` takes 1 s. A no-worker ``shutdown(timeout=3.0)`` on ``one`` is
+    parked before its first take while ``configure(sink=S2)`` and a ``@trace`` build the late
+    worker; released, its take declines and it is parked again as that first ``_close_owed``
+    returns. A second ``shutdown(timeout=3.0)`` on ``two`` then enters on the worker branch and
+    starts closing R. ``one`` goes on: its retake finds R's close in flight, and must wait for
+    it rather than return through it with R still open (SPEC-050 FR-002). At ``1e559923`` the
+    retake did not wait: ``one`` returned before R's close finished. Green at ``864d71e5``, where
+    ``one`` took R in its first pass, before any decline existed.
+    """
+
+    def work() -> str:
+        closed_at: list[float] = []
+        in_close = threading.Event()
+
+        class SlowClose(Plain):
+            def close(self) -> None:
+                in_close.set()
+                time.sleep(1.0)
+                super().close()
+                closed_at.append(time.monotonic())
+
+        r = SlowClose()
+        log_foundry.configure(service="t", sink=r)
+        log_foundry.info("arms R")
+        entered, go = _park("_await_swap_decisions", 0)
+        real_close = _lifecycle._close_owed
+        after, go_after = threading.Event(), threading.Event()
+        first: list[bool] = []
+
+        def close_owed(*args: object, **kwargs: object) -> bool:
+            result = real_close(*args, **kwargs)  # type: ignore[arg-type]
+            if threading.current_thread().name == "one" and not first:
+                first.append(True)
+                after.set()
+                go_after.wait(GATE)
+            return result
+
+        _lifecycle._close_owed = close_owed  # type: ignore[assignment]
+        returned: dict[str, float] = {}
+
+        def stop(name: str) -> None:
+            log_foundry.shutdown(timeout=3.0)
+            returned[name] = time.monotonic()
+
+        one = threading.Thread(target=stop, args=("one",), name="one", daemon=True)
+        one.start()
+        if not entered.wait(GATE):
+            return "one never parked before its take"
+        log_foundry.configure(sink=Plain())
+        _traced()()
+        go.set()
+        if not after.wait(GATE):
+            return "one's first take never returned"
+        declined = _lifecycle._state._take_ahead()
+        two = threading.Thread(target=stop, args=("two",), name="two", daemon=True)
+        two.start()
+        if not in_close.wait(GATE):
+            return "two never started closing R"
+        go_after.set()
+        one.join(GATE * 2)
+        two.join(GATE * 2)
+        waited = bool(closed_at) and "one" in returned and returned["one"] >= closed_at[0]
+        return (
+            f"take_ahead_after_decline={declined} one_returned_after_r_closed={waited} "
+            f"r_closes={r.closes}"
+        )
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == (
+        "take_ahead_after_decline=True one_returned_after_r_closed=True r_closes=1"
+    ), child.output
+
+
 def test_a_late_workers_expiry_line_names_the_timeout_the_caller_gave() -> None:
     """A late worker's join that expires writes the caller's ``timeout``, as the worker path does.
 
