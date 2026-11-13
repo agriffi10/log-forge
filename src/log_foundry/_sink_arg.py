@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import types
 import weakref
 from itertools import islice
 
 from log_foundry import _diag, _fork
-from log_foundry.sinks.base import _MRO, _NAMESPACE, _instance_dict
+from log_foundry.sinks.base import _MRO, _NAMESPACE, _class_member, _instance_dict
 
 _UNPATCHABLE: tuple[type, ...] = (
     object,
@@ -278,46 +279,75 @@ def loop_in(root: object, *, back_to: object | None = None) -> object | None:
     return None
 
 
-def only_package_sinks(root: object) -> bool:
-    """Answers whether every sink the graph from ``root`` forwards to is exactly a package class.
+def package_graph(root: object) -> frozenset[int] | None:
+    """Returns the ids of the package's own sinks the graph from ``root`` forwards to, or ``None``.
 
-    The receiver half of a final refusal's provenance (``sinks/_refusal.is_final_refusal``). A
-    sink of the caller's own can choose where ``emit`` goes without leaving a frame in the
-    refusal's traceback — a ``__getattr__`` proxy, ``self.emit = inner.emit`` rebound on a swap,
-    a property returning the inner sink's bound method, or a subclass of a shipped sink that
-    re-initialises itself and inherits ``emit`` — and measured on each, the 1.x resend delivered
-    through the fresh destination the caller had swapped in. So the mark is honoured only when
-    no such object is on the path: every node, from ``root`` through the package wrappers'
-    forwarding positions (:func:`_forwards_to`), has an exact type defined in this package, and
-    none carries an ``emit`` in its own instance ``__dict__``.
+    The receiver half of a final refusal's provenance (``sinks/_refusal.is_final_refusal``): the
+    refusal is honoured only when the sink that refused is in this set, so only when the library
+    itself forwarded the batch to it. A sink of the caller's own can choose where ``emit`` goes
+    without leaving a frame in the refusal's traceback, and the diff reviews measured every shape
+    below delivering on 1.x's resend through a fresh sink the caller had swapped in, where
+    honouring the mark lost the batch: a ``__getattr__`` proxy, ``self.emit = inner.emit``
+    rebound on a swap, a property returning a bound ``emit``, a subclass of a shipped sink that
+    re-initialises itself, a ``CallbackSink`` whose callable dispatches through a property, a
+    class that declares ``__module__ = "log_foundry..."``, ``FileSink.emit`` replaced on the
+    class, and an ``emit`` planted in an instance ``__dict__`` under a ``str`` subclass key.
+
+    So the walk answers ``None``, meaning "not the package's own", unless every node reached from
+    ``root`` through the package wrappers' forwarding positions (:func:`_forwards_to`) has an
+    exact type defined in this package (``_fork._defined_here``), whose ``emit``, found along its
+    MRO's own namespaces, is exactly a plain function — not a property or other descriptor, which
+    can route the call and return before it — and whose instance ``__dict__`` holds only exact
+    ``str`` keys and none named ``emit``. Where that function was written is not checked: a plain
+    function runs in a frame of its own, so one written outside the package is in the refusal's
+    traceback and fails the traceback half; a filename test here was measured redundant (its
+    mutant survived every case).
+    A refuser need not be a forwarding node: ``SyslogSink`` and socket-mode ``LogstashSink`` hold
+    the ``SocketTransport`` that refuses in an attribute, so each node's instance ``__dict__``
+    values are in the set too — never walked further, since only a forwarding position forwards.
+    A ``CallbackSink`` forwards nothing, so a sink its callable reaches is never in the set.
 
     The walk is static, as :func:`loop_in`'s is: no node's code runs. A ``super`` or a
-    ``weakref.proxy`` is not a package type, so either answers False, and so does a graph past
-    :data:`_LOOP_CEILING` visits. Every doubt answers False, which costs only the 1.x resend.
+    ``weakref.proxy`` is not a package type, a graph past :data:`_LOOP_CEILING` visits is not
+    walked, and an unreadable node is doubt; each answers ``None``, which costs only the 1.x
+    resend.
 
     Args:
       root: The sink whose ``emit`` the catcher called.
 
     Returns:
-      True only when the whole forwarding graph is the package's own, untouched.
+      The ids of every node and of every value its instance ``__dict__`` holds, or ``None`` when
+      any node is not exactly the package's own, untouched.
 
     Raises:
       None.
     """
-    seen: set[int] = set()
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        if len(seen) > _LOOP_CEILING or not _fork._defined_here(type(node)):
-            return False
-        own = _instance_dict(node)
-        if own is not None and any(type(key) is str and key == "emit" for key in dict.keys(own)):
-            return False
-        stack.extend(_forwards_to(node))
-    return True
+    try:
+        held: set[int] = set()
+        seen: set[int] = set()
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            cls = type(node)
+            if len(seen) > _LOOP_CEILING or not _fork._defined_here(cls):
+                return None
+            found = _class_member(cls, "emit")
+            if found is None or type(found[0]) is not types.FunctionType:
+                return None
+            held.add(id(node))
+            own = _instance_dict(node)
+            if own is not None:
+                for key, value in dict.items(own):
+                    if type(key) is not str or key == "emit":
+                        return None
+                    held.add(id(value))
+            stack.extend(_forwards_to(node))
+        return frozenset(held)
+    except Exception:
+        return None
 
 
 def require_sink(value: object, name: str, *, owner: object | None = None) -> None:

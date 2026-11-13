@@ -270,6 +270,7 @@ class FileSink:
                 with self._guard.enter() as section:
                     if not section:
                         raise final_refusal(
+                            self,
                             f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
                         )
                     if not lines:
@@ -602,6 +603,7 @@ class RotatingFileSink:
                 with self._guard.enter() as section:
                     if not section:
                         raise final_refusal(
+                            self,
                             f"RotatingFileSink wrote none of {len(batch)} event(s): "
                             "the sink is closed"
                         )

@@ -408,6 +408,7 @@ class MongoDBSink:
             if not section:
                 run_context().refuse(
                     final_refusal(
+                        self,
                         f"MongoDBSink inserted none of {len(batch)} document(s): "
                         "the sink is closed"
                     )

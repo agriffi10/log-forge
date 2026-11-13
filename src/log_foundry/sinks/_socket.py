@@ -390,6 +390,7 @@ class SocketTransport:
             if not section:
                 run_context().refuse(
                     final_refusal(
+                        self,
                         f"SocketTransport delivered none of {len(batch)} message(s): "
                         f"the transport is closed"
                     )

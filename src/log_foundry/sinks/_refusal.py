@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Final
 
-from log_foundry._sink_arg import only_package_sinks
+from log_foundry._sink_arg import package_graph
 from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["final_refusal", "is_final_refusal"]
@@ -12,11 +12,14 @@ __all__ = ["final_refusal", "is_final_refusal"]
 _MARK: Final = "_log_foundry_final_refusal"
 """The instance attribute the mark is stored under, read back only by :func:`is_final_refusal`."""
 
+_REFUSER: Final = "_log_foundry_refuser"
+"""The instance attribute holding the ``id`` of the sink that refused, an ``int`` so the error pickles."""
+
 _PACKAGE: Final = "log_foundry"
 """The package whose frames alone may carry a final refusal from its raise to its catcher."""
 
 
-def final_refusal(message: str) -> SinkDeliveryError:
+def final_refusal(refuser: object, message: str) -> SinkDeliveryError:
     """Builds the ``SinkDeliveryError`` a shipped sink raises for a batch no retry can deliver.
 
     A closed or closing sink refuses every batch for the rest of its life (SPEC-032, SPEC-076),
@@ -34,7 +37,12 @@ def final_refusal(message: str) -> SinkDeliveryError:
     the public surface grows (invariant 10), and a sink of the caller's own cannot opt in by
     accident.
 
+    The refusing sink is recorded by ``id``, never by reference, so the error still pickles and
+    keeps no sink alive; :func:`is_final_refusal` honours the mark only when that sink is one the
+    library itself forwarded the batch to.
+
     Args:
+      refuser: The sink that refuses, ``self`` at every call site.
       message: The refusal's text, which names a type and counts, never a value (invariant 11).
 
     Returns:
@@ -45,6 +53,7 @@ def final_refusal(message: str) -> SinkDeliveryError:
     """
     err = SinkDeliveryError(message)
     vars(err)[_MARK] = True
+    vars(err)[_REFUSER] = id(refuser)
     return err
 
 
@@ -64,14 +73,15 @@ def is_final_refusal(err: BaseException, sink: object) -> bool:
     ``contextlib`` frame for the closed guard's ``with``: a direct closed sink, and one behind
     ``MultiSink`` or ``TransformSink``. An error never raised has no traceback and passes.
 
-    **And the sink the catcher called is the package's own, all the way down**
-    (:func:`~log_foundry._sink_arg.only_package_sinks`). The traceback alone cannot see a sink of
-    the caller's own that forwards ``emit`` by attribute — a ``__getattr__`` proxy, a rebound
-    ``self.emit``, a property, a re-initialising subclass that inherits ``emit`` — since that
-    forwarding returns before the call and leaves no frame; measured on all of them, 1.x's resend
-    reached the fresh sink the caller had swapped in. Each half covers what the other cannot: the
-    traceback a caller's code that runs during the call (a re-raise, a ``CallbackSink``
-    callback), the receiver a caller's object that only chose where the call went.
+    **And the sink that refused is one the library forwarded the batch to**
+    (:func:`~log_foundry._sink_arg.package_graph`): the graph the catcher called is the package's
+    own all the way down, and it holds the refuser. The traceback alone cannot see a sink of the
+    caller's own that chooses where ``emit`` goes and returns before the call, leaving no frame —
+    a ``__getattr__`` proxy, a rebound ``self.emit``, a property, a ``CallbackSink`` callable that
+    dispatches through one — and measured on each, 1.x's resend reached the fresh sink the caller
+    had swapped in. A refuser the library did not forward to is never in the graph, whatever
+    routed the call to it. The traceback half stays for a caller's code that runs during the call
+    and re-raises a refusal it caught from a sink inside the graph.
 
     Total by construction: the exact-type test runs first and cannot raise, so an exception of
     any other class, a hostile ``__getattribute__`` or ``__dict__`` included, is never read
@@ -82,8 +92,8 @@ def is_final_refusal(err: BaseException, sink: object) -> bool:
       sink: The sink whose ``emit`` the catcher called.
 
     Returns:
-      True only for an exact marked ``SinkDeliveryError`` raised and carried by this package, from
-      a sink graph that is the package's own.
+      True only for an exact marked ``SinkDeliveryError`` raised and carried by this package, by
+      a sink in a graph that is the package's own and that the catcher called.
 
     Raises:
       None.
@@ -99,4 +109,6 @@ def is_final_refusal(err: BaseException, sink: object) -> bool:
         ):
             return False
         frame = frame.tb_next
-    return only_package_sinks(sink)
+    graph = package_graph(sink)
+    refuser = vars(err).get(_REFUSER)
+    return graph is not None and type(refuser) is int and refuser in graph

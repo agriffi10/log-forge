@@ -265,6 +265,7 @@ class _RedisSink:
             if not section:
                 run_context().refuse(
                     final_refusal(
+                        self,
                         f"{type(self).__name__} delivered none of {len(batch)} event(s): "
                         "the sink is closed"
                     )

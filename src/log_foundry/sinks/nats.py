@@ -804,6 +804,7 @@ class NATSSink:
                 report = self._run(self._round_on_loop(batch), self.publish_timeout + CALL_SLACK)
             except _LoopWedgedError as err:
                 wedged = final_refusal(
+                    self,
                     f"NATSSink published none of {len(batch)} event(s) within "
                     f"{self.publish_timeout + CALL_SLACK}s: the loop is wedged and the sink is "
                     "now closed"
@@ -914,12 +915,13 @@ class NATSSink:
         """
         if os.getpid() != self._pid:
             return Outcome.REJECTED, final_refusal(
+                self,
                 f"{prefix}: a forked child acquired no connection"
             )
         if self._closed:
-            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closed")
+            return Outcome.REJECTED, final_refusal(self, f"{prefix}: the sink is closed")
         if self._closing:
-            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closing")
+            return Outcome.REJECTED, final_refusal(self, f"{prefix}: the sink is closing")
         if self._latched():
             return Outcome.RETRYABLE, SinkDeliveryError(
                 f"{prefix}: the server has not answered a PING, and the stall it measures has "
@@ -1028,9 +1030,9 @@ class NATSSink:
           None.
         """
         if self._closed:
-            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closed")
+            return Outcome.REJECTED, final_refusal(self, f"{prefix}: the sink is closed")
         if self._closing:
-            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closing")
+            return Outcome.REJECTED, final_refusal(self, f"{prefix}: the sink is closing")
         stuck = self._stuck_refusal(prefix)
         return None if stuck is None else (Outcome.RETRYABLE, stuck)
 
@@ -1762,6 +1764,7 @@ class NATSSink:
                 self._run(self._flush_on_loop(), self.publish_timeout + CALL_SLACK)
             except _LoopWedgedError as err:
                 raise final_refusal(
+                    self,
                     f"NATSSink cannot flush: no answer within {self.publish_timeout + CALL_SLACK}s,"
                     " the loop is wedged and the sink is now closed"
                 ) from err

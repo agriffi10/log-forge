@@ -253,6 +253,7 @@ class GooglePubSubSink:
             return
         if self._closed:
             raise final_refusal(
+                self,
                 f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed"
             )
         with Deferral(self) as pending:
@@ -646,7 +647,7 @@ class GooglePubSubSink:
           SinkDeliveryError: The sink is closed, or a publish was still in flight afterwards.
         """
         if self._closed:
-            raise final_refusal("GooglePubSubSink cannot flush: the sink is closed")
+            raise final_refusal(self, "GooglePubSubSink cannot flush: the sink is closed")
         with self._futures_lock:
             pending, self._futures = self._futures, []
         if not pending:

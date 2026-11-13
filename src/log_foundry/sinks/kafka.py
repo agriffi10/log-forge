@@ -297,6 +297,7 @@ class KafkaSink:
         with self._guard.enter() as section:
             if not section:
                 raise final_refusal(
+                    self,
                     f"KafkaSink produced none of {len(batch)} message(s): the sink is closed"
                 )
             with Deferral(self) as pending:
@@ -426,7 +427,7 @@ class KafkaSink:
         """
         with self._guard.enter() as section:
             if not section:
-                raise final_refusal("KafkaSink cannot flush: the sink is closed")
+                raise final_refusal(self, "KafkaSink cannot flush: the sink is closed")
             remaining = self.producer.flush(self.flush_timeout)
         if type(remaining) is int and remaining > 0:
             raise SinkDeliveryError(

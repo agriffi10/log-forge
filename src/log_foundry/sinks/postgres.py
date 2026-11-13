@@ -389,6 +389,7 @@ class PostgresSink:
             if not section:
                 run_context().refuse(
                     final_refusal(
+                        self,
                         f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
                     )
                 )

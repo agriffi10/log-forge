@@ -32,6 +32,7 @@ from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._refusal import final_refusal, is_final_refusal
 from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.callback import CallbackSink
 from log_foundry.sinks.file import FileSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
@@ -167,7 +168,9 @@ class _Raises:
             delivery_error(sqlite3.OperationalError("database is locked")), id="dual-typed"
         ),
         pytest.param(ConnectionError("refused"), id="transient"),
-        pytest.param(final_refusal("Borrowed: the sink is closed"), id="marked-but-foreign"),
+        pytest.param(
+            final_refusal(object(), "Borrowed: the sink is closed"), id="marked-but-foreign"
+        ),
     ],
 )
 def test_any_other_raise_keeps_the_resend(
@@ -466,30 +469,32 @@ def _caught(error: Exception) -> Exception:
 
 def test_the_mark_is_read_only_from_an_exact_marked_sink_delivery_error() -> None:
     """Total, and narrow: a subclass, an unmarked instance and a hostile class are not final."""
-    marked = final_refusal("X: the sink is closed")
+    refuser = MemorySink()
+    marked = final_refusal(refuser, "X: the sink is closed")
     assert type(marked) is SinkDeliveryError and str(marked) == "X: the sink is closed"
-    assert is_final_refusal(marked, MemorySink()), "an error never raised has no foreign frame"
+    assert is_final_refusal(marked, refuser), "an error never raised has no foreign frame"
+    assert is_final_refusal(marked, MultiSink(MemorySink(), refuser))
+    assert not is_final_refusal(marked, MemorySink()), "a refuser outside the called graph"
 
     class Sub(SinkDeliveryError):
         pass
 
     sub = Sub("x")
     vars(sub).update(vars(marked))
-    assert not is_final_refusal(sub, MemorySink())
-    assert not is_final_refusal(SinkDeliveryError("X: the sink is closed"), MemorySink())
-    assert not is_final_refusal(_Hostile(), MemorySink())
-    assert not is_final_refusal(
-        delivery_error(sqlite3.OperationalError("x")), MemorySink()
-    )
+    assert not is_final_refusal(sub, refuser)
+    assert not is_final_refusal(SinkDeliveryError("X: the sink is closed"), refuser)
+    assert not is_final_refusal(_Hostile(), refuser)
+    assert not is_final_refusal(delivery_error(sqlite3.OperationalError("x")), refuser)
 
 
 def test_a_foreign_frame_below_the_catcher_makes_a_marked_error_resent() -> None:
     """The catcher's own frame is skipped; any other frame outside the package is not."""
-    assert not is_final_refusal(_caught(final_refusal("X: the sink is closed")), MemorySink())
+    refuser = MemorySink()
+    assert not is_final_refusal(_caught(final_refusal(refuser, "X: closed")), refuser)
     try:
-        raise final_refusal("X: the sink is closed")
+        raise final_refusal(refuser, "X: the sink is closed")
     except SinkDeliveryError as err:
-        assert is_final_refusal(err, MemorySink()), "the catcher's own frame counted as a carrier"
+        assert is_final_refusal(err, refuser), "the catcher's own frame counted as a carrier"
 
 
 class _Proxy:
@@ -539,73 +544,169 @@ class _Reopening(FileSink):
         FileSink.__init__(self, path)
 
 
-@pytest.mark.parametrize("shape", ["getattr", "rebound", "property", "transform-over-getattr", "subclass"])
-def test_a_callers_sink_that_forwards_emit_without_a_frame_keeps_the_resend(
+class _Router:
+    """A ``CallbackSink`` callable that dispatches through a property, so it leaves no frame."""
+
+    def __init__(self, inner: FileSink) -> None:
+        self.inner = inner
+
+    @property
+    def __call__(self) -> Callable[[list[dict[str, object]]], None]:  # type: ignore[override]
+        return self.inner.emit
+
+
+class _Spoofed:
+    """A caller's class that declares this package's module and routes ``emit`` by property."""
+
+    __module__ = "log_foundry.sinks.file"
+
+    def __init__(self, inner: FileSink) -> None:
+        self.inner = inner
+
+    @property
+    def emit(self) -> Callable[[list[dict[str, object]]], None]:
+        return self.inner.emit
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+class _EmitKey(str):
+    """A ``str`` subclass equal to ``"emit"``, planting an instance ``emit`` a plain read skips."""
+
+    __slots__ = ()
+
+    def __eq__(self, other: object) -> bool:
+        return str.__eq__(self, other)
+
+    def __hash__(self) -> int:
+        return str.__hash__(self)
+
+
+SHAPES = [
+    "getattr",
+    "rebound",
+    "property",
+    "transform-over-getattr",
+    "subclass",
+    "callback-property",
+    "module-spoof",
+    "class-patched",
+    "str-subclass-key",
+]
+"""Every frameless route a review found from a caller's object to a closed shipped sink."""
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+def test_a_callers_sink_that_routes_emit_without_a_frame_keeps_the_resend(
     shape: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The receiver half: a caller's object chose where ``emit`` went, so the refusal is resent.
 
-    The inner ``FileSink`` is closed; the first backoff swaps a fresh one in, as a caller's
-    self-healing sink would, and the worker's second attempt delivers both events.
+    The routed-to ``FileSink`` is closed; the first backoff swaps a fresh one in, as a caller's
+    self-healing sink would, and the worker's second attempt delivers both events. On 1.x every
+    shape delivered this way.
     """
     old, new = tmp_path / "old.ndjson", tmp_path / "new.ndjson"
     closed = _Reopening(str(old)) if shape == "subclass" else FileSink(str(old))
     closed.close()
-    fresh: list[FileSink] = []
-    holder: Any
+    opened: list[FileSink] = []
+    state: dict[str, Any] = {"target": closed, "swapped": False}
+    sink: Any
     if shape == "subclass":
-        holder = closed
+        sink = closed
     elif shape == "rebound":
-        holder = _Rebinding(closed)
+        sink = _Rebinding(closed)
     elif shape == "property":
-        holder = _Property(closed)
+        sink = _Property(closed)
+    elif shape == "callback-property":
+        router = _Router(closed)
+        sink = TransformSink(CallbackSink(router), lambda event: event)
+    elif shape == "module-spoof":
+        sink = _Spoofed(closed)
+    elif shape == "class-patched":
+        original = FileSink.emit
+        sink = FileSink(str(tmp_path / "unused.ndjson"))
+        opened.append(sink)
+        monkeypatch.setattr(
+            FileSink, "emit", property(lambda self: original.__get__(state["target"]))
+        )
+    elif shape == "str-subclass-key":
+        sink = MemorySink()
+        vars(sink)[_EmitKey("emit")] = closed.emit
     else:
-        holder = _Proxy(closed)
+        sink = _Proxy(closed)
+    if shape == "transform-over-getattr":
+        sink = TransformSink(sink, lambda event: event)
 
     def swap_in_the_backoff(attempt: int) -> float:
-        if not fresh:
-            if shape == "subclass":
-                holder.reopen(str(new))
-                fresh.append(holder)
-            else:
-                replacement = FileSink(str(new))
-                fresh.append(replacement)
-                if shape == "rebound":
-                    holder.swap(replacement)
-                else:
-                    holder.inner = replacement
+        if state["swapped"]:
+            return 0.0
+        state["swapped"] = True
+        if shape == "subclass":
+            closed.reopen(str(new))
+            state["target"] = closed
+            opened.append(closed)
+            return 0.0
+        fresh = FileSink(str(new))
+        opened.append(fresh)
+        state["target"] = fresh
+        if shape == "rebound":
+            sink.swap(fresh)
+        elif shape == "callback-property":
+            router.inner = fresh
+        elif shape == "str-subclass-key":
+            vars(sink)[_EmitKey("emit")] = fresh.emit
+        elif shape == "transform-over-getattr":
+            sink._inner.inner = fresh
+        elif shape != "class-patched":
+            sink.inner = fresh
         return 0.0
 
     monkeypatch.setattr(_engine, "cycle_backoff", swap_in_the_backoff)
-    sink = TransformSink(holder, lambda event: event) if shape == "transform-over-getattr" else holder
     try:
         ok, failed = _drain(sink)
     finally:
-        for opened in fresh:
-            opened.close()
+        monkeypatch.undo()
+        for each in opened:
+            each.close()
     assert ok and failed == 0, f"{shape}: the resend the caller arranged was not made"
     assert len(new.read_text().splitlines()) == 2
 
 
-def test_only_package_sinks_reads_the_graph_without_running_it(tmp_path: Path) -> None:
-    """The receiver test's own corpus: package graphs pass; any foreign or patched node fails."""
-    from log_foundry._sink_arg import only_package_sinks
+def test_package_graph_reads_the_graph_without_running_it(tmp_path: Path) -> None:
+    """The receiver test's own corpus: package graphs list their sinks; anything foreign is None."""
+    from log_foundry._sink_arg import package_graph
+    from log_foundry.sinks.syslog import SyslogSink
 
     plain = FileSink(str(tmp_path / "a.ndjson"))
+    memory = MemorySink()
     try:
-        assert only_package_sinks(plain)
-        assert only_package_sinks(MultiSink(plain, MemorySink()))
-        assert only_package_sinks(TransformSink(MultiSink(plain), lambda event: event))
-        assert not only_package_sinks(_Proxy(plain))
-        assert not only_package_sinks(MultiSink(MemorySink(), _Proxy(plain)))
-        assert not only_package_sinks(TransformSink(_Proxy(plain), lambda event: event))
+        graph = package_graph(plain)
+        assert graph is not None and id(plain) in graph
+        graph = package_graph(TransformSink(MultiSink(plain, memory), lambda event: event))
+        assert graph is not None and {id(plain), id(memory)} <= graph
+        syslog = SyslogSink("localhost", 514, transport="udp")
+        graph = package_graph(syslog)
+        assert graph is not None and id(syslog._socket) in graph, "a held transport is a refuser"
+        syslog.close()
+        callback = CallbackSink(plain.emit)
+        graph = package_graph(callback)
+        assert graph is not None and id(plain) not in graph, "a callable's target is not forwarded to"
+        assert package_graph(_Proxy(plain)) is None
+        assert package_graph(MultiSink(memory, _Proxy(plain))) is None
+        assert package_graph(TransformSink(_Proxy(plain), lambda event: event)) is None
+        assert package_graph(_Spoofed(plain)) is None
         subclass = _Reopening(str(tmp_path / "b.ndjson"))
-        assert not only_package_sinks(subclass)
+        assert package_graph(subclass) is None
         subclass.close()
         patched = MemorySink()
         patched.emit = plain.emit  # type: ignore[method-assign]
-        assert not only_package_sinks(patched)
-        assert not only_package_sinks(MultiSink(patched))
+        assert package_graph(patched) is None
+        assert package_graph(MultiSink(patched)) is None
+        keyed = MemorySink()
+        vars(keyed)[_EmitKey("other")] = None
+        assert package_graph(keyed) is None, "a key that is not exactly str is doubt"
     finally:
         plain.close()
 

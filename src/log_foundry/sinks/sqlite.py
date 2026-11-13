@@ -335,7 +335,9 @@ class SQLiteSink:
         if not batch:
             return
         if os.getpid() != self._pid:
-            raise final_refusal(f"SQLiteSink inserted none of {len(batch)} event(s): {_FORKED}")
+            raise final_refusal(
+                self, f"SQLiteSink inserted none of {len(batch)} event(s): {_FORKED}"
+            )
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
         with Deferral(self) as pending:
@@ -344,6 +346,7 @@ class SQLiteSink:
                 with self._guard.enter() as section:
                     if not section:
                         raise final_refusal(
+                            self,
                             f"SQLiteSink inserted none of {len(batch)} event(s): "
                             "the sink is closed"
                         )

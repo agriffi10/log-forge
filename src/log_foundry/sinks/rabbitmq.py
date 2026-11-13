@@ -330,6 +330,7 @@ class RabbitMQSink:
             if not section:
                 run_context().refuse(
                     final_refusal(
+                        self,
                         f"RabbitMQSink published none of {len(batch)} message(s): "
                         "the sink is closed"
                     )
