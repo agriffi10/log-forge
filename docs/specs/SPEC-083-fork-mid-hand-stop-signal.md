@@ -80,7 +80,7 @@ re-enter the setter (FR-004 records why it is rejected).
   is still set and still the one the sink held. Handing it a fresh signal means running its setter
   inside the call that forked, which FR-004 forbids. This is a recorded limit (`architecture.md`
   §13, FR-005).
-- **A child that unwinds out of the setter needs no new mechanism**, for example a bare
+- **A child that unwinds out of the setter needs nothing beyond FR-004's re-owe**, for example a bare
   `os.fork()` whose child returns from the setter. Its own `finally` blocks pop the offer record
   and the handing mark. What it then holds depends on the path. This was measured at `53b68203`,
   with and without this spec's mechanism patched in:
@@ -92,7 +92,19 @@ re-enter the setter (FR-004 records why it is rejected).
     signal only because the fork handler ran the setter again, which FR-004 removes. With this
     spec's mechanism, the child holds the parent's event until its first orphan log or `flush()`
     settles the fork's signal debt, and then it holds its own. Its `shutdown()` before that point
-    still cuts the wait short, through FR-003's set. Measured wait: 0.00 s in both cases.
+    still cuts the wait short, through FR-003's set. Measured wait: 0.00 s in both cases. Another
+    thread of the child may pay that debt while the forking thread is still inside the setter. If
+    it does, the debt is re-owed as the forking thread leaves the offer (FR-004), so the later log
+    or `flush()` still hands the sink its own signal.
+- **A grandchild forked by another thread of a child that is still inside a lock-holding
+  setter.** That grandchild hangs on its first log. `_clear_after_fork` replaces `_fork_offers`
+  with the new forking thread's list, so the grandchild does not inherit the child's view of the
+  sink still being offered. The execution review of the cross-thread view found it hanging, and
+  found the same at `d3950848`. It is not closed, because the control hangs too: with no
+  fork inside a hand at all, one thread inside a locked setter and another thread forking also
+  dies on `SIGALRM`. That is the generic hazard of forking while another thread holds a lock the
+  caller's code owns, and no record can close it, so carrying the old prefix would fix only one
+  shape of it. This is a recorded limit (`architecture.md` §13, FR-005).
 - **Behaviour change for `_building_here`.** A child forked inside a sink factory keeps the factory
   build's entry, and that is harmless (FR-005 records why). Only its docstring changes.
 - **An offered event whose type is not exactly `threading.Event`.** The capture keeps only exact
@@ -203,6 +215,10 @@ which FR-004 removes; once it is removed, this FR's set is what cuts their wait 
 - [ ] A child that unwinds out of a setter called by `Worker.retarget` (a bare `os.fork()`): its
   `shutdown()` cuts a wait on the event the sink holds short, and after a `flush()` the sink holds
   the child's `_state._stop`.
+- [ ] The same child with another of its threads calling `flush()` first, while the forking thread
+  is still inside the setter: that thread returns and the debt reads cleared. After the forking
+  thread unwinds, a `flush()` still gives the sink the child's `_state._stop`. Removing FR-004's
+  re-owe turns this row red (`own=False`) and no other.
 - [ ] After the child returns, the event the sink holds in the parent is not set.
 - [ ] A second `shutdown()` in the child returns normally.
 - [ ] Invariants 3, 6 and 12: a shutdown cuts the wait short on both `shutdown()` branches and on
@@ -246,6 +262,19 @@ than a copy is stored so that the count can follow it down: `offer_stop_signal`'
 `_fork_inherited` whenever the forking thread pops below it. A child that unwinds out of the setter
 therefore stops sharing that offer, and an offer the forking thread makes after the fork lands
 beyond the count, so it is never shared.
+
+**Leaving an inherited offer re-owes the fork's signal debt.** While the forking thread is inside
+the offer, another thread of the child that pays the debt, with its first orphan log or `flush()`,
+leaves the sink out because `handing_here` is true for it, and then clears the debt. On the
+retarget path, which has no settle loop, nothing then handed the sink the child's own signal once
+the forking thread returned. Measured at `471eef5e`: `alive=False debt=False before=False own=False
+cut=True`. Invariant 3 still held. So where `offer_stop_signal`'s `finally` lowers
+`_fork_inherited`, it also sets `_state._signal_owed`, with both writes in one `_state._lock`
+section. A payer computes its candidates and clears the flag in one locked section, so either it
+sees the sink as left and hands it, or it ran first and its clear is undone. That branch runs only
+in a child, on the forking thread, once per inherited level. No caller holds `_state._lock` across
+an offer, because a setter never runs under a lifecycle lock; this was checked by reading every
+caller. The lock-site roster in `tests/test_runtime_holder.py` gains the one site.
 
 Each caller of the predicate takes one of two readings:
 
@@ -375,8 +404,9 @@ child that unwinds. `_handing_here`'s docstring gains why the child keeps the ma
 - [ ] `tests/test_lifecycle_inventory.py` has the row `_offering_here` (inherited) and the row
   `_stale_signals` (reset: `_lifecycle._clear_after_fork`). The text of the `_handing_here` and
   `_building_here` rows no longer says a `finally` clears them, and the inventory tests pass.
-- [ ] `architecture.md` §13 *Known constraints* records the two limits in Out of Scope: forking
-  before the store, and the signal kept after the child's shutdown. In `docs/invariants.md`, the
+- [ ] `architecture.md` §13 *Known constraints* records the three limits in Out of Scope: forking
+  before the store, the signal kept after the child's shutdown, and the grandchild forked by
+  another thread of a child that is still inside a lock-holding setter. In `docs/invariants.md`, the
   wait entry's recorded exceptions point to that entry, and the fork entry's *Guarded* list names
   the new test file.
 - [ ] A decision file in `docs/decisions/sink-lifecycle/` carries the fence, the rejected reset and
@@ -502,3 +532,9 @@ docs/release-notes/v1.2.0.md
   thread of the child. FR-004 gains the four criteria that hold this, and FR-002's grandchild
   criterion gains the fresh-thread read. The payment's equivalence argument now covers all four
   offers that have no `handing` block, instead of only the retarget.
+- 2026-11-13, execution review of the cross-thread view: the review planted four mutants, and all
+  were killed. It raised two MINORs. First, a debt paid by another thread while the forking thread
+  was inside the setter was not re-owed, so FR-004 gains the re-owe and FR-003 gains the
+  `another-thread` row. Second, a grandchild forked by another thread of such a child hangs on a
+  lock-holding setter. That is recorded as a third limit under Out of Scope, with the control that
+  shows it is the generic fork-while-locked hazard.

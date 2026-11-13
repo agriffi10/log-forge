@@ -22,6 +22,15 @@
   thread unwinds. `handing_here` also reads `_fork_offers[:_fork_inherited]` from any thread.
   `_in_handing` is unchanged. Its docstring now argues all four offers that have no `handing`
   block, where the earlier argument named only the retarget.
+- **The re-owed debt** (found by the execution review). Another thread of the child could pay the
+  fork's signal debt while the forking thread was still inside the setter. It left that sink out
+  and cleared the debt, so on the retarget path the sink kept the parent's event after the forking
+  thread unwound. Where `offer_stop_signal`'s `finally` lowers `_fork_inherited`, it now also sets
+  `_signal_owed`, in one `_state._lock` section. `tests/test_runtime_holder.py`'s lock-site roster
+  gains `("offer_stop_signal", "_state._lock")`.
+- **A third recorded limit.** A grandchild forked by another thread of a child that is still inside
+  a lock-holding setter hangs on its first log. It is not closed, because the same hang occurs with
+  no fork inside a hand at all. It is in `architecture.md` §13 and in the decision.
 - **A parent-process fix the spec did not name.** At `53b68203`, a setter that `Worker.retarget`
   ran and that logged was handed its signal again inside itself (calls=2, depth=2), so a setter
   holding its own lock deadlocked the process. Now it runs once.
@@ -39,8 +48,8 @@
   - One docstring in `tests/test_reentrant_stop_signal.py`
     (`test_a_paid_hand_never_runs_a_setter_inside_itself`) is reworded, with its assertions
     unchanged.
-  - The cross-thread view is a mechanism added after the plan review. It was found by the diff
-    review and is recorded in the spec's revision history.
+  - The cross-thread view and the re-owe are mechanisms added after the plan review, found by
+    the diff reviews. The spec's revision history records both.
 
 ## What changed from earlier specs?
 
@@ -72,6 +81,16 @@
   - removing the `_fork_offers` read turned six tests red, with a thread hung;
   - removing the shrink turned the unwinding test red, reading `S=False R=True`;
   - removing the `[:_fork_inherited]` slice turned two tests red.
-- Gates as the implementer reported them, all exiting 0 at `ede27f5f`: `pytest` (9806 passed, 34
-  skipped on 3.13.1), the five fork-related files on 3.12.12 (704 passed), ruff, mypy, spec-lint,
-  docs-lint and docstring-lint.
+- The re-owe's mutant (removed) turned only the `payer=another-thread` row of the unwinding
+  retarget test red.
+- **An execution review beyond the usual four.** The cross-thread view was a new mechanism added
+  after both diff frames had run, so no review had examined it. One more round was spent on it, in
+  the execution frame. That review planted four mutants of the new mechanism, all of which were
+  killed: the shrink, `handing_here`'s third term, the slice, and a copied rather than live list. It
+  ran the five new tests five times each, under `-n 8` and serially, with no flakes. It found the
+  re-owe and the third limit.
+- Gates as reported, all exiting 0:
+  - at `ede27f5f`: `pytest` (9806 passed, 34 skipped on 3.13.1), and the five fork-related files on
+    3.12.12 (704 passed);
+  - at `f50b8648`: `pytest` (9807 passed, 34 skipped), with ruff, mypy, spec-lint, docs-lint and
+    docstring-lint.

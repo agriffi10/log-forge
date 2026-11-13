@@ -52,6 +52,15 @@ count as the forking thread pops below it. As a result, a child that unwinds out
 stops sharing that offer, and an offer the forking thread makes after the fork lands beyond the
 count, so it is never shared.
 
+**Leaving an inherited offer re-owes the fork's signal debt.** While the forking thread is still
+inside the offer, another thread of the child that pays the debt leaves the sink out and clears the
+debt. On the retarget path, which has no settle loop, nothing then handed the sink the child's own
+signal after the forking thread returned. The execution review measured this at `471eef5e`:
+`alive=False debt=False before=False own=False cut=True`. So where `offer_stop_signal`'s `finally`
+lowers `_fork_inherited`, it also sets `_signal_owed`, with both writes under one `_state._lock`.
+That branch runs only in a child, on the forking thread. No caller holds that lock across an offer,
+because a setter never runs under a lifecycle lock.
+
 **It also fixes the same nesting in the parent, with no fork involved.** At `53b68203`, a setter
 that `Worker.retarget` ran during a `configure(sink=...)` with a live worker, and that logged, was
 handed its signal again from inside itself: two calls, depth two. A setter holding its own lock
@@ -98,23 +107,35 @@ read survived the full suite, as expected.
 - A per-sink record of earlier hands. That would mean a reference to every sink ever handed a
   signal, which is what SPEC-081 bounded the ownership record to avoid.
 
-**What is left.** Both items are recorded in `architecture.md` §13.
+**What is left.** All three items are recorded in `architecture.md` §13.
 
 - A setter that forks before it stores the event leaves the sink holding what it held before. The
   child's `shutdown()` does not set that event unless the repair replaced it.
 - After the child's `shutdown()`, the sink keeps the event that shutdown set for the rest of the
   child's life, so its later backoffs do not wait. Handing it a fresh signal is the nesting this
   decision forbids.
+- A grandchild forked by another thread of a child that is still inside a lock-holding setter
+  hangs on its first log. `_clear_after_fork` replaces `_fork_offers` with the new forking thread's
+  list, so the child's view does not carry into that grandchild. It was the same at `d3950848`. It
+  is not closed because the control hangs too: with no fork inside a hand at all, one thread
+  inside a locked setter and another thread forking also dies on `SIGALRM`. That is the generic
+  hazard of forking while another thread holds a lock the caller's code owns, which no record can
+  close, so carrying the old prefix would fix only one shape of it.
 
-A child that unwinds out of the setter, as with a bare `os.fork()`, needs nothing new. On the orphan
-and build paths the outer hand's settle loop hands it its own signal. On the retarget path it holds
-the parent's event until its first log or `flush()` settles the fork's signal debt, and a
-`shutdown()` before that point is still cut short by the set.
+A child that unwinds out of the setter, as with a bare `os.fork()`, needs nothing beyond the
+re-owe. On the orphan and build paths, the outer hand's settle loop hands it its own signal. On the
+retarget path, it holds the parent's event until its first log or `flush()` settles the fork's
+signal debt, and that debt is owed again if another thread paid it first. A `shutdown()` before
+that point is still cut short by the set.
 
 ## History
 
 ### 2026-11-13
 
+- **Refined** after the execution review of the cross-thread view. Leaving an inherited offer now
+  re-owes the fork's signal debt. A grandchild forked by another thread of a child that is still
+  inside a lock-holding setter is recorded as a third limit, because the same hang occurs with no
+  fork inside a hand at all.
 - **Refined** after the system-frame diff review. A child's other threads now see the forking
   thread's inherited offers (`_fork_offers`, `_fork_inherited`), because another thread's first log
   and the resumed drain thread through a factory wrapper still handed the sink again. The payment's

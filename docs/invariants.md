@@ -212,7 +212,10 @@ on the build the factory is running, and the library cannot see a wait in the ca
 (`docs/decisions/sink-lifecycle/`). A child forked from inside a sink's stop-signal setter has its
 backoff on the event that sink holds cut short by its `shutdown()` (SPEC-083). However, a setter
 that forks before it stores the event leaves that wait uncut. After the child's `shutdown()`, that
-sink keeps the set event, so its later backoffs do not wait (`architecture.md` §13).
+sink keeps the set event, so its later backoffs do not wait. A grandchild forked by another
+thread of such a child, while a lock-holding setter is still running, hangs on its first log. That
+is the generic hazard of forking while another thread holds a lock the caller's code owns
+(`architecture.md` §13).
 *Guarded:* the wall-clock half by `tests/test_worker.py` (against a wedged sink),
 `tests/test_sink_retry.py` (only the engine waits, derived over `sinks/`, SPEC-074),
 `tests/test_sinks_db_engine.py`, `tests/test_sinks_broker_engine.py` and `tests/test_socket_engine.py`
