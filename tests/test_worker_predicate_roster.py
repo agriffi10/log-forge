@@ -466,6 +466,32 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         EXISTENCE,
         ("the guard on the pair above: the same existence question, asked once per worker."),
     ),
+    ("_delivering_sinks", "_state.live_worker()", 0): (
+        LIVENESS,
+        (
+            "which worker still delivers, so its sink is one the library still holds and the "
+            "ownership record pins strongly (SPEC-081 FR-001). Liveness, not existence: a "
+            "retired worker's sink was closed by the shutdown that retired it, and holding it "
+            "strongly for the retired worker's sake would keep a sink the library is done with "
+            "pinned in the record, which is the growth this re-pin exists to end."
+        ),
+    ),
+    ("_delivering_sinks", "worker is not None", 0): (
+        LIVENESS,
+        ("the guard on the binding above: the same liveness question, the local's answer."),
+    ),
+    ("_delivering_sinks", "_state._late_worker", 0): (
+        LIVENESS,
+        (
+            "the worker a `shutdown()` with no worker built in its body, which delivers until "
+            "that shutdown stops it (SPEC-044 FR-001); while it does, its sink is held, so the "
+            "record pins it. A forked child forgets it in `_clear_after_fork`."
+        ),
+    ),
+    ("_delivering_sinks", "late_worker is not None", 0): (
+        LIVENESS,
+        ("the guard on the read above: whether such a worker is delivering now."),
+    ),
     ("_live_roots", "_state.worker_exists()", 0): (
         EXISTENCE,
         (

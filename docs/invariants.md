@@ -279,7 +279,12 @@ its decision within the closer grace, nor by the call's last take, a sink change
 built during it, or a re-entrant `shutdown()` (from a sink's own code on the drain thread or the
 changing thread, or a signal handler) landing between that change's retarget and its decision, may
 leave the sink that change installs open until a later `shutdown()` or the exit closes it — only
-the first with a `pending` line (`docs/decisions/pipeline/`).
+the first with a `pending` line (`docs/decisions/pipeline/`); a forked child that cannot tell what
+it inherited — its heap scan after a tripped marking raised or met a frozen heap, or its walk
+raised — records a sink it is handed with `sink=` that has no record of its own as `_FOREIGN` and
+never closes it, with one `pending` line, while the lazy default, a `sink_factory=` sink and an
+inherited sink the repair reached whose `reacquire_after_fork` returned are still closed — not
+one a walk that raised first never reached (SPEC-081 FR-006).
 *Guarded:* `tests/test_owed_closes.py`, `tests/test_shutdown_lifecycle.py`,
 `tests/test_sink_ownership.py`; `tests/test_concurrent_configure.py` that two concurrent
 `configure(sink=…)` calls close each sink once; `tests/test_shutdown_mid_swap.py` that a
@@ -291,7 +296,9 @@ swap when that shutdown took the displaced sink and one when it left it owed; `t
 lock, its connection released once, and a forked child releases nothing (SPEC-061);
 `tests/test_closed_guard.py`, `tests/test_sink_post_close.py` and `tests/test_sinks_kafka.py` that
 the guard releases once, waits for the call inside, and counts a call its release overtook
-(SPEC-076).
+(SPEC-076); `tests/test_ownership_record.py` that a sink on a reused `id` is closed once by its
+owner, and `tests/test_fork_heap_marking.py` that a last-resort child closes the sinks the library
+built and no `sink=` (SPEC-081).
 
 ## 6. Twin paths keep the same promises
 
@@ -554,9 +561,10 @@ hostile probe (SPEC-067).
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
-The package's global locks and events from one roster first, then one walk from the runtime's
-roots, inherited buffers next, registered handlers last; `before` never runs for a C-level fork; a
-value the child inherits is stranded, not detached (SPEC-039, SPEC-042, SPEC-079).
+The inherited record pinned first, then the package's global locks and events from one roster,
+then one walk from the runtime's roots, inherited buffers next, registered handlers last; `before`
+never runs for a C-level fork; a value the child inherits is stranded, not detached (SPEC-039,
+SPEC-042, SPEC-079, SPEC-081).
 
 *Observable:* a child forked mid-drain delivers its own events, never hangs on a parent's lock,
 and closes no transport the parent opened.
@@ -581,8 +589,12 @@ wrapper's child-sink slot, a live worker's sink — is recorded by position what
 so a `weakref.proxy`, `super(Sub, inst)` or `__getattr__` proxy there is never claimed by a child;
 but a sink **behind a `weakref.proxy`** is not repaired, because its referent is reachable only by
 calling into the proxy, so a lock it holds at the fork stays held in the child (`architecture.md`
-§13). After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink owns
-it and closes it (§13, pre-existing). A sink's closed guard
+§13). Past a tripped marking ceiling the child marks the sink-shaped objects on its inherited heap
+instead, so a parent's sink it hands over again is still refused; where that scan raises or meets
+a frozen heap, or the walk raises, the child refuses a sink it is handed with `sink=` that has no
+record of its own and that the library did not build, while one the repair reached whose
+`reacquire_after_fork` returned is reclaimed and closed (SPEC-081; `architecture.md` §13 lists what the bounded record leaves). A
+sink's closed guard
 (SPEC-076) is on the walk at `self._guard`, so its locks and its event are replaced, and its state
 is adopted lazily by pid: the child counts no parent section inside, turns a `CLOSING` it
 inherited back to `OPEN`, since no parent closer runs there, and keeps `CLOSED`.
@@ -590,7 +602,8 @@ inherited back to `OPEN`, since no parent closer runs there, and keeps `CLOSED`.
 the closed guard driven through `configure()`, SPEC-076), `tests/test_fork_roster.py`,
 `tests/test_fork_one_walk.py`, `tests/test_fork_static_reads.py` and
 `tests/test_fork_child_state.py` (SPEC-079),
-`tests/test_sink_ownership.py`,
+`tests/test_sink_ownership.py`, `tests/test_ownership_record.py` and
+`tests/test_fork_heap_marking.py` (SPEC-081),
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
 `tests/test_sinks_sqlite_fork.py` (the `SQLiteSink` child, under a real `os.fork` and through a
 child's interpreter exit),

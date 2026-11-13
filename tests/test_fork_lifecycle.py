@@ -1957,7 +1957,7 @@ def test_the_marking_handler_still_runs_before_the_worker_rebuild() -> None:
     seen_by_first: list[object] = []
 
     def spy() -> None:
-        seen_by_first.append(_lifecycle._state._owned.get(id(inner), (None,))[0])
+        seen_by_first.append(getattr(_lifecycle._state._owned.get(id(inner)), "pid", None))
         first()
 
     _fork._child_handlers[0] = spy

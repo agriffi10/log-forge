@@ -72,7 +72,7 @@ def test_the_module_walk_and_the_separate_marking_are_deleted() -> None:
 
 def _record_in_child(conn: object) -> str:
     record = _lifecycle._state._owned.get(id(conn))
-    return "unrecorded" if record is None else str(record[0])
+    return "unrecorded" if record is None else str(record.pid)
 
 
 def test_a_foreign_holders_namespace_is_forwarded_to_the_marking() -> None:

@@ -16,15 +16,17 @@ from __future__ import annotations
 
 import collections
 import gc
+import io
 import pathlib
 import socket
+import sys
 import threading
 import time
 
 import pytest
 
 import log_foundry
-from log_foundry import _fork, _lifecycle, config
+from log_foundry import _diag, _fork, _lifecycle, config
 from log_foundry.sinks.filtering import FilteringSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
@@ -492,7 +494,7 @@ def test_the_marking_walk_does_not_escape_through_a_module_reference() -> None:
     def in_child() -> str:
         with _lifecycle._state._owned_lock:
             marked = sum(
-                1 for pid, _ref in _lifecycle._state._owned.values() if pid == _lifecycle._FOREIGN
+                1 for entry in _lifecycle._state._owned.values() if entry.pid == _lifecycle._FOREIGN
             )
         return str(marked)
 
@@ -517,6 +519,12 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     `__iter__` is never entered at all and cannot trip anything; the ceiling is asserted on what
     can still exceed it, a configured sink holding more than `_MARKING_CEILING` distinct objects,
     in a real child now that no unbounded read stands in front of it.
+
+    **Since SPEC-081 FR-005 a trip marks the heap instead**, so the child reads `failed=False` and
+    still refuses the unrecorded sink, which the heap scan found and marked `_FOREIGN`. This is
+    the one trip in the suite at the shipped ceiling, so it also holds the trip's line whole: the
+    detail is exactly `_diag._MAX_DETAIL` characters at 100,000, and a lowered-ceiling trip, which
+    prints a shorter number, cannot guard that length.
     """
     entered: list[int] = []
 
@@ -542,17 +550,32 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     assert configured < 10.0, "the *parent's* stamp walk is bounded too"
     assert entered == [], "the stamp walk entered the subclass's own `__iter__`"
 
+    detail = (
+        f"the walk marking a forked child's inherited sinks passed {_lifecycle._MARKING_CEILING} "
+        "objects; this child marked the unrecorded sinks on its heap instead and closes none of "
+        "them, even if configured, unless re-acquired"
+    )
+    assert len(detail) <= _diag._MAX_DETAIL, "the line is written whole, never cut"
+
     def in_child() -> str:
+        said = buffer.getvalue()
         return (
             f"entered={entered} failed={_lifecycle._state._marking_failed} "
-            f"releasable={_lifecycle.releasable(unrecorded)}"
+            f"releasable={_lifecycle.releasable(unrecorded)} "
+            f"said={said.count(detail + chr(10))}"
         )
 
-    child = run_in_child(in_child, timeout=30)
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(in_child, timeout=30)
+    finally:
+        sys.stderr = saved
     assert child.finished, f"the child did not return from fork: {child.ending}"
-    assert child.output == "entered=[] failed=True releasable=False", (
-        f"the ceiling tripped, nothing entered the runaway iterator, and an unrecorded sink was "
-        f"refused: {child.output}"
+    assert child.output == "entered=[] failed=False releasable=False said=1", (
+        f"the ceiling tripped, nothing entered the runaway iterator, the heap was marked and an "
+        f"unrecorded sink was refused, with the whole line said once: {child.output}"
     )
 
 
@@ -617,7 +640,7 @@ def test_the_record_holds_a_strong_reference() -> None:
         gc.collect()
         with _lifecycle._state._owned_lock:
             record = _lifecycle._state._owned.get(sink_id)
-        held = "-" if record is None else type(record[1]).__name__
+        held = "-" if record is None else type(record.strong).__name__
         return f"{record is not None},{held}"
 
     child = run_in_child(in_child)
@@ -636,7 +659,7 @@ def test_the_parents_records_are_untouched_by_the_child() -> None:
     with _lifecycle._state._owned_lock:
         after = dict(_lifecycle._state._owned)
     assert after == before
-    assert all(after[key][1] is before[key][1] for key in before), "the same objects, not copies"
+    assert all(after[key] is before[key] for key in before), "the same entries, not copies"
 
 
 def test_the_blind_spot_is_stated_in_the_module_docstring() -> None:
@@ -730,16 +753,23 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
     `_worker_lock` -> `_config_lock` -> `_owned_lock` and never the reverse in any pair.
 
     The order is enforced by what runs *under* the record lock rather than by acquiring locks
-    here in sequence, which proves nothing without actually deadlocking. The first draft of this
-    test did deadlock: it took `_owned_lock` and then called `releasable`, which takes it again.
-    That is the hazard this asserts is absent from the library, and it is a real one because the
-    lock is deliberately **not** reentrant -- SPEC-028 chose `Lock` over `RLock` precisely so a
-    function re-entering its own critical section fails loudly instead of being hidden.
+    here in sequence, which proves nothing without actually deadlocking: every call inside a
+    `with ..._owned_lock:` block, and inside the helpers those blocks call (`_entry_for`, and
+    `_Entry`'s constructor and `referent`), must be a dictionary read or write, a weak-reference
+    creation or dereference, or a constructor of the entry itself, none of which runs an object's
+    code or takes another lock.
+
+    **The lock is an `RLock` since SPEC-081 FR-003**, and that reverses this test's old final
+    assertion. SPEC-028 chose `Lock` over `RLock` for a sink's *transport* lock, where re-entering
+    a section is a bug an `RLock` would hide. The record lock is the exception: once an entry
+    holds a sink only weakly, the collector can finalize that sink on a thread inside a record
+    section, and a finalizer forwarding a close into a library wrapper re-enters `releasable` on
+    that same thread, which hung on a `Lock` (`tests/test_ownership_record.py` holds both shapes).
     """
     import ast
     import pathlib
 
-    source = pathlib.Path(_lifecycle.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(pathlib.Path(_lifecycle.__file__).read_text(encoding="utf-8"))
     under_lock: list[str] = []
 
     def walk(node: ast.AST, held: bool) -> None:
@@ -753,23 +783,39 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
                 under_lock.append(ast.unparse(child.func))
             walk(child, here)
 
-    walk(ast.parse(source), False)
+    walk(tree, False)
+    helpers = 0
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_entry_for":
+            walk(node, True)
+            helpers += 1
+        if isinstance(node, ast.ClassDef) and node.name == "_Entry":
+            for method in node.body:
+                if isinstance(method, ast.FunctionDef) and method.name in ("__init__", "referent"):
+                    walk(method, True)
+                    helpers += 1
+    assert helpers == 3, "the helpers the record sections call were found"
     permitted = {
         "_state._owned.get",
-        "_state._owned.setdefault",
-        "_state._owned.clear",
+        "_state._owned.items",
         "_state._owned.values",
-        "seeds.extend",
+        "_entry_for",
+        "_Entry",
+        "entry.referent",
+        "weakref.ref",
+        "weak",
+        "demoted.append",
+        "enumerate",
+        "list",
         "id",
     }
     assert set(under_lock) <= permitted, (
-        f"new work under the record lock: {sorted(set(under_lock))}. It is the last lock in the "
-        "order, so anything here that calls out can only invert it -- and anything that "
-        "re-enters deadlocks outright, since it is a Lock and not an RLock."
+        f"new work under the record lock: {sorted(set(under_lock) - permitted)}. It is the last "
+        "lock in the order, so anything here that calls out can only invert it."
     )
 
-    assert not isinstance(_lifecycle._state._owned_lock, type(threading.RLock())), (
-        "a non-reentrant Lock is the choice (SPEC-028): an RLock would hide the re-entry above"
+    assert isinstance(_lifecycle._state._owned_lock, type(threading.RLock())), (
+        "the record lock is re-entrant (SPEC-081 FR-003): a finalizer can re-enter it"
     )
 
 

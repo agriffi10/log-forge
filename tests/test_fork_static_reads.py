@@ -289,6 +289,33 @@ def test_a_forked_child_repairs_without_running_a_hook_of_a_sink() -> None:
     assert hostile is not None
 
 
+def test_a_tripped_childs_heap_scan_runs_no_hook_of_a_sink(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-081 FR-005 AC-7: the heap scan reads every object statically, the hostile one too.
+
+    The hostile sink is held here only, never handed to the library, so the walk cannot reach it
+    and the scan is what reads it; the child also reports that the scan found and marked it, so a
+    zero is not the zero of a scan that never ran.
+    """
+    hostile = Hostile()
+    log_foundry.configure(service="static", sink=MultiSink(MemorySink()))
+    monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", 0)
+    Ran.calls.clear()
+    Ran.armed = True
+
+    def in_child() -> str:
+        with _lifecycle._state._owned_lock:
+            entry = _lifecycle._entry_for(hostile)
+        marked = entry is not None and entry.pid == _lifecycle._FOREIGN
+        return f"{marked};{sorted(Ran.calls.items())!r}"
+
+    try:
+        child = run_in_child(in_child)
+    finally:
+        Ran.armed = False
+    assert child.finished, child.output
+    assert child.output == "True;[]", f"the heap scan ran a hook: {child.output}"
+
+
 def test_a_subclass_iterator_is_never_entered() -> None:
     """A `list` subclass's own non-terminating `__iter__` is never called, and its storage is read."""
     entered: list[int] = []

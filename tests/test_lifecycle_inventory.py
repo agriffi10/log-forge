@@ -247,14 +247,16 @@ class _Index:
         return seen
 
     def registered(self) -> set[Key]:
-        """Every function passed to ``register_child_handler`` or ``register_walk`` (SPEC-079)."""
+        """Every function passed to ``register_child_handler``, ``register_walk`` or ``register_pin``."""
         found: set[Key] = set()
         for name, tree in self.trees.items():
             module = name.removesuffix(".py")
             for node in ast.walk(tree):
                 if (
                     isinstance(node, ast.Call)
-                    and ast.unparse(node.func).endswith(("register_child_handler", "register_walk"))
+                    and ast.unparse(node.func).endswith(
+                        ("register_child_handler", "register_walk", "register_pin")
+                    )
                     and node.args
                     and isinstance(node.args[0], ast.Name)
                 ):
@@ -866,8 +868,11 @@ INVENTORY: dict[Key, Row] = {
         _R,
         "the registry's leaf; _closing_now_lock and _closers_lock merged into it (SPEC-078 FR-001)",
     ),
-    _c("_lifecycle.py", "Runtime.__init__", "self._owned_lock", "Lock"): Row(
-        "Runtime", _R, "guards the ownership record, last in the order; moved in SPEC-077"
+    _c("_lifecycle.py", "Runtime.__init__", "self._owned_lock", "RLock"): Row(
+        "Runtime",
+        _R,
+        "guards the ownership record, last in the order; moved in SPEC-077, re-entrant since "
+        "SPEC-081 so a finalizer forwarding a close cannot hang on it",
     ),
     _c("_lifecycle.py", "_Close.__init__", "self.event", "Event"): Row(
         "_Close",
@@ -967,7 +972,28 @@ INVENTORY: dict[Key, Row] = {
     _rt("_owned"): Row(
         "Runtime",
         ("reset: _lifecycle._walk_after_fork",),
-        "the ownership record; SPEC-077 moved it",
+        "the ownership record; SPEC-077 moved it; its live entries are pinned first in a child "
+        "(SPEC-081)",
+    ),
+    _rt("_owned_clock"): Row(
+        "Runtime",
+        _INH,
+        "bumped by every stamp and reclaim; guards a re-pin and a close's settle (SPEC-081)",
+    ),
+    _rt("_stamp_refusal_announced"): Row(
+        "Runtime",
+        ("reset: _lifecycle._walk_after_fork",),
+        "the last-resort child's refused-sink line, once per process (SPEC-081 FR-006)",
+    ),
+    _rt("_capture_announced"): Row(
+        "Runtime",
+        ("reset: _lifecycle._walk_after_fork",),
+        "the capture's stopped-short line, once per process (SPEC-081 FR-002)",
+    ),
+    _rt("_repin_announced"): Row(
+        "Runtime",
+        ("reset: _lifecycle._walk_after_fork",),
+        "the re-pin's absorbed line, once per process (SPEC-081 FR-001)",
     ),
     _rt("_owned_lock"): Row("Runtime", _R, "moved from the module in SPEC-077"),
     _rt("_marking_failed"): Row(
@@ -986,6 +1012,16 @@ INVENTORY: dict[Key, Row] = {
         "Runtime",
         _INH,
         "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
+    ),
+    _rt("_releasing_here"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "how many performed releases this thread is inside; only the outermost re-pins (SPEC-081)",
+    ),
+    _rt("_freeze_floor"): Row(
+        "Runtime",
+        _INH,
+        "the freeze count of an unfrozen process, read at import on 3.12, zero after (SPEC-081)",
     ),
     _rt("_building_here"): Row(
         "Runtime",

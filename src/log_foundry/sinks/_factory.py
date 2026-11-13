@@ -297,7 +297,8 @@ class _FactorySink:
           result: What the factory returned.
 
         Returns:
-          The result, stamped for this process.
+          The result, stamped for this process as a sink the library built, so a forked child
+          that cannot tell what it inherited still owns and closes it (SPEC-081 FR-006).
 
         Raises:
           SinkDeliveryError: When it is not a ``Sink``, or leads back to this wrapper or to a
@@ -319,7 +320,7 @@ class _FactorySink:
             refusal = SinkDeliveryError("sink_factory returned a sink that contains itself")
             self._announce(refusal, f"what it returned {where}")
             raise refusal
-        _lifecycle.stamp(result)
+        _lifecycle.stamp(result, built=True)
         return result
 
     def _discard(self, built: Sink) -> None:

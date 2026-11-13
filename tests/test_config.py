@@ -1128,7 +1128,7 @@ def test_a_refused_ceiling_does_not_swap_a_running_worker() -> None:
 # --- SPEC-079 FR-005: what configure() refuses where it is written ---------------------------
 
 
-def _snapshot() -> tuple[object, dict[int, tuple[int, object]]]:
+def _snapshot() -> tuple[object, dict[int, _lifecycle._Entry]]:
     """The config and the ownership record, as a refused call must leave them."""
     with _lifecycle._state._owned_lock:
         record = dict(_lifecycle._state._owned)

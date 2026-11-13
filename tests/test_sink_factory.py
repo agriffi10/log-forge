@@ -682,10 +682,18 @@ def test_the_built_sink_is_handed_the_workers_stop_signal() -> None:
     assert vars(built[0]).get("log_foundry_stop_signal") is worker._stop
 
 
-def _child_of_a_traced_factory(monkeypatch: pytest.MonkeyPatch, *, ceiling: int | None) -> str:
+def _child_of_a_traced_factory(
+    monkeypatch: pytest.MonkeyPatch, *, ceiling: int | None, heap_fails: bool = False
+) -> str:
     factory, built = _signalled_factory()
     if ceiling is not None:
         monkeypatch.setattr(_lifecycle, "_MARKING_CEILING", ceiling)
+    if heap_fails:
+
+        def unreadable() -> list[object]:
+            raise RuntimeError("the heap cannot be read")
+
+        monkeypatch.setattr(_lifecycle, "_heap_objects", unreadable)
     log_foundry.configure(service="factory", sink_factory=factory)
     _traced()
     log_foundry.flush(timeout=5.0)
@@ -696,8 +704,9 @@ def _child_of_a_traced_factory(monkeypatch: pytest.MonkeyPatch, *, ceiling: int 
         mine = built[-1]
         adopted = log_foundry.get_config().sink
         owed = id(adopted) in _lifecycle._state._closes.owed
+        failed = _lifecycle._state._marking_failed
         log_foundry.shutdown(3.0)
-        return f"owed={owed} closed={mine.closed}"
+        return f"owed={owed} closed={mine.closed} failed={failed}"
 
     return run_in_child(in_child).output
 
@@ -706,7 +715,9 @@ def test_a_trace_only_child_owes_and_closes_its_own_built_sink(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """FR-006: the adopted wrapper is armed on the worker, so ``shutdown()`` closes the child's sink."""
-    assert _child_of_a_traced_factory(monkeypatch, ceiling=None) == "owed=True closed=1"
+    assert _child_of_a_traced_factory(monkeypatch, ceiling=None) == (
+        "owed=True closed=1 failed=False"
+    )
 
 
 def test_a_factory_child_owns_its_wrapper_when_the_marking_failed(
@@ -714,11 +725,14 @@ def test_a_factory_child_owns_its_wrapper_when_the_marking_failed(
 ) -> None:
     """FR-006: the child stamps its adopted wrapper, so even a failed marking leaves it releasable.
 
-    With ``_MARKING_CEILING`` at zero every child's marking fails and refuses every sink it has
-    no record of; only the adoption's own stamp makes the child's wrapper, and through it the sink
-    the child built, the child's to close.
+    With ``_MARKING_CEILING`` at zero every child's marking trips; with the heap scan that falls
+    back for a trip made to raise as well (SPEC-081 FR-006), the child cannot tell what it
+    inherited and refuses every sink it has no record of. Only the adoption's own stamp, and the
+    built sink's, both ``built=True``, make the child's wrapper and the sink it built the child's to
+    close.
     """
-    assert _child_of_a_traced_factory(monkeypatch, ceiling=0).endswith("closed=1")
+    outcome = _child_of_a_traced_factory(monkeypatch, ceiling=0, heap_fails=True)
+    assert outcome.endswith("closed=1 failed=True"), outcome
 
 
 def test_a_build_mark_inherited_across_a_fork_does_not_refuse_the_childs_thread() -> None:

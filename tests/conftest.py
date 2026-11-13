@@ -528,13 +528,17 @@ def _reset_worker() -> None:
     delivers nothing.
 
     SPEC-079 adds the ownership record and its failure flag, which only
-    ``tests/test_sink_ownership.py`` cleared until then. The record is process-global and holds a
-    strong reference to every sink any earlier test stamped, and a forked child walks every one of
-    those references as a record seed of its marking, bounded by ``_MARKING_CEILING``. Left
+    ``tests/test_sink_ownership.py`` cleared until then. The record is process-global and, before
+    SPEC-081, held a strong reference to every sink any earlier test stamped, and a forked child
+    walks every live entry as a record seed of its marking, bounded by ``_MARKING_CEILING``. Left
     uncleared it grows for the whole session in each xdist worker: measured at ``44db79a6``, one
     worker ended a full run at 92,940 marking visits, and a test that configured a ``MemorySink``
     holding 60,000 events made the next test's child trip the ceiling and announce it, which is
     how ``test_a_child_of_a_process_that_built_no_worker_is_silent`` failed on ``44db79a6``.
+    SPEC-081 bounds the record to what is alive, and the clear stays as isolation: a sink an
+    earlier test still holds would otherwise keep its entry. Its references are dropped after the
+    record lock is released, so a finalizer they run meets no lock, and the three once-only
+    announcement flags SPEC-081 adds are reset with it.
     """
     try:
         from log_foundry import _lifecycle, decorator
@@ -555,13 +559,19 @@ def _reset_worker() -> None:
     _lifecycle._state._hands_running.clear()
     _lifecycle._state._handing_here = threading.local()
     _lifecycle._state._building_here = threading.local()
+    _lifecycle._state._releasing_here = threading.local()
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
     with _lifecycle._state._closes._lock:
         _lifecycle._state._closes._in_flight.clear()
     with _lifecycle._state._owned_lock:
+        dropped = dict(_lifecycle._state._owned)
         _lifecycle._state._owned.clear()
+    del dropped
     _lifecycle._state._marking_failed = False
+    _lifecycle._state._capture_announced = False
+    _lifecycle._state._stamp_refusal_announced = False
+    _lifecycle._state._repin_announced = False
     with _lifecycle._state._lock:
         _lifecycle._state._move()
 

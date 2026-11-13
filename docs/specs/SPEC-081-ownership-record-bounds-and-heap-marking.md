@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-081
 title: "Ownership Record: Pin Only What the Library Holds, and Mark the Heap When a Child's Marking Trips"
 description: "Bounds the ownership record to the sinks the library still holds, so superseded sinks are collected and a long-lived process's forked children stop tripping the marking ceiling, and makes a child whose marking trips mark the inherited sinks on its heap, so a parent's sink the child hands over again is never closed."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-039, SPEC-042, SPEC-044, SPEC-053, SPEC-054, SPEC-077, SPEC-078, SPEC-079]
 arc: stability-redesign
 arc_order: 12
@@ -133,7 +133,10 @@ the dead ones (FR-003). It runs the stamp walk outside `_owned_lock`, as `stamp`
 under it.
 
 - **Where it runs.** On every exit of `_swap_sink`, the early return included, from its outer
-  `finally`. And at the end of every `release` that performed a close, after `_closes.finish`.
+  `finally`. And at the end of every `release` that performed a close, after `_closes.finish`,
+  unless that release is nested inside another performed release's `close()` on the same thread:
+  then it marks its sink and leaves the re-pin to the release that encloses it, which runs after
+  every nested one has settled, so a library-driven wrapper close re-pins once.
 - **It never raises.** A fault is absorbed and announced once per process through
   `_diag.absorbed`, guarded by `Runtime._repin_announced`. In `release` it runs inside the
   `finally` and must never replace the exception `close()` raised.
@@ -147,7 +150,7 @@ under it.
     holds.
   - The one case in which `_owned_lock` is held is a finalizer re-entering on a thread already
     inside it (FR-003).
-- **The epoch guard.** `stamp` and `reclaim` bump `Runtime._owned_epoch` and write it on the entry.
+- **The epoch guard.** `stamp` and `reclaim` bump `Runtime._owned_clock` and write it on the entry.
   A re-pin demotes only entries whose epoch is no later than the value it read when it began.
 - **A sink re-handed while its earlier close is in flight.** `stamp` finds that sink's own,
   alive entry. Write-once keeps its pid, but `stamp` makes the entry strong, clears `closed` and
@@ -375,14 +378,19 @@ parent's transport. The pin is bounded by what was alive at the fork. Another li
 **`_record_seeds`** returns:
 
 - the sinks in `_state._closes.owed`;
-- then every entry whose referent is alive, **except a closed entry whose sink is package-owned**
-  (`closed` true and `_fork._is_owned(sink)`).
+- then every entry whose referent is alive, **except a closed entry whose sink is an instance of
+  a shipped class exactly** (`closed` true and `_fork._defined_here(type(sink))`).
 
-A package sink that this process finished closing has released its transport through the closed
-guard (SPEC-076), and what it holds was stamped when it was handed over. Leaving those out drops the
+A shipped sink that this process finished closing has released its transport through the closed
+guard (SPEC-076), and what it holds was stamped when it was handed over. The test is the exact
+class, never `_fork._is_owned`: that asks the whole MRO, so a caller's `class Pool(Sink)` or a
+subclass of a shipped sink would count as package-owned while its `close()` is the caller's code
+and may have closed nothing beneath it (the plan review's `sinkpool.py` probe: such a pool, closed
+and kept, left its connection closed by a child that handed it over again). Leaving those out drops the
 closed, superseded `MemorySink`s, which were the whole cost of the tripped ceiling.
 
-A closed **third-party** entry is still a seed while it is alive. Its `close()` is the caller's
+A closed **third-party** entry, a `Sink` subclass or a subclass of a shipped sink included, is
+still a seed while it is alive. Its `close()` is the caller's
 code and may have closed nothing beneath it, and what it holds may sit deeper than the capture
 reads. The reviewer's `pool.py` probe is the shape: a wrapper holding `{"primary": [conn]}`, two
 containers down.
@@ -413,9 +421,11 @@ un-closed or third-party sinks the application itself keeps alive after handing 
 - [ ] The parent configures an empty `TP`, keeps it, supersedes it with nothing logged, and then
   assigns `tp.inner = s`, asserting that `s` has no entry. In the child, `s`'s entry is `_FOREIGN`,
   and a bare re-hand of `s` and `shutdown()` leave `s.closes == 0`.
-- [ ] The `pool.py` shape: a third-party wrapper holding `{"primary": [conn]}`, with a `close()`
-  that does nothing, is logged to, superseded and kept. In the child, a re-hand of `conn` and
-  `shutdown()` leave `conn.closes == 0`.
+- [ ] The `pool.py` shape: a wrapper holding `{"primary": [conn]}`, with a `close()` that does
+  nothing, is logged to, superseded and kept. In the child, a re-hand of `conn` and `shutdown()`
+  leave `conn.closes == 0`. It holds for three wrappers: a duck-typed class, a `Sink` subclass and
+  a subclass of a shipped sink. With `_defined_here(type(sink))` replaced by `_is_owned(sink)` in
+  the exclusion, the `Sink`-subclass case turns red.
 - [ ] The parent keeps a closed, superseded sink `c` whose `__del__` calls `close()`. When the roster
   replacement starts, `c`'s entry is already strong. After the child deletes its only reference
   and runs `gc.collect()`, `c` is alive and `c.closes` is unchanged.
@@ -451,8 +461,12 @@ When the scan succeeds, `_marking_failed` is cleared. When it fails, the flag is
 set), and FR-006 applies. Clearing the flag is a deliberate change from `9f4d4dfd`, where nothing
 ever cleared it, so every descendant of a failed child stayed in the failed state.
 
-**A frozen heap is a failed scan.** In a child where `gc.get_freeze_count() > 0`,
-`gc.get_objects()` cannot see the permanent generation. A scan there would miss every frozen sink,
+**A frozen heap is a failed scan.** In a child where `gc.get_freeze_count()` is above
+`Runtime._freeze_floor`, the count of a process that never called `gc.freeze()`,
+`gc.get_objects()` cannot see the permanent generation. The floor is zero on CPython 3.13 and
+later; 3.12 reads it once, when the package is imported, because its collector keeps immortal
+objects in the permanent generation with no freeze, so testing the count against zero read every
+tripped child on 3.12 as frozen (Known residual 4 states what 3.12 cannot see). A scan there would miss every frozen sink,
 so `_mark_heap` does not read the heap at all and reports the scan as failed. Andrew's decision
 said that if the heap scan fails, the last resort applies, and a scan that cannot see the heap has
 failed.
@@ -485,7 +499,7 @@ marks for a sink whose `reacquire_after_fork` returned.
 close an inherited sink it has no record of unless it configures that sink itself") is now false.
 The new detail is exactly:
 
-`the walk marking a forked child's inherited sinks passed {_MARKING_CEILING} objects; this child marked the sink-shaped objects on its inherited heap instead, and closes none of them, even one it configures itself`
+`the walk marking a forked child's inherited sinks passed {_MARKING_CEILING} objects; this child marked the unrecorded sinks on its heap instead and closes none of them, even if configured, unless re-acquired`
 
 A scan that fails writes FR-006's line instead of this one, since this line would then be false.
 A scan run only because the flag was inherited, which then succeeds, writes nothing.
@@ -556,7 +570,8 @@ library constructed the root:
 
 - `config._ensure_sink`'s lazy default;
 - `config._change_sink`, for the `_FactorySink` that `configure()`'s `sink_factory=` branch builds;
-- `_FactorySink._make`, for what the factory returned;
+- `_FactorySink._checked`, for what the factory returned (PR #345 moved the stamp there from
+  `_make`, which calls it with no lock held);
 - `_adopt_factory_after_fork`, for the adopted `_FactorySink`.
 
 Only the root is exempt, and *Known residuals*, item 3 states the cost. In a process whose
@@ -593,7 +608,7 @@ and never through a parent that configured nothing.
 - [ ] In a child whose `_live_roots` raises, a bare re-hand of the parent's `s` leaves
   `s.closes == 0`. It is 1 at `9f4d4dfd`.
 - [ ] An AST scan finds `built=` passed to `stamp` in exactly `config._ensure_sink`,
-  `config._change_sink`, `_FactorySink._make` and `_lifecycle._adopt_factory_after_fork`.
+  `config._change_sink`, `_FactorySink._checked` and `_lifecycle._adopt_factory_after_fork`.
 - [ ] Invariants 5, 11 and 12: in such a child no parent transport is closed, a library-built sink is
   closed by this process, and the announcement is written once and is true.
 
@@ -632,7 +647,7 @@ At build time, the completion ritual rewrites these, each against the code as bu
     SPEC-081", as §12 marks a closed item.
   - Rewrite item 8 of the "eight things" list ("The record never shrinks"), and item 7, which says
     `_marking_failed` catches the visit ceiling.
-  - Add *Known residuals* items 1 to 8 below.
+  - Add *Known residuals* items 1 to 9 below.
   - Rewrite the sentence on callables that says a trip would "refuse every unrecorded sink in every
     child".
   - The third-party-sink item's "past a tripped ceiling it is neither" stays, because it is about
@@ -670,7 +685,7 @@ At build time, the completion ritual rewrites these, each against the code as bu
   or `unless it configures that sink itself`.
 - [ ] `docs/invariants.md` §12 names the pin first, no longer carries the tripped-ceiling exception
   for a child that re-configures, and still carries "past a tripped ceiling it is not".
-- [ ] §13 carries the eight *Known residuals* below, and both retired items are struck through and
+- [ ] §13 carries the nine *Known residuals* below, and both retired items are struck through and
   name SPEC-081.
 - [ ] `sh scripts/docs-lint.sh` and `poetry run python scripts/docstring-lint.py` exit 0.
 - [ ] Invariant 12: the page's statement and recorded exceptions match the code as built, so a
@@ -692,7 +707,7 @@ class _Entry:
                                                # None when the sink cannot be weakly referenced
     closed: bool                               # a close this process performed has finished (returned or raised)
     captured: bool                             # written by _capture (FR-002), not by stamp, reclaim or the walk
-    epoch: int                                 # Runtime._owned_epoch at this entry's last stamp or reclaim
+    epoch: int                                 # Runtime._owned_clock at this entry's last stamp or reclaim
 
     def referent(self) -> object | None: ...   # strong, else weak(); None means dead
 
@@ -700,7 +715,7 @@ class Runtime:
     ...
     _owned: dict[int, _Entry]                  # was dict[int, tuple[int, object]]
     _owned_lock: threading.RLock               # was threading.Lock (FR-003)
-    _owned_epoch: int = 0                      # bumped by every stamp and reclaim write; inherited
+    _owned_clock: int = 0                      # bumped by every stamp and reclaim write; inherited
     _stamp_refusal_announced: bool = False     # FR-006's line; reset by _walk_after_fork
     _capture_announced: bool = False           # FR-002's line; reset by _walk_after_fork
     _repin_announced: bool = False             # FR-001's absorbed line; reset by _walk_after_fork
@@ -713,7 +728,8 @@ The rules for an entry:
 | this process's, live, owed or in flight | strong | at the next re-pin after none holds, after the capture | never while alive |
 | this process's, closed or superseded unowed | weak (`closed` set after a performed close) | n/a | by `_repin`, once dead |
 | this process's, written by the capture | weak (`captured` set, `closed` clear) | n/a | by `_repin`, once dead |
-| another pid's, or `_FOREIGN` | strong | never | never |
+| another pid's, or `_FOREIGN` from the walk or the heap | strong | never | never |
+| `_FOREIGN`, written by the capture while `_marking_failed` is set | weak where it can be | n/a | by `_repin`, once dead |
 | a sink with no `__weakref__`, a `weakref.proxy` included | strong | never | never |
 
 ## API / Interface Contract
@@ -763,7 +779,7 @@ src/log_foundry/_lifecycle.py        # _Entry, _entry_for, _repin, _capture, _pi
                                      # the RLock; the new lines
 src/log_foundry/_fork.py             # register_pin; _reinit_after_fork runs it first
 src/log_foundry/config.py            # built=True at _ensure_sink and _change_sink
-src/log_foundry/sinks/_factory.py    # built=True at _FactorySink._make
+src/log_foundry/sinks/_factory.py    # built=True at _FactorySink._checked
 src/log_foundry/worker.py            # Worker._FORK_SKIP's docstring
 tests/test_ownership_record.py       # FR-001, FR-002 and FR-003 (new)
 tests/test_fork_heap_marking.py      # FR-004, FR-005 and FR-006 (new)
@@ -778,7 +794,7 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
 
 ### Phase 1: The entry, the re-pin, the capture and the dead-entry rule (FR-001, FR-002, FR-003)
 
-- Add `_Entry`, `_entry_for`, `_owned_epoch` and `_repin`, make `_owned_lock` an `RLock` with
+- Add `_Entry`, `_entry_for`, `_owned_clock` and `_repin`, make `_owned_lock` an `RLock` with
   snapshot iteration, and move every reader and writer of `_owned` onto them. Update the roster
   tests and `LOCK_SITES_AT_BASE`.
 - Call `_repin` from `_swap_sink`'s outer `finally` and from every `release` that performed a
@@ -817,17 +833,30 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
    - the rest of a capture that tripped `_MARKING_CEILING` or raised, which its line names;
    - a sink more than one container level below a third-party holder;
    - a sink reachable only through a bound method, a closure cell or a `functools.partial`;
-   - a sink placed beneath a superseded sink after that sink was demoted.
+   - a sink placed beneath a superseded sink after that sink was demoted;
+   - beneath a holder whose class subclasses `Sink` or a shipped sink, anything past the package
+     reach: `_fork._is_owned` accepts such a holder, so the capture enters it as it enters a
+     package holder, its namespace and one container level with only candidates pushed, and never
+     with the third-party reach. While the application keeps such a holder it is still a seed
+     (FR-004), since only an exact shipped class is left out of the seeds.
 
    If the application keeps such a sink and drops the holder, a child that hands the sink over
    again claims it, as it would a sink never handed over at all (§13 item 1).
 3. **The last resort leaves library-built graphs half-owned and fresh `sink=` sinks unclosed.** In a
    child whose heap scan failed or whose walk raised, a fresh `sink=` is never closed, with
    FR-006's costs. A factory that returns a wrapper has only the root recorded as the child's, so
-   the wrapper's members are refused their close.
+   the wrapper's members are refused their close. Such a child also keeps every `sink=` that it
+   is handed strongly, as a `_FOREIGN` entry, so its record grows by one entry per such sink for its
+   life; that is the safe direction, since a strong entry is never answered for another object.
 4. **A frozen heap sends a tripped child to the last resort.** A gunicorn-style prefork server that
    calls `gc.freeze()` and whose children trip the marking gets FR-006 in every such child, so a
-   fresh `sink=` there is not closed. Use `sink_factory=`, which the last resort still closes.
+   fresh `sink=` there is not closed. Use `sink_factory=`, which the last resort still closes. On CPython 3.12 "frozen" is read
+   against a floor taken when the package is imported, because 3.12 keeps a few hundred immortal
+   tuples in the permanent generation with no `gc.freeze()` (measured 375, stable across imports and
+   collections); a `gc.freeze()` made **before** the package is imported is then absorbed by the
+   floor, so a tripped child of such a process scans a heap that hides the frozen objects, and a
+   frozen sink it hands over again is unrecorded and claimable. On 3.13 and later the floor is zero
+   and every freeze is seen.
 5. **A C-extension sink type without GC support** is not in `gc.get_objects()`. It stays unrecorded
    in a scanning child, as in a normal child whose walk did not reach it.
 6. **A scanning child pays in refusals and in memory.** An inherited sink the parent never handed
@@ -840,10 +869,23 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
    superseded ones. It is narrow: no shipped sink defines `__del__` (a grep of `src/log_foundry`
    for `__del__` at `9f4d4dfd` finds none), and a plain third-party sink's `close()` takes no
    library lock. This spec does not audit the library's own reference drops inside those sections
-   for the same effect.
+   for the same effect. A finalizer under `_owned_lock` itself can still deadlock two threads: one
+   that forwards a close whose entry carries a hand a worker build declined reaches
+   `_hand_after_close`, which takes `_state._lock` with `_owned_lock` held, the reverse of the
+   `_state._lock` then `_owned_lock` that `_swap_sink`'s first section takes through `releasable`.
+   It needs that declined-hand mark on the very sink being finalized.
 8. **Another library's at-fork handlers run before the pin.** An `os.register_at_fork(after_in_child=…)`
    handler registered before log-foundry's runs first. If it drops the child's last reference to an
-   inherited sink whose entry was weak, that sink is collected before `_pin_inherited` runs.
+   inherited sink whose entry was weak, that sink is collected before `_pin_inherited` runs. A
+   collection the child's own first allocations trigger can do the same to an inherited sink that
+   was already unreachable cyclic garbage in the parent, before the pin reaches it. The repair is
+   never wrapped in `gc.disable()` (the order-of-work decision), so this is stated, not closed.
+9. **A re-pin costs a stamp walk of the live graph, and a wrapper the caller closes directly
+   re-pins once per child.** Measured with a configured `MemorySink` holding 100k events: one
+   re-pin takes about 5 ms, dominated by the walk's one-level read of the events list, and a
+   20-member `MultiSink` that the caller closes itself took about 99 ms, because each child's
+   release is outermost on its thread. The same wrapper closed by the library at `shutdown()`
+   re-pins once, 5.5 ms against 112 ms re-pinning per child (0.05 ms before this spec).
 
 ## Revision history
 
@@ -874,3 +916,42 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
   - An inherited failed marking re-scans rather than persisting.
   - `_owned_lock` is re-entrant, and finalizers have rules.
   - The capture is its own FR, the pin runs first, and the names are corrected.
+- **Revised at the plan review (2026-11-13, against `a8e91fac`).**
+  - FR-004's seed exclusion tests the exact shipped class (`_fork._defined_here(type(sink))`),
+    not `_fork._is_owned`, which a `Sink` subclass satisfies; AC-6 runs over three wrapper kinds.
+  - FR-006 names `_FactorySink._checked`, where PR #345 moved the factory's stamp.
+  - The Data Model's table gives a captured `_FOREIGN` entry its own row, weak where it can be.
+  - Known residuals 2, 3, 7 and 8 each gain what the plan review found: a `Sink`-subclass holder's
+    capture reach, a last-resort child's growing record, the two-thread inversion through a
+    finalizer reaching `_hand_after_close`, and cyclic garbage collected before the pin.
+  - `Runtime._owned_epoch` is named `Runtime._owned_clock` (an entry keeps `epoch`), because
+    `tests/test_worker_predicate_roster.py` files every site naming `_epoch` as a question about
+    the worker, which the record's counter is not.
+- **Completed (2026-11-13, at `f8dc19a1`).** The code as built agrees with the text above; where
+  it says more, the code is the record:
+  - A re-hand that finds the sink's own live entry also clears `captured`, besides making the
+    entry strong, clearing `closed` and bumping its epoch.
+  - The re-pin's roots are `_delivering_sinks()`, and the closes in flight are read through
+    `_CloseRegistry.in_flight_ids()`, one acquisition of the registry's leaf with no other lock
+    held. `release` reads the entry's epoch through `_close_clock` before registering the close
+    and settles it through `_settle_close`, inside a nested `finally` after `_closes.finish`.
+  - `_capture` reads containers through `_read_members`, which `_bounded_children` now wraps and
+    which announces nothing, so a container that raises in the parent is announced under the
+    capture's own line rather than the marking's.
+  - The pin also runs before `_fork` rebinds `reacquired_in_child`, which drops a list that may
+    hold an inherited sink; a fault in it is absorbed with its own line and the repair goes on.
+  - FR-001's lock criterion asserts "not held by the entering thread" through stand-ins that
+    record which thread holds them, and the `id`-reuse tests build live ballast of the same types
+    first, because a sink alone in its allocator pool empties the pool when it dies and the next
+    build is then served from another.
+- **Revised at the frame-1 diff review (2026-11-13, against `9bf54950`).** A performed release
+  nested inside another's `close()` on the same thread leaves the re-pin to the one that encloses
+  it (FR-001's "Where it runs"), because each forwarded child release re-pinning made a
+  library-driven 20-member `MultiSink` shutdown take 112 ms with a large live sink; Known residual
+  9 records what is left.
+- **Revised at the frame-2 diff review (2026-11-13, against `d1be4662`).**
+  - FR-005's frozen-heap test reads the freeze count against `Runtime._freeze_floor`, not zero:
+    CPython 3.12 reports 375 with no `gc.freeze()`, which sent every tripped child on 3.12 to the
+    last resort. Known residual 4 records the freeze 3.12 cannot see.
+  - FR-005's detail no longer says the child closes none of the heap's sinks "even one it
+    configures itself": a sink whose `reacquire_after_fork` returned is reclaimed and closed.

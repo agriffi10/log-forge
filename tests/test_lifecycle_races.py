@@ -1332,7 +1332,7 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     It does not, and the reason is worth stating because it is not the obvious one. The refusal
     is grounded in `_owned`, where `configure()` stamped the sink with the **parent's** pid;
     the child's walk, `_walk_after_fork`, writes its marks with `setdefault`, so it leaves that
-    stamp alone, and `releasable` answers on `record[0] == pid`, which the parent's stamp fails.
+    stamp alone, and `releasable` answers on `record.pid == pid`, which the parent's stamp fails.
     `_record_seeds`' own docstring says the same from the other side — `_owned` is the
     load-bearing seed of the marking (SPEC-079).
 
@@ -1340,7 +1340,7 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     repairs and descends into, and the record write is a `setdefault` either way. So the
     two terms the child reports carry different work, and the split is not the obvious one. The
     **verdict** is the term that sees `releasable` itself weakened while the record stands:
-    drop its `record[0] == pid` and the child answers `releasable,the-parent-s`. A change that
+    drop its `record.pid == pid` and the child answers `releasable,the-parent-s`. A change that
     *deletes* the record is caught twice over, `releasable,unrecorded` — and only once, on the
     pid, if the marking walk fails in the same edit, because `_marking_failed` then refuses the
     unrecorded sink anyway and the verdict stays `refused`.
@@ -1373,11 +1373,11 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
             record = _lifecycle._state._owned.get(id(superseded))
         if record is None:
             stamped = "unrecorded"
-        elif record[0] == os.getpid():
+        elif record.pid == os.getpid():
             stamped = "the-child-s"
-        elif record[0] == parent_pid:
+        elif record.pid == parent_pid:
             stamped = "the-parent-s"
-        elif record[0] == _lifecycle._FOREIGN:
+        elif record.pid == _lifecycle._FOREIGN:
             stamped = "foreign"
         else:
             stamped = "another-process"

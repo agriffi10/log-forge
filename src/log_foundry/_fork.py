@@ -718,8 +718,9 @@ _SKIP_ATTRIBUTE = "_FORK_SKIP"
 """A holder's opt-out: attribute names the walk must not read or descend into.
 
 **Bookkeeping that pins objects is not live state to repair**, and the difference is invisible to a
-walk that only sees a container. ``_lifecycle._state._owned`` is the case: SPEC-042 FR-001 requires
-it to hold a **strong** reference to every sink this process ever acquired, so without an opt-out
+walk that only sees a container. ``_lifecycle._state._owned`` is the case: SPEC-042 FR-001 has it
+reference the sinks this process acquired that are still alive, and in a forked child it holds
+each inherited one strongly from the first step of the repair (SPEC-081), so without an opt-out
 the walk reaches sinks the process abandoned several ``configure()`` calls ago — replacing their
 locks, which is merely wasteful, and calling their fork hooks, which is not. Measured: a forked
 child announced a buffer-discard failure for a sink that had been superseded, and a ``FileSink`` in
@@ -937,6 +938,33 @@ def register_walk(fn: Callable[[_Repair], None]) -> None:
     _walk = fn
 
 
+_pin: Callable[[], None] | None = None
+"""The step a child runs before anything else, set by :func:`register_pin` (SPEC-081 FR-004).
+
+``_lifecycle``'s pin of the ownership record it inherited, registered for the reason
+:data:`_walk` is: this module imports nothing that imports it.
+"""
+
+
+def register_pin(fn: Callable[[], None]) -> None:
+    """Sets the step a forked child runs first, before the rebind, the roster and the walk.
+
+    A second registration replaces the first, the reload case :data:`_installed` records.
+
+    Args:
+      fn: Called in the child with no arguments, taking no lock. A raise is absorbed and
+        announced, and the rest of the repair still runs.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    global _pin
+    _pin = fn
+
+
 def _reacquire_transports(holders: list[Any]) -> list[Any]:
     """Asks each sink that owns a buffered stream to re-acquire it in this child (FR-004).
 
@@ -1013,14 +1041,19 @@ def register_child_handler(fn: Callable[[], None]) -> None:
 def _reinit_after_fork() -> None:
     """Repairs the library in a child that has just returned from ``fork``.
 
-    **The order of work here is the contract** (SPEC-039 FR-001 AC-2, SPEC-079 FR-002):
+    **The order of work here is the contract** (SPEC-039 FR-001 AC-2, SPEC-079 FR-002,
+    SPEC-081 FR-004):
 
-    1. rebind :data:`reacquired_in_child`, so this fork cannot inherit the last one's;
-    2. replace the roster of global primitives, :data:`_GLOBAL_PRIMITIVES`;
-    3. run the registered walk with the shared :class:`_Repair`, which repairs every sink and
+    1. run the registered pin (:data:`_pin`), which holds strongly every inherited ownership
+       record entry whose sink is alive, before anything below can drop the last reference to
+       one — the rebind in step 2 drops a list that may hold one — and before the roster, since it
+       takes no lock;
+    2. rebind :data:`reacquired_in_child`, so this fork cannot inherit the last one's;
+    3. replace the roster of global primitives, :data:`_GLOBAL_PRIMITIVES`;
+    4. run the registered walk with the shared :class:`_Repair`, which repairs every sink and
        worker reached from the runtime's roots and marks what the child inherited;
-    4. run the hooks it collected (:func:`_reacquire_transports`);
-    5. run the registered handlers.
+    5. run the hooks it collected (:func:`_reacquire_transports`);
+    6. run the registered handlers.
 
     A lock re-initialised *after* a handler that takes it is a handler that hangs, and it hangs
     on the child's only thread with nothing to interrupt it. Work that must happen before *any*
@@ -1046,6 +1079,16 @@ def _reinit_after_fork() -> None:
         only writer, appending only.
     """
     global reacquired_in_child
+    pin = _pin
+    if pin is not None:
+        try:
+            pin()
+        except Exception as exc:
+            _diag.absorbed(
+                "pinning the inherited ownership record after a fork",
+                exc,
+                "a sink the parent no longer held may be collected in this child",
+            )
     reacquired_in_child = []
     repair = _Repair()
     try:
