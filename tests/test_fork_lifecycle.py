@@ -363,7 +363,8 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     repair is exactly the case a refusal made later would miss. The parent's own setting is put
     back once the fork has returned, in the ``finally``, so it is restored when the fork raises
     -- and a fork that raises closes the pipe it would have handed the child, rather than leaking
-    both ends into the rest of the run.
+    both ends into the rest of the run. The pipe is made only once the setting has been changed,
+    so a setting :func:`_set_dumpable` refuses leaves no pipe behind either.
 
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
@@ -378,16 +379,17 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
       OSError: If the kernel refuses to change whether the process may dump core.
     """
     global _child_pipe
-    read_fd, write_fd = os.pipe()
     parent = os.getpid()
     dumpable = _set_dumpable(0)
     try:
-        gc.collect()
-        pid = os.fork()
-    except BaseException:
-        os.close(read_fd)
-        os.close(write_fd)
-        raise
+        read_fd, write_fd = os.pipe()
+        try:
+            gc.collect()
+            pid = os.fork()
+        except BaseException:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
     finally:
         if os.getpid() == parent:
             _set_dumpable(dumpable)
@@ -769,9 +771,48 @@ def test_every_child_is_forked_unable_to_dump_core(monkeypatch: pytest.MonkeyPat
         raise OSError(errno.EAGAIN, "planted fork failure")
 
     monkeypatch.setattr(os, "fork", refused)
+    open_before = set(os.listdir("/dev/fd"))
     with pytest.raises(OSError, match="planted fork failure"):
         run_in_child(lambda: None)
     assert _dumpable() == before, "a failed fork left the parent unable to dump core"
+    leaked = set(os.listdir("/dev/fd")) - open_before
+    assert not leaked, f"a failed fork leaked descriptor(s) {sorted(leaked)} into the run"
+
+
+def test_an_unrestorable_dump_setting_is_refused_before_the_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent reading dumpable 2 gets an error, and no child, no pipe and no changed setting.
+
+    ``PR_SET_DUMPABLE`` cannot set 2 back, so :func:`_set_dumpable` refuses it up front rather
+    than discovering it in :func:`run_in_child`'s ``finally``, after the fork. Found by review,
+    with the refusal removed and still green: the case is unreachable on a CI runner, whose
+    parent reads 1, so the reading is planted here, which also lets this run off Linux.
+
+    Args:
+      monkeypatch: Plants the reading of 2 and records any fork.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    forks: list[None] = []
+
+    def recorded() -> int:
+        forks.append(None)
+        raise OSError(errno.EAGAIN, "the refusal let a fork through")
+
+    monkeypatch.setattr(sys.modules[__name__], "_dumpable", lambda: 2)
+    monkeypatch.setattr(os, "fork", recorded)
+    open_before = set(os.listdir("/dev/fd"))
+    with pytest.raises(OSError, match="dumpable is 2") as refused:
+        run_in_child(lambda: None)
+    assert refused.value.errno == errno.EINVAL
+    assert not forks, "a setting that cannot be restored was refused only after the fork"
+    leaked = set(os.listdir("/dev/fd")) - open_before
+    assert not leaked, f"the refusal leaked descriptor(s) {sorted(leaked)} into the run"
 
 
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
