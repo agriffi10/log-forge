@@ -13,9 +13,9 @@ description: "Assembly cannot know the destination, so a value it allows and a d
 - `PostgresSink` matches the JSON text it already builds against `NUL_ESCAPE`, `(?<!\\)(?:\\\\)*\\u0000` — a `u0000` whose preceding backslash run has odd length — so a clean event costs one search and the six characters `\u0000` written as text, which JSONB accepts, cost no walk. The search is a filter, not the decision: `repair_nul` walks for a real U+0000 and returns `None` when it finds none, so it is the walk that leaves the lookalike alone. On a match `repair_nul` replaces every U+0000 in every string value and key, at every depth, with U+FFFD before encoding again; the projected text columns are top-level values of the same event, the `service`, `version` and `env` stamps included, so one repair covers the JSON and the columns with one representation.
 - `MongoDBSink` asks the driver's own `bson.encode`, imported lazily on the first `emit` that reaches the check and read by name, never at construction: a `bson` that is missing or has no `encode` disables the check rather than raising, so an injected client with no driver installed is never repaired. When it refuses, `repair_bson` replaces an out-of-range integer with assembly's too-large-number placeholder through `sanitize.int_placeholder` — factored out of `sanitize._int_text`, with a test holding `_Coercer`'s two inline copies and `_otel._int_digits` equal to it — and a NUL in a key with U+FFFD; a NUL in a *value* is left, because BSON accepts it, and a `bool` is never read as an integer. The existing `json.dumps` size measure still decides the 16 MB drop.
 
-**A projected column the driver cannot bind is bound as its JSON text, and nothing is marked.** `SQLiteSink` and `PostgresSink` project a few top-level values into text columns beside the event's JSON, and a value there the driver cannot bind cost the whole batch: `sqlite3` refuses a `dict`, a `list` and an integer outside the signed 64-bit range (that one a bare `OverflowError`, nothing counted), and psycopg a `dict` and a `list` that is mixed, ragged or holds a `dict`, each measured on 2026-11-13 against `sqlite3` and PostgreSQL 17.11. A `TransformSink` can put any of them in a column, so the admission rule holds. `sinks/_encode.column_value` binds a container, and for SQLite an out-of-range integer, as its JSON text, the text the event column already holds for it. Every container takes the rule, including the lists psycopg did bind as array literals (`{1,2}`), so a column holds one representation whichever sink wrote it. The event itself is not changed, so it carries no `truncated` and nothing is counted: the column is a filter beside the record, not the record.
+**A projected column the driver cannot bind is bound as its JSON text, and nothing is marked.** `SQLiteSink` and `PostgresSink` project a few top-level values into text columns beside the event's JSON, and a value there the driver cannot bind cost the whole batch: `sqlite3` refuses a `dict`, a `list` and an integer outside the signed 64-bit range (that one a bare `OverflowError`, nothing counted), and psycopg a `dict` and a `list` that is mixed, ragged or holds a `dict`, each measured at `a8e91fac` against `sqlite3` and PostgreSQL 17.11. A `TransformSink` can put any of them in a column, so the admission rule holds. `sinks/_encode.column_value` binds a container, and for SQLite an out-of-range integer, as its JSON text, the text the event column already holds for it. Every container takes the rule, including the lists psycopg did bind as array literals (`{1,2}`), so a column holds one representation whichever sink wrote it. The event itself is not changed, so it carries no `truncated` and nothing is counted: the column is a filter beside the record, not the record.
 
-**A lone surrogate is dropped alone, not repaired.** JSONB refuses its `\ud800` escape and psycopg the string in a text column, so one cost `PostgresSink` the whole transaction, measured on 2026-11-13; in a SQLite projected column `sqlite3` refuses it too. Assembly replaces a lone surrogate, `TransformSink` coerces one and `configure()` refuses one in a stamp, so only a direct `emit` brings one, and by the admission rule it is not repaired: `sinks/_encode.refuse_surrogate` (PostgreSQL, the whole event) and `column_value` (a projected column) raise, and the encode step drops the event alone, counted and announced. SQLite's event column stores the escape, so a surrogate outside SQLite's projected columns lands.
+**A lone surrogate is dropped alone, not repaired.** JSONB refuses its `\ud800` escape and psycopg the string in a text column, so one cost `PostgresSink` the whole transaction, measured at `a8e91fac`; in a SQLite projected column `sqlite3` refuses it too. Assembly replaces a lone surrogate, `TransformSink` coerces one and `configure()` refuses one in a stamp, so only a direct `emit` brings one, and by the admission rule it is not repaired: `sinks/_encode.refuse_surrogate` (PostgreSQL, the whole event) and `column_value` (a projected column) raise, and the encode step drops the event alone, counted and announced. SQLite's event column stores the escape, so a surrogate outside SQLite's projected columns lands.
 
 **Marked as assembly marks, and not a loss.** A repaired copy carries `truncated: True`, the mark assembly sets for a lone surrogate replaced by U+FFFD and for its too-large-number placeholder; an event the repair did not change gets no `truncated` key and is byte-identical to before. Two keys that repair to one text keep the later value, marked, as assembly resolves two hostile keys on one placeholder. Nothing is counted and nothing is announced, as with assembly's coercion (invariant 2).
 
@@ -23,16 +23,16 @@ description: "Assembly cannot know the destination, so a value it allows and a d
 
 ## History
 
-### 2026-11-06
-
-- **Settled** by SPEC-069; Andrew chose on 2026-11-04 to repair and deliver rather than drop.
-- **Corrected** the same day by the system-frame diff review: the entry said a substring test would
-  repair the six-character lookalike. The walk decides that, and returns `None` for it; the
-  pattern is a filter that keeps the walk off clean text.
-
 ### 2026-11-13
 
 - **Widened** by the SPEC-069 follow-up fix (no spec): a projected column value `sqlite3` or
   psycopg cannot bind is bound as its JSON text, unmarked, and a lone surrogate from a direct
   `emit` is dropped alone rather than repaired, both measured. The struck *Out* sentence names
   them.
+
+### 2026-11-06
+
+- **Settled** by SPEC-069; Andrew chose on 2026-11-04 to repair and deliver rather than drop.
+- **Corrected** the same day by the system-frame diff review: the entry said a substring test would
+  repair the six-character lookalike. The walk decides that, and returns `None` for it; the
+  pattern is a filter that keeps the walk off clean text.

@@ -10,18 +10,18 @@ description: "When `SQLiteSink`'s insert raises `sqlite3.Error`, or a `FileSink`
 
 **Not public surface.** A frozen name is inherited and kept for all of `1.x` (*A protocol that is exported is a protocol that will be inherited*), and nothing needs one: `isinstance(exc, SinkDeliveryError)` and the driver's own `except` already match. The derived class is in no `__all__` and has no documented import path; `SinkDeliveryError`'s docstring says a sink may raise such a subclass. Rejected: a static subclass per driver type, which cannot cover a type the driver adds and is not the driver's class for an `except` written against a narrower one. Accepted: this is dynamic inheritance and module state, which the Python rulebook asks to avoid (§15, §13), and `_driver_error.py`'s docstring says so.
 
-**A partial write's duplicates are an accepted edge for 1.2.0** (Andrew's ruling, 2026-11-13). A `FileSink` or `RotatingFileSink` write that fails partway leaves the earlier lines of the batch on disk, the sink raises, and the worker's retry writes the whole batch again; a `StdoutSink` or `StderrSink` stream that raises partway does the same. Measured with `RLIMIT_FSIZE` capping the file partway through a 200-event batch and lifted before the second `emit`: 69 to 100 of the 200 events landed twice, and no line was torn, because CPython's `BufferedWriter` keeps the unwritten tail in its buffer and the next flush finishes it. A fault that persists fails the retry too and duplicates nothing, so the duplicates need the fault to clear between attempts. This is a recorded exception to invariant 7's "no event landed twice". Two remedies are rejected. Truncating the file back to where the batch began would delete the lines a forked child appended to the same file in between (invariant 12). Flushing per line and reporting a partial write instead of raising trades the duplicates for losing the unwritten rest, which is never retried even when the disk recovers, and made a 1,000-event batch about eleven times slower to write (0.17 ms against 1.89 ms). The closure is moving the file sinks onto `deliver`, so the engine resends only what did not land, as its own spec after 1.2.0.
+**A partial write's duplicates are an accepted edge for 1.2.0** (Andrew's ruling, 2026-11-13). A `FileSink` or `RotatingFileSink` write that fails partway leaves the earlier lines of the batch on disk, the sink raises, and the worker's retry writes the whole batch again; a `StdoutSink` or `StderrSink` stream that raises partway does the same. Measured at `a8e91fac` with `RLIMIT_FSIZE` capping the file partway through a 200-event batch and lifted before the second `emit`: 69 to 100 of the 200 events landed twice, and no line was torn, because CPython's `BufferedWriter` keeps the unwritten tail in its buffer and the next flush finishes it. A fault that persists fails the retry too and duplicates nothing, so the duplicates need the fault to clear between attempts. This is a recorded exception to invariant 7's "no event landed twice". Two remedies are rejected. Truncating the file back to where the batch began would delete the lines a forked child appended to the same file in between (invariant 12). Flushing per line and reporting a partial write instead of raising trades the duplicates for losing the unwritten rest, which is never retried even when the disk recovers, and made a 1,000-event batch about eleven times slower to write (0.17 ms against 1.89 ms). The closure is moving the file sinks onto `deliver`, so the engine resends only what did not land, as its own spec after 1.2.0.
 
 **Do NOT** make a partial file write atomic under this decision, by truncation or otherwise; do NOT export the derived class; do NOT copy an attribute the original did not set; do NOT take the emit lock to count. (SPEC-069 FR-004)
 
 ## History
-
-### 2026-11-06
-
-- **Settled** by SPEC-069.
 
 ### 2026-11-13
 
 - **Ruled** on SPEC-069's open follow-up: a partial write's duplicates are accepted for 1.2.0 and
   recorded as an exception to invariant 7, with the measurement and the two rejected remedies;
   the closure, the file sinks on `deliver`, is to be specified after 1.2.0 (Andrew's choice).
+
+### 2026-11-06
+
+- **Settled** by SPEC-069.

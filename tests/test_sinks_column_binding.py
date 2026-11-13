@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -150,7 +150,7 @@ class _Cursor:
     def __init__(self, rows: list[tuple[object, ...]]) -> None:
         self._rows = rows
 
-    def __enter__(self) -> _Cursor:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *exc: object) -> bool:

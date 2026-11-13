@@ -431,8 +431,8 @@ A file or stream write that fails partway can land events twice, accepted for 1.
 ruling, 2026-11-13): a `FileSink` or `RotatingFileSink` write, or a `StdoutSink` or `StderrSink`
 stream, that raises after earlier lines of the batch reached the file leaves them there and
 raises, and the worker's retry writes the whole batch again, so a fault that clears between the
-attempts duplicates those lines (69 to 100 of a 200-event batch, measured with the file size
-capped). The measurement, the two rejected remedies and the closure — the file sinks on `deliver`,
+attempts duplicates those lines (69 to 100 of a 200-event batch, measured at `a8e91fac` with the
+file size capped). The measurement, the two rejected remedies and the closure — the file sinks on `deliver`,
 specified after 1.2.0 — are in *A sink's own driver error is counted, announced and raised as both
 types* (`docs/decisions/sink-delivery/`).
 The recorded exception extends to `deliver` (SPEC-072 FR-004): a run whose verdict marks an event
