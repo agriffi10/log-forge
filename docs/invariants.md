@@ -281,9 +281,10 @@ changing thread, or a signal handler) landing between that change's retarget and
 leave the sink that change installs open until a later `shutdown()` or the exit closes it — only
 the first with a `pending` line (`docs/decisions/pipeline/`); a forked child that cannot tell what
 it inherited — its heap scan after a tripped marking raised or met a frozen heap, or its walk
-raised — records a sink it is handed with `sink=` as `_FOREIGN` and never closes it, with one
-`pending` line, while the lazy default and a `sink_factory=` sink are still closed (SPEC-081
-FR-006).
+raised — records a sink it is handed with `sink=` that has no record of its own as `_FOREIGN` and
+never closes it, with one `pending` line, while the lazy default, a `sink_factory=` sink and an
+inherited sink the repair reached whose `reacquire_after_fork` returned are still closed — not
+one a walk that raised first never reached (SPEC-081 FR-006).
 *Guarded:* `tests/test_owed_closes.py`, `tests/test_shutdown_lifecycle.py`,
 `tests/test_sink_ownership.py`; `tests/test_concurrent_configure.py` that two concurrent
 `configure(sink=…)` calls close each sink once; `tests/test_shutdown_mid_swap.py` that a
@@ -590,8 +591,9 @@ but a sink **behind a `weakref.proxy`** is not repaired, because its referent is
 calling into the proxy, so a lock it holds at the fork stays held in the child (`architecture.md`
 §13). Past a tripped marking ceiling the child marks the sink-shaped objects on its inherited heap
 instead, so a parent's sink it hands over again is still refused; where that scan raises or meets
-a frozen heap, or the walk raises, the child refuses every sink it is handed with `sink=` that the
-library did not build (SPEC-081; `architecture.md` §13 lists what the bounded record leaves). A
+a frozen heap, or the walk raises, the child refuses a sink it is handed with `sink=` that has no
+record of its own and that the library did not build, while one the repair reached whose
+`reacquire_after_fork` returned is reclaimed and closed (SPEC-081; `architecture.md` §13 lists what the bounded record leaves). A
 sink's closed guard
 (SPEC-076) is on the walk at `self._guard`, so its locks and its event are replaced, and its state
 is adopted lazily by pid: the child counts no parent section inside, turns a `CLOSING` it

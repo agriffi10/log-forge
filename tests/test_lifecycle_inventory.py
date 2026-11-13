@@ -1015,8 +1015,13 @@ INVENTORY: dict[Key, Row] = {
     ),
     _rt("_releasing_here"): Row(
         "Runtime",
-        _INH,
+        ("reset: _lifecycle._clear_after_fork",),
         "how many performed releases this thread is inside; only the outermost re-pins (SPEC-081)",
+    ),
+    _rt("_freeze_floor"): Row(
+        "Runtime",
+        _INH,
+        "the freeze count of an unfrozen process, read at import on 3.12, zero after (SPEC-081)",
     ),
     _rt("_building_here"): Row(
         "Runtime",

@@ -552,8 +552,8 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
 
     detail = (
         f"the walk marking a forked child's inherited sinks passed {_lifecycle._MARKING_CEILING} "
-        "objects; this child marked the sink-shaped objects on its inherited heap instead, and "
-        "closes none of them, even one it configures itself"
+        "objects; this child marked the unrecorded sinks on its heap instead and closes none of "
+        "them, even if configured, unless re-acquired"
     )
     assert len(detail) <= _diag._MAX_DETAIL, "the line is written whole, never cut"
 

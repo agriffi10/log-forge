@@ -466,8 +466,9 @@ def test_a_library_driven_wrapper_close_re_pins_once(monkeypatch: pytest.MonkeyP
     """FR-001's "where it runs": only the outermost performed release on a thread re-pins.
 
     A ``MultiSink`` forwards a release for each child from inside its own ``close()``, and a re-pin
-    walks the live graph; measured with a 100k-event ``MemorySink`` live, re-pinning per child made
-    a 20-member shutdown take 112 ms against 5.5 ms re-pinning once (0.05 ms before SPEC-081).
+    walks the live graph. Measured on macOS with Python 3.13, the shutdown of a configured
+    ``MultiSink`` holding a 100k-event ``MemorySink`` and 20 other children took 112 ms re-pinning
+    per child (``f8dc19a1``), 5.5 ms re-pinning once (``d1be4662``) and 0.05 ms at ``a8e91fac``.
     """
     children = [RecordingSink() for _ in range(20)]
     log_foundry.configure(sink=MultiSink(*children))
@@ -514,6 +515,51 @@ def test_a_sink_handed_over_while_a_repin_runs_stays_strong(
     _lifecycle._repin()
     entry = entry_for(sink)
     assert entry is not None and entry.strong is sink, "a sink handed over again stays strong"
+
+
+class InterruptedClose(RecordingSink):
+    """A sink whose close raises ``KeyboardInterrupt``."""
+
+    def close(self) -> None:
+        """Raises the interrupt."""
+        raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize(
+    "raised", [OSError, KeyboardInterrupt], ids=["OSError", "KeyboardInterrupt"]
+)
+def test_a_release_whose_close_raised_leaves_no_depth_behind(raised: type[BaseException]) -> None:
+    """The depth a release raises is restored on every exit, or the thread never re-pins again."""
+    failing: RecordingSink = RaisingClose() if raised is OSError else InterruptedClose()
+    _lifecycle.stamp(failing)
+    with pytest.raises(raised):
+        _lifecycle.release(failing)  # type: ignore[arg-type]
+    assert _lifecycle._release_depth() == 0
+    after = RecordingSink()
+    _lifecycle.stamp(after)
+    _lifecycle.release(after)  # type: ignore[arg-type]
+    entry = entry_for(after)
+    assert entry is not None and entry.closed is True and entry.strong is None, (
+        "the next release on this thread is outermost, so it re-pins and demotes"
+    )
+
+
+def test_a_child_forked_inside_a_close_starts_at_depth_zero() -> None:
+    """A child that leaves through ``os._exit`` from inside a ``close()`` never unwinds the depth.
+
+    The fork-context ``multiprocessing.Process`` shape: ``run_in_child`` forks from inside the
+    close and its child leaves through ``os._exit``, so only the child's handler can zero it.
+    """
+    seen: list[str] = []
+
+    class ForkingClose(RecordingSink):
+        def close(self) -> None:
+            child = run_in_child(lambda: str(_lifecycle._release_depth()))
+            seen.append(str(child.output))
+            super().close()
+
+    _lifecycle.release(ForkingClose())  # type: ignore[arg-type]
+    assert seen == ["0"], seen
 
 
 # -- FR-002: before an entry is demoted, the sinks beneath it are captured ----------------------

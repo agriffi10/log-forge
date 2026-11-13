@@ -65,7 +65,7 @@ def _restore_ceiling_in_child() -> None:
 
 os.register_at_fork(after_in_child=_restore_ceiling_in_child)
 
-_HEAP_LINE = "this child marked the sink-shaped objects on its inherited heap instead"
+_HEAP_LINE = "this child marked the unrecorded sinks on its heap instead"
 _LAST_RESORT = "this child cannot tell what it inherited and will close only a sink the library"
 _REFUSED_SINK = "configure(sink=...) in a forked child that could not tell what it inherited"
 
@@ -481,6 +481,74 @@ def test_a_child_announces_for_itself(monkeypatch: pytest.MonkeyPatch) -> None:
 
     child = run_in_child(in_child)
     assert child.output == "False,False,False", child.output
+
+
+_FRESH_INTERPRETER = """
+import gc, os, sys
+import log_foundry
+from log_foundry import _lifecycle
+
+
+class Inner:
+    def emit(self, batch):
+        pass
+
+    def close(self):
+        pass
+
+
+class Wrapper:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def emit(self, batch):
+        pass
+
+    def close(self):
+        pass
+
+
+log_foundry.configure(sink=Wrapper(Inner()))
+log_foundry.info("parent")
+log_foundry.flush()
+for _ in range(5):
+    gc.collect()
+_lifecycle._MARKING_CEILING = 0
+read, write = os.pipe()
+gc.collect()
+pid = os.fork()
+if pid == 0:
+    report = f"{gc.get_freeze_count() > _lifecycle._state._freeze_floor},"
+    report += f"{_lifecycle._state._marking_failed}"
+    os.write(write, report.encode())
+    os._exit(0)
+os.close(write)
+os.waitpid(pid, 0)
+sys.stdout.write(os.read(read, 100).decode())
+"""
+
+
+def test_a_process_that_never_froze_its_heap_is_not_read_as_frozen() -> None:
+    """FR-005: a fresh interpreter with no ``gc.freeze()``, tripped, scans its heap in the child.
+
+    Run in a subprocess so the interpreter is the one CPython starts, with nothing the suite did
+    before: on 3.12 the collector keeps immortal tuples in the permanent generation with no freeze,
+    so a test of the count against zero read every tripped child there as frozen and sent it to the
+    last resort. CI's 3.12 leg is what this guards.
+    """
+    import subprocess
+
+    env = dict(os.environ, PYTHONPATH=str(pathlib.Path(log_foundry.__file__).resolve().parents[1]))
+    done = subprocess.run(  # noqa: S603
+        [sys.executable, "-c", _FRESH_INTERPRETER],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
+    assert done.stdout == "False,False", (done.stdout, done.stderr)
 
 
 def test_a_tripped_child_refuses_a_sink_the_parent_never_handed_over(

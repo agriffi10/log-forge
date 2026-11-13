@@ -1057,8 +1057,25 @@ class Runtime:
         Read by :func:`release` so that only the outermost one on a thread re-pins the ownership
         record: a release a wrapper forwards from inside another release's ``close()`` leaves the
         re-pin to it. Per thread, for :attr:`_handing_here`'s reason: what it records is a call on
-        this thread's stack. A forked child keeps the forking thread's depth, which that thread's
-        own ``finally`` restores.
+        this thread's stack. A forked child starts at zero (:func:`_clear_after_fork`): a child
+        forked from inside a ``close()`` — a fork-context ``multiprocessing.Process`` started there
+        — may leave through ``os._exit`` without unwinding, and an inherited depth would then keep
+        it from ever re-pinning. A forking thread that does unwind in the child restores each
+        level's saved depth on the way out, so it still ends at zero.
+        """
+        self._freeze_floor = gc.get_freeze_count() if sys.version_info < (3, 13) else 0
+        """The freeze count of a process that never called ``gc.freeze()`` (SPEC-081 FR-005).
+
+        :func:`_mark_heap` reads a heap as frozen only above it. On CPython 3.12 the collector moves
+        immortal objects into the permanent generation, so ``gc.get_freeze_count()`` reads a few
+        hundred with no freeze anywhere — measured 375 tuples, unchanged by later imports, fifty
+        collections, allocation churn and collections on eight threads, back to the same value
+        after ``gc.unfreeze()`` and one collection, and about 27,000 after a real ``gc.freeze()``.
+        So 3.12 reads its floor once, when this module is imported. On 3.13 and later the count is
+        zero without a freeze, so the floor is zero and every freeze is seen. What 3.12 cannot see
+        is a freeze made **before** this package was imported, which the floor then absorbs: a
+        tripped child of such a process scans a heap that hides the frozen objects (a recorded
+        residual, ``architecture.md`` §13). Inherited by a child as it stands.
         """
         self._building_here = threading.local()
         """The sink-factory builds whose factory is running on this thread, as ``yielders``.
@@ -1570,6 +1587,11 @@ def _clear_after_fork() -> None:
     only because this is the critical section the handler already has; the sets themselves need
     none.
 
+    **It zeroes the release depth** (SPEC-081): :attr:`Runtime._releasing_here` counts the
+    performed releases a thread is inside, and a child forked from inside one's ``close()`` that
+    leaves through ``os._exit`` never unwinds them, so an inherited depth would stop that child
+    from ever re-pinning its ownership record.
+
     **It marks the child's stop signal as owed to its sinks**, through
     :attr:`Runtime._signal_owed`, which :func:`_owed_candidates` settles on the child's
     first orphan log or ``flush()``. It writes only the flag, so no sink's code runs here. It is
@@ -1594,6 +1616,7 @@ def _clear_after_fork() -> None:
         _state._shutdown_running = 0
         _state._late_worker = None
         _state._signal_owed = True
+        _state._releasing_here = threading.local()
         worker = _state.live_worker()
         if worker is not None and id(worker.sink) not in _state._closes.owed:
             _state._closes.arm(worker.sink)
@@ -2283,8 +2306,8 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
         if tripped:
             _diag.pending(
                 f"the walk marking a forked child's inherited sinks passed {_MARKING_CEILING} "
-                f"objects; this child marked the sink-shaped objects on its inherited heap "
-                f"instead, and closes none of them, even one it configures itself"
+                f"objects; this child marked the unrecorded sinks on its heap instead and closes "
+                f"none of them, even if configured, unless re-acquired"
             )
 
 
@@ -2316,7 +2339,10 @@ def _mark_heap(found: list[object]) -> bool:
 
     **A frozen heap is a failed scan.** After ``gc.freeze()`` the permanent generation is out of
     ``gc.get_objects()``'s reach, so a scan there would miss every frozen sink; it reads nothing
-    and reports failure, sending the child to the last resort. Unfreezing to scan was rejected: it
+    and reports failure, sending the child to the last resort. "Frozen" is a freeze count above
+    :attr:`Runtime._freeze_floor`, not above zero: CPython 3.12 keeps a few hundred immortal tuples
+    in the permanent generation with no ``gc.freeze()`` at all, so a zero test sent every tripped
+    child on 3.12 to the last resort. Unfreezing to scan was rejected: it
     would change the application's collector state behind its back.
 
     The cost is paid once, in a scanning child only: measured about 2 ms to list 71k objects and
@@ -2332,7 +2358,7 @@ def _mark_heap(found: list[object]) -> bool:
     Raises:
       Exception: Whatever :func:`_heap_objects` raises.
     """
-    if gc.get_freeze_count() > 0:
+    if gc.get_freeze_count() > _state._freeze_floor:
         return False
     for candidate in _heap_objects():
         if not _may_be_a_sink(candidate):
@@ -2737,9 +2763,9 @@ def _settle_close(sink: object, epoch: int | None, *, repin: bool) -> None:
     library holds again looking finished — so it is left as that stamp made it.
 
     **Only the outermost performed release on a thread re-pins.** A wrapper's ``close()`` forwards
-    a release for each of its children, and a re-pin walks the live graph, which a configured
-    ``MemorySink`` of 100k events makes about 5 ms: measured, ``MultiSink(20 sinks).close()`` took
-    105 ms re-pinning once per child against 0.06 ms before SPEC-081. A release nested inside
+    a release for each of its children, and a re-pin walks the live graph, whose cost grows with
+    what the live sink holds, so one re-pin per child multiplied a wrapper's close by its member
+    count (``tests/test_ownership_record.py`` records the measurement). A release nested inside
     another's ``close()`` on the same thread therefore marks its sink and leaves the re-pin to the
     release that encloses it, which runs after every child has settled, so a library-driven
     wrapper close re-pins once. A wrapper the caller closes directly has no enclosing release, so

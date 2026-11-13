@@ -2188,7 +2188,12 @@ and a third copy is a fork with no merge.
   4. **A frozen heap sends a tripped child to the last resort.** A gunicorn-style prefork server
      that calls `gc.freeze()` and whose children trip the marking gets the last resort in every
      such child, so a fresh `sink=` there is not closed. Use `sink_factory=`, which the last
-     resort still closes.
+     resort still closes. On CPython 3.12 "frozen" is read against a floor taken when the package
+     is imported, because 3.12 keeps a few hundred immortal tuples in the permanent generation with
+     no `gc.freeze()` (measured 375); a `gc.freeze()` made **before** the package is imported is
+     then absorbed by the floor, so a tripped child of such a process scans a heap that hides the
+     frozen objects, and a frozen sink it hands over again is unrecorded and claimable. On 3.13
+     and later the floor is zero and every freeze is seen.
   5. **A C-extension sink type without GC support** is not in `gc.get_objects()`. It stays
      unrecorded in a scanning child, as in a normal child whose walk did not reach it.
   6. **A scanning child pays in refusals and in memory.** An inherited sink the parent never

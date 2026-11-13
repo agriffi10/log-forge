@@ -66,11 +66,20 @@
   `Lock`. After the frame-1 review, eight more reddened: the heap scan's `_is_weak_proxy` branch,
   the refusal line made non-root-only, the demotion's epoch test, both epoch tests, each of the
   three once-only flag resets, and the re-pin made per-release. The re-pin's pre-filter epoch test
-  removed alone survives by design: it only saves a capture.
+  removed alone survives by design: it only saves a capture. After the frame-2 review three more
+  reddened: the release depth's restore removed (`OSError` and `KeyboardInterrupt` cases), the
+  child's depth reset removed, and the freeze floor replaced by zero, under 3.12.
 - **Owed to CI:** the full suite on 3.12 and 3.13, whose fork tests run real `os.fork()`
   children on Linux.
 
 ## Open and accepted edges
+
+- **A freeze before the import, on 3.12** (Known residual 4). CPython 3.12 reports a freeze count of
+  375 with no `gc.freeze()`, so `_mark_heap` reads the heap as frozen only above
+  `Runtime._freeze_floor`, taken at import on 3.12 and zero on 3.13 and later. A `gc.freeze()` made
+  before log-foundry is imported is then not seen on 3.12. `tests/test_fork_heap_marking.py` runs a
+  fresh interpreter with no freeze and asserts its tripped child is not read as frozen, which CI's
+  3.12 leg holds.
 
 - **A re-pin's cost** (Known residual 9), measured on macOS with Python 3.13 and a configured
   `MemorySink` of 100k events: one re-pin about 5 ms, dominated by the stamp walk's read of the

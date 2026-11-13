@@ -461,8 +461,12 @@ When the scan succeeds, `_marking_failed` is cleared. When it fails, the flag is
 set), and FR-006 applies. Clearing the flag is a deliberate change from `9f4d4dfd`, where nothing
 ever cleared it, so every descendant of a failed child stayed in the failed state.
 
-**A frozen heap is a failed scan.** In a child where `gc.get_freeze_count() > 0`,
-`gc.get_objects()` cannot see the permanent generation. A scan there would miss every frozen sink,
+**A frozen heap is a failed scan.** In a child where `gc.get_freeze_count()` is above
+`Runtime._freeze_floor`, the count of a process that never called `gc.freeze()`,
+`gc.get_objects()` cannot see the permanent generation. The floor is zero on CPython 3.13 and
+later; 3.12 reads it once, when the package is imported, because its collector keeps immortal
+objects in the permanent generation with no freeze, so testing the count against zero read every
+tripped child on 3.12 as frozen (Known residual 4 states what 3.12 cannot see). A scan there would miss every frozen sink,
 so `_mark_heap` does not read the heap at all and reports the scan as failed. Andrew's decision
 said that if the heap scan fails, the last resort applies, and a scan that cannot see the heap has
 failed.
@@ -495,7 +499,7 @@ marks for a sink whose `reacquire_after_fork` returned.
 close an inherited sink it has no record of unless it configures that sink itself") is now false.
 The new detail is exactly:
 
-`the walk marking a forked child's inherited sinks passed {_MARKING_CEILING} objects; this child marked the sink-shaped objects on its inherited heap instead, and closes none of them, even one it configures itself`
+`the walk marking a forked child's inherited sinks passed {_MARKING_CEILING} objects; this child marked the unrecorded sinks on its heap instead and closes none of them, even if configured, unless re-acquired`
 
 A scan that fails writes FR-006's line instead of this one, since this line would then be false.
 A scan run only because the flag was inherited, which then succeeds, writes nothing.
@@ -846,7 +850,13 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
    life; that is the safe direction, since a strong entry is never answered for another object.
 4. **A frozen heap sends a tripped child to the last resort.** A gunicorn-style prefork server that
    calls `gc.freeze()` and whose children trip the marking gets FR-006 in every such child, so a
-   fresh `sink=` there is not closed. Use `sink_factory=`, which the last resort still closes.
+   fresh `sink=` there is not closed. Use `sink_factory=`, which the last resort still closes. On CPython 3.12 "frozen" is read
+   against a floor taken when the package is imported, because 3.12 keeps a few hundred immortal
+   tuples in the permanent generation with no `gc.freeze()` (measured 375, stable across imports and
+   collections); a `gc.freeze()` made **before** the package is imported is then absorbed by the
+   floor, so a tripped child of such a process scans a heap that hides the frozen objects, and a
+   frozen sink it hands over again is unrecorded and claimable. On 3.13 and later the floor is zero
+   and every freeze is seen.
 5. **A C-extension sink type without GC support** is not in `gc.get_objects()`. It stays unrecorded
    in a scanning child, as in a normal child whose walk did not reach it.
 6. **A scanning child pays in refusals and in memory.** An inherited sink the parent never handed
@@ -939,3 +949,9 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
   it (FR-001's "Where it runs"), because each forwarded child release re-pinning made a
   library-driven 20-member `MultiSink` shutdown take 112 ms with a large live sink; Known residual
   9 records what is left.
+- **Revised at the frame-2 diff review (2026-11-13, against `d1be4662`).**
+  - FR-005's frozen-heap test reads the freeze count against `Runtime._freeze_floor`, not zero:
+    CPython 3.12 reports 375 with no `gc.freeze()`, which sent every tripped child on 3.12 to the
+    last resort. Known residual 4 records the freeze 3.12 cannot see.
+  - FR-005's detail no longer says the child closes none of the heap's sinks "even one it
+    configures itself": a sink whose `reacquire_after_fork` returned is reclaimed and closed.
