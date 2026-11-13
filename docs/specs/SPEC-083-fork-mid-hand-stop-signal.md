@@ -78,11 +78,19 @@ re-enter the setter (FR-004 records why it is rejected).
   is still set and still the one the sink held. Handing it a fresh signal means running its setter
   inside the call that forked, which FR-004 forbids. This is a recorded limit (`architecture.md`
   §13, FR-005).
-- **A child that unwinds out of the setter**, for example a bare `os.fork()` whose child returns
-  from the setter. Its own `finally` blocks pop the offer record and the handing mark, and the outer
-  hand's settle loop hands it the child's signal, as at `53b68203`
-  (`tests/test_reentrant_stop_signal.py::test_a_setter_that_forks_leaves_the_child_its_own_signal`).
-  The stale events it captured are set by its `shutdown()` and reach no sink that still holds them.
+- **A child that unwinds out of the setter needs no new mechanism**, for example a bare
+  `os.fork()` whose child returns from the setter. Its own `finally` blocks pop the offer record
+  and the handing mark. What it then holds depends on the path. This was measured at `53b68203`,
+  with and without this spec's mechanism patched in:
+  - **Orphan path:** the outer hand's settle loop hands it the child's signal in both cases, as
+    `test_a_setter_that_forks_leaves_the_child_its_own_signal` in
+    `tests/test_reentrant_stop_signal.py` already holds.
+  - **Worker-build path:** the settle loop of `_hand_out` hands it the child's signal in both cases.
+  - **Retarget path:** `_hand_retargeted` has no settle loop. At `53b68203` the child holds its own
+    signal only because the fork handler ran the setter again, which FR-004 removes. With this
+    spec's mechanism, the child holds the parent's event until its first orphan log or `flush()`
+    settles the fork's signal debt, and then it holds its own. Its `shutdown()` before that point
+    still cuts the wait short, through FR-003's set. Measured wait: 0.00 s in both cases.
 - **Behaviour change for `_building_here`.** A child forked inside a sink factory keeps the factory
   build's entry, and that is harmless (FR-005 records why). Only its docstring changes.
 - **An offered event whose type is not exactly `threading.Event`.** The capture keeps only exact
@@ -186,6 +194,12 @@ which FR-004 removes; once it is removed, this FR's set is what cuts their wait 
   `Worker.retarget`.
 - [ ] With the capture in `_clear_after_fork` removed, the first criterion's wait runs its full
   5 s. With the set in `_shutdown_worker` removed, the same.
+- [ ] With FR-004 in place and the set in `_shutdown_worker` removed, the worker-build and
+  `Worker.retarget` rows of the second criterion also wait the full 5 s. At `53b68203` those rows
+  pass only because the fork handler re-runs the setter, so this is what makes them guard FR-003.
+- [ ] A child that unwinds out of a setter called by `Worker.retarget` (a bare `os.fork()`): its
+  `shutdown()` cuts a wait on the event the sink holds short, and after a `flush()` the sink holds
+  the child's `_state._stop`.
 - [ ] After the child returns, the event the sink holds in the parent is not set.
 - [ ] A second `shutdown()` in the child returns normally.
 - [ ] Invariants 3, 6 and 12: a shutdown cuts the wait short on both `shutdown()` branches and on
@@ -209,8 +223,42 @@ child that unwinds gets a nested setter call it never had.
 (`_hand_retargeted`) calls `offer_stop_signal` without the `handing` mark. Its child's first log
 therefore found `handing_here` false and handed the sink again: two setter calls in the child, and
 a hang for a lock-holding setter, measured at `53b68203`. So `handing_here(sink)` is true when the
-sink is under `handing` or on this thread's offer record. The `payment_owed` mechanism stays on
-`handing` alone.
+sink is under `handing` or on this thread's offer record.
+
+Each caller of the predicate takes one of two readings:
+
+| Caller | Site at `53b68203` | Reading |
+|---|---|---|
+| `_will_hand`, and through it `_hand_after_close`, `_arm_and_hand`, `_owed_candidates`, `_swap_sink` and `_flush_live_sink` | `_lifecycle.py:4095` | widened: `handing_here` |
+| `_get_worker`'s build | `_lifecycle.py:3597` | widened: `handing_here` |
+| the factory wrapper's `_FactorySink._build` | `sinks/_factory.py:204` | widened: `handing_here` |
+| `Worker._reinit_after_fork`'s new skip | `worker.py` | widened: `handing_here` |
+| `_pay_marks_after_stop`'s parking of a stop-end payment | `_lifecycle.py:3239` | the `handing` mark alone: `_in_handing(sink)`, which is `id(sink) in _mid_hand()` |
+
+The stop-end payment keeps the mark alone because `handing()`'s exit is the only thing that pays a
+parked payment (`payment_owed`). A payment parked on a widened read inside `_hand_retargeted`'s
+offer, which runs outside any `handing` block, would have no exit to pay it. So the payment is
+unchanged from `53b68203`.
+
+No criterion pins that choice, because no reachable state tells the two readings apart. A thread
+inside an offer that has no `handing` mark is inside `Worker.retarget`'s hand, and a retarget needs
+a live worker. That worker is the process's only one: `_state._worker` is assigned at one site,
+`_get_worker`'s build, and never cleared. Every call of `_pay_marks_after_stop` such a thread can
+make comes from its own `shutdown()`. That shutdown takes the worker branch and retires that worker
+before its `finally` asks for the payment. The payment therefore returns at its liveness check, with
+`_stop` set, before it reaches the predicate. The other entries to the payment do not apply:
+`_pay_a_mark_the_stop_missed` is reached only by a writer that marked. Such a thread cannot build,
+because a worker exists. It cannot retarget either, because its `configure()` finds
+`config._sink_lock` held and swaps unconfirmed. `handing()`'s exit pays only what an earlier parked
+payment left. A child forked inside that hand inherits the worker, so the same holds there.
+
+The authoring session probed this at `53b68203` with both readings patched in. In
+`probe_payment2.py` the setter called by `Worker.retarget` calls `shutdown()` while the sink's
+earlier close is still in flight. `probe_payment3.py` adds a second thread's `shutdown()` and a
+worker build injected inside the setter's own stop. In every run, every payment call found no live
+worker and a set `_stop`, and the two readings produced the same result. A mutant that gives the
+payment the widened predicate is therefore equivalent. The reading is set by this table rather
+than by a test.
 
 **The resumed worker skips a sink the forking thread is offering.**
 `Worker._reinit_after_fork(resume=True)` offers the child's signal to `self.sink` only when
@@ -219,7 +267,7 @@ FR-003 sets that event at the child's shutdown.
 
 Measured at `53b68203` with all of this patched in by monkeypatch: the child ran the setter zero
 times and returned on all three paths, both with a lock-holding setter and without one. The full
-suite also passed under the patch.
+suite also passed under that patch, which gave the payment the widened read too.
 
 #### Acceptance Criteria:
 
@@ -307,6 +355,8 @@ def _offers_here() -> list[tuple[int, threading.Event]]
     # this thread's offer record, created on first use (the shape of _builds_here)
 def handing_here(sink: object) -> bool
     # true when sink is under handing() or on this thread's offer record
+def _in_handing(sink: object) -> bool
+    # id(sink) in _mid_hand(): the handing mark alone; _pay_marks_after_stop's one reading
 
 # src/log_foundry/worker.py
 class Worker:
@@ -345,7 +395,8 @@ docs/release-notes/v1.2.0.md
 
 ### Phase 2: No re-entry (FR-004)
 
-- Widen `handing_here` to the offer record, and add the skip in `Worker._reinit_after_fork`.
+- Widen `handing_here` to the offer record, give `_pay_marks_after_stop` `_in_handing`, and add
+  the skip in `Worker._reinit_after_fork`.
 - Write FR-004's three lock-holding-setter tests.
 - Mutation-test each guard whose failure would be silent: the capture, the set, the
   `_at_fork_reinit()` call, the `handing_here` offer read, the resumed worker's skip, and a reset of
@@ -369,3 +420,10 @@ docs/release-notes/v1.2.0.md
   worker-build and retarget paths re-entered the setter at `53b68203`, in the fork handler and on
   the child's first log. That is why FR-004 widens `handing_here` and adds the resumed worker's
   skip.
+- 2026-11-13, spec review: three findings answered. First, the widened `handing_here` no longer
+  reaches the stop-end payment, and FR-004 lists every caller with its reading. The payment's
+  criterion is replaced by the reason no reachable state distinguishes the two readings, with the
+  probes (`probe_payment2.py`, `probe_payment3.py`). Second, the unwinding-child bullet now states
+  the outcome per path, re-measured with `probe_unwind2.py`, and FR-003 gains the retarget
+  unwinding criterion. Third, FR-003 gains the criterion that turns its worker-path rows into
+  guards.
