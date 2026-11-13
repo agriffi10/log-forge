@@ -27,7 +27,6 @@ import gc
 import io
 import os
 import pathlib
-import resource
 import select
 import signal
 import sys
@@ -234,6 +233,54 @@ def report_from_child(marker: str) -> None:
     os.write(_child_pipe[1], marker.encode())
 
 
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+
+
+def _set_dumpable(dumpable: int | None) -> int | None:
+    """Sets whether this process may dump core, returning the setting it replaced.
+
+    A process killed by ``SIGSEGV`` is not gone when the signal lands: the kernel first writes
+    its core, and while it does the process keeps every descriptor it had open and takes no
+    signal but ``SIGKILL``. When ``core_pattern`` pipes the core to a helper, that write lasts
+    as long as the helper takes to read it, and GitHub's Ubuntu runner images install
+    ``systemd-coredump``, which pipes it (``actions/runner-images``,
+    ``images/ubuntu/toolsets/toolset-2404.json``). On a loaded runner that outlasts the
+    parent's deadline in :func:`run_in_child`, the parent sends ``SIGKILL`` mid-dump, and Linux
+    lets that one signal replace the exit code the crash had already set. The child is reaped
+    as ``SIGKILL`` and reads as :attr:`_Child.blocked`, a watchdog, although a crash was all
+    that happened to it. Measured in a Linux container with ``core_pattern`` set to
+    ``|/bin/sleep 8`` and no load: the deliberate crash in
+    ``test_a_crashed_child_does_not_read_as_blocked`` failed every run with "it reached
+    `os.kill`, and was still alive at the parent's deadline", the reading CI kept reporting on
+    ``main``, and a demonstration test whose child was made to crash instead of blocking passed
+    as blocked. With the dump refused both read the ``SIGSEGV`` they died of.
+
+    ``RLIMIT_CORE`` would not do: the kernel ignores it for a piped ``core_pattern``, measured in
+    the same container. ``PR_SET_DUMPABLE`` is what the kernel checks before any dump, piped or
+    not. It is Linux's, so elsewhere this does nothing and returns ``None``; no CI leg runs
+    anywhere else, and a crash on macOS ended its child at once with or without a core limit.
+
+    Args:
+      dumpable: ``0`` to refuse a dump, or the value an earlier call returned, to put it back.
+        ``None`` is what an earlier call returned off Linux, and does nothing.
+
+    Returns:
+      The setting before this call, or ``None`` off Linux.
+
+    Raises:
+      OSError: If ``prctl`` refuses.
+    """
+    if sys.platform != "linux" or dumpable is None:
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    previous = int(libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0))
+    if previous < 0 or libc.prctl(_PR_SET_DUMPABLE, dumpable, 0, 0, 0) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"prctl on PR_SET_DUMPABLE failed: {os.strerror(code)}")
+    return previous
+
+
 def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT) -> _Child:
     """Forks, runs ``work`` in the child, and reaps it.
 
@@ -272,6 +319,15 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     not immediately preceded by a bare ``gc.collect()``, so a fifth fork site cannot be added
     without either the guard or a deliberate argument against it.
 
+    **Every child is forked unable to dump core, so a crash always reads as the signal it was.**
+    Otherwise a crashing child can be held mid-dump past the parent's deadline and reaped as
+    ``SIGKILL`` -- the parent's watchdog -- which is what :attr:`_Child.blocked` counts as a
+    deadlock: :func:`_set_dumpable` has the mechanism and the measurement. The setting is made
+    in the **parent** around the fork, not in the child, because the child inherits it and the
+    library's fork handler runs in the child before any of this code does; a crash inside that
+    repair is exactly the case a refusal made later would miss. The parent's own setting is put
+    back once the fork has returned, in the ``finally``, so it is restored when the fork raises.
+
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
         is sent back as the child's output.
@@ -282,12 +338,18 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
       The reaped child.
 
     Raises:
-      None.
+      OSError: If the kernel refuses to change whether the process may dump core.
     """
     global _child_pipe
     read_fd, write_fd = os.pipe()
-    gc.collect()
-    pid = os.fork()
+    parent = os.getpid()
+    dumpable = _set_dumpable(0)
+    try:
+        gc.collect()
+        pid = os.fork()
+    finally:
+        if os.getpid() == parent:
+            _set_dumpable(dumpable)
     if pid == 0:
         code = 1
         try:
@@ -633,48 +695,6 @@ def _diagnose(child: _Child, *, reached: bool) -> str:
     return f"it {child.ending} without reaching `os.kill`, leaving no exception report behind"
 
 
-_PR_SET_DUMPABLE = 4
-
-
-def _refuse_core_dump() -> None:
-    """Makes this process unable to dump core, so a deliberate crash ends it at once.
-
-    A process killed by ``SIGSEGV`` is not gone when the signal lands: the kernel first writes
-    its core, and while it does the process holds every descriptor it had open, takes no other
-    signal but ``SIGKILL``, and has not exited. When ``core_pattern`` pipes the core to a helper
-    (``apport``, ``systemd-coredump``), that write lasts as long as the helper takes to read
-    it, which on a loaded CI runner can outlast the parent's deadline in :func:`run_in_child`.
-    The parent then sends ``SIGKILL`` mid-dump, and Linux lets that one signal replace the
-    exit code the crash had already set, so the child is reaped as ``SIGKILL`` and reads as
-    :attr:`_Child.blocked` -- a watchdog -- although the crash was all that happened to it.
-    That is the failure ``test_a_crashed_child_does_not_read_as_blocked`` kept producing.
-    Measured: under ``core_pattern`` set to ``|/bin/sleep 8`` in a Linux container, with no
-    load at all, the test failed on every run with "it reached `os.kill`, and was still alive
-    at the parent's deadline", the reading CI kept reporting, and passed with this call.
-
-    ``RLIMIT_CORE`` alone is not enough, because the kernel ignores it for a piped
-    ``core_pattern``. ``PR_SET_DUMPABLE`` set to 0 is what the kernel checks before any dump,
-    piped or not, so on Linux both are set. Elsewhere only the limit is set, since ``prctl``
-    is Linux's and no CI leg runs anywhere else.
-
-    Args:
-      None.
-
-    Returns:
-      None.
-
-    Raises:
-      OSError: If ``prctl`` refuses, which the child reports as its ``!Type: msg`` rather than
-        crashing with the dump it was meant to suppress still armed.
-    """
-    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    if sys.platform == "linux":
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(_PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
-            errno = ctypes.get_errno()
-            raise OSError(errno, f"prctl(PR_SET_DUMPABLE, 0) failed: {os.strerror(errno)}")
-
-
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
     """A crash and a deadlock are different findings, and one test turns on telling them apart.
 
@@ -694,14 +714,14 @@ def test_a_crashed_child_does_not_read_as_blocked() -> None:
     making it legible. The marker written immediately before ``os.kill`` is what separates the
     premise from the property, and :func:`_diagnose` turns the pair into the reading.
 
-    **The child refuses to dump core before it reports reaching the crash, and that is what
-    makes the property deterministic.** Once legible, the reading on CI was the same each time
-    its log was read (``5202dd34`` and ``717d0c68``, Release): the child reached ``os.kill``
-    and was still alive at the parent's deadline. A core dump piped to a slow helper holds it
-    exactly there, and :func:`_refuse_core_dump` says how and what was measured. With the dump
-    refused, nothing stands between the signal and the exit, so a recurrence of that reading
-    is no longer this mechanism and is worth reading as a finding. The deadline was not
-    widened: a dump helper has no upper bound to widen past.
+    **What held the child there on CI was its own core dump, and** :func:`run_in_child` **now
+    refuses it.** Once legible, the reading was the same each time its log was read
+    (``5202dd34`` and ``717d0c68``, Release): the child reached ``os.kill`` and was still alive
+    at the parent's deadline. A core dump piped to a slow helper holds it exactly there, and
+    :func:`_set_dumpable` says how and what was measured. With the dump refused, nothing stands
+    between the signal and the exit, so a recurrence of that reading is no longer this mechanism
+    and is worth reading as a finding. The deadline was not widened: a dump helper has no upper
+    bound to widen past.
 
     **The premise is that a signal ended the child, not that it failed to exit cleanly.**
     ``not finished`` is satisfied by a non-zero exit, so a ``work`` that reached the marker and
@@ -718,7 +738,6 @@ def test_a_crashed_child_does_not_read_as_blocked() -> None:
 
     def crash() -> str:
         faulthandler.disable()
-        _refuse_core_dump()
         report_from_child(requested)
         os.kill(os.getpid(), signal.SIGSEGV)
         return "survived"
