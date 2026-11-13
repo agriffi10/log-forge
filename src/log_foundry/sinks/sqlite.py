@@ -13,7 +13,7 @@ from log_foundry import _diag, _fork
 from log_foundry.sinks._chunk import valid_identifier
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._driver_error import delivery_error
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import column_value, encode_events
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks.base import _ABSENT, SinkLosses, _static_value
@@ -365,6 +365,14 @@ class SQLiteSink:
     def _row(self, event: dict[str, object]) -> tuple[object, ...]:
         """Builds one row: the projected columns, then the whole event as JSON.
 
+        **A projected value** ``sqlite3`` **cannot bind is bound as its JSON text**
+        (``_encode.column_value``). A ``dict`` or ``list`` there raised ``ProgrammingError`` and
+        an integer outside the signed 64-bit range a bare ``OverflowError`` from the insert,
+        either costing the whole batch, and a ``TransformSink`` can put any of them in a
+        column. The event column is built first, so an event that is not JSON is dropped
+        before its columns are read; a lone surrogate in a projected column, which only a
+        direct ``emit`` brings, raises here and costs only its event.
+
         Args:
           event: The event to convert.
 
@@ -376,8 +384,11 @@ class SQLiteSink:
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
+          UnicodeEncodeError: If a projected value is a string holding a lone surrogate, which
+            ``encode_events`` turns into a drop of this one event.
         """
-        return (*(event.get(col) for col in _COLUMNS), json.dumps(event))
+        text = json.dumps(event)
+        return (*(column_value(event.get(col), int64=True) for col in _COLUMNS), text)
 
     def _insert(
         self, rows: list[tuple[object, ...]], columns: str, placeholders: str

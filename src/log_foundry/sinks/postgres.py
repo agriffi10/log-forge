@@ -10,7 +10,14 @@ from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
-from log_foundry.sinks._encode import NUL_ESCAPE, encode_round, repair_nul, unencodable_in_run
+from log_foundry.sinks._encode import (
+    NUL_ESCAPE,
+    column_value,
+    encode_round,
+    refuse_surrogate,
+    repair_nul,
+    unencodable_in_run,
+)
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
@@ -730,6 +737,14 @@ class PostgresSink:
         are read from the same copy. The six characters ``\\u0000`` written as text are left
         alone, since JSONB accepts them.
 
+        **A lone surrogate costs only its event** (``_encode.refuse_surrogate``): JSONB refuses
+        its escape and psycopg the string, and either used to roll back the whole transaction.
+        Only a direct ``emit`` brings one, so it is dropped rather than repaired. **A container
+        in a projected column is bound as its JSON text** (``_encode.column_value``): psycopg
+        cannot adapt a ``dict``, or a ``list`` that is mixed, ragged or holds a ``dict``, and a
+        ``TransformSink`` can put any of them there; a list it did bind as an array literal
+        (``{1,2}``) now reads as JSON (``[1, 2]``) too.
+
         Args:
           event: The event to convert.
 
@@ -741,6 +756,8 @@ class PostgresSink:
             drop of this one event. Neither source of events produces one: assembly coerces every
             value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
             returns (SPEC-058 FR-001).
+          UnicodeEncodeError: If a string value or key holds a lone surrogate, which
+            ``encode_round`` turns into a drop of this one event.
         """
         text = json.dumps(event)
         source = event
@@ -748,7 +765,8 @@ class PostgresSink:
             repaired = repair_nul(event)
             if repaired is not None:
                 source, text = repaired, json.dumps(repaired)
-        return (*(source.get(col) for col in _COLUMNS), text)
+        refuse_surrogate(source, text)
+        return (*(column_value(source.get(col), int64=False) for col in _COLUMNS), text)
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target table.

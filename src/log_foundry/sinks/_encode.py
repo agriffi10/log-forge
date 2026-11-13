@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
@@ -16,9 +17,12 @@ if TYPE_CHECKING:
 
 __all__ = [
     "NUL_ESCAPE",
+    "SURROGATE_ESCAPE",
+    "column_value",
     "encode_events",
     "encode_round",
     "encoded_landed",
+    "refuse_surrogate",
     "repair_bson",
     "repair_nul",
 ]
@@ -35,6 +39,17 @@ six-character lookalike. Run over the JSON text ``PostgresSink`` already builds,
 costs one search (SPEC-069 FR-003).
 """
 
+SURROGATE_ESCAPE = re.compile(r"(?<!\\)(?:\\\\)*\\ud[89a-f]")
+"""Matches a JSON escape of a UTF-16 surrogate, ``\\ud800`` to ``\\udfff``, never the text.
+
+The backslash rule is :data:`NUL_ESCAPE`'s. It is a filter, not the decision: a character outside
+the Basic Multilingual Plane, an emoji, is written as a *pair* of such escapes, which every
+destination accepts, so a match only sends the event to :func:`refuse_surrogate`'s strict
+re-encode, which decides (SPEC-069 follow-up).
+"""
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
 _NUL = "\x00"
 _REPLACEMENT = "\ufffd"
 _TRUNCATED = "truncated"
@@ -271,6 +286,82 @@ def encoded_landed(owner: object, positions: list[int]) -> None:
     for position in positions:
         if 0 <= position < len(cells):
             cells[position].landed = True
+
+
+def column_value(value: object, *, int64: bool) -> object:
+    """Returns a projected column's value as the driver can bind it, or as its JSON text.
+
+    ``SQLiteSink`` and ``PostgresSink`` project a few top-level values into text columns beside
+    the whole event's JSON, and a value the driver cannot bind used to cost the whole batch:
+    ``sqlite3`` refuses a ``dict``, a ``list`` and an integer outside the signed 64-bit range
+    (that one as a bare ``OverflowError``, nothing counted), and psycopg a ``dict`` and a
+    ``list`` that is mixed, ragged or holds a ``dict``, each measured on 2026-11-13. A
+    ``TransformSink`` can put any of them there, so the repair is admitted (*A destination's
+    refusal is repaired at the sink*).
+
+    A container, and with ``int64`` an integer outside the range, is bound as its JSON text, the
+    text the event column already holds for it: the column is a filter beside that event, not its
+    record, and the event is not changed, so nothing is marked, counted or announced. Every
+    container takes the rule, including the lists psycopg did bind as array literals
+    (``{1,2}``), so a column holds one representation whichever driver wrote it. A ``str``,
+    ``int``, ``float``, ``bool`` or ``None`` binds as before; the range test reads the value
+    through ``int.__int__``, so no comparison a subclass defines runs.
+
+    A string that is not UTF-8 — a lone surrogate, which assembly replaces and ``configure()``
+    refuses, so only a direct ``emit`` brings one — is not repaired: it raises here, and the
+    encode helper drops that event alone, counted and announced.
+
+    Args:
+      value: The column's value as the event holds it.
+      int64: Whether the driver binds only signed 64-bit integers (``sqlite3``).
+
+    Returns:
+      ``value`` itself when the driver binds it, else its JSON text.
+
+    Raises:
+      UnicodeEncodeError: If ``value`` is a string holding a lone surrogate.
+    """
+    if value is None or isinstance(value, float):
+        return value
+    if isinstance(value, str):
+        if not str.isascii(value):
+            str.encode(value, "utf-8")
+        return value
+    if isinstance(value, int):
+        number = int.__int__(value)
+        if not int64 or _INT64_MIN <= number <= _INT64_MAX:
+            return value
+        return int.__repr__(number)
+    return json.dumps(value)
+
+
+def refuse_surrogate(event: dict[str, object], text: str) -> None:
+    """Raises when an event holds a lone surrogate, which PostgreSQL refuses in JSONB and text.
+
+    ``json.dumps`` writes a lone surrogate as a ``\\ud800`` escape, and PostgreSQL refuses the
+    escape in ``jsonb`` (``InvalidTextRepresentation``) and psycopg the string in a text column
+    (``UnicodeEncodeError``); either used to cost the whole transaction, measured against
+    PostgreSQL 17.11 on 2026-11-13. Assembly replaces a lone surrogate, ``TransformSink`` coerces
+    one and ``configure()`` refuses one in a stamp, so only a direct ``emit`` brings one, and the
+    admission rule repairs nothing the pipeline cannot produce: the event is dropped alone,
+    counted and announced by the encode helper, rather than repaired.
+
+    :data:`SURROGATE_ESCAPE` keeps a clean event to one search. On a match the event is encoded
+    again without ASCII escapes and strictly as UTF-8, which raises only for a real surrogate, so
+    an emoji's escaped pair and the text ``\\ud800`` written with an escaped backslash pass.
+
+    Args:
+      event: The event, as it will be written.
+      text: Its JSON text, as ``json.dumps`` built it.
+
+    Returns:
+      None.
+
+    Raises:
+      UnicodeEncodeError: If a string value or key holds a lone surrogate.
+    """
+    if SURROGATE_ESCAPE.search(text):
+        json.dumps(event, ensure_ascii=False).encode("utf-8")
 
 
 def repair_nul(event: dict[str, object]) -> dict[str, object] | None:

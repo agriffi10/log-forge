@@ -159,6 +159,56 @@ def test_a_nul_is_repaired_and_the_whole_batch_lands(
     assert "truncated" not in rows[2][1]
 
 
+def test_a_lone_surrogate_costs_only_its_event_against_a_real_server(
+    services_are_up: dict[str, Endpoint], table: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-069 follow-up: a direct ``emit``'s lone surrogate no longer rolls back the batch.
+
+    Measured against PostgreSQL 17.11 before the fix: one in a JSON value or key cost the batch
+    (JSONB refuses its ``\\ud800`` escape), and one in a text column too (psycopg cannot encode
+    it). An emoji, written as an escaped surrogate *pair*, must still land.
+    """
+    endpoint = services_are_up["postgres"]
+    sink = PostgresSink(table, dsn=dsn(endpoint), create_table=True, max_retries=0)
+    emoji = {**event(4), "fields": {"text": "smile \U0001f600"}}
+    sink.emit(
+        [
+            event(1),
+            {**event(2), "fields": {"k\ud800": "v"}},
+            {**event(3), "level": "x\udc80"},
+            emoji,
+        ]
+    )
+    losses = sink.losses()
+    sink.close()
+
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT event FROM {table} ORDER BY id")
+        rows = cur.fetchall()
+
+    assert [row[0]["n"] for row in rows] == [1, 4]
+    assert rows[1][0]["fields"] == {"text": "smile \U0001f600"}
+    assert (losses.dropped, losses.failed) == (2, 0)
+    assert "PostgresSink, encoding raised UnicodeEncodeError" in capsys.readouterr().err
+
+
+def test_a_container_in_a_column_lands_as_its_json_text_against_a_real_server(
+    services_are_up: dict[str, Endpoint], table: str
+) -> None:
+    """SPEC-069 follow-up: psycopg cannot adapt a ``dict`` or a mixed list; each lands as JSON."""
+    endpoint = services_are_up["postgres"]
+    sink = PostgresSink(table, dsn=dsn(endpoint), create_table=True, max_retries=0)
+    sink.emit([{**event(1), "level": {"x": 1}}, {**event(2), "service": [1, "a"]}, event(3)])
+    assert sink.losses().failed == 0
+    sink.close()
+
+    with psycopg.connect(dsn(endpoint)) as conn, conn.cursor() as cur:
+        cur.execute(f"SELECT level, service FROM {table} ORDER BY id")
+        rows = cur.fetchall()
+
+    assert rows == [('{"x": 1}', "integration"), ("INFO", '[1, "a"]'), ("INFO", "integration")]
+
+
 def test_a_permanent_refusal_is_one_attempt_against_a_real_server(
     services_are_up: dict[str, Endpoint], table: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
