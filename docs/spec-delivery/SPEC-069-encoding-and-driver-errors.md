@@ -75,8 +75,9 @@ sinks gain a public `losses()`; no other public name, argument or `configure()` 
   from a direct `emit` still costs the batch; a lone surrogate reaching `PostgresSink` through a
   direct `emit` is unmeasured.~~ All three resolved on 2026-11-13 by the SPEC-069 follow-up fix
   (no spec):
-  - **The partial write:** ruled an accepted edge for 1.2.0 by Andrew, measured at `a8e91fac` (69 to 100
-    of a 200-event batch landed twice when the fault cleared before the retry) and recorded in
+  - **The partial write:** ruled an accepted edge for 1.2.0 by Andrew, measured at `a8e91fac` (69 to 200
+    of a 200-event batch landed twice when the fault cleared before the retry, and at one cap a
+    line was torn) and recorded in
     `docs/decisions/sink-delivery/a-sinks-own-driver-error-is-counted-announced-and-raised-as-both-types.md` and as an exception to invariant 7; the closure, the file sinks on `deliver`, is
     to be specified after 1.2.0.
   - **The SQLite column:** fixed. A container, or an integer outside the signed 64-bit range, is
