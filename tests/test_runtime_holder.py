@@ -56,6 +56,14 @@ its capture between them, holding nothing; ``_close_clock`` takes it just before
 ``close()`` and ``_settle_close`` just after, once the entry is discharged and any deferred hand
 paid; and ``_CloseRegistry.in_flight_ids`` takes the registry's leaf with nothing held, for the
 re-pin's snapshot. The record lock is an ``RLock`` since SPEC-081 FR-003, which changes no site.
+
+**Re-recorded at SPEC-083.** One site enters, none leave: ``offer_stop_signal`` takes
+``_state._lock`` to lower a child's inherited offer count and re-owe the fork's signal debt in
+one section, only on the forking thread of a child as it leaves an inherited offer. No caller
+holds ``_state._lock`` across an offer, since a setter never runs under a lifecycle lock, so the
+site nests inside no other ``_state._lock`` section; a retarget's hand may hold
+``config._sink_lock`` around it, the order ``_swap_sink`` already uses. No ``LOCK_COUNTS`` row in
+``test_runtime_state.py`` moves, because no ordinary path reaches the branch.
 """
 
 from __future__ import annotations
@@ -141,6 +149,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_settle_close", "_state._owned_lock"): 1,
             ("_CloseRegistry.in_flight_ids", "self._lock"): 1,
             ("_hand_retargeted", "_state._lock"): 1,
+            ("offer_stop_signal", "_state._lock"): 1,
         }
     ),
     "worker.py": collections.Counter(

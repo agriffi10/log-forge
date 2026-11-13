@@ -538,7 +538,13 @@ class Worker:
         reporting no ``stopped_reason`` must not read that way. The stop signal is re-offered for
         the sink the fork walk cannot reach: a **third-party** sink is outside its ownership
         boundary, so it would keep pointing at the pre-fork event while this worker sets a new
-        one — SPEC-027's guarantee broken by the repair meant to preserve it.
+        one — SPEC-027's guarantee broken by the repair meant to preserve it. **Except a sink the
+        forking thread is being offered** (SPEC-083 FR-004), which :func:`_lifecycle.handing_here`
+        reports: this handler runs in the child nested inside that sink's setter call, so offering
+        it here ran the setter inside itself, and a setter holding its own lock hung the child
+        before its first line, on the worker build's hand and on ``retarget``'s (measured at
+        ``53b68203``). That sink keeps the event it holds, which the child's fork handler kept
+        and its ``shutdown()`` sets (``_lifecycle._clear_after_fork``, FR-003).
 
         **The new thread is only installed once it has started**, which ``__init__`` never had
         to consider: a constructor whose ``start`` raises lets no ``Worker`` escape, while here
@@ -595,7 +601,8 @@ class Worker:
         self._stop = _lifecycle._state.refresh_stop_signal()
         self._drain_finished.clear()
         self._drain_settled.clear()
-        _lifecycle.offer_stop_signal(self.sink, self._stop)
+        if not _lifecycle.handing_here(self.sink):
+            _lifecycle.offer_stop_signal(self.sink, self._stop)
         thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         try:
             thread.start()

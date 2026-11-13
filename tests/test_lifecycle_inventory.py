@@ -1011,7 +1011,27 @@ INVENTORY: dict[Key, Row] = {
     _rt("_handing_here"): Row(
         "Runtime",
         _INH,
-        "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
+        "the sinks this thread is handing a signal to; a child forked mid-hand keeps them",
+    ),
+    _rt("_offering_here"): Row(
+        "Runtime",
+        _INH,
+        "the stop signals this thread is offering; a child forked mid-offer keeps them (SPEC-083)",
+    ),
+    _rt("_stale_signals"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the forking thread's offered events, re-initialised; set by a child's shutdown (SPEC-083)",
+    ),
+    _rt("_fork_offers"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the forking thread's live offer record, shared with a child's other threads (SPEC-083)",
+    ),
+    _rt("_fork_inherited"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "how many of those offers the child inherited and is still inside (SPEC-083)",
     ),
     _rt("_releasing_here"): Row(
         "Runtime",
@@ -1026,7 +1046,7 @@ INVENTORY: dict[Key, Row] = {
     _rt("_building_here"): Row(
         "Runtime",
         _INH,
-        "the factory builds this thread runs; a forking thread's own finally clears its",
+        "the factory builds this thread runs; a child forked mid-build keeps them, harmlessly",
     ),
     _wk("sink"): Row(
         "Worker",

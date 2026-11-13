@@ -1047,6 +1047,23 @@ class Runtime:
         the deciding section, after any token that section opens, so a thread that forks from
         inside a setter leaves its child's flag, which the child's handler set, alone.
         """
+        self._stale_signals: list[threading.Event] = []
+        """The stop signals the forking thread was offering when this process was forked.
+
+        Rewritten by :func:`_clear_after_fork` on every fork, from the forking thread's
+        :attr:`_offering_here` record, and set by :func:`_shutdown_worker` where it sets
+        :attr:`_stop` (SPEC-083 FR-002, FR-003). A child forked inside a sink's
+        ``log_foundry_stop_signal`` setter, a fork-context ``multiprocessing.Process`` started
+        there, is still inside that setter for its whole life when it leaves through ``os._exit``,
+        so no later hand reaches that sink without running its setter inside the call that forked
+        (FR-004 forbids that). The sink keeps the event it was being offered, and setting that
+        event here is what lets the child's ``shutdown()`` cut its backoff short. Only objects
+        whose type is exactly ``threading.Event`` are kept, each re-initialised with
+        ``_at_fork_reinit()``, so no ``set`` that sink code overrides runs. Each is the child's
+        private copy of a parent object, so setting it touches only the child. ``[]`` in a process
+        that was never forked mid-offer, and a grandchild forked from another thread starts empty
+        again.
+        """
         self._hands_running: set[object] = set()
         """One token per stop-signal hand whose deciding section published something.
 
@@ -1069,17 +1086,61 @@ class Runtime:
 
         Read by :func:`handing_here`, the one test of it, so a setter that logs, or builds the
         worker, on the thread already handing it that sink is not handed it again, which would
-        recurse. Per thread, so a forked child keeps the forking thread's entries, which that
-        thread's own ``finally`` removes. A ``threading.local`` rather than the ``contextvars``
-        ``python.md`` §13 prefers, because what it records is a call on this thread's stack: a hand
-        is synchronous and never crosses an ``await`` or a context copy, so the question is "is this
-        thread inside that call right now", not context propagation. A context variable would also
-        be inherited by a task or thread started from inside the setter, which is not inside the
-        hand. It also carries ``payment_owed``: a stop-end payment that found this thread handing
-        the very sink it would pay (:func:`_pay_marks_after_stop`), which :func:`handing` runs again
-        when the thread leaves a hand of a sink, until that sink's hand is over. A forked child
-        keeping the forking thread's flag pays nothing, since the child drops every in-flight entry
-        and its mark.
+        recurse. Per thread, so a forked child keeps the forking thread's entries. A child that
+        unwinds out of the hand removes them in that thread's own ``finally``; a child that leaves
+        through ``os._exit``, as a fork-context ``multiprocessing.Process`` started from a setter
+        does, keeps them for life, and that is deliberate (SPEC-083 FR-004). The mark is true: the
+        child's code runs from the setter's frame, so clearing it in the fork handler makes the
+        child's first log run the setter inside the setter call that forked. Measured at
+        ``53b68203`` with a setter holding its own ``threading.Lock`` across its body, the child
+        returned with the mark kept and hung on the sink's own lock with it cleared, and at
+        ``c21755f1`` the reset gave a child that unwinds a nested setter call it never had.
+        :attr:`_offering_here` is kept for the same reason. A ``threading.local`` rather than the
+        ``contextvars`` ``python.md`` §13 prefers, because what it records is a call on this
+        thread's stack: a hand is synchronous and never crosses an ``await`` or a context copy, so
+        the question is "is this thread inside that call right now", not context propagation. A
+        context variable would also be inherited by a task or thread started from inside the
+        setter, which is not inside the hand. It also carries ``payment_owed``: a stop-end payment
+        that found this thread handing the very sink it would pay (:func:`_pay_marks_after_stop`),
+        which :func:`handing` runs again when the thread leaves a hand of a sink, until that sink's
+        hand is over. A forked child keeping the forking thread's flag pays nothing, since the
+        child drops every in-flight entry and its mark.
+        """
+        self._offering_here = threading.local()
+        """The stop signals this thread is offering a sink right now, as ``offers`` (SPEC-083).
+
+        A list of ``(id(sink), event)``, innermost last, pushed by :func:`offer_stop_signal`
+        before its ``hasattr`` probe and popped in its ``finally``, so it covers every setter the
+        library runs. A wrapper's own setter that assigns an inner sink's setter directly runs
+        inside the outer offer, which covers it. Per thread, for :attr:`_handing_here`'s reason:
+        what it records is a call on this thread's stack. It holds the ``id`` rather than the
+        sink, so a child that never pops the entry keeps no sink alive. Never reset: a forked
+        child inherits the forking thread's record as that thread left it, which is what
+        :func:`_clear_after_fork` reads into :attr:`_stale_signals`, and what makes
+        :func:`handing_here` answer true for the sink that thread is being offered.
+        """
+        self._fork_offers: list[tuple[int, threading.Event]] = []
+        """The forking thread's offer record in a child, the live list object itself (SPEC-083).
+
+        :attr:`_offering_here` is per thread, but in a child that leaves through ``os._exit`` the
+        forking thread stays inside the setter it forked from for life, and **every** thread of
+        the child must treat that sink as being offered: another thread's first orphan log or
+        ``flush()``, settling the fork's debt, or the resumed drain thread reaching the sink
+        through a factory wrapper's build, otherwise hands it again and runs the setter while its
+        frame is still live, which hangs a setter holding its own lock. Only its first
+        :attr:`_fork_inherited` entries count, so :func:`handing_here` reads them from any thread.
+        Rewritten by :func:`_clear_after_fork` on every fork, to an empty list when the forking
+        thread was inside no offer, so a grandchild forked from another thread shares nothing.
+        ``[]`` in a process never forked, where it is no thread's record.
+        """
+        self._fork_inherited = 0
+        """How many of :attr:`_fork_offers`' entries the child inherited and is still inside.
+
+        Set by :func:`_clear_after_fork` to the record's length at the fork, and lowered by
+        :func:`offer_stop_signal` each time the forking thread, unwinding in the child, pops below
+        it. An offer that thread makes after the fork lands beyond it, in a slot it may reuse,
+        and is never shared: it is a call on that thread's stack like any other. Zero in a process
+        never forked mid-offer, and once a child's forking thread has returned from the setter.
         """
         self._releasing_here = threading.local()
         """How many performed releases this thread is inside, as ``depth`` (SPEC-081 FR-001).
@@ -1114,7 +1175,15 @@ class Runtime:
         (:func:`building`, :func:`yielding`). Per thread, for the reason :attr:`_handing_here`
         gives: what it records is a call on this thread's stack, the factory call, and a thread or
         task the factory starts is not inside it. A forked child keeps the forking thread's
-        entries, which that thread's own ``finally`` removes.
+        entries. A child that unwinds out of the factory removes them in that thread's own
+        ``finally``; a child that leaves through ``os._exit``, forked from inside a
+        ``sink_factory`` callable, keeps the factory build's entry for life, and that is harmless
+        (SPEC-083 FR-005; measured at ``53b68203``). The child's ``flush()`` and ``shutdown()``
+        each yield the parent's build, so its ``yielded`` count goes from 0 to 2, but nothing in
+        the child waits on that build. A wrapper the child reaches claims a new build over it,
+        because the claim's owner pid is the parent's. And with another parent thread holding the
+        old wrapper's ``_build_lock`` across the fork, the child reads that lock as unlocked,
+        because the fork repair replaced it, and its ``flush()`` returns ok.
         """
         self._marking_failed = False
         """Whether this child cannot tell what it inherited, so it trusts no unrecorded sink.
@@ -1636,6 +1705,35 @@ def _clear_after_fork() -> None:
     set unconditionally, including in a grandchild and when a worker exists, because the offer
     skips a sink a live worker is draining into and the cost is one locked branch per fork.
 
+    **It keeps the stop signals the forking thread was offering** (SPEC-083 FR-002), reading
+    them from that thread's :attr:`Runtime._offering_here` into :attr:`Runtime._stale_signals`,
+    which :func:`_shutdown_worker` sets. A child forked inside a sink's setter that leaves through
+    ``os._exit`` is inside that setter for life, so no later hand reaches the sink and only
+    setting the event it holds can cut its backoff short. The list is **replaced**, never
+    extended, so a grandchild forked from a thread inside no offer starts empty, while one forked
+    by the still-inside-the-setter thread keeps that event again. It keeps only objects whose type
+    is exactly ``threading.Event``: every event the library offers is one it built, and an exact
+    type means no ``set`` or re-initialisation that sink code overrides runs. Each kept event's
+    ``_at_fork_reinit()`` is called, CPython's own after-fork method, which re-initialises the
+    condition ``Event.set`` takes: a parent thread may have held it at the fork, and measured at
+    ``53b68203`` with one held, the child's ``shutdown()`` never returned without the call and
+    returned at once with it. The record is read with ``getattr`` and left as it stands, and so
+    is :attr:`Runtime._handing_here`: the child's code still runs from the setter's frame, and
+    clearing either makes its first log run the setter inside the setter call that forked
+    (FR-004). No setter, probe or other sink code runs here: the handler reads a thread-local list
+    and calls a method of the standard library's own type.
+
+    **It also shares that record with the child's other threads**, by storing the forking
+    thread's list object in :attr:`Runtime._fork_offers` and its length in
+    :attr:`Runtime._fork_inherited`, both rewritten on every fork. The mark and the record are per
+    thread, so another thread of an ``os._exit`` child, deciding about the sink the forking thread
+    is still being offered, read neither: measured at ``d3950848``, a thread making a child's
+    first log handed that sink the child's debt and blocked forever on a setter holding its own
+    lock, on the orphan, worker-build and retarget paths, and a resumed drain thread reaching the
+    sink through a factory wrapper did the same and delivered nothing. Storing the live list,
+    rather than a copy, is what lets the share shrink as the forking thread unwinds
+    (:func:`offer_stop_signal`), so a child that returns from the setter stops sharing it.
+
     Args:
       None.
 
@@ -1655,6 +1753,14 @@ def _clear_after_fork() -> None:
         _state._late_worker = None
         _state._signal_owed = True
         _state._releasing_here = threading.local()
+        offered = getattr(_state._offering_here, "offers", None)
+        if offered is None:
+            offered = []
+        _state._fork_offers = offered
+        _state._fork_inherited = len(offered)
+        _state._stale_signals = [stop for _, stop in offered if type(stop) is threading.Event]
+        for stop in _state._stale_signals:
+            stop._at_fork_reinit()  # type: ignore[attr-defined]
         worker = _state.live_worker()
         if worker is not None and id(worker.sink) not in _state._closes.owed:
             _state._closes.arm(worker.sink)
@@ -3209,8 +3315,9 @@ def _pay_marks_after_stop() -> None:
     paid: measured at ``ab7f620d`` in a forked child, a 0.3 s backoff on the live worker then
     waited 0.0 s with the mark still in place, for the stop's own end unforced and for a writer
     forced. Paying at once instead runs the sink's setter inside itself. So, under the lock and
-    after the worker's terms, when :func:`handing_here` says this thread is handing that sink, it
-    records the payment as owed on the thread and returns before consuming the mark, and
+    after the worker's terms, when :func:`_in_handing` says this thread is inside a ``handing``
+    block for that sink, it records the payment as owed on the thread and returns before
+    consuming the mark, and
     :func:`handing` runs this function again at the exit of the thread's hand of a sink, which
     re-reads every term and defers again while a hand of the sink is still open. **Only a hand
     of that sink defers it.** Deferring for any hand on the thread, as ``a2c32edf`` did, made a
@@ -3218,7 +3325,9 @@ def _pay_marks_after_stop() -> None:
     requires: measured there, S's 0.3 s backoff waited 0.0 s for as long as R's setter ran,
     where ``ab7f620d`` paid at once. A payment owed on a thread whose stop is followed by another
     before the hand ends finds that stop running at the exit and returns; that stop's own end
-    pays it.
+    pays it. It asks the ``handing`` mark alone rather than :func:`handing_here`, which also
+    reads the offer record (SPEC-083 FR-004): only a ``handing`` block's exit pays what it parks,
+    and :func:`_in_handing` says why the two readings cannot differ here today.
 
     **A mark can land after this looked.** A writer reads a stop token under ``_state._lock`` and
     marks afterwards, while the last stop discards its token with no lock held and only then asks
@@ -3257,7 +3366,7 @@ def _pay_marks_after_stop() -> None:
         stop = _state._stop
         if worker._stop is not stop or stop.is_set() or not worker.draining:
             return
-        if handing_here(sink):
+        if _in_handing(sink):
             _state._handing_here.payment_owed = True
             return
         if not _state._closes.unmark(sink):
@@ -3484,6 +3593,35 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
     same optional-protocol shape SPEC-026 uses for ``losses()`` — a sink without the attribute
     simply never gets one and backs off uninterruptibly, exactly as before.
 
+    **Every offer is recorded on this thread for its length** (SPEC-083 FR-001): ``(id(sink),
+    stop)`` is pushed onto :attr:`Runtime._offering_here` before the probe and popped in a
+    ``finally``, however the setter leaves. This is where the library runs a sink's setter, so the
+    record covers every one; a wrapper's setter that assigns an inner sink's directly runs inside
+    this offer of the wrapper. A child forked from inside the setter inherits the entry, which is
+    how its fork handler finds the event to keep (:func:`_clear_after_fork`) and how
+    :func:`handing_here` knows the child is still inside this offer. The push and pop are a
+    ``try``/``finally`` rather than a context manager, and they run no sink code. When the list
+    is a child's inherited record (:attr:`Runtime._fork_offers`) and the pop takes it below the
+    count the child inherited, the count follows it down, so the child's other threads stop
+    treating an offer as live once the forking thread has returned from it, and never count one
+    that thread makes after the fork.
+
+    **Leaving an inherited offer re-owes the fork's signal debt** (:attr:`Runtime._signal_owed`).
+    While the forking thread is inside the offer, another thread of the child that pays the debt,
+    its first orphan log or ``flush()``, leaves this sink out because :func:`handing_here` is
+    true for it, and clears the debt. On the retarget path, which has no settle loop, nothing
+    then handed the sink the child's own signal once the forking thread returned: measured at
+    ``471eef5e``, a later ``flush()`` left it on the parent's event. So the count and the flag are
+    written together, under ``_state._lock``: a payer computes its candidates and clears the flag
+    in one locked section, so it either sees the sink as left, and hands it, or runs before this
+    and has its clear undone here, and the next orphan log or ``flush()`` hands it. It writes only
+    the flag, so no sink code runs here. The lock is taken only on this branch, which runs only in
+    a child, on the forking thread, once per inherited level, so no ordinary path's count of
+    acquisitions moves. No caller holds ``_state._lock`` across an offer, since a setter never
+    runs under a lifecycle lock (``docs/decisions/sink-lifecycle/``), so taking it here cannot
+    deadlock; the inherited frames are hand paths that offer after releasing it, and the fork
+    handler's resumed hand holds no lock.
+
     Args:
       sink: The sink to offer the signal to.
       stop: The event that is set when delivery should stop waiting.
@@ -3497,11 +3635,43 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
         ``log_foundry_stop_signal`` is a read-only property, or whose ``__setattr__`` objects,
         loses interruptibility rather than preventing the caller from proceeding.
     """
+    offers = _offers_here()
+    offers.append((id(sink), stop))
     try:
-        if hasattr(sink, "log_foundry_stop_signal"):
-            sink.log_foundry_stop_signal = stop
-    except Exception as exc:
-        _diag.absorbed("handing the sink its stop signal", exc, "its backoff stays uninterruptible")
+        try:
+            if hasattr(sink, "log_foundry_stop_signal"):
+                sink.log_foundry_stop_signal = stop
+        except Exception as exc:
+            _diag.absorbed(
+                "handing the sink its stop signal", exc, "its backoff stays uninterruptible"
+            )
+    finally:
+        offers.pop()
+        if offers is _state._fork_offers and len(offers) < _state._fork_inherited:
+            with _state._lock:
+                _state._fork_inherited = len(offers)
+                _state._signal_owed = True
+
+
+def _offers_here() -> list[tuple[int, threading.Event]]:
+    """Returns this thread's record of the stop signals it is offering, innermost last.
+
+    Args:
+      None.
+
+    Returns:
+      The live list of ``(id(sink), event)`` pairs on :attr:`Runtime._offering_here`, created on
+      first use.
+
+    Raises:
+      None.
+    """
+    local = _state._offering_here
+    offers: list[tuple[int, threading.Event]] | None = getattr(local, "offers", None)
+    if offers is None:
+        offers = []
+        local.offers = offers
+    return offers
 
 
 def _get_worker() -> Worker:
@@ -3899,13 +4069,84 @@ def handing_here(sink: object) -> bool:
     The one test of it. A setter that logs to its own sink, builds the worker on it, or emits to
     a factory wrapper whose built sink it is, reaches a decision about the sink it is being
     handed; deciding to hand it again would run the setter again, recursively, so every decision
-    asks this first — :func:`_will_hand`, :func:`_get_worker` and the factory wrapper's build.
+    asks this first — :func:`_will_hand` (and through it :func:`_hand_after_close`,
+    :func:`_arm_and_hand`, :func:`_owed_candidates`, :func:`_swap_sink` and
+    :func:`_flush_live_sink`), :func:`_get_worker`, the factory wrapper's build and the resumed
+    worker's hand in ``Worker._reinit_after_fork``.
+
+    **It answers from the offer record too** (SPEC-083 FR-004): true when the sink is under
+    :func:`handing` or on this thread's :attr:`Runtime._offering_here`. ``Worker.retarget``'s
+    hand (:func:`_hand_retargeted`) offers with no ``handing`` mark, so a setter it ran that logged
+    to its own sink found this false and was handed again inside itself: measured at
+    ``53b68203``, two setter calls, and a hang for a setter holding its own lock. The same holds
+    in a child forked inside that setter, whose code still runs from the setter's frame, and in
+    its fork handler, where the resumed worker would hand the sink. Only ``int`` ids are compared,
+    so no sink's ``__eq__`` runs, which matters because :func:`_get_worker` asks this under
+    ``_state._lock``.
+
+    **In a child it also answers from the offers the child inherited**, on every thread: the
+    first :attr:`Runtime._fork_inherited` entries of :attr:`Runtime._fork_offers`. A child that
+    leaves through ``os._exit`` from inside a setter has its forking thread inside that offer for
+    life, so a decision about that sink on any other thread of the child, its first orphan log
+    or ``flush()``, or its resumed drain thread through a factory wrapper's build, must not hand
+    it again either; reading only this thread's mark and record, those threads ran the setter
+    while its frame was live (:func:`_clear_after_fork` has the measurement).
+
+    **The stop-end payment asks** :func:`_in_handing` **instead**, the ``handing`` mark alone:
+    only ``handing()``'s exit pays a payment it parks (``payment_owed``), and a payment parked
+    inside :func:`_hand_retargeted`'s offer would have no such exit to pay it.
 
     Args:
       sink: The sink a hand is being decided for.
 
     Returns:
-      Whether a hand to that sink is already on this thread's stack.
+      Whether a hand or an offer to that sink is already on this thread's stack.
+
+    Raises:
+      None.
+    """
+    key = id(sink)
+    return (
+        key in _mid_hand()
+        or any(offered == key for offered, _ in _offers_here())
+        or any(offered == key for offered, _ in _state._fork_offers[: _state._fork_inherited])
+    )
+
+
+def _in_handing(sink: object) -> bool:
+    """Whether this thread is inside :func:`handing` for *sink*, ignoring the offer record.
+
+    The reading :func:`_pay_marks_after_stop` takes when it decides whether to park a stop-end
+    payment, rather than :func:`handing_here`'s wider one (SPEC-083 FR-004). A payment is parked
+    by setting ``payment_owed``, and only the exit of a :func:`handing` block pays it, so parking
+    on an offer that has no such block, which :func:`_hand_retargeted`'s is, would leave the
+    payment to nothing. Nor does it read a child's inherited offers (:attr:`Runtime._fork_offers`),
+    which are another thread's record.
+
+    **No reachable state tells the two readings apart today**, and this keeps the payment exactly
+    as it was at ``53b68203`` rather than resting on that argument. They differ only for a
+    payment made on a thread inside an offer with no ``handing`` block, about the sink offered.
+    Four offers have none: :func:`_hand_retargeted`'s, ``Worker._reinit_after_fork``'s in a
+    child's fork handler, the factory wrapper's ``_forward_stop_signal`` of its built sink, and
+    ``Worker.__init__``'s when a caller builds a worker with ``offer_signal=True`` (the library
+    passes ``False``). A payment reaches the predicate only with a live, draining worker, no
+    stop running and a close the stop marked, and it decides about that worker's sink. Inside
+    the retarget's offer that worker is the process's one, and the only payment the thread can
+    make comes from its own ``shutdown()``, which retires it first, so the payment returns at its
+    liveness check. In the fork handler :func:`_clear_after_fork` has already dropped every
+    in-flight close with its mark, and a new mark needs a stop, whose ``shutdown()`` retires that
+    worker the same way. The factory wrapper offers its **built** sink, while the worker's sink is
+    the wrapper, so the readings could differ there only for a factory whose built sink is also
+    the worker's sink, which no ordinary configuration makes; and that inner offer runs nested in
+    an offer of the wrapper itself, one of the other cases. A worker a caller builds directly is
+    not the process's worker, so no payment decides about its sink. This is argued from the code,
+    not measured case by case; the spec's probes measured the retarget case.
+
+    Args:
+      sink: The sink a stop-end payment would hand.
+
+    Returns:
+      Whether a ``handing`` block for that sink is open on this thread.
 
     Raises:
       None.
@@ -4989,6 +5230,15 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     hand a worker build or a retarget declined during the stop on a close that outlives it
     (:func:`_pay_marks_after_stop`), which takes ``_state._lock`` only when such a mark exists.
 
+    **Where it sets the signal it also sets** :attr:`Runtime._stale_signals` (SPEC-083 FR-003):
+    the events a child forked inside a sink's stop-signal setter was being offered, which that
+    sink still holds and no hand can replace without running its setter inside the call that
+    forked. The section is the one both branches share, and the ``atexit`` drain binds this
+    function, so every shutdown in such a child cuts that sink's backoff short. Each event is the
+    child's private copy, re-initialised at the fork, so this touches nothing in the parent and
+    runs no sink code. The list is kept, so a second ``shutdown()`` sets them again, harmlessly.
+    A sink that subclasses ``Sink`` was given the child's signal by the repair walk already.
+
     **Before it drains, it waits for every swap in flight to take its decision**, within the
     closer grace (:func:`_await_swap_decisions`), from a snapshot read in the entry's critical
     section (:func:`_swaps_to_await`). A swap between its retarget and its decision has installed
@@ -5030,6 +5280,8 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             else:
                 claimed = worker.claim_stop(op.deadline)
             _state._stop.set()
+            for stale in _state._stale_signals:
+                stale.set()
             swaps = _swaps_to_await()
             _state._move()
         late_worker: Worker | None = None

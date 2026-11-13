@@ -76,7 +76,14 @@ the one a shutdown sets.
 **The rest of the shape.**
 
 - A thread-local mark (`handing_here`) keeps a setter that logs to its own sink, or builds the
-  worker on it, from being handed again inside itself; it is the one test of it.
+  worker on it, from being handed again inside itself; it is the one test every hand decision asks.
+  Since SPEC-083 it is also true for a sink on the thread's offer record (`offer_stop_signal`
+  records each offer). That covers `Worker.retarget`'s hand, which runs outside `handing()` and
+  whose setter, when it logged, was handed again inside itself. In a forked child, every thread
+  also sees the offers the forking thread is still inside (`Runtime._fork_offers`), so no other
+  thread of the child hands that sink again. The stop-end payment alone asks the `handing` mark
+  (`_in_handing`). A child forked inside a setter keeps both marks (*A child
+  forked inside a stop-signal setter keeps its mark…*).
 - A sink a live worker drains into is handed the worker's own event when that is the current,
   unset signal, which replaces nothing and lets a log on another thread hand it while the build's
   hand is still running.
@@ -143,6 +150,14 @@ own emit loses its event.
   signal handed to the wrapper is forwarded to it as usual.
 
 ## History
+
+### 2026-11-13
+
+- **Refined** by SPEC-083: the mark also reads the offer record, so a setter that
+  `Worker.retarget` runs is not handed its signal again inside itself. At `53b68203` such a setter
+  that logged ran twice, at depth two. In a forked child, the mark also reads the offers the
+  forking thread inherited, from every thread. The stop-end payment keeps the `handing` mark
+  alone.
 
 ### 2026-11-12
 

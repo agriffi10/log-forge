@@ -1993,9 +1993,13 @@ and a third copy is a fork with no merge.
     Inheriting from `Sink` or from a shipped sink is what brings it inside. The one consequence
     that would otherwise break an earlier guarantee is closed separately: the worker rebuild
     **re-offers** its fresh stop signal, so SPEC-027's interruptible backoff still holds for a
-    sink the walk cannot enter. A **shipped** sink held inside a third-party wrapper is repaired
-    and re-acquired since SPEC-079, from the forwarded seeds, within the marking ceiling; past a
-    tripped ceiling it is neither. Its `SinkCounters`, and every engine sink's, are repaired
+    sink the walk cannot enter. The one exception is a sink the forking thread was being offered
+    (SPEC-083). The child runs nested inside that sink's setter call, so the rebuild skips it, and
+    the child's `shutdown()` sets the event that sink holds instead. §13 has the entry *A child
+    forked inside a stop-signal setter keeps the event it was being offered*. A **shipped** sink
+    held inside a third-party wrapper is repaired and re-acquired since SPEC-079, from the
+    forwarded seeds, within the marking ceiling; past a tripped ceiling it is neither. Its
+    `SinkCounters`, and every engine sink's, are repaired
     whatever holds them, from a registry of the live ones.
   - **A package object reachable only through a callable is neither repaired nor marked**
     (SPEC-079). A third-party wrapper that keeps `self._emit = file_sink.emit`, a closure cell or
@@ -2389,6 +2393,38 @@ and a third copy is a fork with no merge.
   > drops that one event, counted, instead of losing the batch. The crash itself is unchanged: a
   > `SIGBUS` on a small thread stack is still beyond any guard. The decision lives in
   > `docs/decisions/sink-delivery/` (*An event a sink cannot encode costs only itself*).
+
+- **A child forked inside a stop-signal setter keeps the event it was being offered.** A sink's
+  `log_foundry_stop_signal` setter can start a process, for example a fork-context
+  `multiprocessing.Process`, whose child leaves through `os._exit`. That child stays inside the
+  setter call for its whole life. It is never handed its own signal for that sink, because handing
+  it runs the setter inside itself: measured at `53b68203`, a setter holding its own lock hung such
+  a child. The library records every event it is offering on the offering thread. A child shares
+  the forking thread's record with all of its own threads, so none of them hands that sink again.
+  That holds within the child only: a grandchild forked by another thread of the child does not
+  carry the view (the third limit below). Leaving an inherited offer re-owes the child's signal
+  debt, so another thread paying that debt early does not leave the sink on the parent's event. The child keeps the forking thread's events, re-initialised, and its `shutdown()` sets
+  them, so a backoff on the event the sink holds is still cut short (SPEC-083). Three limits remain:
+  - **A setter that forks before it stores the event** leaves the sink holding what it held before
+    the call. The child's `shutdown()` does not set that event unless the fork repair replaced it,
+    which it does for a sink that subclasses `Sink`. Closing this would need a per-sink record of
+    earlier hands, which means a reference to every sink ever handed a signal, and that is what
+    SPEC-081 bounded the ownership record to avoid.
+  - **After the child's `shutdown()`, the sink keeps the event that shutdown set** for the rest of
+    the child's life. Its later backoffs on that event do not wait, which is the tight-retry shape
+    SPEC-033 FR-004 removed elsewhere, bounded by the sink's own retry count. A sink that subclasses
+    `Sink` already behaved this way in such a child at `53b68203`. Handing it a fresh signal means
+    running its setter inside the call that forked.
+  - **A grandchild forked by another thread of a child that is still inside a lock-holding setter
+    hangs on its first log.** `_clear_after_fork` replaces the shared record with the new forking
+    thread's, so the child's view does not carry into that grandchild. It is not closed, because
+    the control hangs too: with no fork inside a hand at all, one thread inside a locked setter and
+    another thread forking also hangs the child. That is the generic hazard of forking while
+    another thread holds a lock the caller's code owns, which no record can close.
+
+  The decision lives in `docs/decisions/sink-lifecycle/` (*A child forked inside a stop-signal
+  setter keeps its mark and the event it was offered, and its shutdown sets that event*).
+  (SPEC-083)
 
 ---
 

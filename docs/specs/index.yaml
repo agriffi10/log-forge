@@ -549,6 +549,12 @@ specs:
     spec_status: "Draft"
     depends_on: ["SPEC-048", "SPEC-069", "SPEC-070", "SPEC-072", "SPEC-074", "SPEC-075", "SPEC-076"]
     path: "docs/specs/SPEC-082-file-sinks-on-the-delivery-engine.md"
+  - id: "SPEC-083"
+    title: "Fork Mid-Hand: A Child Forked Inside a Stop-Signal Setter Has Its Backoff Cut Short and Never Re-Enters the Setter"
+    description: "Makes a forked child's shutdown() cut short a backoff on the stop signal a sink was being handed when its setter forked, and keeps the child from ever running that setter again inside the call that forked it, for applications whose sinks start a process from their log_foundry_stop_signal setter."
+    spec_status: "Completed"
+    depends_on: ["SPEC-027", "SPEC-033", "SPEC-039", "SPEC-054", "SPEC-068", "SPEC-079", "SPEC-081"]
+    path: "docs/specs/SPEC-083-fork-mid-hand-stop-signal.md"
   - id: "SPEC-084"
     title: "Stream Sinks on the Delivery Engine: Never Resend What the Stream Took"
     description: "Moves StdoutSink and StderrSink onto deliver, so a stream that raises partway reports each event by what the stream was handed, counts what did not land once per run, and is never handed a line again that it already took, which closes the duplicate lines the worker's whole-batch retry writes today."
