@@ -1013,6 +1013,16 @@ INVENTORY: dict[Key, Row] = {
         _INH,
         "the sinks this thread is handing a signal to; a forking thread's own finally clears its",
     ),
+    _rt("_offering_here"): Row(
+        "Runtime",
+        _INH,
+        "the stop signals this thread is offering; a child forked mid-offer keeps them (SPEC-083)",
+    ),
+    _rt("_stale_signals"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the forking thread's offered events, re-initialised; set by a child's shutdown (SPEC-083)",
+    ),
     _rt("_releasing_here"): Row(
         "Runtime",
         ("reset: _lifecycle._clear_after_fork",),

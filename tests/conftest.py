@@ -539,6 +539,10 @@ def _reset_worker() -> None:
     earlier test still holds would otherwise keep its entry. Its references are dropped after the
     record lock is released, so a finalizer they run meets no lock, and the three once-only
     announcement flags SPEC-081 adds are reset with it.
+
+    SPEC-083 adds the offer record and the stale signals a child keeps. Only a child's fork handler
+    writes the second, and every offer pops its own entry, so both are already empty here. They are
+    reset beside the other thread-locals so that each test starts from the same runtime.
     """
     try:
         from log_foundry import _lifecycle, decorator
@@ -560,6 +564,8 @@ def _reset_worker() -> None:
     _lifecycle._state._handing_here = threading.local()
     _lifecycle._state._building_here = threading.local()
     _lifecycle._state._releasing_here = threading.local()
+    _lifecycle._state._offering_here = threading.local()
+    _lifecycle._state._stale_signals = []
     decorator._orphan_lost = 0
     decorator._in_span_lost = 0
     with _lifecycle._state._closes._lock:
