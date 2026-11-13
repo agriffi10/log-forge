@@ -77,19 +77,18 @@ paid by a refresh: that is the defect.
   orphan log during a take-ahead takes the locked branch and hands the set event again: in the same
   measurement the sink's setter ran three times for the three logs, against once at `a8e91fac`.
 
-**What is left.** The current signal is the stop's set event unless a late worker has been built
-since. A late worker built during a no-worker stop's take-ahead publishes its own unset `_stop` as
-`_state._stop`, which that stop sets only at the late worker's stop, after its first pass, so a hand
-of the current signal before the first pass takes a sink delivers an unset event the close then
-waits on. To reproduce: an orphan hand to R whose setter is still running as the stop enters,
-then a `@trace` building the late worker on another sink before the first take, so the hand's
-settle re-reads the late worker's unset signal; or a `flush()` while that build's hand token is
-open. With a 4 s backoff in R's close and `shutdown(timeout=1)`, R's first-pass close waited
-4.00 s to 4.01 s at `a8e91fac` and on this branch alike. It is recorded with the worker build's decision, which
-it touches too, and left to a session of its own.
+**What is left.** ~~The current signal is the stop's set event unless a late worker has been
+built since.~~ Closed since 2026-11-13: a worker built since the stop's entry still publishes its
+own unset event as the current signal, and these sections still hand it, but the stop's take
+declines while that event is unset and the stop sets it before taking again, so the close starts
+on a set event whichever hand delivered it
+(`docs/decisions/sink-lifecycle/a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`). That stop keeps its take ahead through the worker's join, so the bound above
+holds there too.
 
 ## History
 
 ### 2026-11-13
 
+- **Refined**: *What is left* loses the late-build case, closed at the take by its own decision,
+  `a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`.
 - **Settled**, as a fix after SPEC-079, with `Worker.retarget`'s deferral beside it.

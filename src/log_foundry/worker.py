@@ -1326,6 +1326,9 @@ class Worker:
         during a ``shutdown()`` refreshed the signal at its build, for the reason a sink adopted
         after one does, so the owner's ``set`` at the top of the call never reaches it. Measured
         without this: a 3 s backoff bounded the stop at 3.01 s, against 0.06 s with it.
+        :func:`_lifecycle._shutdown_worker` now sets that event itself, in the section that
+        retires such a worker, before its take; this ``set`` is then a no-op there and still the
+        one a direct caller relies on.
 
         **The once-only gate is** ``_stopped``, **decided under the lock by** :meth:`claim_stop`,
         which records the winner's deadline in the same decision (SPEC-062 FR-001). A second
@@ -1358,8 +1361,10 @@ class Worker:
         **The claim is made before any stop event this worker holds is set**, on both routes.
         :func:`_lifecycle._shutdown_worker` claims for a live worker inside the critical section
         that moves the retirement count, before it sets ``_state._stop`` — which is this worker's
-        own event — and passes the verdict in as ``claimed``. A direct caller, and the late-worker
-        route, pass nothing and claim here, before ``self._stop.set()``. Either way a backoff cut
+        own event — and passes the verdict in as ``claimed``; it claims a worker built since its
+        entry the same way, in the section that retires that worker, before setting the event the
+        worker holds. A direct caller passes nothing and claims here, before ``self._stop.set()``.
+        Either way a backoff cut
         short by the stop wakes to find the deadline already recorded. Each caller joins or waits
         against **its own** budget, never another caller's: a second caller is bounded by the
         budget it asked for whichever deadline the drain is declining against.

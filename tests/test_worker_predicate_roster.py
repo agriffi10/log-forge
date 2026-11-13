@@ -310,17 +310,6 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "`late_worker` deliberately so that its test below is itself filed."
         ),
     ),
-    ("_shutdown_worker", "late_worker is not None", 0): (
-        EXISTENCE,
-        (
-            "the test the binding above feeds. Filed separately on the same rule as every other "
-            "binding/test pair here, and reachable only because the local carries a worker name: "
-            "`_accessor_names` runs its fixpoint over function returns, so a local bound from an "
-            "attribute read is a subject only when its **name** says so. Calling it `late` would "
-            "have hidden this guard from the walker with the file green - the shape SPEC-040 "
-            "recorded when a rename killed two of its own lint rules silently."
-        ),
-    ),
     ("_swap_sink", "_state.live_worker()", 0): (
         LIVENESS,
         (
@@ -604,12 +593,20 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "no-worker branch, or a sink re-armed in the tail is left owed and open."
         ),
     ),
-    ("_shutdown_worker", "late_worker is None and (not waited)", 0): (
+    (
+        "_shutdown_worker",
+        "late_worker is None and (not waited) and (op.publishing_worker is None)",
+        0,
+    ): (
         EXISTENCE,
         (
-            "the no-worker drain's last take was its first pass when no late worker was built and "
-            "nothing was waited on, so no second pass follows: the operation is marked drained in "
-            "this section, which bounds the declining swap (SPEC-078 FR-004)."
+            "the no-worker drain's last take was its first pass when no late worker was built, "
+            "nothing was waited on and its take did not decline for a worker built since the "
+            "entry, so no later pass follows: the operation is marked drained in this section, "
+            "which bounds the declining swap (SPEC-078 FR-004). The third term is the fix after "
+            "SPEC-079 for a late build's signal: a declined take leaves the call a retake, a join "
+            "and a final pass, and marking it drained here would let the hands refresh the "
+            "signal through that join."
         ),
     ),
     ("_will_hand", "not handing_here(sink) and _may_replace(sink)", 0): (
@@ -722,16 +719,57 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_close_owed",
-        "[sink for sink in _state._closes.owed.values() if not _state.held(sink)]",
+        (
+            "[] if declined else [sink for sink in _state._closes.owed.values() if not "
+            "_state.held(sink)]"
+        ),
         0,
     ): (
         MOMENT,
         (
             "the take: every owed sink nothing may be inside, decided in the same critical "
-            "section that registers each one's close (SPEC-054 FR-003). What is left behind is "
+            "section that registers each one's close (SPEC-054 FR-003), and nothing at all when "
+            "the take declines for a worker built since the stop's entry. What is left behind is "
             "either inside a live drain thread or already being closed by somebody else, and the "
             "two are answered differently below - a registration is waited on, a drain thread "
             "costs no grace."
+        ),
+    ),
+    ("_close_owed", "_take_declines(operation, worker)", 0): (
+        MOMENT,
+        (
+            "whether the current signal is the unset event of a worker built since this stop's "
+            "entry, so the take must wait for that worker's stop to set it (the fix after "
+            "SPEC-079 for a late build's signal). Moment: the question is whether that worker's "
+            "stop has happened yet, which is what a set or unset event says, not whether the "
+            "worker exists or performs. Its own terms are filed under `_take_declines`."
+        ),
+    ),
+    ("_close_owed", "worker", 0): (
+        EXISTENCE,
+        (
+            "the record of the worker the take declined for - the right-hand side of "
+            "`operation.publishing_worker = worker`. A write rather than a question, filed for "
+            "the reason `_get_worker`'s publication is: rebinding it changes this text and forces "
+            "a re-decision."
+        ),
+    ),
+    (
+        "_close_owed",
+        (
+            "operation.publishing_worker is None and (not bystander_wait or not (waiting or "
+            "operation.late_possible))"
+        ),
+        0,
+    ): (
+        EXISTENCE,
+        (
+            "whether this take is the call's last, so the operation is marked drained "
+            "(SPEC-078 FR-004): never while a worker the call's take declined for is still to "
+            "be stopped, since the retake after its event is set and the final pass after its "
+            "join both follow. Measured without the first term: the retake marked the call "
+            "drained, a swap and an orphan log during the worker's join refreshed the signal, "
+            "and the final pass closed the new sink on the unset event, 4 s against none."
         ),
     ),
     (
@@ -946,13 +984,104 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "worker-naming tokens sees this because the call names the worker."
         ),
     ),
-    ("_shutdown_worker", "waited or late_worker is not None", 0): (
+    ("_shutdown_worker", "waited or stopping_worker is not None", 0): (
         EXISTENCE,
         (
-            "whether the second pass has anything to do - a close somebody else held, or a "
-            "worker built during this call. Run unconditionally it defeats FR-002's two-caller "
-            "criterion: the first caller, just out of its own inline close, re-takes the "
-            "re-armed sink before the bystander returns from its wait."
+            "whether a later pass has anything to do - a close somebody else held, or a worker "
+            "built during this call, popped as the late worker or declined for by the first "
+            "take. Run unconditionally it defeats FR-002's two-caller criterion: the first "
+            "caller, just out of its own inline close, re-takes the re-armed sink before the "
+            "bystander returns from its wait."
+        ),
+    ),
+    ("_shutdown_worker", "late_worker if late_worker is not None else op.publishing_worker", 0): (
+        EXISTENCE,
+        (
+            "which worker built since the entry this call must stop: the late worker it popped, "
+            "or else the one its first take declined for (the fix after SPEC-079 for a late "
+            "build's signal). Existence: either is a worker this call found, and whether it is "
+            "still live is asked separately, in the section that retires it. It absorbs the "
+            "`late_worker is not None` test that had its own row: a conditional expression is "
+            "filed whole, so that test is in this text and any change to it re-keys this row. "
+            "Bound to a local named for a worker, and the attribute is `publishing_worker` "
+            "rather than `publisher`, for the reason `late_worker` was not called `late`: "
+            "`_accessor_names` runs its fixpoint over function returns, so a local or attribute "
+            "is a subject only when its **name** says so, and a neutral name would have hidden "
+            "every test of it below from the walker with the file green."
+        ),
+    ),
+    ("_shutdown_worker", "stopping_worker is not None", 0): (
+        EXISTENCE,
+        (
+            "the loop's test of the binding above: is there a worker for this round to retire, "
+            "claim, set and join, or only a final pass to run. Filed apart from the loop's own "
+            "condition because the binding is reassigned at the end of each round."
+        ),
+    ),
+    ("_shutdown_worker", "_state.live_worker() is stopping_worker", 0): (
+        LIVENESS,
+        (
+            "whether the worker this call is about to stop still counts as live, and so whether "
+            "the retirement count moves for it. Liveness, because the move exists to stop a "
+            "worker reading as live after its stop; a worker another stop already retired - two "
+            "no-worker stops meeting one late worker, one popping it and one declining for it - "
+            "is not live, and moving the count again would count one worker twice. Measured: an "
+            "unconditional move left two such stops at four retirements against three."
+        ),
+    ),
+    ("_shutdown_worker", "stopping_worker.claim_stop(op.deadline)", 0): (
+        MOMENT,
+        (
+            "whether this caller is the one stopping the worker built since its entry, decided in "
+            "the section that retires it and sets its event, before the set, for the reason the "
+            "entry's claim is: a backoff the set wakes must find the deadline of the caller whose "
+            "join follows. Two stops can now reach one such worker, and the loser waits on its "
+            "own budget. Moment, as the entry's claim is: a worker that lost its gate is still "
+            "live, and the question is only whether a stop is already under way on it."
+        ),
+    ),
+    ("_shutdown_worker", "op.publishing_worker is not None", 0): (
+        EXISTENCE,
+        (
+            "whether this round's worker is one the take declined for, and so whether the owed "
+            "sinks still wait for a take: the retake runs at once after the section sets the "
+            "worker's event, so they close while the worker drains rather than after its join. "
+            "Dropping it closed them only after the join - measured, a late worker's emit that "
+            "waited 0.5 s for the owed sink's close never saw it."
+        ),
+    ),
+    ("_shutdown_worker", "op.publishing_worker", 0): (
+        EXISTENCE,
+        (
+            "the binding for the next round: a final pass that declined again names a worker "
+            "still to stop. Unreachable as the code stands, since the section has set the "
+            "event that is the current signal and nothing replaces a set signal while a take "
+            "is ahead; filed because rebinding it is how the loop would change."
+        ),
+    ),
+    ("_shutdown_worker", "stopping_worker is not None", 1): (
+        EXISTENCE,
+        (
+            "whether the loop runs another round: only when the final pass declined, which is "
+            "the unreachable case the binding above names. A second test of the same text, so "
+            "it carries index 1; index 0 is the round's own test at the head of the loop body."
+        ),
+    ),
+    (
+        "_take_declines",
+        (
+            "op in _state._stops_running and (not stop.is_set()) and (worker is not None) and "
+            "(worker._stop is stop)"
+        ),
+        0,
+    ): (
+        MOMENT,
+        (
+            "the decline itself: a running stop of this process, facing an unset current signal "
+            "that is the worker's own event. Moment, for the reason the call site's row gives. "
+            "The token-set term keeps a stop continuing in a forked child from declining for the "
+            "child's own worker; the identity term keeps a signal some other writer published "
+            "from making the loop set an event that is not the signal and decline again forever."
         ),
     ),
     ("_live_roots", "(config._live_config().sink, worker, _state._late_worker)", 0): (
@@ -1318,8 +1447,26 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 60, "log_foundry.decorator": 2}
+_SITE_FLOOR = {"log_foundry._lifecycle": 92, "log_foundry.decorator": 4}
 """The floor each walked module must still meet, by name.
+
+**Raised to the derived counts by the fix after SPEC-079 for a late build's signal, 60 -> 92 and
+2 -> 4.** Measured with this file's `_sites`, diffing the site list of `_lifecycle.py` at
+`864d71e5` against the branch per scope: `_lifecycle` was already 82 at `864d71e5` and
+`decorator` 4, the specs since SPEC-079 having added sites without raising the floor, so that
+slack is absorbed here rather than left as room for a silent shrink. This change adds ten:
+
+    +3  _close_owed       (the decline call, the record of its worker, the drained test;
+                           the take re-keyed in place)
+    +6  _shutdown_worker  (which worker to stop, the round's two tests, the liveness test of
+                           the conditional retire, its claim, the retake's test, the next
+                           round's binding; two rows re-keyed in place, one absorbed)
+    +1  _take_declines    (the decline's own conjunction)
+
+The absorbed row is `late_worker is not None`: its test now sits inside the binding
+`late_worker if late_worker is not None else op.publishing_worker`, which is filed whole.
+`decorator`'s four are `_sweep_open_spans`'s `worker is None`, `not needs_worker` and its
+`_lifecycle._get_worker()`, and `_flush`'s `_lifecycle._get_worker()`.
 
 **Raised at SPEC-079 to the derived count, 54 -> 60.** `_inheritance_roots`' two sites re-keyed to
 `_live_roots` with their category; added: `_clear_after_fork`'s live-worker read and its arm guard,
@@ -1398,11 +1545,12 @@ of 36 and passed — the exact scenario the test below is named for, measured. A
 mapping fails instead, because the dropped module's entry has nothing to satisfy it.
 
 The counts are measured and may rise; either may fall only in a change that deliberately removes
-guards and says so here, with the per-scope accounting above rather than a new number alone. `decorator`'s 2 are `_sweep_open_spans`'s and `_flush`'s
+guards and says so here, with the per-scope accounting above rather than a new number alone.
+`decorator`'s floor was 2, `_sweep_open_spans`'s and `_flush`'s
 `worker = _lifecycle._get_worker()` — small, and that is the point: they are the sites that make
-walking both modules necessary. It rose from 1 in SPEC-050 FR-003, which bound `_flush`'s call to
-a name so the span's buffer survives a worker that cannot be built; a floor left at 1 would have
-accepted losing either site.
+walking both modules necessary; it is 4 now, its two others named at the top. It rose from 1 in
+SPEC-050 FR-003, which bound `_flush`'s call to a name so the span's buffer survives a worker
+that cannot be built; a floor left at 1 would have accepted losing either site.
 """
 
 

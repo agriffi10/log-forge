@@ -25,9 +25,13 @@ latched boolean every event it delivered would be counted as queued where nothin
 `Health`'s definition of `submitted_after_shutdown` (SPEC-030 FR-001). Against the count, that
 worker records the count at its build as its `_epoch` and reads as live until the *next*
 `shutdown()` moves it, which is exactly when its submissions start being stranded. The count moves
-a **second** time before a late worker is stopped, or that worker reads as live after being
-stopped: delivering nothing, its next submission uncounted, and a later swap waiting a whole budget
-for a fence it cannot confirm. `worker.py` binds the owner once at import rather than reaching
+a **second** time before a late worker is stopped, **when that worker is still live**, or that
+worker reads as live after being stopped: delivering nothing, its next submission uncounted, and a
+later swap waiting a whole budget for a fence it cannot confirm. The condition is since 2026-11-13,
+when two stops became able to stop one worker built since their entry — the one that popped it as
+its late worker and one whose take declined for it — so the count moves once per worker as well as
+once per call
+(`docs/decisions/sink-lifecycle/a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`). `worker.py` binds the owner once at import rather than reaching
 through the module per read — measured over 5M iterations in one process, best of 7:
 `self._shutdown_done` 3.80 ns, `_lifecycle._state.retirements > self._epoch` 14.86 ns, bound
 7.55 ns; the whole-`submit` harness cannot resolve any of that, spreading ~20 ns across runs of one
@@ -80,6 +84,12 @@ permanently after a declined swap and after any `configure()` on a retired worke
 section's `inherited_sink` open item in the same edit. (SPEC-054 FR-005)
 
 ## History
+
+### 2026-11-13
+
+- **Refined**: the second move of the count before a late worker is stopped is now conditional on
+  that worker still being live, since two stops can stop one worker built since their entry; see
+  the sink-lifecycle decision on a take declining for that worker.
 
 ### 2026-09-06
 
