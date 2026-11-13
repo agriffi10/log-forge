@@ -1056,14 +1056,15 @@ class Runtime:
         worker, on the thread already handing it that sink is not handed it again, which would
         recurse. Per thread, so a forked child keeps the forking thread's entries, which that
         thread's own ``finally`` removes. A ``threading.local`` rather than the ``contextvars``
-        ``python.md`` §13 prefers, because what it records is a call on this thread's stack: a
-        hand is synchronous and never crosses an ``await`` or a context copy, so the question is
-        "is this thread inside that call right now", not context propagation. A context variable
-        would also be inherited by a task or thread started from inside the setter, which is not
-        inside the hand. It also carries ``payment_owed``: a stop-end payment that found this thread
-        inside a hand (:func:`_pay_marks_after_stop`), which :func:`handing` runs when the thread
-        leaves its last hand. A forked child keeping the forking thread's flag pays nothing, since
-        the child drops every in-flight entry and its mark.
+        ``python.md`` §13 prefers, because what it records is a call on this thread's stack: a hand
+        is synchronous and never crosses an ``await`` or a context copy, so the question is "is this
+        thread inside that call right now", not context propagation. A context variable would also
+        be inherited by a task or thread started from inside the setter, which is not inside the
+        hand. It also carries ``payment_owed``: a stop-end payment that found this thread handing
+        the very sink it would pay (:func:`_pay_marks_after_stop`), which :func:`handing` runs again
+        when the thread leaves a hand of a sink, until that sink's hand is over. A forked child
+        keeping the forking thread's flag pays nothing, since the child drops every in-flight entry
+        and its mark.
         """
         self._releasing_here = threading.local()
         """How many performed releases this thread is inside, as ``depth`` (SPEC-081 FR-001).
@@ -3178,22 +3179,25 @@ def _pay_marks_after_stop() -> None:
     its mark, owes its sinks its own signal, and a continuing settle re-reads the child's signal
     under the child's lock.
 
-    **It never pays inside a stop-signal hand on this thread; it is owed until the hand ends.**
-    A payment can run while this thread is inside a setter's hand of the very sink it would hand:
-    the stop's own end when a setter called ``shutdown()`` and a build in its tail marked the
-    sink's close, or a writer's payment (:func:`_pay_a_mark_the_stop_missed`) when the build ran
-    inside that setter. It used to decline there, on :func:`handing_here`, and so did the hand
-    already running, whose settle refuses while the sink's close is in flight, so nothing paid:
-    measured at ``ab7f620d`` in a forked child, a 0.3 s backoff on the live worker then waited
-    0.0 s with the mark still in place, for the stop's own end unforced and for a writer forced.
-    Paying at once instead runs the sink's setter inside itself. So when this thread is inside
-    any hand (:func:`_mid_hand`) and there is a mark to pay, it records the payment as owed on
-    the thread and returns, and :func:`handing` runs it when the thread leaves its last hand —
-    no setter on its stack, no lifecycle lock held — through this function again, which re-reads
-    every term. That is why the payment's terms no longer include :func:`handing_here`: it can
-    only be reached with no hand on this thread, so the term could never refuse. A payment owed
-    on a thread whose stop is followed by another before the hand ends finds that stop running
-    at the exit and returns; that stop's own end pays it.
+    **It never pays inside a hand of the very sink it would pay; it is owed until that hand
+    ends.** A payment can run while this thread is inside a setter's hand of the live worker's
+    sink: the stop's own end when a setter called ``shutdown()`` and a build in its tail marked
+    the sink's close, or a writer's payment (:func:`_pay_a_mark_the_stop_missed`) when the build
+    ran inside that setter. It used to decline there, on :func:`handing_here`, and so did the
+    hand already running, whose settle refuses while the sink's close is in flight, so nothing
+    paid: measured at ``ab7f620d`` in a forked child, a 0.3 s backoff on the live worker then
+    waited 0.0 s with the mark still in place, for the stop's own end unforced and for a writer
+    forced. Paying at once instead runs the sink's setter inside itself. So, under the lock and
+    after the worker's terms, when :func:`handing_here` says this thread is handing that sink, it
+    records the payment as owed on the thread and returns before consuming the mark, and
+    :func:`handing` runs this function again at the exit of the thread's hand of a sink, which
+    re-reads every term and defers again while a hand of the sink is still open. **Only a hand
+    of that sink defers it.** Deferring for any hand on the thread, as ``a2c32edf`` did, made a
+    payment inside a hand of another sink R wait for R's setter to return, which no nesting
+    requires: measured there, S's 0.3 s backoff waited 0.0 s for as long as R's setter ran,
+    where ``ab7f620d`` paid at once. A payment owed on a thread whose stop is followed by another
+    before the hand ends finds that stop running at the exit and returns; that stop's own end
+    pays it.
 
     **A mark can land after this looked.** A writer reads a stop token under ``_state._lock`` and
     marks afterwards, while the last stop discards its token with no lock held and only then asks
@@ -3222,9 +3226,6 @@ def _pay_marks_after_stop() -> None:
     """
     if _state._stops_running or not _state._closes.marked():
         return
-    if _mid_hand():
-        _state._handing_here.payment_owed = True
-        return
     with _state._lock:
         if _state._stops_running:
             return
@@ -3233,12 +3234,12 @@ def _pay_marks_after_stop() -> None:
             return
         sink = worker.sink
         stop = _state._stop
-        if (
-            worker._stop is not stop
-            or stop.is_set()
-            or not worker.draining
-            or not _state._closes.unmark(sink)
-        ):
+        if worker._stop is not stop or stop.is_set() or not worker.draining:
+            return
+        if handing_here(sink):
+            _state._handing_here.payment_owed = True
+            return
+        if not _state._closes.unmark(sink):
             return
     _hand_out([sink], stop)
 
@@ -3331,8 +3332,8 @@ def _pay_a_mark_the_stop_missed() -> None:
     Called by both writers after their critical section, outside every lifecycle lock, only when
     they marked; ``tests/test_lock_held_discharges.py`` refuses a payment under ``_state._lock``.
     A writer can be inside a setter's hand of the very sink it marked — a build a setter runs —
-    and the payment then waits for that thread's last hand to end (:func:`handing`), rather than
-    decline on it, which left the mark unpaid while the close ran (see
+    and the payment then waits for that thread's hand of that sink to end (:func:`handing`), rather
+    than decline on it, which left the mark unpaid while the close ran (see
     :func:`_pay_marks_after_stop`).
 
     Args:
@@ -3470,9 +3471,10 @@ def offer_stop_signal(sink: Sink, stop: threading.Event) -> None:
       None.
 
     Raises:
-      None. A sink whose ``log_foundry_stop_signal`` is a read-only property, or whose
-      ``__setattr__``
-        objects, loses interruptibility rather than preventing the caller from proceeding.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from the sink's setter or its
+        ``hasattr`` probe; only an ``Exception`` is absorbed. A sink whose
+        ``log_foundry_stop_signal`` is a read-only property, or whose ``__setattr__`` objects,
+        loses interruptibility rather than preventing the caller from proceeding.
     """
     try:
         if hasattr(sink, "log_foundry_stop_signal"):
@@ -3888,15 +3890,18 @@ def handing_here(sink: object) -> bool:
 def handing(sink: object) -> Iterator[None]:
     """Marks this thread as handing *sink* its stop signal for the length of the block.
 
-    **Leaving the last hand on this thread pays a stop-end payment owed here.** A payment that
-    found this thread inside a hand (:func:`_pay_marks_after_stop`) set ``payment_owed`` on
-    :attr:`Runtime._handing_here` and returned; when this exit empties the thread's record, no
-    setter is on its stack, so the payment runs then, with the flag cleared first. Every caller
-    exits with no lifecycle lock held — :func:`_hand_out` hands after its deciding section, and the
-    factory wrapper's ``_hand`` holds no lock — so the payment, which takes ``_state._lock`` itself,
-    can run here; ``config._sink_lock`` may be held, as for any hand. An ordinary hand pays one
-    thread-local read at its last exit. A ``KeyboardInterrupt`` or ``SystemExit`` from a setter
-    the payment runs replaces an exception already leaving the block, as in any ``finally``.
+    **Leaving a hand of a sink pays a stop-end payment owed on this thread.** A payment that found
+    this thread handing the very sink it would pay (:func:`_pay_marks_after_stop`) set
+    ``payment_owed`` on :attr:`Runtime._handing_here` and returned. When this exit leaves the thread
+    with no hand of this sink, the flag is cleared and the payment runs again; it re-checks under
+    the lock and defers once more if the thread is still handing the sink it pays, so it lands at
+    the exit of that sink's outermost hand, and not later, whatever other sink's hand encloses it.
+    Every caller exits with no lifecycle lock held — :func:`_hand_out` hands after its deciding
+    section, and the factory wrapper's ``_hand`` holds no lock — so the payment, which takes
+    ``_state._lock`` itself, can run here; ``config._sink_lock`` may be held, as for any hand. An
+    ordinary hand pays one thread-local read at each sink's last exit. A ``KeyboardInterrupt`` or
+    ``SystemExit`` from a setter the payment runs replaces an exception already leaving the block,
+    as in any ``finally``.
 
     Args:
       sink: The sink being handed a signal.
@@ -3920,7 +3925,7 @@ def handing(sink: object) -> Iterator[None]:
         else:
             del ids[key]
             local = _state._handing_here
-            if not ids and getattr(local, "payment_owed", False):
+            if getattr(local, "payment_owed", False):
                 local.payment_owed = False
                 _pay_marks_after_stop()
 
@@ -4273,7 +4278,9 @@ def _hand_out(sinks: list[Sink], event: threading.Event) -> None:
       None.
 
     Raises:
-      None.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from a sink's setter, which
+        :func:`offer_stop_signal` does not absorb, or from a stop-end payment owed on this thread
+        that :func:`handing` runs as a hand ends.
     """
     for sink in sinks:
         with handing(sink):
@@ -4325,7 +4332,8 @@ def _settle_signal(sink: Sink, event: threading.Event) -> None:
       None.
 
     Raises:
-      None.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from the sink's setter, which
+        :func:`offer_stop_signal` does not absorb.
     """
     for remaining in range(_SETTLE_ROUNDS - 1, -1, -1):
         offer_stop_signal(sink, event)

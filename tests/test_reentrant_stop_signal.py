@@ -2611,3 +2611,77 @@ def test_a_stop_end_payment_inside_a_hand_is_paid_when_the_hand_ends(
         f"notes={notes} close_in_flight=True holds_worker_signal=True "
         "paid_inside_the_hand=False marked=False waited=[0.3]"
     ), child.output
+
+
+@pytest.mark.parametrize("where", ["in-r", "in-s-inside-r"])
+def test_a_stop_end_payment_is_owed_only_to_a_hand_of_the_sink_it_pays(where: str) -> None:
+    """The payment waits only for a hand of the sink it pays, not for any hand on its thread.
+
+    Thread H's orphan log hands R its signal, and R's setter runs inside that hand. ``in-r``: the
+    setter configures S and logs to it, which hands S and returns; swaps S out, its close
+    parking, and back in; then runs ``shutdown()``, whose tail builds a worker on S and marks S's
+    close, so the stop's own end finds the mark while H is inside R's hand but not S's.
+    ``in-s-inside-r``: the setter configures S and logs to it, and the same steps run in S's
+    setter, inside that nested hand of S, so the payment is owed until S's hand exits; S's
+    setter then returns. Either way R's setter then goes on running, and S is measured
+    meanwhile. Paying S there runs no setter inside itself, so it is paid at once, or at the exit
+    of S's hand: S holds the live worker's own signal, the mark is gone, and a 0.3 s backoff
+    waits 0.3 s. At ``a2c32edf`` the payment was deferred for any hand on the thread and paid
+    only at its last, so until R's setter returned S stayed on the stop's set signal with the
+    mark in place and the backoff waited 0.0 s; ``ab7f620d`` paid ``in-r`` at once.
+    """
+
+    def work() -> str:
+        from log_foundry import worker as worker_mod
+
+        worker_mod.DEFAULT_SWAP_TIMEOUT = 0.2
+        sink, other = _SwappedOut(), Hook()
+        state = _lifecycle._state
+        stopped, go_on = threading.Event(), threading.Event()
+        real_announce = _lifecycle._announce_unsettled
+
+        def build_in_the_tail(op: object) -> None:
+            _traced()()
+            real_announce(op)  # type: ignore[arg-type]
+
+        def stop_route() -> None:
+            log_foundry.configure(sink=Plain())
+            if not sink.in_close.wait(GATE):
+                return
+            log_foundry.configure(sink=sink)
+            _lifecycle._announce_unsettled = build_in_the_tail  # type: ignore[assignment]
+            log_foundry.shutdown(timeout=1.0)
+
+        def in_rs_hand() -> None:
+            log_foundry.configure(sink=sink)
+            if where == "in-s-inside-r":
+                sink.act = stop_route
+                sink.armed = True
+            log_foundry.info("hands S inside R's hand")
+            if where == "in-r":
+                stop_route()
+            stopped.set()
+            go_on.wait(GATE * 2)
+
+        log_foundry.configure(service="t", sink=other)
+        other.act = in_rs_hand
+        hand = threading.Thread(target=lambda: log_foundry.info("hands R"), name="H", daemon=True)
+        hand.start()
+        if not stopped.wait(GATE * 3):
+            return "the stop never ended inside R's hand"
+        live = state.live_worker()
+        held = sink.log_foundry_stop_signal
+        sink.waits.clear()
+        _traced()()
+        log_foundry.flush(timeout=GATE)
+        report = (
+            f"holds_worker_signal={live is not None and live.sink is sink and held is live._stop} "
+            f"marked={state._closes.marked()} waited={sink.waits[:1]}"
+        )
+        go_on.set()
+        hand.join(GATE)
+        sink.go.set()
+        return report
+
+    child = run_in_child(work, timeout=60)
+    assert child.output == "holds_worker_signal=True marked=False waited=[0.3]", child.output
