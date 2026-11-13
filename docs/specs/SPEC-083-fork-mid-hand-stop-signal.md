@@ -37,8 +37,9 @@ This spec fixes both, on Andrew's standing direction to harden rather than recor
 records the event it is offering on the offering thread for the length of each offer. A child's
 fork handler keeps the forking thread's offered events and makes them safe to set, and the child's
 `shutdown()` sets them. A sink that a thread is in the middle of being offered is treated, by every
-decision to hand it again, as one that thread is already handing. The resumed worker's hand in the
-fork handler skips such a sink too. No setter, and no other sink code, runs in the new handler
+decision to hand it again, as one that thread is already handing. In a child, every thread treats
+the sink the forking thread is still being offered that way. The resumed worker's hand in the fork
+handler skips such a sink too. No setter, and no other sink code, runs in the new handler
 code. The child's mark is deliberately kept: clearing it is the obvious fix, and it makes the child
 re-enter the setter (FR-004 records why it is rejected).
 
@@ -52,9 +53,10 @@ re-enter the setter (FR-004 records why it is rejected).
   `Runtime._stale_signals` and re-initialising each event's internal condition (FR-002).
 - The child's `shutdown()` setting those events, in the section where it sets its own signal, on
   both of its branches (FR-003).
-- `handing_here` answering true for a sink on the offer record, and the resumed worker's hand in
-  the fork handler skipping a sink `handing_here` reports. The child's handing mark stays as it is
-  (FR-004).
+- `handing_here` answering true for a sink on the offer record and, in a child, for a sink the
+  forking thread was still being offered, on every thread of the child. Also, the resumed worker's
+  hand in the fork handler skipping a sink `handing_here` reports. The child's handing mark stays
+  as it is (FR-004).
 - The docstrings that say a forking thread's own `finally` clears its entries, including
   `_building_here`'s, which gets a docstring correction and no behaviour change. Also the inventory
   rows, `architecture.md` §13, invariants 3 and 12, a decision file and the 1.2.0 release notes
@@ -151,8 +153,9 @@ returns at once.
   identity) and nothing else.
 - [ ] A child forked by a thread that is inside no offer has `_stale_signals == []`.
 - [ ] A grandchild forked from a thread of that child other than the forking one has
-  `_stale_signals == []`. A grandchild forked by the child's still-inside-the-setter thread holds
-  `E` again.
+  `_stale_signals == []`, and a fresh thread of that grandchild reads `handing_here(sink)` false.
+  A grandchild forked by the child's still-inside-the-setter thread holds `E` again, and a fresh
+  thread of it reads `handing_here(sink)` true.
 - [ ] An offer of a `threading.Event` subclass instance is recorded by FR-001 and left out of
   `_stale_signals`.
 - [ ] With a parent thread holding `E._cond` across the fork, the child's `shutdown(timeout=1)`
@@ -209,7 +212,8 @@ which FR-004 removes; once it is removed, this FR's set is what cuts their wait 
 
 #### Description:
 
-Three paths could run the setter again in such a child, and each needs a guard.
+Three paths could run the setter again in such a child, and so could any thread of the child
+other than the forking one. Each needs a guard.
 
 **The orphan path keeps the child's handing mark.** It would be natural to clear `_handing_here`
 in the child, as SPEC-081 cleared the release depth. That is rejected. The mark is true: the
@@ -225,32 +229,74 @@ therefore found `handing_here` false and handed the sink again: two setter calls
 a hang for a lock-holding setter, measured at `53b68203`. So `handing_here(sink)` is true when the
 sink is under `handing` or on this thread's offer record.
 
+**Every thread of the child sees the offers the child inherited.** The mark and the offer record
+are per thread. In a child that leaves through `os._exit`, any thread other than the forking one
+read neither, so it could hand the sink again while the setter's frame was still live, and a
+setter holding its own lock hung that thread for the child's life. Two cases were measured at
+`d3950848`, the build before this fix:
+- another thread making the child's first log, which settles the fork's signal debt, read
+  `T_alive=True child_calls=1`;
+- the resumed drain thread, reaching the built sink through a factory wrapper's build, read
+  `emits=0 calls=1 cut=False fast=False`, and the child's `shutdown()` spent its whole 1 s.
+
+So `_clear_after_fork` stores the forking thread's live offer list in `Runtime._fork_offers` and
+its length in `Runtime._fork_inherited`, both rewritten on every fork. `handing_here` also answers
+from `_fork_offers[:_fork_inherited]`, comparing ids only, on every thread. The live list rather
+than a copy is stored so that the count can follow it down: `offer_stop_signal`'s `finally` lowers
+`_fork_inherited` whenever the forking thread pops below it. A child that unwinds out of the setter
+therefore stops sharing that offer, and an offer the forking thread makes after the fork lands
+beyond the count, so it is never shared.
+
 Each caller of the predicate takes one of two readings:
 
 | Caller | Site at `53b68203` | Reading |
 |---|---|---|
-| `_will_hand`, and through it `_hand_after_close`, `_arm_and_hand`, `_owed_candidates`, `_swap_sink` and `_flush_live_sink` | `_lifecycle.py:4095` | widened: `handing_here` |
+| `_will_hand`, and through it `_hand_after_close`, `_arm_and_hand`, `_owed_candidates`, `_swap_sink` and `_flush_live_sink` | `_lifecycle.py:4095` | widened: `handing_here`, which is the mark, this thread's offer record, and a child's inherited offers |
 | `_get_worker`'s build | `_lifecycle.py:3597` | widened: `handing_here` |
 | the factory wrapper's `_FactorySink._build` | `sinks/_factory.py:204` | widened: `handing_here` |
 | `Worker._reinit_after_fork`'s new skip | `worker.py` | widened: `handing_here` |
-| `_pay_marks_after_stop`'s parking of a stop-end payment | `_lifecycle.py:3239` | the `handing` mark alone: `_in_handing(sink)`, which is `id(sink) in _mid_hand()` |
+| `_pay_marks_after_stop`'s parking of a stop-end payment | `_lifecycle.py:3239` | the `handing` mark alone: `_in_handing(sink)`, which is `id(sink) in _mid_hand()`. It reads neither offer record, including a child's inherited one |
 
 The stop-end payment keeps the mark alone because `handing()`'s exit is the only thing that pays a
 parked payment (`payment_owed`). A payment parked on a widened read inside `_hand_retargeted`'s
 offer, which runs outside any `handing` block, would have no exit to pay it. So the payment is
 unchanged from `53b68203`.
 
-No criterion pins that choice, because no reachable state tells the two readings apart. A thread
-inside an offer that has no `handing` mark is inside `Worker.retarget`'s hand, and a retarget needs
-a live worker. That worker is the process's only one: `_state._worker` is assigned at one site,
-`_get_worker`'s build, and never cleared. Every call of `_pay_marks_after_stop` such a thread can
-make comes from its own `shutdown()`. That shutdown takes the worker branch and retires that worker
-before its `finally` asks for the payment. The payment therefore returns at its liveness check, with
-`_stop` set, before it reaches the predicate. The other entries to the payment do not apply:
-`_pay_a_mark_the_stop_missed` is reached only by a writer that marked. Such a thread cannot build,
-because a worker exists. It cannot retarget either, because its `configure()` finds
-`config._sink_lock` held and swaps unconfirmed. `handing()`'s exit pays only what an earlier parked
-payment left. A child forked inside that hand inherits the worker, so the same holds there.
+No criterion pins that choice, because no reachable state tells the two readings apart. The
+readings differ only for a payment made on a thread inside an offer that has no `handing` block,
+about the sink offered.
+
+Four offers have no `handing` block:
+- `_hand_retargeted`'s;
+- `Worker._reinit_after_fork`'s, in a child's fork handler;
+- the factory wrapper's `_forward_stop_signal` of its built sink;
+- `Worker.__init__`'s, when a caller builds a worker with `offer_signal=True` (the library passes
+  `False`).
+
+An earlier version of this paragraph named only the retarget, which was incomplete. A payment
+reaches the predicate only with a live, draining worker, no stop running, and a close that the stop
+marked. It then decides about that worker's sink. The four cases, argued from the code:
+
+- **Inside the retarget's offer.** That worker is the process's only one: `_state._worker` is
+  assigned at one site, `_get_worker`'s build, and never cleared. Every call of
+  `_pay_marks_after_stop` such a thread can make comes from its own `shutdown()`. That shutdown
+  takes the worker branch and retires that worker before its `finally` asks for the payment, so the
+  payment returns at its liveness check, with `_stop` set.
+  
+  The other entries to the payment do not apply. `_pay_a_mark_the_stop_missed` is reached only by a
+  writer that marked, and such a thread can be neither kind of writer: it cannot build, because a
+  worker exists, and it cannot retarget, because its `configure()` finds `config._sink_lock` held
+  and swaps unconfirmed. `handing()`'s exit pays only what an earlier parked payment left.
+- **In the fork handler.** `_clear_after_fork` has already dropped every in-flight close with its
+  mark. A new mark needs a stop, and that stop's `shutdown()` retires the worker in the same way.
+- **The factory wrapper.** It offers its built sink, but the worker's sink is the wrapper itself,
+  so the readings could differ only for a factory whose built sink is also the worker's sink. No
+  ordinary configuration makes one. That inner offer also runs nested inside an offer of the wrapper
+  itself, which is one of the other cases.
+- **A worker a caller builds directly.** It is not the process's worker, so no payment decides
+  about its sink.
+
+`_in_handing`'s docstring carries this argument. Only the retarget case was measured.
 
 The authoring session probed this at `53b68203` with both readings patched in. In
 `probe_payment2.py` the setter called by `Worker.retarget` calls `shutdown()` while the sink's
@@ -280,13 +326,26 @@ suite also passed under that patch, which gave the payment the widened read too.
 - [ ] The same setter on the `Worker.retarget` path: the child returns and the setter ran zero
   times in the child. With the offer-record read removed from `handing_here`, the child fails on
   its bound.
+- [ ] Each of the three paths above, with the child's first log made from **another** thread of
+  the child: that thread returns within its bound, and the setter ran zero times in the child.
+  Removing the `_fork_offers` read from `handing_here` leaves that thread hung on the setter's lock.
+- [ ] A sink built through `sink_factory=` whose setter, holding its own lock, forks from the
+  parent's drain thread: in the child, the resumed drain thread delivers the batch, and the setter
+  ran zero times. The batch's backoff on the kept event ends at the child's `shutdown()`, which
+  returns in under 0.5 s.
+- [ ] In a child still inside the setter for S that offers another sink R, another thread reads S
+  as being offered and R as not. Removing the `[:_fork_inherited]` bound makes it read R as being
+  offered.
+- [ ] In a child that unwinds out of the setter for S (a bare `os.fork()`) and then offers R from
+  the same thread, another thread reads neither S nor R as being offered. Removing the shrink in
+  `offer_stop_signal`'s `finally` makes it read R as being offered.
 - [ ] A child forked by a thread inside no offer, with a live worker on a sink that does not
   subclass `Sink`, still has its resumed worker hand that sink the child's signal: the sink holds
   `_state._stop` after the fork.
 - [ ] `tests/test_reentrant_stop_signal.py` and `tests/test_fork_lifecycle.py` pass with their
   assertions unchanged.
-- [ ] Invariants 3, 6 and 12: no child waits forever on a lock its own setter frame holds, on any
-  hand path.
+- [ ] Invariants 3, 6 and 12: no thread of a child waits forever on a lock its own setter frame
+  holds, on any hand path.
 
 ### FR-005: The record says what a mid-hand child keeps, and why
 
@@ -340,6 +399,12 @@ class Runtime:
     _stale_signals: list[threading.Event]
         # the forking thread's offered events, exact threading.Event only, each _at_fork_reinit()'d;
         # rewritten by _clear_after_fork on every fork; [] in a process never forked mid-offer
+    _fork_offers: list[tuple[int, threading.Event]]
+        # in a child, the forking thread's live offer list itself, shared with every thread;
+        # rewritten by _clear_after_fork on every fork ([] when that thread was inside no offer)
+    _fork_inherited: int
+        # how many of _fork_offers' entries the child inherited and is still inside; set by
+        # _clear_after_fork, lowered by offer_stop_signal as the forking thread pops below it
 ```
 
 ## API / Interface Contract
@@ -351,11 +416,13 @@ Private:
 ```python
 # src/log_foundry/_lifecycle.py
 def offer_stop_signal(sink: Sink, stop: threading.Event) -> None
-    # unchanged signature; pushes (id(sink), stop) before the probe, pops in finally
+    # unchanged signature; pushes (id(sink), stop) before the probe, pops in finally,
+    # and lowers _fork_inherited when the pop takes the inherited list below it
 def _offers_here() -> list[tuple[int, threading.Event]]
     # this thread's offer record, created on first use (the shape of _builds_here)
 def handing_here(sink: object) -> bool
-    # true when sink is under handing() or on this thread's offer record
+    # true when sink is under handing(), on this thread's offer record,
+    # or among _fork_offers[:_fork_inherited], from any thread
 def _in_handing(sink: object) -> bool
     # id(sink) in _mid_hand(): the handing mark alone; _pay_marks_after_stop's one reading
 
@@ -428,3 +495,10 @@ docs/release-notes/v1.2.0.md
   the outcome per path, re-measured with `probe_unwind2.py`, and FR-003 gains the retarget
   unwinding criterion. Third, FR-003 gains the criterion that turns its worker-path rows into
   guards.
+- 2026-11-13, system-frame diff review: the review found FR-004's twin path. The mark and the offer
+  record are per thread, so another thread of an `os._exit` child could hand the sink again: the
+  child's first log from another thread, or the resumed drain thread through a factory wrapper.
+  `Runtime._fork_offers` and `Runtime._fork_inherited` now share the inherited offers with every
+  thread of the child. FR-004 gains the four criteria that hold this, and FR-002's grandchild
+  criterion gains the fresh-thread read. The payment's equivalence argument now covers all four
+  offers that have no `handing` block, instead of only the retarget.

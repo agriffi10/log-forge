@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A child forked inside a stop-signal setter keeps its mark and the event it was offered, and its shutdown sets that event"
-description: "`offer_stop_signal` records each offer on the offering thread (`Runtime._offering_here`); a forked child keeps the forking thread's offered events, exact `threading.Event` only and re-initialised, and its `shutdown()` sets them where it sets its own signal; `handing_here` also reads the offer record, and the resumed worker's fork-handler hand skips a sink it reports; the stop-end payment asks the `handing` mark alone. Never reset either mark in a child, never hand an offered sink from the fork handler, keep no per-sink history of hands. (SPEC-083)"
+description: "`offer_stop_signal` records each offer on the offering thread (`Runtime._offering_here`); a forked child keeps the forking thread's offered events, exact `threading.Event` only and re-initialised, and its `shutdown()` sets them where it sets its own signal; `handing_here` also reads the offer record and, from any thread of a child, the forking thread's inherited offers (`_fork_offers[:_fork_inherited]`); the resumed worker's fork-handler hand skips a sink it reports; the stop-end payment asks the `handing` mark alone. Never reset either mark in a child, never hand an offered sink from the fork handler, keep no per-sink history of hands. (SPEC-083)"
 ---
 
 **The defect.** A sink's `log_foundry_stop_signal` setter is the sink's own code, and it can
@@ -36,6 +36,22 @@ the offer record, and `Worker._reinit_after_fork` skips a sink it reports, so th
 event the child's `shutdown()` will set. With these changes, the child ran the setter zero times on
 the orphan, worker-build and retarget paths, and the wait ended at the child's `shutdown()`.
 
+**Every thread of the child sees what the forking thread is still offering.** The mark and the
+offer record are per thread, so in a child that leaves through `os._exit` any other thread read
+neither, and it could hand the sink again while the setter's frame was still live. The system-frame
+diff review measured this at `d3950848`. In the first case, another thread made the child's first
+log, which settles the fork's signal debt; that thread blocked for the child's life on a setter
+holding its own lock. In the second case, the resumed drain thread reached the built sink through a
+factory wrapper's build; it delivered nothing, and the child's `shutdown()` spent its whole timeout.
+
+`_clear_after_fork` therefore stores the forking thread's live offer list in
+`Runtime._fork_offers` and its length in `Runtime._fork_inherited`, both rewritten on every fork.
+`handing_here` also answers from the first `_fork_inherited` entries, comparing ids only, from any
+thread. Storing the live list rather than a copy lets `offer_stop_signal`'s `finally` lower the
+count as the forking thread pops below it. As a result, a child that unwinds out of the setter
+stops sharing that offer, and an offer the forking thread makes after the fork lands beyond the
+count, so it is never shared.
+
 **It also fixes the same nesting in the parent, with no fork involved.** At `53b68203`, a setter
 that `Worker.retarget` ran during a `configure(sink=...)` with a live worker, and that logged, was
 handed its signal again from inside itself: two calls, depth two. A setter holding its own lock
@@ -54,16 +70,24 @@ reset in the handler.
 **The stop-end payment keeps the `handing` mark alone.** `_pay_marks_after_stop` parks a payment
 on its thread (`payment_owed`), and only `handing()`'s exit pays it. A payment parked on the
 widened read, inside `_hand_retargeted`'s offer, which runs outside any `handing` block, would have
-no exit to pay it. So the payment asks `_in_handing` and is unchanged. No test pins this choice,
-because no reachable state tells the two readings apart:
+no exit to pay it. So the payment asks `_in_handing` and is unchanged. It reads no offer record, including a
+child's inherited offers. No test pins this choice, because no reachable state tells the two
+readings apart.
 
-- A thread inside an offer with no `handing` mark is inside a retarget, which needs the process's
-  one live worker. `_state._worker` is assigned once and never cleared.
-- The only payment such a thread can make is its own `shutdown()`'s. That shutdown retires that
-  worker before its `finally` pays, so the payment returns at its liveness check, with `_stop` set,
-  before it reaches the predicate.
+The readings differ only for a payment made on a thread inside an offer that has no `handing`
+block, about the sink offered. Four offers have none: `_hand_retargeted`'s, `Worker._reinit_after_fork`'s
+in the fork handler, the factory wrapper's `_forward_stop_signal` of its built sink, and
+`Worker.__init__`'s with `offer_signal=True`. The argument first recorded here named only the
+retarget, which was incomplete, and `_in_handing`'s docstring now argues all four cases from the
+code:
 
-The spec's probes found the two readings identical. The mutant that gives the payment the widened
+- **Retarget.** The process's one worker is retired by the thread's own `shutdown()` before that
+  shutdown pays, so the payment returns at its liveness check.
+- **The fork handler.** It has already dropped every marked close.
+- **The factory wrapper.** It offers its built sink, while the worker's sink is the wrapper.
+- **A caller-built worker.** It is not the process's worker.
+
+The spec's probes measured the retarget case and found the two readings identical. The mutant that gives the payment the widened
 read survived the full suite, as expected.
 
 **Do not build.**
@@ -91,5 +115,9 @@ the parent's event until its first log or `flush()` settles the fork's signal de
 
 ### 2026-11-13
 
+- **Refined** after the system-frame diff review. A child's other threads now see the forking
+  thread's inherited offers (`_fork_offers`, `_fork_inherited`), because another thread's first log
+  and the resumed drain thread through a factory wrapper still handed the sink again. The payment's
+  equivalence argument now covers all four offers that have no `handing` block.
 - **Settled** by SPEC-083, after the spec review moved the stop-end payment onto the `handing`
   mark alone, and after the plan review added the parent-side retarget test.

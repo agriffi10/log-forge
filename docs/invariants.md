@@ -249,7 +249,8 @@ shape that keeps the hand the build or the retarget defers from being paid under
 `tests/test_fork_mid_hand.py` holds a child forked inside a setter to a wait cut short by its
 `shutdown()`, on the orphan path, inside a `FilteringSink`, on the worker build and on
 `Worker.retarget`, and holds a setter that holds its own lock to never being run again inside
-itself, in the child and, during a retarget, in the parent (SPEC-083).
+itself: in the child, from the forking thread, from another thread of the child and from its
+resumed drain thread through a factory wrapper, and, during a retarget, in the parent (SPEC-083).
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 

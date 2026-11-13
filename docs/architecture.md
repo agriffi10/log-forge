@@ -2399,9 +2399,10 @@ and a third copy is a fork with no merge.
   `multiprocessing.Process`, whose child leaves through `os._exit`. That child stays inside the
   setter call for its whole life. It is never handed its own signal for that sink, because handing
   it runs the setter inside itself: measured at `53b68203`, a setter holding its own lock hung such
-  a child. The library records every event it is offering on the offering thread. The child keeps
-  the forking thread's events, re-initialised, and its `shutdown()` sets them, so a backoff on the
-  event the sink holds is still cut short (SPEC-083). Two limits remain:
+  a child. The library records every event it is offering on the offering thread, and a child
+  shares the forking thread's record with all of its threads, so none of them hands that sink
+  again. The child keeps the forking thread's events, re-initialised, and its `shutdown()` sets
+  them, so a backoff on the event the sink holds is still cut short (SPEC-083). Two limits remain:
   - **A setter that forks before it stores the event** leaves the sink holding what it held before
     the call. The child's `shutdown()` does not set that event unless the fork repair replaced it,
     which it does for a sink that subclasses `Sink`. Closing this would need a per-sink record of
