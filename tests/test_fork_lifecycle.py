@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 import collections
 import ctypes
+import errno
 import faulthandler
 import gc
 import io
@@ -261,6 +262,13 @@ def _set_dumpable(dumpable: int | None) -> int | None:
     not. It is Linux's, so elsewhere this does nothing and returns ``None``; no CI leg runs
     anywhere else, and a crash on macOS ended its child at once with or without a core limit.
 
+    **A setting this cannot put back is refused before anything changes.** ``PR_SET_DUMPABLE``
+    takes only 0 or 1, but a process whose credentials changed under ``fs.suid_dumpable=2``
+    reads 2, and setting 2 back fails with ``EINVAL``. Found by review: refused only on the way
+    back, the error would surface from :func:`run_in_child`'s ``finally`` after the fork, with
+    the parent left non-dumpable and the child never reaped. Refused here, it is raised before
+    the fork, with nothing changed.
+
     Args:
       dumpable: ``0`` to refuse a dump, or the value an earlier call returned, to put it back.
         ``None`` is what an earlier call returned off Linux, and does nothing.
@@ -269,16 +277,43 @@ def _set_dumpable(dumpable: int | None) -> int | None:
       The setting before this call, or ``None`` off Linux.
 
     Raises:
+      OSError: If ``prctl`` refuses, or the current setting is one ``prctl`` cannot restore.
+    """
+    if dumpable is None:
+        return None
+    previous = _dumpable()
+    if previous is None:
+        return None
+    if previous not in (0, 1):
+        raise OSError(errno.EINVAL, f"dumpable is {previous}, which prctl cannot put back")
+    if ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, dumpable, 0, 0, 0) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"prctl(PR_SET_DUMPABLE) failed: {os.strerror(code)}")
+    return previous
+
+
+def _dumpable() -> int | None:
+    """Reads whether this process may dump core, as the kernel's 0, 1 or 2.
+
+    Split from :func:`_set_dumpable` so a test can read the setting a child was forked with,
+    which is the one observation that pins the guard whatever ``core_pattern`` a host has.
+
+    Args:
+      None.
+
+    Returns:
+      The current setting, or ``None`` off Linux, where there is none to read.
+
+    Raises:
       OSError: If ``prctl`` refuses.
     """
-    if sys.platform != "linux" or dumpable is None:
+    if sys.platform != "linux":
         return None
-    libc = ctypes.CDLL(None, use_errno=True)
-    previous = int(libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0))
-    if previous < 0 or libc.prctl(_PR_SET_DUMPABLE, dumpable, 0, 0, 0) != 0:
+    value = int(ctypes.CDLL(None, use_errno=True).prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0))
+    if value < 0:
         code = ctypes.get_errno()
-        raise OSError(code, f"prctl on PR_SET_DUMPABLE failed: {os.strerror(code)}")
-    return previous
+        raise OSError(code, f"prctl(PR_GET_DUMPABLE) failed: {os.strerror(code)}")
+    return value
 
 
 def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT) -> _Child:
@@ -326,7 +361,9 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     in the **parent** around the fork, not in the child, because the child inherits it and the
     library's fork handler runs in the child before any of this code does; a crash inside that
     repair is exactly the case a refusal made later would miss. The parent's own setting is put
-    back once the fork has returned, in the ``finally``, so it is restored when the fork raises.
+    back once the fork has returned, in the ``finally``, so it is restored when the fork raises
+    -- and a fork that raises closes the pipe it would have handed the child, rather than leaking
+    both ends into the rest of the run.
 
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
@@ -347,6 +384,10 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     try:
         gc.collect()
         pid = os.fork()
+    except BaseException:
+        os.close(read_fd)
+        os.close(write_fd)
+        raise
     finally:
         if os.getpid() == parent:
             _set_dumpable(dumpable)
@@ -693,6 +734,44 @@ def _diagnose(child: _Child, *, reached: bool) -> str:
             f"it {child.ending} without reaching `os.kill`, and the `!Type: msg` it left says why"
         )
     return f"it {child.ending} without reaching `os.kill`, leaving no exception report behind"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_DUMPABLE exists only on Linux")
+def test_every_child_is_forked_unable_to_dump_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard on :func:`run_in_child` is read directly, not inferred from a crash's timing.
+
+    The crash test below can tell a guarded child from an unguarded one only while a dump
+    helper is slow, and CI's is usually fast, so a guard removed or undone would leave every
+    other test green and come back only as the flake it ended -- which that test's docstring
+    would then tell the reader is not this mechanism. Found by review, with three mutants green
+    under a fast ``core_pattern``: the guard removed, the child restoring the parent's setting
+    before ``work`` runs, and the parent never restoring its own. Each check here is one of them.
+
+    Args:
+      monkeypatch: Makes the fork fail, for the restore on that path.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    before = _dumpable()
+    assert before in (0, 1), f"the parent starts at dumpable {before}, which nothing can restore"
+
+    child = run_in_child(lambda: str(_dumpable()))
+
+    assert child.finished, f"the probe child did not finish: it {child.ending}"
+    assert child.output == "0", f"the child was forked able to dump core: {child.output!r}"
+    assert _dumpable() == before, "the parent did not get its own setting back after the fork"
+
+    def refused() -> int:
+        raise OSError(errno.EAGAIN, "planted fork failure")
+
+    monkeypatch.setattr(os, "fork", refused)
+    with pytest.raises(OSError, match="planted fork failure"):
+        run_in_child(lambda: None)
+    assert _dumpable() == before, "a failed fork left the parent unable to dump core"
 
 
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
