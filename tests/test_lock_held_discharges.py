@@ -1,15 +1,16 @@
 """No discharge of a close under ``_state._lock`` can owe a deferred stop-signal hand.
 
-A worker build that meets a close of its sink in flight during a stop marks the close's entry
-instead of handing the sink its signal (``_CloseRegistry.defer_hand``), and whoever discharges
-the entry pays the hand through ``_lifecycle._hand_after_close`` — which takes ``_state._lock``.
-A discharge that runs with that lock held and finds the mark would therefore deadlock the
-thread on its own lock, or, if it skipped the payment, leave the late worker delivering into a
-sink on the shutdown's set signal. That cannot happen today only because of a **shape**: every
-release made under the lock discharges an entry it took in the same critical section, and the
-mark is written only in ``_get_worker``'s section under the same lock, so nothing can mark it in
-between; and the one discharge under the lock that can meet a mark, ``put_back``, reports it and
-lets ``_close_owed`` pay after releasing the lock. This file holds that shape over the source.
+A worker build, or a retarget's hand of the worker's new sink, that meets a close of that sink in
+flight during a stop marks the close's entry instead of handing the sink its signal
+(``_CloseRegistry.defer_hand``), and whoever discharges the entry pays the hand through
+``_lifecycle._hand_after_close`` — which takes ``_state._lock``. A discharge that runs with that
+lock held and finds the mark would therefore deadlock the thread on its own lock, or, if it skipped
+the payment, leave the late worker delivering into a sink on the shutdown's set signal. That cannot
+happen today only because of a **shape**: every release made under the lock discharges an entry it
+took in the same critical section, and the mark is written only in ``_get_worker``'s and
+``_hand_retargeted``'s sections under the same lock, so nothing can mark it in between; and the one
+discharge under the lock that can meet a mark, ``put_back``, reports it and lets ``_close_owed`` pay
+after releasing the lock. This file holds that shape over the source.
 
 Five checks, each a reason a finding names, and a roster of the sites the real module has, so a
 rename or a lost ``with`` detection cannot make the audit pass by finding nothing. Four hold the
@@ -48,14 +49,16 @@ LOCK_HELD_SITES = {
     ("_swap_sink", "release"): 2,
     ("_close_owed", "put_back"): 1,
     ("_get_worker", "defer_hand"): 1,
+    ("_hand_retargeted", "defer_hand"): 1,
 }
 """Every discharge made under ``_state._lock`` in ``_lifecycle.py``, and every mark, by function.
 
-``_swap_sink`` releases a stale sink and its displaced one detached, each taken in the same
-section; ``_close_owed`` puts back what an interrupt left untaken; ``_get_worker`` marks a close in
-flight, the one writer of the mark. The ``defer_hand`` row counts every call, under the lock or
-not, so moving the call is a roster change as well as a finding. A new site is a new row, after
-the reasoning in this module's docstring has been checked for it.
+``_swap_sink`` releases a stale sink and its displaced one detached, each taken in the same section;
+``_close_owed`` puts back what an interrupt left untaken; ``_get_worker`` and ``_hand_retargeted``
+mark a close in flight, the two writers of the mark — a worker build, and the hand
+``Worker.retarget`` makes of its new sink. The ``defer_hand`` rows count every call, under the lock
+or not, so moving a call is a roster change as well as a finding. A new site is a new row, after the
+reasoning in this module's docstring has been checked for it.
 """
 
 

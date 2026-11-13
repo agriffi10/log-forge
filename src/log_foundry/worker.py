@@ -1060,6 +1060,16 @@ class Worker:
         from that comparison and nowhere else. ``old`` stays among the sinks this thread may be
         inside on every verdict but ``fenced``.
 
+        **The new sink is handed this worker's signal after the reassign, through**
+        :func:`_lifecycle._hand_retargeted`, **which defers into a stop's close.** A swap during
+        a ``shutdown()`` can retarget a late or tail worker onto a sink that stop is closing, and
+        that close is already waiting on the signal the stop set; handing it this worker's unset
+        ``_stop`` made it wait out the sink's whole backoff — measured at ``a8e91fac``, 4.01 s for
+        a ``shutdown(timeout=1)``. So while a stop is running and a close of the sink is in
+        flight, the hand marks that close and is paid when it ends, as a worker build's is.
+        Outside a stop the hand is made at once, here, with no library lock held but
+        ``config._sink_lock``, as it always was.
+
         **A first drain that failed stays** ``unfenced`` **even when that shutdown lands after the
         reassign**, deliberately. That drain really was unconfirmed, and the verdict reports the
         drain. Its line then says the previous sink is "left open" although a shutdown already
@@ -1102,7 +1112,7 @@ class Worker:
                 return SwapOutcome(verdict="fenced", previous=new_sink)
             self.sink = new_sink
             self._held = [held for held in self._held if held is not new_sink] + [new_sink]
-        _lifecycle.offer_stop_signal(new_sink, self._stop)
+        _lifecycle._hand_retargeted(new_sink, self._stop)
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not drained:
             self._record_incomplete_swap(timeout, old)
