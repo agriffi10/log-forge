@@ -1023,6 +1023,16 @@ INVENTORY: dict[Key, Row] = {
         ("reset: _lifecycle._clear_after_fork",),
         "the forking thread's offered events, re-initialised; set by a child's shutdown (SPEC-083)",
     ),
+    _rt("_fork_offers"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the forking thread's live offer record, shared with a child's other threads (SPEC-083)",
+    ),
+    _rt("_fork_inherited"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "how many of those offers the child inherited and is still inside (SPEC-083)",
+    ),
     _rt("_releasing_here"): Row(
         "Runtime",
         ("reset: _lifecycle._clear_after_fork",),

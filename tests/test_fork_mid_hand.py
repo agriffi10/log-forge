@@ -253,20 +253,25 @@ def test_a_child_forked_outside_any_offer_keeps_nothing() -> None:
     assert child.output == "[]", child.output
 
 
-@pytest.mark.parametrize(("forker", "expected"), [("other-thread", "[]"), ("setter-thread", "[E]")])
+@pytest.mark.parametrize(
+    ("forker", "expected"), [("other-thread", "[] False"), ("setter-thread", "[E] True")]
+)
 def test_a_grandchild_keeps_only_its_forking_threads_offers(forker: str, expected: str) -> None:
     """AC3: the record is per thread and replaced on every fork, never extended.
 
     The child is forked inside the setter for ``E``. A grandchild forked from another of its
     threads finds that thread's empty record. One forked by the thread still inside the setter
-    finds ``E`` on its record again.
+    finds ``E`` on its record again. The same holds for what every other thread of the grandchild
+    reads as being offered: nothing in the first, the sink in the second.
     """
     holder = Holder()
     event = threading.Event()
     outputs: list[str] = []
 
     def grandchild() -> str:
-        return _describe(_lifecycle._state._stale_signals, event)
+        return (
+            f"{_describe(_lifecycle._state._stale_signals, event)} {_from_another_thread(holder)}"
+        )
 
     def child() -> str:
         if forker == "setter-thread":
@@ -370,6 +375,15 @@ def test_a_childs_shutdown_cuts_short_a_wait_on_the_offered_event(path: str) -> 
     assert not offered[0].is_set(), "the parent's event was set by the child"
 
 
+def _from_another_thread(sink: object) -> bool | None:
+    """Asks ``handing_here(sink)`` from a new thread, which holds no offer of its own."""
+    seen: list[bool] = []
+    thread = threading.Thread(target=lambda: seen.append(_lifecycle.handing_here(sink)))
+    thread.start()
+    thread.join(GATE)
+    return seen[0] if seen else None
+
+
 def _unwound(holder: Holder) -> str:
     """In a child that unwound out of the setter: the held event, the flush's hand and the cut."""
     held = holder.log_foundry_stop_signal
@@ -438,8 +452,11 @@ def test_a_child_that_unwinds_out_of_a_retarget_hand_is_cut_short_and_then_hande
 # -- FR-004: a child never runs a sink's setter inside the setter call that forked it ------------
 
 
+@pytest.mark.parametrize("first", ["main", "thread"])
 @pytest.mark.parametrize("path", ["orphan", "build", "retarget"])
-def test_a_lock_holding_setter_that_forks_is_never_reentered_in_the_child(path: str) -> None:
+def test_a_lock_holding_setter_that_forks_is_never_reentered_in_the_child(
+    path: str, first: str
+) -> None:
     """AC1 to AC3: the child logs, flushes and shuts down, and its setter never runs again.
 
     The setter holds its own lock across a body that forks. In the child that lock stays held by
@@ -447,24 +464,36 @@ def test_a_lock_holding_setter_that_forks_is_never_reentered_in_the_child(path: 
     paths' resumed hand, before the child's first line) or on the child's first log. At
     ``53b68203`` the ``build`` and ``retarget`` rows hung. The orphan row keeps the child's
     handing mark, which is what a reset in the handler would remove.
+
+    With ``first=thread`` the child's first log is made by **another** thread of the child, which
+    holds neither the forking thread's mark nor its offer record. That thread still sees the sink
+    as being offered, through the fork's inherited offers; at ``d3950848`` the orphan row's
+    thread hung on the setter's lock, handing the sink the child's debt.
     """
     holder = Holder(locked=True)
     outputs: list[str] = []
 
     def child() -> str:
         report_from_child(ENTERED)
+        alive = False
+        if first == "thread":
+            thread = threading.Thread(target=lambda: log_foundry.info("from a thread"), daemon=True)
+            thread.start()
+            thread.join(GATE)
+            alive = thread.is_alive()
+        report_from_child(f"alive={alive};")
         log_foundry.info("child")
         log_foundry.flush(timeout=1)
         log_foundry.shutdown(timeout=1)
         return f"calls={holder.child_calls} handing={_lifecycle.handing_here(holder)}"
 
     def act(_offered: threading.Event) -> None:
-        run = run_in_child(child, timeout=6)
+        run = run_in_child(child, timeout=12)
         outputs.append(f"{run.output}|{run.ending}")
 
     holder.act = act
     _hand(path, holder)
-    assert outputs == ["entered;calls=0 handing=True|exited 0"], outputs
+    assert outputs == ["entered;alive=False;calls=0 handing=True|exited 0"], outputs
     assert holder.timed_out == 0, "the parent's setter was re-entered"
 
 
@@ -502,3 +531,129 @@ def test_a_setter_a_retarget_runs_that_logs_is_not_handed_again() -> None:
     log_foundry.flush(timeout=GATE)
     assert during == "calls=1 depth=1 timed_out=0", during
     assert holder.log_foundry_stop_signal is _lifecycle._state._stop
+
+
+class Waiting(Holder):
+    """A holder whose ``emit`` in a child backs off ``BACKOFF`` seconds on the event it holds."""
+
+    def __init__(self, *, locked: bool = False) -> None:
+        super().__init__(locked=locked)
+        self.emits = 0
+        self.waits: list[bool] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        if os.getpid() == self.home:
+            return
+        self.emits += 1
+        held = self._signal
+        self.waits.append(held.wait(BACKOFF) if held is not None else False)
+
+
+def test_a_resumed_drain_through_a_factory_wrapper_never_reenters_the_setter() -> None:
+    """The child's drain thread reaches the built sink through the wrapper and does not hand it.
+
+    The parent's drain thread builds the sink through ``sink_factory=`` and forks inside its
+    setter, before the wrapper records what it built. In the child the resumed worker's drain
+    thread, another thread, meets the wrapper with nothing recorded, finds the sink pending, and
+    must see it as being offered rather than hand it again. At ``d3950848`` it handed it, blocked
+    on the setter's own lock, delivered nothing, and the child's ``shutdown()`` waited out its
+    whole timeout. The delivered batch's backoff ends at the child's shutdown, through the kept
+    event.
+    """
+    holder = Waiting(locked=True)
+    outputs: list[str] = []
+
+    def child() -> str:
+        _traced()
+        deadline = time.monotonic() + GATE
+        while holder.emits == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        started = time.monotonic()
+        log_foundry.shutdown(timeout=1)
+        took = time.monotonic() - started
+        return (
+            f"emits={holder.emits} calls={holder.child_calls} cut={holder.waits == [True]} "
+            f"fast={took < 0.5}"
+        )
+
+    def act(_offered: threading.Event) -> None:
+        run = run_in_child(child, timeout=12)
+        outputs.append(f"{run.output}|{run.ending}")
+
+    holder.act = act
+    log_foundry.configure(service="t", sink_factory=lambda: holder)
+    _traced()
+    log_foundry.flush(timeout=GATE * 4)
+    assert outputs == ["emits=1 calls=0 cut=True fast=True|exited 0"], outputs
+
+
+def test_an_offer_the_forking_thread_makes_after_the_fork_is_not_shared() -> None:
+    """Only the offers the child inherited are visible to its other threads.
+
+    The child is still inside the setter for S and offers R. Another thread of the child sees S as
+    being offered, since the forking thread holds it for life, but not R: an offer made in the
+    child is a call on that thread's stack like any other.
+    """
+    holder = Holder()
+    later = Holder()
+    outputs: list[str] = []
+
+    def child() -> str:
+        seen: list[str] = []
+        later.act = lambda _offered: seen.append(
+            f"S={_from_another_thread(holder)} R={_from_another_thread(later)}"
+        )
+        _lifecycle.offer_stop_signal(later, threading.Event())
+        return seen[0] if seen else "R's setter never ran"
+
+    holder.act = lambda _offered: outputs.append(run_in_child(child).output)
+    _lifecycle.offer_stop_signal(holder, threading.Event())
+    assert outputs == ["S=True R=False"], outputs
+
+
+def test_a_forking_thread_that_unwinds_in_the_child_shares_nothing_it_offers_later() -> None:
+    """A child that returns from the setter stops sharing the offer, including the slot it reuses.
+
+    A bare ``os.fork()`` in the setter: the child unwinds, and the offer it inherited is popped.
+    It then offers another sink R from the same thread, which reuses the popped slot of the same
+    list. Another thread must see neither S nor R as being offered.
+    """
+
+    def work() -> str:
+        read_fd, write_fd = os.pipe()
+        parent = os.getpid()
+        holder = Holder()
+        later = Holder()
+        forked: list[int] = []
+
+        def fork(_offered: threading.Event) -> None:
+            gc.collect()
+            pid = os.fork()
+            if pid == 0:
+                signal.alarm(int(GATE * 3))
+            forked.append(pid)
+
+        holder.act = fork
+        _lifecycle.offer_stop_signal(holder, threading.Event())
+        if os.getpid() != parent:
+            seen: list[str] = []
+            later.act = lambda _offered: seen.append(
+                f"S={_from_another_thread(holder)} R={_from_another_thread(later)}"
+            )
+            try:
+                _lifecycle.offer_stop_signal(later, threading.Event())
+                line = seen[0] if seen else "R's setter never ran"
+            except BaseException as exc:
+                line = f"!{type(exc).__name__}: {exc}"
+            os.write(write_fd, line.encode())
+            os._exit(0)
+        os.close(write_fd)
+        ready = select.select([read_fd], [], [], GATE * 3)[0]
+        line = os.read(read_fd, 256).decode() if ready else "silent"
+        if not ready:
+            os.kill(forked[0], signal.SIGKILL)
+        os.waitpid(forked[0], 0)
+        return line
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == "S=False R=False", child.output
