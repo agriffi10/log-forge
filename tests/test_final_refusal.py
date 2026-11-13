@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import sqlite3
 import sys
+import types
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -485,6 +486,61 @@ def test_the_mark_is_read_only_from_an_exact_marked_sink_delivery_error() -> Non
     assert not is_final_refusal(SinkDeliveryError("X: the sink is closed"), refuser)
     assert not is_final_refusal(_Hostile(), refuser)
     assert not is_final_refusal(delivery_error(sqlite3.OperationalError("x")), refuser)
+
+
+class _RaisingGet(dict):  # type: ignore[type-arg]
+    """A ``dict`` whose ``get`` raises, as a caller could plant in ``__dict__`` or ``f_globals``."""
+
+    def get(self, *args: Any, **kwargs: Any) -> Any:
+        raise KeyError("planted")
+
+
+def test_a_hostile_dict_on_an_exact_error_keeps_the_resend_and_the_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
+) -> None:
+    """The fourth review's probe: an overridden ``get`` once stopped the worker thread for good.
+
+    A third-party sink raises an exact ``SinkDeliveryError`` whose ``__dict__`` is a dict
+    subclass with a raising ``get``, once, then delivers. On 1.x the resend delivered it.
+    """
+    _no_backoff(monkeypatch)
+    delivered: list[int] = []
+
+    class OnceHostile:
+        def __init__(self) -> None:
+            self.raised = False
+
+        def emit(self, batch: list[dict[str, object]]) -> None:
+            if not self.raised:
+                self.raised = True
+                err = SinkDeliveryError("OnceHostile: refused")
+                err.__dict__ = _RaisingGet()
+                raise err
+            delivered.append(len(batch))
+
+    emits = calls_to(OnceHostile.emit)
+    ok, failed = _drain(OnceHostile())
+    assert emits() == 2 and delivered == [2]
+    assert ok and failed == 0
+
+
+def test_a_hostile_frame_globals_is_never_read_through_its_own_get(tmp_path: Path) -> None:
+    """A frame whose ``f_globals`` is a dict subclass with a raising ``get`` reads as foreign."""
+    closed = FileSink(str(tmp_path / "f.ndjson"))
+    closed.close()
+
+    def forward(batch: list[dict[str, object]]) -> None:
+        closed.emit(batch)
+
+    hostile = _RaisingGet(vars(sys.modules[__name__]))
+    routed = types.FunctionType(forward.__code__, hostile, "routed", None, forward.__closure__)
+    try:
+        routed(_batch(1))
+    except SinkDeliveryError as err:
+        assert not is_final_refusal(err, closed)
+    else:
+        raise AssertionError("the closed sink did not refuse")
 
 
 def test_a_foreign_frame_below_the_catcher_makes_a_marked_error_resent() -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Final
 
 from log_foundry._sink_arg import package_graph
-from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.base import SinkDeliveryError, _instance_dict
 
 __all__ = ["final_refusal", "is_final_refusal"]
 
@@ -83,9 +83,13 @@ def is_final_refusal(err: BaseException, sink: object) -> bool:
     routed the call to it. The traceback half stays for a caller's code that runs during the call
     and re-raises a refusal it caught from a sink inside the graph.
 
-    Total by construction: the exact-type test runs first and cannot raise, so an exception of
-    any other class, a hostile ``__getattribute__`` or ``__dict__`` included, is never read
-    further, and a frame's ``__name__`` is compared only when it is exactly a ``str``.
+    Total, and it runs no caller code. The exact-type test runs first and cannot raise, so an
+    exception of any other class is never read further. An exact ``SinkDeliveryError`` can still
+    carry a caller's ``__dict__`` subclass, and a frame a caller's ``f_globals`` subclass (a
+    function built with ``types.FunctionType(code, globals)``), whose overridden ``get`` once
+    escaped the worker and stopped it for good; so both are read through the builtin
+    ``dict.get``, unbound, a frame's ``__name__`` is compared only when exactly a ``str``, and the
+    whole reading sits inside a ``try`` that answers False, which costs only the 1.x resend.
 
     Args:
       err: The exception a sink's ``emit`` raised, as its catcher holds it.
@@ -98,17 +102,23 @@ def is_final_refusal(err: BaseException, sink: object) -> bool:
     Raises:
       None.
     """
-    if type(err) is not SinkDeliveryError or vars(err).get(_MARK) is not True:
+    if type(err) is not SinkDeliveryError:
         return False
-    caught = err.__traceback__
-    frame = None if caught is None else caught.tb_next
-    while frame is not None:
-        module = frame.tb_frame.f_globals.get("__name__")
-        if type(module) is not str or not (
-            module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
-        ):
+    try:
+        own = _instance_dict(err)
+        if own is None or dict.get(own, _MARK) is not True:
             return False
-        frame = frame.tb_next
-    graph = package_graph(sink)
-    refuser = vars(err).get(_REFUSER)
-    return graph is not None and type(refuser) is int and refuser in graph
+        caught = err.__traceback__
+        frame = None if caught is None else caught.tb_next
+        while frame is not None:
+            module = dict.get(frame.tb_frame.f_globals, "__name__")
+            if type(module) is not str or not (
+                module == _PACKAGE or module.startswith(f"{_PACKAGE}.")
+            ):
+                return False
+            frame = frame.tb_next
+        refuser = dict.get(own, _REFUSER)
+        graph = package_graph(sink)
+        return graph is not None and type(refuser) is int and refuser in graph
+    except Exception:
+        return False
