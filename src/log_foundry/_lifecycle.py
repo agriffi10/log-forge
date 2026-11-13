@@ -3261,8 +3261,9 @@ def _pay_marks_after_stop() -> None:
     paid: measured at ``ab7f620d`` in a forked child, a 0.3 s backoff on the live worker then
     waited 0.0 s with the mark still in place, for the stop's own end unforced and for a writer
     forced. Paying at once instead runs the sink's setter inside itself. So, under the lock and
-    after the worker's terms, when :func:`handing_here` says this thread is handing that sink, it
-    records the payment as owed on the thread and returns before consuming the mark, and
+    after the worker's terms, when :func:`_in_handing` says this thread is inside a ``handing``
+    block for that sink, it records the payment as owed on the thread and returns before
+    consuming the mark, and
     :func:`handing` runs this function again at the exit of the thread's hand of a sink, which
     re-reads every term and defers again while a hand of the sink is still open. **Only a hand
     of that sink defers it.** Deferring for any hand on the thread, as ``a2c32edf`` did, made a
@@ -3270,7 +3271,9 @@ def _pay_marks_after_stop() -> None:
     requires: measured there, S's 0.3 s backoff waited 0.0 s for as long as R's setter ran,
     where ``ab7f620d`` paid at once. A payment owed on a thread whose stop is followed by another
     before the hand ends finds that stop running at the exit and returns; that stop's own end
-    pays it.
+    pays it. It asks the ``handing`` mark alone rather than :func:`handing_here`, which also
+    reads the offer record (SPEC-083 FR-004): only a ``handing`` block's exit pays what it parks,
+    and :func:`_in_handing` says why the two readings cannot differ here today.
 
     **A mark can land after this looked.** A writer reads a stop token under ``_state._lock`` and
     marks afterwards, while the last stop discards its token with no lock held and only then asks
@@ -3309,7 +3312,7 @@ def _pay_marks_after_stop() -> None:
         stop = _state._stop
         if worker._stop is not stop or stop.is_set() or not worker.draining:
             return
-        if handing_here(sink):
+        if _in_handing(sink):
             _state._handing_here.payment_owed = True
             return
         if not _state._closes.unmark(sink):
@@ -3988,13 +3991,56 @@ def handing_here(sink: object) -> bool:
     The one test of it. A setter that logs to its own sink, builds the worker on it, or emits to
     a factory wrapper whose built sink it is, reaches a decision about the sink it is being
     handed; deciding to hand it again would run the setter again, recursively, so every decision
-    asks this first — :func:`_will_hand`, :func:`_get_worker` and the factory wrapper's build.
+    asks this first — :func:`_will_hand` (and through it :func:`_hand_after_close`,
+    :func:`_arm_and_hand`, :func:`_owed_candidates`, :func:`_swap_sink` and
+    :func:`_flush_live_sink`), :func:`_get_worker`, the factory wrapper's build and the resumed
+    worker's hand in ``Worker._reinit_after_fork``.
+
+    **It answers from the offer record too** (SPEC-083 FR-004): true when the sink is under
+    :func:`handing` or on this thread's :attr:`Runtime._offering_here`. ``Worker.retarget``'s
+    hand (:func:`_hand_retargeted`) offers with no ``handing`` mark, so a setter it ran that logged
+    to its own sink found this false and was handed again inside itself: measured at
+    ``53b68203``, two setter calls, and a hang for a setter holding its own lock. The same holds
+    in a child forked inside that setter, whose code still runs from the setter's frame, and in
+    its fork handler, where the resumed worker would hand the sink. Only ``int`` ids are compared,
+    so no sink's ``__eq__`` runs, which matters because :func:`_get_worker` asks this under
+    ``_state._lock``.
+
+    **The stop-end payment asks** :func:`_in_handing` **instead**, the ``handing`` mark alone:
+    only ``handing()``'s exit pays a payment it parks (``payment_owed``), and a payment parked
+    inside :func:`_hand_retargeted`'s offer would have no such exit to pay it.
 
     Args:
       sink: The sink a hand is being decided for.
 
     Returns:
-      Whether a hand to that sink is already on this thread's stack.
+      Whether a hand or an offer to that sink is already on this thread's stack.
+
+    Raises:
+      None.
+    """
+    key = id(sink)
+    return key in _mid_hand() or any(offered == key for offered, _ in _offers_here())
+
+
+def _in_handing(sink: object) -> bool:
+    """Whether this thread is inside :func:`handing` for *sink*, ignoring the offer record.
+
+    The reading :func:`_pay_marks_after_stop` takes when it decides whether to park a stop-end
+    payment, rather than :func:`handing_here`'s wider one (SPEC-083 FR-004). A payment is parked
+    by setting ``payment_owed``, and only the exit of a :func:`handing` block pays it, so parking
+    on an offer that has no such block, which :func:`_hand_retargeted`'s is, would leave the
+    payment to nothing. No reachable state tells the two readings apart today: a thread inside an
+    offer with no ``handing`` mark is inside a retarget's hand, which needs the process's one live
+    worker, and the only payment such a thread can make comes from its own ``shutdown()``, which
+    retires that worker first, so the payment returns at its liveness check before it asks. This
+    keeps the payment exactly as it was at ``53b68203`` rather than resting on that argument.
+
+    Args:
+      sink: The sink a stop-end payment would hand.
+
+    Returns:
+      Whether a ``handing`` block for that sink is open on this thread.
 
     Raises:
       None.
