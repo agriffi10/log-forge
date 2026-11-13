@@ -120,6 +120,44 @@ def test_a_forked_child_refuses_its_inherited_sqlite_sink_and_survives(
     assert read() == ["parent", "after"]
 
 
+def test_a_forked_childs_traced_batch_costs_one_emit_call_not_a_resend_each(
+    inherited: tuple[SQLiteSink, Callable[[], list[str]]],
+) -> None:
+    """The measured case: a child's ``@trace`` calls reach the worker, which resends nothing.
+
+    The refusal is final (``sinks/_refusal.py``), so each batch the child's worker abandons cost
+    one ``emit``. Before, every batch cost ``max_retries + 1`` calls and their backoff waits: 2000
+    ``@trace`` calls took 17.3 s to ``flush()``, about 85 ms a batch.
+    """
+    _, read = inherited
+
+    def work() -> str:
+        calls = [0]
+        original = SQLiteSink.emit
+
+        def counted(self: SQLiteSink, batch: list[dict[str, object]]) -> None:
+            calls[0] += 1
+            original(self, batch)
+
+        SQLiteSink.emit = counted  # type: ignore[method-assign]
+
+        @log_foundry.trace
+        def step() -> None:
+            pass
+
+        for _ in range(20):
+            step()
+        log_foundry.flush(timeout=5)
+        failed = log_foundry.health().failed_batches
+        return f"emits:{calls[0]};batches:{failed};one-each:{calls[0] == failed > 0}"
+
+    child = run_in_child(work, timeout=10)
+
+    assert child.status == 0, child.output
+    assert child.output.endswith("one-each:True"), child.output
+    assert read() == []
+
+
 def test_a_forked_child_holds_the_inherited_connection_by_a_reference_nothing_releases() -> None:
     """The fork handler leaks exactly one reference to the inherited connection, held by nothing.
 

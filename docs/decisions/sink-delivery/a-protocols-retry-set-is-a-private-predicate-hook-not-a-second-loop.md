@@ -19,7 +19,9 @@ re-sent a batch whenever `emit` raised, whatever the status, so a `400` was stil
 was a change to every sink's contract, not to this one, and stayed out of scope. SPEC-072's verdict
 is where it landed: since SPEC-073 the worker calls the family's `deliver`, a `REJECTED` request is
 final, and a `400` is sent once. A third-party subclass not offered `deliver` keeps the worker's
-1.x resend. **The exception hook
+1.x resend. The one exception is narrower and private: a shipped sink's closed, closing or
+forked-child refusal carries a mark the worker reads, so it is not resent, and no third-party sink's
+contract changes (*A refusal no retry can cure is marked, and the worker abandons it at once*). **The exception hook
 is the same shape** (SPEC-070): every retry loop in the sinks, and `HTTPSink._exchange`'s classification, asks a
 private `_retryable_error(err)` beside this status hook, through `is_retryable` so a predicate that
 raises reads as "not retryable" (*A sink declares what it retries, and anything else fails at
@@ -32,6 +34,12 @@ OTLP's own server rule for an oversized request is to answer `413`, which is exa
 search exists to act on. (SPEC-056 FR-003)
 
 ## History
+
+### 2026-11-12
+
+- **Refined**: the rejected per-sink retry set on the worker stays rejected; a private mark on a
+  shipped sink's final refusal is recorded beside it as the narrower thing that was built. Fence
+  unchanged.
 
 ### 2026-11-08
 

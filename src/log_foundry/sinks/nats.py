@@ -15,6 +15,7 @@ from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import exact_int, usable_timeout
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
@@ -802,7 +803,7 @@ class NATSSink:
             try:
                 report = self._run(self._round_on_loop(batch), self.publish_timeout + CALL_SLACK)
             except _LoopWedgedError as err:
-                wedged = SinkDeliveryError(
+                wedged = final_refusal(
                     f"NATSSink published none of {len(batch)} event(s) within "
                     f"{self.publish_timeout + CALL_SLACK}s: the loop is wedged and the sink is "
                     "now closed"
@@ -912,13 +913,13 @@ class NATSSink:
           None.
         """
         if os.getpid() != self._pid:
-            return Outcome.REJECTED, SinkDeliveryError(
+            return Outcome.REJECTED, final_refusal(
                 f"{prefix}: a forked child acquired no connection"
             )
         if self._closed:
-            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closed")
+            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closed")
         if self._closing:
-            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closing")
+            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closing")
         if self._latched():
             return Outcome.RETRYABLE, SinkDeliveryError(
                 f"{prefix}: the server has not answered a PING, and the stall it measures has "
@@ -1027,9 +1028,9 @@ class NATSSink:
           None.
         """
         if self._closed:
-            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closed")
+            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closed")
         if self._closing:
-            return Outcome.REJECTED, SinkDeliveryError(f"{prefix}: the sink is closing")
+            return Outcome.REJECTED, final_refusal(f"{prefix}: the sink is closing")
         stuck = self._stuck_refusal(prefix)
         return None if stuck is None else (Outcome.RETRYABLE, stuck)
 

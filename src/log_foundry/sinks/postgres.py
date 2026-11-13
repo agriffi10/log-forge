@@ -14,6 +14,7 @@ from log_foundry.sinks._encode import NUL_ESCAPE, encode_round, repair_nul, unen
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_positive
 from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
@@ -387,7 +388,7 @@ class PostgresSink:
         with self._guard.enter() as section:
             if not section:
                 run_context().refuse(
-                    SinkDeliveryError(
+                    final_refusal(
                         f"PostgresSink inserted none of {len(batch)} event(s): the sink is closed"
                     )
                 )

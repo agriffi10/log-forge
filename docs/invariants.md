@@ -356,7 +356,9 @@ released nothing keeps accepting (SPEC-032). Since SPEC-076 the refusal starts w
 begins, not when its release does, and comes from the closed guard: a closed or closing engine
 sink's `deliver` calls `RunContext.refuse` with its 1.x error and answers `REJECTED`, so a run
 that fails moves no sink counter and the adapter raises that error by identity; an emit-only sink
-raises it.
+raises it. That error, and a forked child's `SQLiteSink` or `NATSSink` refusal, is built by
+`sinks/_refusal.final_refusal`: exactly `SinkDeliveryError`, with a private mark the worker reads to
+abandon the batch at the attempt that raised it rather than resend it, since no retry can cure it.
 
 **A sink that offers `deliver` states the same promise per event** (SPEC-072): it returns a
 `Verdict` rather than raising, and the engine applies the rule to the run. A run **fails** when no
@@ -433,7 +435,9 @@ worker and the orphan path, and a third-party override on its 1.x path, SPEC-073
 `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's mapped
 verdict and refusal, and an engine child under `MultiSink`, SPEC-075), and
 `tests/test_sink_post_close.py` (a closed or closing sink's refusal on every adopter and path,
-and every sink that releases nothing still delivering after `close()`, SPEC-076).
+and every sink that releases nothing still delivering after `close()`, SPEC-076), and
+`tests/test_final_refusal.py` (a final refusal costs one `emit` call, every other raise the 1.x
+resend, and every closed-guard section refuses through `final_refusal`).
 
 ## 8. An event is safe by construction, once, at assembly
 

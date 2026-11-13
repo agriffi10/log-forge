@@ -14,8 +14,9 @@ from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_positive
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["FileSink", "RotatingFileSink"]
 
@@ -268,7 +269,7 @@ class FileSink:
             try:
                 with self._guard.enter() as section:
                     if not section:
-                        raise SinkDeliveryError(
+                        raise final_refusal(
                             f"FileSink wrote none of {len(batch)} event(s): the sink is closed"
                         )
                     if not lines:
@@ -600,7 +601,7 @@ class RotatingFileSink:
             try:
                 with self._guard.enter() as section:
                     if not section:
-                        raise SinkDeliveryError(
+                        raise final_refusal(
                             f"RotatingFileSink wrote none of {len(batch)} event(s): "
                             "the sink is closed"
                         )

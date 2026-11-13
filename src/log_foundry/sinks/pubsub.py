@@ -11,6 +11,7 @@ from log_foundry import _diag
 from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._encode import encode_events
 from log_foundry.sinks._extras import import_extra
+from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, usable_timeout, wait
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 
@@ -251,7 +252,7 @@ class GooglePubSubSink:
         if not batch:
             return
         if self._closed:
-            raise SinkDeliveryError(
+            raise final_refusal(
                 f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed"
             )
         with Deferral(self) as pending:
@@ -645,7 +646,7 @@ class GooglePubSubSink:
           SinkDeliveryError: The sink is closed, or a publish was still in flight afterwards.
         """
         if self._closed:
-            raise SinkDeliveryError("GooglePubSubSink cannot flush: the sink is closed")
+            raise final_refusal("GooglePubSubSink cannot flush: the sink is closed")
         with self._futures_lock:
             pending, self._futures = self._futures, []
         if not pending:
