@@ -4,17 +4,23 @@ A closed or closing shipped sink, and a forked child's ``SQLiteSink``, raise the
 ``sinks/_refusal.final_refusal`` builds. The worker abandons such a batch at the attempt that
 raised it, moving ``failed_batches`` once and writing the abandoned line with the attempts it
 made, where before it resent the batch ``max_retries`` times with a backoff wait between, about
-85 ms a batch. Any other raise keeps the resend, a third-party sink's ``SinkDeliveryError`` and a
-dual-typed driver error included, and ``MultiSink`` re-raises a final refusal only when every
-child's raise was one. Serves invariants 2, 3, 6 and 7.
+85 ms a batch. Any other raise keeps the resend: a third-party sink's ``SinkDeliveryError``, a
+dual-typed driver error, and a shipped sink's final refusal that a sink of the caller's own caught
+and re-raised. ``MultiSink`` re-raises a final refusal only when every child's raise was one.
+
+``emit`` calls are counted through ``sys.monitoring`` rather than by wrapping ``emit``, because a
+wrapper defined here would put a frame of this module into every refusal's traceback, and a
+foreign frame there is exactly what turns a final refusal back into a resent one. Serves
+invariants 2, 3, 6 and 7.
 """
 
 from __future__ import annotations
 
 import ast
 import sqlite3
+import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -26,9 +32,16 @@ from log_foundry.sinks._driver_error import delivery_error
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._refusal import final_refusal, is_final_refusal
 from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.file import FileSink
 from log_foundry.sinks.multi import MultiSink
+from log_foundry.sinks.nats import NATSSink, _LoopWedgedError
 from log_foundry.worker import Worker
-from test_sink_post_close import EMIT_ONLY_CLOSED, ENGINE_CLOSED, Built
+from test_sink_post_close import EMIT_ONLY_CLOSED, ENGINE_CLOSED, Built, _hold_a_section
+
+if TYPE_CHECKING:
+    import threading
+    from collections.abc import Callable, Iterator
+    from types import CodeType
 
 LIMIT = 5.0
 RETRIES = 3
@@ -43,19 +56,36 @@ def _batch(n: int = 2) -> list[dict[str, object]]:
     return [sink_rigs.ok(f"e{i}") for i in range(n)]
 
 
-class EmitCount:
-    """Counts the calls a class's ``emit`` receives, delegating each."""
+@pytest.fixture
+def calls_to() -> Iterator[Callable[[Callable[..., Any]], Callable[[], int]]]:
+    """Counts the calls one function receives, from any thread, adding no frame to its stack.
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, cls: type) -> None:
-        self.calls = 0
-        original = cls.emit  # type: ignore[attr-defined]
-        counter = self
+    Yields a ``watch(function)`` that starts counting ``function``'s calls and returns a reader.
+    """
+    monitoring = sys.monitoring
+    tool = next(t for t in range(6) if monitoring.get_tool(t) is None)
+    monitoring.use_tool_id(tool, "test_final_refusal")
+    counts: dict[CodeType, int] = {}
 
-        def emit(sink: Any, batch: list[dict[str, object]]) -> Any:
-            counter.calls += 1
-            return original(sink, batch)
+    def started(code: CodeType, offset: int) -> None:
+        if code in counts:
+            counts[code] += 1
 
-        monkeypatch.setattr(cls, "emit", emit)
+    monitoring.register_callback(tool, monitoring.events.PY_START, started)
+
+    def watch(function: Callable[..., Any]) -> Callable[[], int]:
+        code = function.__code__
+        counts[code] = 0
+        monitoring.set_local_events(tool, code, monitoring.events.PY_START)
+        return lambda: counts[code]
+
+    try:
+        yield watch
+    finally:
+        for code in counts:
+            monitoring.set_local_events(tool, code, 0)
+        monitoring.register_callback(tool, monitoring.events.PY_START, None)
+        monitoring.free_tool_id(tool)
 
 
 def _drain(sink: Any) -> tuple[bool, int]:
@@ -71,6 +101,10 @@ def _abandoned(err: str) -> list[str]:
     return [line for line in err.splitlines() if "batch abandoned after" in line]
 
 
+def _no_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_engine, "cycle_backoff", lambda attempt: 0.0)
+
+
 @pytest.mark.parametrize(
     ("name", "state"), [*((name, "closed") for name in EMIT_ONLY), ("SQLiteSink", "forked")]
 )
@@ -80,6 +114,7 @@ def test_one_refused_batch_costs_one_emit_call_not_four(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
 ) -> None:
     """The regression: ``max_retries=3`` once cost 4 calls and 3 backoffs; now one call.
 
@@ -93,7 +128,7 @@ def test_one_refused_batch_costs_one_emit_call_not_four(
     else:
         own_pid = sink._pid
         sink._pid = -1
-    count = EmitCount(monkeypatch, type(sink))
+    emits = calls_to(type(sink).emit)
     before = rig.calls()
     capsys.readouterr()
     try:
@@ -101,7 +136,7 @@ def test_one_refused_batch_costs_one_emit_call_not_four(
     finally:
         if state == "forked":
             sink._pid = own_pid
-    assert count.calls == 1, f"{name} {state}: {count.calls} emit call(s) for one refused batch"
+    assert emits() == 1, f"{name} {state}: {emits()} emit call(s) for one refused batch"
     assert not ok, "a refused batch reported a flush success"
     assert failed == 1
     assert rig.calls() == before, f"{name} reached its driver while {state}"
@@ -123,41 +158,119 @@ class _Raises:
 @pytest.mark.parametrize(
     "error",
     [
-        pytest.param(SinkDeliveryError("ThirdPartySink delivered none: the sink is closed"), id="unmarked"),
-        pytest.param(delivery_error(sqlite3.OperationalError("database is locked")), id="dual-typed"),
+        pytest.param(
+            SinkDeliveryError("ThirdPartySink delivered none: the sink is closed"), id="unmarked"
+        ),
+        pytest.param(
+            delivery_error(sqlite3.OperationalError("database is locked")), id="dual-typed"
+        ),
         pytest.param(ConnectionError("refused"), id="transient"),
+        pytest.param(final_refusal("Borrowed: the sink is closed"), id="marked-but-foreign"),
     ],
 )
 def test_any_other_raise_keeps_the_resend(
-    error: Exception, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
 ) -> None:
-    """The silent twin: what ``final_refusal`` did not build is resent, as in 1.x."""
-    monkeypatch.setattr(_engine, "cycle_backoff", lambda attempt: 0.0)
-    count = EmitCount(monkeypatch, _Raises)
+    """The silent twin: what a shipped sink did not raise as final is resent, as in 1.x."""
+    _no_backoff(monkeypatch)
+    emits = calls_to(_Raises.emit)
     capsys.readouterr()
     ok, failed = _drain(_Raises(error))
-    assert count.calls == RETRIES + 1
+    assert emits() == RETRIES + 1
     assert not ok and failed == 1
     assert _abandoned(capsys.readouterr().err) == [
         f"log-foundry: lost 2 event(s); batch abandoned after {RETRIES + 1} emit attempts"
     ]
 
 
-def test_a_refusal_after_a_transient_failure_stops_the_resend_where_it_lands(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+class _Replacing:
+    """A sink of the caller's own that swaps in a fresh ``FileSink`` when its inner one refuses."""
+
+    def __init__(self, inner: FileSink, path: Path) -> None:
+        self.inner = inner
+        self.path = path
+        self.replacements: list[FileSink] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        try:
+            self.inner.emit(batch)
+        except SinkDeliveryError:
+            self.inner = FileSink(str(self.path))
+            self.replacements.append(self.inner)
+            raise
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+def test_a_callers_sink_re_raising_a_shipped_refusal_keeps_the_resend_it_arranged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
 ) -> None:
-    """A sink that fails transiently, then closes: the line counts the attempts actually made."""
-    monkeypatch.setattr(_engine, "cycle_backoff", lambda attempt: 0.0)
-    errors = [ConnectionError("refused"), final_refusal("ThenClosed: the sink is closed")]
+    """The caller's frame is in the traceback, so the refusal is not final and the resend lands.
 
-    class Closes:
-        def emit(self, batch: list[dict[str, object]]) -> None:
-            raise errors[min(count.calls - 1, 1)]
+    The wrapper re-raises the closed ``FileSink``'s own error by identity, mark and all, after
+    replacing it; the worker's second attempt reaches the fresh sink and is delivered.
+    """
+    _no_backoff(monkeypatch)
+    closed = FileSink(str(tmp_path / "old.ndjson"))
+    closed.close()
+    wrapper = _Replacing(closed, tmp_path / "new.ndjson")
+    emits = calls_to(_Replacing.emit)
+    try:
+        ok, failed = _drain(wrapper)
+    finally:
+        for sink in wrapper.replacements:
+            sink.close()
+    assert emits() == 2
+    assert ok and failed == 0
+    assert len((tmp_path / "new.ndjson").read_text().splitlines()) == 2
 
-    count = EmitCount(monkeypatch, Closes)
+
+class _FailsOnce:
+    """A stream whose first ``write`` raises ``EIO``, for a transient file failure."""
+
+    def __init__(self) -> None:
+        self.writes = 0
+
+    def write(self, line: str) -> int:
+        self.writes += 1
+        raise OSError(5, "Input/output error")
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_refusal_after_a_transient_failure_stops_the_resend_where_it_lands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
+) -> None:
+    """A write fails (retried), the sink closes in the backoff, and the close's refusal is final.
+
+    The line counts the attempts actually made: two.
+    """
+    sink = FileSink(str(tmp_path / "f.ndjson"))
+    sink._stream.close()
+    sink._stream = _FailsOnce()
+
+    def close_in_the_backoff(attempt: int) -> float:
+        sink.close()
+        return 0.0
+
+    monkeypatch.setattr(_engine, "cycle_backoff", close_in_the_backoff)
+    emits = calls_to(FileSink.emit)
     capsys.readouterr()
-    ok, failed = _drain(Closes())
-    assert count.calls == 2
+    ok, failed = _drain(sink)
+    assert emits() == 2
     assert not ok and failed == 1
     assert _abandoned(capsys.readouterr().err) == [
         "log-foundry: lost 2 event(s); batch abandoned after 2 emit attempts"
@@ -179,6 +292,19 @@ def test_every_emit_only_closed_refusal_is_final_and_still_exactly_sink_delivery
         assert str(raised.value) == EMIT_ONLY_CLOSED[name](2)
 
 
+@pytest.mark.parametrize("name", ["KafkaSink", "GooglePubSubSink"])
+def test_a_closed_buffering_sinks_flush_refusal_is_final(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The two buffering emit-only sinks refuse a flush after close the same way."""
+    rig = sink_rigs.RIGS[name](monkeypatch, tmp_path)
+    rig.sink.close()
+    with pytest.raises(SinkDeliveryError) as raised:
+        rig.sink.flush()
+    assert is_final_refusal(raised.value)
+    assert str(raised.value) == f"{name} cannot flush: the sink is closed"
+
+
 def test_a_forked_sqlite_sinks_refusal_is_final(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -195,18 +321,29 @@ def test_a_forked_sqlite_sinks_refusal_is_final(
     assert "a forked child acquired no connection" in str(raised.value)
 
 
+@pytest.mark.parametrize("state", ["closed", "closing"])
 @pytest.mark.parametrize("name", sorted(ENGINE_CLOSED))
-def test_a_closed_engine_sinks_emit_raises_a_final_refusal(
-    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_a_closed_or_closing_engine_sinks_emit_raises_a_final_refusal(
+    name: str, state: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Through the inline adapter, as a ``MultiSink`` or third-party wrapper reaches it."""
     built = Built(name, monkeypatch, tmp_path)
-    built.target.close()
-    with pytest.raises(SinkDeliveryError) as raised:
-        if name == "SocketTransport":
-            built.outer.emit(_batch(1))
-        else:
-            emit_via_deliver(built.outer, _batch(1))
+    closer: threading.Thread | None = None
+    leave: threading.Event | None = None
+    if state == "closed":
+        built.target.close()
+    else:
+        closer, leave = _hold_a_section(built)
+    try:
+        with pytest.raises(SinkDeliveryError) as raised:
+            if name == "SocketTransport":
+                built.outer.emit(_batch(1))
+            else:
+                emit_via_deliver(built.outer, _batch(1))
+    finally:
+        if leave is not None and closer is not None:
+            leave.set()
+            closer.join(LIMIT)
     assert type(raised.value) is SinkDeliveryError
     assert is_final_refusal(raised.value)
 
@@ -227,8 +364,32 @@ def test_a_forked_nats_sinks_emit_raises_a_final_refusal(
     assert "a forked child acquired no connection" in str(raised.value)
 
 
+@pytest.mark.parametrize("call", ["emit", "flush"])
+def test_a_wedged_nats_loops_refusal_is_final(
+    call: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The backstop closes the sink, so its refusal on either call is final."""
+    built = Built("NATSSink", monkeypatch, tmp_path)
+    sink: NATSSink = built.target
+
+    def wedged(self: NATSSink, coroutine: Any, timeout: float) -> Any:
+        coroutine.close()
+        raise _LoopWedgedError("wedged")
+
+    monkeypatch.setattr(NATSSink, "_run", wedged)
+    with pytest.raises(SinkDeliveryError) as raised:
+        if call == "emit":
+            emit_via_deliver(sink, _batch(1))
+        else:
+            sink.flush()
+    assert is_final_refusal(raised.value)
+    assert "the loop is wedged and the sink is now closed" in str(raised.value)
+
+
 def test_a_fan_out_of_closed_children_costs_one_attempt(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
 ) -> None:
     """Every child refused for good, an engine child among them: one fan-out call."""
     file_rig = sink_rigs.RIGS["FileSink"](monkeypatch, tmp_path)
@@ -236,18 +397,21 @@ def test_a_fan_out_of_closed_children_costs_one_attempt(
     file_rig.sink.close()
     engine.target.close()
     fan_out = MultiSink(file_rig.sink, engine.outer)
-    count = EmitCount(monkeypatch, MultiSink)
+    emits = calls_to(MultiSink.emit)
     ok, failed = _drain(fan_out)
-    assert count.calls == 1
+    assert emits() == 1
     assert not ok and failed == 1
 
 
 @pytest.mark.parametrize("closed_first", [True, False], ids=["closed-first", "closed-last"])
 def test_a_fan_out_with_one_curable_child_keeps_the_resend(
-    closed_first: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    closed_first: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
 ) -> None:
     """A closed child must not stop the resend a sibling's transient failure is owed."""
-    monkeypatch.setattr(_engine, "cycle_backoff", lambda attempt: 0.0)
+    _no_backoff(monkeypatch)
     file_rig = sink_rigs.RIGS["FileSink"](monkeypatch, tmp_path)
     file_rig.sink.close()
     transient = ConnectionError("refused")
@@ -256,18 +420,25 @@ def test_a_fan_out_with_one_curable_child_keeps_the_resend(
     with pytest.raises(ConnectionError) as raised:
         fan_out.emit(_batch(1))
     assert raised.value is transient
-    count = EmitCount(monkeypatch, MultiSink)
+    emits = calls_to(MultiSink.emit)
     ok, failed = _drain(fan_out)
-    assert count.calls == RETRIES + 1
+    assert emits() == RETRIES + 1
     assert not ok and failed == 1
 
 
-def test_a_fan_out_of_final_refusals_raises_the_first_childs() -> None:
-    """When every raise is final the first child's is re-raised, by identity, as before."""
-    first, second = final_refusal("A: the sink is closed"), final_refusal("B: the sink is closed")
+def test_a_fan_out_of_final_refusals_raises_the_first_childs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When every raise is final the first child's is re-raised, as before."""
+    first = sink_rigs.RIGS["FileSink"](monkeypatch, tmp_path).sink
+    (tmp_path / "second").mkdir()
+    second = sink_rigs.RIGS["RotatingFileSink"](monkeypatch, tmp_path / "second").sink
+    first.close()
+    second.close()
     with pytest.raises(SinkDeliveryError) as raised:
-        MultiSink(_Raises(first), _Raises(second)).emit(_batch(1))
-    assert raised.value is first
+        MultiSink(first, second).emit(_batch(1))
+    assert str(raised.value) == EMIT_ONLY_CLOSED["FileSink"](1)
+    assert is_final_refusal(raised.value)
 
 
 class _Hostile(Exception):
@@ -277,11 +448,24 @@ class _Hostile(Exception):
         raise RuntimeError(name)
 
 
+def _raise(error: Exception) -> None:
+    raise error
+
+
+def _caught(error: Exception) -> Exception:
+    """Raises ``error`` through a frame of this module and returns it as its catcher holds it."""
+    try:
+        _raise(error)
+    except Exception as err:
+        return err
+    raise AssertionError("not raised")
+
+
 def test_the_mark_is_read_only_from_an_exact_marked_sink_delivery_error() -> None:
     """Total, and narrow: a subclass, an unmarked instance and a hostile class are not final."""
     marked = final_refusal("X: the sink is closed")
     assert type(marked) is SinkDeliveryError and str(marked) == "X: the sink is closed"
-    assert is_final_refusal(marked)
+    assert is_final_refusal(marked), "an error never raised has no foreign frame"
 
     class Sub(SinkDeliveryError):
         pass
@@ -291,7 +475,16 @@ def test_the_mark_is_read_only_from_an_exact_marked_sink_delivery_error() -> Non
     assert not is_final_refusal(sub)
     assert not is_final_refusal(SinkDeliveryError("X: the sink is closed"))
     assert not is_final_refusal(_Hostile())
-    assert not is_final_refusal(delivery_error(sqlite3.OperationalError("x")) or ValueError())
+    assert not is_final_refusal(delivery_error(sqlite3.OperationalError("x")))
+
+
+def test_a_foreign_frame_below_the_catcher_makes_a_marked_error_resent() -> None:
+    """The catcher's own frame is skipped; any other frame outside the package is not."""
+    assert not is_final_refusal(_caught(final_refusal("X: the sink is closed")))
+    try:
+        raise final_refusal("X: the sink is closed")
+    except SinkDeliveryError as err:
+        assert is_final_refusal(err), "the catcher's own frame counted as a carrier"
 
 
 def section_problems(source: str) -> list[str]:

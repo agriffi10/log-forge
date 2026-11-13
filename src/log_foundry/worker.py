@@ -1844,12 +1844,14 @@ class Worker:
         that is closed or closing, or a forked child's ``SQLiteSink`` or ``NATSSink``, raises the
         error :func:`~log_foundry.sinks._refusal.final_refusal` built, and resending it cannot
         succeed: it only cost the batch ``max_retries`` backoff waits, measured at 17.3 s for a
-        forked child's ``flush()`` over 2000 ``@trace`` calls, 4 ``emit`` calls a batch. Such a
+        forked child's ``flush()`` over 2000 ``@trace`` calls, 4 ``emit`` calls a batch, at
+        ``2ff9de9e`` (#342). Such a
         batch moves ``failed_batches`` once and writes the abandoned line with the attempts it
         actually made, as an exhausted batch does and as an engine sink's ``REJECTED`` run
         already did. Any other exception, a third-party sink's ``SinkDeliveryError`` included,
-        keeps the 1.x resend: the mark is private, so the ``emit`` contract for a sink of the
-        caller's own is unchanged.
+        keeps the 1.x resend, and so does a shipped sink's final refusal that a sink of the
+        caller's own caught and re-raised, since its frame is then in the traceback: the mark is
+        private, so the ``emit`` contract for a sink of the caller's own is unchanged.
 
         ``max_retries`` is floored at zero so the loop always makes at least one attempt: a
         negative value otherwise skipped the emit entirely and discarded the batch with no

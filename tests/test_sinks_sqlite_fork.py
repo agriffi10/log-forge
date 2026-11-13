@@ -127,19 +127,25 @@ def test_a_forked_childs_traced_batch_costs_one_emit_call_not_a_resend_each(
 
     The refusal is final (``sinks/_refusal.py``), so each batch the child's worker abandons cost
     one ``emit``. Before, every batch cost ``max_retries + 1`` calls and their backoff waits: 2000
-    ``@trace`` calls took 17.3 s to ``flush()``, about 85 ms a batch.
+    ``@trace`` calls took 17.3 s to ``flush()``, about 85 ms a batch, at ``2ff9de9e`` (#342).
+    The calls are counted through ``sys.monitoring``, since a wrapper around ``emit`` would put a
+    frame of this module in the refusal's traceback and so make it a resent one.
     """
     _, read = inherited
 
     def work() -> str:
         calls = [0]
-        original = SQLiteSink.emit
+        monitoring = sys.monitoring
+        tool = next(t for t in range(6) if monitoring.get_tool(t) is None)
+        monitoring.use_tool_id(tool, "sqlite-fork-emits")
+        code = SQLiteSink.emit.__code__
 
-        def counted(self: SQLiteSink, batch: list[dict[str, object]]) -> None:
-            calls[0] += 1
-            original(self, batch)
+        def started(started_code: object, offset: int) -> None:
+            if started_code is code:
+                calls[0] += 1
 
-        SQLiteSink.emit = counted  # type: ignore[method-assign]
+        monitoring.register_callback(tool, monitoring.events.PY_START, started)
+        monitoring.set_local_events(tool, code, monitoring.events.PY_START)
 
         @log_foundry.trace
         def step() -> None:

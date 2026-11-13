@@ -1761,7 +1761,7 @@ class NATSSink:
             try:
                 self._run(self._flush_on_loop(), self.publish_timeout + CALL_SLACK)
             except _LoopWedgedError as err:
-                raise SinkDeliveryError(
+                raise final_refusal(
                     f"NATSSink cannot flush: no answer within {self.publish_timeout + CALL_SLACK}s,"
                     " the loop is wedged and the sink is now closed"
                 ) from err
