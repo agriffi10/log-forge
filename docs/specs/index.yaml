@@ -539,7 +539,7 @@ specs:
   - id: "SPEC-081"
     title: "Ownership Record: Pin Only What the Library Holds, and Mark the Heap When a Child's Marking Trips"
     description: "Bounds the ownership record to the sinks the library still holds, so superseded sinks are collected and a long-lived process's forked children stop tripping the marking ceiling, and makes a child whose marking trips mark the inherited sinks on its heap, so a parent's sink the child hands over again is never closed."
-    spec_status: "In Progress"
+    spec_status: "Completed"
     depends_on: ["SPEC-039", "SPEC-042", "SPEC-044", "SPEC-053", "SPEC-054", "SPEC-077", "SPEC-078", "SPEC-079"]
     arc: "stability-redesign"
     path: "docs/specs/SPEC-081-ownership-record-bounds-and-heap-marking.md"

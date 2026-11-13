@@ -683,31 +683,40 @@ decorated call ends
   hung permanently in `info()` on the application's own thread. `_fork.py` registers **one**
   `os.register_at_fork(after_in_child=…)` handler, whose order of work is the contract:
 
-  1. **Re-initialise every lock and event the library owns**, in two steps sharing one identity
-     memo (SPEC-079). First the package's **global** primitives, listed in one roster,
-     `_fork._GLOBAL_PRIMITIVES` — the runtime's state, stop, record and close-registry locks,
-     the config lock, the decorator's two and the console's — which `tests/test_fork_roster.py`
-     holds complete from a live sweep of every module global and an AST scan of every class
-     that assigns a primitive to `self`. Then **one walk from the runtime's roots**, the
-     configured sink, the worker and the late worker: its repair frontier enters this package's
-     objects and sinks, reads a container one level deep and replaces every lock and event on
-     each package holder; its marking frontier follows what the repair frontier forwarded, a
-     third-party wrapper's namespace and the containers, first in first out under a visit
-     ceiling, then the records. A lock that was not held is replaced too — asking whether one is
-     held has no answer that is not itself a race — and the memo keeps two holders of one
-     primitive sharing it, which is what stops a sink's `log_foundry_stop_signal` drifting from
-     the worker's `_stop` and from the roster's `_state._stop`. Every read the walk makes is
-     static, so no attribute hook of a sink runs. A registry of live `SinkCounters` repairs
-     every engine sink's counters whatever holds them. An AST lint forbids building a primitive
-     anywhere the repair cannot write it back.
-  2. **Re-acquire what can be re-acquired.** A fork landing inside `emit`, after the write loop
+  1. **Pin the inherited record.** Every record entry whose sink is alive is held strongly before
+     anything else runs (SPEC-081). The record holds a sink the library no longer holds only
+     weakly, so without the pin a sink the child stops referencing could be collected there and
+     its finalizer could close the parent's transport. The pin takes no lock and its fault is
+     absorbed; it runs before the roster, and before the rebind of the published re-acquisition
+     list, which drops a list that may hold one.
+  2. **Re-initialise every lock and event the library owns**, in two steps sharing one identity memo
+     (SPEC-079). First the package's **global** primitives, listed in one roster,
+     `_fork._GLOBAL_PRIMITIVES` — the runtime's state, stop, record and close-registry locks, the
+     config and sink-change locks, the decorator's two and the console's — which
+     `tests/test_fork_roster.py` holds complete from a live sweep of every module global and an AST
+     scan of every class that assigns a primitive to `self`. Then **one walk from the runtime's
+     roots**, the configured sink, the worker and the late worker: its repair frontier enters this
+     package's objects and sinks, reads a container one level deep and replaces every lock and event
+     on each package holder; its marking frontier follows what the repair frontier forwarded, a
+     third-party wrapper's namespace and the containers, first in first out under a visit ceiling,
+     then the record's live entries other than a closed package sink; a trip marks the inherited
+     sinks on the heap instead (SPEC-081). A closed package sink here means an instance of a shipped
+     class exactly (`_fork._defined_here(type(sink))`), never a subclass of one or of `Sink`, whose
+     `close()` is the caller's code. A lock that was not held is replaced too — asking whether one
+     is held has no answer that is not itself a race — and the memo keeps two holders of one
+     primitive sharing it, which is what stops a sink's `log_foundry_stop_signal` drifting from the
+     worker's `_stop` and from the roster's `_state._stop`. Every read the walk makes is static, so
+     no attribute hook of a sink runs. A registry of live `SinkCounters` repairs every engine sink's
+     counters whatever holds them. An AST lint forbids building a primitive anywhere the repair
+     cannot write it back.
+  3. **Re-acquire what can be re-acquired.** A fork landing inside `emit`, after the write loop
      and before the flush, leaves both processes holding the same pending bytes; the child
      strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
      optional `reacquire_after_fork()` hook `sinks/base.py` documents (§8). The name says the
      larger half (SPEC-042 FR-005): a sink that returns from it has claimed the transport as
      **this process's own**, which is what makes releasing it safe later. Which hooks returned
      is published, not acted on — ownership is `_lifecycle`'s.
-  3. **Run the registered handlers**, in order: the reclaim of every sink whose hook returned,
+  4. **Run the registered handlers**, in order: the reclaim of every sink whose hook returned,
      the clearing of what no thread will finish (in-flight closes, the token sets, the
      no-worker shutdown count and the late worker, then a re-settle of the stored state), the
      adoption of a `sink_factory` (FR-006 of SPEC-079), and the worker rebuild. The worker is rebuilt **in place** with a fresh
@@ -1203,6 +1212,13 @@ close it.
   degrades to a leaked handle; the repair frontier reads one level and has no visit cap.
   `tests/test_sink_ownership.py::test_a_runaway_container_trips_the_ceiling_and_refuses_everything`
   runs it in a real child.
+
+  > **Superseded in part by SPEC-081.** A trip no longer degrades to a leaked handle by refusing
+  > every unrecorded sink: the child marks the sink-shaped objects on its inherited heap instead
+  > and carries on as a normal child, and only a heap scan that raises or meets a frozen heap, or a
+  > walk that raises, leaves it refusing every unrecorded sink and every `sink=` the library did not
+  > build. The same test now reads the flag clear and the unrecorded sink still refused. Decision:
+  > `docs/decisions/sink-lifecycle/` (*A process releases only a transport it acquired here*).
 
 - ~~**An empty `auth` token or pair is accepted, and sends an empty credential**~~ (HTTP auth fix's
   frame-2 review; invariant 13) → **closed by the 1.2.0 follow-up fix (no spec)**, by refusal, at
@@ -1984,8 +2000,10 @@ and a third copy is a fork with no merge.
     (SPEC-079). A third-party wrapper that keeps `self._emit = file_sink.emit`, a closure cell or
     a `functools.partial` holds the sink where no reading walk follows: descending into callables
     routinely escapes into application state through a callback's closure or a bound method's
-    `self`, which would trip the ceiling and refuse every unrecorded sink in every child. Hand the
-    library the sink itself, or build it in the worker process with `sink_factory=`.
+    `self`, which would trip the ceiling in every child and make each one pay for a scan of its
+    whole heap, and refuse every inherited sink it finds there (the bounded record's residual 6,
+    below). Hand the library the sink itself, or build it in the worker process with
+    `sink_factory=`.
   - **The converse costs a mixed-base class its foreign attributes.** Ownership is keyed on the
     whole MRO, because subclassing a shipped sink is a documented extension point and a
     defining-module test walked straight past a `_lock` that `FileSink.__init__` built — measured,
@@ -2021,13 +2039,18 @@ and a third copy is a fork with no merge.
   deeper than `_LOOP_CEILING` visits. The rejected runtime re-entry guard would catch them at a cost on every
   wrapper call (`docs/decisions/sink-lifecycle/`).
 
-- **After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink
+- ~~**After a tripped marking ceiling, a child that re-configures an unrecorded inherited sink
   owns it and closes it** (SPEC-042, SPEC-079). A marking that trips `_MARKING_CEILING` sets
   `_marking_failed`, which refuses the close of every sink that stays unrecorded. But a child
   that hands such a sink to `configure()` again — a bare re-hand, with the parent having held it
   only inside a third-party wrapper the tripped marking never reached — has `stamp` record it as
   the child's own, and the child's `shutdown()` then closes the parent's transport. Measured
-  identically at `9b238733` and at SPEC-079's head; the fix is work of its own.
+  identically at `9b238733` and at SPEC-079's head; the fix is work of its own.~~ → **closed by
+  SPEC-081.** A tripped child gives every sink-shaped object on its inherited heap that has no
+  live entry a `_FOREIGN` one, and refuses the parent's sink re-handed bare, in a `MultiSink` or in
+  a `FilteringSink`. Where that scan raises or meets a frozen heap, or the walk itself raises,
+  `stamp` records as `_FOREIGN` every sink that it is handed with no live entry, unless the
+  library built it (the bounded record's residuals 3 and 4, below).
 
 - **A sink behind a `weakref.proxy` configured as the sink is not repaired in a forked child**
   (SPEC-079). FR-005 accepts a `weakref.proxy` as `sink=`, and the child records it, so it is
@@ -2044,7 +2067,7 @@ and a third copy is a fork with no merge.
   which the inherited, parent-owned wrapper chain never releases: a leaked handle per child.
   Configure `sink_factory=` itself rather than wrapping what it installs.
 
-- **The ownership record grows for the life of the process, and a forked child walks all of it**
+- ~~**The ownership record grows for the life of the process, and a forked child walks all of it**
   (SPEC-079). `_state._owned` holds a strong reference to every sink the process ever stamped
   (SPEC-042 FR-001), and a child's marking frontier seeds from every one of those references,
   bounded by `_MARKING_CEILING`. A long-lived process that reconfigures with buffering sinks and
@@ -2056,7 +2079,11 @@ and a third copy is a fork with no merge.
   `test_a_child_of_a_process_that_built_no_worker_is_silent` failed; the suite's own reset now
   clears the record between tests. The remedy — the record seeds not descending into a
   superseded sink's caller data, or released sinks pruned from the record — changes SPEC-042's
-  settled strong-reference record and is work of its own.
+  settled strong-reference record and is work of its own.~~ → **closed by SPEC-081.** An entry
+  holds its sink strongly only while the library holds it, and weakly once it is closed or
+  superseded, so a superseded sink is collected when the application drops it and its dead entry
+  is pruned. A child's record seeds leave out a closed sink of a shipped class exactly, which is
+  what the closed, superseded `MemorySink`s were. The suite's reset stays, as test isolation.
 
 - **A forked child releases only a transport it acquired in *this* process, and what that
   cannot decide is listed here** (SPEC-042). The record is stamped when the library is handed a
@@ -2104,14 +2131,17 @@ and a third copy is a fork with no merge.
      tests sink-shaped before container-shaped, so an owned *non-sink* container subclass, and a
      container-subclass sink's own members, lose reach there. Neither is a destructive close, and
      the child's marking walk compensates.
-  7. **`_state._marking_failed` catches an escaping fault and the visit ceiling, not a partial walk.**
-     Every read inside the walk is absorbed a level down in `_fork`, so a walk that quietly
-     reached less than everything raises nothing and leaves the flag clear; the sinks it missed
-     are unrecorded rather than marked.
-  8. **The record never shrinks.** One entry per sink ever handed to the library, each pinned by
-     a strong reference — required, because an `id` is reusable once its object dies and a
-     collected sink closes itself. Startup-scale in an application, since `configure()` is a
-     startup call.
+  7. **`_state._marking_failed` catches an escaping fault and a failed heap scan, not a partial
+     walk.** It is set when the walk itself raises, or when the heap scan that a tripped visit
+     ceiling falls back to raises or meets a frozen heap (SPEC-081); a trip whose scan succeeds
+     leaves it clear. Every read inside the walk is absorbed a level down in `_fork`, so a walk
+     that quietly reached less than everything raises nothing and leaves the flag clear, and runs
+     no heap scan; the sinks it missed are unrecorded rather than marked.
+  8. **The record is bounded by what is alive, not by what was handed over.** An entry pins its
+     sink only while the library holds it (SPEC-081), and a dead entry answers for nothing and is
+     pruned, so the record follows the sinks still alive. What that leaves — a sink that cannot be
+     weakly referenced, a sink the capture did not reach once its holder is gone, and the rest —
+     is the bounded record's eight residuals, the next item.
 
   What a refused close costs, measured from the shipped `close()` bodies: `KafkaSink` and
   `GooglePubSubSink` do not deliver their buffer, `NATSSink` does not drain its loop, and
@@ -2126,6 +2156,65 @@ and a third copy is a fork with no merge.
   is belt and braces rather than a buffer. That qualifies what this roster measured from the close
   bodies alone. Its own population sweep then found three more: `SentrySink`, `LoggingSink`, and
   the three wrapper sinks, which forwarded no flush at all.
+
+- **The bounded ownership record leaves eight residuals** (SPEC-081). The record pins a sink
+  only while the library holds it, captures the sinks beneath one before it goes weak, reads a
+  dead entry as absent, is pinned first in a child, and falls back to the heap when a child's
+  marking trips. What that does not settle:
+
+  1. **A sink that cannot be weakly referenced keeps a strong entry.** The record grows by one
+     entry per such sink handed over or captured, as every entry grew before SPEC-081. A
+     `weakref.proxy` is one, whether configured or captured, but it pins only the proxy. No
+     shipped sink is one.
+  2. **What the capture does not reach stays unrecorded once its holder is gone.** A holder the
+     application keeps is a seed, so this applies only after the holder is collected: the rest of
+     a capture that tripped `_MARKING_CEILING` or raised, which its line names; a sink more than
+     one container level below a third-party holder; a sink reachable only through a bound
+     method, a closure cell or a `functools.partial`; a sink placed beneath a superseded sink
+     after that sink was demoted; and, beneath a holder whose class subclasses `Sink` or a shipped
+     sink, anything past the package reach, since `_fork._is_owned` accepts such a holder and the
+     capture enters it as it enters a package holder, never with the third-party reach. While the
+     application keeps such a holder it is still a seed, since only an exact shipped class is left
+     out of the seeds. If the application keeps such a sink and drops the holder, a child that
+     hands the sink over again claims it, as it would a sink never handed over at all (item 1 of
+     the list above).
+  3. **The last resort leaves library-built graphs half-owned and fresh `sink=` sinks unclosed.**
+     In a child whose heap scan failed or whose walk raised, a fresh `sink=` is never closed, with
+     the costs the refused-close paragraph above lists. A factory that returns a wrapper has only
+     the root recorded as the child's, so the wrapper's members are refused their close. Such a
+     child also keeps every `sink=` that it is handed strongly, as a `_FOREIGN` entry, so its record
+     grows by one entry per such sink for its life; that is the safe direction, since a strong
+     entry is never answered for another object.
+  4. **A frozen heap sends a tripped child to the last resort.** A gunicorn-style prefork server
+     that calls `gc.freeze()` and whose children trip the marking gets the last resort in every
+     such child, so a fresh `sink=` there is not closed. Use `sink_factory=`, which the last
+     resort still closes.
+  5. **A C-extension sink type without GC support** is not in `gc.get_objects()`. It stays
+     unrecorded in a scanning child, as in a normal child whose walk did not reach it.
+  6. **A scanning child pays in refusals and in memory.** An inherited sink the parent never
+     handed over is refused rather than closed. Garbage sinks not yet collected at the fork are
+     pinned. Every page holding an inherited GC-tracked object is copied, because taking a
+     reference writes its count — reasoned from how CPython stores reference counts, not
+     measured.
+  7. **A finalizer that runs under another library lock can still hang.** A collection that fires
+     while the thread holds `_state._lock`, `_config_lock` or the close registry's lock can run a
+     finalizer that forwards into a library wrapper's `close()`, and that can block on the lock
+     the thread holds. This was already possible for a sink never handed over; SPEC-081 widens it
+     to superseded ones. It is narrow: no shipped sink defines `__del__`, and a plain third-party
+     sink's `close()` takes no library lock. The library's own reference drops inside those
+     sections are not audited for the same effect. A finalizer under `_owned_lock` itself can
+     still deadlock two threads: one that forwards a close whose entry carries a stop-signal hand
+     a worker build declined reaches `_hand_after_close`, which takes `_state._lock` with
+     `_owned_lock` held, the reverse of the `_state._lock` then `_owned_lock` that `_swap_sink`'s
+     first section takes through `releasable`. It needs that declined-hand mark on the very sink
+     being finalized.
+  8. **Another library's at-fork handlers run before the pin.** An
+     `os.register_at_fork(after_in_child=…)` handler registered before log-foundry's runs first.
+     If it drops the child's last reference to an inherited sink whose entry was weak, that sink
+     is collected before the pin runs. A collection the child's own first allocations trigger can
+     do the same to an inherited sink that was already unreachable cyclic garbage in the parent,
+     before the pin reaches it. The repair is never wrapped in `gc.disable()` (the order-of-work
+     decision), so this is stated, not closed.
 
 - **A sink shared across a fork is shared, and both processes act on it** (SPEC-039 FR-005
   AC-1). Beyond the buffer discard the library neither clones nor re-opens the inherited sink,
@@ -2236,9 +2325,12 @@ and a third copy is a fork with no merge.
   first looks. A connection reachable only from a *non-surviving thread's* frame is safe: CPython
   does not clear those frames in the child, so the reference leaks rather than becoming
   collectable (measured 0/20, against 13/20 for the same connection made garbage on the main
-  thread). A sink the library was handed is safe for a second, independent reason — `_state._owned` in
-  `_lifecycle.py` holds a strong reference to every one, superseded sinks included, and never
-  shrinks — so a live `SQLiteSink` is never finalized in a child while it *runs*. ~~That held at
+  thread). A sink the library was handed is safe for a second, independent reason — a forked
+  child pins every entry of `_state._owned` whose sink was alive at the fork before anything else
+  runs (SPEC-081; until then the record held every sink strongly for the process's life) — so a
+  live `SQLiteSink` is never finalized in a child while it *runs*. One that was already cyclic
+  garbage in the parent can be collected before the pin reaches it (the bounded record's residual
+  8, above). ~~That held at
   the child's exit too~~ — it did not: interpreter finalization clears module globals and runs the
   cyclic collector, which finalized the inherited connection there, and a child of a process that
   had configured a `SQLiteSink` and logged died of `SIGSEGV` on a plain `sys.exit`, with no call

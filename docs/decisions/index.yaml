@@ -92,7 +92,7 @@ areas:
         status: "stable"
         path: "docs/decisions/pipeline/one-lifecycle-owner-the-bookkeeping-around-the-two-emit-paths-exists-once.md"
       - title: "Only the forked *child* is repaired, and its order of work is the contract"
-        fence: "the global-lock roster, then one walk from the runtime's roots, then inherited buffers, then the registered handlers — a lock re-initialised after a handler that takes it is a handler that hangs. `before` does not run for a C-level fork at all, and the repair is never wrapped in `gc.disable()`. (SPEC-039, SPEC-079; arch §9, §13)"
+        fence: "the inherited ownership record pinned first, then the global-lock roster, then one walk from the runtime's roots, then inherited buffers, then the registered handlers — a lock re-initialised after a handler that takes it is a handler that hangs. `before` does not run for a C-level fork at all, and the repair is never wrapped in `gc.disable()`. (SPEC-039, SPEC-079, SPEC-081; arch §9, §13)"
         status: "stable"
         path: "docs/decisions/pipeline/only-the-forked-child-is-repaired-and-its-order-of-work-is-the-contract.md"
       - title: "The close is once-only across both delivery paths; the `atexit` *registration* is not the thing being guarded"

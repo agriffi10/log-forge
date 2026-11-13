@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-081
 title: "Ownership Record: Pin Only What the Library Holds, and Mark the Heap When a Child's Marking Trips"
 description: "Bounds the ownership record to the sinks the library still holds, so superseded sinks are collected and a long-lived process's forked children stop tripping the marking ceiling, and makes a child whose marking trips mark the inherited sinks on its heap, so a parent's sink the child hands over again is never closed."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-039, SPEC-042, SPEC-044, SPEC-053, SPEC-054, SPEC-077, SPEC-078, SPEC-079]
 arc: stability-redesign
 arc_order: 12
@@ -908,3 +908,20 @@ docs/architecture.md, docs/invariants.md, docs/release-notes/v1.2.0.md
   - `Runtime._owned_epoch` is named `Runtime._owned_clock` (an entry keeps `epoch`), because
     `tests/test_worker_predicate_roster.py` files every site naming `_epoch` as a question about
     the worker, which the record's counter is not.
+- **Completed (2026-11-13, at `f8dc19a1`).** The code as built agrees with the text above; where
+  it says more, the code is the record:
+  - A re-hand that finds the sink's own live entry also clears `captured`, besides making the
+    entry strong, clearing `closed` and bumping its epoch.
+  - The re-pin's roots are `_delivering_sinks()`, and the closes in flight are read through
+    `_CloseRegistry.in_flight_ids()`, one acquisition of the registry's leaf with no other lock
+    held. `release` reads the entry's epoch through `_close_clock` before registering the close
+    and settles it through `_settle_close`, inside a nested `finally` after `_closes.finish`.
+  - `_capture` reads containers through `_read_members`, which `_bounded_children` now wraps and
+    which announces nothing, so a container that raises in the parent is announced under the
+    capture's own line rather than the marking's.
+  - The pin also runs before `_fork` rebinds `reacquired_in_child`, which drops a list that may
+    hold an inherited sink; a fault in it is absorbed with its own line and the repair goes on.
+  - FR-001's lock criterion asserts "not held by the entering thread" through stand-ins that
+    record which thread holds them, and the `id`-reuse tests build live ballast of the same types
+    first, because a sink alone in its allocator pool empties the pool when it dies and the next
+    build is then served from another.

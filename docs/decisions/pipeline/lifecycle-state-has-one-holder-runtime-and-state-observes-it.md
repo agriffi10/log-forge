@@ -65,7 +65,11 @@ registry's one, which changed no acquisition order, since they never nested. Fol
 `_lock` would deadlock `in_flight` and `held`, which are asked with `_lock` held, and closer
 threads discharge it without `_lock`. The order: `_lock`, then `_config_lock`, then `_owned_lock`;
 and `_lock` with `Worker._lock` and the registry's lock as leaves. Nothing acquires `_lock` beneath
-any of them.
+any of them, with one exception SPEC-081 made possible: `_owned_lock` is re-entrant, because a
+sink the record holds only weakly can be collected inside a record section and its finalizer can
+forward a close back into the record on that thread, and a close reached that way whose entry
+carries a declined stop-signal hand takes `_lock` under `_owned_lock` (`_hand_after_close`). Two
+threads can deadlock there; it is recorded in arch §13 as a residual rather than closed.
 
 **The token sets are discarded without the lock, and that departs from `python.md` §13 on
 purpose.** `_swap_sink` and `_shutdown_worker` each add their `_Operation` to `_swaps_running` or
@@ -103,6 +107,11 @@ the owed record outside `_CloseRegistry.arm`, `take` and `put_back`. (SPEC-077 F
 SPEC-078 FR-001 to FR-004)
 
 ## History
+
+### 2026-11-13
+
+- **Refined by SPEC-081**: `_owned_lock` is an `RLock`, and the lock order gains its one
+  exception, a finalizer that reaches `_hand_after_close` with `_owned_lock` held.
 
 ### 2026-11-10
 
