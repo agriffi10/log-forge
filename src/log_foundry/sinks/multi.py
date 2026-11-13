@@ -154,7 +154,7 @@ class MultiSink:
                     pending.count("_absorbed", len(batch))
                     if first_error is None:
                         first_error = err
-                    if first_curable is None and not is_final_refusal(err):
+                    if first_curable is None and not is_final_refusal(err, sink):
                         first_curable = err
                     _diag.absorbed(
                         "emitting to a MultiSink child", err, f"{type(sink).__name__} skipped"

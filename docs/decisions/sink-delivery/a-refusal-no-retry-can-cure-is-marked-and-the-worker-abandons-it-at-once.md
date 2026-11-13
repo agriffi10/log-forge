@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A refusal no retry can cure is marked, and the worker abandons it at once"
-description: "a shipped sink that is closed or closing, or a forked child's `SQLiteSink` or `NATSSink`, raises the `SinkDeliveryError` `sinks/_refusal.final_refusal` builds, exact in type and text and carrying a private instance mark; the worker abandons such a batch at the attempt that raised it, one `failed_batches` and the abandoned line with the attempts made, and `MultiSink` re-raises one only when every child's raise was one. It is final only while every frame below its catcher is the package's own; any other raise, a third-party sink's or a shipped refusal a sink of the caller's own re-raised, keeps the 1.x resend. (maintainer's choice, 2026-11-12)"
+description: "a shipped sink that is closed or closing, or a forked child's `SQLiteSink` or `NATSSink`, raises the `SinkDeliveryError` `sinks/_refusal.final_refusal` builds, exact in type and text and carrying a private instance mark; the worker abandons such a batch at the attempt that raised it, one `failed_batches` and the abandoned line with the attempts made, and `MultiSink` re-raises one only when every child's raise was one. It is final only while every frame below its catcher and every sink in the called graph is the package's own; any other raise, a third-party sink's or a shipped refusal that reached the worker through a sink of the caller's own, keeps the 1.x resend. (maintainer's choice, 2026-11-12)"
 ---
 
 **A refusal no retry can cure is marked, and the worker abandons it at once** — the worker re-sent
@@ -17,11 +17,14 @@ since its `REJECTED` verdict is final (SPEC-072).
 
 **The mechanism.** `sinks/_refusal.py` defines `final_refusal(message)`, which builds an exact
 `SinkDeliveryError` with the message given and sets a private attribute on the instance, and
-`is_final_refusal(err)`, true only for an exact `SinkDeliveryError` carrying it **and** whose
-traceback, below the catcher's own frame, passes through no module outside `log_foundry`. Every
+`is_final_refusal(err, sink)`, true only for an exact `SinkDeliveryError` carrying it, whose
+traceback below the catcher's own frame passes through no module outside `log_foundry`, **and**
+whose catcher called a sink graph that is the package's own (`_sink_arg.only_package_sinks`). Every
 closed-guard section's refusal (twelve sections at the time of writing), `GooglePubSubSink`'s and
 `NATSSink`'s own closed and closing refusals, `NATSSink`'s wedged-loop refusal on `emit` and on
-`flush`, which closes the sink, and the two forked-child refusals build their error through it. `Worker._emit`'s 1.x loop treats a final refusal
+`flush`, which closes the sink, and the two forked-child refusals build their error through it.
+The `flush()` refusals among them (`KafkaSink`, `GooglePubSubSink`, `NATSSink`) carry the mark for
+one rule's sake and nothing reads it there, since no caller retries a `flush`. `Worker._emit`'s 1.x loop treats a final refusal
 as it treats the last attempt: `failed_batches` moves once and the abandoned line names the attempts
 actually made, `batch abandoned after 1 emit attempts` when the first raised it, the wording an engine
 sink's `REJECTED` run already wrote. The orphan path makes one attempt anyway and is unchanged.
@@ -35,10 +38,22 @@ traceback, so the refusal is not final. The catcher's own frame, the first entry
 it is the one asking. On the shipped paths the chain holds the catcher's frame and the package's
 only — no `contextlib` frame for the guard's `with` — for a direct closed sink and one behind
 `MultiSink` or `TransformSink`. A subclass that overrides `emit` and calls `super().emit` is the
-caller's code too, and keeps the resend. **Rejected: deciding by the configured sink's type**
-(honour the mark when `type(worker.sink)` is a shipped class): a shipped wrapper over a caller's
-wrapper over a shipped sink would pass it, and the traceback names every carrier where the type
-names one.
+caller's code too, and keeps the resend.
+
+**The traceback cannot see a caller's sink that only forwards, so the receiver is checked too.**
+The second diff review found four shapes that choose where `emit` goes and return before the call,
+leaving no frame: a `__getattr__` proxy, `self.emit = inner.emit` rebound on a swap, a property
+returning the inner sink's bound method, and a subclass of a shipped sink that re-initialises
+itself and inherits `emit`. On each, 1.x's resend reached the fresh sink the caller had swapped in
+and the traceback test alone lost the batch. So `only_package_sinks(sink)` walks the graph the
+catcher called, statically through the package wrappers' forwarding positions as `loop_in` does,
+and requires every node's exact type to be defined in the package and none to hold an `emit` in
+its own instance `__dict__`. The two halves cover different carriers: the traceback, a caller's
+code that runs during the call (a re-raise, a `CallbackSink` callback, a `TransformSink`
+function); the receiver, a caller's object that only routed it. Every doubt — a `super`, a
+`weakref.proxy`, a graph past the walk's ceiling — answers "not final", which costs only the 1.x
+resend. **Rejected: the type of the configured sink alone** (`type(worker.sink)`): a shipped wrapper
+over a caller's proxy over a shipped sink passes it.
 
 **Nothing a caller sees changes but the count.** The type is exactly `SinkDeliveryError` and the
 message is today's, so `type(err) is SinkDeliveryError`, `str(err)` and every diagnostic naming the
@@ -73,7 +88,9 @@ holds every `with <...>.enter() as <name>:` section under `sinks/` to refusing t
 `final_refusal`, derived from the tree with a floor of twelve and a fixture corpus asserting each
 failure reason and a silent case; pins one `emit` call for a refused batch on every emit-only sink
 and on the forked `SQLiteSink`, and `max_retries + 1` for an unmarked, a dual-typed, a transient
-and a marked raise from a caller's frame; pins the replacing wrapper's delivered resend; pins the
+and a marked raise from a caller's frame; pins the replacing wrapper's delivered resend and the
+four frameless forwarding shapes' (and a `TransformSink` over one); holds `only_package_sinks` to a
+corpus of package and foreign graphs; pins the
 NATS closing, forked and wedged refusals and the two buffering sinks' flush refusals as final; and
 pins `MultiSink`'s choice both ways. It counts `emit` calls through `sys.monitoring`, since a
 counting wrapper would itself be a foreign frame. `tests/test_sinks_sqlite_fork.py` pins the measured
@@ -84,5 +101,8 @@ case under a real `os.fork`.
 ### 2026-11-12
 
 - **Settled.** The maintainer chose the private mark over putting the refusing sinks on the engine,
-  a public refusal type, or leaving the resend. The traceback test was added in the same change,
-  after the first diff review showed the mark alone carried through a caller's re-raise.
+  a public refusal type, or leaving the resend. Two provenance tests were added in the same
+  change: the traceback, after the first diff review showed the mark alone carried through a
+  caller's re-raise, and the receiver graph, after the second showed the traceback alone missed a
+  caller's sink that forwards `emit` by attribute. The same class of defect twice is why the
+  second answer is a structural check over the graph rather than another frame test.

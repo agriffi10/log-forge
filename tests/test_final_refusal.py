@@ -33,8 +33,10 @@ from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._refusal import final_refusal, is_final_refusal
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.file import FileSink
+from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from log_foundry.sinks.nats import NATSSink, _LoopWedgedError
+from log_foundry.sinks.transform import TransformSink
 from log_foundry.worker import Worker
 from test_sink_post_close import EMIT_ONLY_CLOSED, ENGINE_CLOSED, Built, _hold_a_section
 
@@ -287,7 +289,7 @@ def test_every_emit_only_closed_refusal_is_final_and_still_exactly_sink_delivery
     with pytest.raises(SinkDeliveryError) as raised:
         rig.sink.emit(_batch(2))
     assert type(raised.value) is SinkDeliveryError
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, rig.sink)
     if name in EMIT_ONLY_CLOSED:
         assert str(raised.value) == EMIT_ONLY_CLOSED[name](2)
 
@@ -301,7 +303,7 @@ def test_a_closed_buffering_sinks_flush_refusal_is_final(
     rig.sink.close()
     with pytest.raises(SinkDeliveryError) as raised:
         rig.sink.flush()
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, rig.sink)
     assert str(raised.value) == f"{name} cannot flush: the sink is closed"
 
 
@@ -317,7 +319,7 @@ def test_a_forked_sqlite_sinks_refusal_is_final(
             rig.sink.emit(_batch(1))
     finally:
         rig.sink._pid = own_pid
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, rig.sink)
     assert "a forked child acquired no connection" in str(raised.value)
 
 
@@ -345,7 +347,7 @@ def test_a_closed_or_closing_engine_sinks_emit_raises_a_final_refusal(
             leave.set()
             closer.join(LIMIT)
     assert type(raised.value) is SinkDeliveryError
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, built.outer)
 
 
 def test_a_forked_nats_sinks_emit_raises_a_final_refusal(
@@ -360,7 +362,7 @@ def test_a_forked_nats_sinks_emit_raises_a_final_refusal(
             emit_via_deliver(built.target, _batch(1))
     finally:
         built.target._pid = own_pid
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, built.target)
     assert "a forked child acquired no connection" in str(raised.value)
 
 
@@ -382,7 +384,7 @@ def test_a_wedged_nats_loops_refusal_is_final(
             emit_via_deliver(sink, _batch(1))
         else:
             sink.flush()
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, sink)
     assert "the loop is wedged and the sink is now closed" in str(raised.value)
 
 
@@ -435,10 +437,11 @@ def test_a_fan_out_of_final_refusals_raises_the_first_childs(
     second = sink_rigs.RIGS["RotatingFileSink"](monkeypatch, tmp_path / "second").sink
     first.close()
     second.close()
+    fan_out = MultiSink(first, second)
     with pytest.raises(SinkDeliveryError) as raised:
-        MultiSink(first, second).emit(_batch(1))
+        fan_out.emit(_batch(1))
     assert str(raised.value) == EMIT_ONLY_CLOSED["FileSink"](1)
-    assert is_final_refusal(raised.value)
+    assert is_final_refusal(raised.value, fan_out)
 
 
 class _Hostile(Exception):
@@ -465,26 +468,146 @@ def test_the_mark_is_read_only_from_an_exact_marked_sink_delivery_error() -> Non
     """Total, and narrow: a subclass, an unmarked instance and a hostile class are not final."""
     marked = final_refusal("X: the sink is closed")
     assert type(marked) is SinkDeliveryError and str(marked) == "X: the sink is closed"
-    assert is_final_refusal(marked), "an error never raised has no foreign frame"
+    assert is_final_refusal(marked, MemorySink()), "an error never raised has no foreign frame"
 
     class Sub(SinkDeliveryError):
         pass
 
     sub = Sub("x")
     vars(sub).update(vars(marked))
-    assert not is_final_refusal(sub)
-    assert not is_final_refusal(SinkDeliveryError("X: the sink is closed"))
-    assert not is_final_refusal(_Hostile())
-    assert not is_final_refusal(delivery_error(sqlite3.OperationalError("x")))
+    assert not is_final_refusal(sub, MemorySink())
+    assert not is_final_refusal(SinkDeliveryError("X: the sink is closed"), MemorySink())
+    assert not is_final_refusal(_Hostile(), MemorySink())
+    assert not is_final_refusal(
+        delivery_error(sqlite3.OperationalError("x")), MemorySink()
+    )
 
 
 def test_a_foreign_frame_below_the_catcher_makes_a_marked_error_resent() -> None:
     """The catcher's own frame is skipped; any other frame outside the package is not."""
-    assert not is_final_refusal(_caught(final_refusal("X: the sink is closed")))
+    assert not is_final_refusal(_caught(final_refusal("X: the sink is closed")), MemorySink())
     try:
         raise final_refusal("X: the sink is closed")
     except SinkDeliveryError as err:
-        assert is_final_refusal(err), "the catcher's own frame counted as a carrier"
+        assert is_final_refusal(err, MemorySink()), "the catcher's own frame counted as a carrier"
+
+
+class _Proxy:
+    """Forwards every attribute to the current inner sink: ``emit`` leaves no frame of its own."""
+
+    def __init__(self, inner: FileSink) -> None:
+        self.inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+class _Rebinding:
+    """Holds the inner sink's bound ``emit`` as its own, rebinding it on a swap."""
+
+    def __init__(self, inner: FileSink) -> None:
+        self.inner = inner
+        self.emit = inner.emit
+
+    def swap(self, inner: FileSink) -> None:
+        self.inner = inner
+        self.emit = inner.emit
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+class _Property:
+    """Answers ``emit`` through a property that returns the current inner sink's bound method."""
+
+    def __init__(self, inner: FileSink) -> None:
+        self.inner = inner
+
+    @property
+    def emit(self) -> Callable[[list[dict[str, object]]], None]:
+        return self.inner.emit
+
+    def close(self) -> None:
+        self.inner.close()
+
+
+class _Reopening(FileSink):
+    """A ``FileSink`` of the caller's own that re-initialises itself, inheriting ``emit``."""
+
+    def reopen(self, path: str) -> None:
+        self.close()
+        FileSink.__init__(self, path)
+
+
+@pytest.mark.parametrize("shape", ["getattr", "rebound", "property", "transform-over-getattr", "subclass"])
+def test_a_callers_sink_that_forwards_emit_without_a_frame_keeps_the_resend(
+    shape: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The receiver half: a caller's object chose where ``emit`` went, so the refusal is resent.
+
+    The inner ``FileSink`` is closed; the first backoff swaps a fresh one in, as a caller's
+    self-healing sink would, and the worker's second attempt delivers both events.
+    """
+    old, new = tmp_path / "old.ndjson", tmp_path / "new.ndjson"
+    closed = _Reopening(str(old)) if shape == "subclass" else FileSink(str(old))
+    closed.close()
+    fresh: list[FileSink] = []
+    holder: Any
+    if shape == "subclass":
+        holder = closed
+    elif shape == "rebound":
+        holder = _Rebinding(closed)
+    elif shape == "property":
+        holder = _Property(closed)
+    else:
+        holder = _Proxy(closed)
+
+    def swap_in_the_backoff(attempt: int) -> float:
+        if not fresh:
+            if shape == "subclass":
+                holder.reopen(str(new))
+                fresh.append(holder)
+            else:
+                replacement = FileSink(str(new))
+                fresh.append(replacement)
+                if shape == "rebound":
+                    holder.swap(replacement)
+                else:
+                    holder.inner = replacement
+        return 0.0
+
+    monkeypatch.setattr(_engine, "cycle_backoff", swap_in_the_backoff)
+    sink = TransformSink(holder, lambda event: event) if shape == "transform-over-getattr" else holder
+    try:
+        ok, failed = _drain(sink)
+    finally:
+        for opened in fresh:
+            opened.close()
+    assert ok and failed == 0, f"{shape}: the resend the caller arranged was not made"
+    assert len(new.read_text().splitlines()) == 2
+
+
+def test_only_package_sinks_reads_the_graph_without_running_it(tmp_path: Path) -> None:
+    """The receiver test's own corpus: package graphs pass; any foreign or patched node fails."""
+    from log_foundry._sink_arg import only_package_sinks
+
+    plain = FileSink(str(tmp_path / "a.ndjson"))
+    try:
+        assert only_package_sinks(plain)
+        assert only_package_sinks(MultiSink(plain, MemorySink()))
+        assert only_package_sinks(TransformSink(MultiSink(plain), lambda event: event))
+        assert not only_package_sinks(_Proxy(plain))
+        assert not only_package_sinks(MultiSink(MemorySink(), _Proxy(plain)))
+        assert not only_package_sinks(TransformSink(_Proxy(plain), lambda event: event))
+        subclass = _Reopening(str(tmp_path / "b.ndjson"))
+        assert not only_package_sinks(subclass)
+        subclass.close()
+        patched = MemorySink()
+        patched.emit = plain.emit  # type: ignore[method-assign]
+        assert not only_package_sinks(patched)
+        assert not only_package_sinks(MultiSink(patched))
+    finally:
+        plain.close()
 
 
 def section_problems(source: str) -> list[str]:

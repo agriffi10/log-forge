@@ -359,8 +359,9 @@ that fails moves no sink counter and the adapter raises that error by identity; 
 raises it. That error, and a forked child's `SQLiteSink` or `NATSSink` refusal, is built by
 `sinks/_refusal.final_refusal`: exactly `SinkDeliveryError`, with a private mark the worker reads to
 abandon the batch at the attempt that raised it rather than resend it, since no retry can cure it —
-but only while no frame outside the package carried it, so a sink of the caller's own that
-re-raises it keeps the resend.
+but only while no frame outside the package carried it and the sink called is the package's own
+all the way down, so a sink of the caller's own that re-raises it or forwards `emit` to it keeps
+the resend.
 
 **A sink that offers `deliver` states the same promise per event** (SPEC-072): it returns a
 `Verdict` rather than raising, and the engine applies the rule to the run. A run **fails** when no

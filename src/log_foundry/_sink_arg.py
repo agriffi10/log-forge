@@ -278,6 +278,48 @@ def loop_in(root: object, *, back_to: object | None = None) -> object | None:
     return None
 
 
+def only_package_sinks(root: object) -> bool:
+    """Answers whether every sink the graph from ``root`` forwards to is exactly a package class.
+
+    The receiver half of a final refusal's provenance (``sinks/_refusal.is_final_refusal``). A
+    sink of the caller's own can choose where ``emit`` goes without leaving a frame in the
+    refusal's traceback — a ``__getattr__`` proxy, ``self.emit = inner.emit`` rebound on a swap,
+    a property returning the inner sink's bound method, or a subclass of a shipped sink that
+    re-initialises itself and inherits ``emit`` — and measured on each, the 1.x resend delivered
+    through the fresh destination the caller had swapped in. So the mark is honoured only when
+    no such object is on the path: every node, from ``root`` through the package wrappers'
+    forwarding positions (:func:`_forwards_to`), has an exact type defined in this package, and
+    none carries an ``emit`` in its own instance ``__dict__``.
+
+    The walk is static, as :func:`loop_in`'s is: no node's code runs. A ``super`` or a
+    ``weakref.proxy`` is not a package type, so either answers False, and so does a graph past
+    :data:`_LOOP_CEILING` visits. Every doubt answers False, which costs only the 1.x resend.
+
+    Args:
+      root: The sink whose ``emit`` the catcher called.
+
+    Returns:
+      True only when the whole forwarding graph is the package's own, untouched.
+
+    Raises:
+      None.
+    """
+    seen: set[int] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if len(seen) > _LOOP_CEILING or not _fork._defined_here(type(node)):
+            return False
+        own = _instance_dict(node)
+        if own is not None and any(type(key) is str and key == "emit" for key in dict.keys(own)):
+            return False
+        stack.extend(_forwards_to(node))
+    return True
+
+
 def require_sink(value: object, name: str, *, owner: object | None = None) -> None:
     """Refuses a sink argument that can never be a sink, or that would make a sink contain itself.
 

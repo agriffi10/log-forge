@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Final
 
+from log_foundry._sink_arg import only_package_sinks
 from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["final_refusal", "is_final_refusal"]
@@ -47,10 +48,10 @@ def final_refusal(message: str) -> SinkDeliveryError:
     return err
 
 
-def is_final_refusal(err: BaseException) -> bool:
+def is_final_refusal(err: BaseException, sink: object) -> bool:
     """Answers whether an exception is a final refusal that only the library's own code carried.
 
-    Two tests, both required. The error is exactly ``SinkDeliveryError`` carrying the mark
+    Three tests, all required. The error is exactly ``SinkDeliveryError`` carrying the mark
     :func:`final_refusal` sets: a subclass is never one, which keeps SPEC-069's dual-typed driver
     errors, a transient ``database is locked`` among them, on the worker's resend. And every frame
     of its traceback below the catcher's own, the first entry, down to the raise, belongs to a
@@ -63,15 +64,26 @@ def is_final_refusal(err: BaseException) -> bool:
     ``contextlib`` frame for the closed guard's ``with``: a direct closed sink, and one behind
     ``MultiSink`` or ``TransformSink``. An error never raised has no traceback and passes.
 
+    **And the sink the catcher called is the package's own, all the way down**
+    (:func:`~log_foundry._sink_arg.only_package_sinks`). The traceback alone cannot see a sink of
+    the caller's own that forwards ``emit`` by attribute — a ``__getattr__`` proxy, a rebound
+    ``self.emit``, a property, a re-initialising subclass that inherits ``emit`` — since that
+    forwarding returns before the call and leaves no frame; measured on all of them, 1.x's resend
+    reached the fresh sink the caller had swapped in. Each half covers what the other cannot: the
+    traceback a caller's code that runs during the call (a re-raise, a ``CallbackSink``
+    callback), the receiver a caller's object that only chose where the call went.
+
     Total by construction: the exact-type test runs first and cannot raise, so an exception of
     any other class, a hostile ``__getattribute__`` or ``__dict__`` included, is never read
     further, and a frame's ``__name__`` is compared only when it is exactly a ``str``.
 
     Args:
       err: The exception a sink's ``emit`` raised, as its catcher holds it.
+      sink: The sink whose ``emit`` the catcher called.
 
     Returns:
-      True only for an exact marked ``SinkDeliveryError`` raised and carried by this package.
+      True only for an exact marked ``SinkDeliveryError`` raised and carried by this package, from
+      a sink graph that is the package's own.
 
     Raises:
       None.
@@ -87,4 +99,4 @@ def is_final_refusal(err: BaseException) -> bool:
         ):
             return False
         frame = frame.tb_next
-    return True
+    return only_package_sinks(sink)
