@@ -6,6 +6,7 @@ import atexit
 import collections
 import contextlib
 import enum
+import gc
 import os
 import sys
 import threading
@@ -2032,13 +2033,24 @@ def _live_sinks() -> list[object]:
 
 
 def _record_seeds() -> list[object]:
-    """Returns the sinks the record pins, the marking frontier's second group of seeds.
+    """Returns the sinks the record holds, the marking frontier's second group of seeds.
 
-    Every sink in ``_state._closes.owed``, then every reference in ``_state._owned``, which are
-    the only handles the library holds that the live roots may not reach. ``_owned`` is the
-    load-bearing entry: it is the only one that reaches a sink held inside a **superseded**
-    wrapper — one ``configure()`` replaced, so it is no live target, while the transport beneath
-    it is still the parent's. Dropping it is a destructive close.
+    Every sink in ``_state._closes.owed``, then the sink of every entry in ``_state._owned``
+    whose sink is alive, which are the only handles the library holds that the live roots may not
+    reach. ``_owned`` is the load-bearing entry: it is the only one that reaches a sink held inside
+    a **superseded** wrapper — one ``configure()`` replaced, so it is no live target, while the
+    transport beneath it is still the parent's. Dropping it is a destructive close.
+
+    **A closed sink of a shipped class exactly is left out** (SPEC-081 FR-004). It released its
+    transport through the closed guard (SPEC-076), and what it held was stamped when it was handed
+    over, so walking it buys nothing — and walking every closed, superseded ``MemorySink``'s events
+    was the whole cost of a long-lived process's children tripping :data:`_MARKING_CEILING`. The
+    test is the exact class (``_fork._defined_here``), never ``_fork._is_owned``: a caller's
+    ``class Pool(Sink)`` or a subclass of a shipped sink satisfies that, while its ``close()`` is
+    the caller's code and may have closed nothing beneath it, so such a sink, closed and kept, is
+    still a seed — as a closed third-party sink is, whose transport may sit two containers down,
+    deeper than ``_capture`` reads. A sink the capture recorded was never closed, so it is a seed
+    while it lives.
 
     Args:
       None.
@@ -2051,8 +2063,12 @@ def _record_seeds() -> list[object]:
     """
     seeds: list[object] = list(_state._closes.owed.values())
     with _state._owned_lock:
-        alive = [entry.referent() for entry in list(_state._owned.values())]
-    seeds.extend(referent for referent in alive if referent is not None)
+        alive = [(entry.referent(), entry.closed) for entry in list(_state._owned.values())]
+    seeds.extend(
+        referent
+        for referent, closed in alive
+        if referent is not None and not (closed and _fork._defined_here(type(referent)))
+    )
     return seeds
 
 
@@ -2155,13 +2171,21 @@ def _repair_live_counters(repair: _fork._Repair) -> None:
         repair.repair(counters)
 
 
+_LAST_RESORT = (
+    "this child cannot tell what it inherited and will close only a sink the library built "
+    "itself; configure sink_factory= to build one"
+)
+"""The detail a child writes when it cannot tell what it inherited (SPEC-081 FR-006)."""
+
+
 def _walk_after_fork(repair: _fork._Repair) -> None:
     """The one walk a forked child runs: repair from the live roots, then mark (SPEC-079).
 
     Registered with ``_fork.register_walk`` and run by ``_fork._reinit_after_fork`` after the
-    roster of global primitives is replaced and before any handler, with the ``_Repair`` that
-    carries the roster's memo, so a sink's ``log_foundry_stop_signal`` and the worker's ``_stop``
-    stay the one ``Event`` the roster put at ``_state._stop``.
+    inherited record is pinned and the roster of global primitives is replaced, and before any
+    handler, with the ``_Repair`` that carries the roster's memo, so a sink's
+    ``log_foundry_stop_signal`` and the worker's ``_stop`` stay the one ``Event`` the roster put
+    at ``_state._stop``.
 
     1. **The repair frontier**: :func:`_reachable_sinks` from each of :func:`_live_roots`, with
        ``after_fork``, then every live ``SinkCounters`` from its registry.
@@ -2169,20 +2193,29 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
        :data:`_MARKING_CEILING` visits across both of its groups and by the same per-read bound on
        every container: first the forwarded seeds, whose package holders are hooked, then
        :func:`_record_seeds`, whose holders never are. The groups share the repair frontier's
-       ``seen`` set, so an object reachable from both is visited through the first. A trip sets
-       :attr:`Runtime._marking_failed` and writes a ``_diag.lost`` line, and costs nothing on the
-       repair frontier, which is already done.
-    3. **The record write**: each sink-shaped object either frontier recorded is written with
-       ``_owned.setdefault(id(sink), (_FOREIGN, sink))``, so a sink the parent stamped keeps the
-       parent's pid and every other recorded sink becomes unclaimable. What the setdefault
-       leaves alone is everything the walk did not record — a sink beyond a tripped ceiling, or
-       one no root or seed reaches — which stays unrecorded and is refused unless the walk
-       failed, in which case every unrecorded sink is refused anyway.
+       ``seen`` set, so an object reachable from both is visited through the first.
+    3. **The heap fallback** (SPEC-081 FR-005), when the marking frontier tripped the ceiling or
+       this child inherited :attr:`Runtime._marking_failed` from an ancestor whose own marking
+       failed: :func:`_mark_heap` adds the sink-shaped objects on the inherited heap to what the
+       frontiers recorded. It runs inside the at-fork walk, before any handler and before the
+       application resumes, so whatever it finds was inherited.
+    4. **The record write**: each object recorded above that has no live entry
+       (:func:`_entry_for`) gets a strong ``_FOREIGN`` one, so a sink the parent stamped keeps the
+       parent's pid, a dead entry on a reused ``id`` is overwritten, and a recorded sink with no
+       record becomes unclaimable. What no frontier and no scan recorded stays unrecorded, and is
+       refused unless this child can tell what it inherited.
+    5. **The verdict.** A scan that succeeded clears :attr:`Runtime._marking_failed` — a trip
+       writes one ``pending`` line saying the heap was marked instead, while a scan run only for
+       an inherited flag writes nothing. A scan that raised, or met a frozen heap
+       (``gc.freeze``), sets it and writes the last-resort line (FR-006).
+
+    It first resets the three once-only announcement flags, so each child announces for itself.
 
     **Marking is what makes "no record" terminal in a child** (SPEC-042 FR-001). Without it, a
     child that re-wraps an inherited object the parent never recorded stamps it with its own pid
     and then closes the parent's transport; the marking frontier keeps the reach that prevents it
-    for a sink behind a third-party wrapper and for one two containers down.
+    for a sink behind a third-party wrapper and for one two containers down, and the heap scan
+    keeps it past a trip.
 
     Args:
       repair: The fork's shared repair state.
@@ -2191,15 +2224,19 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
       None.
 
     Raises:
-      None. An escaping exception sets :attr:`Runtime._marking_failed`, after which every
-        unrecorded sink in this child is refused rather than trusted — a leaked handle instead
-        of a destructive close — and is announced. Every read below is static, so the outer guard
-        is for a fault in resolving the roots or the seeds. The hooks collected before a raise
-        still run, and ``_reclaim_after_fork`` runs either way.
+      None. An exception escaping the walk itself sets :attr:`Runtime._marking_failed` with no
+        heap scan and writes the last-resort line, after which this child refuses an unrecorded
+        sink rather than trusting it, and records a ``sink=`` it is handed as ``_FOREIGN``.
+        Every read below is static, so that guard is for a fault in resolving the roots or the
+        seeds. The hooks collected before a raise still run, and ``_reclaim_after_fork`` runs
+        either way.
     """
+    inherited_failed = _state._marking_failed
     _state._capture_announced = False
     _state._stamp_refusal_announced = False
     _state._repin_announced = False
+    scanned: bool | Exception | None = None
+    tripped = False
     try:
         found: list[object] = _live_sinks()
         for root in _live_roots():
@@ -2211,14 +2248,12 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
             queue = collections.deque(_record_seeds())
             _mark_frontier(queue, repair, found, hook=False, visits=visits)
         except _CeilingTripped:
-            _state._marking_failed = True
-            _diag.lost(
-                "object",
-                len(queue),
-                f"the walk marking a forked child's inherited sinks passed "
-                f"{_MARKING_CEILING} objects and stopped; this child will not close an "
-                f"inherited sink it has no record of unless it configures that sink itself",
-            )
+            tripped = True
+        if tripped or inherited_failed:
+            try:
+                scanned = _mark_heap(found)
+            except Exception as exc:
+                scanned = exc
         with _state._owned_lock:
             epoch = _state._owned_clock
             for inherited in found:
@@ -2226,12 +2261,76 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
                     _state._owned[id(inherited)] = _Entry(inherited, _FOREIGN, epoch, strong=True)
     except Exception as exc:
         _state._marking_failed = True
-        _diag.absorbed(
-            "marking the sinks a forked child inherited",
-            exc,
-            "this child will not close an inherited sink it has no record of unless it "
-            "configures that sink itself",
-        )
+        _diag.absorbed("marking the sinks a forked child inherited", exc, _LAST_RESORT)
+        return
+    if isinstance(scanned, Exception):
+        _state._marking_failed = True
+        _diag.absorbed("marking the sinks a forked child inherited", scanned, _LAST_RESORT)
+    elif scanned is False:
+        _state._marking_failed = True
+        _diag.pending(f"the heap is frozen (gc.freeze); {_LAST_RESORT}")
+    elif scanned is True:
+        _state._marking_failed = False
+        if tripped:
+            _diag.pending(
+                f"the walk marking a forked child's inherited sinks passed {_MARKING_CEILING} "
+                f"objects; this child marked the sink-shaped objects on its inherited heap "
+                f"instead, and closes none of them, even one it configures itself"
+            )
+
+
+def _heap_objects() -> list[object]:
+    """Returns every object the collector tracks, the seam a test makes raise (SPEC-081 FR-006).
+
+    Args:
+      None.
+
+    Returns:
+      ``gc.get_objects()``.
+
+    Raises:
+      Exception: Whatever the collector raises; :func:`_walk_after_fork` absorbs it.
+    """
+    return gc.get_objects()
+
+
+def _mark_heap(found: list[object]) -> bool:
+    """Adds the sink-shaped objects on a forked child's heap to what its walk found (FR-005).
+
+    Andrew's decision of 2026-11-12, for a child whose marking tripped :data:`_MARKING_CEILING`:
+    rather than trust nothing, it marks what it can see. Each object :func:`_heap_objects` returns
+    is judged only by the static predicates the walk already uses — skipped when its exact type is
+    a plain builtin, kept when ``_fork._sink_shaped`` or ``_fork._is_weak_proxy`` says so — so no
+    object's code runs, and a class is never kept. Every instance of a Python class is tracked by
+    the collector, so what it misses is a C-extension sink type without GC support, as the walk
+    does.
+
+    **A frozen heap is a failed scan.** After ``gc.freeze()`` the permanent generation is out of
+    ``gc.get_objects()``'s reach, so a scan there would miss every frozen sink; it reads nothing
+    and reports failure, sending the child to the last resort. Unfreezing to scan was rejected: it
+    would change the application's collector state behind its back.
+
+    The cost is paid once, in a scanning child only: measured about 2 ms to list 71k objects and
+    52 ms for 2.5M, then about 0.65 s per million to classify them, and a copy of every page holding
+    an inherited tracked object, since taking a reference writes its count.
+
+    Args:
+      found: What the walk recorded; each object kept is appended.
+
+    Returns:
+      ``True`` when the heap was read, ``False`` when it was frozen and nothing was read.
+
+    Raises:
+      Exception: Whatever :func:`_heap_objects` raises.
+    """
+    if gc.get_freeze_count() > 0:
+        return False
+    for candidate in _heap_objects():
+        if not _may_be_a_sink(candidate):
+            continue
+        if _fork._sink_shaped(candidate) or _fork._is_weak_proxy(candidate):
+            found.append(candidate)
+    return True
 
 
 def _reclaim_after_fork() -> None:
@@ -2239,7 +2338,7 @@ def _reclaim_after_fork() -> None:
 
     The half of the old marking handler that was not a walk (SPEC-042 FR-005): a sink that
     returned from ``reacquire_after_fork`` provably holds its own transport, so :func:`reclaim`
-    overrides whatever the walk's ``setdefault`` wrote. It runs after the marks are written and
+    overrides whatever the walk wrote. It runs after the marks are written and
     before any other handler, and it runs whether or not the walk failed.
 
     Args:
@@ -2292,7 +2391,14 @@ def reclaim(sink: object) -> None:
         _state._owned[id(sink)] = _Entry(sink, pid, _state._owned_clock, strong=True)
 
 
-def stamp(sink: object) -> None:
+_STAMP_REFUSAL = (
+    "configure(sink=...) in a forked child that could not tell what it inherited: this child "
+    "will not close that sink; configure sink_factory= so each process builds a sink of its own"
+)
+"""The detail of a last-resort child's first refused ``sink=`` (SPEC-081 FR-006)."""
+
+
+def stamp(sink: object, *, built: bool = False) -> None:
     """Records that this process acquired a sink, and everything reachable from it (FR-001).
 
     Called at the one moment ownership is knowable — when the library is *handed* a sink, by
@@ -2318,8 +2424,20 @@ def stamp(sink: object) -> None:
     sink-shaped there; left unrecorded, a forked child found it unrecorded with its walk
     succeeded and closed the parent's transport at its ``shutdown()``.
 
+    **In a child that cannot tell what it inherited** (:attr:`Runtime._marking_failed`), every
+    sink it finds that has no live entry is recorded ``_FOREIGN`` (SPEC-081 FR-006): such a sink
+    may be one the walk missed rather than one this process made, and recording it as this
+    process's would let the child close a parent's transport. The one exception is a root the
+    library built itself — ``built=True``, passed only by ``config._ensure_sink``,
+    ``config._change_sink`` for a ``sink_factory=`` wrapper, ``_FactorySink._checked`` and
+    :func:`_adopt_factory_after_fork` — which is recorded as this process's, so the lazy default
+    and a factory's sink are still closed. The first ``configure(sink=…)`` whose root is refused
+    this way writes one ``pending`` line per process. Where the flag is clear, ``built`` changes
+    nothing.
+
     Args:
       sink: The sink being installed, whose reachable graph is acquired with it.
+      built: Whether the library constructed this root, which a last-resort child still owns.
 
     Returns:
       None.
@@ -2334,18 +2452,28 @@ def stamp(sink: object) -> None:
     except Exception as exc:
         _diag.absorbed("recording which sinks this process owns", exc, "they will not be closed")
     pid = os.getpid()
+    refused = False
     with _state._owned_lock:
+        failed = _state._marking_failed
         _state._owned_clock += 1
         epoch = _state._owned_clock
-        for found in reachable:
+        for index, found in enumerate(reachable):
             entry = _entry_for(found)
             if entry is None:
-                _state._owned[id(found)] = _Entry(found, pid, epoch, strong=True)
+                own = not failed or (built and index == 0)
+                _state._owned[id(found)] = _Entry(
+                    found, pid if own else _FOREIGN, epoch, strong=True
+                )
+                refused = refused or (index == 0 and not own)
             elif entry.pid == pid:
                 entry.strong = found
                 entry.closed = False
                 entry.captured = False
                 entry.epoch = epoch
+    if refused:
+        announced, _state._stamp_refusal_announced = _state._stamp_refusal_announced, True
+        if not announced:
+            _diag.pending(_STAMP_REFUSAL)
 
 
 def releasable(sink: object, *, owner: object = None) -> bool:
@@ -2386,9 +2514,10 @@ def releasable(sink: object, *, owner: object = None) -> bool:
     record keeps that stamp and is refused on it. What the walk reached is therefore stamped or
     ``_FOREIGN``; what it missed stays unrecorded and is the §13 item 7 residual, not a case this
     closes — measured, a sink built before the fork behind a container that raises is unrecorded
-    in the child, releasable, and closed. If the walk could not finish *at all*,
-    :attr:`Runtime._marking_failed` withdraws the assumption entirely and every unrecorded sink is
-    refused.
+    in the child, releasable, and closed. A walk that tripped :data:`_MARKING_CEILING` marks the
+    sink-shaped objects on the child's heap instead (SPEC-081 FR-005). If the walk could not
+    finish *at all*, or the heap scan failed, :attr:`Runtime._marking_failed` withdraws the
+    assumption entirely and an unrecorded sink is refused.
 
     **An entry whose sink is dead answers for nothing** (SPEC-081 FR-003), for the sink and for
     its ``owner`` alike: an ``id`` is free for reuse once its object dies, and a new object of the
@@ -3412,7 +3541,7 @@ def _adopt_factory_after_fork() -> None:
     if module is None or not _fork._is_module(module):
         return
     adopted = _fork._MODULE_DICT(module)["_FactorySink"](factory)
-    stamp(adopted)
+    stamp(adopted, built=True)
     config._rebind(sink=adopted)
     worker = _state.worker_exists()
     if worker is not None:

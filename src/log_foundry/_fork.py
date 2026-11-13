@@ -718,8 +718,9 @@ _SKIP_ATTRIBUTE = "_FORK_SKIP"
 """A holder's opt-out: attribute names the walk must not read or descend into.
 
 **Bookkeeping that pins objects is not live state to repair**, and the difference is invisible to a
-walk that only sees a container. ``_lifecycle._state._owned`` is the case: SPEC-042 FR-001 requires
-it to hold a **strong** reference to every sink this process ever acquired, so without an opt-out
+walk that only sees a container. ``_lifecycle._state._owned`` is the case: SPEC-042 FR-001 has it
+reference the sinks this process acquired that are still alive, and in a forked child it holds
+each inherited one strongly from the first step of the repair (SPEC-081), so without an opt-out
 the walk reaches sinks the process abandoned several ``configure()`` calls ago — replacing their
 locks, which is merely wasteful, and calling their fork hooks, which is not. Measured: a forked
 child announced a buffer-discard failure for a sink that had been superseded, and a ``FileSink`` in

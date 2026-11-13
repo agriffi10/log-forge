@@ -16,15 +16,17 @@ from __future__ import annotations
 
 import collections
 import gc
+import io
 import pathlib
 import socket
+import sys
 import threading
 import time
 
 import pytest
 
 import log_foundry
-from log_foundry import _fork, _lifecycle, config
+from log_foundry import _diag, _fork, _lifecycle, config
 from log_foundry.sinks.filtering import FilteringSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
@@ -517,6 +519,12 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     `__iter__` is never entered at all and cannot trip anything; the ceiling is asserted on what
     can still exceed it, a configured sink holding more than `_MARKING_CEILING` distinct objects,
     in a real child now that no unbounded read stands in front of it.
+
+    **Since SPEC-081 FR-005 a trip marks the heap instead**, so the child reads `failed=False` and
+    still refuses the unrecorded sink, which the heap scan found and marked `_FOREIGN`. This is
+    the one trip in the suite at the shipped ceiling, so it also holds the trip's line whole: the
+    detail is exactly `_diag._MAX_DETAIL` characters at 100,000, and a lowered-ceiling trip, which
+    prints a shorter number, cannot guard that length.
     """
     entered: list[int] = []
 
@@ -542,17 +550,32 @@ def test_a_runaway_container_trips_the_ceiling_and_refuses_everything() -> None:
     assert configured < 10.0, "the *parent's* stamp walk is bounded too"
     assert entered == [], "the stamp walk entered the subclass's own `__iter__`"
 
+    detail = (
+        f"the walk marking a forked child's inherited sinks passed {_lifecycle._MARKING_CEILING} "
+        "objects; this child marked the sink-shaped objects on its inherited heap instead, and "
+        "closes none of them, even one it configures itself"
+    )
+    assert len(detail) <= _diag._MAX_DETAIL, "the line is written whole, never cut"
+
     def in_child() -> str:
+        said = buffer.getvalue()
         return (
             f"entered={entered} failed={_lifecycle._state._marking_failed} "
-            f"releasable={_lifecycle.releasable(unrecorded)}"
+            f"releasable={_lifecycle.releasable(unrecorded)} "
+            f"said={said.count(detail + chr(10))}"
         )
 
-    child = run_in_child(in_child, timeout=30)
+    buffer = io.StringIO()
+    saved = sys.stderr
+    sys.stderr = buffer
+    try:
+        child = run_in_child(in_child, timeout=30)
+    finally:
+        sys.stderr = saved
     assert child.finished, f"the child did not return from fork: {child.ending}"
-    assert child.output == "entered=[] failed=True releasable=False", (
-        f"the ceiling tripped, nothing entered the runaway iterator, and an unrecorded sink was "
-        f"refused: {child.output}"
+    assert child.output == "entered=[] failed=False releasable=False said=1", (
+        f"the ceiling tripped, nothing entered the runaway iterator, the heap was marked and an "
+        f"unrecorded sink was refused, with the whole line said once: {child.output}"
     )
 
 
@@ -782,6 +805,7 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
         "weakref.ref",
         "weak",
         "demoted.append",
+        "enumerate",
         "list",
         "id",
     }

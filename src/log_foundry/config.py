@@ -501,16 +501,18 @@ def _change_sink(
     if serialized:
         _sink_holder = me
     try:
+        built = False
         if sink is not None:
             changed["sink_factory"] = None
         elif sink_factory is not None and sink_factory is not _config.sink_factory:
             from log_foundry.sinks._factory import _FactorySink
 
             sink = _FactorySink(sink_factory)
+            built = True
             changed["sink"] = sink
             changed["sink_factory"] = sink_factory
         if sink is not None:
-            _lifecycle.stamp(sink)
+            _lifecycle.stamp(sink, built=built)
 
         _rebind(**changed)
 
@@ -678,7 +680,7 @@ def _ensure_sink() -> Sink:
     with _config_lock:
         if _config.sink is None:
             default = StdoutSink()
-            _lifecycle.stamp(default)
+            _lifecycle.stamp(default, built=True)
             _config = replace(_config, sink=default)
         resolved = _config.sink
     if resolved is None:  # pragma: no cover - unreachable; the branch above just set it
