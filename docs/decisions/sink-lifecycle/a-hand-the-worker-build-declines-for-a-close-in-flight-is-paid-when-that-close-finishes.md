@@ -81,7 +81,9 @@ gate is the whole stop (`_state._stops_running`), not the window in which the bu
 stop's late worker (`_shutdown_running`): a no-worker stop's second pass closes the sink inline
 after that count drops, and a build inside that close, handed at once, made the close serve its
 whole backoff — measured 4.92 s against 0.91 s. So a build in the stop's tail defers too, though
-its worker is live and stopped by nobody. Where the close it marked is not one the stop performs —
+its worker, built after the stop's last take, is live and stopped by nobody; one built before that
+take is stopped by the stop since 2026-11-13, whose take declines for it
+(`docs/decisions/sink-lifecycle/a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`). Where the close it marked is not one the stop performs —
 a swap's displaced close still running — waiting for that close's discharge left the live worker
 delivering into a sink on the shutdown's set signal: measured, three 0.3 s backoffs then waited
 0.00 s each, against 0.30 s each at the base. So **the last stop out pays** (`_pay_marks_after_stop`,
@@ -192,24 +194,21 @@ fence names this as its one tokenless publication.
   since 2026-11-13, with `flush()`'s twin of it: while a stop has a take ahead, those sections hand
   the current signal and never refresh it
   (`docs/decisions/sink-lifecycle/a-hand-while-a-stop-has-a-take-ahead-hands-the-current-signal-and-never-refreshes-it.md`).
-- **A late worker built during a no-worker stop's take-ahead makes the current signal unset.** Its
-  build publishes its own unset `_stop` as `_state._stop`, which that stop sets only at the late
-  worker's stop, after its first pass. So a hand of the current signal to another owed sink R before
-  the first pass takes R — a settle re-reading the signal, `flush()` under the build's token, and
-  this decision's payment alike — delivers an unset event that R's close then waits on. To
-  reproduce: an orphan hand to R whose setter is still running as the stop enters, then a `@trace`
-  building the late worker on another sink before the first take, so the hand's settle re-reads
-  the late worker's unset signal; or a `flush()` while that build's hand token is open. With a 4 s
-  backoff in R's close and `shutdown(timeout=1)`, R's first-pass close waited 4.00 s to 4.01 s at
-  `a8e91fac` and with the 2026-11-13 fixes alike. It is a different source from the
-  two windows closed here — a build publishing a signal the pending take will not see set — and
-  the answer is structural (a stop's close not depending on the last event the sink was handed), so
-  it is left to a session of its own.
+- ~~**A late worker built during a no-worker stop's take-ahead makes the current signal
+  unset.**~~ Closed since 2026-11-13, structurally, at the close: a stop's take declines while the
+  current signal is the unset event of the worker built since its entry, and the stop sets that
+  event before taking again, so R's close starts on a set event whichever hand — a settle, a
+  `flush()` under the build's token, or this decision's payment — delivered it
+  (`docs/decisions/sink-lifecycle/a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`).
 
 ## History
 
 ### 2026-11-13
 
+- **Refined**: *What is left* loses the late-build case, closed at the take by its own decision,
+  `a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`;
+  a tail build before the stop's last take is now stopped by that stop, and the tail paragraph says
+  so.
 - **Refined**: the fence extends to `Worker.retarget`, whose hand of its new sink now defers into a
   stop's close in flight through `_hand_retargeted` and is paid by the same discharge or stop-end
   payment; measured at `a8e91fac` that hand held a `shutdown(timeout=1)` 4.01 s. *What is left*

@@ -166,12 +166,24 @@ class _Operation:
     what bounds the one changed cell of the transition table: a swap during a drain with no live
     worker declines only while some drain still has a take ahead of it, because only then does
     the drain own every owed close. It is written under ``_state._lock``, in the critical section
-    where the last take becomes known — the second pass's take; the first pass's, when no
+    where the last take becomes known — the final pass's take; the first pass's, when no
     bystander was waited on and no late worker can still be registered; or the section that
-    reads the late worker, when there is none and nothing was waited on — and read by
+    reads the late worker, when there is none, nothing was waited on and no take declined — and
+    read by
     :meth:`Runtime._take_ahead` under the same lock. ``late_possible`` is whether a worker built
     now would still be registered as this call's late worker: true from a no-worker shutdown's
     entry until the section that lowers ``_shutdown_running``.
+
+    ``publishing_worker`` is the worker a take of this ``STOP`` declined for
+    (:func:`_take_declines`): the current signal was that worker's unset event, published by its
+    build after the call's entry, so the take took nothing and left the worker to the call.
+    :func:`_shutdown_worker` sets that worker's event, takes again, joins the worker, and clears
+    this before the final pass. While it is set the call still has a take ahead after a join, so
+    no section marks the call ``drained`` — the hands keep handing the set signal through that
+    join, as they do through a late worker's. It is read and written only on the call's own
+    thread; ``drained``, which other threads read, stays under ``_state._lock``. The name carries
+    ``worker`` on purpose: ``tests/test_worker_predicate_roster.py`` finds a guard by the tokens
+    it names, and every test of this attribute is a question about a worker.
 
     ``decided`` is what a ``STOP`` waits on for a ``SWAP`` in flight (the fix after SPEC-079 for a
     shutdown landing mid-swap). A swap with a live worker retargets it and then, in a second
@@ -196,6 +208,8 @@ class _Operation:
       grace_spent: Seconds this ``STOP`` spent waiting on swaps to decide, carved from its grace.
       unsettled: The swaps this ``STOP`` gave up waiting on and had not seen decide by its last
         take, for the one line that says so.
+      publishing_worker: The worker whose unset event made a take of this ``STOP`` decline,
+        until the call has stopped it, or ``None``.
     """
 
     def __init__(self, kind: _Op, timeout: float | None) -> None:
@@ -221,6 +235,7 @@ class _Operation:
         self.thread = threading.get_ident()
         self.grace_spent = 0.0
         self.unsettled: list[_Operation] = []
+        self.publishing_worker: Worker | None = None
 
 
 class _Close:
@@ -1473,7 +1488,10 @@ class Runtime:
         **It bounds two hands as well**, the orphan log's and ``flush()``'s (:func:`_refreshes`):
         while it is true they hand the current signal and never refresh it, because the take
         ahead closes the sink on the signal it holds, and a refreshed one is an unset event the
-        stop never sets. Once it is false they refresh, as after any ``shutdown()``.
+        stop never sets. Once it is false they refresh, as after any ``shutdown()``. A stop whose
+        take declined for a worker built since its entry (:func:`_take_declines`) is not drained
+        until its final pass, after that worker's join, so this stays true through the join, as
+        it does through a late worker's.
 
         The token set is copied into a tuple before it is read: its discard runs without the
         lock, and the copy is one C-level pass that runs no Python code, so it cannot see the set
@@ -3121,9 +3139,10 @@ def _hand_after_close(sink: Sink) -> None:
     :func:`_will_hand` first, under ``_state._lock``, then hands with no lock held through
     :func:`_hand_out`, whose settle keeps the same rule; so it can deliver only the event the next
     ``shutdown()`` sets, never an unset one into a close in flight. The current signal is the
-    stop's set event unless a late worker has been built since, which publishes its own unset
-    one; a sink handed that before a take the stop has still to make is the case this does not
-    close (``docs/decisions/sink-lifecycle/``). It publishes nothing, so it
+    stop's set event unless a worker has been built since, which publishes its own unset one; a
+    sink handed that before a take the stop has still to make is closed on it set, because the
+    stop's take declines while that event is unset and the stop sets it before taking again
+    (:func:`_take_declines`). It publishes nothing, so it
     opens no hand token. It is not paid through :attr:`Runtime._signal_owed`: a debt is settled by
     the next orphan log or ``flush()``, which **refreshes**, and measured, a ``flush()`` between
     the late worker's stop and the shutdown's second take then handed an unset event into that
@@ -3152,9 +3171,11 @@ def _pay_marks_after_stop() -> None:
     The build defers while any stop is running (:attr:`Runtime._stops_running`), and so does the
     hand of a sink a worker is retargeted onto (:func:`_hand_retargeted`); that gate reaches past
     the window where its worker is that stop's late worker: a build in a no-worker stop's
-    tail, after ``_shutdown_running`` has dropped, is deferred too, and the worker it built is
-    live and stopped by nobody. Deferring there is still right while the stop runs, because the
-    stop's second pass may yet close the sink inline — measured, gating the deferral on
+    tail, after ``_shutdown_running`` has dropped, is deferred too, and a worker built there
+    after the stop's last take is live and stopped by nobody (one built before that take is
+    stopped by the stop, whose take declines for it: :func:`_take_declines`). Deferring there is
+    still right while the stop runs, because the stop's second pass may yet close the sink
+    inline — measured, gating the deferral on
     ``_shutdown_running`` instead let a build inside that second-pass close hand its fresh signal
     into it, and the ``shutdown()`` took 4.92 s against 0.91 s. But when the close the build
     marked is not one this stop performs — a swap's displaced close still running after it —
@@ -3525,7 +3546,13 @@ def _get_worker() -> Worker:
     (SPEC-045 FR-002) rather than a double.
     The registration is gated on the counter, which is what keeps this off the **sequential**
     ``shutdown()`` → ``@trace`` path, where a fresh worker still delivers by the decision
-    :func:`_worker_health` records.
+    :func:`_worker_health` records. A worker built after a no-worker stop lowered the counter but
+    before its final pass's take — the few bytecodes between the two — is registered nowhere,
+    yet is stopped by that stop all the same: its build published its unset event as the current
+    signal, so the take declines for it and the stop retires, sets and stops it
+    (:func:`_take_declines`). The boundary of "a worker this stop retires" is therefore the
+    stop's last take, not the end of the registration window; a worker built a moment earlier
+    already got that outcome as the late worker. A build after the last take still delivers.
 
     **The sink is handed its stop signal after the lock is released**, not by ``Worker.__init__``
     inside it: a setter is the sink's own code, and one that logs or calls ``configure()`` on
@@ -4190,8 +4217,9 @@ def _refreshes() -> bool:
 
     **While a stop has a take of the owed record ahead of it, a section hands the current signal
     and never refreshes it.** ``_shutdown_worker`` sets the signal in its entry section and takes
-    the owed sinks later — after the swaps it awaits, after ``Worker.stop``, and for a late worker
-    after that worker's stop — and in between no close is in flight, so :func:`_will_hand` accepts
+    the owed sinks later — after the swaps it awaits, after ``Worker.stop``, and for a worker
+    built since its entry after that worker's join — and in between no close is in flight, so
+    :func:`_will_hand` accepts
     the sink. A refresh there replaced the set event with a fresh unset one, the sink was handed
     it, and the take's close then waited on that unset event: measured at ``a8e91fac``, an
     ``info()`` or a ``flush()`` landing in that window made ``shutdown(timeout=1)`` take 4.00 s to
@@ -4199,8 +4227,10 @@ def _refreshes() -> bool:
     worker path, before a late worker's second take, and for a ``flush()`` while another thread's
     hand token was open. That is the rule :func:`_settle_signal` and :func:`_hand_after_close`
     already keep, carried to these two sections. The current signal is the stop's set event
-    unless a late worker has been built since, which publishes its own unset one; that case is
-    not closed here (``docs/decisions/sink-lifecycle/`` records it).
+    unless a worker has been built since, which publishes its own unset one; that case is closed
+    at the take rather than here: the stop's take declines while that event is unset and the
+    stop sets it before taking (:func:`_take_declines`), so the event these sections hand is set
+    by the time any close the stop makes starts.
 
     **A refusal needs no payment.** The fast path of :func:`_note_orphan_emit` declines on a set
     signal, so the next orphan log after the stop's last take refreshes and hands, as it does
@@ -4214,9 +4244,10 @@ def _refreshes() -> bool:
     would hand the set event to an orphan writer through the stop's graced tail, collapsing that
     writer's backoffs to nothing (SPEC-033 FR-004) with no close to cut short. It over-reaches the
     other way in one place: a no-worker stop that may still meet a late worker keeps its take
-    ahead through its first pass's closes, so a sink no take of the call will close, configured
-    mid-stop, holds the set event for those closes, which is within the ``shutdown()`` call where
-    a shutdown shortening a wait is the promise.
+    ahead through its first pass's closes, and a stop whose take declined for a worker built since
+    its entry keeps it through that worker's join, so a sink no take of the call will close,
+    configured mid-stop, holds the set event for those closes and that join, which is within the
+    ``shutdown()`` call where a shutdown shortening a wait is the promise.
 
     Callers hold ``_state._lock``.
 
@@ -4311,11 +4342,13 @@ def _settle_signal(sink: Sink, event: threading.Event) -> None:
     left it, and the next orphan log or ``flush()`` once no take is ahead refreshes it, since the
     fast path declines on a set signal; the deciding sections keep the same rule while a take is
     ahead (:func:`_refreshes`). So **a late hand never delivers a fresh event into a shutdown's
-    close** (SPEC-044 FR-003): every event it hands is the one a shutdown sets, **with one
-    exception**. A late worker built during a no-worker stop's take-ahead publishes its own unset
-    ``_stop`` as the current signal, which that stop sets only at the late worker's stop, after
-    its first pass; a sink handed it before that pass takes the sink is closed on an unset event.
-    That is not this rule's to close, and ``docs/decisions/sink-lifecycle/`` records it.
+    close** (SPEC-044 FR-003): every event it hands is the one a shutdown sets. That includes a
+    worker built during a stop's take-ahead, which publishes its own unset ``_stop`` as the
+    current signal, so a settle can hand it to a sink the stop is about to close, even with its
+    setter still running across the take. The stop never takes while that event is unset: its
+    take declines and it sets the worker's event first (:func:`_take_declines`), so the sink's
+    close starts on a set event whichever order the settle and the take land in. The close
+    holds that rule, not this one, which is what lets it cover every hand site at once.
 
     The rounds are capped at :data:`_SETTLE_ROUNDS`, which only something replacing the signal on
     every round can reach; past them it sets :attr:`Runtime._signal_owed` in the last round's
@@ -4567,22 +4600,36 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     joined, in a ``finally`` of their own, so a setter that is slow or raises cannot cut that
     join short.
 
+    **The take declines while the current signal is an unset event the worker built since the
+    stop's entry published** (:func:`_take_declines`). It then takes nothing, records the worker
+    as :attr:`_Operation.publishing_worker` for :func:`_shutdown_worker` to stop, and leaves
+    ``op.drained`` and ``op.unsettled`` untouched, because no take was made: a take is still
+    ahead, so the hands keep handing the current signal and a swap still declines, and a swap
+    that decides before the retake still has its sink closed by it. It still snapshots the
+    closes somebody else has in flight and waits on them as before, since a decline changes
+    nothing about a close this call did not make. The caller sets the worker's event, which is
+    the current signal, and takes again, so every sink this call closes holds a set event when
+    its close starts, whichever hand gave it that event and in whatever order the setters
+    finished.
+
     **It records the call's last take** (SPEC-078 FR-004): in the take's own critical section,
-    ``op.drained`` is set when no further take of this call can follow — the second pass, or a
-    first pass that waits on nobody once no late worker can still be registered for the call.
-    That is what bounds the declining swap, and the hands that keep the stop's set signal rather
-    than refresh it (:func:`_refreshes`). In the same section it drops from
-    :attr:`_Operation.unsettled` every swap the call gave up waiting on that has decided since:
-    that swap's arm landed before this take, so the sink it installed is closed here, and
-    :func:`_announce_unsettled` must not say it may be left open.
+    ``op.drained`` is set when no further take of this call can follow — the final pass, or a
+    first pass that waits on nobody once no late worker can still be registered for the call —
+    and never while :attr:`_Operation.publishing_worker` is set, because the call's final pass
+    still follows that worker's join, and the take :func:`_shutdown_worker` makes at once after
+    setting the worker's event is not its last. That is what bounds the declining swap, and the
+    hands that keep the stop's set signal rather than refresh it (:func:`_refreshes`). In the
+    same section it drops from :attr:`_Operation.unsettled` every swap the call gave up waiting
+    on that has decided since: that swap's arm landed before this take, so the sink it installed
+    is closed here, and :func:`_announce_unsettled` must not say it may be left open.
 
     Args:
       op: The ``STOP`` this closer runs for, whose deadline bounds the grace and which carries the
         call's one ``grace_end``. ``None`` only for a direct call from a test, which gets an
         unbounded operation of its own, as the old ``deadline=None`` default gave it.
       bystander_wait: Whether to wait on closes somebody else had in flight. ``False`` for
-        :func:`_shutdown_worker`'s second pass, which runs only when there is something for it to
-        do and must never wait a second time.
+        :func:`_shutdown_worker`'s later passes — the retake after a decline and the final pass —
+        which run only when there is something for them to do and must never wait a second time.
 
     Returns:
       Whether it waited on a close it did not perform, which is what tells its caller a second
@@ -4600,16 +4647,28 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     entries: list[tuple[Sink, _Close]] = []
     with _state._lock:
         worker = _state.worker_exists()
-        taken = [sink for sink in _state._closes.owed.values() if not _state.held(sink)]
+        declined = _take_declines(operation, worker)
+        if declined:
+            operation.publishing_worker = worker
+        taken = (
+            []
+            if declined
+            else [sink for sink in _state._closes.owed.values() if not _state.held(sink)]
+        )
         for sink in taken:
             rule = _Rule.JOINED
             if worker is not None and worker.holds_unfenced(sink):
                 rule = _Rule.GRACED
             entries.append((sink, _state._closes.take(sink, rule)))
         mine = {id(sink) for sink in taken}
-        operation.unsettled = [swap for swap in operation.unsettled if not swap.decided.is_set()]
+        if not declined:
+            operation.unsettled = [
+                swap for swap in operation.unsettled if not swap.decided.is_set()
+            ]
         waiting = _state._closes.bystanders(mine) if bystander_wait else []
-        if not bystander_wait or not (waiting or operation.late_possible):
+        if operation.publishing_worker is None and (
+            not bystander_wait or not (waiting or operation.late_possible)
+        ):
             operation.drained = True
     undischarged = {id(sink): (sink, close) for sink, close in entries}
     try:
@@ -4812,8 +4871,9 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     ``_state._stop`` is set **before** delegating, so a sink parked in a backoff is released
     while :meth:`Worker.stop` is still draining rather than after it has given up waiting. A
     **late** worker holds a different event — its build refreshed the signal, for the reason a
-    sink adopted after a ``shutdown()`` does — so ``stop`` sets the event it actually holds.
-    Measured without that: a 3 s backoff bounded the stop at 3.01 s, against 0.06 s with it.
+    sink adopted after a ``shutdown()`` does — so the section that retires it sets the event it
+    actually holds, and ``stop`` sets it again. Measured without that: a 3 s backoff bounded the
+    stop at 3.01 s, against 0.06 s with it.
 
     **The count and the worker read are one critical section** (SPEC-044 FR-001).
     Unlocked, a worker built between them sent this down the no-worker branch: the drain thread
@@ -4837,19 +4897,53 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     a losing caller writes no expiry line, so no rendered text depends on it.
 
     **The stored state moves with the count** (SPEC-078 FR-003): :meth:`Runtime._move` is the
-    last statement of the entry's critical section and of the late worker's, the two sections of
-    this call that change the retirement count.
+    last statement of the entry's critical section and of the count's move in the section that
+    stops a worker built since the entry, the two sections of this call that change the
+    retirement count.
 
-    **The count moves a second time before a late worker is stopped**, under the same lock
-    (FR-001). That worker recorded the already-incremented count at its build, so without the
-    second move the call that stops it leaves it reading as *live*: delivering nothing, its next
-    submission uncounted, and a later swap waiting a whole budget for a fence it cannot confirm.
+    **The count moves a second time before a worker built since the entry is stopped**, under the
+    same lock (FR-001), **when that worker is still live**. It recorded the already-incremented
+    count at its build, so without the second move the call that stops it leaves it reading as
+    *live*: delivering nothing, its next submission uncounted, and a later swap waiting a whole
+    budget for a fence it cannot confirm. The move is conditional because two calls can now stop
+    one worker — the stop that popped it as its late worker and another whose take declined for
+    it — and the count moves once per worker as well as once per call: two concurrent no-worker
+    ``shutdown()`` calls that meet one late worker leave ``retirements`` at 3, as they did before
+    the decline existed. The same condition means a late worker an earlier call already retired
+    is not counted again; :meth:`Runtime.live_worker` compares with ``>``, so nothing read the
+    extra move.
 
-    **The second pass runs only when there is something for it to do** — the first waited on a
-    close somebody else held, or a late worker was stopped — and it never waits itself. Run
-    unconditionally it defeats FR-002's two-caller criterion: the first caller, just out of its
-    own inline close, re-takes the re-armed sink before the bystander returns from its wait.
-    Nothing runs a third.
+    **A worker built since the entry is stopped in the worker branch's order: claim, retire and
+    set at once, take, then join.** That is a late worker this call popped, or the
+    :attr:`_Operation.publishing_worker` its take declined for (:func:`_take_declines`): the
+    current signal was that worker's unset event, which a hand may already have delivered to a
+    sink the take would have closed. One critical section moves the count if the worker is still
+    live, claims its stop with this call's deadline and sets its event, which is the current signal;
+    after a decline the call then takes again at once, without a bystander wait, so the owed
+    sinks close on that set event **while the worker drains**, inside the call's budget, rather
+    than after its join; then it joins the worker, and the final pass closes the worker's own
+    sink, as the second pass always did. Joining first was measured: a 0.5 s close of the owed
+    sink behind a late worker whose ``emit`` slept 3 s took ``shutdown(timeout=1)`` to 1.51 s,
+    the close starting after the deadline, against 1.01 s in this order and 1.00 s to 1.01 s at
+    ``864d71e5``, which closed that sink before stopping the worker. Setting the event in the section rather than inside :meth:`Worker.stop` is the
+    same order as before, a few bytecodes earlier. The join passes the call's ``budget`` when
+    it won the claim, as the worker branch does, so a late worker's expiry line names the
+    caller's timeout rather than what was left of it. **No lock site and no** ``_move`` **site
+    moved**: the section is the one that already retired a late worker, made conditional and
+    reached by a decline too, so the pinned counts hold, and a shutdown that meets no build still
+    takes in its first pass and pays three acquisitions, because a set signal never declines.
+    An interrupt raised inside that section between the claim and the set leaves the event
+    unset; it is a few bytecodes under ``_state._lock`` and is excluded rather than closed.
+
+    **A later pass runs only when there is something for it to do** — the first waited on a
+    close somebody else held, or a worker built since the entry was stopped — and none waits
+    itself. Run unconditionally it defeats FR-002's two-caller criterion: the first caller, just
+    out of its own inline close, re-takes the re-armed sink before the bystander returns from
+    its wait. The loop ends after one round: once the section has set the worker's event,
+    the event is ``_state._stop``, and nothing replaces a set signal while a take is ahead
+    (:func:`_refreshes`, :func:`_swap_sink`'s decline) and nothing builds a second worker, so no
+    later take of the call can decline. A call therefore takes at most three times: the first
+    pass, the retake after a decline, and the final pass.
 
     **The closer grace is spent once per call** (SPEC-078 FR-002). Every graced wait of the call —
     the first pass's bystander wait and the graced join at the end — ends at the operation's one
@@ -4870,14 +4964,15 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     FR-006). Nothing here changes for it: the closer leaves the sink a live drain thread may
     still be inside, which on that call is the caller's own thread, and the closer grace still
     applies, so that call can wait on a swapped-out sink's close though it never waits on its own
-    thread. A late worker is stopped through ``stop`` without a verdict
-    and claims for itself, before it sets the different event it holds.
+    thread. A worker built since the entry is claimed the same way, in the section that retires
+    it, before that section sets the different event it holds, and the verdict is passed on.
 
     **The draining token** (SPEC-077 FR-002) is this call's :class:`_Operation`, added to
     :attr:`Runtime._stops_running` in the first critical section, before ``_stop`` is set, and
     discarded in the outer ``finally`` once the graced join has returned, so
-    :attr:`Runtime.state` reads ``DRAINING`` for the whole body on both branches, the late
-    worker's stop and the second ``_close_owed`` pass included — and is never left there by an
+    :attr:`Runtime.state` reads ``DRAINING`` for the whole body on both branches, the stop of a
+    worker built since the entry and the later ``_close_owed`` passes included — and is never
+    left there by an
     exception. The discard takes no lock: it is one ``set.discard``, so the token adds no
     acquisition to this call's pinned count. After it, the last stop out pays any hand a worker
     build or a retarget declined during the stop on a close that outlives it
@@ -4942,20 +5037,87 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
                     _state._late_worker = None
                     _state._shutdown_running -= 1
                     op.late_possible = False
-                    if late_worker is None and not waited:
+                    if late_worker is None and not waited and op.publishing_worker is None:
                         op.drained = True
-            if late_worker is not None:
+        stopping_worker = late_worker if late_worker is not None else op.publishing_worker
+        again = waited or stopping_worker is not None
+        while again:
+            if stopping_worker is not None:
                 with _state._lock:
-                    _state.retirements += 1
-                    _state._move()
-                late_worker.stop(_remaining(op.deadline))
-        if waited or late_worker is not None:
+                    if _state.live_worker() is stopping_worker:
+                        _state.retirements += 1
+                        _state._move()
+                    claimed = stopping_worker.claim_stop(op.deadline)
+                    stopping_worker._stop.set()
+                if op.publishing_worker is not None:
+                    _close_owed(op, bystander_wait=False)
+                stopping_worker.stop(
+                    op.budget if claimed else _remaining(op.deadline), claimed=claimed
+                )
+            op.publishing_worker = None
             _close_owed(op, bystander_wait=False)
+            stopping_worker = op.publishing_worker
+            again = stopping_worker is not None
         _announce_unsettled(op)
         _state._closes.wait_graced(op, None)
     finally:
         _state._stops_running.discard(op)
         _pay_marks_after_stop()
+
+
+def _take_declines(op: _Operation, worker: Worker | None) -> bool:
+    """Whether *op*'s take must first stop the worker whose unset event is the current signal.
+
+    **A stop never takes the owed record while the process's current signal is an unset event
+    published by the worker built since its entry.** A hand of "the current signal" — a settle
+    whose setter is still running, a ``flush()`` under another thread's hand token, a deferred
+    payment, any hand site added later — can deliver that event to a sink the take is about to
+    close, and the close then waits on an event no stop has set: measured at ``864d71e5``, a
+    sink whose ``close()`` backs off 4 s on its signal waited out the whole 4 s inside
+    ``shutdown(timeout=1)``, handed the event by a settle (4.00 s), by a ``flush()`` (4.01 s) and
+    after a worker built in the gap before the second pass's take (4.0 s). So
+    :func:`_close_owed` takes nothing when this is true, records the worker as
+    :attr:`_Operation.publishing_worker`, and :func:`_shutdown_worker` sets that worker's event —
+    the current signal — and takes again. Every event a hand can deliver is then set when the
+    take runs, whatever route delivered it, which makes the rule a property of the close rather
+    than of each hand site (``docs/decisions/sink-lifecycle/``).
+
+    At most one event is ever published after a stop's entry, because :func:`_get_worker` builds
+    only while no worker exists and nothing but a fork resets the worker: the build's. Each term
+    is needed:
+
+    - ``op in _state._stops_running``: the take is a running stop's, in this process. A forked
+      child empties the token set, so a stop continuing on a child's thread never declines and
+      never stops the child's own worker; that continuation's closes may then meet the child's
+      unset signal, which is excluded rather than closed.
+    - ``not stop.is_set()``: an event set already cuts the close short, so nothing is owed. This
+      is what keeps the decline off every ordinary shutdown, whose entry set the signal and which
+      no build since has replaced.
+    - ``worker is not None and worker._stop is stop``: the unset signal is the worker's own, so
+      setting the worker's event sets the signal. Without it a take facing an unset signal some
+      other writer published would decline, set an event that is not the signal, and decline
+      again on every retake. No such writer exists today, since every refresh is gated off while
+      a take is ahead; the term is the loop's termination guard rather than a filter that fires.
+
+    Callers hold ``_state._lock``.
+
+    Args:
+      op: The ``STOP`` about to take.
+      worker: The worker the take's section read, or ``None``.
+
+    Returns:
+      Whether the take must take nothing and leave the worker to the stop.
+
+    Raises:
+      None.
+    """
+    stop = _state._stop
+    return (
+        op in _state._stops_running
+        and not stop.is_set()
+        and worker is not None
+        and worker._stop is stop
+    )
 
 
 def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:

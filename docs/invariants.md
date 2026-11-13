@@ -237,8 +237,12 @@ under `shutdown(timeout=1)`), and the same close when a `configure(sink=…)` re
 the sink inside it (`a8e91fac`: 4.01 s); it holds the shutdown's take to that signal when an orphan
 log or a `flush()` lands between the stop setting the signal and the take
 (`test_a_hand_before_the_take_leaves_the_close_the_shutdowns_signal`, `a8e91fac`: 4.00 s to 4.01 s
-on all four of its rows), and `tests/test_lock_held_discharges.py` holds the shape that keeps the
-hand the build or the retarget defers from being paid under the state lock.
+on all four of its rows), and to a set signal when a worker built since the stop's entry published
+its own unset one and a hand delivered it to the sink
+(`test_a_stop_never_closes_on_the_unset_event_of_a_worker_built_since_its_entry`, `864d71e5`:
+4.0 s on its settle, `flush()` and tail rows, 1.01 s for each of two stops); and
+`tests/test_lock_held_discharges.py` holds the
+shape that keeps the hand the build or the retarget defers from being paid under the state lock.
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
