@@ -54,8 +54,9 @@ targets the first release after 1.2.0.
   stream took the line. Lines a failed `flush()` leaves in the stream's buffer may still be written
   by the stream later, so the honest outcome for them is `UNKNOWN`, not `RETRYABLE`. That is a
   different verdict rule from this spec's. They also hold no closed guard (they release nothing,
-  SPEC-032), have no fork hook, and count no `failed` at all today. The two specs share no code path
-  and do not depend on each other. Until the sibling lands, invariant 7's recorded exception stays in
+  SPEC-032), have no fork hook, and count no `failed` at all today. The sibling, SPEC-084, depends
+  on this spec's `RunContext.raise_on_failure` and builds after it; this spec does not depend on
+  the sibling. Until the sibling lands, invariant 7's recorded exception stays in
   place for the stream sinks.
 - `SQLiteSink`. It keeps SPEC-069's driver-error path and stays off the engine.
 - **Truncating the file back to where the batch began.** It is rejected because a forked child
@@ -477,3 +478,6 @@ tests/
   made a tear the run will not offer again `UNKNOWN`, after reproducing `MultiSink` resending a failed run whole. It
   also restated the close-during-backoff criterion in SPEC-074's form, kept 1.x's failed-run count
   for unencodable events, added the codec check, and pointed Phase 4 at the records that exist.
+- **2026-11-13, SPEC-084 authored.** *Out of Scope*'s first bullet said the two specs share no
+  code path; SPEC-084 reuses this spec's `raise_on_failure`, so it now says the sibling depends on
+  this one and builds after it.
