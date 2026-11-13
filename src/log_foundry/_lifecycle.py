@@ -3229,9 +3229,9 @@ def _hand_retargeted(sink: Sink, stop: threading.Event) -> None:
     read without it first, and re-read under it before marking. A stop entering just after the
     lock-free read sets ``_state._stop``, which is this live worker's ``_stop`` unless the worker
     was stopped directly (``Worker.stop``), whose ``_stop`` is then already set; so the hand made
-    here is of an event that is set or that stop sets, and that stop cannot take the sink before
-    its worker stop, since the worker now holds it. ``defer_hand`` is called inside the lock's section, the
-    shape ``tests/test_lock_held_discharges.py`` requires of every mark.
+    here is of an event that is set or that stop sets, and that stop cannot take the sink before its
+    worker stop, since the worker now holds it. ``defer_hand`` is called inside the lock's section,
+    the shape ``tests/test_lock_held_discharges.py`` requires of every mark.
 
     Called by ``Worker.retarget`` with no library lock held but ``config._sink_lock``, which a
     setter's own ``configure()`` never waits on.
@@ -3947,11 +3947,12 @@ def _will_hand(sink: Sink) -> bool:
 
     **A sink a live worker drains into is handed the worker's own event when that is the current,
     unset signal.** That hand replaces nothing — it is the object the drain already waits on — and
-    it is needed: the worker build hands its sink the signal after its section, so a log on
-    another thread that meets the build's token would otherwise skip, as the moment predicate
-    says, and emit to a sink still holding no signal. The caller hands ``_state._stop`` or
-    ``refresh_stop_signal()``, which on an unset signal is that same object. A set signal, a worker holding another event, or a close in
-    flight keeps the skip, which is the case SPEC-035 FR-001 and SPEC-044 FR-003 measured.
+    it is needed: the worker build hands its sink the signal after its section, so a log on another
+    thread that meets the build's token would otherwise skip, as the moment predicate says, and emit
+    to a sink still holding no signal. The caller hands ``_state._stop`` or
+    ``refresh_stop_signal()``, which on an unset signal is that same object. A set signal, a worker
+    holding another event, or a close in flight keeps the skip, which is the case SPEC-035 FR-001
+    and SPEC-044 FR-003 measured.
 
     The moment half is :func:`_may_replace`, which :func:`_settle_signal` asks too.
 

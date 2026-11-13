@@ -336,7 +336,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-lifecycle/a-hand-the-worker-build-declines-for-a-close-in-flight-is-paid-when-that-close-finishes.md"
       - title: "A hand while a stop has a take ahead hands the current signal and never refreshes it"
-        fence: "while a `shutdown()` still has a take of the owed record ahead of it (`Runtime._take_ahead`), the orphan log's locked branch and `flush()`'s section hand a sink the current stop signal as it is, set or not, and open a hand token only when they really refresh (`_refreshes`); the swap's no-worker branch returns before its hand while a take is ahead, and the factory wrapper only relays what it was handed. Never gate it on the whole stop (`_stops_running`), never pay a refusal through a mark or `_signal_owed`. (fix after SPEC-079)"
+        fence: "while a `shutdown()` still has a take of the owed record ahead of it (`Runtime._take_ahead`), the orphan log's locked branch and `flush()`'s section hand a sink the current stop signal as it is, set or not, and open a hand token only when they publish an arm, a cleared debt or a real refresh (`_refreshes`); the swap's no-worker branch returns before its hand while a take is ahead, and the factory wrapper only relays what it was handed. Never gate it on the whole stop (`_stops_running`), never pay a refusal through a mark or `_signal_owed`. (fix after SPEC-079)"
         status: "stable"
         path: "docs/decisions/sink-lifecycle/a-hand-while-a-stop-has-a-take-ahead-hands-the-current-signal-and-never-refreshes-it.md"
       - title: "A process releases only a transport it acquired *here*, and unrecorded must be unclaimable rather than merely unreleasable"

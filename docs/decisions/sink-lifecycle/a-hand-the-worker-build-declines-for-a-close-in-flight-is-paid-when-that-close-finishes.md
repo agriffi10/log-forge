@@ -146,9 +146,12 @@ fence names this as its one tokenless publication.
   build publishes its own unset `_stop` as `_state._stop`, which that stop sets only at the late
   worker's stop, after its first pass. So a hand of the current signal to another owed sink R before
   the first pass takes R — a settle re-reading the signal, `flush()` under the build's token, and
-  this decision's payment alike — delivers an unset event that R's close then waits on. Measured
-  with a 4 s backoff by the plan reviewer's probes `late_build_settle` and `late_build_flush`: 4.00
-  s to 4.01 s at `a8e91fac` and with the 2026-11-13 fixes alike. It is a different source from the
+  this decision's payment alike — delivers an unset event that R's close then waits on. To
+  reproduce: an orphan hand to R whose setter is still running as the stop enters, then a `@trace`
+  building the late worker on another sink before the first take, so the hand's settle re-reads
+  the late worker's unset signal; or a `flush()` while that build's hand token is open. With a 4 s
+  backoff in R's close and `shutdown(timeout=1)`, R's first-pass close waited 4.00 s to 4.01 s at
+  `a8e91fac` and with the 2026-11-13 fixes alike. It is a different source from the
   two windows closed here — a build publishing a signal the pending take will not see set — and
   the answer is structural (a stop's close not depending on the last event the sink was handed), so
   it is left to a session of its own.

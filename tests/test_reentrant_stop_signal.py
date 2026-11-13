@@ -322,7 +322,9 @@ class _SwappedOut(Plain):
 
     ``emit`` backs off up to 0.3 s on the signal it holds and records how long it waited, so a
     set signal shows as a wait of nothing. With ``build_in_second_close`` its second close builds
-    the worker on another thread first, then backs off up to 4 s on its signal.
+    the worker on another thread first, then backs off up to 4 s on its signal. A second close
+    records ``_shutdown_running`` as it begins, so a test relying on that close running after the
+    count dropped can assert it rather than trust a sleep.
     """
 
     def __init__(self, *, build_in_second_close: bool = False) -> None:
@@ -332,6 +334,7 @@ class _SwappedOut(Plain):
         self.go = threading.Event()
         self.waits: list[float] = []
         self.second_close_held_set: list[bool] = []
+        self.second_close_shutdown_running: list[int] = []
         self.offers: list[threading.Event | None] = []
         self.act: Callable[[], None] | None = None
         self.armed = False
@@ -364,6 +367,7 @@ class _SwappedOut(Plain):
         elif self.build_in_second_close:
             from log_foundry.sinks import _retry
 
+            self.second_close_shutdown_running.append(_lifecycle._state._shutdown_running)
             tracer = threading.Thread(target=lambda: _traced()(), daemon=True)
             tracer.start()
             tracer.join(GATE)
@@ -1740,10 +1744,14 @@ def test_a_build_inside_a_stops_second_pass_close_keeps_that_close_short() -> No
         log_foundry.shutdown(timeout=6.0)
         elapsed = time.monotonic() - started
         releaser.join(GATE)
-        return f"second_close_held_set={sink.second_close_held_set} quick={elapsed < 2.0}"
+        return (
+            f"shutdown_running={sink.second_close_shutdown_running} "
+            f"second_close_held_set={sink.second_close_held_set} quick={elapsed < 2.0}"
+        )
 
     child = run_in_child(work, timeout=40)
-    assert child.output == "second_close_held_set=[True] quick=True", child.output
+    expected = "shutdown_running=[0] second_close_held_set=[True] quick=True"
+    assert child.output == expected, child.output
 
 
 def test_a_mark_paid_at_the_stops_end_is_not_paid_again_by_the_close() -> None:
@@ -2077,6 +2085,8 @@ class _RetargetedInSecondClose(_SwappedOut):
         else:
             from log_foundry.sinks import _retry
 
+            self.second_close_shutdown_running.append(_lifecycle._state._shutdown_running)
+
             def retarget_onto_me() -> None:
                 log_foundry.configure(sink=Plain())
                 _traced()()
@@ -2120,7 +2130,150 @@ def test_a_retarget_inside_a_stops_second_pass_close_keeps_that_close_short() ->
         log_foundry.shutdown(timeout=6.0)
         elapsed = time.monotonic() - started
         releaser.join(GATE)
-        return f"second_close_held_set={sink.second_close_held_set} quick={elapsed < 2.0}"
+        return (
+            f"shutdown_running={sink.second_close_shutdown_running} "
+            f"second_close_held_set={sink.second_close_held_set} quick={elapsed < 2.0}"
+        )
 
     child = run_in_child(work, timeout=40)
-    assert child.output == "second_close_held_set=[True] quick=True", child.output
+    expected = "shutdown_running=[0] second_close_held_set=[True] quick=True"
+    assert child.output == expected, child.output
+
+
+def test_a_hand_that_keeps_the_stops_signal_opens_no_token() -> None:
+    """A section that hands the stop's set signal during a take-ahead opens no hand token.
+
+    A no-worker
+    ``shutdown()`` is parked after it set the signal, before its take; thread A's orphan log to the
+    armed S takes the locked branch, since the signal is set, and its setter parks while A hands S
+    the set signal. That section armed nothing, cleared no debt and replaced nothing, so it opens
+    no token, and a ``flush()`` on the main thread then has nothing to hand: S is offered only the
+    arming hand and A's. A token condition still reading a set signal as a publication opened a
+    token there, and the ``flush()``, meeting it, handed S the set signal a third time. Red at
+    ``a8e91fac`` too, for that reason and the refresh's: A's section opened a token and handed S
+    a fresh unset signal, and the ``flush()`` handed it again.
+    """
+
+    def work() -> str:
+        parked, release = threading.Event(), threading.Event()
+        park_next = [False]
+        offers: list[tuple[bool, str]] = []
+
+        class Offered(Plain):
+            def __init__(self) -> None:
+                super().__init__()
+                self._signal: threading.Event | None = None
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:
+                return self._signal
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+                assert event is not None
+                offers.append((event.is_set(), threading.current_thread().name))
+                self._signal = event
+                if park_next[0]:
+                    park_next[0] = False
+                    parked.set()
+                    release.wait(GATE)
+
+        log_foundry.configure(service="t", sink=Offered())
+        log_foundry.info("arms it and hands it E0")
+        entered, go = _park("_await_swap_decisions", 0)
+        stopper = threading.Thread(target=lambda: log_foundry.shutdown(timeout=1.0), daemon=True)
+        stopper.start()
+        if not entered.wait(GATE):
+            return "the stop never parked"
+        park_next[0] = True
+        writer = threading.Thread(target=lambda: log_foundry.info("A"), name="A", daemon=True)
+        writer.start()
+        if not parked.wait(GATE):
+            return "A's hand never parked"
+        tokens = len(_lifecycle._state._hands_running)
+        log_foundry.flush(timeout=1.0)
+        during = list(offers)
+        release.set()
+        writer.join(GATE)
+        go.set()
+        stopper.join(GATE * 2)
+        return f"tokens_during_a={tokens} offers={during}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == ("tokens_during_a=0 offers=[(False, 'MainThread'), (True, 'A')]"), (
+        child.output
+    )
+
+
+def test_a_flush_that_keeps_the_stops_signal_opens_no_token() -> None:
+    """A ``flush()`` that hands the stop's set signal during a take-ahead opens no token of its own.
+
+    The ``flush()`` twin of the test above (invariant 6). S is armed and a no-worker
+    ``shutdown()`` is parked after it set the signal, before its take. ``configure(sink=R)`` is
+    declined there, and thread A's orphan log arms R, which publishes, so A holds a token while
+    R's setter parks inside A's hand. A ``flush()`` on thread B meets that token and hands every
+    owed sink the current, set signal, and S's setter parks inside B's hand. B cleared no debt and
+    replaced nothing, so the only token open is A's. A token condition still reading a set signal
+    as a publication opened a second one for B. Red at ``a8e91fac`` too, for the refresh: A's
+    section replaced the set signal, and both hands delivered the fresh unset one.
+    """
+
+    def work() -> str:
+        parked = {"S": threading.Event(), "R": threading.Event()}
+        release = threading.Event()
+        park_on = {"S": "", "R": ""}
+        offers: list[tuple[str, bool, str]] = []
+
+        class Offered(Plain):
+            def __init__(self, name: str) -> None:
+                super().__init__()
+                self.name = name
+                self._signal: threading.Event | None = None
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:
+                return self._signal
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, event: threading.Event | None) -> None:
+                assert event is not None
+                thread = threading.current_thread().name
+                offers.append((self.name, event.is_set(), thread))
+                self._signal = event
+                if park_on[self.name] == thread:
+                    park_on[self.name] = ""
+                    parked[self.name].set()
+                    release.wait(GATE)
+
+        sink, other = Offered("S"), Offered("R")
+        log_foundry.configure(service="t", sink=sink)
+        log_foundry.info("arms S and hands it E0")
+        entered, go = _park("_await_swap_decisions", 0)
+        stopper = threading.Thread(target=lambda: log_foundry.shutdown(timeout=1.0), daemon=True)
+        stopper.start()
+        if not entered.wait(GATE):
+            return "the stop never parked"
+        log_foundry.configure(sink=other)
+        park_on.update(S="B", R="A")
+        writer = threading.Thread(target=lambda: log_foundry.info("arms R"), name="A", daemon=True)
+        writer.start()
+        if not parked["R"].wait(GATE):
+            return "A's hand never parked"
+        flusher = threading.Thread(target=lambda: log_foundry.flush(timeout=1.0), name="B")
+        flusher.daemon = True
+        flusher.start()
+        if not parked["S"].wait(GATE):
+            return "B's hand never parked"
+        tokens = len(_lifecycle._state._hands_running)
+        during = list(offers)
+        release.set()
+        writer.join(GATE)
+        flusher.join(GATE)
+        go.set()
+        stopper.join(GATE * 2)
+        return f"tokens_during_b={tokens} offers={during}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == (
+        "tokens_during_b=1 offers=[('S', False, 'MainThread'), ('R', True, 'A'), ('S', True, 'B')]"
+    ), child.output

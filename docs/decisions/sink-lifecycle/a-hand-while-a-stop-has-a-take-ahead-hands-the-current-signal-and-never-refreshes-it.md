@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A hand while a stop has a take ahead hands the current signal and never refreshes it"
-description: "while a `shutdown()` still has a take of the owed record ahead of it (`Runtime._take_ahead`), the orphan log's locked branch and `flush()`'s section hand a sink the current stop signal as it is, set or not, and open a hand token only when they really refresh (`_refreshes`); the swap's no-worker branch returns before its hand while a take is ahead, and the factory wrapper only relays what it was handed. Never gate it on the whole stop (`_stops_running`), never pay a refusal through a mark or `_signal_owed`. (fix after SPEC-079)"
+description: "while a `shutdown()` still has a take of the owed record ahead of it (`Runtime._take_ahead`), the orphan log's locked branch and `flush()`'s section hand a sink the current stop signal as it is, set or not, and open a hand token only when they publish an arm, a cleared debt or a real refresh (`_refreshes`); the swap's no-worker branch returns before its hand while a take is ahead, and the factory wrapper only relays what it was handed. Never gate it on the whole stop (`_stops_running`), never pay a refusal through a mark or `_signal_owed`. (fix after SPEC-079)"
 ---
 
 **The defect.** `_shutdown_worker` sets the process's stop signal in its entry section and takes
@@ -25,6 +25,10 @@ refresh. This is the rule `_settle_signal` and `_hand_after_close` already kept,
 two sections, not a new guard. Measured with the fix: each of the four cases above took 0.00 s, the
 close holding the set event. `test_a_hand_before_the_take_leaves_the_close_the_shutdowns_signal`
 holds all four rows, asserting the event the close held.
+`test_a_hand_that_keeps_the_stops_signal_opens_no_token` and its `flush()` twin hold the token
+condition at each site: with `_stop.is_set()` left there, each section opened a token for a hand
+that published nothing, and at the log's site a `flush()` meeting that token handed the sink the
+set signal a second time.
 
 **The sweep of hand sites.**
 
@@ -77,8 +81,11 @@ paid by a refresh: that is the defect.
 since. A late worker built during a no-worker stop's take-ahead publishes its own unset `_stop` as
 `_state._stop`, which that stop sets only at the late worker's stop, after its first pass, so a hand
 of the current signal before the first pass takes a sink delivers an unset event the close then
-waits on. The plan reviewer's probes `late_build_settle` and `late_build_flush` measured 4.00 s to
-4.01 s at `a8e91fac` and with this fix alike. It is recorded with the worker build's decision, which
+waits on. To reproduce: an orphan hand to R whose setter is still running as the stop enters,
+then a `@trace` building the late worker on another sink before the first take, so the hand's
+settle re-reads the late worker's unset signal; or a `flush()` while that build's hand token is
+open. With a 4 s backoff in R's close and `shutdown(timeout=1)`, R's first-pass close waited
+4.00 s to 4.01 s at `a8e91fac` and on this branch alike. It is recorded with the worker build's decision, which
 it touches too, and left to a session of its own.
 
 ## History
