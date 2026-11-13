@@ -14,9 +14,11 @@ after releasing the lock. This file holds that shape over the source.
 
 Five checks, each a reason a finding names, and a roster of the sites the real module has, so a
 rename or a lost ``with`` detection cannot make the audit pass by finding nothing. Four hold the
-discharges under the lock; the fifth holds the premise they rest on, that every
-``defer_hand`` call sits inside a ``with _state._lock:`` body. The corpus at the bottom asserts
-each check's reason on a case written to trip it, and silence on the shapes that must pass.
+discharges under the lock; the fifth holds the premise they rest on, that every ``defer_hand`` call
+sits inside a ``with _state._lock:`` body. The payment check covers every payer (:data:`PAYERS`): a
+close's discharge, the last stop's end, and a writer paying a mark the stop's end missed. The corpus
+at the bottom asserts each check's reason on a case written to trip it, and silence on the shapes
+that must pass.
 
 **The scan is lexical.** It sees a call written inside a ``with _state._lock:`` body of the
 function that holds the lock, and nothing else: a discharge reached through a helper that a
@@ -41,6 +43,14 @@ RELEASE_NOT_TAKEN = "a release under the state lock discharges an entry it did n
 FINISH_NOT_TAKEN = "a finish under the state lock discharges an entry it did not take there"
 PUT_BACK_DISCARDED = "a put_back under the state lock discards the deferred hand it reports"
 PAID_UNDER_LOCK = "a deferred hand is paid under the state lock, which the payment takes itself"
+
+PAYERS = frozenset({"_hand_after_close", "_pay_marks_after_stop", "_pay_a_mark_the_stop_missed"})
+"""Every function that pays a deferred hand, each taking ``_state._lock`` itself to decide it.
+
+``_hand_after_close`` pays at a close's discharge, ``_pay_marks_after_stop`` at the last stop's
+end, and ``_pay_a_mark_the_stop_missed`` is a writer's own payment of a mark it made after that end
+looked; a call to any of them under the lock would wait on the lock its own thread holds.
+"""
 MARKED_OUTSIDE_LOCK = (
     "a hand is deferred outside the state lock, so a locked discharge could meet it"
 )
@@ -177,7 +187,7 @@ def audit(source: str) -> tuple[list[str], dict[tuple[str, str], int]]:
             elif name == "put_back":
                 if isinstance(parent, ast.Expr):
                     findings.append(f"{function}: {PUT_BACK_DISCARDED}")
-            elif name == "_hand_after_close":
+            elif name in PAYERS:
                 findings.append(f"{function}: {PAID_UNDER_LOCK}")
     for function, call in _defer_calls(tree):
         sites[(function, "defer_hand")] = sites.get((function, "defer_hand"), 0) + 1
@@ -257,6 +267,15 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
         """,
         [f"site: {PAID_UNDER_LOCK}"],
     ),
+    "a-stop-end-payment-under-the-lock": (
+        """
+        with _state._lock:
+            deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
+            _pay_a_mark_the_stop_missed()
+            _pay_marks_after_stop()
+        """,
+        [f"site: {PAID_UNDER_LOCK}", f"site: {PAID_UNDER_LOCK}"],
+    ),
     "the-shipped-shapes-pass": (
         """
         with _state._lock:
@@ -270,6 +289,11 @@ CORPUS: dict[str, tuple[str, list[str]]] = {
         for sink in owed:
             _hand_after_close(sink)
         release(sink, closing=close)
+        with _state._lock:
+            deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
+        if deferred:
+            _pay_a_mark_the_stop_missed()
+        _pay_marks_after_stop()
         """,
         [],
     ),

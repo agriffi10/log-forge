@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A hand the worker build or a retarget declines for a close in flight is paid when that close finishes"
-description: "while a stop is running, a worker build whose sink has a close in flight, or a `Worker.retarget` onto such a sink (`_hand_retargeted`), hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it; a mark whose close outlives the stop is paid by the last stop out (`_pay_marks_after_stop`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
+description: "while a stop is running, a worker build whose sink has a close in flight, or a `Worker.retarget` onto such a sink (`_hand_retargeted`), hands it no stop signal and marks that close's entry (`_CloseRegistry.defer_hand`); the participant that discharges the entry hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`), and `put_back`, which holds `_state._lock`, pays after it; a mark whose close outlives the stop is paid by the last stop out (`_pay_marks_after_stop`), or by its writer when it lands after that stop's end looked (`_pay_a_mark_the_stop_missed`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
 ---
 
 **The defect.** A no-worker `shutdown()` sets the stop signal and closes the configured sink; a
@@ -99,6 +99,26 @@ hand: its in-flight entries go with their marks and it owes its sinks its own si
 `test_a_worker_built_in_a_stops_tail_is_handed_its_signal_when_the_stop_ends` and
 `test_a_build_inside_a_stops_second_pass_close_keeps_that_close_short` hold the two halves.
 
+**A mark that lands after the stop's end looked is paid by its writer.** Each writer reads a stop
+token under `_state._lock` and then marks, while the last stop's `finally` discards its token with
+no lock held and only then asks `_CloseRegistry.marked()`. So this order is legal: the writer reads
+the token, the stop discards it and finds no mark, and the writer marks. A mark left that way on a
+close that outlives the stop, a swap's, was paid by nothing until that close ended, and the live
+tail worker delivered into S on the stop's set signal after `shutdown()` returned. Forced in a
+forked child, a 0.3 s backoff after the shutdown then waited 0.0 s: at `609d5c37` for both writers,
+and at `a8e91fac` for the build, the retarget not deferring there. So each writer that marked
+calls `_pay_a_mark_the_stop_missed` once it has released the lock, outside every lifecycle lock;
+that runs `_pay_marks_after_stop`, whose first line is a lock-free re-read of the stop tokens. The
+stop discards and then reads the marks, the writer marks and then reads the tokens, so at least
+one of the two sees the other; `unmark` consumes a mark once under the leaf, so at most one pays.
+With the fix the backoff waits 0.3 s and S holds the live worker's own signal.
+`test_a_mark_made_after_the_stops_end_looked_is_still_paid` forces the order for both writers. A
+second, writer-side copy of the token check before that call was an equivalent mutant (made
+unconditional, the whole suite stayed green), since `_pay_marks_after_stop` makes the same check
+first, so it was dropped. `tests/test_lock_held_discharges.py` counts both stop-end payers among
+the payments it refuses under `_state._lock`. The re-read takes no lock and the payment takes it
+only when a mark exists, so no pinned lock count moves.
+
 **Rejected: declining without paying.** The late worker then delivers into a sink still on the
 shutdown's set signal, so any backoff of the sink's own collapses to nothing — SPEC-033 FR-004's
 tight retry loop — until a later orphan log happens to refresh it, which a process that only
@@ -165,6 +185,9 @@ fence names this as its one tokenless publication.
   payment; measured at `a8e91fac` that hand held a `shutdown(timeout=1)` 4.01 s. *What is left*
   loses the retarget twin and the orphan window, now closed (the latter by its own decision), and
   gains the late-build case the plan review found, with its measurement.
+- **Refined** the same day, after the diff review: a writer that marks after the last stop's end
+  looked for marks pays the mark itself (`_pay_a_mark_the_stop_missed`), closing a race the
+  stop-end payment left open for both writers.
 
 ### 2026-11-12
 

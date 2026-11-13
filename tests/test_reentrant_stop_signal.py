@@ -2277,3 +2277,99 @@ def test_a_flush_that_keeps_the_stops_signal_opens_no_token() -> None:
     assert child.output == (
         "tokens_during_b=1 offers=[('S', False, 'MainThread'), ('R', True, 'A'), ('S', True, 'B')]"
     ), child.output
+
+
+def _marked_after_the_stop_looked(writer: str) -> str:
+    """Forces a mark to land after the last stop's end looked for one, and reports what S holds.
+
+    S's first close is a swap's, parked on its own thread, and outlives the stop. The stop's
+    ``shutdown()`` runs on the ``stopper`` thread and is held after its graced wait, just before
+    its ``finally`` discards its token and looks for marks, until the ``mover`` thread is inside
+    ``defer_hand`` for S — having read the stop's token under ``_state._lock``. The mover is then
+    held there until the stop's end has looked and found nothing, and only then marks. ``build``:
+    the mover's ``@trace`` builds the worker on S. ``retarget``: the configured sink is T, so the
+    mover's ``@trace`` builds the worker on T and its ``configure(sink=S)`` retargets it onto S.
+    """
+    sink = _SwappedOut()
+    _swapped_out_and_back(sink)
+    state = _lifecycle._state
+    at_end, mover_in, stop_looked = threading.Event(), threading.Event(), threading.Event()
+    ordered: list[bool] = []
+    real_wait = state._closes.wait_graced
+    real_defer = state._closes.defer_hand
+    real_pay = _lifecycle._pay_marks_after_stop
+
+    def wait_graced(op: object, waiting: object) -> None:
+        real_wait(op, waiting)  # type: ignore[arg-type]
+        if waiting is None and threading.current_thread().name == "stopper":
+            at_end.set()
+            mover_in.wait(GATE)
+
+    def defer_hand(target: object) -> bool:
+        if threading.current_thread().name == "mover" and target is sink:
+            mover_in.set()
+            ordered.append(stop_looked.wait(GATE))
+        return real_defer(target)  # type: ignore[arg-type]
+
+    def pay() -> None:
+        try:
+            real_pay()
+        finally:
+            if threading.current_thread().name == "stopper":
+                stop_looked.set()
+
+    state._closes.wait_graced = wait_graced  # type: ignore[method-assign]
+    state._closes.defer_hand = defer_hand  # type: ignore[method-assign]
+    _lifecycle._pay_marks_after_stop = pay
+    if writer == "retarget":
+        log_foundry.configure(sink=Plain())
+    stopper = threading.Thread(
+        target=lambda: log_foundry.shutdown(timeout=1.0), name="stopper", daemon=True
+    )
+    stopper.start()
+    if not at_end.wait(GATE * 2):
+        return "the stop never reached its end"
+
+    def move() -> None:
+        _traced()()
+        if writer == "retarget":
+            log_foundry.configure(sink=sink)
+
+    mover = threading.Thread(target=move, name="mover", daemon=True)
+    mover.start()
+    stopper.join(GATE * 3)
+    mover.join(GATE * 3)
+    live = state.live_worker()
+    held = sink.log_foundry_stop_signal
+    report = (
+        f"ordered={ordered} stops_left={len(state._stops_running)} "
+        f"close_in_flight={state._closes.in_flight(sink)} "
+        f"holds_worker_signal={live is not None and live.sink is sink and held is live._stop} "
+        f"marked={state._closes.marked()}"
+    )
+    sink.waits.clear()
+    _traced()()
+    log_foundry.flush(timeout=GATE)
+    waits = sink.waits[:1]
+    sink.go.set()
+    return f"{report} waited={waits}"
+
+
+@pytest.mark.parametrize("writer", ["build", "retarget"])
+def test_a_mark_made_after_the_stops_end_looked_is_still_paid(writer: str) -> None:
+    """A writer that marks after the last stop's end looked for marks pays the mark itself.
+
+    The writer read the stop's token under ``_state._lock``; the stop then discarded it, with no
+    lock held, and found no mark; only then did the writer mark a close of S that outlives the
+    stop. Nothing else pays that mark before the close ends, so the live worker would deliver
+    into S on the stop's set signal after ``shutdown()`` returned. The writer re-reads the tokens
+    after its section and pays when none is left, so S holds the live worker's own signal, the
+    mark is consumed, and a 0.3 s backoff after the shutdown waits 0.3 s. At ``609d5c37`` both
+    rows left S on the set signal with the mark in place and the backoff waited 0.0 s; at
+    ``a8e91fac`` the ``build`` row did, the retarget not deferring there at all.
+    """
+    child = run_in_child(lambda: _marked_after_the_stop_looked(writer), timeout=60)
+    assert child.output == (
+        "ordered=[True] stops_left=0 close_in_flight=True holds_worker_signal=True "
+        "marked=False waited=[0.3]"
+    ), child.output

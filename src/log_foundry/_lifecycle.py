@@ -499,6 +499,13 @@ class _CloseRegistry:
         entry already discharged is not found, so the caller hands the sink itself. No hand is
         lost between them.
 
+        **Nor between the mark and the stop's end.** The caller read a stop token under
+        ``_state._lock``, but the last stop discards its token without that lock and then asks
+        :meth:`marked`, so a mark can land after that question. Every caller that marked therefore
+        re-reads the tokens once it has released the lock and pays the mark itself if none is left
+        (:func:`_pay_a_mark_the_stop_missed`): mark-then-read against discard-then-read, so one of
+        the two sees the other, and :meth:`unmark` lets only one of them pay.
+
         Args:
           sink: The sink a worker is about to deliver to.
 
@@ -3168,6 +3175,17 @@ def _pay_marks_after_stop() -> None:
     repair, as for any hand: the child drops every in-flight entry with its mark, owes its sinks
     its own signal, and a continuing settle re-reads the child's signal under the child's lock.
 
+    **A mark can land after this looked.** A writer reads a stop token under ``_state._lock`` and
+    marks afterwards, while the last stop discards its token with no lock held and only then asks
+    :meth:`_CloseRegistry.marked`; so the writer can read the token, this find no mark, and the
+    mark land after. Measured, forced in a forked child at ``609d5c37``: the live worker then
+    delivered into the sink on the stop's set signal after ``shutdown()`` returned, a 0.3 s backoff
+    waiting 0.0 s, for a build and for a retarget alike. So each writer that marked re-reads the
+    tokens after releasing the lock and calls this itself when none is left
+    (:func:`_pay_a_mark_the_stop_missed`). This side discards, then reads the marks; that side
+    marks, then reads the tokens; so at least one of the two sees the other, and the mark is
+    consumed once under the leaf, so at most one hands.
+
     A ``shutdown()`` with no mark left behind — every one but this case — asks only a lock-free
     read of the stop tokens and one acquisition of the registry's leaf
     (:meth:`_CloseRegistry.marked`), so its pinned count of ``_state._lock`` acquisitions does not
@@ -3233,6 +3251,11 @@ def _hand_retargeted(sink: Sink, stop: threading.Event) -> None:
     worker stop, since the worker now holds it. ``defer_hand`` is called inside the lock's section,
     the shape ``tests/test_lock_held_discharges.py`` requires of every mark.
 
+    **A hand that marked re-reads the stop tokens after the section**, without the lock, and pays
+    the mark itself when no stop is left (:func:`_pay_a_mark_the_stop_missed`): the last stop
+    discards its token with no lock held and then looks for marks, so a mark can land after that
+    look, on a close that outlives the stop, and nothing else would pay it before that close ends.
+
     Called by ``Worker.retarget`` with no library lock held but ``config._sink_lock``, which a
     setter's own ``configure()`` never waits on.
 
@@ -3244,13 +3267,58 @@ def _hand_retargeted(sink: Sink, stop: threading.Event) -> None:
       None.
 
     Raises:
-      None.
+      BaseException: What the sink's setter raised that :func:`offer_stop_signal` does not absorb,
+        on the hand or on a mark this pays itself.
     """
     if _state._stops_running:
         with _state._lock:
-            if _state._stops_running and _state._closes.defer_hand(sink):
-                return
+            deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
+        if deferred:
+            _pay_a_mark_the_stop_missed()
+            return
     offer_stop_signal(sink, stop)
+
+
+def _pay_a_mark_the_stop_missed() -> None:
+    """Pays the mark a writer just made, if the last stop ended before the mark landed.
+
+    The two writers of the mark — the worker build (:func:`_get_worker`) and a retarget's hand
+    (:func:`_hand_retargeted`) — read :attr:`Runtime._stops_running` under ``_state._lock`` and
+    then mark through :meth:`_CloseRegistry.defer_hand`. The last stop's ``finally`` discards its
+    token with no lock held and then asks :meth:`_CloseRegistry.marked` in
+    :func:`_pay_marks_after_stop`, so a writer that read the token, then the stop discarding it
+    and finding no mark, then the writer marking, is a legal order. A mark left that way on a close
+    that outlives the stop — a swap's displaced close — was paid by nothing until that close
+    ended, and the live worker delivered into the sink on the stop's set signal after
+    ``shutdown()`` returned: forced in a forked child at ``609d5c37``, a 0.3 s backoff then waited
+    0.0 s, for both writers.
+
+    **So a writer that marked re-reads the tokens once it has released the lock**, without it,
+    and pays through :func:`_pay_marks_after_stop` when none is left. The stop does "discard the
+    token, then read the marks", and the writer does "mark, then read the tokens", so at least one
+    of the two sees the other: either the stop finds the mark, or the writer finds no token. Both
+    may, and then both reach :meth:`_CloseRegistry.unmark`, which consumes a mark once under the
+    registry's leaf, so at most one pays. The re-read is lock-free and the payment takes
+    ``_state._lock`` only when a mark exists, so no pinned acquisition count moves.
+
+    **The re-read is the first line of** :func:`_pay_marks_after_stop`, which returns while any
+    stop is running before it asks for marks; a second copy of it here was an equivalent mutant
+    (made unconditional, the whole suite stayed green), so this calls it directly. It is a function
+    of its own so the rule, and the reason it is safe, have one home that both writers name.
+
+    Called by both writers after their critical section, outside every lifecycle lock, only when
+    they marked; ``tests/test_lock_held_discharges.py`` refuses a payment under ``_state._lock``.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: What the sink's setter raised that :func:`offer_stop_signal` does not absorb.
+    """
+    _pay_marks_after_stop()
 
 
 def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
@@ -3466,6 +3534,12 @@ def _get_worker() -> Worker:
     nobody to pay. A worker retargeted onto a sink a stop is closing defers its hand the same way
     (:func:`_hand_retargeted`), the one other writer of the mark.
 
+    **A build that marked re-reads the stop tokens after its section**, without the lock, and pays
+    the mark itself when no stop is left (:func:`_pay_a_mark_the_stop_missed`). It read a token
+    under the lock, but the last stop discards its token with no lock held and then looks for
+    marks, so the build can mark after that look; marking first and reading the tokens after is
+    what guarantees one of the two sees the other.
+
     Args:
       None.
 
@@ -3474,6 +3548,8 @@ def _get_worker() -> Worker:
 
     Raises:
       Exception: Whatever constructing the sink or worker raises.
+      BaseException: What the sink's setter raised that :func:`offer_stop_signal` does not absorb,
+        during the build's hand or a mark it pays itself.
     """
     worker = _state.worker_exists()
     if worker is None:
@@ -3482,6 +3558,7 @@ def _get_worker() -> Worker:
 
         token: object | None = None
         sink: Sink | None = None
+        deferred = False
         try:
             with _state._lock:
                 worker = _state.worker_exists()
@@ -3497,6 +3574,8 @@ def _get_worker() -> Worker:
                         _state._late_worker = worker
                     _state._closes.arm(sink)
                     _state._move()
+            if deferred:
+                _pay_a_mark_the_stop_missed()
             if token is not None and sink is not None:
                 _hand_out([sink], worker._stop)
         finally:
@@ -4134,13 +4213,15 @@ def _hand_out(sinks: list[Sink], event: threading.Event) -> None:
     """Hands each sink the stop signal its deciding section chose, holding no lifecycle lock.
 
     The only library lock a caller may still hold across it is ``config._sink_lock``, which a
-    setter's own ``configure()`` never waits on, and it reaches here held by three routes: the
+    setter's own ``configure()`` never waits on, and it reaches here held by four routes: the
     no-worker swap's ``configure()``, handing its new sink; a deferred hand paid at a close's
-    discharge (:func:`_hand_after_close`) by a ``shutdown()`` that a sink's own code ran on a
-    swap's thread, which holds that lock across the whole swap; and a stop-end payment
-    (:func:`_pay_marks_after_stop`) by such a ``shutdown()``, run inside a swap's setter. Each sink is marked as being handed on this
-    thread (:func:`handing`) for the length of its hand, so a setter that logs to it, or builds
-    the worker on it, does not hand it again. Every caller has already asked
+    discharge (:func:`_hand_after_close`) by a ``shutdown()`` that a sink's own code ran on a swap's
+    thread, which holds that lock across the whole swap; a stop-end payment
+    (:func:`_pay_marks_after_stop`) by such a ``shutdown()``, run inside a swap's setter; and a
+    retarget paying a mark it made after the last stop's end looked
+    (:func:`_pay_a_mark_the_stop_missed`), inside the swap that retargeted. Each sink is marked as
+    being handed on this thread (:func:`handing`) for the length of its hand, so a setter that logs
+    to it, or builds the worker on it, does not hand it again. Every caller has already asked
     :func:`handing_here`, through :func:`_will_hand` or directly.
 
     Args:
