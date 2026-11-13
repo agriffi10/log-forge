@@ -295,7 +295,7 @@ def column_value(value: object, *, int64: bool) -> object:
     the whole event's JSON, and a value the driver cannot bind used to cost the whole batch:
     ``sqlite3`` refuses a ``dict``, a ``list`` and an integer outside the signed 64-bit range
     (that one as a bare ``OverflowError``, nothing counted), and psycopg a ``dict`` and a
-    ``list`` that is mixed, ragged or holds a ``dict``, each measured on 2026-11-13. A
+    ``list`` that is mixed, ragged or holds a ``dict``, each measured at ``a8e91fac``. A
     ``TransformSink`` can put any of them there, so the repair is admitted (*A destination's
     refusal is repaired at the sink*).
 
@@ -303,13 +303,15 @@ def column_value(value: object, *, int64: bool) -> object:
     text the event column already holds for it: the column is a filter beside that event, not its
     record, and the event is not changed, so nothing is marked, counted or announced. Every
     container takes the rule, including the lists psycopg did bind as array literals
-    (``{1,2}``), so a column holds one representation whichever driver wrote it. A ``str``,
-    ``int``, ``float``, ``bool`` or ``None`` binds as before; the range test reads the value
-    through ``int.__int__``, so no comparison a subclass defines runs.
+    (``{1,2}``), so a column holds one representation whichever driver wrote it (Andrew's choice,
+    2026-11-13, over a rule predicting which lists psycopg adapts). A ``str``, ``int``,
+    ``float``, ``bool`` or ``None`` binds as before; the range test reads the value through
+    ``int.__int__``, so no comparison a subclass defines runs.
 
-    A string that is not UTF-8 — a lone surrogate, which assembly replaces and ``configure()``
-    refuses, so only a direct ``emit`` brings one — is not repaired: it raises here, and the
-    encode helper drops that event alone, counted and announced.
+    A string that is not UTF-8 — a lone surrogate, or a surrogate pair held as two code points,
+    which neither driver encodes and which assembly replaces and ``configure()`` refuses, so only
+    a direct ``emit`` brings one — is not repaired: it raises here, and the encode helper drops
+    that event alone, counted and announced.
 
     Args:
       value: The column's value as the event holds it.
@@ -341,14 +343,19 @@ def refuse_surrogate(event: dict[str, object], text: str) -> None:
     ``json.dumps`` writes a lone surrogate as a ``\\ud800`` escape, and PostgreSQL refuses the
     escape in ``jsonb`` (``InvalidTextRepresentation``) and psycopg the string in a text column
     (``UnicodeEncodeError``); either used to cost the whole transaction, measured against
-    PostgreSQL 17.11 on 2026-11-13. Assembly replaces a lone surrogate, ``TransformSink`` coerces
-    one and ``configure()`` refuses one in a stamp, so only a direct ``emit`` brings one, and the
-    admission rule repairs nothing the pipeline cannot produce: the event is dropped alone,
-    counted and announced by the encode helper, rather than repaired.
+    PostgreSQL 17.11 at ``a8e91fac``. Assembly replaces a lone surrogate, ``TransformSink``
+    coerces one and ``configure()`` refuses one in a stamp, so only a direct ``emit`` brings one,
+    and the admission rule repairs nothing the pipeline cannot produce: the event is dropped
+    alone, counted and announced by the encode helper, rather than repaired.
 
     :data:`SURROGATE_ESCAPE` keeps a clean event to one search. On a match the event is encoded
-    again without ASCII escapes and strictly as UTF-8, which raises only for a real surrogate, so
-    an emoji's escaped pair and the text ``\\ud800`` written with an escaped backslash pass.
+    again without ASCII escapes and round-tripped through UTF-16, which fails only for a
+    surrogate with no partner beside it. So an emoji, the text ``\\ud800`` written with an
+    escaped backslash, and a surrogate pair held as two code points all pass: ``json.dumps``
+    writes the last as the same two escapes as the emoji, which JSONB reads as one character.
+    Only then is the text encoded as UTF-8, which raises with the lone surrogate named. A pair
+    held as two code points in a *projected column* still fails, in ``column_value``, because
+    psycopg encodes that column's string as UTF-8.
 
     Args:
       event: The event, as it will be written.
@@ -360,8 +367,13 @@ def refuse_surrogate(event: dict[str, object], text: str) -> None:
     Raises:
       UnicodeEncodeError: If a string value or key holds a lone surrogate.
     """
-    if SURROGATE_ESCAPE.search(text):
-        json.dumps(event, ensure_ascii=False).encode("utf-8")
+    if not SURROGATE_ESCAPE.search(text):
+        return
+    wide = json.dumps(event, ensure_ascii=False)
+    try:
+        wide.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+    except UnicodeDecodeError:
+        wide.encode("utf-8")
 
 
 def repair_nul(event: dict[str, object]) -> dict[str, object] | None:

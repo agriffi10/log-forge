@@ -166,7 +166,8 @@ def test_a_lone_surrogate_costs_only_its_event_against_a_real_server(
 
     Measured against PostgreSQL 17.11 before the fix: one in a JSON value or key cost the batch
     (JSONB refuses its ``\\ud800`` escape), and one in a text column too (psycopg cannot encode
-    it). An emoji, written as an escaped surrogate *pair*, must still land.
+    it). An emoji, written as an escaped surrogate *pair*, must still land, and so must the same
+    pair held as two code points, which ``json.dumps`` writes as the emoji's two escapes.
     """
     endpoint = services_are_up["postgres"]
     sink = PostgresSink(table, dsn=dsn(endpoint), create_table=True, max_retries=0)
@@ -177,6 +178,7 @@ def test_a_lone_surrogate_costs_only_its_event_against_a_real_server(
             {**event(2), "fields": {"k\ud800": "v"}},
             {**event(3), "level": "x\udc80"},
             emoji,
+            {**event(5), "fields": {"text": "\ud83d\ude00"}},
         ]
     )
     losses = sink.losses()
@@ -186,8 +188,9 @@ def test_a_lone_surrogate_costs_only_its_event_against_a_real_server(
         cur.execute(f"SELECT event FROM {table} ORDER BY id")
         rows = cur.fetchall()
 
-    assert [row[0]["n"] for row in rows] == [1, 4]
+    assert [row[0]["n"] for row in rows] == [1, 4, 5]
     assert rows[1][0]["fields"] == {"text": "smile \U0001f600"}
+    assert rows[2][0]["fields"] == {"text": "\U0001f600"}
     assert (losses.dropped, losses.failed) == (2, 0)
     assert "PostgresSink, encoding raised UnicodeEncodeError" in capsys.readouterr().err
 

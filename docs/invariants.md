@@ -427,14 +427,6 @@ the worker calls the family's `deliver` and a `REJECTED` event is final. A core
 flight to a server that may yet process them, and the next call is refused by the probe or its
 latch, so a sustained stall is still reported as failed batches and only the one batch that
 straddles its onset is counted rather than raised.
-A file or stream write that fails partway can land events twice, accepted for 1.2.0 (Andrew's
-ruling, 2026-11-13): a `FileSink` or `RotatingFileSink` write, or a `StdoutSink` or `StderrSink`
-stream, that raises after earlier lines of the batch reached the file leaves them there and
-raises, and the worker's retry writes the whole batch again, so a fault that clears between the
-attempts duplicates those lines (69 to 100 of a 200-event batch, measured at `a8e91fac` with the
-file size capped). The measurement, the two rejected remedies and the closure — the file sinks on `deliver`,
-specified after 1.2.0 — are in *A sink's own driver error is counted, announced and raised as both
-types* (`docs/decisions/sink-delivery/`).
 The recorded exception extends to `deliver` (SPEC-072 FR-004): a run whose verdict marks an event
 `UNKNOWN`, or whose verdict cannot be read — not a `Verdict`, outcomes that are not exact `Outcome`
 members, the wrong length, or a field that raises when read — settles even when nothing else was
@@ -443,6 +435,15 @@ accepted, its events counted in `failed_events` and resent only by a sink that d
 a run of nothing but `DROPPED` events, counted in `dropped_events`, and a run of nothing but
 `SKIPPED` events, a deliberate non-send the engine counts nowhere. An exception escaping `deliver`
 is not this exception: no response is in hand, so its round's events fail the run.
+A second recorded exception, separate from the may-have-landed ones above: a file or stream
+write that fails partway can land events twice, accepted for 1.2.0 (Andrew's ruling, 2026-11-13).
+A `FileSink` or `RotatingFileSink` write, or a `StdoutSink` or `StderrSink` stream, that raises
+after the file or the stream took earlier lines of the batch leaves them there and raises, and the
+worker's retry writes the whole batch again, so a fault that clears between the attempts
+duplicates those lines (69 to 100 of a 200-event batch, measured at `a8e91fac` with the file size
+capped). The measurement, the two rejected remedies and the closure — the file sinks on
+`deliver`, specified after 1.2.0 — are in *A sink's own driver error is counted, announced and
+raised as both types* (`docs/decisions/sink-delivery/`).
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_encode.py` (an all-unencodable batch settles on every record-building sink,
 SPEC-069), `tests/test_classify.py` and `tests/test_sinks_sns.py` (a batch lost only to sender

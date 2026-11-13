@@ -118,9 +118,21 @@ def test_a_transform_putting_a_container_in_a_column_no_longer_costs_the_batch()
     ]
 
 
-def test_column_value_refuses_a_lone_surrogate_by_type() -> None:
+@pytest.mark.parametrize("text", ["x\udc80", "\ud83d\ude00"], ids=["lone", "pair as two"])
+def test_column_value_refuses_a_string_neither_driver_encodes(text: str) -> None:
     with pytest.raises(UnicodeEncodeError):
-        column_value("x\udc80", int64=False)
+        column_value(text, int64=False)
+
+
+def test_sqlite_reads_the_event_column_before_the_projected_ones(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An event that is not JSON is dropped for that, before a bad column is ever read."""
+    sink, conn = _sqlite()
+    sink.emit([{"log_id": "a"}, {"log_id": "b", "level": "x\ud800", "tags": {1, 2}}])
+
+    assert [row[0] for row in _levels(conn)] == ["a"]
+    assert "SQLiteSink, encoding raised TypeError" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -129,8 +141,10 @@ def test_column_value_refuses_a_lone_surrogate_by_type() -> None:
         {"msg": "smile \U0001f600"},
         {"msg": "\\ud800 as text"},
         {"msg": "plain"},
+        {"msg": "\ud83d\ude00"},
+        {"k": "\\\\ud800"},
     ],
-    ids=["emoji pair", "escaped backslash", "clean"],
+    ids=["emoji pair", "escaped backslash", "clean", "pair as two code points", "backslash run"],
 )
 def test_refuse_surrogate_passes_what_postgres_accepts(event: dict[str, object]) -> None:
     refuse_surrogate(event, json.dumps(event))
@@ -138,8 +152,14 @@ def test_refuse_surrogate_passes_what_postgres_accepts(event: dict[str, object])
 
 @pytest.mark.parametrize(
     "event",
-    [{"msg": "a\ud800b"}, {"fields": {"k\udc80": 1}}, {"list": ["\udfff"]}],
-    ids=["value", "key", "nested"],
+    [
+        {"msg": "a\ud800b"},
+        {"fields": {"k\udc80": 1}},
+        {"list": ["\udfff"]},
+        {"msg": "\ude00\ud83d"},
+        {"msg": "\\\ud800"},
+    ],
+    ids=["value", "key", "nested", "pair reversed", "backslash then a real one"],
 )
 def test_refuse_surrogate_raises_for_a_real_lone_surrogate(event: dict[str, object]) -> None:
     with pytest.raises(UnicodeEncodeError):
