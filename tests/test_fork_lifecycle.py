@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import ast
 import collections
+import ctypes
+import errno
 import faulthandler
 import gc
 import io
@@ -232,6 +234,88 @@ def report_from_child(marker: str) -> None:
     os.write(_child_pipe[1], marker.encode())
 
 
+_PR_GET_DUMPABLE = 3
+_PR_SET_DUMPABLE = 4
+
+
+def _set_dumpable(dumpable: int | None) -> int | None:
+    """Sets whether this process may dump core, returning the setting it replaced.
+
+    A process killed by ``SIGSEGV`` is not gone when the signal lands: the kernel first writes
+    its core, and while it does the process keeps every descriptor it had open and takes no
+    signal but ``SIGKILL``. When ``core_pattern`` pipes the core to a helper, that write lasts
+    as long as the helper takes to read it, and GitHub's Ubuntu runner images install
+    ``systemd-coredump``, which pipes it (``actions/runner-images``,
+    ``images/ubuntu/toolsets/toolset-2404.json``). On a loaded runner that outlasts the
+    parent's deadline in :func:`run_in_child`, the parent sends ``SIGKILL`` mid-dump, and Linux
+    lets that one signal replace the exit code the crash had already set. The child is reaped
+    as ``SIGKILL`` and reads as :attr:`_Child.blocked`, a watchdog, although a crash was all
+    that happened to it. Measured in a Linux container with ``core_pattern`` set to
+    ``|/bin/sleep 8`` and no load: the deliberate crash in
+    ``test_a_crashed_child_does_not_read_as_blocked`` failed every run with "it reached
+    `os.kill`, and was still alive at the parent's deadline", the reading CI kept reporting on
+    ``main``, and a demonstration test whose child was made to crash instead of blocking passed
+    as blocked. With the dump refused both read the ``SIGSEGV`` they died of.
+
+    ``RLIMIT_CORE`` would not do: the kernel ignores it for a piped ``core_pattern``, measured in
+    the same container. ``PR_SET_DUMPABLE`` is what the kernel checks before any dump, piped or
+    not. It is Linux's, so elsewhere this does nothing and returns ``None``; no CI leg runs
+    anywhere else, and a crash on macOS ended its child at once with or without a core limit.
+
+    **A setting this cannot put back is refused before anything changes.** ``PR_SET_DUMPABLE``
+    takes only 0 or 1, but a process whose credentials changed under ``fs.suid_dumpable=2``
+    reads 2, and setting 2 back fails with ``EINVAL``. Found by review: refused only on the way
+    back, the error would surface from :func:`run_in_child`'s ``finally`` after the fork, with
+    the parent left non-dumpable and the child never reaped. Refused here, it is raised before
+    the fork, with nothing changed.
+
+    Args:
+      dumpable: ``0`` to refuse a dump, or the value an earlier call returned, to put it back.
+        ``None`` is what an earlier call returned off Linux, and does nothing.
+
+    Returns:
+      The setting before this call, or ``None`` off Linux.
+
+    Raises:
+      OSError: If ``prctl`` refuses, or the current setting is one ``prctl`` cannot restore.
+    """
+    if dumpable is None:
+        return None
+    previous = _dumpable()
+    if previous is None:
+        return None
+    if previous not in (0, 1):
+        raise OSError(errno.EINVAL, f"dumpable is {previous}, which prctl cannot put back")
+    if ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_DUMPABLE, dumpable, 0, 0, 0) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"prctl(PR_SET_DUMPABLE) failed: {os.strerror(code)}")
+    return previous
+
+
+def _dumpable() -> int | None:
+    """Reads whether this process may dump core, as the kernel's 0, 1 or 2.
+
+    Split from :func:`_set_dumpable` so a test can read the setting a child was forked with,
+    which is the one observation that pins the guard whatever ``core_pattern`` a host has.
+
+    Args:
+      None.
+
+    Returns:
+      The current setting, or ``None`` off Linux, where there is none to read.
+
+    Raises:
+      OSError: If ``prctl`` refuses.
+    """
+    if sys.platform != "linux":
+        return None
+    value = int(ctypes.CDLL(None, use_errno=True).prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0))
+    if value < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"prctl(PR_GET_DUMPABLE) failed: {os.strerror(code)}")
+    return value
+
+
 def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT) -> _Child:
     """Forks, runs ``work`` in the child, and reaps it.
 
@@ -270,6 +354,18 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
     not immediately preceded by a bare ``gc.collect()``, so a fifth fork site cannot be added
     without either the guard or a deliberate argument against it.
 
+    **Every child is forked unable to dump core, so a crash always reads as the signal it was.**
+    Otherwise a crashing child can be held mid-dump past the parent's deadline and reaped as
+    ``SIGKILL`` -- the parent's watchdog -- which is what :attr:`_Child.blocked` counts as a
+    deadlock: :func:`_set_dumpable` has the mechanism and the measurement. The setting is made
+    in the **parent** around the fork, not in the child, because the child inherits it and the
+    library's fork handler runs in the child before any of this code does; a crash inside that
+    repair is exactly the case a refusal made later would miss. The parent's own setting is put
+    back once the fork has returned, in the ``finally``, so it is restored when the fork raises
+    -- and a fork that raises closes the pipe it would have handed the child, rather than leaking
+    both ends into the rest of the run. The pipe is made only once the setting has been changed,
+    so a setting :func:`_set_dumpable` refuses leaves no pipe behind either.
+
     Args:
       work: Called in the child, after the library's fork handler has run. Whatever it returns
         is sent back as the child's output.
@@ -280,12 +376,23 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
       The reaped child.
 
     Raises:
-      None.
+      OSError: If the kernel refuses to change whether the process may dump core.
     """
     global _child_pipe
-    read_fd, write_fd = os.pipe()
-    gc.collect()
-    pid = os.fork()
+    parent = os.getpid()
+    dumpable = _set_dumpable(0)
+    try:
+        read_fd, write_fd = os.pipe()
+        try:
+            gc.collect()
+            pid = os.fork()
+        except BaseException:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+    finally:
+        if os.getpid() == parent:
+            _set_dumpable(dumpable)
     if pid == 0:
         code = 1
         try:
@@ -631,6 +738,83 @@ def _diagnose(child: _Child, *, reached: bool) -> str:
     return f"it {child.ending} without reaching `os.kill`, leaving no exception report behind"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_DUMPABLE exists only on Linux")
+def test_every_child_is_forked_unable_to_dump_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard on :func:`run_in_child` is read directly, not inferred from a crash's timing.
+
+    The crash test below can tell a guarded child from an unguarded one only while a dump
+    helper is slow, and CI's is usually fast, so a guard removed or undone would leave every
+    other test green and come back only as the flake it ended -- which that test's docstring
+    would then tell the reader is not this mechanism. Found by review, with three mutants green
+    under a fast ``core_pattern``: the guard removed, the child restoring the parent's setting
+    before ``work`` runs, and the parent never restoring its own. Each check here is one of them.
+
+    Args:
+      monkeypatch: Makes the fork fail, for the restore on that path.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    before = _dumpable()
+    assert before in (0, 1), f"the parent starts at dumpable {before}, which nothing can restore"
+
+    child = run_in_child(lambda: str(_dumpable()))
+
+    assert child.finished, f"the probe child did not finish: it {child.ending}"
+    assert child.output == "0", f"the child was forked able to dump core: {child.output!r}"
+    assert _dumpable() == before, "the parent did not get its own setting back after the fork"
+
+    def refused() -> int:
+        raise OSError(errno.EAGAIN, "planted fork failure")
+
+    monkeypatch.setattr(os, "fork", refused)
+    open_before = set(os.listdir("/dev/fd"))
+    with pytest.raises(OSError, match="planted fork failure"):
+        run_in_child(lambda: None)
+    assert _dumpable() == before, "a failed fork left the parent unable to dump core"
+    leaked = set(os.listdir("/dev/fd")) - open_before
+    assert not leaked, f"a failed fork leaked descriptor(s) {sorted(leaked)} into the run"
+
+
+def test_an_unrestorable_dump_setting_is_refused_before_the_fork(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parent reading dumpable 2 gets an error, and no child, no pipe and no changed setting.
+
+    ``PR_SET_DUMPABLE`` cannot set 2 back, so :func:`_set_dumpable` refuses it up front rather
+    than discovering it in :func:`run_in_child`'s ``finally``, after the fork. Found by review,
+    with the refusal removed and still green: the case is unreachable on a CI runner, whose
+    parent reads 1, so the reading is planted here, which also lets this run off Linux.
+
+    Args:
+      monkeypatch: Plants the reading of 2 and records any fork.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    forks: list[None] = []
+
+    def recorded() -> int:
+        forks.append(None)
+        raise OSError(errno.EAGAIN, "the refusal let a fork through")
+
+    monkeypatch.setattr(sys.modules[__name__], "_dumpable", lambda: 2)
+    monkeypatch.setattr(os, "fork", recorded)
+    open_before = set(os.listdir("/dev/fd"))
+    with pytest.raises(OSError, match="dumpable is 2") as refused:
+        run_in_child(lambda: None)
+    assert refused.value.errno == errno.EINVAL
+    assert not forks, "a setting that cannot be restored was refused only after the fork"
+    leaked = set(os.listdir("/dev/fd")) - open_before
+    assert not leaked, f"the refusal leaked descriptor(s) {sorted(leaked)} into the run"
+
+
 def test_a_crashed_child_does_not_read_as_blocked() -> None:
     """A crash and a deadlock are different findings, and one test turns on telling them apart.
 
@@ -649,6 +833,15 @@ def test_a_crashed_child_does_not_read_as_blocked() -> None:
     must not read as a deadlock". Widening the watchdog would have made that rarer without
     making it legible. The marker written immediately before ``os.kill`` is what separates the
     premise from the property, and :func:`_diagnose` turns the pair into the reading.
+
+    **What held the child there on CI was its own core dump, and** :func:`run_in_child` **now
+    refuses it.** Once legible, the reading was the same each time its log was read
+    (``5202dd34`` and ``717d0c68``, Release): the child reached ``os.kill`` and was still alive
+    at the parent's deadline. A core dump piped to a slow helper holds it exactly there, and
+    :func:`_set_dumpable` says how and what was measured. With the dump refused, nothing stands
+    between the signal and the exit, so a recurrence of that reading is no longer this mechanism
+    and is worth reading as a finding. The deadline was not widened: a dump helper has no upper
+    bound to widen past.
 
     **The premise is that a signal ended the child, not that it failed to exit cleanly.**
     ``not finished`` is satisfied by a non-zero exit, so a ``work`` that reached the marker and
