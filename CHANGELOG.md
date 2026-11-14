@@ -19,6 +19,29 @@ required whenever that version's notes link this file at `blob/<tag>/…`, since
 against the tagged tree. Nothing gates this file against the tags, so it goes stale by being
 forgotten rather than by failing.
 
+## 1.2.0 — 2026-11-14
+
+**One delivery engine, and a sink per process; nothing removed or renamed.** A minor release under
+the `1.x` freeze: a sink may now offer an optional `deliver(batch) -> Verdict` that reports each
+event's fate, and one engine resends only what can still land. The HTTP family, most SDK and
+driver sinks, and the `FilteringSink`, `TransformSink` and `LogstashSink` wrappers when what they
+wrap does, now offer it and stop re-sending events that already landed or can never land; every
+other sink, among them `KafkaSink`, `GooglePubSubSink`, `SentrySink`, `MultiSink`, `CallbackSink`
+and the file, stdout and SQLite sinks, keeps its 1.1.0 retries. `Outcome`, `Verdict`, `SinkCounters`,
+`read_deliver` and `emit_via_deliver` are new public names, `log_foundry.__all__` goes from 30 to
+35, and `configure(sink_factory=)` builds a sink per process, lazily, in every process, including
+a forked child. One event a sink cannot encode now costs only itself, at encoding, in every sink.
+The library's
+lifecycle, fork and shutdown handling was rebuilt around one owner, closing a run of hangs and
+double closes. `emit`'s contract, `losses()`, `SinkLosses` and every documented counter keep their
+names and units, but several counters move, some configurations that were silently broken are now
+refused, some error messages read differently, three wrappers' retry settings are now read-only,
+and a list `PostgresSink` projects into a column now reads as JSON. The notes' opening paragraph
+lists what can break a working caller, and *Known gaps* names what is still open (one
+`ClickHouseSink` case, and lines a failed file or stream write can leave twice); read both before
+you bump a `>=1,<2` pin.
+[**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.2.0/docs/release-notes/v1.2.0.md).
+
 ## 1.1.0 — 2026-11-05
 
 **An OTLP log sink, and fixes; nothing removed or renamed.** A feature release under the `1.x`
