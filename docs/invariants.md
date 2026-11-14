@@ -525,7 +525,18 @@ is unchanged, so it is not marked, and nothing is counted (SPEC-069 follow-up fi
 lone surrogate, which only a direct `emit` can bring, is not repaired: `PostgresSink`, and
 `SQLiteSink` when it sits in a projected column, drop that event alone, counted and announced, and
 `PostgresSink` does the same for a non-finite float, which JSONB refuses and assembly and
-`TransformSink` replace with their marker.
+`TransformSink` replace with their marker. **`ClickHouseSink` neither repairs nor drops alone, so
+there one bad event still costs its whole insert chunk:** with the column types `create_table`
+provisions — `Nullable(String)`, and `Nullable(Float64)` for `duration_ms` — a projected value that
+is neither a `str` nor `None` in a string column (`AttributeError`; measured for `dict`, `list`, `int`, `float`
+and `bool`), a `str` holding a lone surrogate there (`UnicodeEncodeError`), or a `str`, `list` or
+`dict` in `duration_ms` (`DataError`) fails the chunk's one `insert`, which is not retried, and
+every event in that chunk is counted in `failed` and announced. Assembly always writes those keys
+with their columns' types, so only a direct `emit` brings one, or a `TransformSink` whose function
+rewrites a projected key with a wrong type (it replaces a lone surrogate, so that kind is direct
+`emit` only). Measured against ClickHouse 24 and clickhouse-connect 1.4.2 at `1545113c`: one such
+event in four lost all four. The fix is deferred until
+after 1.2.0, by Andrew's choice of 2026-11-13, and nothing guards this yet.
 The three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
 (invariant 13), but an over-long one is stamped unbounded (SPEC-055, Out of Scope). A boundary

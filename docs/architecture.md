@@ -1005,6 +1005,18 @@ close it.
 
 ### Open
 
+- **One value `ClickHouseSink`'s typed columns refuse costs its whole insert chunk** (invariant 8;
+  no spec — deferred past 1.2.0 by Andrew, 2026-11-13). A non-`str`, non-`None` value or a lone
+  surrogate in a `Nullable(String)` column, or a `str`, `list` or `dict` in `duration_ms`'s
+  `Nullable(Float64)`, fails the chunk's one `insert`; every event in it is counted in `failed`
+  and announced. Only a direct `emit`, or a `TransformSink` rewriting a projected key, brings one.
+  The measurement and the kinds: the *Out* sentence of
+  `docs/decisions/event-assembly/a-destinations-refusal-is-repaired-at-the-sink-and-marked-as-assembly-marks.md`.
+  **Closed by** a `column_value`-style rule in `ClickHouseSink._row` that binds or drops the one
+  value as the SQLite and PostgreSQL sinks do, plus a hostile-value corpus that runs one bad event
+  through every column-projecting sink against the real services, since the same defect has now
+  been found in three sinks.
+
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
   outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it

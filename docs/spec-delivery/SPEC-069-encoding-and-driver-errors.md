@@ -4,7 +4,7 @@
 
 Five FRs, built in `82f25317`..`bc2cc3b5` on the first spec of the `stability-redesign` arc. The
 principle: **an event the sink cannot encode costs only itself, and one its destination refuses is
-repaired and delivered.**
+repaired and delivered** — except in `ClickHouseSink`'s typed columns (*Follow-ups*).
 
 - **One encode step before the first bulk call** (FR-001): `sinks/_encode.encode_events` runs a
   sink's per-event `encode` over the whole batch under an `Exception` guard, outside any lock and
@@ -87,6 +87,11 @@ sinks gain a public `losses()`; no other public name, argument or `configure()` 
     the event is dropped alone, counted and announced (`sinks/_encode.refuse_surrogate`), in the
     same decision. Guarded by `tests/test_sinks_column_binding.py` and
     `tests/integration/test_postgres.py`.
+- **Open, deferred past 1.2.0 by Andrew (2026-11-13): `ClickHouseSink`'s typed columns.** Found
+  by the follow-up fix's system-frame review: one projected value a `ClickHouseSink` column refuses
+  costs the whole insert chunk, counted and announced. Recorded as *Out* in the same decision, as
+  an exception to invariant 8, under *Known gaps* in the 1.2.0 notes, and in `architecture.md` §12,
+  which names what closes it.
 
 ## Verification
 

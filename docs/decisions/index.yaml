@@ -6,7 +6,7 @@ areas:
     governs: ["src/log_foundry/model.py", "src/log_foundry/sanitize.py"]
     decisions:
       - title: "A destination's refusal is repaired at the sink and marked as assembly marks"
-        fence: "Assembly cannot know the destination, so a value it allows and a destination refuses is repaired by that sink, on a copy, and delivered: `PostgresSink` turns every U+0000 into U+FFFD, `MongoDBSink` an integer outside int64 into `<int: ~N digits>` and a NUL in a key into U+FFFD, each marked `truncated`, never counted; `SQLiteSink` and `PostgresSink` bind a projected column value their driver refuses as its JSON text, the event unchanged and unmarked. Only a refusal the pipeline can produce, measured against the real service, decidable from one event. (SPEC-069)"
+        fence: "Assembly cannot know the destination, so a value it allows and a destination refuses is repaired by that sink, on a copy, and delivered: `PostgresSink` turns every U+0000 into U+FFFD, `MongoDBSink` an integer outside int64 into `<int: ~N digits>` and a NUL in a key into U+FFFD, each marked `truncated`, never counted; `SQLiteSink` and `PostgresSink` bind a projected column value their driver refuses as its JSON text, the event unchanged and unmarked. `ClickHouseSink`'s typed columns are Out until after 1.2.0. Only a refusal the pipeline can produce, measured against the real service, decidable from one event. (SPEC-069)"
         status: "stable"
         path: "docs/decisions/event-assembly/a-destinations-refusal-is-repaired-at-the-sink-and-marked-as-assembly-marks.md"
       - title: "A reserved word needs exactly one route through, including its own name"

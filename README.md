@@ -1588,6 +1588,11 @@ value is stored as it is). Each repair is made on a copy, so another sink beside
 when assembly makes the same substitution, and nothing is counted as lost. The six characters
 `\u0000` written as text are not a NUL and are left alone.
 
+**`SQLiteSink` and `PostgresSink` store a projected column value their driver cannot bind as its
+JSON text; `ClickHouseSink` does not yet.** One value its typed columns refuse, which only a direct
+`emit` or a `TransformSink` rewriting a top-level key can bring, costs every event in its insert
+chunk, counted in `failed` and announced. The fix is planned after 1.2.0.
+
 ## Development
 
 ```bash
