@@ -24,9 +24,10 @@ forgotten rather than by failing.
 **One delivery engine, and a sink per process; nothing removed or renamed.** A minor release under
 the `1.x` freeze: a sink may now offer an optional `deliver(batch) -> Verdict` that reports each
 event's fate, and one engine resends only what can still land. The HTTP family, most SDK and
-driver sinks, and the `FilteringSink`, `TransformSink` and `LogstashSink` wrappers now offer it and
-stop re-sending events that already landed or can never land; `KafkaSink`, `GooglePubSubSink`,
-`SentrySink`, `MultiSink` and the file, stdout and SQLite sinks keep their 1.1.0 retries. `Outcome`, `Verdict`, `SinkCounters`,
+driver sinks, and the `FilteringSink`, `TransformSink` and `LogstashSink` wrappers when what they
+wrap does, now offer it and stop re-sending events that already landed or can never land; every
+other sink, among them `KafkaSink`, `GooglePubSubSink`, `SentrySink`, `MultiSink`, `CallbackSink`
+and the file, stdout and SQLite sinks, keeps its 1.1.0 retries. `Outcome`, `Verdict`, `SinkCounters`,
 `read_deliver` and `emit_via_deliver` are new public names, `log_foundry.__all__` goes from 30 to
 35, and `configure(sink_factory=)` builds a sink per process, lazily, in every process, including
 a forked child. One event a sink cannot encode now costs only itself in every sink. The library's
