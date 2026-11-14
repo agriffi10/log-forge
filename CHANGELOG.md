@@ -30,13 +30,16 @@ other sink, among them `KafkaSink`, `GooglePubSubSink`, `SentrySink`, `MultiSink
 and the file, stdout and SQLite sinks, keeps its 1.1.0 retries. `Outcome`, `Verdict`, `SinkCounters`,
 `read_deliver` and `emit_via_deliver` are new public names, `log_foundry.__all__` goes from 30 to
 35, and `configure(sink_factory=)` builds a sink per process, lazily, in every process, including
-a forked child. One event a sink cannot encode now costs only itself in every sink. The library's
+a forked child. One event a sink cannot encode now costs only itself, at encoding, in every sink.
+The library's
 lifecycle, fork and shutdown handling was rebuilt around one owner, closing a run of hangs and
 double closes. `emit`'s contract, `losses()`, `SinkLosses` and every documented counter keep their
 names and units, but several counters move, some configurations that were silently broken are now
-refused, and a list `PostgresSink` projects into a column now reads as JSON. The notes' opening
-paragraph lists what can break a working caller, and *Known gaps* names the one case
-`ClickHouseSink` does not cover yet; read both before you bump a `>=1,<2` pin.
+refused, some error messages read differently, three wrappers' retry settings are now read-only,
+and a list `PostgresSink` projects into a column now reads as JSON. The notes' opening paragraph
+lists what can break a working caller, and *Known gaps* names what is still open (one
+`ClickHouseSink` case, and lines a failed file or stream write can leave twice); read both before
+you bump a `>=1,<2` pin.
 [**Full release notes**](https://github.com/agriffi10/log-forge/blob/v1.2.0/docs/release-notes/v1.2.0.md).
 
 ## 1.1.0 — 2026-11-05
