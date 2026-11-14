@@ -528,7 +528,7 @@ lone surrogate, which only a direct `emit` can bring, is not repaired: `Postgres
 `TransformSink` replace with their marker. **`ClickHouseSink` neither repairs nor drops alone, so
 there one bad event still costs its whole insert chunk:** with the column types `create_table`
 provisions — `Nullable(String)`, and `Nullable(Float64)` for `duration_ms` — a projected value that
-is not a `str` in a string column (`AttributeError`; measured for `dict`, `list`, `int`, `float`
+is neither a `str` nor `None` in a string column (`AttributeError`; measured for `dict`, `list`, `int`, `float`
 and `bool`), a `str` holding a lone surrogate there (`UnicodeEncodeError`), or a `str`, `list` or
 `dict` in `duration_ms` (`DataError`) fails the chunk's one `insert`, which is not retried, and
 every event in that chunk is counted in `failed` and announced. Assembly always writes those keys
