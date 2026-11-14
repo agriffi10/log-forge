@@ -534,8 +534,8 @@ and `bool`), a `str` holding a lone surrogate there (`UnicodeEncodeError`), or a
 every event in that chunk is counted in `failed` and announced. Assembly always writes those keys
 with their columns' types, so only a direct `emit` brings one, or a `TransformSink` whose function
 rewrites a projected key with a wrong type (it replaces a lone surrogate, so that kind is direct
-`emit` only). Measured against ClickHouse 24 and clickhouse-connect 1.4.2, at `1545113c` and again
-at the commit recording this: one such event in four lost all four. The fix is deferred until
+`emit` only). Measured against ClickHouse 24 and clickhouse-connect 1.4.2 at `1545113c`: one such
+event in four lost all four. The fix is deferred until
 after 1.2.0, by Andrew's choice of 2026-11-13, and nothing guards this yet.
 The three config stamps `service`, `version` and `env` are copied from
 the config without a ceiling — `configure()` refuses one that is not a `str` or cannot encode
