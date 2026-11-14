@@ -19,12 +19,14 @@ description: "Assembly cannot know the destination, so a value it allows and a d
 
 **Marked as assembly marks, and not a loss.** A repaired copy carries `truncated: True`, the mark assembly sets for a lone surrogate replaced by U+FFFD and for its too-large-number placeholder; an event the repair did not change gets no `truncated` key and is byte-identical to before. Two keys that repair to one text keep the later value, marked, as assembly resolves two hostile keys on one placeholder. Nothing is counted and nothing is announced, as with assembly's coercion (invariant 2).
 
-**Do NOT** repair in assembly what only one destination refuses; do NOT mutate the batch; do NOT repair a refusal no real service was measured making; do NOT repair the JSON text by substring; do NOT import `bson` at construction or let a missing one raise; do NOT count or announce a repair. ~~Out: a lone surrogate reaching `PostgresSink` through a direct `emit` (assembly and `TransformSink` replace them, so it is outside the pipeline and unmeasured), and SQLite column values that cannot be bound.~~ Superseded by the SPEC-069 follow-up fix of 2026-11-13: both measured and handled, as *A projected column the driver cannot bind* and *A lone surrogate* above say. (SPEC-069 FR-003)
+**Do NOT** repair in assembly what only one destination refuses; do NOT mutate the batch; do NOT repair a refusal no real service was measured making; do NOT repair the JSON text by substring; do NOT import `bson` at construction or let a missing one raise; do NOT count or announce a repair. ~~Out: a lone surrogate reaching `PostgresSink` through a direct `emit` (assembly and `TransformSink` replace them, so it is outside the pipeline and unmeasured), and SQLite column values that cannot be bound.~~ Superseded by the SPEC-069 follow-up fix of 2026-11-13: both measured and handled, as *A projected column the driver cannot bind* and *A lone surrogate* above say. Out until after 1.2.0, by Andrew's choice of 2026-11-13: `ClickHouseSink`, whose projected columns are typed (`Nullable(String)`, and `Nullable(Float64)` for `duration_ms`); a value one refuses (measured: a `dict` or an `int` in a string column, a `str` or a `list` in `duration_ms`), which only a direct `emit` or a `TransformSink` brings, fails the chunk's one `insert`, the driver raising `AttributeError` for a string column and `DataError` for `duration_ms`, neither retried, so every event in the chunk is lost, counted and announced (measured at `1545113c` against ClickHouse 24 and clickhouse-connect 1.4.2). Invariant 8 records it as an exception. (SPEC-069 FR-003)
 
 ## History
 
 ### 2026-11-13
 
+- **Recorded** the `ClickHouseSink` twin as *Out*: found by the SPEC-069 follow-up fix's
+  system-frame review, re-measured at `1545113c`, and deferred past 1.2.0 by Andrew.
 - **Widened** by the SPEC-069 follow-up fix (no spec): a projected column value `sqlite3` or
   psycopg cannot bind is bound as its JSON text, unmarked, and a lone surrogate from a direct
   `emit` is dropped alone rather than repaired, both measured. The struck *Out* sentence names
