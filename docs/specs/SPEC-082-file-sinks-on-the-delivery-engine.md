@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-082
 title: "File Sinks on the Delivery Engine: Resend Only What Did Not Land"
 description: "Moves FileSink and RotatingFileSink onto deliver, so a write that fails partway reports each event by the bytes the operating system took and the engine resends only the events that did not land, which closes the duplicate lines a partial write and the worker's whole-batch retry produce today."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-048, SPEC-069, SPEC-070, SPEC-072, SPEC-074, SPEC-075, SPEC-076]
 ---
 
