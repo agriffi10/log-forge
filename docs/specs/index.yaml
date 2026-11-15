@@ -571,7 +571,7 @@ specs:
   - id: "SPEC-086"
     title: "The Model Test's Passive Gate and Soak: A One-Second Time Bound, an Exact Close Count Where One Caller Makes It Exact, and the Same Count Under Concurrency on Request"
     description: "Tightens the generative model test for the passive sink it runs today: every call is held to its timeout plus one second, a sink's closes are counted against its writes where a single caller makes that exact, seeds are named and widened from the environment, and the same close count runs under concurrency as an on-request soak that reads the library's own arms and takes to tell a second close it owes from one it does not."
-    spec_status: "Draft"
+    spec_status: "In Progress"
     depends_on: ["SPEC-077", "SPEC-085"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-086-passive-model-gate-and-soak.md"
