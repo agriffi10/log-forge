@@ -1,0 +1,576 @@
+diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 18:19:25
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 18:37:45
+@@ -64,6 +64,9 @@
+         "StreamLostError": ("AMQPConnectionError",),
+         "ConnectionWrongStateError": ("AMQPConnectionError",),
+         "ChannelWrongStateError": ("AMQPError",),
++        "UnroutableError": ("AMQPError",),
++        "NackError": ("AMQPError",),
++        "ChannelClosedByBroker": ("AMQPError",),
+     },
+     "psycopg.errors": {"Error": (), "OperationalError": ("Error",)},
+     "redis.exceptions": {
+@@ -749,13 +752,20 @@
+ 
+ 
+ class RabbitChannel:
+-    """`basic_publish` writes a frame to its connection's socket; no confirm is asked for."""
++    """`basic_publish` writes a frame to its connection's socket; with confirms on, it waits for
++    the broker's ack, and a dead connection is found while waiting."""
+ 
+     def __init__(self, conn: RabbitConnection) -> None:
+         self.conn = conn
++        self.confirming = False
+ 
++    def confirm_delivery(self) -> None:
++        if self.conn.broken:
++            raise driver_error("pika.exceptions", "ChannelWrongStateError", "Channel is closed")
++        self.confirming = True
++
+     def basic_publish(
+-        self, *, exchange: str, routing_key: str, body: bytes, properties: Any
++        self, *, exchange: str, routing_key: str, body: bytes, properties: Any, mandatory: bool = False
+     ) -> None:
+         conn = self.conn
+         if conn.broken:
+@@ -764,6 +774,9 @@
+         backend = conn.backend
+         if backend.peer_closed and conn.generation == 0:
+             backend.decide(carried, knowable=False)
++            if self.confirming:
++                conn.broken = True
++                raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
+             conn.blind += 1
+             if conn.blind > 3:
+                 conn.broken = True
+@@ -772,9 +785,11 @@
+         action = backend.decide(carried)
+         if action == "refuse":
+             conn.broken = True
++            if self.confirming:
++                raise driver_error("pika.exceptions", "ChannelWrongStateError", "Channel is closed")
+             raise driver_error("pika.exceptions", "AMQPConnectionError", "connection refused")
+         backend.take(carried)
+-        if action == "taken-raise":
++        if action in ("taken-raise", "reply-lost") and (self.confirming or action == "taken-raise"):
+             conn.broken = True
+             raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
+ 
+diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_table.py ./docs/audits/2026-11-14-probes/sinks/spec092_table.py
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-15 18:19:25
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-15 18:37:45
+@@ -109,7 +109,7 @@
+     return _same(make)
+ 
+ 
+-def _rabbitmq(owned: bool) -> Build:
++def _rabbitmq(owned: bool, confirm: bool = True) -> Build:
+     """`owned` builds from a URL through the stub `pika.BlockingConnection`, each connection new;
+     `borrowed` hands the sink one connection, which its `_reset` keeps."""
+ 
+@@ -124,6 +124,8 @@
+             sys.modules["pika"].BlockingConnection = lambda params: shims.RabbitConnection(  # type: ignore[attr-defined]
+                 backend, next(generations)
+             )
++            if not confirm:
++                return RabbitMQSink(exchange="x", routing_key="k", url="amqp://h/", confirm=False)
+             return RabbitMQSink(exchange="x", routing_key="k", url="amqp://h/")
+         return RabbitMQSink(
+             exchange="x", routing_key="k", connection=shims.RabbitConnection(backend)
+@@ -423,8 +425,9 @@
+         "socket-stream",
+         _socket_sink("log_foundry.sinks.logstash.LogstashSink", "udp", host="h", port=5000),
+     ),
+-    ("RabbitMQSink", "owned"): ("socket-stream", _rabbitmq(True)),
+-    ("RabbitMQSink", "borrowed"): ("socket-stream", _rabbitmq(False)),
++    ("RabbitMQSink", "owned"): ("per-event-ack", _rabbitmq(True)),
++    ("RabbitMQSink", "borrowed"): ("per-event-ack", _rabbitmq(False)),
++    ("RabbitMQSink", "unconfirmed"): ("socket-stream", _rabbitmq(True, confirm=False)),
+     ("NATSSink", "jetstream"): ("per-event-ack", _nats(True, owned=True)),
+     ("NATSSink", "jetstream-injected"): ("per-event-ack", _nats(True, owned=False)),
+     ("NATSSink", "core"): ("client-buffered", _nats(False, owned=True)),
+@@ -513,6 +516,13 @@
+ """A variant that exists for one fault runs only that fault."""
+ 
+ 
++ADDS: dict[tuple[str, str], tuple[str, ...]] = {
++    ("RabbitMQSink", "owned"): ("taken-then-raised", "peer-closed"),
++    ("RabbitMQSink", "borrowed"): ("taken-then-raised", "peer-closed"),
++}
++"""Faults a variant runs beyond its class's: RabbitMQ holds a connection between batches."""
++
++
+ def rows() -> list[Row]:
+     out: list[Row] = []
+     for (sink, variant), (klass, build) in VARIANTS.items():
+@@ -521,6 +531,7 @@
+             faults = (*faults, "caller-code-raises")
+         if (sink, variant) in ONLY:
+             faults = ONLY[(sink, variant)]
++        faults = (*faults, *ADDS.get((sink, variant), ()))
+         skip = NOT_RUN.get((sink, variant), {})
+         for fault in faults:
+             if fault in skip:
+diff -ruN ./src/log_foundry/sinks/_batch.py ./src/log_foundry/sinks/_batch.py
+--- a/src/log_foundry/sinks/_batch.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/_batch.py	2026-11-15 18:37:45
+@@ -142,6 +142,7 @@
+     error_key: str = "ErrorCode",
+     failed_count: object = _NOT_PASSED,
+     rejected: bool = False,
++    absent: bool = False,
+ ) -> Adjudication[T]:
+     """Pairs a positional batch response against the records it should describe.
+ 
+@@ -183,6 +184,8 @@
+     """
+     if failed_count is not _NOT_PASSED:
+         if rejected:
++            return Adjudication([], len(records))
++        if absent and failed_count is ABSENT:
+             return Adjudication([], len(records))
+         return _adjudicate_counted(records, results, error_key, failed_count)
+     if len(results) != len(records):
+diff -ruN ./src/log_foundry/sinks/_rounds.py ./src/log_foundry/sinks/_rounds.py
+--- a/src/log_foundry/sinks/_rounds.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/_rounds.py	2026-11-15 18:37:45
+@@ -259,16 +259,28 @@
+       None. A ``BaseException`` from the predicate or the reply still propagates.
+     """
+     try:
+-        failed = cast("dict[str, object]", response).get("Failed", [])
++        reply = cast("dict[str, object]", response)
++        if "Failed" not in reply and "Successful" not in reply:
++            return KeyedReply([], unread=True)
++        failed = reply.get("Failed", [])
+         read = adjudicate_keyed(ids, failed, key="Id")
+         if read.unadjudicated:
+             return KeyedReply([], unread=True)
++        named: list[object] = [None] * len(ids)
++        if "Successful" in reply:
++            landed = adjudicate_keyed(ids, reply["Successful"], key="Id")
++            if landed.unadjudicated:
++                return KeyedReply([], unread=True)
++            named = list(landed.failed)
+         outcomes: list[Outcome] = []
+         code: object = "unknown"
+         found = False
+-        for entry in read.failed:
++        for entry, success in zip(read.failed, named, strict=True):
++            if entry is not None and success is not None:
++                return KeyedReply([], unread=True)
+             if entry is None:
+-                outcomes.append(Outcome.ACCEPTED)
++                listed = success is not None or "Successful" not in reply
++                outcomes.append(Outcome.ACCEPTED if listed else Outcome.UNKNOWN)
+             elif retryable_entry(entry):
+                 outcomes.append(Outcome.RETRYABLE)
+             else:
+@@ -392,6 +404,7 @@
+             fates[position] = Outcome.UNKNOWN
+         unread = len(positions)
+         when = When.LAST if context.resends_unknown(owner) else When.ALWAYS
++        context.count(cast("_Counted", owner), "dropped_unadjudicated", unread, when=when)
+         context.announce(
+             lambda: _diag.lost(
+                 "message",
+@@ -404,16 +417,31 @@
+         return []
+     accepted: list[int] = []
+     faults = 0
++    unnamed = 0
+     retrying: list[dict[str, object]] = []
+     for position, event, outcome in zip(positions, carried, reply.outcomes, strict=True):
+         fates[position] = outcome
+         if outcome is Outcome.ACCEPTED:
+             accepted.append(position)
++        elif outcome is Outcome.UNKNOWN:
++            unnamed += 1
+         elif outcome is Outcome.REJECTED:
+             faults += 1
+             final.append(position)
+         else:
+             retrying.append(event)
++    if unnamed:
++        when = When.LAST if context.resends_unknown(owner) else When.ALWAYS
++        context.count(cast("_Counted", owner), "dropped_unadjudicated", unnamed, when=when)
++        context.announce(
++            lambda: _diag.lost(
++                "message",
++                unnamed,
++                f"{name}, a {call} reply named neither success nor failure for {unnamed} "
++                "entry(ies); may have landed, not retried",
++            ),
++            when=when,
++        )
+     if faults:
+         code = reply.code
+         context.announce(
+@@ -501,7 +529,9 @@
+         failed_count, raw = ABSENT, object()
+     results = usable_results(raw)
+     rejected = results_rejected(raw)
+-    verdict = adjudicate_positional(records, results, failed_count=failed_count, rejected=rejected)
++    verdict = adjudicate_positional(
++        records, results, failed_count=failed_count, rejected=rejected, absent=raw is None
++    )
+     if verdict.unadjudicated:
+         coded = sum(1 for result in results if result.get("ErrorCode"))
+         returned = (
+diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
+--- a/src/log_foundry/sinks/_socket.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/_socket.py	2026-11-15 18:37:45
+@@ -4,6 +4,7 @@
+ 
+ import errno
+ import json
++import select
+ import socket
+ from typing import TYPE_CHECKING
+ 
+@@ -116,6 +117,37 @@
+     )
+ 
+ 
++def _closed_by_peer(sock: socket.socket) -> bool:
++    """Reports whether a held TCP connection shows its peer has closed it (SPEC-093 FR-001).
++
++    A zero-timeout readiness check, then a one-byte peek: readable with nothing to read is a FIN,
++    and a peek that raises ``OSError`` is a reset. A check that cannot be made reads as open.
++
++    Args:
++      sock: The held socket.
++
++    Returns:
++      True when the peer has closed or reset the connection.
++
++    Raises:
++      None.
++    """
++    try:
++        try:
++            readable = bool(select.select([sock], [], [], 0)[0])
++        except ValueError:
++            poller = select.poll()
++            poller.register(sock, select.POLLIN)
++            readable = bool(poller.poll(0))
++        if not readable:
++            return False
++        return sock.recv(1, socket.MSG_PEEK) == b""
++    except OSError:
++        return True
++    except Exception:
++        return False
++
++
+ def _json_frame(event: dict[str, object]) -> bytes:
+     """Frames an event as its UTF-8 JSON text, the transport's default when a caller gives none.
+ 
+@@ -400,12 +432,20 @@
+             fates = [Outcome.DROPPED] * len(batch)
+             pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
+             lost = Lost(self)
++            stream = self._transport == "tcp"
++            if stream and self._sock is not None and _closed_by_peer(self._sock):
++                self._reset()
++            unconfirmed: list[int] = []
+             for position, message in self._sendable(pairs, context.drops(self)):
+                 mark_sent(self, [batch[position]])
+                 called = self._send_one(message)
+                 if called.error is None:
+                     fates[position] = Outcome.ACCEPTED
++                    if stream:
++                        unconfirmed.append(position)
+                     continue
++                self._unconfirm(unconfirmed, fates, context)
++                unconfirmed = []
+                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                 kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
+                 lost.add(
+@@ -414,8 +454,40 @@
+                     key=kind,
+                     line=raised_line("message", "SocketTransport", kind),
+                 )
++            if unconfirmed and self._sock is not None and _closed_by_peer(self._sock):
++                self._unconfirm(unconfirmed, fates, context)
++                self._reset()
+             lost.register()
+         return Verdict(outcomes=tuple(fates))
++
++    def _unconfirm(self, positions: list[int], fates: list[Outcome], context: object) -> None:
++        """Makes frames written to a connection later found closed ``UNKNOWN``, with one line.
++
++        Args:
++          positions: The frames written on that connection since its last check.
++          fates: The round's outcomes, updated in place.
++          context: The run context.
++
++        Returns:
++          None.
++
++        Raises:
++          None.
++        """
++        if not positions:
++            return
++        for position in positions:
++            fates[position] = Outcome.UNKNOWN
++        count = len(positions)
++        run_context().announce(
++            lambda: _diag.lost(
++                "message",
++                count,
++                "SocketTransport, written to a connection its peer closed; may have landed, "
++                "not retried",
++            ),
++            when=When.ALWAYS,
++        )
+ 
+     def _sendable(
+         self, messages: list[tuple[int, bytes]], pending: Deferral | _Drops
+diff -ruN ./src/log_foundry/sinks/elasticsearch.py ./src/log_foundry/sinks/elasticsearch.py
+--- a/src/log_foundry/sinks/elasticsearch.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/elasticsearch.py	2026-11-15 18:38:07
+@@ -188,7 +188,7 @@
+             data = json.loads(payload)
+         except Exception:
+             return self._unadjudicated(items, _detail(sent))
+-        if not _diag.is_a(data, dict):
++        if not _diag.is_a(data, dict) or ("errors" not in data and "items" not in data):
+             return self._unadjudicated(items, _detail(sent))
+         if not data.get("errors"):
+             return (Outcome.ACCEPTED,) * sent
+diff -ruN ./src/log_foundry/sinks/rabbitmq.py ./src/log_foundry/sinks/rabbitmq.py
+--- a/src/log_foundry/sinks/rabbitmq.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/rabbitmq.py	2026-11-15 18:38:07
+@@ -80,6 +80,7 @@
+         blocked_connection_timeout: float | None = None,
+         socket_timeout: float | None = None,
+         stack_timeout: float | None = None,
++        confirm: bool = True,
+     ) -> None:
+         """Binds the sink to an exchange and connects if no connection was injected.
+ 
+@@ -146,6 +147,8 @@
+         self._owns_connection = connection is None
+         self._connection = connection if connection is not None else self._connect()
+         self._channel: Any = None
++        self._confirming = False
++        self._confirm = confirm
+         self._properties: Any = None
+         self.log_foundry_counters = SinkCounters()
+         self._guard = ClosedGuard(GuardMode.SERIAL)
+@@ -339,6 +342,7 @@
+                 return Verdict.uniform(Outcome.REJECTED, len(batch))
+             fates = [Outcome.DROPPED] * len(batch)
+             lost = Lost(self)
++            unknown: list[str] = []
+             name = _diag.type_name(self)
+             for position, body in encode_round(self, batch, self._encode, sink=name):
+                 mark_sent(self, [batch[position]])
+@@ -346,8 +350,12 @@
+                 if called.error is None:
+                     fates[position] = Outcome.ACCEPTED
+                     continue
+-                fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                 kind = _diag.type_name(called.error)
++                if called.result == "unknown":
++                    fates[position] = Outcome.UNKNOWN
++                    unknown.append(kind)
++                    continue
++                fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                 lost.add(
+                     [batch[position]],
+                     when=When.LAST if called.retryable else When.ALWAYS,
+@@ -355,6 +363,18 @@
+                     line=raised_line("message", "RabbitMQSink", kind),
+                 )
+             lost.register()
++            if unknown:
++                count = len(unknown)
++                first = unknown[0]
++                run_context().announce(
++                    lambda: _diag.lost(
++                        "message",
++                        count,
++                        f"RabbitMQSink, no confirm before the connection was lost ({first}); "
++                        "may have landed, not retried",
++                    ),
++                    when=When.ALWAYS,
++                )
+         return Verdict(outcomes=tuple(fates))
+ 
+     def _encode(self, event: dict[str, object]) -> bytes:
+@@ -414,7 +434,7 @@
+             _safe_close(self._connection)
+             self._connection = None
+ 
+-    def _publish(self, body: bytes) -> Called[None]:
++    def _publish(self, body: bytes) -> Called[str]:
+         """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.
+ 
+         Args:
+@@ -428,14 +448,32 @@
+             (FR-011).
+         """
+         try:
+-            self._active_channel().basic_publish(
++            channel = self._active_channel()
++        except Exception as err:
++            self._reset()
++            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
++        try:
++            channel.basic_publish(
+                 exchange=self._exchange,
+                 routing_key=self._routing_key,
+                 body=body,
+                 properties=self._persistent_properties(),
++                **({"mandatory": True} if self._confirming else {}),
+             )
+         except Exception as err:
++            refused = driver_classes("pika.exceptions", "UnroutableError", "NackError")
++            if _diag.is_a(err, refused):
++                return Called(None, error=err, retryable=False)
+             self._reset()
++            unconfirmed = driver_classes(
++                "pika.exceptions",
++                "StreamLostError",
++                "ConnectionClosedByBroker",
++                "AMQPHeartbeatTimeout",
++                "ConnectionBlockedTimeout",
++            )
++            if self._confirming and _diag.is_a(err, unconfirmed):
++                return Called("unknown", error=err)
+             return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+         return Called(None)
+ 
+@@ -497,7 +535,12 @@
+         if self._connection is None:
+             self._connection = self._connect()
+         if self._channel is None:
+-            self._channel = self._connection.channel()
++            channel = self._connection.channel()
++            confirm = getattr(channel, "confirm_delivery", None) if self._confirm else None
++            if callable(confirm):
++                confirm()
++            self._confirming = callable(confirm)
++            self._channel = channel
+         return self._channel
+ 
+     def _reset(self) -> None:
+diff -ruN ./src/log_foundry/sinks/sentry.py ./src/log_foundry/sinks/sentry.py
+--- a/src/log_foundry/sinks/sentry.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/sentry.py	2026-11-15 18:37:45
+@@ -10,6 +10,7 @@
+ from urllib.parse import urlsplit
+ 
+ from log_foundry import _diag, _lifecycle
++from log_foundry.sinks._deferral import Deferral
+ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+ from log_foundry.sinks.http import (
+@@ -180,6 +181,7 @@
+         self.sent = 0
+         self.skipped = 0
+         self.transport_errors = 0
++        self.discarded = 0
+         self._counter_lock = threading.Lock()
+         self.client: Any = None if backend == "http" else (
+             client if client is not None else _import_sdk()
+@@ -232,22 +234,34 @@
+             successful emit — there was never anything to deliver.
+         """
+         backend = self._select_backend()
+-        attempted = delivered = 0
+-        for event in batch:
+-            if not self._qualifies(event):
++        attempted = delivered = discarded = 0
++        with Deferral(self) as pending:
++            for event in batch:
++                if not self._qualifies(event):
++                    with self._counter_lock:
++                        self.skipped += 1
++                    continue
++                attempted += 1
++                landed = self._capture(event, backend)
++                if landed is None:
++                    discarded += 1
++                    continue
++                if not landed:
++                    continue
+                 with self._counter_lock:
+-                    self.skipped += 1
+-                continue
+-            attempted += 1
+-            if not self._capture(event, backend):
+-                continue
+-            with self._counter_lock:
+-                self.sent += 1
+-            delivered += 1
+-        if attempted and not delivered:
+-            raise SinkDeliveryError(
+-                f"SentrySink delivered none of {attempted} qualifying event(s)"
+-            )
++                    self.sent += 1
++                delivered += 1
++            if discarded:
++                pending.count("discarded", discarded)
++                pending.announce(
++                    lambda: _diag.lost(
++                        "event", discarded, "SentrySink, discarded by the Sentry SDK at capture"
++                    )
++                )
++            if attempted - discarded and not delivered:
++                raise SinkDeliveryError(
++                    f"SentrySink delivered none of {attempted} qualifying event(s)"
++                )
+ 
+     def flush(self) -> None:
+         """Pushes the Sentry SDK's own transport queue, which nothing else here ever does.
+@@ -402,9 +416,11 @@
+           None.
+         """
+         with self._counter_lock:
+-            return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
++            return SinkLosses(
++                dropped=self.discarded, failed=self.failed + self.transport_errors
++            )
+ 
+-    def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool:
++    def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool | None:
+         """Sends one event by the backend ``emit`` resolved for this batch.
+ 
+         A ``None`` backend is refused here, before the ``try``, and moves nothing. Letting it fall
+@@ -445,7 +461,8 @@
+             return False
+         try:
+             if backend == "sdk":
+-                self.client.capture_event(self._sentry_event(event))
++                if self.client.capture_event(self._sentry_event(event)) is None:
++                    return None
+             else:
+                 self._post_envelope(event)
+         except SinkDeliveryError:
+diff -ruN ./src/log_foundry/sinks/sns.py ./src/log_foundry/sinks/sns.py
+--- a/src/log_foundry/sinks/sns.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/sns.py	2026-11-15 18:37:45
+@@ -95,6 +95,7 @@
+         self.log_foundry_stop_signal: threading.Event | None = None
+         self.log_foundry_counters = SinkCounters()
+         self.dropped_oversized = 0
++        self.dropped_unadjudicated = 0
+ 
+     @property
+     def _counter_lock(self) -> threading.Lock:
+diff -ruN ./src/log_foundry/sinks/sqs.py ./src/log_foundry/sinks/sqs.py
+--- a/src/log_foundry/sinks/sqs.py	2026-11-15 18:19:25
++++ b/src/log_foundry/sinks/sqs.py	2026-11-15 18:37:45
+@@ -245,6 +245,7 @@
+         self.message_deduplication_id = message_deduplication_id
+         self.log_foundry_counters = SinkCounters()
+         self.dropped_oversized = 0
++        self.dropped_unadjudicated = 0
+ 
+     @property
+     def _counter_lock(self) -> threading.Lock:

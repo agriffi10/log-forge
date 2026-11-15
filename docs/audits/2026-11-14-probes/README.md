@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Thirty-six files here are not the audit's.** Each was added after the audit was brought in
+**Forty-one files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -32,6 +32,13 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   import one another, so `sinks/` and `tests/` go on `PYTHONPATH` as their docstrings say.
 - `core-pipeline/spec088_cost.py`, written while building SPEC-088: it measures what the event
   ledger costs, by the spec's Evidence method, for the delivery doc.
+- `sinks/spec093_socket_options.py` and `sinks/spec093_rabbitmq_confirm_cost.py`, written while
+  authoring SPEC-093 against `33582484`, and `sinks/spec094_report_wait_cost.py`, written while
+  authoring SPEC-094. Each is run with `PYTHONPATH=<tree>/src` as its docstring says, against two
+  trees to compare. `sinks/spec093_prototype.patch` and `sinks/spec094_prototype.patch` are not
+  probes: they are the two specs' prototypes, applied in that order with `patch -p1` to
+  `git archive bb6656ff src tests docs/audits/2026-11-14-probes`, and SPEC-093's and SPEC-094's
+  *Evidence* sections say what each measured.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded

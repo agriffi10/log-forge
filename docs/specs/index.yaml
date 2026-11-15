@@ -617,13 +617,27 @@ specs:
     depends_on: ["SPEC-026", "SPEC-041", "SPEC-049", "SPEC-061", "SPEC-069", "SPEC-071", "SPEC-072", "SPEC-073", "SPEC-074", "SPEC-075", "SPEC-079", "SPEC-082", "SPEC-084", "SPEC-085", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-092-sink-conformance-corpus.md"
+  - id: "SPEC-093"
+    title: "Acknowledgement Fixes: a Write the Sink Cannot Confirm Is Counted, Not Believed"
+    description: "Makes the TCP socket sinks, SentrySink's SDK backend, the AWS batch sinks, the _bulk sinks and RabbitMQSink stop reporting as delivered what their backend never confirmed, each counting and announcing it as lost or as one that may have landed, so the rows SPEC-092's conformance corpus pins for findings 1, 11 and 14 and for RabbitMQ's missing confirms turn green and no other row moves."
+    spec_status: "Draft"
+    depends_on: ["SPEC-070", "SPEC-072", "SPEC-073", "SPEC-074", "SPEC-076", "SPEC-092"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-093-acknowledgement-fixes.md"
+  - id: "SPEC-094"
+    title: "Client-Buffered Sinks Wait for the Delivery Report, on the Delivery Engine"
+    description: "Moves KafkaSink and GooglePubSubSink onto the delivery engine, with each round waiting within the sink's own timeout for the client's report on every message it handed over, so that a definitive refusal fails the batch, an indefinite report is counted as one that may have landed, and no count arrives after the batch's verdict."
+    spec_status: "Draft"
+    depends_on: ["SPEC-069", "SPEC-072", "SPEC-074", "SPEC-075", "SPEC-076", "SPEC-092"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-094-client-buffered-sinks-wait-for-the-report.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
