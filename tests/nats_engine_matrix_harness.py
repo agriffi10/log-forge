@@ -37,17 +37,36 @@ LINE_PREFIX = "log-foundry:"
 
 
 class Clock:
-    """A ``time`` stand-in for ``log_foundry.sinks.nats``: real time plus an offset.
+    """A ``time`` stand-in for ``log_foundry.sinks.nats``: a fixed base plus an offset.
+
+    The reading does not advance with real time, so a deadline the sink computes from it passes
+    only when a double moves ``offset``, never because the runner was slow: a loaded CI runner
+    once spent a case's whole ``PUBLISH_TIMEOUT`` between two events, and the sink recorded the
+    rest as unattempted. Every bounded wait in the sink is an ``asyncio`` timeout on the loop's
+    own clock, which this does not replace, so a publish that holds is still abandoned on time.
+
+    Two readers see the difference. Probe ageing (``_latched``, and the wait ``_await_probe``
+    takes) measures a probe's age on this clock, so an outstanding probe never ages and the
+    stall latch never arms unless a double moves ``offset``; the recorded cases leave no probe
+    outstanding long enough for that to change a record, on either tree. And ``_drained`` polls
+    this clock until the driver's pending buffer empties or the deadline passes: with the
+    buffer non-zero and the clock frozen, the deadline never passes, the loop spins until the
+    caller's real-time backstop gives up on the loop, and the verdict becomes a wedged loop
+    instead of an unconfirmed batch, on both trees alike, so the matrix would compare an
+    artifact of the backstop. :func:`run_case` therefore refuses a client whose
+    ``pending_data_size`` is not zero (:func:`_require_drained`).
 
     Attributes:
+      base: The real ``monotonic()`` reading taken when the clock was made.
       offset: Seconds added to every reading; a double moves it to pass a deadline at once.
     """
 
     def __init__(self) -> None:
+        self.base = real_time.monotonic()
         self.offset = 0.0
 
     def monotonic(self) -> float:
-        return real_time.monotonic() + self.offset
+        return self.base + self.offset
 
     def __getattr__(self, name: str) -> Any:
         return getattr(real_time, name)
@@ -188,10 +207,35 @@ def _patched(target: Any, name: str, value: Any) -> Iterator[None]:
             setattr(target, name, old)
 
 
-def _build(case: Case, script: Script) -> Any:
+def _require_drained(client: Client) -> None:
+    """Refuses a client double that reports pending bytes, which the frozen clock cannot model.
+
+    Read as the sink reads it, by name with a default of zero. A non-zero buffer makes the sink's
+    ``_drained`` wait for a deadline that :class:`Clock` never passes on its own, so the case would
+    end on the caller's real-time backstop rather than on the behaviour it is meant to record. A
+    double that needs a stalled buffer must move ``Clock.offset`` itself.
+
+    Args:
+      client: The double the case's sink publishes through.
+
+    Returns:
+      None.
+
+    Raises:
+      RuntimeError: The client reports a non-zero ``pending_data_size``.
+    """
+    pending = getattr(client, "pending_data_size", 0)
+    if pending != 0:
+        raise RuntimeError(
+            f"the NATS matrix client reports pending_data_size={pending!r}: the harness's frozen "
+            "clock cannot model a drain, so a double with pending bytes must move Clock.offset "
+            "itself"
+        )
+
+
+def _build(case: Case, client: Client) -> Any:
     from log_foundry.sinks.nats import NATSSink
 
-    client = Client(script)
     if not case.owned:
         return NATSSink(
             "logs", client=client, jetstream=case.jetstream, publish_timeout=PUBLISH_TIMEOUT
@@ -236,8 +280,10 @@ def run_case(case: Case, path: str) -> dict[str, Any]:
         return original(self, batch)
 
     record: dict[str, Any] = {}
+    client = Client(script)
+    _require_drained(client)
     with _patched(nats_module, "time", script.clock), _patched(NATSSink, entry, counted):
-        sink = _build(case, script)
+        sink = _build(case, client)
         try:
             if case.prelude:
                 script.steps = ["hold"]
@@ -263,6 +309,7 @@ def run_case(case: Case, path: str) -> dict[str, Any]:
                         failed_batches = worker.health().failed_batches
                     finally:
                         worker.stop()
+            _require_drained(client)
             record = {
                 "failed": sink.losses().failed,
                 "failed_batches": failed_batches,

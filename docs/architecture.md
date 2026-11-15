@@ -1745,8 +1745,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
   callback against every public call, with a fork and a signal handler as calls.
 - **`NATSSink` leaves the events past a round's deadline unattempted and counts them in no
-  per-event term, and the engine-matrix test that pins its counts is timed by the wall clock**
-  (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
+  per-event term** (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
   wall-clock deadline, and an event it has not reached gets no per-event line and no `failed`
   count; the batch's loss then shows only in `failed_batches` and the worker's abandon line. The
   harness sets that deadline to 0.2 s of real time, so on a loaded runner
@@ -1757,12 +1756,12 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `docs/audits/2026-11-14-probes/core-pipeline/p18_nats_deadline_leaves_events_unattempted.py`
   (the `nats` extra installed) slows the first encode by 0.25 s and prints, at `ae0b7674`,
   `{'failed': 7, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and
-  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. **Closed by** two things:
-  the harness drives the round deadline through its `Clock` instead of real time, so the pinned
-  count cannot depend on runner load; and SPEC-088's ledger places every event of such a run in
-  exactly one term, with this probe as the case its build checks, so whether the per-event count
-  and the abandon line together count each event once is decided by the identity rather than by
-  reading.
+  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. The test's half is closed:
+  `tests/nats_engine_matrix_harness.py`'s `Clock` now drives the round deadline instead of real
+  time, so the pinned count no longer depends on runner load, and the same 0.25 s stall now reads
+  the pinned 9. **Closed by** SPEC-088's ledger, which places every event of such a run in exactly
+  one term, with this probe as the case its build checks, so whether the per-event count and the
+  abandon line together count each event once is decided by the identity rather than by reading.
 - **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
   breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
   of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
