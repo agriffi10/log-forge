@@ -1086,3 +1086,22 @@ def test_a_later_occurrence_of_the_same_object_is_written_whole_after_the_first_
     assert seen.outcomes == [(R, R), (A, R), (A,)]
     assert path.read_bytes() == LINES[0] + LINES[0]
     sink.close()
+
+
+@BOTH
+def test_a_closed_sinks_refusal_costs_one_deliver_call_through_the_worker(
+    cls: type, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The engine's twin of the worker's 1.x rule: one call, one failed batch, no counter."""
+    sink = cls(str(tmp_path / "closed-worker.ndjson"))
+    sink.close()
+    seen = Rounds(sink)
+    worker = _worker(sink, 3)
+    capsys.readouterr()
+    worker.submit(list(EVENTS[:2]))
+    assert not worker.flush(timeout=30.0)
+    assert seen.outcomes == [(J, J)], "one deliver call for one refused batch"
+    assert worker.failed_batches == 1
+    assert sink.losses() is None
+    abandoned = [line for line in capsys.readouterr().err.splitlines() if "abandoned" in line]
+    assert abandoned == ["log-foundry: lost 2 event(s); batch abandoned after 1 emit attempts"]

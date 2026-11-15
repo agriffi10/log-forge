@@ -24,6 +24,8 @@ class SinkDeliveryError(Exception):
     ``SQLiteSink`` and the file sinks raise their ``sqlite3.Error`` or ``OSError`` as an instance
     of both, so ``isinstance(exc, SinkDeliveryError)`` and the driver's own ``except`` clause both
     match. That subclass is built at run time and has no public name; ask with ``isinstance``.
+    The file sinks raise it only from an ``emit`` whose batch landed nothing (SPEC-082): a write
+    that failed partway returns, with what did not land counted.
     """
 
 
@@ -117,11 +119,12 @@ class Sink(Protocol):
     collision the fourth member's name guards against is an attribute the library writes onto an
     object it does not own.
 
-    **The contract has two halves and the name says the larger one** (SPEC-042 FR-005). Strand
-    what you inherited — the parent's pending bytes are not yours to write — *and*, by returning
-    normally, **claim the transport as this process's own**. ``FileSink`` satisfies both in one
-    step, because reopening the path is what strands the buffer: measured, parent and child then
-    hold different descriptors. That second half is what the library acts on, so a sink that
+    **The contract has two halves and the name says the larger one** (SPEC-042 FR-005). Leave
+    what you inherited unwritten — the parent's pending bytes are not yours to write — *and*, by
+    returning normally, **claim the transport as this process's own**. ``FileSink`` does both:
+    it drops the tail of a line the parent's write cut partway, which is all it can inherit now
+    that its handle is unbuffered (SPEC-082), and reopens the path, so that, measured, parent and
+    child hold different descriptors. That second half is what the library acts on, so a sink that
     merely dropped a buffer without re-acquiring would satisfy a name describing only the
     discard — which this member carried until SPEC-042 — while making a destructive close look
     safe. A sink that does **not** implement this keeps whatever it inherited, so a child will
@@ -216,7 +219,10 @@ class Sink(Protocol):
     caller that loops it therefore sees a sink's held line or giving-up line on every call — an
     ``SQSSink`` writes "still failing after 1 attempt(s)" each time — and an ``SQSSink`` FIFO
     hold is not released at the end, because only a run's budgeted last round sends what is
-    held, and a detached round is never one. A caller that wants retries should use
+    held, and a detached round is never one. For the same reason a file sink never answers
+    ``RETRYABLE`` there for an event whose line a write cut partway: nothing would remember which
+    one it was, so it is ``UNKNOWN`` and the next section on the sink finishes its line
+    (SPEC-082). A caller that wants retries should use
     ``emit_via_deliver``, which runs the engine over the sink's own budget, keeps the counts
     across its rounds and sends held events in the run's last round.
     """

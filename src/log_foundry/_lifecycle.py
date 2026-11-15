@@ -2549,8 +2549,8 @@ def reclaim(sink: object) -> None:
     inheriting ``MultiSink(FileSink, FileSink)`` re-stamps the two children — only they implement
     the hook — while the wrapper keeps the parent's mark and stays refused, which leaves the
     re-acquired children reachable only through a wrapper nothing will release. That is a leak
-    and loses nothing, since ``FileSink.emit`` flushes at the end of every batch, but it is
-    stated rather than discovered.
+    and loses nothing, since a ``FileSink`` holds no buffer and every write call it makes hands
+    its bytes to the operating system (SPEC-082), but it is stated rather than discovered.
 
     It writes a fresh strong entry naming this process and bumps :attr:`Runtime._owned_clock`
     onto it, as :func:`stamp` does, so a re-pin already walking cannot demote it (SPEC-081).

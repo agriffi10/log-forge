@@ -710,10 +710,15 @@ decorated call ends
      no attribute hook of a sink runs. A registry of live `SinkCounters` repairs every engine sink's
      counters whatever holds them. An AST lint forbids building a primitive anywhere the repair
      cannot write it back.
-  3. **Re-acquire what can be re-acquired.** A fork landing inside `emit`, after the write loop
-     and before the flush, leaves both processes holding the same pending bytes; the child
-     strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode) through the
-     optional `reacquire_after_fork()` hook `sinks/base.py` documents (§8). The name says the
+  3. **Re-acquire what can be re-acquired.** A child must not write what its parent had
+     pending, and leaves it unwritten through the optional `reacquire_after_fork()` hook
+     `sinks/base.py` documents (§8). ~~A fork landing inside a file sink's `emit`, after the
+     write loop and before the flush, leaves both processes holding the same pending bytes; the
+     child strands its copy (`dup2` to `/dev/null`, then reopen in **append** mode)~~ —
+     superseded by SPEC-082: the file sinks write through an unbuffered handle and have no such
+     window, so their hook drops the parent's pending tail, the rest of a line a write cut
+     partway, and reopens in **append** mode with no `dup2`. The decision is *A value the child
+     inherits is stranded, never merely detached* (`docs/decisions/pipeline/`). The name says the
      larger half (SPEC-042 FR-005): a sink that returns from it has claimed the transport as
      **this process's own**, which is what makes releasing it safe later. Which hooks returned
      is published, not acted on — ownership is `_lifecycle`'s.
@@ -2179,8 +2184,9 @@ and a third copy is a fork with no merge.
   **Since SPEC-074 and SPEC-076 the wait is one round, never a backoff, and the lock is the
   closed guard's.** An engine sink holds its transport lock for one round inside `deliver` and
   waits between rounds with no lock held, so an orphan caller waits for at most the round the
-  drain thread is inside. A `SERIAL` guard (the five engine sinks that cannot share their
-  transport, and `FileSink`, `RotatingFileSink` and `SQLiteSink`) holds its lock across each
+  drain thread is inside. A `SERIAL` guard (the seven engine sinks that cannot share their
+  transport, `FileSink` and `RotatingFileSink` among them since SPEC-082, and `SQLiteSink`,
+  which locks in `emit`) holds its lock across each
   section; a `CLOSE_ONLY` guard (`MongoDBSink`, the Redis sinks, `KafkaSink`) takes none, so on
   those an orphan call does not wait at all.
 
@@ -2473,11 +2479,17 @@ and a third copy is a fork with no merge.
     a *different* hazard from the shared handle below — that one is the caller's object, this is
     a buffer nobody in this process can address — and the `reacquire_after_fork()` hook
     cannot help, because there is no descriptor to redirect.
-  - **`StdoutSink` carries the file sinks' duplication hazard and is deliberately not fixed.**
-    It flushes once per batch exactly as they do, so the window is identical — but `sys.stdout`
+  - **`StdoutSink` carries a fork duplication hazard and is deliberately not fixed.**
+    It writes a batch into a buffered stream and flushes once at the end, so a fork landing
+    between the two leaves both processes holding the same pending bytes — but `sys.stdout`
     is a **process**-owned buffer, and discarding the application's pending output to protect
     the library's own is not a trade a logging library may make. This occupant was not expected
     when the hook was designed and is the reason it is per-sink rather than global.
+    > Superseded in part by SPEC-082: this said `StdoutSink` "carries the file sinks'
+    > duplication hazard". The file sinks no longer have one: they write through an unbuffered
+    > handle, so a child inherits no buffer, and their hook drops the parent's pending tail
+    > (*A value the child inherits is stranded, never merely detached*,
+    > `docs/decisions/pipeline/`).
   - **A third-party sink's own locks are not repaired, and its hook is never called.** A sink
     satisfying `Sink` *structurally* — which is how every shipped sink satisfies it — is outside
     the ownership test, so a lock it holds stays held by a thread that does not exist and a
@@ -2617,7 +2629,9 @@ and a third copy is a fork with no merge.
   4. **A re-acquired child under a refused wrapper.** Only the children implement the hook, so a
      child inheriting `MultiSink(FileSink, FileSink)` re-stamps the two files while the wrapper
      keeps the parent's mark and stays refused — leaving them reachable only through something
-     nothing will release. A leak; nothing is lost, since `emit` flushes per batch.
+     nothing will release. A leak; nothing is lost, since a file sink holds no buffer and every
+     write call hands its bytes to the operating system (SPEC-082; before it, since `emit`
+     flushed per batch).
   5. **A third-party wrapper's own `close()`.** A user's wrapper closes its children directly and
      the library never sees the call, so the refusal cannot reach it. Same boundary SPEC-039
      FR-005 draws; the remedy is the one §9 gives.
@@ -2729,7 +2743,8 @@ and a third copy is a fork with no merge.
   A SQLite handle is the exception: a child's `SQLiteSink` refuses every `emit` rather than
   write through it (§12). Two consequences are worth naming because they are not obvious from that
   sentence. `RotatingFileSink` lets **both** processes rotate: a child can rename the file the
-  parent is writing to, and each keeps its own `_size`, which is why the discard hook leaves
+  parent is writing to, and each keeps its own `_size`, which is why the fork hook (it
+  discarded a buffer until SPEC-082, and drops a pending tail now) leaves
   that counter alone rather than claiming a precision a shared file cannot support. And both
   processes hold an orphan-path close record for the same sink object, so ~~**each closes its own
   copy at exit** — deliberately left rather than fixed, since neither side can tell whether the

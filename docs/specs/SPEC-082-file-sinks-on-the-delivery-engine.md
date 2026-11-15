@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-082
 title: "File Sinks on the Delivery Engine: Resend Only What Did Not Land"
 description: "Moves FileSink and RotatingFileSink onto deliver, so a write that fails partway reports each event by the bytes the operating system took and the engine resends only the events that did not land (on a one-round run they are counted, not resent), which closes the duplicate lines a partial write and the worker's whole-batch retry produce today."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-048, SPEC-069, SPEC-070, SPEC-072, SPEC-074, SPEC-075, SPEC-076]
 ---
 
@@ -855,3 +855,22 @@ that raises fails at once naming the original exception.
     gives: the state follows the counts the write calls returned, and it is the library that never
     resends a torn line whole. The Overview and the frontmatter `description` say that a one-round
     run counts the events after a failure and does not resend them.
+- **2026-11-15, at completion.** Recorded by the build, with no requirement changed:
+  - *The byte order mark on a path that cannot seek.* FR-001 says a mark owed only on a seekable
+    handle at offset 0 "is what 1.x's text stream wrote". Measured at completion on Python 3.13.1,
+    macOS, that is true of `utf-16` and `utf-32` and false of `utf-8-sig`: into a FIFO 1.x's text
+    stream wrote the `utf-8-sig` mark. The build follows the rule as written, so
+    `FileSink(fifo, encoding="utf-8-sig")` writes no mark where 1.x wrote one. The criterion
+    checks `utf-16`, and into a regular file the two agree for every codec probed. Whether to
+    match 1.x for `utf-8-sig` on a pipe is left open for the project owner.
+  - *Where the criteria are tested.* FR-002's FIFO and real-signal criteria are in
+    `tests/test_file_sink_interrupt.py`, a file *File & Folder Structure* does not list, each
+    case in a child process: a handler that raises in the test runner's main thread would
+    interrupt the runner. The fork tests retired from `tests/test_fork_lifecycle.py` (the three
+    that parked a parent between a write and its flush, and the one that flushed an inherited
+    buffer to the null device) are restated on the tail in `tests/test_file_sink_fork.py`.
+  - *The data model.* The run's notes hold the torn event object and its tail record, not a
+    position in the run, which a sink handed only a round's batch cannot know: every position
+    before a tear is final, so the first offered event that is that object is the torn
+    occurrence. The write sequence raises what stopped it, and each sink's own round handler
+    asks its predicate, which is the shape `tests/test_classify.py`'s engine-round roster reads.

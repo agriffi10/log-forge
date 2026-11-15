@@ -106,8 +106,15 @@ settles, so a run that fails counts none of them and its catcher owns the batch.
 tree and the rule checked over it (`tests/test_deferral.py`). The
 exception is a sink's own `failed` count, the upper bound above: on a sink still off the engine it
 can land before a raise and again each time the worker retries that batch — the batch size a
-`SQLiteSink`, `FileSink` or `RotatingFileSink` adds to `failed` when its driver raises, before it
-raises in turn (SPEC-069 FR-004). ~~The SQS and SNS sender faults and a failure the retry predicate
+`SQLiteSink` adds to `failed` when its driver raises, before it raises in turn (SPEC-069 FR-004).
+~~`FileSink` and `RotatingFileSink` added it the same way~~ — superseded by SPEC-082: the file
+sinks are on the engine, where each event that did not land is in `failed` once per run. Their
+`failed` has an upper bound of its own. An event whose line a write cut partway, and which the run
+will not be offered again, is reported `UNKNOWN` and counted, though the next section on the sink
+writes the rest of its line and it may land. And a torn event a round left `RETRYABLE` is
+counted when the worker then declines the run, or the sink is closed during the backoff, and if
+nothing else landed it is in `failed_batches` too, the bound for a failed run stated below; in
+both cases `close()` or the next section finishes the line, and nothing is written twice. ~~The SQS and SNS sender faults and a failure the retry predicate
 refuses, counted before `emit` raised (SPEC-070)~~ — superseded by SPEC-074: those sinks are on the
 engine, where each lost event lands in `failed` once per run. The HTTP family's `failed` lands once per batch since SPEC-073: it
 is registered on the run context and committed when the run ends, once per request refused for
@@ -175,6 +182,8 @@ and `tests/test_engine_sinks_roster.py` (every engine sink's counts and the deri
 SPEC-074), `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's
 ledger against the bare sink's over real HTTP, SQS and NATS sinks, and an engine child's counts
 under `MultiSink`, SPEC-075), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
+`tests/test_file_sink_deliver.py` (the file sinks' counts once per run, the torn event's
+`UNKNOWN` and the declined-run residue, SPEC-082);
 `tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,
 holding each term to its exact share, and for an `HTTPSink` behind a scripted opener.
 
@@ -450,16 +459,22 @@ accepted, its events counted in `failed_events` and resent only by a sink that d
 a run of nothing but `DROPPED` events, counted in `dropped_events`, and a run of nothing but
 `SKIPPED` events, a deliberate non-send the engine counts nowhere. An exception escaping `deliver`
 is not this exception: no response is in hand, so its round's events fail the run.
-A second recorded exception, separate from the may-have-landed ones above: a file or stream
-write that fails partway can land events twice, accepted for 1.2.0 (Andrew's ruling, 2026-11-13).
-A `FileSink` or `RotatingFileSink` write, or a `StdoutSink` or `StderrSink` stream, that raises
-after the file or the stream took earlier lines of the batch leaves them there and raises, and the
-worker's retry writes the whole batch again, so a fault that clears between the attempts
-duplicates the batch's lines, up to all of them, since the lines still buffered land on the
-retry too (69 to 200 of a 200-event batch, measured at `a8e91fac` with the file size capped) and, at some caps, leaves one unparseable line where a partly written line was glued to
-the retry's first. The measurement, the two rejected remedies and the closure — the file sinks on
-`deliver`, specified after 1.2.0 — are in *A sink's own driver error is counted, announced and
-raised as both types* (`docs/decisions/sink-delivery/`).
+A second recorded exception, separate from the may-have-landed ones above: a stream write
+that fails partway can land events twice, accepted for 1.2.0 (Andrew's ruling, 2026-11-13). A
+`StdoutSink` or `StderrSink` stream that raises after it took earlier lines of the batch leaves
+them there and raises, and the worker's retry writes the whole batch again, so a fault that
+clears between the attempts duplicates the batch's lines, up to all of them. ~~A `FileSink` or
+`RotatingFileSink` write did the same (69 to 200 of a 200-event batch, measured at `a8e91fac`
+with the file size capped, and at some caps one unparseable line where a partly written line was
+glued to the retry's first)~~ — superseded by SPEC-082: the file sinks offer `deliver` and report
+each event by the bytes the file took, so the engine resends only what did not land, a line cut
+partway is finished once before anything else reaches its file, and a run that cut a line settles
+and is never resent whole. The price is on a run of one round, an inline `emit` or a `MultiSink`
+child: the events after a failure are counted in `failed` and not written, where 1.x could
+deliver them with duplicates. The measurement and the rejected remedies are in *A sink's own
+driver error is counted, announced and raised as both types*, the closure in *A file write
+reports each event by the bytes taken, and a torn line is finished once*
+(`docs/decisions/sink-delivery/`); the stream sinks' closure is SPEC-084.
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_encode.py` (an all-unencodable batch settles on every record-building sink,
 SPEC-069), `tests/test_classify.py` and `tests/test_sinks_sns.py` (a batch lost only to sender
@@ -476,7 +491,12 @@ verdict and refusal, and an engine child under `MultiSink`, SPEC-075), and
 `tests/test_sink_post_close.py` (a closed or closing sink's refusal on every adopter and path,
 and every sink that releases nothing still delivering after `close()`, SPEC-076), and
 `tests/test_final_refusal.py` (a final refusal costs one `emit` call, every other raise the 1.x
-resend, and every closed-guard section refuses through `final_refusal`).
+resend, and every closed-guard section refuses through `final_refusal`), and
+`tests/test_file_sink_deliver.py`, `tests/test_rotating_file_sink_deliver.py`,
+`tests/test_file_sink_partial_write.py` and `tests/test_file_sink_interrupt.py` (a file write
+that fails partway: each event by the bytes taken, the tail before anything else, no event twice
+through the worker, `MultiSink`, an inline `emit` and a direct `deliver`, under a real file-size
+limit and a real signal on a pipe, SPEC-082).
 
 ## 8. An event is safe by construction, once, at assembly
 
@@ -612,7 +632,10 @@ hostile probe (SPEC-067).
 The inherited record pinned first, then the package's global locks and events from one roster,
 then one walk from the runtime's roots, inherited buffers next, registered handlers last; `before`
 never runs for a C-level fork; a value the child inherits is stranded, not detached (SPEC-039,
-SPEC-042, SPEC-079, SPEC-081).
+SPEC-042, SPEC-079, SPEC-081). For the file sinks that value is no longer a buffer: their handle
+is unbuffered, so there is nothing to strand, and what a child inherits is the parent's pending
+tail, the rest of a line a write cut partway, which the child's hook drops unwritten because the
+parent finishes it (SPEC-082).
 
 *Observable:* a child forked mid-drain delivers its own events, never hangs on a parent's lock,
 and closes no transport the parent opened.
@@ -657,6 +680,8 @@ the events it keeps and runs no sink code, SPEC-083),
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
 `tests/test_sinks_sqlite_fork.py` (the `SQLiteSink` child, under a real `os.fork` and through a
 child's interpreter exit),
+`tests/test_file_sink_fork.py` (a file sink's child writes none of its parent's pending tail,
+under a real `os.fork`, SPEC-082),
 `tests/test_invariants_model.py` (a child forked at a step boundary of the sequential driver,
 from each lifecycle state, SPEC-077).
 

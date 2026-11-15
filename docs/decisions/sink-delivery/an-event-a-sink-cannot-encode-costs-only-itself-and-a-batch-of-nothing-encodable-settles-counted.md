@@ -12,9 +12,13 @@ description: "Every record-building sink encodes the whole batch through `sinks/
 
 **The two declared exceptions.** `NATSSink` and `SentrySink` already isolated an unencodable event per event, counted it `failed` and never retried it, so their outcome did not change and they keep their counter, and an all-unencodable batch on either still raises. The principle is that an outcome that has not changed keeps its counter: no count is reclassified in a minor release (Andrew, 2026-11-04). The sinks this decision moves — Postgres, both Redis sinks and Mongo, which lost and retried the whole batch — moved because their outcome changed, and every move is listed in the release notes.
 
-**Do NOT** encode inside a lock or a retry loop; do NOT hand anything to the destination before the whole batch is encoded; do NOT count an unencodable event in a call that raises; do NOT re-raise for an all-unencodable batch; do NOT move `NATSSink` or `SentrySink` to `dropped` in `1.x`; do NOT catch `BaseException` in the guard. A stream or file that fails partway through a batch still leaves its earlier lines written — this closes the encode route to that duplicate, not the I/O route. (SPEC-069 FR-001, FR-002)
+**Do NOT** encode inside a lock or a retry loop; do NOT hand anything to the destination before the whole batch is encoded; do NOT count an unencodable event in a call that raises; do NOT re-raise for an all-unencodable batch; do NOT move `NATSSink` or `SentrySink` to `dropped` in `1.x`; do NOT catch `BaseException` in the guard. A `StdoutSink` or `StderrSink` stream that fails partway through a batch still leaves its earlier lines written and is resent whole — this closes the encode route to that duplicate, not the I/O route, which stays open for the stream sinks until SPEC-084. The file sinks no longer leave it: since SPEC-082 they report each event by the bytes the file took and only what did not land is resent. (SPEC-069 FR-001, FR-002)
 
 ## History
+
+### 2026-11-15
+
+- **Refined** by SPEC-082: the *Do NOT* paragraph's closing sentence names the stream sinks alone; the file sinks' I/O route to the duplicate is closed.
 
 ### 2026-11-09
 
