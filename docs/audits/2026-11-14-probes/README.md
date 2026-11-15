@@ -52,6 +52,13 @@ sink becomes a child of the incoming graph. The lifecycle frame probed only the 
 and `docs/architecture.md` §12 leads with this one. Both lose the same share of the file's lines
 at `a0f44b5f` and against the trees at `v1.0.0`, `v1.1.0` and `3835a30e`.
 
+**One probe was added after the audit, and is not the audit's.**
+`lifecycle/released_sink_handed_back.py` was written while SPEC-087 was authored, against
+`5cb0f449`. It hands back a sink an earlier swap released, with no sink shared between the graphs
+at either swap, which is a different defect from finding 4. It is the evidence for the open item
+in `docs/architecture.md` §12 that begins *A sink the library has released loses every later
+event when it is handed back*, which records its output.
+
 **Not brought in:** the probes' own output files, the `*.stripped.txt` module views, the pytest
 collection listing and the commit bodies. So `verification/cats.py` does not run as it stands: it
 reads a `perfile.txt` of collected tests per file that was derived from that listing.

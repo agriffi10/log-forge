@@ -568,13 +568,20 @@ specs:
     depends_on: ["SPEC-077", "SPEC-079"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-085-adversarial-sink-cells.md"
+  - id: "SPEC-087"
+    title: "A Swap Keeps the Sinks the Graph It Installs Still Holds"
+    description: "Stops configure(sink=...) from closing a sink that the outgoing and the incoming sink graph share, so a caller who adds a destination beside a sink, or drops one, loses no event, and every sink is still closed exactly once."
+    spec_status: "Draft"
+    depends_on: ["SPEC-032", "SPEC-042", "SPEC-045", "SPEC-054", "SPEC-078", "SPEC-079", "SPEC-081"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-087-a-swap-keeps-the-sinks-the-installed-graph-holds.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085"]
+    order: ["SPEC-085", "SPEC-087"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
