@@ -18,6 +18,7 @@ import ast
 import gc
 import os
 import pathlib
+import signal
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -1127,6 +1128,9 @@ def test_a_forked_child_drops_the_in_flight_close_registrations_it_inherited() -
         gc.collect()
         pid = os.fork()
         if pid == 0:  # pragma: no cover - the child never returns to pytest
+            # Bounded, as every fork site is: a child that outlives a worker the hang guard
+            # kills holds that worker's pipe open, so xdist never reports it (pyproject.toml).
+            signal.alarm(10)
             os.close(read_fd)
             with _lifecycle._state._closes._lock:
                 remaining = len(_lifecycle._state._closes._in_flight)
@@ -1316,6 +1320,9 @@ def test_a_forked_child_does_not_hook_a_superseded_sink() -> None:
     gc.collect()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child never returns to pytest
+        # Bounded, as every fork site is: a child that outlives a worker the hang guard
+        # kills holds that worker's pipe open, so xdist never reports it (pyproject.toml).
+        signal.alarm(10)
         os.close(read_fd)
         os.write(write_fd, ",".join(sorted(_HOOKED)).encode())
         os._exit(0)
@@ -1368,6 +1375,9 @@ def test_a_child_still_refuses_to_close_an_inherited_superseded_sink() -> None:
     gc.collect()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child never returns to pytest
+        # Bounded, as every fork site is: a child that outlives a worker the hang guard
+        # kills holds that worker's pipe open, so xdist never reports it (pyproject.toml).
+        signal.alarm(10)
         os.close(read_fd)
         with _lifecycle._state._owned_lock:
             record = _lifecycle._state._owned.get(id(superseded))

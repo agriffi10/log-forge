@@ -71,6 +71,18 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The backstop to the per-test hang guard in pyproject.toml (`faulthandler_timeout`), and the
+    # only bound on a hang that guard cannot see: one outside every test, such as in collection
+    # or in an exit-time drain after the last test, or a forked child that outlives its test
+    # (pyproject.toml says why that one never reports). Without it such a hang held a runner for
+    # GitHub's six-hour default. The slowest of the 30 green runs of this job before the guard
+    # took 227 s (run 43739925007, py3.12), so 20 minutes is over five times that. It must also
+    # stay well above the 600 s per-test limit plus setup and the rest of the suite, so that a
+    # single hung test's thread dump and its "worker crashed" failure reach the log before the job
+    # is killed. When many tests hang, later waves of dumps can be cut off along with the end of
+    # the run summary, but the first wave's dumps are already in the log. Raising one of the two
+    # numbers means checking the other.
+    timeout-minutes: 20
     strategy:
       fail-fast: false   # report both legs; one version failing shouldn't hide the other's result
       matrix:
@@ -112,6 +124,9 @@ jobs:
       # put a restorable cache into the workflow `release.yml` calls immediately before it
       # publishes to PyPI with `id-token: write` — the cache-poisoning shape zizmor audits for.
       # Not worth ~5 s on the one path where a poisoned input reaches consumers.
+      # The test figures above are from when this was written: the suite has since grown, so the
+      # test step is longer (206 s in run 43739925007) and the install a smaller share of the job
+      # still, which only strengthens the conclusion.
       - name: Install Poetry
         uses: ./.github/actions/install-poetry
 
@@ -129,7 +144,8 @@ jobs:
       # developer runs as the pre-push gate — no drift between what CI proves and what a human can
       # reproduce, and the reasoning and measurements for the worker count live beside the setting
       # rather than here. Measured on this runner: the step fell from 141 s to ~49 s at the
-      # first setting; the scheduler has since changed, so expect that or better.
+      # first setting. The suite has grown a great deal since, so do not expect that figure:
+      # run 43739925007 took 206 s for this step.
       #
       # To debug serially, `-n 0` overrides it.
       - name: Test (pytest)

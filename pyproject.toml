@@ -223,6 +223,44 @@ asyncio_mode = "auto"            # async test functions run without an explicit 
 # distributed session, so deleting `-n 0` from the workflow fails loudly instead of producing the
 # intermittent cross-talk it used to.
 addopts = "--strict-markers -n 12 --dist worksteal"
+# THE HANG GUARD. This library runs a worker thread, fork repair and exit-time drains, so a
+# regression can show up as a test that never returns rather than one that fails, and before this
+# a hung test sat until GitHub's six-hour job limit with nothing in the log. Both settings ship
+# with pytest (`faulthandler_exit_on_timeout` since 9.0, the floor of the dev dependency), so the
+# guard costs no dependency: a test still running after the timeout gets EVERY thread's stack
+# dumped to stderr, and then its process exits. Under xdist that process is one worker, so the
+# controller reports "worker 'gwN' crashed while running '<test id>'", fails that test, starts a
+# replacement worker and finishes the run; under `-n 0` the whole run stops at the dump. pytest
+# cancels the timer on entering pdb, so `--pdb` and `breakpoint()` are not killed.
+#
+# 600 s, against a slowest single test of 156 s (`test_type_door_roster.py`, a mutation sweep
+# that is CPU-bound and so scales with load), measured at 9b54b370 on a developer machine at a
+# load average near 150. On CI no test can outlast the whole pytest step, and the slowest step of
+# the 30 green CI runs before this guard was 206 s (run 43739925007, py3.12). So the limit is
+# about three times the worst measurement anywhere: wide enough that a sweep growing or a loaded
+# laptop does not turn into a false hang, and still well under `timeout-minutes` in `ci.yml`, so
+# a hung test's dump lands before the job is killed.
+#
+# A FORKED CHILD MUST BE BOUNDED ON ITS OWN. The guard kills the hung worker, but a child that
+# worker forked survives it and keeps the worker's pipe to the xdist controller open, so the
+# controller never sees the worker die: the dump still prints, naming the parent's frame, but no
+# "crashed" report follows and the run hangs until the job is killed. Measured with a child that
+# never exits under a parent in `os.waitpid`. So every in-process fork in `tests/` arms
+# `signal.alarm` in the child (`run_in_child` does it for its callers) or kills it at a deadline
+# from the parent; a new fork test does the same.
+#
+# THE FORK HAZARD, measured rather than assumed. The timer is a C watchdog thread, and a child
+# forked while it is armed inherits its locks held by a thread that does not exist there. If that
+# child then exits through normal interpreter finalization (`sys.exit`, falling off the end) or
+# calls any `faulthandler` timer function, it deadlocks: on 3.12 and 3.13, Linux and macOS alike, such
+# a child hung past 30 s where the same child without the timer exited at once. Every in-process fork in `tests/`
+# leaves through `os._exit` or a default-action signal, which never reaches that code, and the
+# two children that do call `sys.exit` run in a fresh interpreter (`test_sinks_sqlite_fork.py`).
+# A NEW fork test must keep to that, which `run_in_child` in `test_fork_lifecycle.py` already
+# does. The watchdog also makes every test process multi-threaded, so a fork now always draws
+# CPython's "use of fork() may lead to deadlocks" DeprecationWarning; nothing here asserts on it.
+faulthandler_timeout = 600
+faulthandler_exit_on_timeout = true
 
 [tool.ruff]
 src = ["src", "tests"]
