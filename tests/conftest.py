@@ -880,3 +880,19 @@ def count_grace_writes(monkeypatch) -> dict[int, int]:
 
     monkeypatch.setattr(_lifecycle._CloseRegistry, "_open_grace", counting)
     return writes
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    """Prints SPEC-085's worst-margin line over the passing model cells, when any ran.
+
+    The line is read from each passing report's recorded property, not from module state, because
+    a worker's module state never reaches the controller under ``-n 12`` and a recorded property
+    does. The logic lives in ``model_oracles.margin_line`` so this hook stays a thin caller: a run
+    at an older commit copies the model files without this ``conftest.py``, and needs nothing here.
+    """
+    del exitstatus, config
+    from model_oracles import margin_line
+
+    line = margin_line(terminalreporter.stats.get("passed", ()))
+    if line is not None:
+        terminalreporter.write_line(line)
