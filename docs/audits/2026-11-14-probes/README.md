@@ -5,16 +5,26 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Four scripts here are not the audit's.** Three were written on 2026-11-15 while authoring
-SPEC-086, against `5447d26a`, and the fourth while building SPEC-087; each says so in its first
-line. `lifecycle/leaves_remaining_holder.py` was written for SPEC-087: it is the probe behind the
-open item in `docs/architecture.md` §12 for a wrapper that leaves its member alone, which is then
-closed by nobody.
-`lifecycle/p9_second_stop_in_fork_repair.py` and `lifecycle/p10_fork_with_stderr_lock_held.py`
-are the probes behind two open items in `docs/architecture.md` §12 that the audit did not find.
-`lifecycle/p8_second_close_after_a_rearm.py` is behind no open item: it traces a sink closed
-twice with nothing written between the closes to a re-arm between two takes, which invariant 5
-records as correct, and is kept so the next reader of that symptom finds the trace.
+**Thirty-four files here are not the audit's.** Each was added after the audit was brought in
+(`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
+from `git log --diff-filter=A` per file; rederive it the same way when adding one.
+
+- `lifecycle/p8_second_close_after_a_rearm.py`, `p9_second_stop_in_fork_repair.py` and
+  `p10_fork_with_stderr_lock_held.py`, written while authoring SPEC-086 against `5447d26a`. `p9`
+  and `p10` are the probes behind two open items in `docs/architecture.md` §12 that the audit did
+  not find. `p8` is behind no open item: it traces a sink closed twice with nothing written between
+  the closes to a re-arm between two takes, which invariant 5 records as correct, and is kept so
+  the next reader of that symptom finds the trace.
+- `lifecycle/released_sink_handed_back.py`, written while authoring SPEC-087, and
+  `lifecycle/leaves_remaining_holder.py`, written while building it: the probe behind §12's item
+  for a wrapper that leaves its member alone, which is then closed by nobody.
+- `core-pipeline/p14_end_races_sweep.py` to `p17_log_after_an_interrupted_close.py`, written
+  while authoring and revising SPEC-088, and `p18_nats_deadline_leaves_events_unattempted.py`,
+  filed from SPEC-082's build session.
+- `core-pipeline/spec090_*.py`, twelve, written while authoring SPEC-090.
+- `core-pipeline/spec091_*.py`, seven, written while authoring SPEC-091.
+- `sinks/spec092_*.py`, five, SPEC-092's prototype conformance corpus. Unlike the probes they
+  import one another, so `sinks/` and `tests/` go on `PYTHONPATH` as their docstrings say.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded
