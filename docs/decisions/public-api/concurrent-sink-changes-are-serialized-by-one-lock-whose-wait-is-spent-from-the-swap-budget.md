@@ -59,7 +59,13 @@ it, so a thread that forks from inside the call does not release the child's fre
 while it is still the worker's looks local, but an unfenced second swap leaves its displaced sink in
 the record for a later `shutdown()`. A first swap that skipped arming that sink would then leave it
 owed by nobody, and every further guard of that kind answers one interleaving. The lock turns the
-pair into the sequential case the swap already handles.
+pair into the sequential case the swap already handles. The swap's fenced branch releasing its
+displaced sink only while the record still owes it is not that re-check: skipping an *arm* can
+orphan a sink, while skipping a *release* of a sink the record no longer owes cannot, because the
+worker's sink leaves the record only by a take whose taker closes it. A cede, the one route out
+that closes nothing, is made only of a sink the installed graph still holds, in the section that
+arms that graph, and the closer's guard puts back what it passes over, so neither applies to it
+(SPEC-087; `docs/decisions/pipeline/`).
 
 **The lock is outermost and not taken on the orphan path.** `stamp`, `_rebind`, `_ensure_sink` and
 the swap take `_owned_lock`, `_config_lock`, `_state._lock` and the worker's lock beneath it, and
@@ -68,6 +74,15 @@ nothing holding any of those takes it. A `configure()` with neither argument, or
 on `_fork._GLOBAL_PRIMITIVES`, so a child forked while a parent thread held it starts unlocked.
 
 ## History
+
+### 2026-11-15
+
+- **Refined by SPEC-087**: the reason the fenced branch's `owes` term is not the rejected re-check
+  said every route out of the owed record is a take whose taker closes it. SPEC-087 added `cede`,
+  a route out that closes nothing, and a closer's take that passes a sink over and puts it back, so
+  the reason is narrowed to the worker's sink, which neither reaches, and the conclusion stands.
+  The body now carries it beside the rejected re-check, and the 2026-11-12 entry's clause is
+  struck in place.
 
 ### 2026-11-12
 
@@ -78,7 +93,9 @@ on `_fork._GLOBAL_PRIMITIVES`, so a child forked while a parent thread held it s
   its closer grace (`docs/decisions/pipeline/`). The swap's fenced branch now releases its displaced
   sink only while the record still owes it, and that is not the decision re-check rejected above:
   skipping an *arm* can orphan a sink, while skipping a *release* of a sink the record no longer
-  owes cannot, because every route out of the record is a take whose taker closes it.
+  owes cannot, because ~~every route out of the record is a take whose taker closes it~~ the
+  worker's sink leaves the record only by a take whose taker closes it (corrected 2026-11-15, see
+  that entry).
 - A sentence on a setter's `configure()` from the hands that no longer run under a lock, which
   waits like any caller (the stop-signal fix after SPEC-079).
 

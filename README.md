@@ -297,7 +297,11 @@ The drain is bounded at 5 s. If it cannot be confirmed in that time the swap sti
 you asked for that sink — but the previous sink is left **open** rather than closed, because the
 drain thread may still be inside its `emit`, and `health().incomplete_swaps` records it. Passing
 the sink that is already live is a no-op: no drain, no close. The previous sink **is** closed, so
-do not hand it back to a later call.
+do not hand it back to a later call — except a sink the new one still holds, which stays open.
+Adding a destination beside a sink, `configure(sink=MultiSink(file, other))` after
+`configure(sink=file)`, closes nothing, and dropping it again with `configure(sink=file)` closes
+`other` only; `file` is closed once, at `shutdown()`, at exit, or by a later call whose sink no
+longer holds it.
 
 The 5 s covers the **whole** call — both drains and the previous sink's `close()`. `Sink.close()`
 takes no timeout of its own — though `KafkaSink` bounds its own flush at `flush_timeout=10.0`
@@ -1158,6 +1162,24 @@ reads it without running a property and reads a property as no signal. `Filterin
 `TransformSink` and `LogstashSink` do that, with a descriptor that writes the value into the
 instance and then forwards it. `SyslogSink` holds the signal itself, because its own delivery runs
 the engine.
+
+A wrapper also decides who closes the sink it was handed, and the library closes a sink the new
+sink still holds only through that holder: a `configure(sink=...)` leaves such a sink open, and it
+is closed when its holder is. For the shipped wrappers the library does that itself, once. For
+your own wrapper there are two ways to lose nothing, in either direction of a sink change and on
+both delivery paths:
+
+- **Build it on a shipped wrapper and inherit its `close()`** — `class MyWrapper(TransformSink)`,
+  or `FilteringSink` or `MultiSink`. Its member then sits where the library can see it, and the
+  library closes the member exactly once.
+- **Leave the member's close out of your wrapper's `close()`, and close the member yourself** after
+  `shutdown()`. The library then closes the member only when you configure it directly.
+
+A wrapper that closes a sink it was handed must not have that sink configured directly after it:
+`configure(sink=MyWrapper(file))` then `configure(sink=file)` lets your wrapper's `close()` close
+`file` while it is the live sink, and every event `file` then refuses is counted and announced as
+lost. There is no third way, because a wrapper has no public means to declare its members to the
+library.
 
 ##### Reporting per event: `deliver` (optional)
 

@@ -41,8 +41,12 @@ tree. (SPEC-054 FR-001)
 that contradicted it.** A sink enters the record when an orphan emit lands on it, when a worker is
 built on it, and when a swap installs it in a worker; it leaves at the moment a close of it
 *starts*, under the lock, in the same critical section that decides who performs it and registers
-that close — so there is no instant at which a sink is neither owed nor in flight, which a
-preempted orphan emit re-arms and a racing `shutdown()` then closes alongside. The **closed-sink
+that close — so there is no instant at which a sink taken to be closed is neither owed nor in
+flight, which a preempted orphan emit re-arms and a racing `shutdown()` then closes alongside. Since
+SPEC-087 a sink can also leave the record with no close: a swap whose installed graph still holds an
+owed sink cedes it, and it is closed by that graph's forward, so a ceded sink is neither owed nor in
+flight by design (*A swap keeps the sinks the graph it installs holds, and one decision closes a
+sink once*, in this directory). The **closed-sink
 latch** refused re-arming for the most recently closed sink only, and what it protected against — a
 close performed against a sink the drain thread may still be inside — is answered at close time by
 `held`, not by refusing the arming. **`Worker(sink_released=)`** made a late worker inherit a
@@ -84,6 +88,12 @@ permanently after a declined swap and after any `configure()` on a retired worke
 section's `inherited_sink` open item in the same edit. (SPEC-054 FR-005)
 
 ## History
+
+### 2026-11-15
+
+- **Refined by SPEC-087**: "no instant at which a sink is neither owed nor in flight" is narrowed to
+  a sink taken to be closed, because a swap now cedes an owed sink the graph it installs still
+  holds, which leaves the record with no close and is closed by that graph's forward.
 
 ### 2026-11-13
 

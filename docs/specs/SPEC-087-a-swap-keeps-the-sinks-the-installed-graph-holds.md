@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-087
 title: "A Swap Keeps the Sinks the Graph It Installs Still Holds"
 description: "Stops configure(sink=...) from closing a sink that the outgoing and the incoming sink graph share, so a caller who adds a destination beside a sink, or drops one, loses no event, and every sink is still closed exactly once."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-032, SPEC-042, SPEC-045, SPEC-054, SPEC-078, SPEC-079, SPEC-081]
 arc: audit-2026-11-14
 arc_order: 3
@@ -359,8 +359,12 @@ the take-ahead rule and the declining take), `tests/test_factory_reentrant.py`,
       round 1 (invariant 5).
 - [ ] **Concurrent callers.** Over at least 16 seeds, threads logging with and without spans and
       calling `flush()` run beside 150 swaps among graphs that all hold A, then a `shutdown()`
-      races one more swap: the outcome holds, no close of A overlaps another, and no other sink is
-      closed twice (invariants 2, 5 and 6).
+      races one more swap: the outcome holds, no close of A overlaps another, and no other sink has
+      two closes overlapping or more closes than the wrapper holding it was armed, or than one
+      where that wrapper was never armed (invariants 2, 5 and 6). A wrapper armed twice is owed two closes, made one after the
+      other: a log with no span reads the wrapper, a swap takes it, and the log then arms it
+      again, which is invariant 5's recorded exception for a sink written to after its close
+      (SPEC-045, `p8_second_close_after_a_rearm.py`).
 - [ ] A sink whose `close()` is its delivery and which keeps accepting afterwards delivers every
       event it took and is closed exactly once, forward and reverse (invariants 2 and 5).
 - [ ] Every test file named in the Description passes with no edit to it (invariant 6).
@@ -971,3 +975,13 @@ move.
   FR-004's fourth shape as an open item in `docs/architecture.md` §12 as well as a §13
   constraint, with both numbers, a probe of its own and a **Closed by** that names the closer's
   ordering and the lifecycle command-path spec.
+- 2026-11-15, the build: FR-003's concurrent criterion corrected. It asked that no sink but A be
+  closed twice. Under four logging threads, two of them with no span, a seed sometimes closed an
+  unshared member twice, in sequence and never overlapping: a log with no span read the wrapper
+  as the configured sink, a swap took that wrapper, and the log then armed it again and wrote into
+  it before its detached close ran, so a later decision closed it a second time. That is the
+  re-arm invariant 5 already records as owing a second close (SPEC-045). With each member's
+  closes held to its wrapper's arms, counted by wrapping the registry's `arm`, the test passed 6 of
+  6 serial and 5 of 5 parallel runs of its 16 seeds, where the unchanged assertion had failed on 3
+  of 6 serial runs. The criterion now holds each member to its wrapper's
+  arms and to no overlap, and every assertion on A is unchanged.

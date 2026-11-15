@@ -336,7 +336,14 @@ SPEC-030, updating `get_config().sink` while every event continued to the sink c
    `shutdown()` is closing that sink, once that close is over (`docs/decisions/sink-lifecycle/`);
 3. drains once more — a fence, not a delivery: it proves the drain thread is not still inside the
    old sink's `emit`, the one way `close()` could be called under a writer (SPEC-028);
-4. closes the previous sink.
+4. closes the previous sink — except a sink the new one still holds (SPEC-087). The swap reads
+   the graph it installs once, from the sink it is handed, and a sink in that graph is kept: it
+   is not closed here, nor by the outgoing wrapper's forwarded release, and it joins the new
+   graph, which closes it once when it is itself released, at `shutdown()`, at exit or by a later
+   change that drops both. `configure(A)` then `configure(MultiSink(A, B))` closes nothing, and
+   the reverse closes B only. The rule and what it rejected: `docs/decisions/pipeline/`, *A swap
+   keeps the sinks the graph it installs holds, and one decision closes a sink once*; what the
+   read cannot reach: §13.
 
 One deadline covers all four steps, so a destination that hangs in any of them cannot make
 `configure()` block for a multiple of the budget. Step 4 gets what is left of it: `Sink.close()`
@@ -1026,29 +1033,9 @@ close it.
   through every column-projecting sink against the real services, since the same defect has now
   been found in three sinks.
 
-- **A sink can be released while it is still live inside the graph that replaced it.**
-  `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
-  outgoing sink while A is a child of the new one. ~~Pre-dates SPEC-045, which pinned only that it
-  must not become a *loss* — A keeps taking events through the wrapper, is owed a further close, and
-  delivers everything.~~ **Corrected 2026-11-14 (audit finding 4; invariants 5 and 2): it is a loss
-  for every sink that refuses after its `close()`.** It pre-dates SPEC-045, whose pin that it "must
-  not become a loss" holds only for a sink that keeps accepting after it is closed, which is what
-  the pin's own test double does (`BufferingSink` in `tests/test_owed_closes.py`, whose `emit` never
-  refuses). A sink that released its transport refuses from then on (invariant 7, SPEC-032), so once
-  the swap has closed it every later event it is offered is lost, counted and announced. Both
-  directions are probed with a shipped `FileSink`, under `docs/audits/2026-11-14-probes/lifecycle/`,
-  and at `a0f44b5f` each left 1 of 4 orphan events and 2 of 8 span events in the file.
-  `p4b_forward.py` is the direction this item leads with, and there the rest is counted in
-  `health().sink.failed` (3 and 6) and announced as a skipped `MultiSink` child.
-  `p4b_shared_child_shipped_sink.py` is the reverse, `MultiSink(FileSink, MemorySink)` then that
-  `FileSink` alone, and there it is `orphan_lost=3` and `lost 6 event(s); batch abandoned`.
-  `p4_shared_child_swap.py` shows the sink closed at the swap and again at shutdown, on both
-  delivery paths and for a `FilteringSink` too. The audit's lifecycle frame dates the loss from
-  SPEC-076's closed guard, and that is wrong: both probes lose the same events against the trees at
-  `v1.0.0`, `v1.1.0` and `3835a30e`, the parent of SPEC-076's commit `3d65cf32`. **Closed by** not
-  releasing a sink reachable from the graph just handed over, which is decidable only against a live
-  config read, and by a test that holds a shipped sink which releases its transport to every event
-  delivered, in both directions.
+- ~~**A sink can be released while it is still live inside the graph that replaced it.**~~ →
+  **closed by SPEC-087**; struck and moved under *Resolved*, with two corrections to its
+  **Closed by** sentence.
 - **A sink the library has released loses every later event when it is handed back, and two
   documents disagree about whether handing it back is allowed** (invariants 2, 5 and 13, each as
   below; no spec yet; found while SPEC-087 was authored, which leaves it Out of Scope). `configure(F)`, an event,
@@ -1104,6 +1091,65 @@ close it.
   transport when it is handed over again, against SPEC-032's rule that it refuses. Either way
   the docstring and the README are brought into agreement, and the pin gains a shipped sink that
   refuses after `close()`.
+- **A sink the library wrote to and never closes, behind a wrapper that leaves its member alone**
+  (invariant 5; no spec yet; SPEC-087 FR-004's fourth shape, held open here as well as stated in
+  §13). A kept sink is closed by the graph that holds it, and for a caller's wrapper that is the
+  wrapper's own `close()`. A wrapper `Leaves(A)` whose `close()` does not close its member, as the
+  holder on whose account the library does not close A, leaves A closed by nobody. It is that
+  holder when it is installed over a kept sink — `configure(A)` then `configure(Leaves(A))`, or
+  `configure(MultiSink(A, B))` then `configure(Leaves(A))` — and when it is still in the record
+  with a retired worker's drain thread inside it while a later `configure(MultiSink(A, B))` is
+  shut down, where SPEC-087's keep skips the shipped wrapper's forward of A because a sink the
+  record still holds lies over it. No event is lost in any of the three; the close is the
+  caller's to make. For the last sequence, on SPEC-087's prototype:
+
+  | Remaining holder | `5cb0f449` | SPEC-087 | With the member kept owed |
+  |---|---|---|---|
+  | `Leaves(A)` | 1 close, under the drain thread | 0 closes, no event lost | 1 close |
+  | A wrapper that closes its member | 1 close, under the drain thread | 1 close | 2 closes, overlapping |
+
+  For the two installed sequences, 0 closes, where `5cb0f449` closed A once at the swap and lost
+  the events after it; measured again at `f4d45665`, each delivered 3 of 3 events with no loss
+  term moved and `A.close()` never called. The reproduction is
+  `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`, written for SPEC-087 and
+  not one of the audit's own: `configure(Leaves(A))`, a span; a second span parks the drain thread
+  inside `A.emit`; `shutdown(timeout=0.2)`; `configure(MultiSink(A, B))`, a log with no span;
+  `shutdown(timeout=0.3)`; the emit released; `shutdown()`. Its output at `f4d45665`:
+
+  ```
+  log-foundry: shutdown timed out after 0.2s; the sink is left open because the worker thread is still using it; 2 event(s) in flight, counted when the emit returns
+  A.closes=0 A.closed_while_inside=0 A.closes_while_parked=0 A.refused=0 A.events=5 B.closes=1
+  ```
+
+  and at `5cb0f449`, run from a worktree of that commit with `PYTHONPATH=src`:
+
+  ```
+  A.closes=1 A.closed_while_inside=1 A.closes_while_parked=1 A.refused=0 A.events=5 B.closes=1
+  ```
+
+  That close was made under the drain thread. In this short probe the parked emits had already
+  been counted, so A refused nothing; the spec's own run of the sequence, with events written
+  after the close, had A refuse two. Keeping the member owed when a forward is skipped was built
+  for SPEC-087 and is the table's last column: it closes A once behind `Leaves`, and twice,
+  overlapping, behind a wrapper that closes its member, and the library cannot tell the two
+  wrappers apart. **Closed by** the closer ordering a member after its holder: the member is kept
+  owed when a forward is skipped on a holder's account, and closed after that holder's own close
+  has returned, so that a wrapper which closes its member gives a second close in sequence, which
+  a sink tolerates, and never two at once. That restructures `_close_owed`'s take and its fan-out,
+  so it belongs in this arc's lifecycle command-path spec (*lifecycle commands serialized through
+  one owner*, the signal-handler item below) and not in a further patch to the closer.
+- **A kept sink a straddling orphan log put back in the record can be handed a stop signal on its
+  own** (SPEC-087 FR-004's fifth shape; read from the code and not reproduced). A log with no span
+  reads the configured sink and arms it a moment later (`api.py`, `_ensure_sink()` then
+  `_note_orphan_emit`); a swap that keeps that sink and runs between the two leaves it a root in
+  the record again. SPEC-087's guard covers the two places a sink is taken to be closed, the
+  closer's take and the swap's stale take. `Runtime.in_flight`, which decides whether a sink is
+  handed a refreshed stop signal, still decides by identity, so such a sink can be handed one
+  directly while the worker drains into it through its wrapper. Nothing is closed in this shape;
+  it is about which object holds the signal. The sequence that would reproduce it: the straddle,
+  then a `shutdown()`, then a further log with no span while a worker built since is draining.
+  **Closed by** one stable stop signal per sink (the item *One stable stop signal per sink changes
+  a documented public protocol*, below), which retires the refreshed hands this shape rides on.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
   of it is the seam lint guarding the prose in its own data table rather than the rule. The case
@@ -1820,6 +1866,47 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 ### Resolved
 
+- ~~**A sink can be released while it is still live inside the graph that replaced it.**~~
+  (2026-11-14 audit, finding 4; invariants 5 and 2) → **closed by SPEC-087.** `configure(A)` then
+  `configure(MultiSink(A, B))`, or the reverse, closed A at the swap while A was a member of the
+  new graph. SPEC-045 had pinned only that it "must not become a loss", with a double that keeps
+  accepting after `close()`; a sink that released its transport refuses from then on, so every
+  later event it was offered was lost, counted and announced. Both directions were probed with a
+  shipped `FileSink` under `docs/audits/2026-11-14-probes/lifecycle/`, and at `a0f44b5f`, as at
+  `v1.0.0` and `v1.1.0`, each left 1 of 4 orphan events and 2 of 8 span events in the file;
+  `p4_shared_child_swap.py` showed the shared sink closed at the swap and again at `shutdown()`.
+  Since SPEC-087 the swap reads the graph it installs once and cedes an owed sink in it rather
+  than releasing it, so the sink joins that graph and is closed once, by its holder's forward;
+  every release one decision starts carries a keep, so a shipped wrapper's forwarded release
+  skips a sink that is kept, lies beneath a sink still owed, or that the decision already closed;
+  and the closer's take and the swap's stale take pass over a sink lying beneath one still in
+  use. At `f4d45665` both `p4b` probes print 4 lines of 4 and 8 lines of 8 with every loss term
+  0, and `p4_shared_child_swap.py` prints `X.closes=1` and `X.events_after_its_close=0` on all
+  four rows. `tests/test_shared_sink_swap.py` holds every shipped wrapper in each direction, with
+  and without spans, against a double that refuses after `close()` and against a `FileSink`; run
+  against `5cb0f449`, every one of its 28 table rows failed. Decision:
+  `docs/decisions/pipeline/` (*A swap keeps the sinks the graph it installs holds, and one
+  decision closes a sink once*); what the read cannot reach is §13's.
+
+  **Two corrections to this item's own Closed by sentence**, which read: "not releasing a sink
+  reachable from the graph just handed over, which is decidable only against a live config
+  read". **First, that rule closes one direction only.** In the reverse direction the sink
+  released is the outgoing wrapper, which the new graph does not reach, and it was the wrapper's
+  forwarded release that closed the live sink; so the closure is the kept read and the keep on
+  every forwarded release together (SPEC-087 FR-001 and FR-002). Evidence: at `f4d45665`, with
+  the keep's skip in `release` replaced by `False` and the read left in place, all 16 reverse
+  rows of `tests/test_shared_sink_swap.py`'s table fail and all 12 forward rows pass.
+  **Second, "decidable only against a live config read" is wrong as a requirement.** The swap is
+  handed the sink it installs and reads nothing else. A rule that does read the configuration at
+  each forwarded release was built for SPEC-087 and delivers the same events, on 26 of the 32
+  matrix cases as the chosen rule does, and it costs two things: `_swap_sink` then answers from
+  module state rather than its argument, which five existing tests that call it directly fail
+  on; and a later sink change answers for an earlier one, so with no worker,
+  `configure(MultiSink(B, A))`, then `configure(A)` returning at its budget while B's close was
+  still running, then `configure(C)`, the first swap's closer reached A after the second swap had
+  displaced and closed it, read a configuration that no longer held A, and closed it again: 2
+  closes against 1 (SPEC-087 *Evidence*).
+
 - ~~**`configure(sink=object())` is accepted, and every batch is then lost on the drain
   thread**~~ (SPEC-080 frame-2 review; invariant 13) → **closed by SPEC-079 for what `configure()`
   can decide.** Reproduced at `4f0c5741`: a traced call's three events ended in `lost 3 event(s);
@@ -2345,6 +2432,59 @@ and a third copy is a fork with no merge.
   **The concurrent half was real after all** (2026-11-11): SPEC-078's review measured two
   concurrent `configure(sink=…)` calls closing one sink twice with nothing written in between,
   which `config._sink_lock` now prevents (§7).
+
+- **A sink a swap keeps is closed by the graph that holds it, so four shapes are the caller's
+  wrapper's or the read's, not the library's** (SPEC-087 FR-004). Since SPEC-087 a
+  `configure()` reads the graph it installs and keeps every sink in it open (§7, step 4); the kept
+  sink is closed when its holder is released. For a shipped wrapper that is the library's own
+  forwarded release, which skips what the decision keeps. For a wrapper the package does not ship
+  it is the wrapper's own `close()`, which no rule in `release` can reach, and the read itself
+  stops at a bound. The counts below were measured at `f4d45665` with the refusing double of
+  `tests/test_shared_sink_swap.py` (a sink that refuses after `close()` and counts its closes),
+  one write before the swap and two after, then `shutdown()`; "spans" is a span per write, two
+  events each, and every refused event is counted and announced, so invariant 2 holds and the
+  loss is visible.
+
+  - **A `sink_factory` that has not built.** `configure(A)` then
+    `configure(sink_factory=lambda: A)`: the factory wrapper holds nothing when the swap reads it,
+    so A is released, and the factory later returns a closed sink. With no span A took 1 of 3
+    events, refused 2 (`orphan_lost=2`) and was closed twice, at the swap and at `shutdown()`;
+    with spans it took 2 of 6 and the batch of 4 was abandoned (`failed_batches=1`). A factory
+    is meant to build a sink of its own (`docs/decisions/sink-lifecycle/`, *A sink factory builds
+    each process's own sink lazily*), which this one does not.
+  - **A sink past the read's bound**: more than one plain container below a holder the package
+    does not ship, or past `_MARKING_CEILING` objects entered. A caller's holder keeping A as
+    `self.boxes = [[A]]`, installed over A: the same counts as the unbuilt factory, on both paths.
+    A read that trips or raises writes one line saying a shared sink may be closed while still
+    in use.
+  - **A wrapper the package does not ship, which closes its member itself** — `Mine.close()`
+    calling `A.close()`, or a subclass of a shipped wrapper overriding `close()` to do so.
+    Displaced while A is kept, `configure(Mine(A))` then `configure(A)`, it closes the live sink
+    as before SPEC-087: the same counts as above, for a `Mine` that subclasses a sink and for one
+    that subclasses nothing. Where the record also owes A, `Mine` closes A beside the record's own
+    close: after an unconfirmed `configure(A)` then `configure(Mine(A))`, and after a straddling
+    orphan log with `Mine(A)`, `shutdown()` closed A twice, **two closes overlapping**, with no
+    event refused. At `5cb0f449` the unconfirmed sequence does the same, and the straddle closed
+    A three times and lost events (SPEC-087 *Evidence*). Forward on a fenced swap or with no
+    worker the read reaches into such a wrapper, A joins it and `Mine.close()` is its one close.
+  - **A wrapper that leaves its member alone.** Installed over a kept sink —
+    `configure(A)` then `configure(Leaves(A))`, or `configure(MultiSink(A, B))` then
+    `configure(Leaves(A))` — A took 3 of 3 events, no loss term moved and **A was closed 0 times,
+    against 1** at `5cb0f449`, which closed it at the swap and lost the events after. As a
+    remaining holder with a retired drain thread inside it, the same 0 against 1, where
+    `5cb0f449`'s one close was made under that thread. The close is the caller's to make; §12
+    holds this shape open, with its probe and what would close it.
+
+  Deferring the displaced wrapper's release was built and is rejected: under 200 rounds of
+  `configure(Mine(A))` and `configure(A)` it left 201 sinks owed and called `A.close()` 201
+  times at shutdown, 199 of them overlapping, which is the unbounded record SPEC-081 removed. A
+  caller who writes a wrapper has two routes, measured in both directions and on both delivery
+  paths with no event lost, and `README.md` (*Writing your own sink*) gives them: build the
+  wrapper on a shipped one and inherit its `close()`, so its member sits in a declared slot and
+  is closed once through `release`; or leave the member's close out of the wrapper's `close()`
+  and close the member yourself after `shutdown()`. There is no third, because a wrapper has no
+  public means to declare its members. The fifth shape, a stop-signal hand to a sink a straddling
+  log put back in the record, is §12's, read and not reproduced.
 
 - **`Worker._release_waiters` reads `queue.Queue`'s internals, and there is no public
   alternative.** It takes `self._queue.mutex` and iterates `self._queue.queue` — both private —

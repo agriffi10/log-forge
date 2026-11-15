@@ -298,9 +298,15 @@ Not measured as a latency bound by any test — listed so the gap is visible.
 ## 5. A sink the library wrote to is closed, once, by one owner, and a close in flight is waited for
 
 Whoever is delivering owns the close: the worker for its sink, the orphan path for a sink it
-reached with no worker, the swap for the sink it replaced. Ownership is recorded when the library
-is *handed* a sink and consulted by every close, so a process releases only a transport it
-acquired here (SPEC-042). The record is a set, so arming a second sink never discards the first
+reached with no worker, the swap for the sinks the graph it installs no longer holds. A sink that
+graph still holds is kept: it leaves the owed record with no close and joins the graph, closed
+once when its holder is released (SPEC-087). One decision — one swap, or one take by
+`shutdown()` or the exit drain — closes a sink once: a shipped wrapper's forwarded release made
+inside it skips a sink that is kept, lies beneath a sink still owed, or that the decision already
+closed; the closer's take passes over a sink lying beneath one it leaves owed, and the swap's
+stale take one lying beneath a sink still in use, each left owed for a later call (SPEC-087).
+Ownership is recorded when the library is *handed* a sink and consulted by every close, so a
+process releases only a transport it acquired here (SPEC-042). The record is a set, so arming a second sink never discards the first
 (SPEC-045); closes run concurrently and are all joined (SPEC-046); a second caller finding a
 close already running waits for it rather than returning through it (SPEC-050). Inside one sink
 the rule is the closed guard's (SPEC-076): the eleven sinks that release a transport release it
@@ -316,7 +322,16 @@ later `shutdown()` finds the drain thread ended (SPEC-050); an expired `shutdown
 open, and only a later call that finds the drain thread ended closes it — so in an `atexit` exit
 after an expired call, a sink still inside an emit is not closed at all (SPEC-027 FR-004, decided
 final by SPEC-068); a sink written to after its close is owed a second close, which is correct
-rather than a double (SPEC-045); a `shutdown()` that a sink change in flight does not let take
+rather than a double (SPEC-045), and a swap between two graphs that share a sink no longer
+reaches it, because the swap keeps the shared sink open (SPEC-087); a sink a swap keeps is closed
+by the graph that holds it, so where that holder is not a shipped wrapper the library cannot
+spare it (SPEC-087 FR-004, `docs/architecture.md` §13): a caller's wrapper that closes its member
+itself closes a kept sink it is displaced from while the sink is still live, and closes it beside
+the record's own close where the record also owes it, two closes overlapping; a caller's wrapper
+that leaves its member alone leaves a kept sink closed by nobody (§12 holds that one open); and a
+sink the swap's read does not reach — beneath a `sink_factory` that has not built, or past the
+read's bound — is released as it was before SPEC-087, every event it then refuses counted and
+announced; a `shutdown()` that a sink change in flight does not let take
 its decision within the closer grace, nor by the call's last take, a sink change that starts after it and retargets a worker
 built during it, or a re-entrant `shutdown()` (from a sink's own code on the drain thread or the
 changing thread, or a signal handler) landing between that change's retarget and its decision, may
@@ -344,7 +359,10 @@ built and no `sink=` (SPEC-081); `tests/test_model_cells.py` that, with a sink t
 from its own code, every sink written to has had a close when the `shutdown()` returns, no two closes enter at one
 count unless two sink changes overlapped, and no write enters after the last close once the exit
 drain has run, except in the cells and the reproduction pinned to `architecture.md` §12 open items
-and the cells those pins withhold (SPEC-085).
+and the cells those pins withhold (SPEC-085); and
+`tests/test_shared_sink_swap.py` that a sink both graphs hold is closed once, after its last event, for every shipped wrapper in each direction and on every
+twin path, and that each recorded exception above for a caller's wrapper holds as stated
+(SPEC-087).
 
 ## 6. Twin paths keep the same promises
 
