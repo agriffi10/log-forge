@@ -603,13 +603,20 @@ specs:
     depends_on: ["SPEC-004", "SPEC-021", "SPEC-039", "SPEC-054", "SPEC-062", "SPEC-068", "SPEC-072", "SPEC-088"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-090-backlog-batching.md"
+  - id: "SPEC-091"
+    title: "An Open Span's Events Ship on the Worker's Interval"
+    description: "Has the worker take every open span's buffered events about once a flush interval, on its own thread and exactly once, so a process killed mid-handler loses at most about one interval of a span's events rather than the whole span, and states plainly what a kill still loses."
+    spec_status: "Draft"
+    depends_on: ["SPEC-015", "SPEC-024", "SPEC-036", "SPEC-039", "SPEC-050", "SPEC-085", "SPEC-088", "SPEC-089", "SPEC-090"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-091-open-span-events-ship-on-the-interval.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
