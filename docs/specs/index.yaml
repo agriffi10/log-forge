@@ -585,7 +585,7 @@ specs:
   - id: "SPEC-088"
     title: "One Event Ledger: Every Accepted Event Is in Exactly One Term"
     description: "Counts every event in one unit from the moment it is accepted to the one term it leaves through, exposes the terms on health(), and checks the balance at shutdown() and after every test, so that an accounting defect fails a check where today an audit has to find it."
-    spec_status: "Draft"
+    spec_status: "In Progress"
     depends_on: ["SPEC-017", "SPEC-019", "SPEC-030", "SPEC-036", "SPEC-039", "SPEC-050", "SPEC-054", "SPEC-062", "SPEC-068", "SPEC-072"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-088-event-ledger.md"
