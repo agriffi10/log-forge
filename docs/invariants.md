@@ -267,7 +267,8 @@ resumed drain thread through a factory wrapper, and, during a retarget, in the p
 `tests/test_model_cells.py` holds every call a sink makes from its own stop-signal setter, `emit`,
 `close` or factory, on both paths, to its budget plus one second of its own time, and a waiting
 sink's wait to ending within a second of the stop that should cut it, for a wait in `emit` and in
-`close`, in the parent and in a forked child (SPEC-085).
+`close`, in the parent and in a forked child, except in the cells pinned to `architecture.md` §12
+open items and the cells those pins withhold (SPEC-085).
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -333,7 +334,9 @@ the guard releases once, waits for the call inside, and counts a call its releas
 owner, and `tests/test_fork_heap_marking.py` that a last-resort child closes the sinks the library
 built and no `sink=` (SPEC-081); `tests/test_model_cells.py` that, with a sink that calls back
 from its own code, every sink written to is closed by the `shutdown()`, no two closes enter at one
-count, and no write enters after the last close once the exit drain has run (SPEC-085).
+count unless two sink changes overlapped, and no write enters after the last close once the exit
+drain has run, except in the cells and the reproduction pinned to `architecture.md` §12 open items
+and the cells those pins withhold (SPEC-085).
 
 ## 6. Twin paths keep the same promises
 
@@ -693,7 +696,8 @@ under a real `os.fork`, SPEC-082),
 from each lifecycle state, SPEC-077),
 `tests/test_model_cells.py` (a child forked from inside a sink's setter, `emit` or `close`, on
 both paths and during a sink change: it closes nothing it inherited, its two events land in one
-sink or move a counter, and it ends `CLOSED`, SPEC-085).
+sink or move a counter, and it ends `CLOSED`, except in the cell pinned to an `architecture.md`
+§12 open item, SPEC-085).
 
 ## 13. A bad argument is refused where it is written, never later on the drain thread
 

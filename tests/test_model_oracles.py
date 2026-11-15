@@ -614,7 +614,10 @@ def _named(node: ast.AST) -> str | None:
 def skip_offenders(source: str) -> list[str]:
     """Returns every skip and every ``xfail`` that is not strict with a ``raises=`` in a source.
 
-    Identifiers are read, never text, so the words in a string or a docstring are not sites.
+    Identifiers are read, never text, so the words in a string or a docstring are not sites. An
+    ``xfail`` whose ``run=`` is anything but a literal ``True`` is a skip in practice, since it
+    may not run the test, so it offends however strict it is, and so does one spreading
+    ``**`` keywords, which could carry such a ``run=``.
 
     Args:
       source: A module's text.
@@ -631,7 +634,15 @@ def skip_offenders(source: str) -> list[str]:
         if isinstance(node, ast.Call) and _named(node.func) == "xfail":
             keywords = {keyword.arg: keyword.value for keyword in node.keywords}
             flag = keywords.get("strict")
-            if isinstance(flag, ast.Constant) and flag.value is True and "raises" in keywords:
+            runs = keywords.get("run", ast.Constant(True))
+            if (
+                isinstance(flag, ast.Constant)
+                and flag.value is True
+                and "raises" in keywords
+                and None not in keywords
+                and isinstance(runs, ast.Constant)
+                and runs.value is True
+            ):
                 strict.add(id(node.func))
     offenders: list[str] = []
     for node in ast.walk(tree):
@@ -770,6 +781,10 @@ def test_the_model_files_hold_no_skip_and_no_xfail_that_is_not_strict() -> None:
         ("pytest.mark.xfail", True),
         ("pytest.mark.xfail(strict=False, raises=E)", True),
         ("pytest.mark.xfail(strict=True)", True),
+        ("pytest.mark.xfail(strict=True, raises=E, run=True)", False),
+        ("pytest.mark.xfail(strict=True, raises=E, run=False)", True),
+        ("pytest.mark.xfail(strict=True, raises=E, run=flag)", True),
+        ("pytest.mark.xfail(strict=True, raises=E, **options)", True),
         ("pytest.xfail('r')", True),
     ],
 )
@@ -1180,6 +1195,7 @@ def test_every_scheduled_pinned_cell_carries_the_strict_mark() -> None:
         assert marks[0].name == "xfail"
         assert marks[0].kwargs["strict"] is True
         assert marks[0].kwargs["raises"] is PinnedVerdict
+        assert "run" not in marks[0].kwargs, cell_id(cell)
 
 
 def test_every_reproduction_is_a_test_function_of_the_cells_file() -> None:
@@ -1195,6 +1211,7 @@ def test_every_reproduction_is_a_test_function_of_the_cells_file() -> None:
         assert len(marks) == 1, pin.reproduction
         assert marks[0].kwargs["strict"] is True
         assert marks[0].kwargs["raises"] is PinnedVerdict
+        assert "run" not in marks[0].kwargs, pin.reproduction
 
 
 def test_a_waiting_sink_holds_no_lock_of_its_own_while_it_waits() -> None:
@@ -1241,11 +1258,31 @@ def test_a_forker_forks_once_where_its_hooks_say_with_its_lock_free() -> None:
 
 
 def test_a_waiter_waits_on_the_event_it_holds_when_the_wait_begins() -> None:
-    """FR-001: a signal assigned after the wait began does not cut it; the one it held does."""
+    """FR-001: a signal assigned after the wait began does not cut it; the one it held does.
+
+    Each event notes every wait made on it and what that wait returned, so which event the wait
+    was on, and that setting it is what ended the wait, are read without timing anything.
+    """
+
+    class Noted(threading.Event):
+        """An event that notes its name and the result of each wait made on it."""
+
+        def __init__(self, name: str, noted: list[str]) -> None:
+            """Builds an unset event that notes into a shared list."""
+            super().__init__()
+            self.name = name
+            self.noted = noted
+
+        def wait(self, timeout: float | None = None) -> bool:
+            """Waits as an event does, then notes which event it was and what the wait returned."""
+            result = super().wait(timeout)
+            self.noted.append(f"{self.name}:{result}")
+            return result
 
     def body(run: ChildRun) -> None:
         sink = Waiter(WAITER_HOLD)
-        held, later = threading.Event(), threading.Event()
+        noted: list[str] = []
+        held, later = Noted("held", noted), Noted("later", noted)
         sink.log_foundry_stop_signal = held
         sink.armed = "emit"
         helper = threading.Thread(target=sink.emit, args=([],))
@@ -1253,13 +1290,12 @@ def test_a_waiter_waits_on_the_event_it_holds_when_the_wait_begins() -> None:
         sink.entered.wait(5.0)
         sink.log_foundry_stop_signal = later
         later.set()
-        helper.join(0.5)
-        run.prop("cut-by-later", not helper.is_alive())
         held.set()
         helper.join()
+        run.prop("waited", " ".join(noted))
         run.prop("waits", len(sink.waits))
 
     outcome = run_body(body)
     assert outcome.verdict == frozenset(), outcome.text
-    assert outcome.properties["cut-by-later"] == "False"
+    assert outcome.properties["waited"] == "held:True"
     assert outcome.properties["waits"] == "1"

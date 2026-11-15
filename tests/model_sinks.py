@@ -467,6 +467,7 @@ class ChildRun:
         inherited = list(self.sinks)
 
         def child() -> str:
+            """Runs the work in the nested child and returns its report with the work's as JSON."""
             run = _begin(inherited)
             report = work(run)
             return json.dumps({**_finish(run), "report": report})
@@ -628,6 +629,7 @@ def _prepare(run: ChildRun) -> None:
         return
 
     def watched(self: Worker, event_lists: list[list[dict[str, object]]]) -> None:
+        """Emits as the worker does, and counts the ``span.end`` events of a refused batch."""
         before = self.failed_batches
         try:
             real(self, event_lists)
@@ -789,6 +791,7 @@ def run_body(body: Callable[[ChildRun], None], *, timeout: int = CELL_TIMEOUT) -
     """
 
     def work() -> str:
+        """Runs the body in the watched child and returns its report as JSON."""
         run = _begin(())
         body(run)
         return json.dumps(_finish(run))
@@ -1230,6 +1233,7 @@ def factory(hooks: Hooks) -> Callable[[], Recorder]:
     """
 
     def build() -> Recorder:
+        """Builds a recorder, running any script the hooks answer for this build first."""
         recorder = Recorder()
         visit(
             recorder,

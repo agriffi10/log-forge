@@ -347,6 +347,7 @@ def _waiter_body(run: ChildRun, cell: Cell) -> None:
     if stop.startswith("child-"):
 
         def child(inner: ChildRun) -> dict[str, object]:
+            """Plays the waiter's scene in the forked child and returns its properties."""
             _waiter_scene(inner, sink, cell, stop.removeprefix("child-"))
             return dict(inner.properties)
 
@@ -381,6 +382,7 @@ def _orphan_write_after_close(run: ChildRun, *, park: bool) -> None:
     real = api._note_orphan_emit
 
     def parking(target: object) -> None:
+        """Calls the real owed-check note and, when parking, signals and waits for release."""
         real(target)  # type: ignore[arg-type]
         if park:
             parked.set()
@@ -447,6 +449,20 @@ def _assert_this_tree(outcome: Outcome) -> None:
     if outcome.file is not None:
         there = pathlib.Path(outcome.file).resolve()
         assert there.is_relative_to(_SRC), f"void run: the child imported {there}, not {_SRC}"
+
+
+def test_a_library_from_outside_this_tree_makes_the_run_void(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The void-run guard refuses another tree's library, in the child and here, and passes ours."""
+    elsewhere = str(tmp_path / "src" / "log_foundry" / "__init__.py")
+    _assert_this_tree(Outcome(frozenset(), "", file=log_foundry.__file__))
+    _assert_this_tree(Outcome(frozenset(), "", file=None))
+    with pytest.raises(AssertionError, match="void run: the child imported"):
+        _assert_this_tree(Outcome(frozenset(), "", file=elsewhere))
+    monkeypatch.setattr(log_foundry, "__file__", elsewhere)
+    with pytest.raises(AssertionError, match="void run: this process imported"):
+        _assert_this_tree(Outcome(frozenset(), "", file=None))
 
 
 @pytest.mark.parametrize("cell", _params())
