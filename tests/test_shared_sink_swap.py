@@ -804,6 +804,41 @@ def test_the_straddling_log_at_a_later_swap(monkeypatch: pytest.MonkeyPatch) -> 
     assert a.events == 2 + 1 + 6, a
 
 
+@pytest.mark.parametrize("worker", ["live", "retired"])
+def test_a_stale_sink_both_kept_and_beneath_a_sink_in_use_is_ceded(
+    worker: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-003: kept is tested before the guard, so both of the sink's holders account for it.
+
+    The straddle leaves A owed as a root beneath `MultiSink(A, X)`, which something may be inside:
+    the worker's current sink, or, after an expired `shutdown()`, a retired drain thread parked in
+    A through it. The next swap, to `MultiSink(A, Y)`, finds A both kept and beneath a sink in use:
+    it cedes A into the graph it installs rather than leaving it owed, and the displaced wrapper's
+    forward of A is skipped. With no live worker the cede is the first section's, which is where
+    the order of the two tests decides it.
+    """
+    a, x, y = Shared("A"), Shared("X"), Shared("Y")
+    holder = _straddle_with_worker(monkeypatch, a, x)
+    if worker == "retired":
+        a.park_emit = threading.Event()
+        _span()
+        assert a.parked.wait(GATE)
+        log_foundry.shutdown(timeout=0.2)
+    installed = MultiSink(a, y)
+    log_foundry.configure(sink=installed)
+    assert not _lifecycle._state._closes.owes(a), "A was left owed rather than ceded"
+    assert _owed()[-1] is installed
+    if worker == "retired":
+        assert _lifecycle._state._closes.owes(holder)
+        _leave(a)
+    else:
+        _write("spans")
+    log_foundry.shutdown(timeout=5.0)
+    join_graced()
+    assert (a.closes, x.closes, y.closes) == (1, 1, 1), (a, x, y)
+    assert a.refused == 0 and a.overlaps == 0 and a.closed_while_inside == 0, a
+
+
 @pytest.mark.parametrize("direction", ["forward", "reverse"])
 def test_an_unconfirmed_swap_keeps_the_outcome(
     direction: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
