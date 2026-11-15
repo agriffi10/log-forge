@@ -1289,7 +1289,12 @@ class _FullDisk:
 
 
 def _driver_failing_sink(build: str, tmp_path: pathlib.Path) -> Any:
-    """One of the three FR-004 sinks, built so its next ``emit`` hits a driver error."""
+    """One of the three FR-004 sinks, built so its next ``emit`` hits a driver error.
+
+    A file sink's path is pointed at a directory that does not exist, so the child's fork hook
+    cannot reopen it: the hook's failure is absorbed and the child keeps the failing handle,
+    where since SPEC-082 a hook that succeeded would replace it with a working one.
+    """
     if build == "sqlite":
         import sqlite3
 
@@ -1304,6 +1309,7 @@ def _driver_failing_sink(build: str, tmp_path: pathlib.Path) -> Any:
     sink = cls(str(tmp_path / f"{build}.ndjson"))
     sink._stream.close()
     sink._stream = _FullDisk()
+    sink._path = str(tmp_path / "no-such-directory" / f"{build}.ndjson")
     return sink
 
 
@@ -1313,9 +1319,9 @@ def test_a_child_does_not_block_on_a_driver_sinks_inherited_counter_lock(
 ) -> None:
     """SPEC-069 FR-004. The counter lock the driver-error count takes is repaired in a child.
 
-    The child's ``emit`` really hits a driver error, so it counts ``failed`` under the counter
-    lock before raising — the only route to that lock for a clean batch — and ``losses()``
-    takes it again. A forked child's ``SQLiteSink`` refuses before it reaches the driver, since a
+    The child's ``emit`` really hits a driver error, so ``failed`` is counted under the counter
+    lock before it raises — the only route to that lock for a clean batch; on the file sinks the
+    count is the engine's commit since SPEC-082 — and ``losses()`` takes it again. A forked child's ``SQLiteSink`` refuses before it reaches the driver, since a
     SQLite connection cannot cross a fork, so for it ``losses()`` is the only route to the lock:
     the refusal is reported, not counted, and the read must still return.
     """
@@ -3071,67 +3077,14 @@ def test_the_parent_keeps_delivering_across_a_fork(tmp_path: pathlib.Path) -> No
     assert "work" in path.read_text(encoding="utf-8")
 
 
-# -- FR-004: the child discards the buffered writes it inherited -----------------------------
-
-
-def _buffered_sink(
-    tmp_path: pathlib.Path, kind: str, *, name: str = "buffered.ndjson"
-) -> tuple[Any, _GatingStream, pathlib.Path]:
-    """Builds a file-backed sink whose *second* write parks, and makes it the process sink.
-
-    The first write is forwarded into the real stream and **not** flushed — ``emit`` flushes
-    once at the end of the batch — so a fork taken while the second is parked lands with the
-    parent's bytes in a buffer both processes then own. That is the window FR-004 is about, and
-    it is the one an earlier draft of this spec measured *after* ``emit`` returned, when the
-    buffer is empty by construction.
-
-    **One batch is delivered and flushed before the window is armed**, so the file is not empty
-    on disk when the child reopens it. That is not scene-setting: with nothing on disk, opening
-    the replacement in ``"w"`` mode is indistinguishable from ``"a"``, and a review measured
-    that mutant passing all 1626 tests — a child truncating the shared log on every fork, which
-    is strictly worse than the duplication this whole FR removes. It is written before the
-    wrapper is installed so it does not consume the wrapper's write count.
-
-    Args:
-      tmp_path: The directory to write into.
-      kind: ``"file"``, ``"rotating"`` or ``"multi"`` — the last wrapping a ``FileSink`` in a
-        ``MultiSink``, so the sink holding the buffer is not the one the worker was given.
-      name: The file to append to.
-
-    Returns:
-      The sink to give the worker, the stream wrapper arming the window, and the path.
-
-    Raises:
-      None.
-    """
-    path = tmp_path / name
-    inner: Any = RotatingFileSink(str(path)) if kind == "rotating" else FileSink(str(path))
-    inner.emit([{"msg": "before-the-fork"}])
-    stream = _GatingStream(inner._stream, park_after=1)
-    inner._stream = stream
-    sink = MultiSink(inner) if kind == "multi" else inner
-    log_foundry.configure(service="fork", version="0", env="test", sink=sink)
-    return sink, stream, path
-
-
-def _park_inside_a_buffered_batch(stream: _GatingStream, worker: Worker) -> _Gate:
-    """Submits a two-event batch and returns once the drain thread is inside the second write.
-
-    Args:
-      stream: The wrapper whose gate is armed.
-      worker: The worker whose drain thread will take the gate.
-
-    Returns:
-      The armed gate, which the caller releases after forking.
-
-    Raises:
-      AssertionError: If the drain thread never reached the window.
-    """
-    gate = _Gate()
-    stream.gate = gate
-    worker.submit([{"msg": "parent-a"}, {"msg": "parent-b"}])
-    assert gate.entered.wait(5.0), "the drain thread never reached the second write of the batch"
-    return gate
+# -- FR-004: what the child inherits from a file sink ------------------------------------------
+#
+# The tests that parked the parent between a write and its flush, and forked there, are retired:
+# SPEC-082 put the file sinks on an unbuffered handle, so no bytes are ever "written but not
+# flushed" for a child to write a second time. What a child could write twice now is the parent's
+# pending tail, and tests/test_file_sink_fork.py holds that, with the same two guards these tests
+# carried: a line on disk before the fork, and the unrepaired behaviour demonstrated with the hook
+# taken away.
 
 
 def _lines_holding(written: str, marker: str) -> int:
@@ -3152,136 +3105,6 @@ def _lines_holding(written: str, marker: str) -> int:
       None.
     """
     return sum(1 for line in written.splitlines() if marker in line)
-
-
-@pytest.mark.parametrize("kind", ["file", "rotating", "multi"])
-def test_the_child_does_not_write_the_parents_buffered_bytes(
-    tmp_path: pathlib.Path, kind: str
-) -> None:
-    """FR-004 AC-1 and AC-2. The fork lands mid-``emit``, with bytes pending on both sides.
-
-    Without the discard both processes flush the same buffer and the event at the fork point
-    appears on disk twice — measured against ``5ad6699``, and identical for
-    ``RotatingFileSink``. The child must re-emit none of it, and the parent's own copy must
-    still reach disk exactly once, which is why both are asserted here rather than only the
-    absence of a duplicate: a child that discarded the parent's *file* would satisfy one half.
-
-    The ``multi`` case is not decoration. The sink holding the buffer is then not the one the
-    worker was handed, so a repair that asked ``worker.sink`` rather than every sink the walk
-    reached would leave a fan-out's children duplicating — the shape FR-003 AC-2 already had to
-    close for the locks.
-
-    ``before-the-fork`` is on disk before any of this and is asserted to survive, which is what
-    holds the child's reopen to **append** mode. Without a line already written, ``"w"`` and
-    ``"a"`` are the same program: a review measured that mutant green across the whole suite,
-    with every child truncating the shared log.
-    """
-    sink, stream, path = _buffered_sink(tmp_path, kind, name=f"{kind}.ndjson")
-    worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
-    gate = _park_inside_a_buffered_batch(stream, worker)
-    at_the_fork = path.read_text(encoding="utf-8")
-    assert _lines_holding(at_the_fork, "before-the-fork") == 1, at_the_fork
-    assert "parent-a" not in at_the_fork, "nothing is buffered, so this proves nothing"
-
-    def log_in_child() -> str:
-        log_foundry.info("child-0")
-        return "logged"
-
-    try:
-        child = run_in_child(log_in_child, timeout=6)
-    finally:
-        gate.release.set()
-
-    assert child.output == "logged", child.output
-    assert log_foundry.flush(timeout=5.0)
-    written = path.read_text(encoding="utf-8")
-    for marker in ("before-the-fork", "parent-a", "parent-b", "child-0"):
-        assert _lines_holding(written, marker) == 1, f"{marker} in {written!r}"
-
-
-def test_the_same_child_duplicates_when_the_discard_is_taken_away(
-    tmp_path: pathlib.Path,
-) -> None:
-    """FR-004 AC-1's other half: the unfixed behaviour is **demonstrated**, not asserted.
-
-    The discard step is removed for the length of one fork, which puts the child in exactly the
-    state the library shipped in before this spec: it inherits the parent's pending bytes, and
-    its own first log call flushes them along with its own. The parent's line then lands twice,
-    which is the measurement against ``5ad6699`` reproduced rather than quoted.
-
-    Without this, the test above could pass against a fork that never entered the window — an
-    empty buffer duplicates nothing, and "each marker appears once" is satisfied by a sink that
-    was never in danger.
-
-    Restoring the inherited *stream object* in the child does not express this and was tried:
-    ``dup2`` has already pointed that object's descriptor at ``/dev/null``, so putting it back
-    sends the child's own line there too and the file shows **less** rather than more. The step
-    has to be absent before the handler runs, not undone after it.
-    """
-    sink, stream, path = _buffered_sink(tmp_path, "file", name="unrepaired.ndjson")
-    worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
-    gate = _park_inside_a_buffered_batch(stream, worker)
-
-    original = _fork._reacquire_transports
-
-    def keep_the_parents_buffer(holders: list[Any]) -> None:
-        pass
-
-    _fork._reacquire_transports = keep_the_parents_buffer  # type: ignore[assignment]
-    try:
-        child = run_in_child(_log_in_child, timeout=6)
-    finally:
-        _fork._reacquire_transports = original  # type: ignore[assignment]
-        gate.release.set()
-
-    assert child.output == "logged", child.output
-    assert log_foundry.flush(timeout=5.0)
-    written = path.read_text(encoding="utf-8")
-    assert _lines_holding(written, "parent-a") == 2, written
-
-
-def test_the_discard_runs_before_any_registered_handler(tmp_path: pathlib.Path) -> None:
-    """FR-001 AC-2's third step, pinned rather than promised.
-
-    The order in the child is the contract — locks, then the discard, then the registered
-    handlers — and the reason the discard is inline rather than registered is that
-    ``decorator``'s rebuild registers first and has a **live drain thread** by the time any
-    later handler runs, emitting into the very sink whose buffer is still the parent's.
-
-    Being straight about what this is: moving the step below the handler loop is not currently
-    observable as a duplicate, because the rebuilt worker starts with an empty queue and so has
-    nothing to emit in the window. It is an unenforced contract rather than a live defect —
-    which is exactly the state SPEC-035's predicate roster was built for, after three reviewers
-    each named a different unenforced ordering site and a fourth shipped anyway. The probe
-    records what it saw rather than asserting in the child, as the locks' order test does.
-
-    **The probe is registered first, and appending it is what this test was doing wrong.**
-    ``decorator``'s rebuild is the only other handler and is the one the contract is about, so a
-    probe on the end reads "the discard ran before the *last* handler" — green against a discard
-    slid to just after that rebuild, which is verbatim the hazard the contract names: a live
-    drain thread emitting into a sink whose buffer is still the parent's. From position 0 the
-    same mutant reports ``still-the-parents``.
-    """
-    sink, stream, _path = _buffered_sink(tmp_path, "file", name="ordering.ndjson")
-    worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
-    gate = _park_inside_a_buffered_batch(stream, worker)
-    inherited = sink._stream
-    seen: list[str] = []
-
-    def probe() -> None:
-        seen.append("discarded" if sink._stream is not inherited else "still-the-parents")
-
-    _fork._child_handlers.insert(0, probe)
-    try:
-        child = run_in_child(lambda: ",".join(seen), timeout=6)
-    finally:
-        _fork._child_handlers.remove(probe)
-        gate.release.set()
-
-    assert child.output == "discarded", child.output
 
 
 def test_the_reopened_stream_keeps_the_encoding_it_was_given(tmp_path: pathlib.Path) -> None:
@@ -3388,39 +3211,6 @@ def test_a_member_of_that_name_which_is_not_callable_is_not_the_hook(
 
     assert child.finished, child.output
     assert child.output == "", f"the child announced something: {child.output!r}"
-
-
-def test_the_inherited_buffer_can_only_reach_the_null_device(tmp_path: pathlib.Path) -> None:
-    """FR-004. The buffer is **stranded**, not merely detached, and the two differ.
-
-    Rebinding ``self._stream`` alone leaves the inherited object holding the parent's bytes and
-    a descriptor still pointing at the file — so the flush nobody wrote lands anyway: CPython
-    flushes a ``TextIOWrapper`` when it is garbage-collected, which happens the moment the sink
-    drops its last reference, and again at interpreter exit. ``dup2`` is what makes that flush
-    harmless, and it is measurement 3 of the spec's prior work.
-
-    The flush is driven explicitly here rather than waited for. A test process holds the wrapper
-    from its own frame, so the collection that makes this bite in production never happens
-    inside the child — and a test that hoped for it would pass with ``dup2`` deleted.
-    """
-    sink, stream, path = _buffered_sink(tmp_path, "file", name="stranded.ndjson")
-    worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
-    gate = _park_inside_a_buffered_batch(stream, worker)
-
-    def flush_what_was_inherited() -> str:
-        stream.flush()
-        return "flushed"
-
-    try:
-        child = run_in_child(flush_what_was_inherited, timeout=6)
-    finally:
-        gate.release.set()
-
-    assert child.output == "flushed", child.output
-    assert log_foundry.flush(timeout=5.0)
-    written = path.read_text(encoding="utf-8")
-    assert _lines_holding(written, "parent-a") == 1, written
 
 
 def _open_descriptors() -> int:

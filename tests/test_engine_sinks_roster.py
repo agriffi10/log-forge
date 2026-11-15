@@ -1,4 +1,4 @@
-"""SPEC-074 FR-006 — the engine sinks are derived from the tree and held to one rule.
+"""SPEC-074 FR-006, SPEC-082 — the engine sinks are derived from the tree and held to one rule.
 
 The population is every class under ``src/log_foundry/sinks/`` that defines ``deliver`` in its
 own body, less the named exclusions, each with its reason. Each must assign
@@ -7,8 +7,11 @@ emit(self, batch)`` whose body is the one call ``emit_via_deliver(self, batch)``
 that defines ``deliver``, with no class below it defining ``emit``; its module must neither call
 ``wait`` nor assign a backoff constant; and it may write a counter only in ``__init__``, the
 ``failed`` setter or the ``_counter_lock`` setter, never registering a run-context count against
-``failed``, whose setter takes the lock a commit holds. The floor is 13, exactly the thirteen.
-A runtime half builds each sink over its double and reads what the AST cannot. The gate carries
+``failed``, whose setter takes the lock a commit holds. The floor is 15, exactly the fifteen:
+SPEC-074's thirteen and, since SPEC-082, ``FileSink`` and ``RotatingFileSink``. A runtime half
+builds each sink over its double and reads what the AST cannot; the two file sinks have a case of
+their own there, because their ``losses()`` is ``None`` until something is counted (SPEC-069) and
+they never had a public ``failed`` to keep assignable. The gate carries
 a fixture corpus asserting each check's reason, a floor case, and a silent case. Serves
 invariants 2, 6, 7, 10 and 12.
 """
@@ -49,9 +52,11 @@ ENGINE_SINKS = frozenset(
         "NATSSink",
         "SocketTransport",
         "SyslogSink",
+        "FileSink",
+        "RotatingFileSink",
     }
 )
-FLOOR = 13
+FLOOR = 15
 
 _WRAPPER_REASON = (
     "SPEC-075's wrapper: its emit is a 1.x body, its losses() is a 1.x formula, and its deliver "
@@ -191,7 +196,7 @@ def engine_sink_findings(root: Path, floor: int = FLOOR) -> tuple[set[str], list
     return found, findings
 
 
-def test_the_engine_sinks_are_the_thirteen() -> None:
+def test_the_engine_sinks_are_the_fifteen() -> None:
     found, findings = engine_sink_findings(SINKS)
     assert findings == [], "\n".join(findings)
     assert found == ENGINE_SINKS
@@ -205,7 +210,7 @@ def test_removing_a_wrapper_exclusion_reddens_naming_it(
 
     Before SPEC-075 no wrapper defined ``deliver`` and removing the entry changed nothing; now the
     roster finds the class and names its 1.x ``emit``, and with every exclusion in place the
-    population is still exactly the thirteen.
+    population is still exactly the fifteen.
     """
     monkeypatch.delitem(EXCLUSIONS, wrapper)
     found, findings = engine_sink_findings(SINKS)
@@ -268,12 +273,12 @@ def test_a_conforming_fixture_is_silent(tmp_path: Path) -> None:
     assert engine_sink_findings(tmp_path, floor=1) == ({"Good"}, [])
 
 
-def test_a_tree_of_twelve_fails_the_floor(tmp_path: Path) -> None:
-    body = "".join(_GOOD.replace("class Good", f"class Good{i}") for i in range(12))
+def test_a_tree_of_fourteen_fails_the_floor(tmp_path: Path) -> None:
+    body = "".join(_GOOD.replace("class Good", f"class Good{i}") for i in range(14))
     (tmp_path / "m.py").write_text(textwrap.dedent(body), encoding="utf-8")
     found, findings = engine_sink_findings(tmp_path)
-    assert len(found) == 12
-    assert findings == ["the scan found 12 engine sinks, under its floor of 13"]
+    assert len(found) == 14
+    assert findings == ["the scan found 14 engine sinks, under its floor of 15"]
 
 
 # --- the runtime half ---------------------------------------------------------------------------
@@ -335,6 +340,38 @@ def test_every_engine_sink_reports_its_counters(
         sink.close()
 
 
+_FILE_SINKS = ("FileSink", "RotatingFileSink")
+"""The engine sinks whose ``losses()`` is ``None`` until something is counted (SPEC-082)."""
+
+
+@pytest.mark.parametrize("name", _FILE_SINKS)
+def test_a_file_sink_reports_its_counters_once_it_has_any(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The runtime half for the two file sinks, whose 1.x ``losses()`` rule SPEC-082 keeps.
+
+    The counters object, the probe and the lock are held to what every engine sink is held to.
+    ``losses()`` differs on purpose: ``None`` while both counters are zero, so a process that
+    only logs clean events still reads ``health().sink is None``, and the counters once either
+    moves. They have no ``failed`` attribute: 1.x's was the private ``_failed``.
+    """
+    sink = RIGS[name](monkeypatch, tmp_path).sink
+    try:
+        assert "log_foundry_counters" in vars(sink)
+        assert type(_static_value(sink, "log_foundry_counters")) is SinkCounters
+        bound = read_deliver(sink)
+        assert bound is not None and bound.__self__ is sink  # type: ignore[attr-defined]
+        assert sink._counter_lock is sink.log_foundry_counters._counter_lock
+        assert sink.losses() is None
+        sink.log_foundry_counters.failed_events = 7
+        assert sink.losses() == sink.log_foundry_counters.losses()
+        sink.log_foundry_counters.failed_events = 0
+        assert sink.losses() is None
+        assert not hasattr(sink, "failed")
+    finally:
+        sink.close()
+
+
 def test_no_shipped_sink_declares_itself_idempotent() -> None:
     declared = [
         f"{path.name} {node.name}"
@@ -348,7 +385,7 @@ def test_no_shipped_sink_declares_itself_idempotent() -> None:
     assert declared == []
 
 
-@pytest.mark.parametrize("name", (*_RIGGED, "NATSSink"))
+@pytest.mark.parametrize("name", (*_RIGGED, "NATSSink", *_FILE_SINKS))
 def test_an_emit_override_is_delivered_through_its_emit(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -369,7 +406,7 @@ def test_an_emit_override_is_delivered_through_its_emit(
         worker.submit([ok("a")])
         assert worker.flush(timeout=30.0)
         assert seen == [1]
-        assert sink.losses().failed == 0
+        assert sink.log_foundry_counters.losses().failed == 0
     finally:
         sink.close()
 
@@ -415,7 +452,7 @@ def test_an_emit_override_counts_a_lost_batch_once_per_emit_call_as_1x(
         sink.close()
 
 
-@pytest.mark.parametrize("name", _ALL)
+@pytest.mark.parametrize("name", (*_ALL, *_FILE_SINKS))
 def test_a_forked_child_completes_an_emit_while_the_parent_holds_the_counter_lock(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

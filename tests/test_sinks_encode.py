@@ -32,6 +32,9 @@ _B = {"log_id": "b", "level": "ERROR", "timestamp": "2026-01-01T00:00:01.000Z", 
 def _golden() -> dict[str, list[object]]:
     """Each sink's hand-offs for :data:`EVENTS`, as 1.1.0 wrote them (captured at ``ebf9d680``).
 
+    The two file sinks' entries are the same bytes 1.1.0 wrote, handed over in one write call
+    for the batch where 1.1.0's text stream took one call a line (SPEC-082).
+
     The syslog frame's hostname and PROCID are the only parts that depend on the machine and the
     process; they are filled in here rather than written as literals.
     """
@@ -40,8 +43,8 @@ def _golden() -> dict[str, list[object]]:
     return {
         "StdoutSink": [A + "\n", B + "\n"],
         "StderrSink": [A + "\n", B + "\n"],
-        "FileSink": [A + "\n", B + "\n"],
-        "RotatingFileSink": [A + "\n", B + "\n"],
+        "FileSink": [a + b"\n" + b + b"\n"],
+        "RotatingFileSink": [a + b"\n" + b + b"\n"],
         "SQLiteSink": [
             [
                 ("a", None, None, "2026-01-01T00:00:00.000Z", "INFO", None, A),
@@ -815,11 +818,16 @@ ENGINE_GAINED["SocketTransport"] = frozenset({"deliver", "log_foundry_counters",
 ENGINE_GAINED["LogstashSink"] = frozenset(
     {"deliver", "log_foundry_counters", "max_retries", "max_retry_after"}
 )
+ENGINE_GAINED["FileSink"] = ENGINE_GAINED["RotatingFileSink"] = frozenset(
+    {"deliver", "log_foundry_counters", "log_foundry_stop_signal"}
+)
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
 ``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
 (invariant 10), so a name appearing beyond these is still a finding. ``LogstashSink``'s entry is
-SPEC-075 FR-003's: it delegates ``deliver`` and copies its backend's budget, read-only.
+SPEC-075 FR-003's: it delegates ``deliver`` and copies its backend's budget, read-only. The two
+file sinks' entries are SPEC-082's: they had no stop signal in 1.1.0, since nothing in them waited,
+and gain the attribute the engine's inline waits read.
 """
 ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
 """SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""

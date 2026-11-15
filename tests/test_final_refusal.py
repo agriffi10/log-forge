@@ -38,6 +38,7 @@ from log_foundry.sinks.file import FileSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from log_foundry.sinks.nats import NATSSink, _LoopWedgedError
+from log_foundry.sinks.sqlite import SQLiteSink
 from log_foundry.sinks.transform import TransformSink
 from log_foundry.worker import Worker
 from test_sink_post_close import EMIT_ONLY_CLOSED, ENGINE_CLOSED, Built, _hold_a_section
@@ -237,43 +238,29 @@ def test_a_callers_sink_re_raising_a_shipped_refusal_keeps_the_resend_it_arrange
     assert len((tmp_path / "new.ndjson").read_text().splitlines()) == 2
 
 
-class _FailsOnce:
-    """A stream whose first ``write`` raises ``EIO``, for a transient file failure."""
-
-    def __init__(self) -> None:
-        self.writes = 0
-
-    def write(self, line: str) -> int:
-        self.writes += 1
-        raise OSError(5, "Input/output error")
-
-    def flush(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
-
-
 def test_a_refusal_after_a_transient_failure_stops_the_resend_where_it_lands(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     calls_to: Callable[[Callable[..., Any]], Callable[[], int]],
 ) -> None:
-    """A write fails (retried), the sink closes in the backoff, and the close's refusal is final.
+    """An insert fails (retried), the sink closes in the backoff, and the close's refusal is final.
 
-    The line counts the attempts actually made: two.
+    The line counts the attempts actually made: two. On ``SQLiteSink`` since SPEC-082, which put
+    ``FileSink`` on the delivery engine: this guards the worker's own 1.x loop, so it needs a
+    shipped sink still off the engine, and it is the one test that fails when that loop abandons
+    a final refusal on its first attempt only.
     """
-    sink = FileSink(str(tmp_path / "f.ndjson"))
-    sink._stream.close()
-    sink._stream = _FailsOnce()
+    rig = sink_rigs.RIGS["SQLiteSink"](monkeypatch, tmp_path)
+    sink = rig.sink
+    rig.state.down = True
 
     def close_in_the_backoff(attempt: int) -> float:
         sink.close()
         return 0.0
 
     monkeypatch.setattr(_engine, "cycle_backoff", close_in_the_backoff)
-    emits = calls_to(FileSink.emit)
+    emits = calls_to(type(sink).emit)
     capsys.readouterr()
     ok, failed = _drain(sink)
     assert emits() == 2
@@ -444,7 +431,7 @@ def test_a_fan_out_of_final_refusals_raises_the_first_childs(
     fan_out = MultiSink(first, second)
     with pytest.raises(SinkDeliveryError) as raised:
         fan_out.emit(_batch(1))
-    assert str(raised.value) == EMIT_ONLY_CLOSED["FileSink"](1)
+    assert str(raised.value) == ENGINE_CLOSED["FileSink"](1)
     assert is_final_refusal(raised.value, fan_out)
 
 
@@ -592,12 +579,19 @@ class _Property:
         self.inner.close()
 
 
-class _Reopening(FileSink):
-    """A ``FileSink`` of the caller's own that re-initialises itself, inheriting ``emit``."""
+class _Reopening(SQLiteSink):
+    """A ``SQLiteSink`` of the caller's own that re-initialises itself, inheriting ``emit``.
+
+    A ``FileSink`` subclass until SPEC-082. The file sinks are on the delivery engine now, where
+    the worker calls the subclass's ``deliver`` and a closed sink's round is final, so that shape
+    is no longer resent (``tests/test_file_sink_deliver.py`` holds it to one ``deliver`` call).
+    The 1.x rule this shape guards is the worker's own loop's, which a shipped sink still off the
+    engine reaches.
+    """
 
     def reopen(self, path: str) -> None:
         self.close()
-        FileSink.__init__(self, path)
+        SQLiteSink.__init__(self, path)
 
 
 class _Router:
@@ -664,9 +658,12 @@ def test_a_callers_sink_that_routes_emit_without_a_frame_keeps_the_resend(
     shape delivered this way.
     """
     old, new = tmp_path / "old.ndjson", tmp_path / "new.ndjson"
-    closed = _Reopening(str(old)) if shape == "subclass" else FileSink(str(old))
+    new_db = tmp_path / "new.db"
+    closed: Any = (
+        _Reopening(str(tmp_path / "old.db")) if shape == "subclass" else FileSink(str(old))
+    )
     closed.close()
-    opened: list[FileSink] = []
+    opened: list[Any] = []
     state: dict[str, Any] = {"target": closed, "swapped": False}
     sink: Any
     if shape == "subclass":
@@ -700,7 +697,7 @@ def test_a_callers_sink_that_routes_emit_without_a_frame_keeps_the_resend(
             return 0.0
         state["swapped"] = True
         if shape == "subclass":
-            closed.reopen(str(new))
+            closed.reopen(str(new_db))
             state["target"] = closed
             opened.append(closed)
             return 0.0
@@ -727,7 +724,14 @@ def test_a_callers_sink_that_routes_emit_without_a_frame_keeps_the_resend(
         for each in opened:
             each.close()
     assert ok and failed == 0, f"{shape}: the resend the caller arranged was not made"
-    assert len(new.read_text().splitlines()) == 2
+    if shape == "subclass":
+        reading = sqlite3.connect(str(new_db))
+        try:
+            assert reading.execute('SELECT COUNT(*) FROM "log_events"').fetchone() == (2,)
+        finally:
+            reading.close()
+    else:
+        assert len(new.read_text().splitlines()) == 2
 
 
 def test_package_graph_reads_the_graph_without_running_it(tmp_path: Path) -> None:

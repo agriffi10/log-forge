@@ -333,13 +333,19 @@ def test_a_failed_rename_neither_loses_nor_duplicates_the_batch(tmp_path, capsys
 
 
 def test_a_failed_flush_still_leaves_every_event_on_disk(tmp_path, capsys) -> None:
-    """The full-disk shape, which the rename injection point cannot reach.
+    """A rotation whose first step, the close, raises is absorbed with every event on disk once.
 
-    `_rotate`'s first statement is `self._stream.close()`, which flushes, while `emit` otherwise
-    flushes once at the end of the batch -- so on a full or read-only filesystem it is *that*
-    flush that raises, and the batch's buffered lines are gone before any rename is attempted.
-    Absorbing the error is then not enough: the events are already lost and `getsize` reports a
-    file that never received them. `emit` flushes before attempting the rotation for this reason.
+    What this still proves since SPEC-082: `_rotate`'s first statement is `self._stream.close()`,
+    the one raise site the rename injection point cannot reach, and a rotation failing there is
+    absorbed like any other, the batch carrying on in the un-rotated file with nothing lost and
+    nothing written twice.
+
+    What it no longer proves is the write-before-rotate ordering it was written for. Under 1.x
+    the stream was buffered, that close flushed, and a close that raised took the batch's
+    buffered lines with it unless `emit` had flushed first. The handle is unbuffered now, so
+    there is no buffered line for the close to lose, and a build that rotated before writing the
+    staged lines passes this test. That ordering is guarded by the first two tests of
+    `tests/test_rotating_file_sink_deliver.py`.
     """
     path = str(tmp_path / "app.log")
     sink = RotatingFileSink(path, max_bytes=120, backup_count=5)
@@ -360,9 +366,7 @@ def test_a_failed_flush_still_leaves_every_event_on_disk(tmp_path, capsys) -> No
     sink.close()
 
     seen = [event["i"] for event in _all_events(str(tmp_path))]
-    assert sorted(seen) == list(range(8)), (
-        f"the pre-rotation flush is what makes this hold; got {sorted(seen)}"
-    )
+    assert sorted(seen) == list(range(8)), f"every event exactly once, got {sorted(seen)}"
 
 
 def test_the_sink_survives_a_persistent_rotation_failure(tmp_path, capsys) -> None:

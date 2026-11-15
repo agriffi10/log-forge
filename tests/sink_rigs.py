@@ -136,7 +136,7 @@ def _no_wait(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.setattr(mod, "wait", lambda *_a, **_k: None)
 
 
-def _lines(payload: str) -> list[dict[str, Any]]:
+def _lines(payload: str | bytes) -> list[dict[str, Any]]:
     return [json.loads(line) for line in payload.splitlines() if line]
 
 
@@ -175,14 +175,39 @@ def stderr(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     return stdout(mp, tmp, "StderrSink")
 
 
+class _Handle:
+    """The file sinks' unbuffered binary handle: each write is handed bytes and returns a count.
+
+    SPEC-082 put the file sinks on the delivery engine, where they write a round's lines in one
+    call and decide each event's outcome from the count that call returns, so the double takes
+    ``bytes``, has no ``flush``, and a hand-off is one write call.
+    """
+
+    def __init__(self, state: State) -> None:
+        self._state = state
+
+    def write(self, data: bytes) -> int:
+        if self._state.error is not None:
+            self._state.log.append(("refused", None))
+            raise self._state.error
+        if self._state.down:
+            self._state.log.append(("refused", None))
+            raise OSError(28, "No space left on device")
+        self._state.log.append(("handoff", bytes(data)))
+        return len(data)
+
+    def close(self) -> None:
+        pass
+
+
 def file(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     from log_foundry.sinks.file import FileSink
 
     state = State()
     sink = FileSink(str(tmp / "f.ndjson"))
     sink._stream.close()
-    sink._stream = _Stream(state)
-    return Rig(sink, state, _lines, sink, "_unencodable")
+    sink._stream = _Handle(state)
+    return Rig(sink, state, _lines, sink.log_foundry_counters, "dropped_events")
 
 
 def rotating(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
@@ -191,8 +216,8 @@ def rotating(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
     state = State()
     sink = RotatingFileSink(str(tmp / "r.ndjson"), max_bytes=10**9, backup_count=1)
     sink._stream.close()
-    sink._stream = _Stream(state)
-    return Rig(sink, state, _lines, sink, "_unencodable")
+    sink._stream = _Handle(state)
+    return Rig(sink, state, _lines, sink.log_foundry_counters, "dropped_events")
 
 
 class _SQLiteProxy:

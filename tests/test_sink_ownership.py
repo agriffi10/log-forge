@@ -1212,8 +1212,9 @@ def test_reacquisition_restamps_the_sink_and_nothing_above_it(tmp_path: pathlib.
 
     Only the children implement the hook, so a `MultiSink` of two `FileSink`s leaves the
     re-acquired children reachable only through a wrapper nothing will release. Nothing is lost
-    -- `FileSink.emit` flushes at the end of every batch -- but AC-6's descriptor test uses a
-    bare `FileSink` and passes while this stands, so it is asserted rather than discovered.
+    -- a `FileSink` holds no buffer, every write call handing its bytes to the operating system
+    -- but AC-6's descriptor test uses a bare `FileSink` and passes while this stands, so it is
+    asserted rather than discovered.
     """
     from log_foundry.sinks.file import FileSink
 

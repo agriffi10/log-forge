@@ -267,7 +267,7 @@ def _self_attribute_names(cls: ast.ClassDef, attr: str) -> set[str]:
 
     **The third route takes any callable's name as a type**, which it cannot verify: a factory
     named like a sink, or a local rebinding that shadows one, both resolve to the roster name.
-    In `src/` today this records `_reopen_discarding`, `open` and `new_event_loop` as candidate
+    In `src/` today this records `open` and `new_event_loop` as candidate
     types, inert only because none collides. That is the safe direction -- a false positive is
     a lint failure somebody reads, where a false negative is a sink close nobody sees.
 
