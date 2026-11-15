@@ -14,6 +14,8 @@ import io
 import json
 import logging
 import sqlite3
+import sys
+import types
 import urllib.error
 from typing import TYPE_CHECKING, Any, Self
 
@@ -29,7 +31,110 @@ def _timeout() -> TimeoutError:
     return TimeoutError("the reply did not arrive")
 
 
+# ------------------------------------------------------------------ driver modules
+
+DRIVERS: dict[str, dict[str, tuple[str, ...]]] = {
+    "botocore.exceptions": {
+        "BotoCoreError": (),
+        "ConnectionError": ("BotoCoreError",),
+        "HTTPClientError": ("BotoCoreError",),
+        "EndpointConnectionError": ("ConnectionError",),
+        "ReadTimeoutError": ("HTTPClientError",),
+        "ClientError": (),
+    },
+    "clickhouse_connect.driver.exceptions": {"Error": (), "OperationalError": ("Error",)},
+    "azure.eventhub.exceptions": {
+        "EventHubError": (),
+        "ConnectError": ("EventHubError",),
+        "AuthenticationError": ("ConnectError",),
+        "ConnectionLostError": ("EventHubError",),
+        "OperationTimeoutError": ("EventHubError",),
+    },
+    "pymongo.errors": {
+        "PyMongoError": (),
+        "ConnectionFailure": ("PyMongoError",),
+        "AutoReconnect": ("ConnectionFailure",),
+        "NetworkTimeout": ("AutoReconnect",),
+        "BulkWriteError": ("PyMongoError",),
+    },
+    "pika.exceptions": {
+        "AMQPError": (),
+        "AMQPConnectionError": ("AMQPError",),
+        "AuthenticationError": ("AMQPConnectionError",),
+        "StreamLostError": ("AMQPConnectionError",),
+        "ConnectionWrongStateError": ("AMQPConnectionError",),
+        "ChannelWrongStateError": ("AMQPError",),
+    },
+    "psycopg.errors": {"Error": (), "OperationalError": ("Error",)},
+    "redis.exceptions": {
+        "RedisError": (),
+        "ConnectionError": ("RedisError",),
+        "TimeoutError": ("RedisError",),
+    },
+}
+"""Each driver module a sink's retry predicate reads through `_classify.driver_classes`, with the
+classes the doubles raise. No class subclasses a builtin, so a raise reaches the sink's
+driver-class branch rather than `TRANSIENT_BUILTINS`."""
+
+
+def install_drivers() -> Callable[[], None]:
+    """Puts a stub of every `DRIVERS` module, and `pika` and `psycopg`, in `sys.modules`.
+
+    Installed for one row and restored after it, in place of a real driver too, since the doubles
+    are fakes either way and `driver_classes` reads `sys.modules` (`_classify.py:87`).
+    """
+    saved: dict[str, Any] = {}
+    names = [*DRIVERS, "pika", "psycopg"]
+    for name in names:
+        saved[name] = sys.modules.get(name)
+    for module_name, classes in DRIVERS.items():
+        module = types.ModuleType(module_name)
+        for cls_name, bases in classes.items():
+            parents = tuple(getattr(module, b) for b in bases) or (Exception,)
+            setattr(module, cls_name, type(cls_name, parents, {"__module__": module_name}))
+        sys.modules[module_name] = module
+    pika = types.ModuleType("pika")
+    pika.exceptions = sys.modules["pika.exceptions"]  # type: ignore[attr-defined]
+    pika.URLParameters = _Params  # type: ignore[attr-defined]
+    pika.ConnectionParameters = _Params  # type: ignore[attr-defined]
+    pika.BasicProperties = _Params  # type: ignore[attr-defined]
+    sys.modules["pika"] = pika
+    psycopg = types.ModuleType("psycopg")
+    psycopg.errors = sys.modules["psycopg.errors"]  # type: ignore[attr-defined]
+    sys.modules["psycopg"] = psycopg
+
+    def restore() -> None:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    return restore
+
+
+class _Params:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.blocked_connection_timeout = None
+        vars(self).update(kwargs)
+
+
+def driver_error(module: str, name: str, message: str, **attrs: Any) -> Exception:
+    """An instance of the driver class `module.name`, as installed for this row."""
+    err = getattr(sys.modules[module], name)(message)
+    vars(err).update(attrs)
+    return err
+
+
 # ------------------------------------------------------------------ keyed reply
+
+
+def _aws_refused() -> Exception:
+    return driver_error("botocore.exceptions", "EndpointConnectionError", "could not connect")
+
+
+def _aws_timeout() -> Exception:
+    return driver_error("botocore.exceptions", "ReadTimeoutError", "read timed out")
 
 
 class SQSClient:
@@ -73,7 +178,7 @@ def _keyed(
     action = backend.decide(carried)
     by_token = {tokens(e[body])[0]: e for e in entries}
     if action == "refuse":
-        raise REFUSED
+        raise _aws_refused()
     if action == "noshape":
         store([by_token[t] for t in carried[: (len(carried) + 1) // 2]])
         return {}
@@ -97,7 +202,7 @@ def _keyed(
             taken.append(entry)
     store(taken)
     if action in ("taken-raise", "reply-lost"):
-        raise _timeout()
+        raise _aws_timeout()
     names = {f["Id"] for f in failed}
     return {
         "Successful": [{"Id": e["Id"], "MessageId": "m"} for e in entries if e["Id"] not in names],
@@ -127,12 +232,12 @@ class MongoClient:
         carried = [t for d in documents for t in tokens({k: v for k, v in d.items() if k != "_id"})]
         action = self.backend.decide(carried)
         if action == "refuse":
-            raise REFUSED
+            raise driver_error("pymongo.errors", "AutoReconnect", "connection refused")
         if action == "noshape":
             for document in documents[: (len(documents) + 1) // 2]:
                 self.ids.add(document["_id"])
                 self.backend.take(tokens({k: v for k, v in document.items() if k != "_id"}))
-            raise _BulkWriteError({"writeErrors": "not a list"})
+            raise _bulk_error({"writeErrors": "not a list"})
         permanent = self.backend.permanent()
         retry: set[str] = set()
         if action == "partial":
@@ -151,16 +256,14 @@ class MongoClient:
             self.ids.add(document["_id"])
             self.backend.take([token])
         if action in ("taken-raise", "reply-lost"):
-            raise _timeout()
+            raise driver_error("pymongo.errors", "NetworkTimeout", "timed out")
         if errors:
-            raise _BulkWriteError({"writeErrors": errors})
+            raise _bulk_error({"writeErrors": errors})
         return object()
 
 
-class _BulkWriteError(Exception):
-    def __init__(self, details: dict[str, Any]) -> None:
-        super().__init__("bulk write error")
-        self.details = details
+def _bulk_error(details: dict[str, Any]) -> Exception:
+    return driver_error("pymongo.errors", "BulkWriteError", "bulk write error", details=details)
 
 
 # ------------------------------------------------------------------ positional reply
@@ -197,11 +300,11 @@ class KinesisClient:
         carried = [tokens(r["Data"])[0] for r in Records]
         action, failed = _positional(self.backend, carried)
         if action == "refuse":
-            raise REFUSED
+            raise _aws_refused()
         if action == "noshape":
             return {}
         if action in ("taken-raise", "reply-lost"):
-            raise _timeout()
+            raise _aws_timeout()
         return {
             "FailedRecordCount": sum(failed),
             "Records": [
@@ -221,11 +324,11 @@ class FirehoseClient:
         carried = [tokens(r["Data"])[0] for r in Records]
         action, failed = _positional(self.backend, carried)
         if action == "refuse":
-            raise REFUSED
+            raise _aws_refused()
         if action == "noshape":
             return {}
         if action in ("taken-raise", "reply-lost"):
-            raise _timeout()
+            raise _aws_timeout()
         return {
             "FailedPutCount": sum(failed),
             "RequestResponses": [
@@ -307,23 +410,38 @@ class ClickHouseClient:
         self.backend = backend
 
     def insert(self, table: str, data: Any = None, column_names: Any = None) -> None:
-        _whole(self.backend, tokens([list(r) for r in data]))
+        _whole(self.backend, tokens([list(r) for r in data]), "clickhouse")
 
     def close(self) -> None:
         pass
 
 
-def _whole(backend: Backend, carried: list[str]) -> None:
+WHOLE_ERRORS = {
+    "clickhouse": (
+        ("clickhouse_connect.driver.exceptions", "OperationalError"),
+        ("clickhouse_connect.driver.exceptions", "OperationalError"),
+    ),
+    "eventhubs": (
+        ("azure.eventhub.exceptions", "ConnectError"),
+        ("azure.eventhub.exceptions", "OperationTimeoutError"),
+    ),
+    "redis": (("redis.exceptions", "ConnectionError"), ("redis.exceptions", "TimeoutError")),
+}
+"""Per driver, the class a refused call raises and the class a lost reply raises."""
+
+
+def _whole(backend: Backend, carried: list[str], driver: str) -> None:
     """One call answered as a whole: raise, or take and return."""
+    refused, timed_out = WHOLE_ERRORS[driver]
     action = backend.decide(carried)
     if action == "refuse":
-        raise REFUSED
+        raise driver_error(*refused, "connection refused")
     if action == "taken-raise":
         backend.take(carried[: (len(carried) + 1) // 2])
-        raise _timeout()
+        raise driver_error(*timed_out, "timed out")
     backend.take(carried)
     if action == "reply-lost":
-        raise _timeout()
+        raise driver_error(*timed_out, "timed out")
 
 
 class EHBatch:
@@ -347,7 +465,7 @@ class EHProducer:
         return EHBatch()
 
     def send_batch(self, batch: EHBatch) -> None:
-        _whole(self.backend, tokens(list(batch.items)))
+        _whole(self.backend, tokens(list(batch.items)), "eventhubs")
 
     def close(self) -> None:
         pass
@@ -368,7 +486,7 @@ class RedisPipeline:
         pass
 
     def execute(self) -> list[Any]:
-        _whole(self.backend, tokens(self.ops))
+        _whole(self.backend, tokens(self.ops), "redis")
         return []
 
 
@@ -386,6 +504,10 @@ class RedisClient:
 # ------------------------------------------------------------------ transactional
 
 
+def _pg_error(message: str, sqlstate: str | None) -> Exception:
+    return driver_error("psycopg.errors", "OperationalError", message, sqlstate=sqlstate)
+
+
 class PGCursor:
     def __init__(self, conn: PGConnection) -> None:
         self.conn = conn
@@ -397,31 +519,41 @@ class PGCursor:
         return False
 
     def execute(self, sql: str, params: Any = None) -> None:
-        pass
+        self.conn.check()
 
     def executemany(self, sql: str, rows: list[Any]) -> None:
+        """One statement; `refuse` and `autocommit` raise a serialization failure (`40001`),
+        which leaves the connection usable, and a lost connection (`08006`) breaks it."""
+        self.conn.check()
         carried = tokens([list(r) for r in rows])
-        action = self.conn.backend.decide(carried)
+        action = self.conn.backend.decide(carried, knowable=None if self.conn.autocommit else True)
+        if action == "reply-lost":
+            self.conn.backend.calls[-1].knowable = False
         if self.conn.autocommit:
             if self.conn.backend.fault == "autocommit" and self.conn.statements == 1:
                 self.conn.statements += 1
-                raise _timeout()
+                raise _pg_error("could not serialize access", "40001")
             self.conn.statements += 1
             self.conn.backend.take(carried)
             return
         self.conn.statements += 1
         if action == "refuse":
-            raise REFUSED
+            raise _pg_error("could not serialize access", "40001")
         if action == "taken-raise":
             self.conn.txn.extend(carried[: (len(carried) + 1) // 2])
-            raise _timeout()
+            self.conn.drop()
+            raise _pg_error("server closed the connection unexpectedly", "08006")
         self.conn.txn.extend(carried)
         if action == "reply-lost":
             self.conn.lose_commit_reply = True
 
 
 class PGConnection:
-    """A psycopg-shaped connection whose transaction is real: a rollback discards its rows."""
+    """A psycopg-shaped connection whose transaction is real and whose loss is permanent.
+
+    A rollback discards the transaction's rows. A lost connection sets `broken` and `closed`, as
+    psycopg's does, and every later call on it raises "the connection is closed".
+    """
 
     def __init__(self, backend: Backend, *, autocommit: bool = False) -> None:
         self.backend = backend
@@ -432,17 +564,29 @@ class PGConnection:
         self.statements = 0
         self.lose_commit_reply = False
 
+    def check(self) -> None:
+        if self.closed:
+            raise _pg_error("the connection is closed", None)
+
+    def drop(self) -> None:
+        self.txn = []
+        self.broken = self.closed = True
+
     def cursor(self) -> PGCursor:
+        self.check()
         return PGCursor(self)
 
     def commit(self) -> None:
+        self.check()
         self.backend.take(self.txn)
         self.txn = []
         if self.lose_commit_reply:
             self.lose_commit_reply = False
-            raise ConnectionResetError(errno.ECONNRESET, "the connection dropped after COMMIT")
+            self.drop()
+            raise _pg_error("server closed the connection unexpectedly", "08006")
 
     def rollback(self) -> None:
+        self.check()
         self.txn = []
 
     def close(self) -> None:
@@ -605,30 +749,61 @@ class UDPSocket:
 
 
 class RabbitChannel:
-    def __init__(self, backend: Backend, state: dict[str, int]) -> None:
-        self.backend = backend
-        self.state = state
+    """`basic_publish` writes a frame to its connection's socket; no confirm is asked for."""
+
+    def __init__(self, conn: RabbitConnection) -> None:
+        self.conn = conn
 
     def basic_publish(
         self, *, exchange: str, routing_key: str, body: bytes, properties: Any
     ) -> None:
-        TCPSocket(self.backend, self.state).sendall(body)
-
-    def close(self) -> None:
-        self.state["generation"] += 1
-
-
-class RabbitConnection:
-    def __init__(self, backend: Backend) -> None:
-        self.backend = backend
-        self.state = {"generation": 0, "blind": 0}
-        self.is_open = True
-
-    def channel(self) -> RabbitChannel:
-        return RabbitChannel(self.backend, self.state)
+        conn = self.conn
+        if conn.broken:
+            raise driver_error("pika.exceptions", "ChannelWrongStateError", "Channel is closed")
+        carried = tokens(body)
+        backend = conn.backend
+        if backend.peer_closed and conn.generation == 0:
+            backend.decide(carried, knowable=False)
+            conn.blind += 1
+            if conn.blind > 3:
+                conn.broken = True
+                raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
+            return
+        action = backend.decide(carried)
+        if action == "refuse":
+            conn.broken = True
+            raise driver_error("pika.exceptions", "AMQPConnectionError", "connection refused")
+        backend.take(carried)
+        if action == "taken-raise":
+            conn.broken = True
+            raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
 
     def close(self) -> None:
         pass
+
+
+class RabbitConnection:
+    """A pika `BlockingConnection`: once its stream is lost it stays lost, as pika's does."""
+
+    def __init__(self, backend: Backend, generation: int = 0) -> None:
+        self.backend = backend
+        self.generation = generation
+        self.blind = 0
+        self.broken = False
+
+    @property
+    def is_open(self) -> bool:
+        return not self.broken
+
+    def channel(self) -> RabbitChannel:
+        if self.broken:
+            raise driver_error(
+                "pika.exceptions", "ConnectionWrongStateError", "Connection is closed"
+            )
+        return RabbitChannel(self)
+
+    def close(self) -> None:
+        self.broken = True
 
 
 # ------------------------------------------------------------------ NATS
@@ -684,14 +859,17 @@ class NATSClient:
 
 
 class KafkaError:
-    def code(self) -> int:
-        return -192
+    """A delivery report's error. `29` is `TOPIC_AUTHORIZATION_FAILED`, definitive: the broker
+    refused the message. `-192` is `_MSG_TIMED_OUT`, which may follow a write the broker kept."""
 
-    def str(self) -> str:
-        return "Local: Message timed out"
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def code(self) -> int:
+        return self.value
 
     def __str__(self) -> str:
-        return "Local: Message timed out"
+        return f"KafkaError {self.value}"
 
 
 class KafkaProducer:
@@ -703,7 +881,8 @@ class KafkaProducer:
 
     def produce(self, topic: str, value: Any = None, key: Any = None, callback: Any = None) -> None:
         carried = tokens(value)
-        action = self.backend.decide(carried, knowable=True)
+        indefinite = self.backend.fault == "report-indefinite"
+        action = self.backend.decide(carried, knowable=not indefinite)
         if action == "refuse":
             raise BufferError("Local: Queue full")
         self.queue.append((carried, callback))
@@ -716,7 +895,11 @@ class KafkaProducer:
         for carried, callback in queue:
             if self.backend.fault == "never-acknowledged":
                 if callback is not None:
-                    callback(KafkaError(), None)
+                    callback(KafkaError(29), None)
+            elif self.backend.fault == "report-indefinite":
+                self.backend.take(carried)
+                if callback is not None:
+                    callback(KafkaError(-192), None)
             else:
                 self.backend.take(carried)
                 if callback is not None:
@@ -737,12 +920,15 @@ class PubSubFuture:
         return self.settled is not None
 
     def result(self, timeout: float | None = None) -> str:
+        fault = self.backend.fault
         if self.settled is None:
-            self.settled = self.backend.fault != "never-acknowledged"
-            if self.settled:
+            self.settled = fault not in ("never-acknowledged", "report-indefinite")
+            if self.settled or fault == "report-indefinite":
                 self.backend.take(self.carried)
-        if not self.settled:
-            raise RuntimeError("the publish failed after the client took it")
+        if fault == "never-acknowledged":
+            raise PermissionDenied("the topic refused the publish")
+        if fault == "report-indefinite":
+            raise DeadlineExceeded("the publish deadline passed")
         return "id"
 
     def exception(self, timeout: float | None = None) -> BaseException | None:
@@ -753,31 +939,46 @@ class PubSubFuture:
         return None
 
 
+class PermissionDenied(Exception):
+    """Stands in for `google.api_core.exceptions.PermissionDenied`: definitive, not stored."""
+
+
+class DeadlineExceeded(Exception):
+    """Stands in for `google.api_core.exceptions.DeadlineExceeded`: the server may have stored it."""
+
+
 class PubSubPublisher:
     def __init__(self, backend: Backend) -> None:
         self.backend = backend
 
     def publish(self, topic: str, data: bytes | None = None, **attrs: Any) -> PubSubFuture:
         carried = tokens(data)
-        action = self.backend.decide(carried, knowable=True)
+        action = self.backend.decide(carried, knowable=self.backend.fault != "report-indefinite")
         if action == "refuse":
             raise REFUSED
         return PubSubFuture(self.backend, carried)
 
 
 class SentrySDK:
-    """`capture_event` returns the event id, or `None` when the SDK discarded the event."""
+    """`capture_event` returns the event id, or `None` when the SDK discarded the event.
+
+    Under `report-indefinite` it returns an id and its transport then drops the event, which the
+    SDK never reports back (`SentrySink.flush`'s docstring, `sentry.py:274-280`).
+    """
 
     def __init__(self, backend: Backend) -> None:
         self.backend = backend
 
     def capture_event(self, event: Any) -> Any:
         carried = tokens(event)
-        action = self.backend.decide(carried, knowable=True)
+        indefinite = self.backend.fault == "report-indefinite"
+        action = self.backend.decide(carried, knowable=not indefinite)
         if action == "refuse":
             raise REFUSED
         if self.backend.fault == "never-acknowledged":
             return None
+        if indefinite:
+            return "event-id"
         self.backend.take(carried)
         return "event-id"
 

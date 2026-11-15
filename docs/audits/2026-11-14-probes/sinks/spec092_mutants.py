@@ -44,7 +44,7 @@ calls every raise ambiguous would make."""
 
 HARNESS_MUTANTS = {
     "partition (differential oracle)": (
-        "fates_from",
+        "fate_of",
         'Outcome.REJECTED: "lost"',
         'Outcome.REJECTED: "landed"',
     ),
@@ -121,6 +121,7 @@ def main() -> int:
                 k: (baseline[k], v) for k, v in verdicts(src, None).items() if v != baseline[k]
             }
         print(f"\n{check}: {len(moved)} row(s) moved")
+        print(f"  ({sum(1 for was, _ in moved.values() if not was)} of them were green)")
         for name, (was, now) in moved.items():
             print(f"  {name}: {'+'.join(was) or 'green'} -> {'+'.join(now) or 'green'}")
     for label, mutant in HARNESS_MUTANTS.items():
@@ -131,10 +132,10 @@ def main() -> int:
                 if v != baseline[k]
             }
         print(f"\n{label}: {len(moved)} row(s) moved")
-        for name, (was, now) in list(moved.items())[:12]:
+        was_green = sum(1 for was, _ in moved.values() if not was)
+        print(f"  ({was_green} of them were green)")
+        for name, (was, now) in moved.items():
             print(f"  {name}: {'+'.join(was) or 'green'} -> {'+'.join(now) or 'green'}")
-        if len(moved) > 12:
-            print(f"  ... and {len(moved) - 12} more")
     return 0
 
 

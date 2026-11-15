@@ -90,12 +90,44 @@ def _eventhubs(backend: Backend) -> object:
     return AzureEventHubsSink(producer=shims.EHProducer(backend))
 
 
-def _postgres(autocommit: bool) -> Build:
+def _postgres(how: str) -> Build:
+    """`owned` builds from a DSN through the stub `psycopg.connect`, so the sink reconnects a lost
+    connection; `borrowed` and `autocommit` hand it a connection, which it never reopens.
+    `chunk_size=3` makes eight events three statements, which `autocommit` needs."""
+
     def make(backend: Backend) -> object:
+        import sys
+
         from log_foundry.sinks.postgres import PostgresSink
 
-        conn = shims.PGConnection(backend, autocommit=autocommit)
+        if how == "owned":
+            sys.modules["psycopg"].connect = lambda *a, **k: shims.PGConnection(backend)  # type: ignore[attr-defined]
+            return PostgresSink("t", dsn="postgresql://h/db", chunk_size=3)
+        conn = shims.PGConnection(backend, autocommit=how == "autocommit")
         return PostgresSink("t", connection=conn, chunk_size=3)
+
+    return _same(make)
+
+
+def _rabbitmq(owned: bool) -> Build:
+    """`owned` builds from a URL through the stub `pika.BlockingConnection`, each connection new;
+    `borrowed` hands the sink one connection, which its `_reset` keeps."""
+
+    def make(backend: Backend) -> object:
+        import itertools
+        import sys
+
+        from log_foundry.sinks.rabbitmq import RabbitMQSink
+
+        if owned:
+            generations = itertools.count()
+            sys.modules["pika"].BlockingConnection = lambda params: shims.RabbitConnection(  # type: ignore[attr-defined]
+                backend, next(generations)
+            )
+            return RabbitMQSink(exchange="x", routing_key="k", url="amqp://h/")
+        return RabbitMQSink(
+            exchange="x", routing_key="k", connection=shims.RabbitConnection(backend)
+        )
 
     return _same(make)
 
@@ -366,8 +398,9 @@ VARIANTS: dict[tuple[str, str], tuple[str, Build]] = {
             )
         ),
     ),
-    ("PostgresSink", ""): ("transactional", _postgres(False)),
-    ("PostgresSink", "autocommit"): ("transactional", _postgres(True)),
+    ("PostgresSink", "owned"): ("transactional", _postgres("owned")),
+    ("PostgresSink", "borrowed"): ("transactional", _postgres("borrowed")),
+    ("PostgresSink", "autocommit"): ("transactional", _postgres("autocommit")),
     ("SQLiteSink", ""): ("transactional", _sqlite(False)),
     ("SQLiteSink", "autocommit"): ("transactional", _sqlite(True)),
     ("FileSink", ""): ("local-write", _file(False)),
@@ -390,14 +423,8 @@ VARIANTS: dict[tuple[str, str], tuple[str, Build]] = {
         "socket-stream",
         _socket_sink("log_foundry.sinks.logstash.LogstashSink", "udp", host="h", port=5000),
     ),
-    ("RabbitMQSink", ""): (
-        "socket-stream",
-        _same(
-            lambda b: __import__("log_foundry.sinks.rabbitmq", fromlist=["x"]).RabbitMQSink(
-                exchange="x", routing_key="k", connection=shims.RabbitConnection(b)
-            )
-        ),
-    ),
+    ("RabbitMQSink", "owned"): ("socket-stream", _rabbitmq(True)),
+    ("RabbitMQSink", "borrowed"): ("socket-stream", _rabbitmq(False)),
     ("NATSSink", "jetstream"): ("per-event-ack", _nats(True, owned=True)),
     ("NATSSink", "jetstream-injected"): ("per-event-ack", _nats(True, owned=False)),
     ("NATSSink", "core"): ("client-buffered", _nats(False, owned=True)),
@@ -469,7 +496,14 @@ NOT_RUN: dict[tuple[str, str], dict[str, str]] = {
         "refused-always": "it calls nothing",
         "taken-then-raised": "it calls nothing",
     },
-    ("PostgresSink", ""): {"autocommit": "the autocommit variant runs it"},
+    ("PostgresSink", "owned"): {"autocommit": "the autocommit variant runs it"},
+    ("PostgresSink", "borrowed"): {"autocommit": "the autocommit variant runs it"},
+    ("NATSSink", "core"): {
+        "report-indefinite": "its never-acknowledged is a PING never answered, which is this case"
+    },
+    ("NATSSink", "core-injected"): {
+        "report-indefinite": "its never-acknowledged is a PING never answered, which is this case"
+    },
 }
 
 ONLY: dict[tuple[str, str], tuple[str, ...]] = {
@@ -494,3 +528,40 @@ def rows() -> list[Row]:
             batches = 2 if fault == "peer-closed" else 1
             out.append(Row(sink, variant, klass, fault, build, batches))
     return out
+
+
+def init_parameters(root: str = "src/log_foundry/sinks") -> dict[str, tuple[str, ...]]:
+    """Each sink class's `__init__` parameter names, read by AST and inherited where not defined.
+
+    What FR-001's standing test compares with the literal it records, so a sink that gains or
+    loses a constructor parameter fails until the parameter is a variant's or declared neutral.
+    """
+    import ast
+    from pathlib import Path
+
+    nodes: dict[str, ast.ClassDef] = {}
+    for path in sorted(Path(root).glob("*.py")):
+        for node in ast.parse(path.read_text()).body:
+            if isinstance(node, ast.ClassDef):
+                nodes[node.name] = node
+
+    def params(name: str) -> tuple[str, ...] | None:
+        node = nodes.get(name)
+        if node is None:
+            return None
+        for item in node.body:
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                a = item.args
+                every = [*a.posonlyargs, *a.args, *a.kwonlyargs]
+                names = [x.arg for x in every][1:]
+                if a.vararg:
+                    names.append("*" + a.vararg.arg)
+                if a.kwarg:
+                    names.append("**" + a.kwarg.arg)
+                return tuple(names)
+        for base in node.bases:
+            if isinstance(base, ast.Name) and (found := params(base.id)) is not None:
+                return found
+        return ()
+
+    return {sink: params(sink) or () for sink in sorted({s for s, _ in VARIANTS})}

@@ -2,7 +2,9 @@
 
 Written on 2026-11-15 while authoring SPEC-092, against 6bd0b66e; not one of the audit's probes.
 It asserts nothing and exits 0: `spec092_run.py` prints each row's verdict. The build turns it
-into `tests/conformance/`; this file is the evidence the spec's tables were measured from.
+into `tests/conformance_*.py`; this file is the evidence the spec's tables were measured from.
+Revised the same day for the spec review: per-run reconstruction, per-batch loss lines, driver
+stubs, owned and borrowed connections, and the `report-indefinite` fault.
 """
 
 from __future__ import annotations
@@ -48,6 +50,7 @@ FAULTS = (
     "peer-closed",
     "no-verdict-shape",
     "never-acknowledged",
+    "report-indefinite",
     "autocommit",
     "caller-code-raises",
 )
@@ -99,7 +102,13 @@ APPLIES: dict[str, tuple[str, ...]] = {
         "peer-closed",
     ),
     "per-event-ack": ("clean", "refused-once", "refused-always", "reply-lost"),
-    "client-buffered": ("clean", "refused-once", "refused-always", "never-acknowledged"),
+    "client-buffered": (
+        "clean",
+        "refused-once",
+        "refused-always",
+        "never-acknowledged",
+        "report-indefinite",
+    ),
     "in-process": ("clean", "refused-once", "refused-always", "taken-then-raised"),
 }
 """A wrapper runs its inner sink's class's faults and `caller-code-raises`."""
@@ -235,6 +244,11 @@ class Report:
     lines: int
     disagreement: str | None = None
     """Set when the per-event reconstruction disagrees with the engine's own `Delivery`."""
+    batch_losses: tuple[tuple[int, int], ...] = ()
+    """Per batch, the events it lost or left ambiguous and the loss lines written inside its
+    `Worker._emit`."""
+    late_lines: int = 0
+    """Loss lines written after the last batch's `_emit` returned: at `close()`."""
 
 
 CHECKS = (
@@ -279,8 +293,7 @@ def judge(
             failed.append("duplicate")
         if any(fates.get(t) in ("lost", "skipped") and held[t] > 0 for t in batch_tokens):
             failed.append("lost-but-held")
-        lost = sum(1 for t in batch_tokens if fates.get(t) in ("lost", "ambiguous"))
-        if lost and not report.lines:
+        if _unannounced(report):
             failed.append("unannounced")
         unknowable = backend.unknowable()
         if any(fates.get(t) == "ambiguous" and t not in unknowable for t in batch_tokens):
@@ -296,9 +309,17 @@ def judge(
             failed.append("duplicate")
         if report.counted_lost + report.counted_late > none:
             failed.append("lost-but-held")
-        if (report.counted_lost or report.counted_late) and not report.lines:
+        if _unannounced(report):
             failed.append("unannounced")
     return tuple(c for c in CHECKS if c in failed and c not in disabled)
+
+
+def _unannounced(report: Report) -> bool:
+    """A batch that lost or left ambiguous an event wrote no loss line inside its own `_emit`, or
+    a late count has no loss line after the last batch."""
+    if any(lost and not lines for lost, lines in report.batch_losses):
+        return True
+    return bool(report.counted_late) and not report.late_lines
 
 
 def _graph(sink: object) -> list[object]:
@@ -321,34 +342,39 @@ def _graph(sink: object) -> list[object]:
 
 
 @contextlib.contextmanager
-def runs() -> Iterator[tuple[list[tuple[object, object]], list[tuple[object, list[str], object]]]]:
-    """Captures every engine run as `(sink, Delivery)` and every round it made.
+def runs() -> Iterator[
+    tuple[list[tuple[object, object, int]], list[tuple[object, list[str], object, int]]]
+]:
+    """Captures every engine run as `(sink, Delivery, run id)` and every round it made.
 
     Patched at `_engine._run`, the one function the worker's `run_delivery` and the inline
     adapter `emit_via_deliver` both call, so a run is seen whichever path made it, and each round
     is recorded by wrapping the `deliver` callable the run was handed: `(sink, the round's
-    log_ids, its verdict or exception)`. Nothing the engine decides is reimplemented here; the
-    final fate of an event is its outcome in the last round that carried it.
+    log_ids, its verdict or exception, run id)`. Nothing the engine decides is reimplemented here;
+    an event's fate in a run is its outcome in that run's last round that carried it.
     """
     from log_foundry.sinks import _engine
 
-    seen: list[tuple[object, object]] = []
-    rounds: list[tuple[object, list[str], object]] = []
+    seen: list[tuple[object, object, int]] = []
+    rounds: list[tuple[object, list[str], object, int]] = []
     original = _engine._run
+    ids = iter(range(10**9))
 
     def wrapper(sink: object, deliver: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        run_id = next(ids)
+
         def recorded(batch: list[dict[str, object]]) -> Any:
             carried = [str(e.get("log_id")) for e in batch]
             try:
                 result = deliver(batch)
             except BaseException as err:
-                rounds.append((sink, carried, err))
+                rounds.append((sink, carried, err, run_id))
                 raise
-            rounds.append((sink, carried, result))
+            rounds.append((sink, carried, result, run_id))
             return result
 
         result = original(sink, recorded, *args, **kwargs)
-        seen.append((sink, result))
+        seen.append((sink, result, run_id))
         return result
 
     _engine._run = wrapper  # type: ignore[assignment]
@@ -358,13 +384,29 @@ def runs() -> Iterator[tuple[list[tuple[object, object]], list[tuple[object, lis
         _engine._run = original  # type: ignore[assignment]
 
 
-def fates_from(records: list[tuple[object, list[str], object]], owner: object) -> dict[str, str]:
-    """Each event's final fate: its outcome in the last round of `owner` that carried it."""
-    from log_foundry.sinks.verdict import Outcome, Verdict
+def fate_of(outcome: object) -> str:
+    """The one reading of a round's outcome as a fate."""
+    from log_foundry.sinks.verdict import Outcome
+
+    return {
+        Outcome.ACCEPTED: "landed",
+        Outcome.RETRYABLE: "lost",
+        Outcome.REJECTED: "lost",
+        Outcome.DROPPED: "lost",
+        Outcome.UNKNOWN: "ambiguous",
+        Outcome.SKIPPED: "skipped",
+    }[outcome]
+
+
+def fates_from(
+    records: list[tuple[object, list[str], object, int]], owner: object, run_id: int
+) -> dict[str, str]:
+    """Each event's fate in one run: its outcome in that run's last round that carried it."""
+    from log_foundry.sinks.verdict import Verdict
 
     fates: dict[str, str] = {}
-    for self, carried, result in records:
-        if self is not owner:
+    for self, carried, result, rid in records:
+        if self is not owner or rid != run_id:
             continue
         if isinstance(result, BaseException):
             for token in carried:
@@ -376,14 +418,7 @@ def fates_from(records: list[tuple[object, list[str], object]], owner: object) -
                 fates[token] = "ambiguous"
             continue
         for token, outcome in zip(carried, outcomes, strict=True):
-            fates[token] = {
-                Outcome.ACCEPTED: "landed",
-                Outcome.RETRYABLE: "lost",
-                Outcome.REJECTED: "lost",
-                Outcome.DROPPED: "lost",
-                Outcome.UNKNOWN: "ambiguous",
-                Outcome.SKIPPED: "skipped",
-            }[outcome]
+            fates[token] = fate_of(outcome)
     return fates
 
 
@@ -466,6 +501,8 @@ class Batch:
     failed_batches: int
     moved: int
     losses_after: tuple[int, int]
+    lines: int
+    text_end: int
 
 
 def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ...], dict[str, Any]]:
@@ -479,7 +516,13 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
     `shutdown()` then closes the sink, which is where a client buffer's late report lands.
     `log_id`s come from a patched `model.new_log_id`, so the backend can count them; the worker's
     own `_emit` is wrapped to see each batch it handled, and `_engine._run` to see every run.
+    The worker's `flush_interval` default is raised to an hour, so no interval sweep of an open
+    span (SPEC-091) can split a row's submission, and any network connection raises.
     """
+    import socket
+
+    import spec092_shims as shims
+
     import log_foundry
     from log_foundry import model
     from log_foundry.worker import Worker
@@ -492,74 +535,102 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
     handled: list[Batch] = []
     original_id = model.new_log_id
     original_emit = Worker._emit
+    defaults = Worker.__init__.__kwdefaults__
+    original_interval = defaults["flush_interval"]
+    original_connect, original_resolve = socket.socket.connect, socket.getaddrinfo
+
+    def no_network(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the conformance corpus opened a network connection")
+
+    restore_drivers = shims.install_drivers()
+    socket.socket.connect = no_network  # type: ignore[method-assign]
+    socket.getaddrinfo = no_network  # type: ignore[assignment]
+    defaults["flush_interval"] = 3600.0
     model.new_log_id = lambda: f"c92e{current[0] * 100 + next(counter) % 100:04d}"  # type: ignore[assignment]
-    with contextlib.redirect_stderr(stderr), runs() as (seen, records):
-        sink, target = row.build(backend)
+    try:
+        with contextlib.redirect_stderr(stderr), runs() as (seen, records):
+            sink, target = row.build(backend)
+            built_as = type(sink).__name__
 
-        def emit(self: Worker, event_lists: list[list[dict[str, object]]]) -> None:
-            carried = [str(e.get("log_id")) for events in event_lists for e in events]
-            mark = len(seen)
-            failed = self.failed_batches
-            start = losses_total(sink)
-            try:
-                original_emit(self, event_lists)
-            finally:
-                after = losses_total(sink)
-                if carried:
-                    handled.append(
-                        Batch(
-                            carried,
-                            (mark, len(seen)),
-                            self.failed_batches - failed,
-                            (after[0] - start[0]) + (after[1] - start[1]),
-                            after,
+            def emit(self: Worker, event_lists: list[list[dict[str, object]]]) -> None:
+                carried = [str(e.get("log_id")) for events in event_lists for e in events]
+                mark = len(seen)
+                failed = self.failed_batches
+                start = losses_total(sink)
+                text_at = len(stderr.getvalue())
+                try:
+                    original_emit(self, event_lists)
+                finally:
+                    after = losses_total(sink)
+                    if carried:
+                        handled.append(
+                            Batch(
+                                carried,
+                                (mark, len(seen)),
+                                self.failed_batches - failed,
+                                (after[0] - start[0]) + (after[1] - start[1]),
+                                after,
+                                lines_of(stderr.getvalue()[text_at:]),
+                                len(stderr.getvalue()),
+                            )
                         )
-                    )
 
-        Worker._emit = emit  # type: ignore[method-assign]
-        try:
-            log_foundry.configure(service="spec092", sink=sink)
+            Worker._emit = emit  # type: ignore[method-assign]
+            try:
+                log_foundry.configure(service="spec092", sink=sink)
 
-            @log_foundry.trace
-            def work() -> None:
-                for _ in range(N - 2):
-                    log_foundry.error("m")
+                @log_foundry.trace
+                def work() -> None:
+                    for _ in range(N - 2):
+                        log_foundry.error("m")
 
-            for number in range(row.batches):
-                current[0] = number
-                counter = iter(range(10**6))
-                backend.begin_batch(number)
-                work()
-                if number < row.batches - 1:
-                    log_foundry.flush(timeout=10.0)
-            log_foundry.shutdown(timeout=None)
-            backend.after_close()
-        finally:
-            Worker._emit = original_emit  # type: ignore[method-assign]
-            model.new_log_id = original_id  # type: ignore[assignment]
+                for number in range(row.batches):
+                    current[0] = number
+                    counter = iter(range(10**6))
+                    backend.begin_batch(number)
+                    work()
+                    if number < row.batches - 1:
+                        log_foundry.flush(timeout=10.0)
+                log_foundry.shutdown(timeout=None)
+                backend.after_close()
+            finally:
+                Worker._emit = original_emit  # type: ignore[method-assign]
+    finally:
+        model.new_log_id = original_id  # type: ignore[assignment]
+        defaults["flush_interval"] = original_interval
+        socket.socket.connect = original_connect  # type: ignore[method-assign]
+        socket.getaddrinfo = original_resolve  # type: ignore[assignment]
+        restore_drivers()
     after_close = losses_total(sink)
     batch_tokens = [t for b in handled for t in b.tokens]
     per_event: dict[str, str] | None = {}
     claimed = counted = 0
     disagreement = None
+    batch_losses: list[tuple[int, int]] = []
     for batch in handled:
-        judged = [d for s, d in seen[batch.runs[0] : batch.runs[1]] if s is target]
+        judged = [(d, rid) for s_, d, rid in seen[batch.runs[0] : batch.runs[1]] if s_ is target]
+        mine = set(batch.tokens)
         if judged and per_event is not None:
-            delivery = judged[-1]
-            mine = set(batch.tokens)
-            fates = {t: f for t, f in fates_from(records, target).items() if t in mine}
-            if delivery.failed:
-                fates = dict.fromkeys(mine, "lost")
-            elif len(judged) == 1:
-                disagreement = disagreement or agrees(fates, delivery)
+            fates: dict[str, str] = {}
+            for delivery, rid in judged:
+                found = {t: f for t, f in fates_from(records, target, rid).items() if t in mine}
+                if delivery.failed:
+                    found = dict.fromkeys(mine, "lost")
+                else:
+                    disagreement = disagreement or agrees(found, delivery)
+                fates.update(found)
             per_event.update(fates)
+            lost = sum(1 for f in fates.values() if f in ("lost", "ambiguous"))
         else:
             per_event = None
             if batch.failed_batches:
-                counted += len(batch.tokens)
+                lost = len(batch.tokens)
+                counted += lost
             else:
-                claimed += len(batch.tokens) - min(batch.moved, len(batch.tokens))
-                counted += min(batch.moved, len(batch.tokens))
+                lost = min(batch.moved, len(batch.tokens))
+                claimed += len(batch.tokens) - lost
+                counted += lost
+        batch_losses.append((lost, batch.lines))
     last = handled[-1].losses_after if handled else (0, 0)
     late = (after_close[0] - last[0]) + (after_close[1] - last[1])
     ambiguous = 0
@@ -567,29 +638,34 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
         claimed = sum(1 for f in per_event.values() if f == "landed")
         counted = sum(1 for f in per_event.values() if f in ("lost", "skipped"))
         ambiguous = sum(1 for f in per_event.values() if f == "ambiguous")
+    text = stderr.getvalue()
     report = Report(
         per_event=per_event,
         claimed_landed=claimed,
         counted_lost=counted,
         counted_ambiguous=ambiguous,
         counted_late=late,
-        lines=lines_of(stderr.getvalue()),
+        lines=lines_of(text),
         disagreement=disagreement,
+        batch_losses=tuple(batch_losses),
+        late_lines=lines_of(text[handled[-1].text_end :]) if handled else 0,
     )
     expected = row.batches * N
     verdict = judge(batch_tokens, backend, report, disabled)
     if len(batch_tokens) != expected:
         verdict = ("harness-error:batch-count",)
+    if built_as != row.sink:
+        verdict = (f"harness-error:built-{built_as}",)
     detail = {
         "held": {t: backend.held[t] for t in batch_tokens if backend.held[t] != 1},
         "claimed": claimed,
         "counted": counted,
         "ambiguous": ambiguous,
         "late": late,
-        "lines": lines_of(stderr.getvalue()),
+        "lines": report.lines,
+        "batch_losses": report.batch_losses,
+        "late_lines": report.late_lines,
         "disagreement": disagreement,
-        "first_line": next(
-            (ln for ln in stderr.getvalue().splitlines() if ln.startswith("log-foundry")), ""
-        ),
+        "first_line": next((ln for ln in text.splitlines() if ln.startswith("log-foundry")), ""),
     }
     return verdict, detail
