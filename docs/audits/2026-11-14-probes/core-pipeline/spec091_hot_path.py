@@ -7,10 +7,12 @@ into a sink that does nothing, 20,000 calls, best of 7; run it on both trees and
 the difference to be within the noise of two runs of one tree. ``isolated`` also times the
 snapshot the close's backfill takes of a three-event buffer. ``hold`` (prototype only, see
 ``spec091_prototype.py``) times one sweep of 10, 100 and 1,000 registered spans holding ten
-events each past their ``span.start``: how long the sweep holds the lock a closing span waits on.
+events each past their ``span.start``, each handed into a plain ``queue.Queue`` as the worker's
+``put_nowait`` does: how long the sweep holds the lock a closing span waits on.
 Run: PYTHONPATH=<src> python spec091_hot_path.py isolated|whole|hold
 """
 
+import queue
 import sys
 import time
 import timeit
@@ -76,8 +78,14 @@ def hold() -> None:
                 span.events = [{"message": "span.start"}] + [{"i": j} for j in range(10)]
                 span.held = 1
                 decorator._open_spans[id(span)] = span
+            sink_queue: queue.Queue[object] = queue.Queue()
+
+            def hand_in(batch: list[dict[str, object]]) -> tuple[int, int]:
+                sink_queue.put_nowait(batch)
+                return (0, 0)
+
             t0 = time.perf_counter()
-            decorator._sweep_registered(lambda batch: None)
+            decorator._sweep_registered(hand_in)
             best = min(best, time.perf_counter() - t0)
         decorator._open_spans.clear()
         print(f"open_spans={spans} events_each=10 sweep_holds_lock={1e6 * best:.1f}us")
