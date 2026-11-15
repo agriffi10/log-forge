@@ -549,6 +549,11 @@ def test_a_span_failing_before_its_end_event_counts_only_what_it_held(capsys) ->
     A fault in `end_event` leaves the span holding what it had *before* the close began, and a
     fault in `_flush` leaves it holding the end event too. Counting `len(span.events)` is what
     makes one site cover both; a constant would be wrong for at least one of them.
+
+    ~~one that fails before it counts only what the span held~~ — superseded by SPEC-088 FR-002
+    item 2: the close guard counts what it takes from the span and one more when `span.end` was
+    never appended (`Span.ended`), so the `span.end` the call asked for is in a term too. The name
+    is the superseded claim, kept so SPEC-050's criterion still finds it.
     """
     from log_foundry import decorator
     sink = stdout_sink.StdoutSink()
@@ -568,8 +573,8 @@ def test_a_span_failing_before_its_end_event_counts_only_what_it_held(capsys) ->
         work()
 
     capsys.readouterr()
-    assert log_foundry.health().in_span_lost == 2, (
-        "span.start and the info() call — the end event was never appended"
+    assert log_foundry.health().in_span_lost == 3, (
+        "span.start, the info() call and the span.end that was never appended (SPEC-088; was 2)"
     )
 
 

@@ -989,9 +989,10 @@ def test_the_expiry_line_counts_the_batch_in_flight(capsys) -> None:
     sink, worker, err = _expire_on_a_wedged_batch(capsys)
 
     assert _lost_lines(err) == [], "the expiry line announces no loss"
+    # ~~counted when the emit returns~~ — struck by SPEC-088 FR-002 item 4: the clause names the ledger gauge the events are in.
     assert err == (
         "log-foundry: shutdown timed out after 0.5s; the sink is left open because the worker "
-        "thread is still using it; 3 event(s) in flight, counted when the emit returns\n"
+        "thread is still using it; 3 event(s) in flight (health().events.in_flight)\n"
     ), err
 
     sink.fail = True

@@ -647,11 +647,17 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
         span = _open_span(name, defaults)
         token = context.push_span(span)
     except Exception as exc:
+        if span is None:
+            _ledger.cell().span += 1
+            _note_in_span_loss(2)
         _diag.absorbed(
             "opening a span",
             exc,
             "this call runs untraced" if span is None else "this call is traced incompletely",
         )
+    except BaseException:
+        _note_in_span_loss(1 if span is None else _abandon(span))
+        raise
     return span, token, scope
 
 
@@ -707,8 +713,11 @@ def _end(
         try:
             _close_span(span, status, error)
         except Exception as exc:
-            _note_in_span_loss(len(span.events))
+            _note_in_span_loss(_abandon(span) + (0 if span.ended else 1))
             _diag.absorbed("closing a span", exc, "the span's events were lost")
+        except BaseException:
+            _note_in_span_loss(_abandon(span) + (0 if span.ended else 1))
+            raise
     if token is not None:
         context.pop_span(token)
     if scope is not None:
@@ -741,10 +750,39 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
       Exception: Whatever building the end event or flushing raises; :func:`_end` is the
         guard.
     """
-    span.events.append(end_event(span, status, exc))
+    event = end_event(span, status, exc)
+    span.events.append(event)
+    span.ended = True
     backfill_baggage(span, context._live_baggage())
     span.closed = True
     _flush(span)
+
+
+def _abandon(span: Span) -> int:
+    """Takes a span's buffer and closes it, for a guard that gave up on it (SPEC-088 FR-002).
+
+    The guard counts what it took as lost, so the take is what keeps those events from a second
+    term: left on the span, a context still holding it could ``flush()`` them after they were
+    counted, and in the review's unforced race 3 events were both counted and delivered. The take
+    is the detach :func:`_flush` and the sweep make, under the same lock. The span is marked
+    closed, so a later append takes the orphan route, and abandoned, so that orphan keeps this
+    span's ids (:func:`log_foundry.api._log`). Popping the span from its context is out of scope
+    (``architecture.md`` §12), so it stays current there.
+
+    Args:
+      span: The span the guard gave up on.
+
+    Returns:
+      How many events it took.
+
+    Raises:
+      None.
+    """
+    with _sweep_lock:
+        taken, span.events = span.events, []
+    span.closed = True
+    span.abandoned = True
+    return len(taken)
 
 
 def _refuse_unusable(fn: object) -> None:

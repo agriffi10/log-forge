@@ -140,8 +140,13 @@ accepted == open_spans + queued + in_flight                               (pendi
           + sink_lost + drain_lost + stranded                             (lost)
 ```
 
-`open_spans`, `queued` and the worker's part of `in_flight` are remainders, so the sum holds only
-where the three remainders meet: the events the caller handed over must equal the events the
+`open_spans` and `queued` are remainders ~~, and so is the worker's part of `in_flight`~~ —
+revised during the build: the worker's `in_flight` is one counter only the drain thread writes,
+raised before its taking count when it takes a submission and lowered after the exit when it
+settles one, which is what SPEC-090 asks of it ("one read of a counter only the drain thread
+writes"). Measured, it has the orphan gauge's twin check: the drain residual, taken less held less
+exits, reads zero at rest and never positive while the drain runs, and a positive one is in
+`unaccounted` (FR-003). So the sum holds only where the remainders meet: the events the caller handed over must equal the events the
 queue took in plus `overflow_lost`. Nothing else ties the caller's side to the worker's, so that
 meeting is checked (below), and with it the identity holds. Each remainder can also read below
 zero, which FR-003 counts. So the criteria below assert `unaccounted == 0` and, at rest after a
@@ -165,12 +170,31 @@ restarts, so outside a test that replaces the worker by hand the record is zero.
 
 **The snapshot's read order, and why it is sound.** A snapshot is several reads and not one, and
 a residual read while calls are in progress must never read positive for a call that is
-balancing correctly, or the shutdown check would fire falsely. Each caller-side cell is written
+balancing correctly, or the shutdown check would fire falsely. ~~Each caller-side cell is written
 by one thread, in program order, so the argument is per write sequence and needs no assumption
 about where a thread switch can fall. The snapshot reads, in this order: `in_span_lost`; then, in
 each cell, the hand-over, the span credits, the orphan credits, the orphan gauge and the orphan
 exits; then `orphan_lost`; then the worker reference and the worker's terms, the drain's end
-first, its leaving counts next, and the queue's taken-in count and `overflow_lost` last.
+first, its leaving counts next, and the queue's taken-in count and `overflow_lost` last.~~ —
+revised during the build (2026-11-15). Read cell by cell, the argument assumed a hand-over debits
+only its own cell's credits. It does not: `asyncio.to_thread` and any `copy_context()` thread
+share a span with its owner, so an in-span log on the executor thread is credited in that
+thread's cell while the close's hand-over is credited in the owner's. A snapshot that read the
+executor's cell, then saw the log and the close, then read the owner's, read `open_spans` at
+minus 1 and `unaccounted == 1`; `tests/test_event_ledger_threads.py`'s
+`test_a_span_shared_across_threads_never_reads_open_spans_below_zero` reddens with the
+hand-overs read after the credits. The order built, as the plan review checked it: the worker
+reference; the drain's end, its taking count, its held events and its exits; `in_span_lost`;
+**every cell's hand-over in one pass**; the queue's taken-in count and `overflow_lost`; **every
+cell's span credits in a second pass**, from a fresh snapshot of the cells so a cell registered
+meanwhile is read too; the orphan pass, cell by cell, credit, gauge and exits; `orphan_lost`. This
+is SPEC-091 FR-004's two-pass refinement built here, with one difference from that spec's
+sentence "the worker's terms keep SPEC-088's order after the two passes": the worker's exits now
+come **before** the passes, so that every exit and loss of the worker path is read before the
+credits its events carry, which is what gives FR-001's per-snapshot "an `accepted` no less than
+its exits and losses" (with them read after the credits, the eight-thread reader test read
+`accepted` below them). The worker's `queued` and the meeting residual keep their properties,
+because the taken-in count is still read after the taking count and after the hand-overs.
 
 - The orphan path writes its gauge up, then its credit, then exactly one exit, then its gauge
   down. If the read counts a credit, the gauge was raised before it, so the later gauge read sees
@@ -182,8 +206,13 @@ first, its leaving counts next, and the queue's taken-in count and `overflow_los
   meeting residual reads zero or negative while hand-overs run; negative also when a caller
   outside the library submits to the worker directly, as tests do.
 - A remainder gauge is read leaving before entering, which keeps it from reading below zero:
-  `in_span_lost` and the hand-over before the span credits, and the worker's exits before what
-  it took and took in.
+  `in_span_lost` and the hand-over before the span credits, ~~and the worker's exits before what
+  it took and took in~~ and the drain's taking count before the queue's taken-in count. The
+  worker's `in_flight` is not a remainder (below).
+- On the orphan path an exit is read after its credit, so a call that credits and fails between
+  the two reads makes `accepted` read below the exits and losses by the calls in progress: the
+  negative orphan residual this paragraph already admits. The per-snapshot bound of FR-001's
+  eight-thread criterion is the worker path's.
 
 So FR-003 counts only a **positive** orphan or meeting residual: a positive one is a missed debit,
 or an event the queue never took in, and nothing in progress produces one. A negative orphan
@@ -308,10 +337,16 @@ counters, is FR-005's. All are in `docs/architecture.md` §12, each with its pro
 6. **The events of a call a `BaseException` cuts short are in no counter** (found here). The four
    guards catch `Exception` and let a `KeyboardInterrupt` or `SystemExit` through (invariant 1),
    which leaves what that call had credited with no term. Each guard counts on a `BaseException`
-   exactly what it counts on an `Exception`, then re-raises it unchanged and writes nothing to
+   ~~exactly what it counts on an `Exception`~~ what its call can no longer deliver (revised
+   during the build: on an `Exception` the open guard also credits and debits the `span.end` the
+   call will never ask for, and an interrupted call asks for nothing more, which `p16`'s
+   `accepted == 5` settles), then re-raises it unchanged and writes nothing to
    stderr: the exception reaching the caller is the announcement. The orphan guard (`api.py:165`)
    debits the orphan event, the in-span guard (`api.py:138`) the event it was building, the open
-   guard (`decorator.py:630`) the `span.start` of a span that was not built, and the close guard
+   guard (`decorator.py:630`) the `span.start` of a span that was not built, and of one that was
+   built but interrupted before it could be pushed the buffer it takes, as the close guard takes
+   one (added during the build: that span is on no context, so its `span.start` was otherwise a
+   silent loss), and the close guard
    (`decorator.py:686`) the buffer it takes and the `span.end` if it was not appended, as in item
    2. Leaving the buffer on a span only that context can reach would be a silent loss whenever the
    context is not used again, which in the suite is every time, and invariant 2 forbids a silent
@@ -394,6 +429,8 @@ expired, and it computes one number, `unaccounted`: the events the ledger cannot
 
 - Events in the worker's `in_flight` when its drain thread has ended (FR-001's definition). A
   drain that ended has nothing in its hands, so these were taken and never debited.
+- A positive drain residual: events the drain thread took that are neither held nor in an exit
+  (added during the build, with the worker's `in_flight` measured, FR-001).
 - A positive orphan residual: orphan events that were credited, are not in progress and are in
   no exit and no loss term. Every orphan call debits before it lowers its gauge, so this is a
   debit that was missed. Only the positive side counts, by FR-001's read-order argument: a
@@ -429,6 +466,17 @@ raising the signal inside the read, it hung. This is one more instance of the op
 finding 3, which already records the same wait on `Runtime._lock`, the close registry's lock,
 `Worker._lock` and the queue's mutex, and is closed by the lifecycle track's one command path.
 This spec makes no new promise about a handler and adds that lock to the item's list.
+
+**Re-entry on the registration lock** (added during the build, from the plan review). The hazard
+above was worse for this lock than the paragraph says: a handler or a `__del__` that *logs* on a
+thread with no cell yet, run while that thread was inside the lock (its own first registration,
+or a `health()` or `shutdown()` reading), registered a cell and so took the same lock again, and
+with a plain `Lock` waited on its own thread (`premise_3b` of the plan review). The lock is an
+`RLock`, the registry is one immutable pair replaced compare-and-set so a re-entrant registration
+made mid-fold is never overwritten, and every walk is over that pair. `tests/`
+`test_event_ledger_threads.py::test_a_log_from_a_collection_inside_the_registration_lock_returns`
+forces the collection inside the fold and reddens with a plain `Lock`. A handler on a thread
+inside any of the item's other locks still waits.
 
 #### Acceptance Criteria:
 
@@ -483,8 +531,10 @@ failed open now counts two events and an interrupted build one, and it is struck
 returns an `EventLedger`. It may be called from any thread, the drain thread included. It
 acquires neither `Runtime._lock`, `Worker._lock`, the queue's mutex nor `decorator._loss_lock`:
 each worker term and each of the two loss counters is read as one attribute load. The one lock it
-takes is the ledger's registration lock, which it holds while it sums the caller-side cells and
-which a caller thread takes once, on its first credit. So it cannot wait behind a `submit`, a
+takes is the ledger's registration lock, ~~which it holds while it sums the caller-side cells~~
+once per pass, to fold the dead cells and read one immutable snapshot of the cells, which it then
+sums outside the lock (revised during the build); a caller thread takes it once, on its first
+credit. So it cannot wait behind a `submit`, a
 drain or a lifecycle call. Every loss term is non-decreasing in a process, so the events lost by
 term between two points are the fieldwise difference of two snapshots. Its cost grows with the
 cells of live threads that have logged: about 3 µs with one, 5 to 6 µs with nine and 15 to 17 µs
@@ -525,7 +575,11 @@ and it is corrected there in place.
 - [ ] The §12 items for findings 7, 16, 17 and 18, and the three filed with this spec that name
       it as their closure, are struck as closed by it; the item for finding 9 is narrowed to its
       capacity half and the item for finding 3 names the ledger's registration lock, in place
-      (invariant 2).
+      (invariant 2). The fourth item that names this spec as its closure, *`NATSSink` leaves the
+      events past a round's deadline unattempted*, filed from SPEC-082's PR, is struck only if
+      `p18_nats_deadline_leaves_events_unattempted.py`, run with the `nats` extra, ends with
+      every event of its run in one term; otherwise the delivery doc says why it stays open
+      (added during the build).
 
 ### FR-005: The counters are exact and add no lock to the accept path, and a forked child starts balanced
 
@@ -743,10 +797,14 @@ after = _lifecycle._ledger_snapshot()
 lost_in_window = after.lost - before.lost
 ```
 
-The two stderr lines FR-002 changes, with the changed clause only:
+The two stderr lines FR-002 changes, with the changed clause only. The expiry clause was first
+written "{n} event(s) in flight, in health().events.in_flight until the emit returns"; built, that
+pushed the line past `_diag`'s 200-character detail bound at six-digit counts, which
+`test_the_expiry_line_fits_the_detail_bound` holds, so it names the gauge in parentheses instead
+(revised during the build):
 
 ```
-...; {n} event(s) in flight, in health().events.in_flight until the emit returns
+...; {n} event(s) in flight (health().events.in_flight)
 ...; worker thread stopped; lost {n} event(s) in {k} undrained event-list(s) it held and {q}
 queued item(s) undelivered, nothing further will be delivered
 ```
@@ -782,7 +840,8 @@ docs/
   worker's terms, the cell retirement, and `_ledger_snapshot()` returning an `EventLedger` with
   `unaccounted`. The type is defined here, in `worker.py`, but not exported and not yet a field of
   `Health`, so Phase 1's tests can read it. No public field, no existing counter and no stderr
-  line changes. The only existing tests that change are the rosters a new
+  line changes. The `drain_lost` debit at `_terminal_failure` lands here, since it changes no
+  existing counter or line; its line's rewording stays in Phase 3 (revised during the build). The only existing tests that change are the rosters a new
   module, lock or worker method is entered in (Evidence).
 - The tests of FR-001 and of FR-005's first five criteria, read through the private snapshot,
   with the isolated cost measured.
@@ -790,7 +849,10 @@ docs/
 ### Phase 2: The surface and the check (FR-003, FR-004)
 
 - `Health.events`, the export of `EventLedger`, and the check at the end of `shutdown()` with its
-  line.
+  line, and the forked child's ledger restart, moved here from Phase 3 so the check reads a
+  child's own ledger (revised during the build).
+- The suite's per-test ledger reset, in the autouse fixture Phase 4 completes: without it, earlier
+  tests' ledger state fired the shutdown line in later tests that pin stderr.
 - The typed consumer, the docstrings and the README's `Health` section.
 
 ### Phase 3: The defects and the record (FR-002, the rest of FR-005)
@@ -951,6 +1013,16 @@ end-to-end figure says nothing about a change of this size.
 ---
 
 ## Revision history
+
+- **2026-11-15, revised in place during the build** on `spec-088/impl`, each change struck in its
+  section: the snapshot's read order is SPEC-091's two passes with the worker's terms first
+  (FR-001), after a span shared through a copied context read below zero cell by cell; the
+  worker's `in_flight` is measured, with a drain residual in `unaccounted` (FR-001, FR-003), for
+  SPEC-090; the registration lock is re-entrant (FR-003), after the plan review's `premise_3b`
+  deadlocked a plain one; FR-002 item 6's open-guard sentence is corrected and covers a built span
+  whose push is interrupted; the expiry clause is shortened to fit `_diag`'s detail bound; the
+  `NATSSink` §12 item is named in FR-004; the `drain_lost` debit and the child's restart move to
+  earlier phases.
 
 - **2026-11-15, revised after the second review**, which built the first revision and found three
   blocking defects, all fixed here. ~~"This sum holds by construction"~~: it held only where the

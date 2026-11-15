@@ -59,6 +59,16 @@ class Span:
     ``continue_trace`` reads it and then re-parents across an ordinary function call, so a sweep
     arriving in that gap still splits the span. It is set before the detach so a concurrent reader
     errs toward refusing, and the residual is recorded in ``architecture.md`` §13.
+
+    ``ended`` marks a span whose ``span.end`` event has been appended (SPEC-088 FR-002), set by
+    ``_close_span`` just after the append. The close guard reads it to count one more lost event
+    when the close failed before that append, where it used to count only what the span held.
+
+    ``abandoned`` marks a span a guard gave up on and took the buffer of (SPEC-088 FR-002). The
+    span stays current in its context, so a later level call there finds it closed and takes the
+    orphan path; for an abandoned span that orphan keeps the span's trace id, span id, parent id,
+    name and defaults, so it stays correlated with the call it belongs to. A span that closed
+    normally is never abandoned, and a log after it still gets a fresh trace (SPEC-036 FR-004).
     """
 
     trace_id: str
@@ -70,6 +80,8 @@ class Span:
     events: list[dict[str, object]] = field(default_factory=list)
     closed: bool = False
     swept: bool = False
+    ended: bool = False
+    abandoned: bool = False
 
 
 def _iso_now() -> str:

@@ -47,7 +47,12 @@ _EXPIRY = (
     "log-foundry: shutdown timed out after {T}; the sink is left open because the worker thread "
     "is still using it"
 )
-"""The expiry line's fixed opening, as FR-001 words it; clauses are appended by each test."""
+"""The expiry line's fixed opening, as FR-001 words it; clauses are appended by each test.
+
+Every in-flight clause below read ``~~counted when the emit returns~~`` until SPEC-088 FR-002 item
+4, which struck it: the count never comes if the process exits first, so the clause names the
+ledger gauge the events are in, ``(health().events.in_flight)``, which is also short enough that
+:func:`test_the_expiry_line_fits_the_detail_bound` still holds."""
 
 _SWAP = (
     "log-foundry: the previous sink could not be confirmed drained within {T}; it is left open "
@@ -163,7 +168,7 @@ def test_case_a_expiry_line_reports_in_flight_and_queued_submissions(capsys) -> 
         assert elapsed < 0.3 + _SLACK, f"the shutdown returned within its budget: {elapsed:.2f}s"
         assert err == (
             _EXPIRY.format(T="0.3s")
-            + "; 1 event(s) in flight, counted when the emit returns; 2 submission(s) still queued"
+            + "; 1 event(s) in flight (health().events.in_flight); 2 submission(s) still queued"
             + "\n"
         )
     finally:
@@ -202,7 +207,7 @@ def test_a_queued_flush_marker_is_not_counted_as_a_submission(capsys) -> None:
         worker.stop(0.2)
         assert worker._queue.qsize() == 2, "the premise: the marker and the sentinel are queued"
         assert capsys.readouterr().err == (
-            _EXPIRY.format(T="0.2s") + "; 1 event(s) in flight, counted when the emit returns\n"
+            _EXPIRY.format(T="0.2s") + "; 1 event(s) in flight (health().events.in_flight)\n"
         )
     finally:
         _release(sink, worker)
@@ -229,7 +234,7 @@ def test_an_unreadable_queue_drops_the_queued_clause_and_raises_nothing(capsys) 
     try:
         worker.stop(0.2)
         assert capsys.readouterr().err == (
-            _EXPIRY.format(T="0.2s") + "; 1 event(s) in flight, counted when the emit returns\n"
+            _EXPIRY.format(T="0.2s") + "; 1 event(s) in flight (health().events.in_flight)\n"
         )
     finally:
         worker._queue.mutex = mutex
@@ -240,6 +245,7 @@ def test_the_expiry_line_fits_the_detail_bound(capsys) -> None:
     """FR-001 AC-8. The longest `T` with six-digit counts is written whole, with no `…`."""
     sink = _GatedSink()
     worker = _wedged(sink)
+    held = worker._in_flight
     worker._in_flight = 999999
     worker._queued_submissions = lambda: 999999  # type: ignore[method-assign]
     try:
@@ -247,11 +253,14 @@ def test_the_expiry_line_fits_the_detail_bound(capsys) -> None:
         err = capsys.readouterr().err
         assert err == (
             _EXPIRY.format(T="-1.23457e-100s")
-            + "; 999999 event(s) in flight, counted when the emit returns"
+            + "; 999999 event(s) in flight (health().events.in_flight)"
             + "; 999999 submission(s) still queued\n"
         )
         assert "…" not in err
     finally:
+        # Restored before the release (plan review m3): the drain thread settles the batch it
+        # holds against the real count, so a fabricated one would read as a deficit.
+        worker._in_flight = held
         _release(sink, worker)
 
 

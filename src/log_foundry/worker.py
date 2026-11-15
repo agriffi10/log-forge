@@ -304,7 +304,9 @@ class Health:
         first invocation logs and every later one silently does not. The count starts at the
         moment ``shutdown()`` begins rather than when the drain thread ends, so a submission
         racing the final drain is counted even if that drain carried it; erring toward
-        reporting is the right direction for a signal whose whole purpose is visibility.
+        reporting is the right direction for a signal whose whole purpose is visibility. A
+        submission counts only once its put has succeeded (SPEC-088 FR-002): one that met a full
+        queue is in ``dropped`` alone, so this reads 0 when every late submission overflowed.
       incomplete_swaps: Late ``configure(sink=...)`` calls whose drain of the previous sink
         did not complete (SPEC-030 FR-003). The swap still took effect, so the caller has the
         sink it asked for, but two things could not be guaranteed: events submitted before the
@@ -368,9 +370,12 @@ class Health:
         FR-003, **no destination at all**, where the process could not give the library a thread
         to deliver through and the span's whole buffer was lost with no worker in existence to
         report anything. ~~this climbing means **the data**, always~~ — struck (SPEC-050
-        FR-003): it was true only while that second cause was counted nowhere. The two are told
+        FR-003): it was true only while that second cause was counted nowhere. ~~The two are told
         apart by the count, which is one event for the first and the span's whole buffer for the
-        second, and by the stderr line, which names the site. Two fields rather than one
+        second~~ — struck (SPEC-088 FR-004): a span that fails to open now counts its two boundary
+        events, a close that fails counts its buffer and its ``span.end``, and an interrupted
+        build counts one, so the count no longer tells the causes apart. They are told apart by
+        the stderr line, which names the site. Two fields rather than one
         because they aggregate different failure populations and so fail SPEC-026's test,
         *would one number hide which fix applies*. Their sum is deliberately not reported: with
         different populations it is a number nobody can act on.
@@ -979,6 +984,16 @@ class Worker:
         **dropped** returns before it: an item that never joined the queue cannot be stranded in
         it, and counting it in both fields would double-report one loss.
 
+        **That last sentence was not true of the code until SPEC-088 FR-002 item 1** (finding 16):
+        the flag was also read *before* the put, and a retired submission was counted there,
+        then counted again in ``dropped`` when the put met a full queue — measured, ``p03`` read a
+        ``submitted_after_shutdown`` above ``queued`` plus ``dropped``. The flag is now read once,
+        after a put that succeeded, which is the read the paragraph above argues closes the
+        window; the read before the put added nothing to that argument but the double count. A
+        caller can see one consequence: ``submitted_after_shutdown`` reads 0 when every late
+        submission overflowed, since none of them was queued. In the event ledger an overflowed
+        event is in ``overflow_lost`` and a queued one in ``stranded``, so the two cannot overlap.
+
         Args:
           events: The span's buffered events, submitted as one item.
 
@@ -988,9 +1003,6 @@ class Worker:
         Raises:
           None.
         """
-        retired = _lifecycle_state.retirements > self._epoch
-        if retired:
-            self._count_undeliverable()
         try:
             self._queue.put_nowait(events)
         except queue.Full:
@@ -1001,7 +1013,7 @@ class Worker:
             if total == 1 or total % _diag.WARN_EVERY == 0:
                 _diag.lost("submission", total, "log queue full; count is cumulative")
             return
-        if not retired and _lifecycle_state.retirements > self._epoch:
+        if _lifecycle_state.retirements > self._epoch:
             self._count_undeliverable()
 
     def _count_undeliverable(self) -> None:
@@ -1720,7 +1732,9 @@ class Worker:
         a loss (SPEC-068 FR-001): how many events are inside the emit the thread is still running
         (SPEC-062 FR-005) and how many submissions are still queued behind it, each clause only
         when non-zero. Neither is lost yet. The emit may still deliver, and :meth:`_emit` counts
-        its batch when it returns; the queued submissions are counted by whichever ``_emit`` line
+        its batch when it returns; until then the events are in ``health().events.in_flight``,
+        which the line names (SPEC-088 FR-002 item 4, where it promised a count "when the emit
+        returns" that never comes if the process exits first); the queued submissions are counted by whichever ``_emit`` line
         settles them, one per batch, so each event is announced lost at most once. The queued
         clause promises no later count on purpose: when the wedged emit is :meth:`_final_drain`'s
         own, what is queued arrived after that drain's last read and will never be taken. It
@@ -1774,7 +1788,7 @@ class Worker:
                 f"because the worker thread is still using it"
             )
             if in_flight:
-                detail += f"; {in_flight} event(s) in flight, counted when the emit returns"
+                detail += f"; {in_flight} event(s) in flight (health().events.in_flight)"
             if queued:
                 detail += f"; {queued} submission(s) still queued"
             _diag.pending(detail)
@@ -2020,8 +2034,8 @@ class Worker:
         _diag.absorbed(
             "draining the log queue",
             exc,
-            f"worker thread stopped; {undrained} undrained event-list(s) held and {queued} "
-            f"queued item(s) undelivered, nothing further will be delivered",
+            f"worker thread stopped; lost {held} event(s) in {undrained} undrained event-list(s) "
+            f"it held and {queued} queued item(s) undelivered, nothing further will be delivered",
         )
 
     def _drain(self, pending: list[list[dict[str, object]]]) -> None:
