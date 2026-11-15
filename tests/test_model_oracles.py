@@ -63,7 +63,7 @@ from model_oracles import (
     own_time,
 )
 from model_pins import PINS, Cell, PinnedVerdict, cell_id, cells, judge, pin_of, scheduled, withheld
-from model_sinks import ChildRun, Reentrant, factory, install_sink, run_body
+from model_sinks import ChildRun, Forker, Reentrant, Waiter, factory, install_sink, run_body
 from test_model_cells import CellHooks, cell_body
 
 TESTS = pathlib.Path(__file__).parent
@@ -1055,23 +1055,25 @@ def test_the_table_and_the_pins_hold_these_counts() -> None:
     table = cells()
     by = {
         name: sum(1 for cell in table if cell.personality == name)
-        for name in ("reentrant", "factory")
+        for name in ("reentrant", "factory", "forker", "waiter")
     }
-    assert by == {"reentrant": 504, "factory": 112}
-    assert len(table) == 616
+    assert by == {"reentrant": 504, "factory": 112, "forker": 9, "waiter": 12}
+    assert len(table) == 637
     assert [pin.name for pin in PINS] == [
         "drain-flush",
         "nested-shutdown",
         "empty-submission",
         "orphan-arm-in-close",
         "installed-closed-twice",
+        "fork-mid-swap",
+        "orphan-write-after-close",
     ]
     pinned = [cell for cell in table if pin_of(cell) is not None]
     held = [cell for cell in table if withheld(cell)]
-    assert len(pinned) == 19
+    assert len(pinned) == 20
     assert len(held) == 175
-    assert len(table) - len(pinned) - len(held) == 422
-    assert len(scheduled()) == 441
+    assert len(table) - len(pinned) - len(held) == 442
+    assert len(scheduled()) == 462
 
 
 def test_every_cell_id_is_unique_and_spells_its_cell() -> None:
@@ -1178,3 +1180,86 @@ def test_every_scheduled_pinned_cell_carries_the_strict_mark() -> None:
         assert marks[0].name == "xfail"
         assert marks[0].kwargs["strict"] is True
         assert marks[0].kwargs["raises"] is PinnedVerdict
+
+
+def test_every_reproduction_is_a_test_function_of_the_cells_file() -> None:
+    """FR-004: a pin held by a reproduction names a strict test function of the cells file."""
+    named = [pin for pin in PINS if pin.reproduction is not None]
+    assert named
+    for pin in named:
+        assert not pin.cells, pin.name
+        function = getattr(test_model_cells, str(pin.reproduction), None)
+        assert callable(function), pin.reproduction
+        assert str(pin.reproduction).startswith("test_")
+        marks = [mark for mark in getattr(function, "pytestmark", []) if mark.name == "xfail"]
+        assert len(marks) == 1, pin.reproduction
+        assert marks[0].kwargs["strict"] is True
+        assert marks[0].kwargs["raises"] is PinnedVerdict
+
+
+def test_a_waiting_sink_holds_no_lock_of_its_own_while_it_waits() -> None:
+    """FR-001: another thread reads a ``waiter``'s lock as free while its wait is in flight."""
+
+    def body(run: ChildRun) -> None:
+        sink = Waiter(WAITER_HOLD)
+        run.call("configure", 5.0, lambda: install_sink(sink))
+        _orphan(run)
+        sink.armed = "emit"
+        helper = threading.Thread(target=_orphan, args=(run,))
+        helper.start()
+        sink.entered.wait(5.0)
+        run.prop("held", sink._lock.locked())
+        run.call("shutdown", 3.0, lambda: log_foundry.shutdown(timeout=3.0))
+        helper.join()
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert outcome.properties["held"] == "False"
+
+
+def test_a_forker_forks_once_where_its_hooks_say_with_its_lock_free() -> None:
+    """FR-001: a ``forker`` forks at the visit its hooks answer, not before, with its lock free.
+
+    The child writes to the sink it inherited, which it could not do were the lock held at the
+    fork, and its report passes the child oracle.
+    """
+
+    def body(run: ChildRun) -> None:
+        hooks = _Asked(lambda site, nth: ("fork",) if site == "emit" and nth == 2 else None)
+        sink = Forker(hooks)
+        run.call("configure", 5.0, lambda: install_sink(sink))
+        _orphan(run)
+        _orphan(run)
+        run.prop("forks", sink.forks)
+        run.prop("held", sum(1 for _, _, held, _ in hooks.asked if held))
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert outcome.properties["forks"] == "1"
+    assert outcome.properties["held"] == "0"
+    assert "orphan_in" in outcome.text
+
+
+def test_a_waiter_waits_on_the_event_it_holds_when_the_wait_begins() -> None:
+    """FR-001: a signal assigned after the wait began does not cut it; the one it held does."""
+
+    def body(run: ChildRun) -> None:
+        sink = Waiter(WAITER_HOLD)
+        held, later = threading.Event(), threading.Event()
+        sink.log_foundry_stop_signal = held
+        sink.armed = "emit"
+        helper = threading.Thread(target=sink.emit, args=([],))
+        helper.start()
+        sink.entered.wait(5.0)
+        sink.log_foundry_stop_signal = later
+        later.set()
+        helper.join(0.5)
+        run.prop("cut-by-later", not helper.is_alive())
+        held.set()
+        helper.join()
+        run.prop("waits", len(sink.waits))
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert outcome.properties["cut-by-later"] == "False"
+    assert outcome.properties["waits"] == "1"

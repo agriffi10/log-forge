@@ -368,10 +368,23 @@ def check_wait(wait: Wait) -> None:
     Raises:
       WaitNotCut: If the wait outlived its stop by more than ``EPSILON`` (invariant 3).
     """
-    if wait.ended - wait.stop_entered > EPSILON:
-        raise WaitNotCut(
-            "wait", detail=f"served {wait.ended - wait.stop_entered:.3f} s past its stop"
-        )
+    if served(wait) > EPSILON:
+        raise WaitNotCut("wait", detail=f"served {served(wait):.3f} s past its stop")
+
+
+def served(wait: Wait) -> float:
+    """Returns how long a wait ran past the entry of the stop that should cut it.
+
+    Args:
+      wait: The wait and its stop.
+
+    Returns:
+      Seconds from the stop's entry to the wait's end; negative for a wait that ended first.
+
+    Raises:
+      None.
+    """
+    return wait.ended - wait.stop_entered
 
 
 def check_repeat(closes: Closes) -> None:

@@ -42,11 +42,13 @@ from model_oracles import (
     REACH_TIMEOUT,
     WATCHDOG,
     Call,
+    ChildReport,
     Closes,
     Interval,
     Ledger,
     ModelFailure,
     check_call,
+    check_child,
     hang_signature,
     has_watchdog_line,
     overdue,
@@ -1302,3 +1304,187 @@ def read_end() -> tuple[str, int]:
     """
     state = _lifecycle._state
     return state.state.name, len(state._swaps_running) + len(state._stops_running)
+
+
+class Waiter(Recorder):
+    """Keeps the signal it is handed in a plain attribute, and waits on it when armed.
+
+    When the driver has **armed** it for ``emit`` or for ``close``, by assigning :attr:`armed`,
+    the next such call waits on the event it holds at that moment, with ``Event.wait``, for at
+    most its hold; holding none, it sleeps that long. The wait is a stretch of sink code, and
+    :attr:`entered` is set as it begins.
+
+    Attributes:
+      log_foundry_stop_signal: The signal the library last assigned; ``None`` until then.
+      hold: The longest a wait lasts.
+      armed: ``"emit"``, ``"close"`` or ``None``; cleared when the wait begins.
+      entered: Set when an armed wait begins.
+      waits: The began and ended instants of each wait.
+    """
+
+    log_foundry_stop_signal: object = None
+
+    def __init__(self, hold: float) -> None:
+        """Builds an unarmed waiter.
+
+        Args:
+          hold: The longest a wait lasts.
+
+        Returns:
+          None.
+
+        Raises:
+          RuntimeError: Outside a watched child.
+        """
+        super().__init__()
+        self.hold = hold
+        self.armed: str | None = None
+        self.entered = threading.Event()
+        self.waits: list[tuple[float, float]] = []
+
+    def _after_emit(self) -> None:
+        """Waits, when armed for ``emit``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._wait("emit")
+
+    def _in_close(self) -> None:
+        """Waits, when armed for ``close``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._wait("close")
+
+    def _wait(self, site: str) -> None:
+        """Waits on the event the sink holds now, or sleeps, for at most the hold.
+
+        Args:
+          site: The method waiting.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if self.armed != site:
+            return
+        self.armed = None
+        run = current()
+        run.visited()
+        held = self.log_foundry_stop_signal
+        with run.sink_code():
+            began = time.monotonic()
+            self.entered.set()
+            wait = getattr(held, "wait", None)
+            if callable(wait):
+                wait(self.hold)
+            else:
+                time.sleep(self.hold)
+            ended = time.monotonic()
+        with self._lock:
+            self.waits.append((began, ended))
+
+
+class Forker(Reentrant):
+    """Forks once, through ``run_in_child``, where its hooks answer ``("fork",)``, and reaps it.
+
+    The fork and its reaping are one stretch of sink code, on the thread that reached the site,
+    with no lock of the sink's own held, so the child can write to the sink it inherited.
+
+    Attributes:
+      forks: How many children it has forked.
+    """
+
+    forks = 0
+
+    def _perform(self, script: tuple[str, ...]) -> None:
+        """Forks for ``("fork",)``, and runs any other script as a ``reentrant`` sink does.
+
+        Args:
+          script: The script.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: For an operation no script holds.
+        """
+        if script != ("fork",):
+            super()._perform(script)
+            return
+        self.forks += 1
+        run = current()
+        ending, report = run.fork(forked_child)
+        if ending == "reported":
+            run.check(
+                check_child,
+                ChildReport(
+                    ending,
+                    tuple(report["orphan_in"]),  # type: ignore[arg-type]
+                    tuple(report["span_in"]),  # type: ignore[arg-type]
+                    bool(report["counters_moved"]),
+                    tuple(report["closed_inherited"]),  # type: ignore[arg-type]
+                    str(report["state"]),
+                ),
+            )
+
+
+def forked_child(run: ChildRun) -> dict[str, object]:
+    """The script of a ``forker``'s child: one orphan log, one traced call, a flush, a shutdown.
+
+    Each call goes through the child's timer, so the universal step holds all four to the time
+    oracle. The report says which sinks the two events landed in, by index, whether a counter
+    moved instead, which inherited sinks the child closed, and the state it ended in.
+
+    Args:
+      run: The child's run, over the sinks it inherited.
+
+    Returns:
+      The report ``check_child`` reads.
+
+    Raises:
+      None.
+    """
+    sinks = [sink for sink in run.sinks if isinstance(sink, Recorder)]
+    before = [(s.count(ORPHAN), s.count(SPAN_END), len(s.closes().at_entry)) for s in sinks]
+    first = log_foundry.health()
+    run.count("info")
+    run.call("info", 0.0, lambda: log_foundry.info(ORPHAN))
+    run.count("span")
+    run.call("span", 0.0, _model_span)
+    run.call("flush", FLUSH_TIMEOUT, lambda: log_foundry.flush(timeout=FLUSH_TIMEOUT))
+    run.call("shutdown", SHUTDOWN_TIMEOUT, lambda: log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT))
+    run.settle()
+    last = log_foundry.health()
+    counters = ("queued", "dropped", "failed_batches", "orphan_lost")
+    report = {
+        "orphan_in": [
+            s.index for s, b in zip(sinks, before, strict=True) if s.count(ORPHAN) > b[0]
+        ],
+        "span_in": [
+            s.index for s, b in zip(sinks, before, strict=True) if s.count(SPAN_END) > b[1]
+        ],
+        "counters_moved": any(getattr(last, c) > getattr(first, c) for c in counters),
+        "closed_inherited": [
+            s.index for s, b in zip(sinks, before, strict=True) if len(s.closes().at_entry) > b[2]
+        ],
+        "state": read_end()[0],
+    }
+    run.note(f"forked child: {report}")
+    return report

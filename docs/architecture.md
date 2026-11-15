@@ -1306,6 +1306,15 @@ close it.
   counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
   by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
   the swap began.
+- **An orphan log that passed its owed check before a `shutdown()` took its sink writes after the
+  close, and the sink is owed nothing** (SPEC-085; invariant 5). Measured at `a0f44b5f` by the
+  reproduction in `tests/test_model_cells.py`: `writes=2`, one close entered and returned at count
+  1, nothing owed, `orphan_lost=0`, on 7 of 7 runs and on 3 of 3 by an independent reviewer; the
+  unparked control closes at count 2. Unforced: 3 of 900 runs of the concurrent model with
+  `shutdown()` in its mix. The measurement used a recorder that keeps accepting after `close()`; a
+  shipped sink behind the closed guard was not measured. **Closed by** a mark around the orphan
+  path's delivery call that a closer waits for or that re-arms the sink once the call returns, or
+  by one lifecycle command path.
 
 **Filed from the 2026-11-14 audit.** Every item from here to *Resolved* was filed from
 `docs/audits/2026-11-14-post-1.2.0-audit.md`, whose findings table gives each its number: the

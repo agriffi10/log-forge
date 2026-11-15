@@ -131,7 +131,7 @@ def cells() -> tuple[Cell, ...]:
       None.
 
     Returns:
-      Every cell: 504 ``reentrant`` and 112 ``factory``.
+      Every cell: 504 ``reentrant``, 112 ``factory``, 9 ``forker`` and 12 ``waiter``.
 
     Raises:
       None.
@@ -140,6 +140,13 @@ def cells() -> tuple[Cell, ...]:
         Cell("reentrant", site, path, script) for site, path in CALLING_SITES for script in SCRIPTS
     ]
     table += [Cell("factory", "factory", path, script) for path in PATHS for script in SCRIPTS]
+    table += [Cell("forker", site, path, ("fork",)) for site, path in CALLING_SITES]
+    table += [
+        Cell("waiter", site, path, (stop,))
+        for site, stops in WAITER_STOPS.items()
+        for path in PATHS
+        for stop in stops
+    ]
     return tuple(table)
 
 
@@ -228,6 +235,21 @@ PINS: tuple[Pin, ...] = (
         frozenset({"CloseBroken:repeat@1"}),
         "A sink a swap installs is closed twice with nothing written between when an orphan log "
         "armed it and a re-entrant `shutdown()` closed it before the swap decided",
+    ),
+    Pin(
+        "fork-mid-swap",
+        (_cell("forker", "swap-emit", "worker", "fork"),),
+        frozenset({"ChildBroken:two-sinks"}),
+        "A child forked while a sink change is in flight sends its spans to the old sink and its "
+        "orphan logs to the new one",
+    ),
+    Pin(
+        "orphan-write-after-close",
+        (),
+        frozenset({"CloseBroken:unreleased@1"}),
+        "An orphan log that passed its owed check before a `shutdown()` took its sink writes after "
+        "the close, and the sink is owed nothing",
+        reproduction="test_an_orphan_log_parked_after_its_owed_check_writes_after_the_close",
     ),
 )
 """The pins, fixed by measurement at the branch head (FR-004)."""

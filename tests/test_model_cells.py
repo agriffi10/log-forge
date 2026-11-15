@@ -31,24 +31,32 @@ import pytest
 import log_foundry
 import model_pins
 import model_sinks
-from log_foundry import _lifecycle
+from log_foundry import _lifecycle, api
 from model_oracles import (
     GATE_TIMEOUT,
     MARGIN,
+    WAITER_HOLD,
+    Wait,
     changes_overlapped,
     check_closed,
     check_end,
     check_ledger,
     check_released,
     check_repeat,
+    check_wait,
+    served,
 )
-from model_pins import Cell, PinnedVerdict, cell_id, scheduled, settle
+from model_pins import PINS, Cell, PinnedVerdict, cell_id, judge, scheduled, settle
 from model_sinks import (
     FINAL_SHUTDOWN_TIMEOUT,
+    ORPHAN,
+    SHUTDOWN_TIMEOUT,
     ChildRun,
+    Forker,
     Outcome,
     Recorder,
     Reentrant,
+    Waiter,
     current,
     factory,
     install_built,
@@ -147,6 +155,8 @@ def quiet_sink(personality: str) -> object:
     """
     if personality == "factory":
         return Recorder()
+    if personality == "forker":
+        return Forker(_Quiet())
     return Reentrant(_Quiet())
 
 
@@ -178,7 +188,7 @@ def _install_first(run: ChildRun, cell: Cell, hooks: CellHooks) -> None:
             lambda: log_foundry.configure(service="model", sink_factory=build),
         )
         return
-    hooks.first = Reentrant(hooks)
+    hooks.first = Forker(hooks) if cell.personality == "forker" else Reentrant(hooks)
     run.call("configure", _lifecycle.DEFAULT_SWAP_TIMEOUT, lambda: install_sink(hooks.first))
 
 
@@ -256,6 +266,9 @@ def cell_body(run: ChildRun, cell: Cell, *, gate: float = GATE_TIMEOUT) -> None:
       cell: The cell.
       gate: How long each ``swap-emit`` wait may take.
     """
+    if cell.personality == "waiter":
+        _waiter_body(run, cell)
+        return
     run.expect_site()
     hooks = CellHooks(cell, gate=gate)
     _install_first(run, cell, hooks)
@@ -271,6 +284,122 @@ def cell_body(run: ChildRun, cell: Cell, *, gate: float = GATE_TIMEOUT) -> None:
         if cell.site == "swap-close":
             _displace(run, cell)
     _tail(run)
+
+
+def _waiter_scene(run: ChildRun, sink: Waiter, cell: Cell, stop: str) -> None:
+    """Arms the waiter, puts one call inside its wait, makes the stop and judges the wait.
+
+    For ``emit`` the call is a helper thread's ``info()`` on the orphan path and a traced call's
+    batch on the drain thread on the worker path, and the scene waits for the sink to enter its
+    wait before it records the stop's entry. For ``close`` the call inside the wait is the
+    stop's own close, so the stop is made at once.
+
+    Args:
+      run: The run of the process making the stop.
+      sink: The waiter, the cell's own or the one a child inherited.
+      cell: The cell.
+      stop: ``"shutdown"`` or ``"exit"``.
+    """
+    run.expect_site()
+    sink.entered = threading.Event()
+    helper: threading.Thread | None = None
+    sink.armed = cell.site
+    if cell.site == "emit":
+        if cell.path == "orphan":
+            helper = threading.Thread(target=reach, args=("orphan",), name="model-helper")
+            helper.start()
+        else:
+            run.count("span")
+            run.call("span", 0.0, model_sinks._model_span)
+        if not sink.entered.wait(GATE_TIMEOUT):
+            run.note("the armed emit never entered its wait")
+    stop_entered = time.monotonic()
+    if stop == "shutdown":
+        run.call(
+            "shutdown", SHUTDOWN_TIMEOUT, lambda: log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+        )
+    else:
+        run.call("exit", _lifecycle.DEFAULT_SHUTDOWN_TIMEOUT, _lifecycle._shutdown_worker)
+    if helper is not None:
+        helper.join()
+    run.settle()
+    for began, ended in list(sink.waits):
+        wait = Wait(began, ended, stop_entered)
+        run.check(check_wait, wait)
+        run.prop("model_wait", f"{served(wait):.3f}")
+
+
+def _waiter_body(run: ChildRun, cell: Cell) -> None:
+    """A ``waiter`` cell: the path, the scene in this process or in a forked child, the tail.
+
+    In the two ``child-`` forms the cell forks first, through ``run_in_child``, and the child
+    does the arming, the call and the stop on the sink it inherited. A child never closes an
+    inherited sink, so there is no ``child-`` form for ``close``.
+
+    Args:
+      run: The child's run.
+      cell: The cell.
+    """
+    sink = Waiter(WAITER_HOLD)
+    run.call("configure", _lifecycle.DEFAULT_SWAP_TIMEOUT, lambda: install_sink(sink))
+    reach(cell.path)
+    stop = cell.script[0]
+    if stop.startswith("child-"):
+
+        def child(inner: ChildRun) -> dict[str, object]:
+            _waiter_scene(inner, sink, cell, stop.removeprefix("child-"))
+            return dict(inner.properties)
+
+        ending, report = run.fork(child)
+        if "model_wait" in report:
+            run.prop("model_wait", report["model_wait"])
+        run.note(f"the child {ending}")
+    else:
+        _waiter_scene(run, sink, cell, stop)
+    _tail(run)
+
+
+def _orphan_write_after_close(run: ChildRun, *, park: bool) -> None:
+    """The reproduction of ``orphan-write-after-close``, or its unparked control.
+
+    Installs a recorder and logs once outside a span. Then ``api._note_orphan_emit``, the name
+    ``api.py`` imports and calls, is replaced in this child by a wrapper that calls the real
+    function and, when parking, sets an event and parks. A thread's ``info()`` reaches it; the
+    parked form waits until the thread has parked and then calls ``shutdown()``, and the control
+    joins its thread first. Then the thread is released and joined, the exit drain runs, and the
+    released rule is the only oracle applied: no call is registered with the time oracle.
+
+    Args:
+      run: The child's run.
+      park: Whether the thread parks after its owed check.
+    """
+    sink = Recorder()
+    log_foundry.configure(service="model", sink=sink)
+    log_foundry.info(ORPHAN)
+    parked = threading.Event()
+    release = threading.Event()
+    real = api._note_orphan_emit
+
+    def parking(target: object) -> None:
+        real(target)  # type: ignore[arg-type]
+        if park:
+            parked.set()
+            release.wait(GATE_TIMEOUT)
+
+    api._note_orphan_emit = parking  # type: ignore[assignment]
+    racer = threading.Thread(target=log_foundry.info, args=(ORPHAN,), name="model-racer")
+    racer.start()
+    if park:
+        if not parked.wait(GATE_TIMEOUT):
+            run.find("NotExercised:site", "the racing info() never reached its park")
+    else:
+        racer.join()
+    log_foundry.shutdown()
+    release.set()
+    racer.join()
+    _lifecycle._shutdown_worker()
+    run.check(check_released, sink.closes())
+    run.note(f"closes: {sink.closes()}")
 
 
 def run_cell(cell: Cell) -> Outcome:
@@ -326,6 +455,7 @@ def test_cell(cell: Cell, record_property: Callable[[str, object], None]) -> Non
     outcome = run_cell(cell)
     record_property("model_verdict", " ".join(sorted(outcome.verdict)) or "pass")
     record_property("model_file", outcome.file or "none")
+    record_property("model_tree", log_foundry.__file__)
     if outcome.margin is not None:
         record_property(MARGIN, f"{outcome.margin:.6f}")
     if outcome.stacks:
@@ -334,3 +464,33 @@ def test_cell(cell: Cell, record_property: Callable[[str, object], None]) -> Non
         record_property(name, value)
     _assert_this_tree(outcome)
     settle(cell, outcome.verdict, outcome.text)
+
+
+_REPRODUCED = next(pin for pin in PINS if pin.name == "orphan-write-after-close")
+
+
+@pytest.mark.xfail(strict=True, raises=PinnedVerdict, reason="pinned by orphan-write-after-close")
+def test_an_orphan_log_parked_after_its_owed_check_writes_after_the_close(
+    record_property: Callable[[str, object], None],
+) -> None:
+    """FR-004's reproduction: an expected failure only at ``CloseBroken:unreleased@1``.
+
+    An orphan log that has passed its owed check when a ``shutdown()`` takes its sink writes
+    after the close, and the sink is owed nothing. Two threads are needed, so no cell has it.
+    """
+    outcome = run_body(functools.partial(_orphan_write_after_close, park=True))
+    record_property("model_verdict", " ".join(sorted(outcome.verdict)) or "pass")
+    record_property("model_file", outcome.file or "none")
+    _assert_this_tree(outcome)
+    judge(_REPRODUCED, outcome.verdict, outcome.text)
+
+
+def test_the_same_orphan_log_unparked_is_closed_after_its_write(
+    record_property: Callable[[str, object], None],
+) -> None:
+    """The reproduction's control: the same body, its thread joined before ``shutdown()``."""
+    outcome = run_body(functools.partial(_orphan_write_after_close, park=False))
+    record_property("model_verdict", " ".join(sorted(outcome.verdict)) or "pass")
+    record_property("model_file", outcome.file or "none")
+    _assert_this_tree(outcome)
+    judge(None, outcome.verdict, outcome.text)
