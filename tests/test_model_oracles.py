@@ -15,17 +15,25 @@ deadline of ``EPSILON`` plus ``HANG_AFTER`` seconds of own time.
 from __future__ import annotations
 
 import ast
+import functools
+import json
 import os
 import pathlib
+import re
 import signal
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
+import log_foundry
 import model_oracles
+import model_pins
 import model_sinks
+import test_model_cells
 from model_oracles import (
     EPSILON,
     HANG_AFTER,
@@ -54,14 +62,22 @@ from model_oracles import (
     overdue,
     own_time,
 )
-from model_sinks import ChildRun, run_body
+from model_pins import PINS, Cell, PinnedVerdict, cell_id, cells, judge, pin_of, scheduled, withheld
+from model_sinks import ChildRun, Reentrant, factory, install_sink, run_body
+from test_model_cells import CellHooks, cell_body
 
 TESTS = pathlib.Path(__file__).parent
 
-MODEL_FILES = ("model_oracles.py", "model_sinks.py", "test_model_oracles.py")
+MODEL_FILES = (
+    "model_oracles.py",
+    "model_sinks.py",
+    "model_pins.py",
+    "test_model_cells.py",
+    "test_model_oracles.py",
+)
 """Every model file that exists so far; the skip and fork gates read each of them."""
 
-COPIED_FILES = ("model_oracles.py", "model_sinks.py")
+COPIED_FILES = ("model_oracles.py", "model_sinks.py", "model_pins.py", "test_model_cells.py")
 """The model files a run at an older commit imports, which the import gate holds."""
 
 
@@ -819,10 +835,8 @@ def test_the_import_rule_can_actually_fail(source: str, refused: bool) -> None:
     assert bool(import_offenders(source, local)) is refused
 
 
-def test_the_runner_reads_its_child_through_the_patched_name(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``run_body`` calls ``model_sinks.run_in_child`` with ``CELL_TIMEOUT``, the literal 60."""
+def test_a_cell_runs_in_a_child_with_the_cell_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-002: a cell's child is made by ``model_sinks.run_in_child`` with the literal 60."""
     seen: list[int] = []
 
     def spy(work: object, *, timeout: int) -> SimpleNamespace:
@@ -831,5 +845,336 @@ def test_the_runner_reads_its_child_through_the_patched_name(
         return SimpleNamespace(finished=False, blocked=True, status=0, output="")
 
     monkeypatch.setattr(model_sinks, "run_in_child", spy)
-    assert run_body(_returns).verdict == frozenset({"HangFound:silent"})
+    outcome = test_model_cells.run_cell(Cell("reentrant", "emit", "orphan", ("info",)))
+    assert outcome.verdict == frozenset({"HangFound:silent"})
     assert seen == [60]
+
+
+# -- the personalities --------------------------------------------------------------------
+
+
+class _Asked:
+    """Hooks that record every visit they are asked about and answer as a rule says.
+
+    Attributes:
+      asked: ``(site, writes at the ask, lock held at the ask, inside a script at the ask)``.
+      supplied: Every sink ``new_sink`` returned.
+    """
+
+    def __init__(self, answer: object = None) -> None:
+        """Builds the hooks over a rule ``(site, nth visit to it) -> script``."""
+        self.answer = answer
+        self.asked: list[tuple[str, int, bool, bool]] = []
+        self.supplied: list[object] = []
+
+    def script(self, sink: object, site: str) -> tuple[str, ...] | None:
+        """Records the visit, then answers by the rule."""
+        lock = getattr(sink, "_lock", None)
+        held = bool(lock is not None and lock.locked())
+        writes = int(getattr(sink, "writes", -1))
+        self.asked.append((site, writes, held, model_sinks.current().in_script()))
+        nth = sum(1 for asked in self.asked if asked[0] == site)
+        return self.answer(site, nth) if callable(self.answer) else None
+
+    def new_sink(self) -> object:
+        """Supplies a quiet ``reentrant`` sink and records it."""
+        sink = Reentrant(_Asked())
+        self.supplied.append(sink)
+        return sink
+
+
+def _orphan(run: ChildRun) -> None:
+    """Logs once outside a span, through the run's timer."""
+    run.count("info")
+    run.call("info", 0.0, lambda: log_foundry.info("orphan"))
+
+
+def test_a_reentrant_sink_asks_its_hooks_at_every_visit() -> None:
+    """FR-001: hooks answering at the second ``emit`` visit run the script then, not at the first.
+
+    Two ``info()`` calls make two visits; the script's own ``info`` makes a third write, whose
+    visit is inside the script and so is not asked.
+    """
+
+    def body(run: ChildRun) -> None:
+        hooks = _Asked(lambda site, nth: ("info",) if site == "emit" and nth == 2 else None)
+        sink = Reentrant(hooks)
+        run.call("configure", 5.0, lambda: install_sink(sink))
+        _orphan(run)
+        _orphan(run)
+        run.prop(
+            "emits", json.dumps([writes for site, writes, _, _ in hooks.asked if site == "emit"])
+        )
+        run.prop("writes", sink.writes)
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert json.loads(outcome.properties["emits"]) == [1, 2]
+    assert outcome.properties["writes"] == "3"
+
+
+def test_a_scripts_configure_installs_the_sink_its_hooks_supply() -> None:
+    """FR-001: a ``configure+configure`` script asks ``new_sink`` twice and installs the second."""
+
+    def body(run: ChildRun) -> None:
+        hooks = _Asked(lambda site, nth: ("configure", "configure") if site == "emit" else None)
+        sink = Reentrant(hooks)
+        run.call("configure", 5.0, lambda: install_sink(sink))
+        _orphan(run)
+        _orphan(run)
+        run.prop("supplied", len(hooks.supplied))
+        run.prop("last", json.dumps([s.count("orphan") for s in hooks.supplied]))  # type: ignore[attr-defined]
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert outcome.properties["supplied"] == "2"
+    assert json.loads(outcome.properties["last"]) == [0, 1]
+
+
+def test_a_factory_asks_its_hooks_at_every_build() -> None:
+    """FR-001: a ``factory``'s callable asks its hooks each time the library builds a sink."""
+
+    def body(run: ChildRun) -> None:
+        hooks = _Asked()
+        build = factory(hooks)
+        for _ in range(2):
+            run.call(
+                "configure",
+                5.0,
+                lambda: log_foundry.configure(service="m", sink_factory=lambda: build()),
+            )
+            _orphan(run)
+        run.prop("builds", sum(1 for site, *_ in hooks.asked if site == "factory"))
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert outcome.properties["builds"] == "2"
+
+
+def test_a_thread_inside_a_script_starts_no_second_script() -> None:
+    """FR-001: a visit by a thread already inside a script does not call the ``script`` hook.
+
+    Hooks that answer at every visit are asked once for the first ``emit``; the script's own
+    ``info`` writes again from inside the script, and that visit returns without asking, so no
+    answer is drawn and discarded during a script.
+    """
+
+    def body(run: ChildRun) -> None:
+        hooks = _Asked(lambda site, nth: ("info",) if site == "emit" else None)
+        sink = Reentrant(hooks)
+        run.call("configure", 5.0, lambda: install_sink(sink))
+        _orphan(run)
+        run.prop("emits", sum(1 for site, *_ in hooks.asked if site == "emit"))
+        run.prop("inside", sum(1 for *_, inside in hooks.asked if inside))
+        run.prop("writes", sink.writes)
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert outcome.properties["emits"] == "1"
+    assert outcome.properties["inside"] == "0"
+    assert outcome.properties["writes"] == "2"
+
+
+def test_no_personality_holds_its_lock_where_its_code_runs() -> None:
+    """FR-001: at every site a script can run from, the personality's own lock is free."""
+
+    def body(run: ChildRun) -> None:
+        hooks = _Asked()
+        sink = Reentrant(hooks)
+        run.call("configure", 5.0, lambda: install_sink(sink))
+        _orphan(run)
+        run.call("shutdown", 3.0, lambda: log_foundry.shutdown(timeout=3.0))
+        build = factory(hooks)
+        run.call("configure", 5.0, lambda: log_foundry.configure(service="m", sink_factory=build))
+        _orphan(run)
+        run.prop("sites", json.dumps(sorted({site for site, *_ in hooks.asked})))
+        run.prop("held", sum(1 for _, _, held, _ in hooks.asked if held))
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset(), outcome.text
+    assert set(json.loads(outcome.properties["sites"])) >= {"setter", "emit", "close", "factory"}
+    assert outcome.properties["held"] == "0"
+
+
+def test_a_cell_whose_site_is_never_reached_is_not_exercised() -> None:
+    """FR-001: a cell cannot pass by doing nothing; an unreached site is ``NotExercised:site``."""
+    cell = Cell("reentrant", "nowhere", "orphan", ("info",))
+    outcome = run_body(functools.partial(cell_body, cell=cell))
+    assert outcome.verdict == frozenset({"NotExercised:site"}), outcome.text
+
+
+def test_a_swap_emit_gate_that_runs_out_is_not_exercised() -> None:
+    """FR-001: a ``swap-emit`` gate with no sink change to open a token is ``NotExercised:gate``."""
+
+    def body(run: ChildRun) -> None:
+        hooks = CellHooks(Cell("reentrant", "swap-emit", "worker", ("info",)), gate=0.2)
+        hooks.first = Reentrant(hooks)
+        run.call("configure", 5.0, lambda: install_sink(hooks.first))
+        run.count("span")
+        run.call("span", 0.0, model_sinks._model_span)
+        run.call("reach-flush", 10.0, lambda: log_foundry.flush(timeout=10.0))
+        run.call("shutdown", 5.0, lambda: log_foundry.shutdown(timeout=5.0))
+
+    outcome = run_body(body)
+    assert outcome.verdict == frozenset({"NotExercised:gate"}), outcome.text
+
+
+@pytest.mark.parametrize("workers", [["-n", "0"], []], ids=["serial", "distributed"])
+def test_the_session_prints_the_worst_margin_line(workers: list[str]) -> None:
+    """FR-003: one line names the worst margin over passing cells, under ``-n 0`` and ``-n 12``.
+
+    A nested session over one passing cell and one pinned cell, from the repo root with this
+    interpreter. The pinned cell's margin is not in the line. The nested session is a new
+    interpreter started with ``subprocess``, not a fork of this process.
+    """
+    passing = "tests/test_model_cells.py::test_cell[reentrant-emit-orphan-info]"
+    pinned = "tests/test_model_cells.py::test_cell[reentrant-close-orphan-shutdown-none]"
+    env = {name: value for name, value in os.environ.items() if not name.startswith("PYTEST_")}
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *workers, passing, pinned],
+        cwd=TESTS.parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    lines = [line for line in result.stdout.splitlines() if line.startswith("model cells:")]
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    assert "1 passed, 1 xfailed" in result.stdout, result.stdout[-2000:]
+    assert len(lines) == 1, result.stdout[-4000:]
+    assert "reentrant-emit-orphan-info]" in lines[0]
+    assert "shutdown-none" not in lines[0]
+
+
+# -- the table and its pins ---------------------------------------------------------------
+
+
+def test_the_table_and_the_pins_hold_these_counts() -> None:
+    """FR-001 and FR-004: the generated table's size and the pins' arithmetic, as literals."""
+    table = cells()
+    by = {
+        name: sum(1 for cell in table if cell.personality == name)
+        for name in ("reentrant", "factory")
+    }
+    assert by == {"reentrant": 504, "factory": 112}
+    assert len(table) == 616
+    assert [pin.name for pin in PINS] == [
+        "drain-flush",
+        "nested-shutdown",
+        "empty-submission",
+        "orphan-arm-in-close",
+        "installed-closed-twice",
+    ]
+    pinned = [cell for cell in table if pin_of(cell) is not None]
+    held = [cell for cell in table if withheld(cell)]
+    assert len(pinned) == 19
+    assert len(held) == 175
+    assert len(table) - len(pinned) - len(held) == 422
+    assert len(scheduled()) == 441
+
+
+def test_every_cell_id_is_unique_and_spells_its_cell() -> None:
+    """FR-001: one id per cell, ``personality-site-path-script`` with ``+`` between operations."""
+    ids = [cell_id(cell) for cell in cells()]
+    assert len(set(ids)) == len(ids)
+    assert "reentrant-emit-worker-flush+shutdown" in ids
+    assert "factory-factory-orphan-span+flush-none" in ids
+
+
+def test_every_pinned_cell_is_in_the_table_and_under_one_pin() -> None:
+    """FR-004: a pin names only cells of the table, and no cell has two pins."""
+    table = set(cells())
+    named = [cell for pin in PINS for cell in pin.cells]
+    assert set(named) <= table
+    assert len(named) == len(set(named))
+
+
+def open_item_leads() -> list[str]:
+    """Returns the bold lead of every bullet between ``### Open`` and ``### Resolved`` in §12.
+
+    A lead wraps across lines there, so it is read across the wrap, and whitespace collapsed.
+
+    Returns:
+      The leads, in order.
+    """
+    text = (TESTS.parent / "docs" / "architecture.md").read_text(encoding="utf-8")
+    section = text.split("\n### Open\n", 1)[1].split("\n### Resolved\n", 1)[0]
+    leads: list[str] = []
+    for bullet in re.split(r"\n(?=- )", "\n" + section):
+        if bullet.startswith("- **"):
+            lead = bullet[len("- **") :].split("**", 1)[0]
+            leads.append(" ".join(lead.split()))
+    return leads
+
+
+def test_every_pin_names_an_open_item() -> None:
+    """FR-004: each pin's item is the bold lead of an open bullet of ``docs/architecture.md`` §12."""
+    leads = open_item_leads()
+    assert len(leads) > 20, leads
+    missing = [pin.name for pin in PINS if " ".join(pin.item.split()) not in leads]
+    assert not missing, missing
+
+
+def test_with_the_pins_emptied_nothing_is_withheld_and_every_cell_is_scheduled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-004: the withheld set is computed from ``PINS`` alone."""
+    monkeypatch.setattr(model_pins, "PINS", ())
+    assert not any(withheld(cell) for cell in cells())
+    assert scheduled() == cells()
+
+
+def test_everything_withheld_repeats_a_pinned_operation_or_its_sibling() -> None:
+    """FR-004: a withheld cell shares its place with a one-operation pinned cell and its operation."""
+    for cell in cells():
+        if not withheld(cell):
+            continue
+        assert pin_of(cell) is None
+        place = (cell.personality, cell.site, cell.path)
+        reasons = [
+            pin
+            for pin in PINS
+            for held in pin.cells
+            if len(held.script) == 1
+            and (held.personality, held.site, held.path) == place
+            and (held.script[0] in cell.script or pin.sibling in cell.script)
+        ]
+        assert reasons, cell_id(cell)
+
+
+def test_no_pin_expects_a_crash() -> None:
+    """FR-002: a crash is never an expected failure."""
+    assert not [pin.name for pin in PINS if any(s.startswith("ChildCrashed:") for s in pin.verdict)]
+
+
+def test_a_pinned_cell_is_an_expected_failure_only_at_its_pins_verdict() -> None:
+    """FR-004: the pure decision behind the strict mark."""
+    pin = PINS[0]
+    with pytest.raises(PinnedVerdict):
+        judge(pin, pin.verdict, "")
+    for other in (frozenset(), frozenset({"Stalled:info"}), pin.verdict | {"Stalled:info"}):
+        with pytest.raises(AssertionError) as caught:
+            judge(pin, other, "")
+        assert not isinstance(caught.value, PinnedVerdict)
+    judge(None, frozenset(), "")
+    with pytest.raises(AssertionError):
+        judge(None, frozenset({"Stalled:info"}), "")
+    crashed = model_pins.Pin("p", (), frozenset({"ChildCrashed:SIGSEGV"}), "item")
+    with pytest.raises(AssertionError) as caught:
+        judge(crashed, crashed.verdict, "")
+    assert not isinstance(caught.value, PinnedVerdict)
+
+
+def test_every_scheduled_pinned_cell_carries_the_strict_mark() -> None:
+    """FR-004: each pinned cell's parameter carries one strict ``xfail`` expecting the pin's raise."""
+    for param in test_model_cells._params():
+        (cell,) = param.values  # type: ignore[attr-defined]
+        marks = list(param.marks)  # type: ignore[attr-defined]
+        if pin_of(cell) is None:
+            assert not marks, cell_id(cell)
+            continue
+        assert len(marks) == 1, cell_id(cell)
+        assert marks[0].name == "xfail"
+        assert marks[0].kwargs["strict"] is True
+        assert marks[0].kwargs["raises"] is PinnedVerdict

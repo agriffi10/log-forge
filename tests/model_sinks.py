@@ -35,11 +35,16 @@ from typing import TYPE_CHECKING
 
 import log_foundry
 import test_fork_lifecycle
+from log_foundry import _lifecycle
+from log_foundry.worker import Worker
 from model_oracles import (
     CELL_TIMEOUT,
+    REACH_TIMEOUT,
     WATCHDOG,
     Call,
+    Closes,
     Interval,
+    Ledger,
     ModelFailure,
     check_call,
     hang_signature,
@@ -53,6 +58,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from model_oracles import Verdict
+    from model_pins import Hooks
 
 NESTED_TIMEOUT = 45
 """``run_in_child``'s timeout for a child of a child.
@@ -164,6 +170,21 @@ class ChildRun:
                 self.spans += 1
             elif operation == "info":
                 self.orphans += 1
+
+    def abandon(self, ends: int) -> None:
+        """Counts ``span.end`` events in a batch the worker abandoned.
+
+        Args:
+          ends: The events.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self.abandoned += ends
 
     def call(self, name: str, budget: float, work: Callable[[], object]) -> object:
         """Makes one library call, registered while it is in flight, and records it.
@@ -581,7 +602,14 @@ def _begin(sinks: Sequence[object]) -> ChildRun:
 
 
 def _prepare(run: ChildRun) -> None:
-    """Prepares the child for the cell's oracles; a hook the personalities' half extends.
+    """Prepares the child for the ledger: watches ``Worker._emit`` for abandoned batches.
+
+    A batch refused while a factory is inside its own ``flush()`` or ``shutdown()`` is a counted
+    failure, not a defect, so its ``span.end`` events are the ledger's abandoned term. They are
+    observed by wrapping ``Worker._emit``, **in the child only**: when ``failed_batches`` rose
+    across a call, the ``span.end`` events in the event lists that call was handed are abandoned.
+    ``failed_batches`` alone will not do, since one batch can hold several traced calls. A child
+    of a child inherits the wrapper, which reads the run at the time of the call.
 
     Args:
       run: The child's run.
@@ -593,6 +621,26 @@ def _prepare(run: ChildRun) -> None:
       None.
     """
     del run
+    real = Worker._emit
+    if getattr(real, "_model_watched", False):
+        return
+
+    def watched(self: Worker, event_lists: list[list[dict[str, object]]]) -> None:
+        before = self.failed_batches
+        try:
+            real(self, event_lists)
+        finally:
+            if self.failed_batches > before:
+                ends = sum(
+                    1
+                    for batch in event_lists
+                    for event in batch
+                    if event.get("message") == SPAN_END
+                )
+                current().abandon(ends)
+
+    watched._model_watched = True  # type: ignore[attr-defined]
+    Worker._emit = watched  # type: ignore[method-assign]
 
 
 def _finish(run: ChildRun) -> dict[str, object]:
@@ -744,3 +792,513 @@ def run_body(body: Callable[[ChildRun], None], *, timeout: int = CELL_TIMEOUT) -
         return json.dumps(_finish(run))
 
     return read_child(run_in_child(work, timeout=timeout))
+
+
+SPAN_END = "span.end"
+"""The message of the event that closes a traced call, which the span ledger counts."""
+
+ORPHAN = "orphan"
+"""The message of a model orphan log, which the orphan ledger counts."""
+
+FLUSH_TIMEOUT = 2.0
+"""The ``flush`` operation's timeout."""
+
+SHUTDOWN_TIMEOUT = 3.0
+"""The ``shutdown`` operation's timeout, and a ``waiter``'s ``shutdown`` stop's."""
+
+FINAL_SHUTDOWN_TIMEOUT = 5.0
+"""The cell's own ``shutdown``'s timeout."""
+
+
+@log_foundry.trace
+def _model_span() -> None:
+    """One traced call that logs once.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    log_foundry.info("in")
+
+
+def install_sink(sink: object) -> None:
+    """Changes the sink to one given directly: ``configure(sink=…)``.
+
+    Args:
+      sink: The sink.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    log_foundry.configure(service="model", sink=sink)  # type: ignore[arg-type]
+
+
+def install_built(sink: object) -> None:
+    """Changes the sink to one a factory returns: ``configure(sink_factory=…)``.
+
+    Args:
+      sink: The sink the factory returns.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    log_foundry.configure(service="model", sink_factory=lambda: sink)  # type: ignore[arg-type,return-value]
+
+
+def operate(operation: str, hooks: Hooks, install: Callable[[object], None]) -> None:
+    """Makes one operation of a script, through the run's timer, and counts it for the ledger.
+
+    Args:
+      operation: One of ``model_pins.OPERATIONS``.
+      hooks: The hooks whose ``new_sink`` a ``configure`` installs.
+      install: How a ``configure`` installs that sink.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: For an operation no script holds.
+    """
+    run = current()
+    if operation == "info":
+        run.count("info")
+        run.call("info", 0.0, lambda: log_foundry.info(ORPHAN))
+    elif operation == "span":
+        run.count("span")
+        run.call("span", 0.0, _model_span)
+    elif operation == "flush":
+        run.call("flush", FLUSH_TIMEOUT, lambda: log_foundry.flush(timeout=FLUSH_TIMEOUT))
+    elif operation == "flush-none":
+        run.call("flush-none", 0.0, lambda: log_foundry.flush(timeout=None))
+    elif operation == "shutdown":
+        run.call(
+            "shutdown", SHUTDOWN_TIMEOUT, lambda: log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+        )
+    elif operation == "shutdown-none":
+        run.call("shutdown-none", 0.0, lambda: log_foundry.shutdown(timeout=None))
+    elif operation == "configure":
+        sink = hooks.new_sink()
+        run.call("configure", _lifecycle.DEFAULT_SWAP_TIMEOUT, lambda: install(sink))
+    else:
+        raise ValueError(f"no such operation: {operation}")
+
+
+def run_script(script: tuple[str, ...], hooks: Hooks, install: Callable[[object], None]) -> None:
+    """Makes a script's operations in order.
+
+    Args:
+      script: The operations.
+      hooks: The hooks a ``configure`` asks for its sink.
+      install: How a ``configure`` installs it.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: For an operation no script holds.
+    """
+    for operation in script:
+        operate(operation, hooks, install)
+
+
+def reach(path: str) -> None:
+    """Reaches the installed sink on a path: one ``info()``, or one traced call and a flush.
+
+    The worker path's flush is ``REACH_TIMEOUT`` long, so it never races a finite wait inside a
+    script the delivery runs.
+
+    Args:
+      path: ``"orphan"`` or ``"worker"``.
+
+    Returns:
+      None.
+
+    Raises:
+      ValueError: For an unknown path.
+    """
+    run = current()
+    if path == "orphan":
+        run.count("info")
+        run.call("info", 0.0, lambda: log_foundry.info(ORPHAN))
+    elif path == "worker":
+        run.count("span")
+        run.call("span", 0.0, _model_span)
+        run.call("reach-flush", REACH_TIMEOUT, lambda: log_foundry.flush(timeout=REACH_TIMEOUT))
+    else:
+        raise ValueError(f"no such path: {path}")
+
+
+def visit(
+    sink: object, site: str, hooks: Hooks, perform: Callable[[tuple[str, ...]], None]
+) -> None:
+    """Asks the hooks what runs at a visit to a site, and runs it as a stretch of sink code.
+
+    A thread already inside a script returns at once, without asking: a thread inside a script
+    starts no second script, and no answer is drawn and discarded during one. Nothing here holds
+    a lock of the sink's own.
+
+    Args:
+      sink: The sink visited.
+      site: The site.
+      hooks: The sink's hooks.
+      perform: What runs the answer.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    run = current()
+    if run.in_script():
+        return
+    script = hooks.script(sink, site)
+    if not script:
+        return
+    with run.sink_code(), run.scripting():
+        perform(script)
+
+
+class Recorder:
+    """Counts the delivery calls entering it, and that count at each close's entry and return.
+
+    Every personality is built on it. Its one lock is a plain ``threading.Lock`` held only
+    around its own bookkeeping, never across a script, a wait or a fork, and never an ``RLock``:
+    a script's ``info`` re-enters the same sink's ``emit`` on the same thread, so a lock held
+    there would hang the cell rather than pass it.
+
+    Attributes:
+      writes: The delivery calls that entered it.
+      events: Every event it was handed.
+      index: Its position in the run's sinks.
+    """
+
+    def __init__(self) -> None:
+        """Starts an empty record and registers the sink with the run.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          RuntimeError: Outside a watched child.
+        """
+        self._lock = threading.Lock()
+        self.writes = 0
+        self._entries: list[int] = []
+        self._returns: list[int] = []
+        self.events: list[dict[str, object]] = []
+        self.index = current().register(self)
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Counts the write at entry, keeps the events, then runs whatever the sink adds.
+
+        Args:
+          batch: The events.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self.writes += 1
+            self.events.extend(batch)
+        self._after_emit()
+
+    def close(self) -> None:
+        """Records the count at entry, runs whatever the sink adds, records the count at return.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._entries.append(self.writes)
+        self._in_close()
+        with self._lock:
+            self._returns.append(self.writes)
+
+    def _after_emit(self) -> None:
+        """Runs after an emit's bookkeeping; a plain recorder runs nothing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+    def _in_close(self) -> None:
+        """Runs between a close's two counts; a plain recorder runs nothing.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+
+    def closes(self) -> Closes:
+        """Returns the record the close oracles read.
+
+        Args:
+          None.
+
+        Returns:
+          The writes and the count at each close's entry and return.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return Closes(self.writes, tuple(self._entries), tuple(self._returns))
+
+    def count(self, message: str) -> int:
+        """Returns how many of its events carry a message.
+
+        Args:
+          message: The message.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return sum(1 for event in self.events if event.get("message") == message)
+
+
+class Reentrant(Recorder):
+    """Declares ``log_foundry_stop_signal`` as a property, and calls back from its own code.
+
+    Its setter, its ``emit`` and its ``close`` each visit their site after the recorder's own
+    bookkeeping: the setter after the value is stored, on every assignment, ``None`` included;
+    ``emit`` after the write is counted and the events kept; ``close`` after the entry count is
+    recorded and before the return count.
+    """
+
+    def __init__(self, hooks: Hooks, install: Callable[[object], None] = install_sink) -> None:
+        """Builds the sink over its hooks.
+
+        Args:
+          hooks: What it asks at each visit.
+          install: How a script's ``configure`` installs the sink the hooks supply.
+
+        Returns:
+          None.
+
+        Raises:
+          RuntimeError: Outside a watched child.
+        """
+        super().__init__()
+        self._signal: object = None
+        self._hooks = hooks
+        self._install = install
+
+    @property
+    def log_foundry_stop_signal(self) -> object:
+        """Returns the signal the library last handed the sink.
+
+        Args:
+          None.
+
+        Returns:
+          The signal, or ``None``.
+
+        Raises:
+          None.
+        """
+        return self._signal
+
+    @log_foundry_stop_signal.setter
+    def log_foundry_stop_signal(self, value: object) -> None:
+        """Stores the signal, then visits ``setter``.
+
+        Args:
+          value: The signal, or ``None``.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._signal = value
+        self._visit("setter")
+
+    def _after_emit(self) -> None:
+        """Visits ``emit``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._visit("emit")
+
+    def _in_close(self) -> None:
+        """Visits ``close``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._visit("close")
+
+    def _visit(self, site: str) -> None:
+        """Asks the hooks at a visit and runs the answer.
+
+        Args:
+          site: The site.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        visit(self, site, self._hooks, self._perform)
+
+    def _perform(self, script: tuple[str, ...]) -> None:
+        """Runs a script the hooks answered.
+
+        Args:
+          script: The script.
+
+        Returns:
+          None.
+
+        Raises:
+          ValueError: For an operation no script holds.
+        """
+        run_script(script, self._hooks, self._install)
+
+
+def factory(hooks: Hooks) -> Callable[[], Recorder]:
+    """Returns a sink factory that asks its hooks at every build, then returns a new recorder.
+
+    A script the hooks answer runs before the factory returns, so a script's calls are made
+    from inside the library's build. Its ``configure`` installs the hooks' sink through
+    ``configure(sink_factory=…)``, as the personality itself was installed.
+
+    Args:
+      hooks: What the factory asks.
+
+    Returns:
+      The factory.
+
+    Raises:
+      None.
+    """
+
+    def build() -> Recorder:
+        recorder = Recorder()
+        visit(
+            recorder,
+            "factory",
+            hooks,
+            lambda script: run_script(script, hooks, install_built),
+        )
+        return recorder
+
+    return build
+
+
+def stranded_markers() -> int:
+    """Counts the flush markers left on the worker's queue, which ``health().queued`` counts.
+
+    The rule of ``tests/test_invariants_model.py``'s ``_stranded_markers``, written again here
+    because the model files import nothing from ``tests/`` but the child runner.
+
+    Args:
+      None.
+
+    Returns:
+      The items on the queue that are not a submission.
+
+    Raises:
+      None.
+    """
+    worker = _lifecycle._state.worker_exists()
+    if worker is None:
+        return 0
+    with worker._queue.mutex:
+        return sum(1 for item in worker._queue.queue if not isinstance(item, list))
+
+
+def read_ledger(run: ChildRun) -> Ledger:
+    """Reads the ledger's terms from the run, the sinks and ``health()``.
+
+    Args:
+      run: The child's run.
+
+    Returns:
+      The ledger.
+
+    Raises:
+      None.
+    """
+    health = log_foundry.health()
+    sinks = [sink for sink in run.sinks if isinstance(sink, Recorder)]
+    return Ledger(
+        spans=run.spans,
+        span_ends=sum(sink.count(SPAN_END) for sink in sinks),
+        queued=health.queued - stranded_markers(),
+        dropped=health.dropped,
+        abandoned=run.abandoned,
+        orphans=run.orphans,
+        orphans_delivered=sum(sink.count(ORPHAN) for sink in sinks),
+        orphan_lost=health.orphan_lost,
+    )
+
+
+def read_end() -> tuple[str, int]:
+    """Reads the lifecycle state's name and the swap and stop tokens held.
+
+    Args:
+      None.
+
+    Returns:
+      The state's name and the token count.
+
+    Raises:
+      None.
+    """
+    state = _lifecycle._state
+    return state.state.name, len(state._swaps_running) + len(state._stops_running)

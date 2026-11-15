@@ -1261,12 +1261,15 @@ close it.
   `_emit` if it fails. `Worker.submit`'s docstring already calls the line over-strong.
   **Closed by** writing that `lost` line only once the final drain's last read of the queue is
   done or the drain thread is dead.
-- **`flush()` and `configure(sink=…)` called on the drain thread wait on themselves** (SPEC-068
-  spec review; invariant 3). A sink's `emit` that calls either waits on the thread it runs on:
-  measured, a 1.009 s `timed-out` flush and a 5.007 s stranded swap. SPEC-068 FR-006 closed this
-  shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain thread,
-  which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034), and a swap that does
-  not wait on the thread it runs on.
+- **`flush()` called on the drain thread waits on itself** (SPEC-068 spec review; invariant 3;
+  corrected in place by SPEC-085). A sink's `emit` that calls `flush()` waits on the thread it
+  runs on: measured at `a0f44b5f`, `flush(timeout=2.0)` takes 2.00 s, `flush(timeout=None)` does
+  not return, and a later `shutdown(timeout=5.0)` expires. ~~`configure(sink=…)` called there
+  waits on itself too: a 5.007 s stranded swap.~~ At `a0f44b5f` a `configure(sink=…)` made from
+  `emit` on the drain thread returns in 0.00 s with two announced lines. SPEC-068 FR-006 closed
+  this shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain
+  thread, which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034)~~, and a
+  swap that does not wait on the thread it runs on~~.
 - **A shutdown sentinel can still strand behind the final drain on the ordinary path** (SPEC-068
   diff review; invariant 2). The first caller queues `_SHUTDOWN` and then sets the stop event, but
   a drain thread that wakes on the stop event first — at the end of an emit, or from a backoff —
@@ -1283,6 +1286,26 @@ close it.
   closer takes and closes the sink under the emit that called it. A sink whose `emit` and `close`
   share a non-reentrant lock never returns from `info()`. The same before SPEC-068. **Closed by** a
   per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
+- **An empty batch submitted after a `shutdown()` is counted as queued, counted as submitted after
+  shutdown and announced as a lost submission** (SPEC-085; invariant 2). Measured at `a0f44b5f`,
+  8 cells red: `flush` then `shutdown` from the setter during the worker's build: the span is
+  delivered once, yet `queued=1` with an empty list on the retired queue,
+  `submitted_after_shutdown=1` and one "lost 1 submission(s)" line. `shutdown` then `flush`:
+  `queued=2`, `submitted_after_shutdown=2` for one span. **Closed by** not submitting, or not
+  counting, a batch with no events.
+- **A sink first written by an orphan log made inside a `shutdown()`'s close is not closed by that
+  `shutdown()`** (SPEC-085; invariant 5, first observable). Measured at `a0f44b5f`, 2 cells red:
+  `configure(sink=B)` then `info()` from inside the close: B has one write and no close when
+  `shutdown()` returns, is in the owed record, and nothing is written to stderr; the exit drain
+  closes it. A `span` from the same place is closed by the same `shutdown()` (closes entered at
+  counts 1 and 3). **Closed by** the shutdown's final pass taking what was armed during its own
+  closes, as it does for a worker built there.
+- **A sink a swap installs is closed twice with nothing written between when an orphan log armed it
+  and a re-entrant `shutdown()` closed it before the swap decided** (SPEC-085; invariant 5).
+  Measured at `a0f44b5f`, 2 cells red: the installed sink has one write and closes entered at
+  counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
+  by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
+  the swap began.
 
 **Filed from the 2026-11-14 audit.** Every item from here to *Resolved* was filed from
 `docs/audits/2026-11-14-post-1.2.0-audit.md`, whose findings table gives each its number: the
