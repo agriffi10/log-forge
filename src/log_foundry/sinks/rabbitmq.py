@@ -470,7 +470,7 @@ class RabbitMQSink:
             "ConnectionClosedByClient",
             "ConnectionOpenAborted",
         )
-        if isinstance(err, excluded):
+        if _diag.is_a(err, excluded):
             return False
         retried = (
             *TRANSIENT_BUILTINS,
@@ -480,7 +480,7 @@ class RabbitMQSink:
                 "ChannelWrongStateError",
             ),
         )
-        return isinstance(err, retried)
+        return _diag.is_a(err, retried)
 
     def _active_channel(self) -> Any:
         """Returns the open channel, reconnecting and reopening as needed.

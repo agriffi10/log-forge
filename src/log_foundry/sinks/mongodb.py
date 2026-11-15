@@ -428,7 +428,7 @@ class MongoDBSink:
                 self._collection.insert_many([document for _, document in documents], ordered=False)
             except Exception as err:
                 details = getattr(err, "details", None)
-                if isinstance(details, dict) and "writeErrors" in details:
+                if _diag.is_a(details, dict) and "writeErrors" in details:
                     self._settle_bulk(details["writeErrors"], positions, fates)
                 else:
                     retryable = is_retryable(self._retryable_error, err)
@@ -529,9 +529,9 @@ class MongoDBSink:
           None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
         """
         retried = (*TRANSIENT_BUILTINS, *driver_classes("pymongo.errors", "ConnectionFailure"))
-        if isinstance(err, retried):
+        if _diag.is_a(err, retried):
             return True
-        if not isinstance(err, driver_classes("pymongo.errors", "PyMongoError")):
+        if not _diag.is_a(err, driver_classes("pymongo.errors", "PyMongoError")):
             return False
         has_label = getattr(err, "has_error_label", None)
         return callable(has_label) and bool(has_label("RetryableWriteError"))

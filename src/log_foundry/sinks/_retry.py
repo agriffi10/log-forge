@@ -169,7 +169,7 @@ def require_timeout(value: float, name: str, owner: str) -> float:
     The test is ``not (0 < value < inf)``, identical to ``usable_timeout``'s and for its reason:
     ``NaN`` compares ``False`` to everything, so the obvious pair of comparisons lets it through.
     It runs on the exact builtin (SPEC-065 FR-004), through :func:`_exact_number` after the
-    ``isinstance`` check, so an ``int`` or ``float`` subclass whose comparisons or ``__float__``
+    real-type check, so an ``int`` or ``float`` subclass whose comparisons or ``__float__``
     are overridden to look positive is judged by the number it holds, and the message names that
     number. What is returned is that exact ``int`` or ``float``; ``True`` is returned as ``1``.
 
@@ -189,7 +189,7 @@ def require_timeout(value: float, name: str, owner: str) -> float:
     """
     exact = exact_seconds(value, name, owner)
     if not 0 < exact < float("inf"):
-        shown = _int_text(exact) if isinstance(exact, int) else repr(exact)
+        shown = _int_text(exact) if _diag.is_a(exact, int) else repr(exact)
         raise ValueError(
             f"{owner} {name} must be a positive, finite number of seconds, not {shown}"
         )

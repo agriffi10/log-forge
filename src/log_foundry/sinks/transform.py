@@ -441,6 +441,12 @@ class TransformSink:
     def _apply(self, event: dict[str, object]) -> dict[str, object] | None:
         """Runs the function on one event and makes its result safe to forward (SPEC-058).
 
+        The result is the caller's object, judged by ``isinstance`` on purpose and under its own
+        guard: a transparent proxy of a ``dict`` (``wrapt``, a lazy object) has always been
+        accepted here and coerced into an exact ``dict`` by :func:`_json_safe`, so a real-type test
+        would drop events 1.x delivered, while a ``__class__`` property that raises is read as
+        not a ``dict``. ``tests/test_class_check_roster.py`` exempts this one site.
+
         A result that is neither ``None`` nor a ``dict`` is the same failure as a raise, so the
         ``TypeError`` is built here — naming this class and the type returned, never the value —
         and raised into :meth:`emit`'s per-event guard. Raising in a helper rather than inside
@@ -467,7 +473,11 @@ class TransformSink:
         result = _engine.outside_runs(self._fn, event)
         if result is None:
             return None
-        if not isinstance(result, dict):
+        try:
+            mapped = isinstance(result, dict)
+        except Exception:
+            mapped = False
+        if not mapped:
             raise TypeError(
                 f"TransformSink's function returned {_diag.type_name(result)}, not a dict or None"
             )

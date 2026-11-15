@@ -1488,7 +1488,7 @@ class Worker:
                 return sum(
                     1
                     for item in self._queue.queue
-                    if item is not _SHUTDOWN and not isinstance(item, _FlushMarker)
+                    if item is not _SHUTDOWN and not _diag.is_a(item, _FlushMarker)
                 )
         except Exception:
             return 0
@@ -1649,7 +1649,7 @@ class Worker:
             marker.event.set()
         try:
             with self._queue.mutex:
-                queued = [i for i in self._queue.queue if isinstance(i, _FlushMarker)]
+                queued = [i for i in self._queue.queue if _diag.is_a(i, _FlushMarker)]
             for marker in queued:
                 marker.event.set()
         except Exception:
@@ -1727,7 +1727,7 @@ class Worker:
                 item = self._queue.get(timeout=timeout)
             except queue.Empty:
                 item = None
-            if isinstance(item, _FlushMarker):
+            if _diag.is_a(item, _FlushMarker):
                 self._take_marker(item)
                 try:
                     self._emit_pending(pending)
@@ -1811,7 +1811,7 @@ class Worker:
                 item = self._queue.get_nowait()
             except queue.Empty:
                 break
-            if isinstance(item, _FlushMarker):
+            if _diag.is_a(item, _FlushMarker):
                 markers.append(item)
                 self._take_marker(item)
                 continue

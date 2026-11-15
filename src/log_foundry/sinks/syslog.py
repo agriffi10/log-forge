@@ -257,12 +257,12 @@ class SyslogSink:
             returns (SPEC-058 FR-001).
         """
         level = event.get("level")
-        severity = _SEVERITY.get(level.upper(), _DEFAULT_SEVERITY) if isinstance(level, str) else (
+        severity = _SEVERITY.get(level.upper(), _DEFAULT_SEVERITY) if _diag.is_a(level, str) else (
             _DEFAULT_SEVERITY
         )
         pri = self._facility * 8 + severity
         timestamp = event.get("timestamp")
-        ts = timestamp if isinstance(timestamp, str) else "-"
+        ts = timestamp if _diag.is_a(timestamp, str) else "-"
         msg = json.dumps(event)
         procid = os.getpid()
         frame = f"<{pri}>1 {ts} {self._hostname} {self._app_name} {procid} - - {msg}"

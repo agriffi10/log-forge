@@ -130,7 +130,7 @@ def usable_results(results: Any) -> list[dict[str, Any]]:
     Raises:
       None.
     """
-    if isinstance(results, list) and all(isinstance(result, dict) for result in results):
+    if _diag.is_a(results, list) and all(_diag.is_a(result, dict) for result in results):
         return results
     return []
 

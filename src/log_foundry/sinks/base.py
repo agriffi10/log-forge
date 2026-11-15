@@ -8,6 +8,8 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from typing import Final, Protocol, cast, runtime_checkable
 
+from log_foundry import _diag
+
 __all__ = ["Sink", "SinkDeliveryError", "SinkLosses", "flush_sink", "read_losses"]
 
 
@@ -545,7 +547,7 @@ def read_losses(sink: object) -> SinkLosses | None:
         losses = accessor() if callable(accessor) else None
     except Exception:
         return None
-    return losses if isinstance(losses, SinkLosses) else None
+    return losses if _diag.is_a(losses, SinkLosses) else None
 
 
 def flush_sink(sink: object) -> bool:

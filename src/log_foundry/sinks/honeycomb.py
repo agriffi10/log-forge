@@ -434,6 +434,6 @@ def _status(entry: dict[str, Any]) -> int | None:
       None.
     """
     status = entry.get("status")
-    if isinstance(status, int) and not isinstance(status, bool):
+    if _diag.is_a(status, int) and not _diag.is_a(status, bool):
         return status
     return None

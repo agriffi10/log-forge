@@ -31,7 +31,10 @@ partially initialised, and resolves only because it is a leaf.
 from __future__ import annotations
 
 import sys
-from typing import cast
+from typing import TYPE_CHECKING, TypeGuard, cast, overload
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeIs
 
 __all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "pending", "rejected"]
 
@@ -87,6 +90,66 @@ def type_name(value: object) -> str:
       None.
     """
     return _STR_STR(_STORED_NAME(type(value)))
+
+
+_SUBCLASS_CHECK = type.__dict__["__subclasscheck__"]
+"""``type.__subclasscheck__``, unbound, so a test of a class reads its MRO and nothing else.
+
+Called as ``_SUBCLASS_CHECK(target, kind)`` it answers whether ``kind`` subclasses ``target`` by
+``kind``'s own MRO, past any ``__subclasscheck__`` the target's metaclass defines, so an ABC's
+registry, cache and ``__subclasshook__`` are not consulted and no ``__hash__`` or ``__eq__`` of
+``kind``'s metaclass runs.
+"""
+
+
+@overload
+def is_a[T](value: object, classes: type[T]) -> TypeIs[T]: ...
+
+
+@overload
+def is_a[T](value: object, classes: tuple[type[T], ...]) -> TypeGuard[T]: ...
+
+
+def is_a(value: object, classes: type | tuple[type, ...]) -> bool:
+    """Whether ``value``'s real type subclasses ``classes``, without running any caller code.
+
+    ``isinstance(value, X)`` reads ``value.__class__`` through attribute lookup whenever the real
+    type is not ``X`` or a subclass of it, so a ``__class__`` property or ``__getattribute__`` of
+    the value ran inside the library: a raising one raised from paths documented ``Raises: None``
+    (invariant 1), and one answering ``X`` made an impostor pass. ``issubclass(type(value), X)``
+    does not read ``__class__``, but asks ``X``'s metaclass, and an ABC's ``__subclasscheck__``
+    hashes ``type(value)`` into its cache, which runs that class's metaclass ``__hash__``. This
+    reads ``type(value)``'s MRO through :data:`_SUBCLASS_CHECK`, which is the test an ``except``
+    clause makes, so it answers by real type alone: a genuine subclass passes, a transparent proxy
+    that only claims ``X`` through ``__class__`` does not, and neither does a class an ABC knows
+    only by ``register`` — so ``classes`` must be concrete classes (``dict``, not ``Mapping``), and
+    ``tests/test_class_check_roster.py`` refuses an abstract one where it can resolve it. That
+    roster also refuses any ``isinstance`` call in ``src/`` outside its exemptions.
+
+    A tuple is walked in a plain loop rather than ``any()`` over a generator, which cost about four
+    times as much per call on the SQL sinks' per-value walk. A single class narrows like
+    ``isinstance``, both branches (``TypeIs``). A tuple narrows only
+    the true branch (``TypeGuard``): ``TypeIs`` over ``tuple[type[T], ...]`` narrowed the false
+    branch of ``is_a(err, TRANSIENT_BUILTINS)`` to ``Never``, so ``mypy --strict`` stopped checking
+    the rest of five retry predicates, and over ``(list, tuple)`` it dropped ``str`` from the rest.
+
+    Args:
+      value: The value to test, such as a caught exception, a sink's result or an event field.
+      classes: A class, or a tuple of classes, none of them abstract.
+
+    Returns:
+      Whether ``type(value)`` is one of ``classes`` or subclasses one of them.
+
+    Raises:
+      None.
+    """
+    kind = type(value)
+    if type(classes) is tuple:
+        for target in classes:  # noqa: SIM110
+            if _SUBCLASS_CHECK(target, kind):
+                return True
+        return False
+    return bool(_SUBCLASS_CHECK(classes, kind))
 
 
 def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
@@ -287,7 +350,7 @@ def errno_of(exc: BaseException) -> str:
     consulted too.
 
     The value is rendered through ``int()`` rather than interpolated as found, because
-    ``isinstance(x, int)`` admits any subclass and a driver's error code is routinely one — an
+    :func:`is_a` admits any ``int`` subclass and a driver's error code is routinely one — an
     ``IntEnum`` or a bespoke class whose ``__str__`` returns whatever its author chose, which
     an f-string would write verbatim. That is the leak this helper exists to be the
     alternative to.
@@ -306,7 +369,7 @@ def errno_of(exc: BaseException) -> str:
         code = getattr(exc, "errno", None)
         if code is None:
             code = getattr(getattr(exc, "reason", None), "errno", None)
-        return f"errno={int(code)}" if isinstance(code, int) else ""
+        return f"errno={int(code)}" if is_a(code, int) else ""
     except Exception:
         return ""
 

@@ -362,7 +362,7 @@ class FilteringSink:
             return False
         if self._min_rank is not None:
             level = event.get("level")
-            rank = _LEVELS.get(level.upper()) if isinstance(level, str) else None
+            rank = _LEVELS.get(level.upper()) if _diag.is_a(level, str) else None
             if rank is not None and rank < self._min_rank:
                 return False
         return True

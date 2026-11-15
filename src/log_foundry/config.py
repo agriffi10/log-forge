@@ -138,7 +138,7 @@ def _require_positive(name: str, value: object) -> int | None:
     integer arithmetic in ``sanitize`` on every event with whatever it is: measured at
     ``71e42dd``, ``max_value_bytes=2.5`` emptied ``fields``, ``nan`` lost the event and ``inf``
     wrote values unbounded, while ``"5"`` raised the comparison's own ``TypeError`` naming
-    neither the ceiling nor the type. So the ``isinstance`` test comes first and names both. A
+    neither the ceiling nor the type. So the type test comes first and names both. A
     value outside ``int | None`` is refused rather than floored, because ``math.ceil(2.5)`` would
     hide the caller's mistake behind a ceiling they never chose, and under invariant 10 a float
     was already a ``mypy`` error for every type-checked caller.

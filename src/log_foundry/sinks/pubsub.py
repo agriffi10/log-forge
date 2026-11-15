@@ -605,9 +605,9 @@ class GooglePubSubSink:
         try:
             future.result() if timeout is None else future.result(timeout=timeout)
         except Exception as err:
-            if timeout is not None and isinstance(err, TypeError):
+            if timeout is not None and _diag.is_a(err, TypeError):
                 raise _Unboundable from None
-            if timeout is not None and isinstance(err, TimeoutError):
+            if timeout is not None and _diag.is_a(err, TimeoutError):
                 return False
             with self._counter_lock:
                 self.failed += 1

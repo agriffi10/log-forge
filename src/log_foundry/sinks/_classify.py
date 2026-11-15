@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -93,7 +93,7 @@ def driver_classes(module: str, *names: str) -> tuple[type[BaseException], ...]:
             candidate = getattr(loaded, name)
         except Exception:
             candidate = None
-        if isinstance(candidate, type) and issubclass(candidate, BaseException):
+        if issubclass(type(candidate), type) and issubclass(candidate, BaseException):
             found.append(candidate)
     return tuple(found)
 
@@ -143,22 +143,29 @@ def aws_retryable(err: Exception) -> bool:
     Raises:
       None.
     """
-    if isinstance(err, TRANSIENT_BUILTINS):
+    kind = type(err)
+    if issubclass(kind, TRANSIENT_BUILTINS):
         return True
-    if isinstance(err, driver_classes("botocore.exceptions", "ConnectionError", "HTTPClientError")):
+    if issubclass(
+        kind, driver_classes("botocore.exceptions", "ConnectionError", "HTTPClientError")
+    ):
         return True
-    if not isinstance(err, driver_classes("botocore.exceptions", "ClientError")):
+    if not issubclass(kind, driver_classes("botocore.exceptions", "ClientError")):
         return False
     response = getattr(err, "response", None)
-    if not isinstance(response, dict):
+    if not issubclass(type(response), dict):
         return False
-    metadata = response.get("ResponseMetadata")
-    status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+    metadata = cast("dict[str, Any]", response).get("ResponseMetadata")
+    status = (
+        cast("dict[str, Any]", metadata).get("HTTPStatusCode")
+        if issubclass(type(metadata), dict)
+        else None
+    )
     if type(status) is int and status in _AWS_RETRY_STATUSES:
         return True
-    error = response.get("Error")
-    code = error.get("Code") if isinstance(error, dict) else None
-    return isinstance(code, str) and code in _AWS_RETRY_CODES
+    error = cast("dict[str, Any]", response).get("Error")
+    code = cast("dict[str, Any]", error).get("Code") if issubclass(type(error), dict) else None
+    return issubclass(type(code), str) and code in _AWS_RETRY_CODES
 
 
 def sender_fault(entry: Mapping[str, object]) -> bool:

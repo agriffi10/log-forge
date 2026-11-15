@@ -540,7 +540,7 @@ class SentrySink:
           None.
         """
         level = event.get("level")
-        if not isinstance(level, str):
+        if not _diag.is_a(level, str):
             return False
         return _LEVEL_RANK.get(level.upper(), -1) >= self._min_rank
 
@@ -557,7 +557,7 @@ class SentrySink:
           None.
         """
         level = event.get("level")
-        sentry_level = _SENTRY_LEVEL.get(level.upper(), "error") if isinstance(level, str) else (
+        sentry_level = _SENTRY_LEVEL.get(level.upper(), "error") if _diag.is_a(level, str) else (
             "error"
         )
         return {

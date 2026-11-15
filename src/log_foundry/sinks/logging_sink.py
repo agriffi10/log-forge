@@ -160,7 +160,7 @@ class LoggingSink:
           None.
         """
         level = event.get("level")
-        if isinstance(level, str):
+        if _diag.is_a(level, str):
             return _LEVELS.get(level.upper(), self._default_level)
         return self._default_level
 
@@ -213,7 +213,7 @@ class LoggingSink:
             if key in event:
                 setattr(record, key, event[key])
         fields = event.get("fields")
-        if isinstance(fields, dict):
+        if _diag.is_a(fields, dict):
             record.fields = fields
             for key, value in fields.items():
                 if key not in _RESERVED and key not in _IDENTITY and key != "fields":

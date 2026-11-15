@@ -7,7 +7,7 @@ import math
 import re
 import sys
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -90,8 +90,9 @@ _TUPLE_ITER = tuple.__iter__
 
 Dispatch is on the builtin base, read through that base's own method, which is the rule
 ``sanitize`` follows with ``_INT_LT`` and ``_FLOAT_REPR``. An object that only claims a builtin
-through ``__class__`` passes ``isinstance`` and then fails the unbound read with ``TypeError``,
-which the guard around every value turns into a placeholder.
+through ``__class__`` is dispatched on its real type, which ``issubclass(type(x), …)`` reads without
+asking it, so it never reaches an unbound read; a raise from one there is ``TypeError``, which the
+guard around every value turns into a placeholder.
 """
 
 _MISSING = object()
@@ -134,10 +135,10 @@ def _text(value: object) -> tuple[str, bool] | None:
     Raises:
       None.
     """
-    if not isinstance(value, str):
+    if not issubclass(type(value), str):
         return None
     try:
-        plain = _STR_STR(value)
+        plain = _STR_STR(cast("str", value))
     except Exception:
         return None
     return _repaired(plain)
@@ -303,37 +304,39 @@ class _Walker:
         """
         if value is None:
             return {}
-        if isinstance(value, bool):
+        kind = type(value)
+        if issubclass(kind, bool):
             return {"boolValue": value is True}
-        if isinstance(value, int):
-            text, placeholder = _int_digits(value)
+        if issubclass(kind, int):
+            integer = cast("int", value)
+            text, placeholder = _int_digits(integer)
             if placeholder:
                 self.marked = True
                 return {"stringValue": text}
-            if _INT_LT(value, _INT64_MIN) or _INT_LT(_INT64_MAX, value):
+            if _INT_LT(integer, _INT64_MIN) or _INT_LT(_INT64_MAX, integer):
                 return {"stringValue": text}
             return {"intValue": text}
-        if isinstance(value, float):
-            number = _FLOAT_FLOAT(value)
+        if issubclass(kind, float):
+            number = _FLOAT_FLOAT(cast("float", value))
             if math.isfinite(number):
                 return {"doubleValue": number}
             if math.isnan(number):
                 return {"doubleValue": "NaN"}
             return {"doubleValue": "Infinity" if number > 0 else "-Infinity"}
-        if isinstance(value, str):
-            text, repaired = _repaired(_STR_STR(value))
+        if issubclass(kind, str):
+            text, repaired = _repaired(_STR_STR(cast("str", value)))
             if repaired:
                 self.marked = True
             return {"stringValue": text}
-        if isinstance(value, dict | list | tuple):
+        if issubclass(kind, (dict, list, tuple)):
             if depth > MAX_NEST:
                 self.marked = True
                 return {"stringValue": _DEPTH_LIMIT}
             if id(value) in ancestors:
                 return {"stringValue": _CIRCULAR}
-            if isinstance(value, dict):
-                return self._kvlist(value, depth, ancestors)
-            return self._array(value, depth, ancestors)
+            if issubclass(kind, dict):
+                return self._kvlist(cast("dict[object, object]", value), depth, ancestors)
+            return self._array(cast("list[object] | tuple[object, ...]", value), depth, ancestors)
         raise TypeError(_type_name(value))
 
     def _kvlist(
@@ -385,7 +388,11 @@ class _Walker:
         Raises:
           Exception: Whatever iterating the sequence raises; the caller's guard owns it.
         """
-        iterator = _LIST_ITER(sequence) if isinstance(sequence, list) else _TUPLE_ITER(sequence)
+        iterator = (
+            _LIST_ITER(cast("list[object]", sequence))
+            if issubclass(type(sequence), list)
+            else _TUPLE_ITER(cast("tuple[object, ...]", sequence))
+        )
         values: list[dict[str, object]] = []
         ancestors.append(id(sequence))
         try:
@@ -432,20 +439,21 @@ class _Walker:
         Raises:
           TypeError: For a type outside the domain, or an object that only claims one.
         """
-        if isinstance(key, str):
-            text, repaired = _repaired(_STR_STR(key))
+        kind = type(key)
+        if issubclass(kind, str):
+            text, repaired = _repaired(_STR_STR(cast("str", key)))
             if repaired:
                 self.marked = True
             return text
-        if isinstance(key, bool):
-            return "True" if key else "False"
-        if isinstance(key, int):
-            text, placeholder = _int_digits(key)
+        if issubclass(kind, bool):
+            return "True" if key is True else "False"
+        if issubclass(kind, int):
+            text, placeholder = _int_digits(cast("int", key))
             if placeholder:
                 self.marked = True
             return text
-        if isinstance(key, float):
-            number = _FLOAT_FLOAT(key)
+        if issubclass(kind, float):
+            number = _FLOAT_FLOAT(cast("float", key))
             if math.isfinite(number):
                 return _FLOAT_REPR(number)
             self.marked = True
@@ -519,10 +527,10 @@ def log_record(event: Mapping[str, object]) -> dict[str, object]:
     Raises:
       None.
     """
-    if not isinstance(event, dict):
+    if not issubclass(type(event), dict):
         return {}
     try:
-        return _log_record(event)
+        return _log_record(cast("dict[str, object]", event))
     except Exception:
         return {}
 
@@ -632,14 +640,14 @@ def _library_attributes(
         pairs.append((_RESERVED_PREFIX + "parent_span_id", walker.value(parent[0], 1, [])))
     pairs.append((_RESERVED_PREFIX + "truncated", {"boolValue": True}))
     duration = _read(event, "duration_ms")
-    if isinstance(duration, float | int) and not isinstance(duration, bool):
+    if issubclass(type(duration), (float, int)) and not issubclass(type(duration), bool):
         pairs.append((_RESERVED_PREFIX + "duration_ms", walker.value(duration, 1, [])))
     status = _text(_read(event, "status"))
     if status is not None:
         pairs.append((_RESERVED_PREFIX + "status", walker.value(status[0], 1, [])))
     error = _read(event, "error")
-    if isinstance(error, dict):
-        for key, text in _exception_reads(error):
+    if issubclass(type(error), dict):
+        for key, text in _exception_reads(cast("dict[str, object]", error)):
             pairs.append((key, walker.value(text, 1, [])))
     return pairs
 
@@ -647,13 +655,14 @@ def _library_attributes(
 def _exception_reads(error: dict[str, object]) -> list[tuple[str, str]]:
     """Reads the three ``exception.*`` strings an ``error`` dict carries, under their own guard.
 
-    An ``error`` that only claims ``dict`` through ``__class__`` passes ``isinstance`` and fails
-    the unbound ``dict.get`` (rule 2); guarded here, that costs the three exception attributes and
-    nothing else, where a raise reaching :func:`log_record`'s outer guard would cost the whole
-    record (rule 1: a key read at the wrong type is omitted, not fatal).
+    The read is the unbound ``dict.get`` (rule 2), so a ``dict`` subclass's own ``get`` never runs;
+    anything the read still raises, such as a stored key's ``__eq__`` on a hash collision, is
+    guarded here and costs the three exception attributes and nothing else, where a raise
+    reaching :func:`log_record`'s outer guard would cost the whole record (rule 1: a key read at
+    the wrong type is omitted, not fatal).
 
     Args:
-      error: The event's ``error`` value, known to pass ``isinstance(error, dict)``.
+      error: The event's ``error`` value, known to be a ``dict`` by its real type.
 
     Returns:
       ``(attribute key, text)`` pairs in table order, empty when the dict cannot be read.
@@ -701,10 +710,10 @@ def _user_attributes(
         timestamp, body and library attributes (rules 1 and 2).
     """
     pairs: list[tuple[str, dict[str, object]]] = []
-    if not isinstance(fields, dict):
+    if not issubclass(type(fields), dict):
         return pairs
     try:
-        items = list(_DICT_ITEMS(fields))
+        items = list(_DICT_ITEMS(cast("dict[object, object]", fields)))
     except Exception:
         return pairs
     seen: set[str] = set()
@@ -739,10 +748,11 @@ def resource_key(event: Mapping[str, object]) -> ResourceKey:
     Raises:
       None.
     """
-    if not isinstance(event, dict):
+    if not issubclass(type(event), dict):
         return (None, None, None)
     try:
-        stamps = [_text(_read(event, name)) for name in ("service", "version", "env")]
+        record = cast("dict[str, object]", event)
+        stamps = [_text(_read(record, name)) for name in ("service", "version", "env")]
     except Exception:
         return (None, None, None)
     service, version, env = (None if read is None else read[0] for read in stamps)

@@ -332,7 +332,7 @@ class _RedisSink:
             "AuthorizationError",
             "ExternalAuthProviderError",
         )
-        if isinstance(err, credential):
+        if _diag.is_a(err, credential):
             return False
         retried = (
             *TRANSIENT_BUILTINS,
@@ -344,7 +344,7 @@ class _RedisSink:
                 "ClusterDownError",
             ),
         )
-        return isinstance(err, retried)
+        return _diag.is_a(err, retried)
 
     def close(self) -> None:
         """Closes the connection only if the sink owns it (FR-005).
