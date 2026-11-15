@@ -561,11 +561,20 @@ specs:
     spec_status: "Draft"
     depends_on: ["SPEC-028", "SPEC-031", "SPEC-032", "SPEC-069", "SPEC-070", "SPEC-072", "SPEC-074", "SPEC-076", "SPEC-082"]
     path: "docs/specs/SPEC-084-stream-sinks-on-the-delivery-engine.md"
+  - id: "SPEC-085"
+    title: "Adversarial Sink Cells: Sinks That Wait, Call Back and Fork, One Deterministic Cell at a Time"
+    description: "Adds a table of 637 deterministic test cells in which a sink waits on its stop signal, calls back into the library, is built by a factory or forks, each judged by tight time, close and ledger oracles in a watched child, with every cell that is red on v1.2.0 either pinned to an open item or withheld with the pin it repeats, so a lifecycle defect of these shapes fails a test and not the review of the next change."
+    spec_status: "Draft"
+    depends_on: ["SPEC-077", "SPEC-079"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-085-adversarial-sink-cells.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
+  - name: "audit-2026-11-14"
+    order: ["SPEC-085"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
