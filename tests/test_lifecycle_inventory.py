@@ -1082,6 +1082,11 @@ INVENTORY: dict[Key, Row] = {
         ("walk", _REBUILD),
         "a reference to Runtime._stop taken at the build, refreshed when the child resumes",
     ),
+    _rt("_ledger_announced"): Row(
+        "Runtime",
+        ("reset: _lifecycle._restart_ledger_after_fork",),
+        "the unaccounted count the shutdown check last announced (SPEC-088 FR-003)",
+    ),
     _wk("_epoch"): Row("Worker", _INH, "the retirement count at this worker's build"),
     _wk("_drain_finished"): Row("Worker", ("walk", _REBUILD), "the drain loop's own event"),
     _wk("_drain_settled"): Row("Worker", ("walk", _REBUILD), "the drain loop's own event"),

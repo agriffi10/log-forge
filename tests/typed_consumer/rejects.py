@@ -13,6 +13,7 @@ tokens only: a first version matched them by regex and picked up this very parag
 from log_foundry import (
     Config,
     ContinueResult,
+    EventLedger,
     FlushResult,
     Health,
     Outcome,
@@ -36,6 +37,7 @@ _c = FlushResult(True)                     # want: Too many positional arguments
 _d = ContinueResult(True)                  # want: Too many positional arguments for "ContinueResult"
 _e = Config("svc")                         # want: Too many positional arguments for "Config"
 _v = Verdict((Outcome.ACCEPTED,))          # want: Too many positional arguments for "Verdict"
+_ev = EventLedger(2)                       # want: Too many positional arguments for "EventLedger"
 
 # ...and a misspelled keyword is the OTHER `call-arg`, which is why the codes are not enough.
 _f = Health(faled_batches=0)               # want: Unexpected keyword argument "faled_batches" for "Health"

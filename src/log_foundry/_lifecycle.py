@@ -1169,6 +1169,13 @@ class Runtime:
         thread was inside no offer, so a grandchild forked from another thread shares nothing.
         ``[]`` in a process never forked, where it is no thread's record.
         """
+        self._ledger_announced = 0
+        """The ``unaccounted`` count the shutdown check last announced (SPEC-088 FR-003).
+
+        A warm container may call ``shutdown()`` on every invocation, so the check writes again
+        only when the number differs from this one. Zero in a process that has announced nothing,
+        and reset by :func:`_restart_ledger_after_fork`, whose child's ledger restarts.
+        """
         self._fork_inherited = 0
         """How many of :attr:`_fork_offers`' entries the child inherited and is still inside.
 
@@ -5698,9 +5705,84 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
             again = stopping_worker is not None
         _announce_unsettled(op)
         _state._closes.wait_graced(op, None)
+        _check_ledger()
     finally:
         _state._stops_running.discard(op)
         _pay_marks_after_stop()
+
+
+def _check_ledger() -> None:
+    """Reports, once per distinct count, events the ledger cannot place (SPEC-088 FR-003).
+
+    It runs at the end of every ``shutdown()``, after the drain has been joined or the wait has
+    expired and the closes have run, and it reports rather than raises: invariant 1 forbids an
+    imbalance reaching the application, and a fault in the check itself is absorbed and announced
+    by type. The number is ``unaccounted`` (:func:`log_foundry.worker._read_ledger`), the same
+    number every ``health()`` call computes, and the line names counts only. It is written when
+    the number is above zero and differs from the last one announced, since a warm container may
+    shut down on every invocation and the same imbalance announced each time is noise.
+
+    It asserts nothing about ``open_spans``: a ``shutdown()`` from inside a traced function, or a
+    daemon thread inside one at interpreter exit, leaves events legitimately buffered.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    try:
+        unaccounted = _ledger_reading().ledger.unaccounted
+        if unaccounted <= 0 or unaccounted == _state._ledger_announced:
+            return
+        _state._ledger_announced = unaccounted
+        _diag.lost(
+            "event",
+            unaccounted,
+            "the event ledger does not balance at shutdown(): these are in no term; "
+            "health().events.unaccounted counts them",
+        )
+    except Exception as exc:
+        _diag.absorbed("checking the event ledger", exc)
+
+
+def _restart_ledger_after_fork() -> None:
+    """Starts a forked child's ledger as what the child holds (SPEC-088 FR-005).
+
+    The child holds the events still buffered on the spans it inherited, and nothing else of the
+    parent's: its worker starts a fresh queue and fresh counters, and a parent's loss is not the
+    child's. So the ledger restarts with ``accepted`` and ``open_spans`` both at the parent's
+    ``open_spans`` and every other term at zero, the two loss counters included, which until now
+    a child reported as its own (``p15_fork_child_counters.py``). Spans that were open on other
+    threads of the parent are in that count and nothing in the child will close them; that
+    over-read is recorded in ``architecture.md`` §13.
+
+    It runs on the child's only thread, before the worker is rebuilt, so no new drain thread can
+    register a cell in the parent's registry first. It reads the inherited cells without the
+    registration lock, which a parent thread may have held at the fork, as one immutable pair; the
+    loss counters are zeroed under ``_loss_lock``, which the roster has already replaced in the
+    child, so the write-site rule needs no shape of its own for it.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry import _ledger, decorator
+
+    held = _ledger.open_spans_unlocked() - decorator._in_span_lost
+    _ledger.restart(max(0, held))
+    with decorator._loss_lock:
+        decorator._orphan_lost = 0
+        decorator._in_span_lost = 0
+    _state._ledger_announced = 0
 
 
 def _take_declines(op: _Operation, worker: Worker | None) -> bool:
@@ -6308,7 +6390,9 @@ def _worker_health() -> Health:
     **One construction site, and every field has one authority.** The worker contributes its own
     counters and nothing else; ``retired`` is the owner's count; ``sink`` is ``read_losses`` over
     the **configured** sink; ``closing_sinks`` is the closer registry; ``inherited_sink`` is the
-    config; and the two loss counters are ``decorator``'s. Two branches assembling eight fields
+    config; and the two loss counters are ``decorator``'s, read once, by the event ledger's
+    reading, which fills ``events`` too (SPEC-088 FR-004), so the two fields and the ledger's two
+    terms cannot disagree. Two branches assembling eight fields
     apiece is what let ``sink`` be filled on one path only — measured against a ``MultiSink``
     with one raising child, ``health().sink`` read ``SinkLosses(dropped=0, failed=3)`` inside a
     span and ``None`` outside one while the sink's own ``losses()`` read ``failed=1``, which
@@ -6355,13 +6439,12 @@ def _worker_health() -> Health:
       None.
     """
     from log_foundry.config import _live_config
-    from log_foundry.decorator import _read_losses
     from log_foundry.sinks.base import read_losses
     from log_foundry.worker import Health
 
     worker = _state.worker_exists()
     counters = None if worker is None else worker.health()
-    orphan_lost, in_span_lost = _read_losses()
+    events = _ledger_reading().ledger
     retired = _state.retirements > 0
     configured = _live_config().sink
     return Health(
@@ -6375,8 +6458,9 @@ def _worker_health() -> Health:
         incomplete_swaps=0 if counters is None else counters.incomplete_swaps,
         closing_sinks=_state._closes.graced_alive(),
         inherited_sink=_delivering_to_an_inherited_sink(),
-        orphan_lost=orphan_lost,
-        in_span_lost=in_span_lost,
+        orphan_lost=events.orphan_lost,
+        in_span_lost=events.in_span_lost,
+        events=events,
     )
 
 
@@ -6430,4 +6514,5 @@ _fork.register_walk(_walk_after_fork)
 _fork.register_child_handler(_reclaim_after_fork)
 _fork.register_child_handler(_clear_after_fork)
 _fork.register_child_handler(_adopt_factory_after_fork)
+_fork.register_child_handler(_restart_ledger_after_fork)
 _fork.register_child_handler(_rebuild_worker_after_fork)

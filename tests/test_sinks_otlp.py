@@ -801,9 +801,10 @@ def test_nothing_from_otel_is_public_and_the_surface_grew_by_one_path_only() -> 
         )
         assert not otel_names & set(exported), module.name
     verdict_names = {"Outcome", "SinkCounters", "Verdict", "emit_via_deliver", "read_deliver"}
-    assert len(log_foundry.__all__) == 35, (
-        "the top-level surface is the 30 names of 1.0.2 plus SPEC-072's four verdict names and "
-        "1.2.0's emit_via_deliver"
+    # ~~35~~ — 36 since SPEC-088 FR-004 added EventLedger; OTLP still adds no top-level name.
+    assert len(log_foundry.__all__) == 36, (
+        "the top-level surface is the 30 names of 1.0.2 plus SPEC-072's four verdict names, "
+        "1.2.0's emit_via_deliver and SPEC-088's EventLedger"
     )
     assert verdict_names <= set(log_foundry.__all__)
     assert not hasattr(log_foundry.sinks, "__all__")

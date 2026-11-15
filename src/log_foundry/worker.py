@@ -17,7 +17,7 @@ from log_foundry.sinks._retry import floor_count
 if TYPE_CHECKING:
     from log_foundry.sinks.base import Sink, SinkLosses
 
-__all__ = ["Health", "Worker"]
+__all__ = ["EventLedger", "Health", "Worker"]
 
 _SHUTDOWN = object()
 
@@ -374,6 +374,16 @@ class Health:
         because they aggregate different failure populations and so fail SPEC-026's test,
         *would one number hide which fix applies*. Their sum is deliberately not reported: with
         different populations it is a number nobody can act on.
+      events: The event ledger (SPEC-088 FR-004): every accepted event in the one term it is in
+        now, counted in **events**, with ``unaccounted`` the events the terms cannot place. Its
+        terms are ``accepted``, the gauges ``open_spans``, ``queued`` and ``in_flight``, the exits
+        ``delivered`` and ``skipped``, the losses ``in_span_lost``, ``orphan_lost``,
+        ``overflow_lost``, ``batch_lost``, ``sink_lost``, ``drain_lost`` and ``stranded``, and the
+        properties ``pending`` and ``lost``. ``events.queued`` counts events where ``queued``
+        above counts submissions and markers, and ``events.overflow_lost`` counts the events of
+        the submissions ``dropped`` counts; ``events.in_span_lost`` and ``events.orphan_lost`` are
+        the two fields above, read once for both. Defaults to an all-zero ledger, so a ``Health``
+        built by hand needs no argument for it and a reader never tests it for ``None``.
     """
 
     queued: int
@@ -388,6 +398,7 @@ class Health:
     inherited_sink: bool = False
     orphan_lost: int = 0
     in_span_lost: int = 0
+    events: EventLedger = EventLedger()
 
 
 @dataclass(frozen=True, kw_only=True)

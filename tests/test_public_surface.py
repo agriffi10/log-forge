@@ -1262,6 +1262,7 @@ _PUBLIC_DATACLASSES = (
     ("ContinueResult", log_foundry.ContinueResult, (True,)),
     ("Config", log_foundry.Config, ("svc",)),
     ("Verdict", log_foundry.Verdict, ((log_foundry.Outcome.ACCEPTED,),)),
+    ("EventLedger", log_foundry.EventLedger, (0,)),
 )
 
 
@@ -2505,12 +2506,21 @@ _VERDICT_NAMES = ("Outcome", "SinkCounters", "Verdict", "emit_via_deliver", "rea
 already told third-party authors to make it their ``emit`` while it lived in private ``_engine``."""
 
 
+_LEDGER_NAMES = ("EventLedger",)
+"""SPEC-088 FR-004's one new public type, the ledger ``health().events`` returns."""
+
+
 def test_all_is_the_thirty_plus_the_five_verdict_names() -> None:
-    """FR-001 AC8: the 30 names plus exactly the five, none leaving, each once."""
+    """FR-001 AC8: the 30 names plus exactly the five, none leaving, each once.
+
+    ~~plus exactly the five~~ — and, since SPEC-088 FR-004, the one ledger name besides them.
+    """
     assert len(set(_THIRTY)) == 30
     assert len(log_foundry.__all__) == len(set(log_foundry.__all__))
-    assert set(log_foundry.__all__) == {*_THIRTY, *_VERDICT_NAMES}
-    assert set(log_foundry.__all__) - {*_THIRTY, "Outcome", "SinkCounters", "Verdict"} == {
+    assert set(log_foundry.__all__) == {*_THIRTY, *_VERDICT_NAMES, *_LEDGER_NAMES}
+    assert set(log_foundry.__all__) - {
+        *_THIRTY, *_LEDGER_NAMES, "Outcome", "SinkCounters", "Verdict"
+    } == {
         "emit_via_deliver",
         "read_deliver",
     }
@@ -2639,4 +2649,5 @@ def test_every_engine_sink_exposes_its_documented_attributes(monkeypatch, tmp_pa
             sink.close()
     import log_foundry
 
-    assert len(log_foundry.__all__) == 35, "the engine sinks add attributes, never an export"
+    # ~~35~~ — 36 since SPEC-088 FR-004 exported EventLedger, which is no engine sink's.
+    assert len(log_foundry.__all__) == 36, "the engine sinks add attributes, never an export"

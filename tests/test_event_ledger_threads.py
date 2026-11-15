@@ -253,20 +253,58 @@ def test_a_traced_call_returns_while_each_ledger_lock_is_held(lock: str) -> None
     assert returned is (lock != "sweep"), lock
 
 
+class _Counts:
+    """A sink that only counts, so 1,200,000 events cost no memory and no copying."""
+
+    def __init__(self) -> None:
+        self.events = 0
+
+    def emit(self, batch: list) -> None:
+        self.events += len(batch)
+
+    def close(self) -> None:
+        pass
+
+
 def test_eight_threads_under_a_tight_switch_interval_count_exactly() -> None:
-    """FR-005 AC-2: 1,200,000 events, every one in one term."""
-    lf.configure(sink=GatedSink())
+    """FR-005 AC-2: 1,200,000 events, every one in one term.
 
-    def work(index: int, iteration: int) -> None:
-        for _ in range(50_000):
-            _logs_once()
+    Not through ``run_concurrently``: its 30 s join per thread is too short for this load on a
+    loaded machine, and a thread it gives up on keeps logging into the next test. The threads
+    start together on a barrier under the same 1e-6 switch interval, and each is joined until it
+    has finished.
+    """
+    import sys
 
-    errors = run_concurrently(work, 8)
+    sink = _Counts()
+    lf.configure(sink=sink)
+    barrier = threading.Barrier(8)
+    errors: list[BaseException] = []
+
+    def work() -> None:
+        barrier.wait()
+        try:
+            for _ in range(50_000):
+                _logs_once()
+        except BaseException as exc:
+            errors.append(exc)
+
+    pool = [threading.Thread(target=work) for _ in range(8)]
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        for thread in pool:
+            thread.start()
+        for thread in pool:
+            thread.join()
+    finally:
+        sys.setswitchinterval(interval)
     assert not errors, errors
     assert lf.flush(60)
     e = ledger()
     assert e.accepted == 1_200_000, e
     assert e.pending == 0 and e.unaccounted == 0, e
+    assert e.delivered == sink.events, e
 
 
 def test_cells_of_ended_raw_threads_are_retired() -> None:

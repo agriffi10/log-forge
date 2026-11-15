@@ -121,6 +121,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_clear_after_fork", "_state._closes._lock"): 1,
             ("_clear_after_fork", "_state._lock"): 1,
             ("_adopt_factory_after_fork", "_state._lock"): 1,
+            ("_restart_ledger_after_fork", "decorator._loss_lock"): 1,
             ("_record_seeds", "_state._owned_lock"): 1,
             ("_walk_after_fork", "_state._owned_lock"): 1,
             ("reclaim", "_state._owned_lock"): 1,
@@ -173,6 +174,11 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
         }
     ),
 }
+"""The ``with <lock>:`` sites as SPEC-078 recorded them, plus one SPEC-088 added on purpose.
+
+``_restart_ledger_after_fork`` zeroes the two loss counters under ``decorator._loss_lock``, the
+lock they are written under everywhere else, in a forked child's handler, after the fork roster
+has replaced that lock; it takes nothing else, so the lock order does not move."""
 
 
 def _tree(name: str) -> ast.Module:

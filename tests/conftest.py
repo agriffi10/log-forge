@@ -457,6 +457,19 @@ def _reset_config():
     context.reset_context()
 
 
+@pytest.fixture(autouse=True)
+def _ledger_balance(_reset_config):
+    """Starts each test on an empty event ledger (SPEC-088 FR-006); the helper is `ledger_check`.
+
+    It requests `_reset_config` by name because same-scope autouse fixtures run in name order,
+    not definition order: requested, the reset runs first at setup and last at teardown.
+    """
+    import ledger_check
+
+    ledger_check.begin()
+    yield
+
+
 def _reset_worker() -> None:
     """Drain and clear the lazily-created process worker (SPEC-004), if present.
 

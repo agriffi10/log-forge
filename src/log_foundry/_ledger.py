@@ -115,7 +115,7 @@ class _Registry:
 
 
 _registry = _Registry()
-"""The process's registry. Rebound, never mutated in place, by :func:`restart`."""
+"""The process's registry. Its pair is replaced whole, never mutated in place."""
 
 _here = threading.local()
 """This thread's cell and its sentinel. Rebound by :func:`restart`, so every thread re-registers."""
@@ -370,14 +370,17 @@ def open_spans_unlocked() -> int:
 
 
 def restart(span_base: int = 0) -> None:
-    """Starts a new registry and a new thread-local, so every thread re-registers on its next credit.
+    """Empties the registry and rebinds the thread-local, so every thread re-registers.
 
     Used by a forked child, whose ledger starts as what it holds, and by the test suite's balance
-    fixture at each test's setup. It writes no other thread's cell: the old cells are dropped
-    with the old registry, and a thread that wrote into one after this read nothing back from it.
+    fixture at each test's setup. It writes no other thread's cell: the old cells are dropped from
+    the registry, and a thread that writes into one afterwards writes into a cell nothing reads.
+    The registry object and its lock are kept, under the lock, so a forked child relies on the
+    fork roster to have replaced a lock a parent thread held, as every other package lock does,
+    rather than on this replacing it in passing.
 
     Args:
-      span_base: The span credits the new registry starts holding.
+      span_base: The span credits the emptied registry starts holding.
 
     Returns:
       None.
@@ -385,6 +388,10 @@ def restart(span_base: int = 0) -> None:
     Raises:
       None.
     """
-    global _registry, _here
-    _registry = _Registry(span_base)
-    _here = threading.local()
+    global _here
+    base = _Cell()
+    base.span = span_base
+    registry = _registry
+    with registry.lock:
+        registry.pair = (base, ())
+        _here = threading.local()

@@ -380,12 +380,13 @@ def test_the_public_surface_and_signatures_are_unchanged() -> None:
     ]
     # SPEC-072 FR-001 grew the surface by exactly four names (Outcome, SinkCounters, Verdict and
     # read_deliver), and 1.2.0 by emit_via_deliver; this pin re-states the 30 it held plus those
-    # five, in sorted position.
+    # five, in sorted position, and SPEC-088 FR-004's EventLedger, the one name it adds.
     assert log_foundry.__all__ == [
         "DEFAULT_SHUTDOWN_TIMEOUT",
         "DEFAULT_SWAP_TIMEOUT",
         "Config",
         "ContinueResult",
+        "EventLedger",
         "FlushResult",
         "Health",
         "Outcome",

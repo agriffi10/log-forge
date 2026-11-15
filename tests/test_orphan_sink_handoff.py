@@ -815,6 +815,7 @@ def test_health_gains_no_field() -> None:
         "inherited_sink",
         "orphan_lost",
         "in_span_lost",
+        "events",
     ]
 
 

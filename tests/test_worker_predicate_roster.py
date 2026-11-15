@@ -358,6 +358,24 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "leaves SPEC-030's retired-plus-submitted pair with a term that can never fire."
         ),
     ),
+    ("_worker_health", "_ledger_reading().ledger", 0): (
+        EXISTENCE,
+        (
+            "the event ledger read for health().events (SPEC-088 FR-004), whose worker terms come "
+            "from the process worker whether or not it has retired: a retired worker's queue is "
+            "what the ledger reports as stranded, so the existence question is the one asked, as "
+            "it is for the counters beside it."
+        ),
+    ),
+    ("_check_ledger", "_ledger_reading().ledger.unaccounted", 0): (
+        EXISTENCE,
+        (
+            "the shutdown check's reading (SPEC-088 FR-003), which runs once the call has retired "
+            "the worker it stopped, so it must read that worker's terms by existence: asked by "
+            "liveness, a drain that ended holding events would read as no worker at all and the "
+            "events it held would never be reported."
+        ),
+    ),
     ("_worker_health", "None if worker is None else worker.health()", 0): (
         LIVENESS,
         (
