@@ -67,6 +67,22 @@ at either swap, which is a different defect from finding 4. It is the evidence f
 in `docs/architecture.md` §12 that begins *A sink the library has released loses every later
 event when it is handed back*, which records its output.
 
+**Three probes were added while SPEC-088 was authored, and are not the audit's.** They were
+written on 2026-11-15 against `ae0b7674`, and each says so in its first line.
+`core-pipeline/p14_end_races_sweep.py` forces a `flush()` on a thread sharing a span to land while
+the close builds `span.end`. `core-pipeline/p15_fork_child_counters.py` prints what a forked
+child's `health()` starts as. `core-pipeline/p16_interrupt_through_a_guard.py` raises a
+`KeyboardInterrupt` through each guard. They are the evidence for the four open items in
+`docs/architecture.md` §12 that begin *A `span.end` built while another thread sweeps the span*,
+*A forked child's `health()` reports*, *The events of a call a `BaseException` cuts short* and
+*A `BaseException` raised while a span opens or closes*.
+
+**One probe was added while SPEC-088 was revised after its second review, and is not the
+audit's.** `core-pipeline/p17_log_after_an_interrupted_close.py`, written on 2026-11-15 against
+`ae0b7674`, prints which trace and span ids a log made after an interrupted close ships on, from
+the caller's `except` handler and from a task created inside the span, against a task that
+outlives a span that closed normally. SPEC-088 FR-002 cites it.
+
 **Not brought in:** the probes' own output files, the `*.stripped.txt` module views, the pytest
 collection listing and the commit bodies. So `verification/cats.py` does not run as it stands: it
 reads a `perfile.txt` of collected tests per file that was derived from that listing.

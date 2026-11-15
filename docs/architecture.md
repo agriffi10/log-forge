@@ -1349,10 +1349,11 @@ an item leaves this list when a spec closes it, not because the arc names it.
   says the same ("the sink took them"), and so do `README.md:1374` and `:1414-1417` ("evidence of
   delivery"), while `README.md:767-769` says what the code does. The Lambda handler idiom at
   `README.md:1501-1502` omits the `h.sink` term the general idiom carries at `:1258`, so a handler
-  written from it sees none of these losses. *Two closures, neither the default; the choice is
-  Andrew's.* On 2026-11-14 he accepted the recommendation that `flush()` be judged on the ledger's
-  loss total; by the orchestrating session's account he was not told that the settled record is
-  divided, so it is not yet a decision, and it was unanswered when this was written. Under (a),
+  written from it sees none of these losses. *Two closures were weighed, neither the
+  default, and the choice was Andrew's.* On 2026-11-14 he accepted the recommendation that `flush()`
+  be judged on the ledger's loss total; by the orchestrating session's account he was not told that
+  the settled record is divided, ~~so it is not yet a decision, and it was unanswered when this was
+  written~~ (answered on 2026-11-15, below). Under (a),
   `flush()`'s truthiness reflects any loss in its window. That fulfils the `flush()` decision, the
   docstring and the README's wording, and it reverses §13's constraint, the shipped consequence of
   the 2026-11-04 decision and invariant 7's recorded exceptions. It costs a behaviour change inside
@@ -1362,12 +1363,24 @@ an item leaves this list when a spec closes it, not because the arc names it.
   §13's constraint, the 2026-11-04 decision and the release notes, and it reverses the `flush()`
   decision's "`True` means the sink took them", `results.py:61` and the README's "evidence of
   delivery". It costs a truthy `flush()` that goes on covering lost events, and every caller having
-  to read the new fields to see a loss, the README's handler idioms first. **Closed by** his choice,
-  and then by the side it reverses being rewritten in place, dated, with the release notes carrying
-  whatever a caller can see. A staleness risk, not a change: SPEC-084, not yet built, holds a
-  settled run that lost events to `failed_batches == 0`
-  (`docs/specs/SPEC-084-stream-sinks-on-the-delivery-engine.md:293`), so its criteria are re-read
-  against the answer before it is built.
+  to read the new fields to see a loss, the README's handler idioms first. **Answered 2026-11-15.**
+  Asked "Should flush() stay truthy over a counted loss and gain loss counts, or turn falsy?",
+  Andrew answered "Keep truthy, add counts", which is closure (b). So `flush()`'s truthiness does
+  not change, and `FlushResult` gains event counts of what was lost; that they are counts of what
+  was lost in the call's window is closure (b)'s wording, the record's reading of "add counts",
+  not his. The item stays
+  open because none of that is built: SPEC-088 specifies the event ledger those counts are read
+  from and leaves `FlushResult` alone. ~~**Closed by** his choice, and then by the side it reverses
+  being rewritten in place, dated, with the release notes carrying whatever a caller can see.~~
+  **Closed by** the spec of arc `audit-2026-11-14` that adds those counts to `FlushResult` and
+  rewrites, in place and dated, the statements closure (b) reverses: "`True` means the sink took
+  them" and "no added path can produce `ok=True` over lost events" in the `flush()` decision
+  (`docs/decisions/pipeline/`), `results.py:61`, and the README's "evidence of delivery"
+  (`README.md:1374`, `:1414-1417`), with the Lambda handler idiom at `README.md:1501-1502` reading
+  the loss and the release notes carrying what a caller can see. A staleness risk, not a change:
+  SPEC-084, not yet built, holds a settled run that lost events to `failed_batches == 0`
+  (`docs/specs/SPEC-084-stream-sinks-on-the-delivery-engine.md:293`), which is what closure (b)
+  keeps, so the answer leaves that criterion as written.
 - **`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**
   (2026-11-14 audit, finding 18; invariant 2, whose recorded exception at `docs/invariants.md:62`
   stands). `dropped` counts submissions, `failed_batches` counts batches, the sink, orphan and
@@ -1381,8 +1394,12 @@ an item leaves this list when a spec closes it, not because the arc names it.
   with the balance asserted at `shutdown()` and by a test fixture. The ledger appends event-unit
   terms to `Health` (invariant 10). The existing counters keep their units and the recorded
   exception stands; nothing is reopened. Nor is this the in-library metrics that `CLAUDE.md` rules
-  out, which are measurements of the application, to be derived downstream from its logs: the terms
-  extend the library's account of its own delivery, which `Health` already carries.
+  out, ~~which are measurements of the application, to be derived downstream from its logs~~
+  (corrected 2026-11-15 while SPEC-088 was authored: the non-goal's words are "derive them
+  downstream" and name no subject, so the argument rests on that test). A count of events that
+  never reached the sink cannot be derived downstream of the sink, the terms are returned by
+  `health()` and shipped nowhere, and they extend the library's account of its own delivery, which
+  `Health` already carries.
 - **A submission that overflows the queue after `shutdown()` is counted in two loss terms**
   (2026-11-14 audit, finding 16; invariant 2). `Worker.submit` counts `submitted_after_shutdown`
   before the put (`worker.py:669-671`) and `dropped` again when the put raises `queue.Full`
@@ -1414,6 +1431,54 @@ an item leaves this list when a spec closes it, not because the arc names it.
   2; and a traced recursion into `RecursionError`, with nothing injected, left 6 of 398 events
   unaccounted, a split the core frame did not determine. **Closed by** a count at the open guard for
   the two events that call will never build, and one more at the close guard.
+- **A `span.end` built while another thread sweeps the span lands on a buffer already handed over,
+  and is lost uncounted once the drain has taken it** (found while authoring SPEC-088, 2026-11-15;
+  invariant 2). `decorator._close_span` runs `span.events.append(end_event(span, status, exc))`
+  (`decorator.py:721`), which reads `span.events` before it calls `end_event`, so a `flush()` on a
+  thread or task sharing the span can detach the buffer during that call (`:459-462`) and the
+  append then lands on a list already submitted. This is not the append window §13 records, which
+  is `api._log`'s and stays open: that one builds first and appends after, so its event lands on the
+  new buffer. `docs/audits/2026-11-14-probes/core-pipeline/p14_end_races_sweep.py`, at `ae0b7674`,
+  forcing the interleaving from inside `end_event`: with a sweep only, the sink still received
+  `span.end`, because the list was still queued; with a `flush()`, it received `span.start` and the
+  in-span log and never `span.end`, with `flush()` truthy, every counter zero and nothing on stderr.
+  Unforced, at a switch interval of 1e-6, the ledger prototype saw the late append in 18 of 30
+  trials of `tests/test_span_sweep.py`'s sweep-against-close race, which asserts only that nothing
+  is delivered twice. **Closed by** SPEC-088 FR-002: the close builds the event before it reads the
+  buffer.
+- **A forked child's `health()` reports the parent's `orphan_lost` and `in_span_lost` as its own**
+  (found while authoring SPEC-088, 2026-11-15; invariants 2 and 12). `Worker._reinit_after_fork`
+  zeroes the worker's counters in the child (`worker.py:584-592`), and nothing resets the two
+  counters `decorator.py` holds (`:51-52`).
+  `docs/audits/2026-11-14-probes/core-pipeline/p15_fork_child_counters.py`, at `ae0b7674`: a parent
+  that had lost one orphan log forked a child that read `orphan_lost=1` at the fork and after its
+  own work, having lost nothing. **Closed by** SPEC-088 FR-005: the child's ledger starts as what
+  its open spans hold, with every loss term zero.
+- **The events of a call a `BaseException` cuts short are in no counter** (found while authoring
+  SPEC-088, 2026-11-15; invariant 2, whose promise is made for a call that returned). The guards
+  catch `Exception` and let a `KeyboardInterrupt` through, by invariant 1, and count nothing on the
+  way. `docs/audits/2026-11-14-probes/core-pipeline/p16_interrupt_through_a_guard.py`, at
+  `ae0b7674`: an interrupt raised by the sink during an orphan log, and one raised while a span
+  opened, each reached the caller with the event gone and `orphan_lost` and `in_span_lost` at 0.
+  An in-span log whose build is interrupted is the same case at the fourth guard (`api.py:138`),
+  found by SPEC-088's spec review. **Closed by** SPEC-088 FR-002: each guard counts what its call
+  can no longer deliver and re-raises the exception unchanged.
+- **A `BaseException` raised while a span closes leaves that span current in the caller's
+  context** (found while authoring SPEC-088, 2026-11-15; invariant 9; no spec yet). `_end` pops
+  the span and the baggage scope after a guard that catches `Exception` only
+  (`decorator.py:683-692`), so an interrupt in `_close_span` skips both. Measured at `ae0b7674` by forcing a
+  `KeyboardInterrupt` from `end_event`, with the caller catching it and carrying on in the same
+  context: the function's span was still current, a later traced call recorded it as its parent,
+  a later level call was appended to its buffer, and a `flush()` delivered that buffer with no
+  `span.end`. ~~The open half~~ — struck the same day: as first filed, this item also said an
+  interrupt while a span *opens* leaves a baggage scope pushed, from reading `_begin`. A spec
+  review measured it false: after an interrupted open the baggage variable held the same object
+  and the span stack was empty. Unlikely to matter where an interrupt ends the process. SPEC-088
+  counts the interrupted close's buffer as lost and marks the span closed and abandoned, so a later
+  level call there goes to the orphan path on the span's own trace and span ids, but the span stays
+  current. **Closed by** popping the span and
+  the scope whatever the guard lets through, in a spec of its own; that this closes it is
+  unmeasured.
 - **The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
   that batch behind a promise of a count that never comes** (2026-11-14 audit, finding 9; invariants
   2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
@@ -1434,10 +1499,16 @@ an item leaves this list when a spec closes it, not because the arc names it.
   exactly 20 events over 23.5 s. **Bounded by a settled decision, which nothing has reopened:** the
   worker's tunables are unreachable from `configure()` by *A frozen surface is keyword-first, and
   says what it will not grow* (`docs/decisions/public-api/`; invariant 10). The arc plans capacity
-  beside the exit drain, and Andrew's decisions of 2026-11-14 name neither. **Closed by** a spec
-  that sizes the queue and the batch without a new public argument and leaves that decision
-  standing, or by Andrew rewriting the decision to admit a capacity setting; which of the two is his
-  to say.
+  beside the exit drain, and Andrew's decisions of 2026-11-14 name neither. **Answered
+  2026-11-15.** Asked "For burst capacity, should the worker send larger batches under backlog, or
+  expose settings?", Andrew answered "Larger batches, no setting". So that decision stands, the
+  worker's tunables stay unreachable from `configure()`, and the remedy for the burst loss is that
+  the worker sends larger batches when a backlog exists. The item stays open because that is not
+  built. ~~**Closed by** a spec that sizes the queue and the batch without a new public argument and
+  leaves that decision standing, or by Andrew rewriting the decision to admit a capacity setting;
+  which of the two is his to say.~~ **Closed by** a later spec of arc `audit-2026-11-14` that has
+  the worker drain a backlog in larger batches without adding a setting, measured against
+  `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`.
 - **A span's events stay on the span until it closes, so a process killed mid-handler loses the
   whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
   document states it). By the core frame's reading, only the close, or a `flush()` called on the
@@ -1636,9 +1707,13 @@ an item leaves this list when a spec closes it, not because the arc names it.
   after 10 of 25, the other 15 were counted `dropped` and never retried, although a full queue is
   the transient case. `GooglePubSubSink` has the same shape by reading (`sinks/pubsub.py:268-275`)
   and was not run. A truthy `flush()` over a counted loss stands here on the same divided record as
-  for the engine sinks. **Closed by** the choice the `flush()` item above puts to Andrew, which
-  covers this case with the engine's and names what each option reverses, and by a decision on
-  whether a full client queue is retried.
+  for the engine sinks, and on the same answer: on 2026-11-15 Andrew chose "Keep truthy, add
+  counts", closure (b) of the `flush()` item above, so `flush()` stays truthy here as well.
+  ~~**Closed by** the choice the `flush()` item above puts to Andrew, which covers this case with
+  the engine's and names what each option reverses, and by a decision on whether a full client
+  queue is retried.~~ **Closed by** the spec that adds the loss counts to `FlushResult`, once it
+  states whether a loss a sink counts after `emit` has returned, as a failed delivery report is
+  here, is among those counts, and by a decision on whether a full client queue is retried.
 - **An injected autocommit connection breaks the database sinks' all-or-nothing write** (2026-11-14
   audit, finding 15; invariants 2 and 7). `PostgresSink` commits once after every chunk of a batch
   (`sinks/postgres.py:457-468`) and `SQLiteSink` relies on `with self._conn`
@@ -1669,6 +1744,25 @@ an item leaves this list when a spec closes it, not because the arc names it.
   timeout plus a small epsilon, and a close-once-per-write oracle
   (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
   callback against every public call, with a fork and a signal handler as calls.
+- **`NATSSink` leaves the events past a round's deadline unattempted and counts them in no
+  per-event term, and the engine-matrix test that pins its counts is timed by the wall clock**
+  (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
+  wall-clock deadline, and an event it has not reached gets no per-event line and no `failed`
+  count; the batch's loss then shows only in `failed_batches` and the worker's abandon line. The
+  harness sets that deadline to 0.2 s of real time, so on a loaded runner
+  `tests/test_sinks_nats_engine_matrix.py::test_the_engine_matches_1x[every-event-unencodable-js-injected-worker]`
+  reads `failed` 7 where it pins 9. It failed so in CI run 43726021314 on a branch that changes
+  neither `sinks/nats.py` nor the harness, and passes 50 of 50 on a quiet machine on both that
+  branch and `ae0b7674`.
+  `docs/audits/2026-11-14-probes/core-pipeline/p18_nats_deadline_leaves_events_unattempted.py`
+  (the `nats` extra installed) slows the first encode by 0.25 s and prints, at `ae0b7674`,
+  `{'failed': 7, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and
+  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. **Closed by** two things:
+  the harness drives the round deadline through its `Clock` instead of real time, so the pinned
+  count cannot depend on runner load; and SPEC-088's ledger places every event of such a run in
+  exactly one term, with this probe as the case its build checks, so whether the per-event count
+  and the abandon line together count each event once is decided by the identity rather than by
+  reading.
 - **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
   breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
   of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles

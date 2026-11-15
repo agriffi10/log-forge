@@ -582,13 +582,20 @@ specs:
     depends_on: ["SPEC-032", "SPEC-042", "SPEC-045", "SPEC-054", "SPEC-078", "SPEC-079", "SPEC-081"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-087-a-swap-keeps-the-sinks-the-installed-graph-holds.md"
+  - id: "SPEC-088"
+    title: "One Event Ledger: Every Accepted Event Is in Exactly One Term"
+    description: "Counts every event in one unit from the moment it is accepted to the one term it leaves through, exposes the terms on health(), and checks the balance at shutdown() and after every test, so that an accounting defect fails a check where today an audit has to find it."
+    spec_status: "Draft"
+    depends_on: ["SPEC-017", "SPEC-019", "SPEC-030", "SPEC-036", "SPEC-039", "SPEC-050", "SPEC-054", "SPEC-062", "SPEC-068", "SPEC-072"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-088-event-ledger.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
