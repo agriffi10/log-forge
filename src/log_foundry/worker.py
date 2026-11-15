@@ -607,7 +607,7 @@ class Worker:
         try:
             thread.start()
         except Exception as exc:
-            self.stopped_reason = type(exc).__name__
+            self.stopped_reason = _diag.type_name(exc)
             self._drain_finished.set()
             self._drain_settled.set()
             _diag.absorbed("starting this child's drain thread", exc, "it will deliver nothing")
@@ -1681,7 +1681,7 @@ class Worker:
           None.
         """
         with self._lock:
-            self.stopped_reason = type(exc).__name__
+            self.stopped_reason = _diag.type_name(exc)
         try:
             queued: object = self._queue.qsize()
         except Exception:

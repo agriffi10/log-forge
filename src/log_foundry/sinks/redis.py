@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from log_foundry import _diag
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
@@ -71,8 +72,8 @@ class _RedisSink:
             would never read it (SPEC-071 FR-003).
           ImportError: If the ``redis`` extra is not installed.
         """
-        self.max_retries = floor_count(max_retries, 0, "max_retries", type(self).__name__)
-        refuse_with_injected(type(self).__name__, "client", client, {"url": url})
+        self.max_retries = floor_count(max_retries, 0, "max_retries", _diag.type_name(self))
+        refuse_with_injected(_diag.type_name(self), "client", client, {"url": url})
         self._owns_client = client is None
         if client is None:
             redis = import_extra("redis", "redis")
@@ -266,14 +267,14 @@ class _RedisSink:
                 run_context().refuse(
                     final_refusal(
                         self,
-                        f"{type(self).__name__} delivered none of {len(batch)} event(s): "
+                        f"{_diag.type_name(self)} delivered none of {len(batch)} event(s): "
                         "the sink is closed"
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
             context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
-            pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+            pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
             if not pairs:
                 return Verdict(outcomes=tuple(fates))
             positions = [position for position, _ in pairs]
@@ -286,7 +287,7 @@ class _RedisSink:
                 pipe.execute()
             except Exception as err:
                 retryable = is_retryable(self._retryable_error, err)
-                kind = type(err).__name__
+                kind = _diag.type_name(err)
                 whole = unencodable_in_run(self)
                 context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
                 lost = Lost(self)
@@ -294,7 +295,7 @@ class _RedisSink:
                     carried,
                     when=When.LAST if retryable else When.ALWAYS,
                     key=kind,
-                    line=raised_line("event", type(self).__name__, kind),
+                    line=raised_line("event", _diag.type_name(self), kind),
                     whole=whole,
                 )
                 lost.register()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from log_foundry import _diag
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import ReadOnlyCount, refuse_with_injected, store_read_only
 from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
@@ -338,14 +339,15 @@ class RabbitMQSink:
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
             fates = [Outcome.DROPPED] * len(batch)
             lost = Lost(self)
-            for position, body in encode_round(self, batch, self._encode, sink=type(self).__name__):
+            name = _diag.type_name(self)
+            for position, body in encode_round(self, batch, self._encode, sink=name):
                 mark_sent(self, [batch[position]])
                 called = self._publish(body)
                 if called.error is None:
                     fates[position] = Outcome.ACCEPTED
                     continue
                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
-                kind = type(called.error).__name__
+                kind = _diag.type_name(called.error)
                 lost.add(
                     [batch[position]],
                     when=When.LAST if called.retryable else When.ALWAYS,

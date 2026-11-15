@@ -94,7 +94,7 @@ class ElasticsearchSink(HTTPSink):
             accompanies an ``Authorization`` header in a forwarded ``headers``, in any case,
             refused by :class:`~log_foundry.sinks.http.HTTPSink` naming this class.
         """
-        _valid_base_url(url, type(self).__name__, "/_bulk", credentials=self._CREDENTIALS)
+        _valid_base_url(url, _diag.type_name(self), "/_bulk", credentials=self._CREDENTIALS)
         if not index or any(char.isspace() for char in index):
             raise ValueError(
                 f"ElasticsearchSink index must be non-empty and contain no whitespace, "
@@ -197,7 +197,7 @@ class ElasticsearchSink(HTTPSink):
         if len(entries) != sent or not errors:
             return self._unadjudicated(items, _detail(sent, len(entries), errors))
         context = run_context()
-        name = type(self).__name__
+        name = _diag.type_name(self)
         context.count(self, "item_errors", errors, when=When.ALWAYS)
         context.announce(
             lambda: _diag.lost("bulk item", errors, f"{name}, rejected by the server"),

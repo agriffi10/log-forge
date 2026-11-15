@@ -198,7 +198,7 @@ class TransformSink:
             before anything is stored.
         """
         require_sink(inner, "TransformSink inner", owner=self)
-        require_callable(fn, "fn", type(self).__name__, optional=False)
+        require_callable(fn, "fn", _diag.type_name(self), optional=False)
         self._inner = inner
         vars(self)["log_foundry_stop_signal"] = None
         self.log_foundry_counters = offered_counters(inner)
@@ -254,7 +254,7 @@ class TransformSink:
             if first is not None and not forwarded and not declined:
                 raise first
             if failures:
-                kind = type(first).__name__
+                kind = _diag.type_name(first)
                 pending.count("_dropped", failures)
                 pending.announce(
                     lambda: _diag.lost(
@@ -469,7 +469,7 @@ class TransformSink:
             return None
         if not isinstance(result, dict):
             raise TypeError(
-                f"TransformSink's function returned {type(result).__name__}, not a dict or None"
+                f"TransformSink's function returned {_diag.type_name(result)}, not a dict or None"
             )
         return _engine.outside_runs(_json_safe, result)
 
@@ -498,7 +498,7 @@ class TransformSink:
             _diag.absorbed(
                 "handing the inner sink its stop signal",
                 err,
-                f"{type(self._inner).__name__} stays uninterruptible",
+                f"{_diag.type_name(self._inner)} stays uninterruptible",
             )
 
     def flush(self) -> None:

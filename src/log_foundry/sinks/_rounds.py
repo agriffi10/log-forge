@@ -377,7 +377,7 @@ def settle_keyed(
     """
     context = run_context()
     if error is not None:
-        kind = type(error).__name__
+        kind = _diag.type_name(error)
         for position in positions:
             fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
         lost.add(
@@ -483,7 +483,7 @@ def settle_positional(
     """
     context = run_context()
     if error is not None:
-        kind = type(error).__name__
+        kind = _diag.type_name(error)
         for position in positions:
             fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
         lost.add(

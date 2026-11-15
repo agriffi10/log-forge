@@ -224,7 +224,7 @@ class SQSSink:
           ValueError: If a constant group id is blank.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
-        owner = type(self).__name__
+        owner = _diag.type_name(self)
         require_callable(message_group_id, "message_group_id", owner, text=True)
         require_callable(message_deduplication_id, "message_deduplication_id", owner)
         self.max_retries = floor_count(max_retries, 0, "max_retries", "SQSSink")
@@ -488,7 +488,7 @@ class SQSSink:
             context.count(self, "dropped_oversized", len(sizes), when=When.SETTLED)
             context.announce(lambda: self._announce_oversized(sizes), when=When.SETTLED)
         if failures:
-            kind = type(failures[0]).__name__
+            kind = _diag.type_name(failures[0])
             count = len(failures)
             context.announce(
                 lambda: _diag.lost("event", count, f"SQSSink, a FIFO id callable raised {kind}"),
@@ -622,7 +622,7 @@ class SQSSink:
         )
         round_entries: list[_Entry | None] = [None] * len(batch)
         notes["prepared_round"] = round_entries
-        bodies = dict(encode_round(self, batch, self._encode, sink=type(self).__name__))
+        bodies = dict(encode_round(self, batch, self._encode, sink=_diag.type_name(self)))
         taken: dict[int, int] = {}
         prepared: list[_Prepared] = []
         dropped: dict[int, str] = {}

@@ -232,7 +232,7 @@ class SNSSink:
         """
         context = run_context()
         fates = [Outcome.DROPPED] * len(batch)
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
         bodies = self._bodies(pairs, context.drops(self))
         lost = Lost(self)
         final: list[int] = []

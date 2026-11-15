@@ -417,7 +417,7 @@ class MongoDBSink:
             context = run_context()
             self._resolve_bson()
             fates = [Outcome.DROPPED] * len(batch)
-            pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+            pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
             documents = self._documents(pairs, context.drops(self))
             if not documents:
                 return Verdict(outcomes=tuple(fates))
@@ -435,7 +435,7 @@ class MongoDBSink:
                     for position in positions:
                         fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
                     lost = Lost(self)
-                    kind = type(err).__name__
+                    kind = _diag.type_name(err)
                     lost.add(
                         carried,
                         when=When.LAST if retryable else When.ALWAYS,

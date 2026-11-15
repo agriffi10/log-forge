@@ -242,7 +242,7 @@ class StdoutSink:
         Raises:
           None. A ``BaseException`` that is not an ``Exception`` propagates from the stream.
         """
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
         fates = [Outcome.DROPPED] * len(batch)
         if not pairs:
             return Verdict(outcomes=tuple(fates))
@@ -346,7 +346,7 @@ class StdoutSink:
                 fates[position] = rest
                 lost.append(position)
         context = run_context()
-        name = type(self).__name__
+        name = _diag.type_name(self)
         name_of = _diag._STR_STR(_diag._STORED_NAME(type(error)))
         kind = f"{name_of} {_diag.errno_of(error)}".rstrip()
         whole = unencodable_in_run(self)

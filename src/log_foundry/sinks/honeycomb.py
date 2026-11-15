@@ -125,7 +125,7 @@ def _carried_in_a_path(dataset: str, owner: str) -> None:
         refused = False
     if refused:
         failure = _send_failure(url)
-        kind = f" ({type(failure).__name__})" if failure is not None else ""
+        kind = f" ({_diag.type_name(failure)})" if failure is not None else ""
         raise ValueError(
             f"{owner} dataset cannot be carried in a request path{kind}{_shown(dataset)}"
         )
@@ -259,15 +259,15 @@ class HoneycombSink(HTTPSink):
             empty or only spaces and tabs, which sent an empty ``X-Honeycomb-Team`` on every
             request (1.2.0).
         """
-        _one_segment(dataset, type(self).__name__)
-        _carried_in_a_path(dataset, type(self).__name__)
+        _one_segment(dataset, _diag.type_name(self))
+        _carried_in_a_path(dataset, _diag.type_name(self))
         _valid_base_url(
-            url, type(self).__name__, f"/1/batch/{dataset}", credentials=self._CREDENTIALS
+            url, _diag.type_name(self), f"/1/batch/{dataset}", credentials=self._CREDENTIALS
         )
         headers = merge_headers(
             {"X-Honeycomb-Team": api_key},
             http_kwargs,
-            owner=type(self).__name__,
+            owner=_diag.type_name(self),
             argument="api_key",
         )
         super().__init__(
@@ -276,7 +276,7 @@ class HoneycombSink(HTTPSink):
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]
         )
-        _refuse_empty_credential(api_key, type(self).__name__, "api_key")
+        _refuse_empty_credential(api_key, _diag.type_name(self), "api_key")
         self.rejected_events = 0
 
     def _render(self, event: dict[str, object]) -> str:
@@ -364,7 +364,7 @@ class HoneycombSink(HTTPSink):
         rejected = sum(1 for status in statuses if not 200 <= status < 300)
         if rejected:
             context = run_context()
-            name = type(self).__name__
+            name = _diag.type_name(self)
             context.count(self, "rejected_events", rejected, when=When.ALWAYS)
             context.announce(
                 lambda: _diag.lost("event", rejected, f"{name}, rejected by the server"),

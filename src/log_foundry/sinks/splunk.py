@@ -102,11 +102,11 @@ class SplunkHECSink(HTTPSink):
         headers = merge_headers(
             {"Authorization": f"Splunk {credential}"},
             http_kwargs,
-            owner=type(self).__name__,
+            owner=_diag.type_name(self),
             argument="token",
         )
         super().__init__(url, headers=headers, **http_kwargs)  # type: ignore[misc]
-        _refuse_empty_credential(credential, type(self).__name__, "token")
+        _refuse_empty_credential(credential, _diag.type_name(self), "token")
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one event's HEC envelope (FR-008).

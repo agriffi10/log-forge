@@ -6,9 +6,9 @@ A *door* is a function raising a `TypeError` that names the type of one of its p
 
 1. A `raise TypeError(...)` whose message formats `type(x).__name__` or `x.__class__.__name__`, for
    an `x` other than `self` or `cls`, is reported — a metaclass `__name__` property answers the
-   first and the value's own `__class__` the second. Two raises are exempt, named and held
-   exactly: `sanitize._coerce_unbounded` and `TransformSink._apply` judge a transform's *result*
-   once per event, where invariants 2 and 8 govern and invariant 13 does not.
+   first and the value's own `__class__` the second. None is exempt: the two raises that judge a
+   transform's *result* once per event, `sanitize._coerce_unbounded` and `TransformSink._apply`,
+   were until they too moved onto the stored name (`tests/test_stored_name_roster.py`).
 2. An `isinstance(p, ...)` on a parameter of a door, or on the parameter of a same-module function
    a door passes `p` to (one level, as `test_numeric_door_roster.py` follows), is reported:
    `isinstance` falls back to the value's `__class__`. The one exemption is
@@ -78,9 +78,6 @@ refused; ``_require_factory`` asks ``callable`` and a signature bind. Neither ha
 then report; each still contributes its stored-name plant, and check 2 still refuses an
 ``isinstance`` of its parameter if one is ever written there.
 """
-
-RAISE_EXEMPT = frozenset({"sanitize._coerce_unbounded", "sinks.transform.TransformSink._apply"})
-"""Raises judging a transform's result per event, not an argument."""
 
 PROXY_EXEMPT = "decorator._refuse_unusable"
 PROXY_EXPRESSIONS = Counter(
@@ -278,7 +275,6 @@ def scan(sources: dict[str, str], expected: frozenset[str] = EXPECTED_DOORS) -> 
     """
     out: list[str] = []
     doors: set[str] = set()
-    matched_exempt: set[str] = set()
     for rel in sorted(sources):
         functions = _functions(rel, ast.parse(sources[rel]))
         by_name = {q.rsplit(".", 1)[1]: f for q, f in functions.items()}
@@ -302,9 +298,6 @@ def scan(sources: dict[str, str], expected: frozenset[str] = EXPECTED_DOORS) -> 
                             and ast.unparse(value.value) not in _OWNERS
                         ):
                             named.append(f"{ast.unparse(value.value)}.__class__.__name__")
-                if named and func.qual in RAISE_EXEMPT:
-                    matched_exempt.add(func.qual)
-                    continue
                 out += [
                     f"{rel}:{raise_.lineno} ({func.qual}): a TypeError names {n}" for n in named
                 ]
@@ -364,8 +357,6 @@ def scan(sources: dict[str, str], expected: frozenset[str] = EXPECTED_DOORS) -> 
                 out += [f"{rel}:{line} ({func.qual}): {expr} in a door" for line, expr in findings]
     out += [f"door set: unexpected {q}" for q in sorted(doors - expected)]
     out += [f"door set: missing {q}" for q in sorted(expected - doors)]
-    present = {q for rel in sources for q in _functions(rel, ast.parse(sources[rel]))}
-    out += [f"stale exemption {q}" for q in sorted((RAISE_EXEMPT & present) - matched_exempt)]
     return out
 
 
@@ -380,11 +371,15 @@ def test_the_real_tree_is_clean_and_holds_the_pinned_doors() -> None:
     assert scan(_tree()) == []
 
 
-def test_the_two_raise_exemptions_still_match_a_raise() -> None:
-    """A stale exemption is reported, so the exempt set cannot outlive what it excused."""
+def test_a_transform_result_raise_reverted_to_the_raw_read_is_reported() -> None:
+    """The two raises once exempt are held like any other, so a revert reddens by its read."""
     tree = _tree()
-    tree["sanitize.py"] = tree["sanitize.py"].replace("type(result).__name__", "'gone'")
-    assert "stale exemption sanitize._coerce_unbounded" in scan(tree)
+    tree["sanitize.py"] = tree["sanitize.py"].replace("_type_name(result)", "type(result).__name__")
+    tree["sinks/transform.py"] = tree["sinks/transform.py"].replace(
+        "_diag.type_name(result)", "type(result).__name__"
+    )
+    found = [f.split(": ", 1)[1] for f in scan(tree)]
+    assert found == ["a TypeError names type(result).__name__"] * 2
 
 
 # --- corpus: what it reports ----------------------------------------------------------------------

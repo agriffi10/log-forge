@@ -123,7 +123,7 @@ class OTLPSink(HTTPSink):
             Every other refusal is inherited, a forwarded ``auth`` beside an ``Authorization``
             header in a forwarded ``headers`` among them.
         """
-        owner = type(self).__name__
+        owner = _diag.type_name(self)
         if not issubclass(type(endpoint), str):
             raise TypeError(
                 f"{owner} endpoint must be a str, "
@@ -314,7 +314,7 @@ class OTLPSink(HTTPSink):
             return accepted
         rejected = min(rejected, sent)
         context = run_context()
-        name = type(self).__name__
+        name = _diag.type_name(self)
         context.count(self, "rejected_records", rejected, when=When.ALWAYS)
         context.announce(
             lambda: _diag.lost(_NOUN, rejected, f"{name}, rejected by the server"),

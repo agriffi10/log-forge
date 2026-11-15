@@ -157,7 +157,7 @@ class MultiSink:
                     if first_curable is None and not is_final_refusal(err, sink):
                         first_curable = err
                     _diag.absorbed(
-                        "emitting to a MultiSink child", err, f"{type(sink).__name__} skipped"
+                        "emitting to a MultiSink child", err, f"{_diag.type_name(sink)} skipped"
                     )
                 else:
                     delivered += 1
@@ -208,7 +208,7 @@ class MultiSink:
                 _diag.absorbed(
                     "handing a MultiSink child its stop signal",
                     err,
-                    f"{type(sink).__name__} stays uninterruptible",
+                    f"{_diag.type_name(sink)} stays uninterruptible",
                 )
 
     def flush(self) -> None:
@@ -244,7 +244,7 @@ class MultiSink:
                 if first_error is None:
                     first_error = err
                 _diag.absorbed(
-                    "flushing a MultiSink child", err, f"{type(sink).__name__} still holds events"
+                    "flushing a MultiSink child", err, f"{_diag.type_name(sink)} still holds events"
                 )
         if first_error is not None:
             raise first_error

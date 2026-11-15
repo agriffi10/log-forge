@@ -138,7 +138,7 @@ def _guarded[T](
     try:
         return True, encode(event)
     except Exception as err:
-        return False, type(err).__name__
+        return False, _diag.type_name(err)
 
 
 @dataclass(slots=True)

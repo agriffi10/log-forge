@@ -284,7 +284,7 @@ class AzureEventHubsSink:
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
             context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
-            pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+            pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
             if pairs:
                 self._send_batch(batch, pairs, fates, context.drops(self))
         return Verdict(outcomes=tuple(fates))
@@ -396,7 +396,7 @@ class AzureEventHubsSink:
             outcome = Outcome.ACCEPTED
         else:
             outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
-            kind = type(called.error).__name__
+            kind = _diag.type_name(called.error)
             lost.add(
                 carried,
                 when=When.LAST if called.retryable else When.ALWAYS,

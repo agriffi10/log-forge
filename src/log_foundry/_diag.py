@@ -64,6 +64,31 @@ was not announced at all, the line swallowed by this module's own guard while it
 _STORED_NAME = type.__dict__["__name__"].__get__
 
 
+def type_name(value: object) -> str:
+    """Returns the name ``value``'s type stores, as an exact ``str``, without running caller code.
+
+    ``type(value).__name__`` is resolved through the metaclass, so a metaclass whose ``__name__``
+    is a raising property made every line that named such a type raise instead, from paths
+    documented ``Raises: None`` (invariant 1), and one returning another string renamed the type.
+    This reads the stored name through :data:`_STORED_NAME` and copies it with :data:`_STR_STR`,
+    so a ``str`` subclass stored as the name can neither raise nor rename it through its own
+    ``__str__`` or ``__format__``. It is the spelling for a value's type; a class already in hand
+    is read as ``_STR_STR(_STORED_NAME(cls))``, the form older sites also apply to ``type(value)``,
+    to the same effect. ``tests/test_stored_name_roster.py`` refuses any read of ``__name__`` or
+    ``__qualname__`` through attribute lookup.
+
+    Args:
+      value: The value whose type is named, such as a caught exception or a sink.
+
+    Returns:
+      The stored name of ``type(value)``.
+
+    Raises:
+      None.
+    """
+    return _STR_STR(_STORED_NAME(type(value)))
+
+
 def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     """Reports a failure the library swallowed rather than propagated.
 

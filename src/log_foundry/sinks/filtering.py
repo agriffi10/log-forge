@@ -111,7 +111,7 @@ class FilteringSink:
             stored.
         """
         require_sink(inner, "FilteringSink inner", owner=self)
-        require_callable(predicate, "predicate", type(self).__name__)
+        require_callable(predicate, "predicate", _diag.type_name(self))
         self._inner = inner
         vars(self)["log_foundry_stop_signal"] = None
         self.log_foundry_counters = offered_counters(inner)
@@ -170,7 +170,7 @@ class FilteringSink:
             if first is not None and not kept and not declined:
                 raise first
             if failures:
-                kind = type(first).__name__
+                kind = _diag.type_name(first)
                 pending.count("_dropped", failures)
                 pending.announce(
                     lambda: _diag.lost(
@@ -392,7 +392,7 @@ class FilteringSink:
             _diag.absorbed(
                 "handing the inner sink its stop signal",
                 err,
-                f"{type(self._inner).__name__} stays uninterruptible",
+                f"{_diag.type_name(self._inner)} stays uninterruptible",
             )
 
     def flush(self) -> None:

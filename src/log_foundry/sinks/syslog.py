@@ -7,6 +7,7 @@ import os
 import socket
 from typing import TYPE_CHECKING
 
+from log_foundry import _diag
 from log_foundry.sinks._args import ReadOnlyCount, store_read_only
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
@@ -133,7 +134,7 @@ class SyslogSink:
             max_retries=max_retries,
             max_datagram_bytes=max_datagram_bytes,
             frame=self._frame,
-            sink_name=type(self).__name__,
+            sink_name=_diag.type_name(self),
         )
         store_read_only(self, "max_retries", self._socket.max_retries)
         self.log_foundry_counters = self._socket.log_foundry_counters

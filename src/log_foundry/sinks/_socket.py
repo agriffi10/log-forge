@@ -407,7 +407,7 @@ class SocketTransport:
                     fates[position] = Outcome.ACCEPTED
                     continue
                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
-                kind = f"{type(called.error).__name__} {_diag.errno_of(called.error)}".rstrip()
+                kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
                 lost.add(
                     [batch[position]],
                     when=When.LAST if called.retryable else When.ALWAYS,

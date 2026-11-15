@@ -303,7 +303,7 @@ class KafkaSink:
             with Deferral(self) as pending:
                 refused: list[str] = []
                 messages = encode_events(
-                    batch, self._encode, pending, sink=type(self).__name__, counter="rejected"
+                    batch, self._encode, pending, sink=_diag.type_name(self), counter="rejected"
                 )
                 if not messages:
                     return
@@ -313,7 +313,7 @@ class KafkaSink:
                             self.topic, value=body, key=key, callback=self._on_delivery
                         )
                     except Exception as err:
-                        refused.append(type(err).__name__)
+                        refused.append(_diag.type_name(err))
                         continue
                     accepted += 1
                     self.producer.poll(0)
@@ -518,7 +518,7 @@ class KafkaSink:
         if err is not None:
             with self._counter_lock:
                 self.failed += 1
-            _diag.lost("message", 1, f"KafkaSink delivery, {type(err).__name__}{_code(err)}")
+            _diag.lost("message", 1, f"KafkaSink delivery, {_diag.type_name(err)}{_code(err)}")
 
 
 def _code(err: object) -> str:
