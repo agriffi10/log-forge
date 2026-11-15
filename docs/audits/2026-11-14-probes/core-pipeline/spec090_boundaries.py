@@ -5,35 +5,62 @@ the new sink's first batch is ten spans, because a target applies only to the si
 is ten spans in both.
 Usage: python spec090_boundaries.py abandon|swap
 """
+
 import sys, threading, time
 from log_foundry.worker import Worker
 
-def ev(): return [{"i": 0}, {"i": 1}]
+
+def ev():
+    return [{"i": 0}, {"i": 1}]
+
+
 class Rec:
     def __init__(self, fail_on=()):
-        self.sizes = []; self.fail_on = set(fail_on); self.calls = 0; self.gate = threading.Event(); self.gate.set()
+        self.sizes = []
+        self.fail_on = set(fail_on)
+        self.calls = 0
+        self.gate = threading.Event()
+        self.gate.set()
+
     def emit(self, batch):
-        self.gate.wait(); self.calls += 1
-        if self.calls in self.fail_on: raise RuntimeError("down")
+        self.gate.wait()
+        self.calls += 1
+        if self.calls in self.fail_on:
+            raise RuntimeError("down")
         self.sizes.append(len(batch))
-    def close(self): pass
+
+    def close(self):
+        pass
+
 
 if sys.argv[1] == "abandon":
-    s = Rec(fail_on={2}); w = Worker(s, max_retries=0)
+    s = Rec(fail_on={2})
+    w = Worker(s, max_retries=0)
     s.gate.clear()
-    for _ in range(3000): w.submit(ev())
-    s.gate.set(); time.sleep(1.0)
+    for _ in range(3000):
+        w.submit(ev())
+    s.gate.set()
+    time.sleep(1.0)
     print("abandon: delivered batch sizes", s.sizes[:6], "failed_batches", w.failed_batches)
 else:
-    a = Rec(); w = Worker(a)
+    a = Rec()
+    w = Worker(a)
     a.gate.clear()
-    for _ in range(3000): w.submit(ev())
-    a.gate.set(); time.sleep(0.5)
-    b = Rec(); b.gate.clear()
-    for _ in range(3000): w.submit(ev())
-    t = threading.Thread(target=w.retarget, args=(b, time.monotonic() + 5)); t.start()
-    time.sleep(0.3); b.gate.set(); t.join()
-    for _ in range(3000): w.submit(ev())
+    for _ in range(3000):
+        w.submit(ev())
+    a.gate.set()
+    time.sleep(0.5)
+    b = Rec()
+    b.gate.clear()
+    for _ in range(3000):
+        w.submit(ev())
+    t = threading.Thread(target=w.retarget, args=(b, time.monotonic() + 5))
+    t.start()
+    time.sleep(0.3)
+    b.gate.set()
+    t.join()
+    for _ in range(3000):
+        w.submit(ev())
     time.sleep(0.5)
     print("swap: first sink's batches", a.sizes[:4], "second sink's batches", b.sizes[:4])
 w.stop(5.0)

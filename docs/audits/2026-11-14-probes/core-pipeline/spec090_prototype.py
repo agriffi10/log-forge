@@ -7,33 +7,50 @@ Never run it on a checkout's own src/.
 Usage: git archive 3e27a0a6 src | tar -x -C <dir>; python spec090_prototype.py <dir>/src/log_foundry/worker.py;
        then run a probe with PYTHONPATH=<dir>/src. LF_TRACE=1 prints each emit and the target it sets.
 """
+
 import sys
+
 p = sys.argv[1]
 s = open(p).read()
+
+
 def rep(a, b):
     global s
     assert s.count(a) == 1, a[:80]
     s = s.replace(a, b)
 
-rep("_JOIN_MARGIN: float = 0.1\n", "_JOIN_MARGIN: float = 0.1\nimport os as _os\n_BACKLOG_BATCH_CAP: int = int(_os.environ.get('LF_CAP', '1000'))\n")
+
+rep(
+    "_JOIN_MARGIN: float = 0.1\n",
+    "_JOIN_MARGIN: float = 0.1\nimport os as _os\n_BACKLOG_BATCH_CAP: int = int(_os.environ.get('LF_CAP', '1000'))\n",
+)
 
 # generation bump at the reassign
-rep("            self.sink = new_sink\n            self._held = [held for held in self._held if held is not new_sink] + [new_sink]\n",
-    "            self.sink = new_sink\n            self._sink_gen = getattr(self, '_sink_gen', 0) + 1\n            self._held = [held for held in self._held if held is not new_sink] + [new_sink]\n")
+rep(
+    "            self.sink = new_sink\n            self._held = [held for held in self._held if held is not new_sink] + [new_sink]\n",
+    "            self.sink = new_sink\n            self._sink_gen = getattr(self, '_sink_gen', 0) + 1\n            self._held = [held for held in self._held if held is not new_sink] + [new_sink]\n",
+)
 
 # expiry line: in-flight is everything taken and not finished; tally written first
-rep("            in_flight = self._in_flight\n", "            in_flight = getattr(self, '_taken', 0)\n            self._write_exit_tally()\n")
-rep('detail += f"; {in_flight} event(s) in flight, counted when the emit returns"',
-    'detail += f"; {in_flight} event(s) in flight"')
+rep(
+    "            in_flight = self._in_flight\n",
+    "            in_flight = getattr(self, '_taken', 0)\n            self._write_exit_tally()\n",
+)
+rep(
+    'detail += f"; {in_flight} event(s) in flight, counted when the emit returns"',
+    'detail += f"; {in_flight} event(s) in flight"',
+)
 
 # steady drain
-rep('''            if item is not None:
+rep(
+    """            if item is not None:
                 pending.append(cast("list[dict[str, object]]", item))
             now = time.monotonic()
             if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
                 self._emit_pending(pending)
                 last_flush = now
-        self._final_drain(pending)''', '''            if item is not None:
+        self._final_drain(pending)""",
+    """            if item is not None:
                 self._take(pending, cast("list[dict[str, object]]", item))
             now = time.monotonic()
             if self._complete(pending, not self._queue.empty()) or now - last_flush >= self.flush_interval:
@@ -68,12 +85,15 @@ rep('''            if item is not None:
         if ab[1]:
             _diag.lost("event", ab[0], f"{ab[1]} more exit batch(es) abandoned")
         if de[1]:
-            _diag.lost("event", de[0], f"{de[1]} exit batch(es) declined unattempted; each was predicted to end after the shutdown() deadline")''')
+            _diag.lost("event", de[0], f"{de[1]} exit batch(es) declined unattempted; each was predicted to end after the shutdown() deadline")""",
+)
 
 # _emit_pending: exit decline, measurement
-rep('''        if pending:
+rep(
+    """        if pending:
             self._emit(pending)
-            pending.clear()''', '''        if pending:
+            pending.clear()""",
+    """        if pending:
             size = sum(len(x) for x in pending)
             gen = getattr(self, "_sink_gen", 0)
             exiting = self._exit_deadline is not None
@@ -107,10 +127,12 @@ rep('''        if pending:
                 self._target = min(float(_BACKLOG_BATCH_CAP), size / took * self.flush_interval / 2)
             self._measured_gen = gen
             if _os.environ.get("LF_TRACE"):
-                print(f"emit {size} in {took:.3f}s -> target {self._target:.0f}", file=__import__('sys').__stdout__)''')
+                print(f"emit {size} in {took:.3f}s -> target {self._target:.0f}", file=__import__('sys').__stdout__)""",
+)
 
 # exit drain
-rep('''        markers: list[_FlushMarker] = []
+rep(
+    """        markers: list[_FlushMarker] = []
         while True:
             try:
                 item = self._queue.get_nowait()
@@ -129,7 +151,8 @@ rep('''        markers: list[_FlushMarker] = []
         finally:
             for marker in markers:
                 marker.event.set()
-                self._release_marker(marker)''', '''        budget = self._queue.qsize()
+                self._release_marker(marker)""",
+    """        budget = self._queue.qsize()
         try:
             while budget > 0:
                 budget -= 1
@@ -152,23 +175,31 @@ rep('''        markers: list[_FlushMarker] = []
                         self._emit_pending(pending)
             self._emit_pending(pending)
         finally:
-            self._write_exit_tally()''')
+            self._write_exit_tally()""",
+)
 
 # _emit: record longest at exit, decline flag, tally lines after the first abandon
-rep('''            if delivery is not None:
-                if delivery.failed:''', '''            if delivery is not None:
+rep(
+    """            if delivery is not None:
+                if delivery.failed:""",
+    """            if delivery is not None:
                 if self._exit_deadline is not None:
                     self._exit_longest = max(getattr(self, "_exit_longest", 0.0), time.monotonic() - started_run)
                     if delivery.declined:
                         self._exit_declining = True
-                if delivery.failed:''')
-rep('''        self._in_flight = size
+                if delivery.failed:""",
+)
+rep(
+    """        self._in_flight = size
         try:
-            delivery = _engine.run_delivery(''', '''        self._in_flight = size
+            delivery = _engine.run_delivery(""",
+    """        self._in_flight = size
         started_run = time.monotonic()
         try:
-            delivery = _engine.run_delivery(''')
-rep('''                except Exception as err:
+            delivery = _engine.run_delivery(""",
+)
+rep(
+    """                except Exception as err:
                     longest = max(longest, time.monotonic() - started)
                     if attempt >= retries or is_final_refusal(err, sink):
                         with self._lock:
@@ -178,7 +209,8 @@ rep('''                except Exception as err:
                             len(batch),
                             f"batch abandoned after {attempt + 1} emit attempts",
                         )
-                        return''', '''                except Exception as err:
+                        return""",
+    """                except Exception as err:
                     longest = max(longest, time.monotonic() - started)
                     if self._exit_deadline is not None:
                         self._exit_longest = max(getattr(self, "_exit_longest", 0.0), longest)
@@ -198,19 +230,26 @@ rep('''                except Exception as err:
                                 len(batch),
                                 f"batch abandoned after {attempt + 1} emit attempts",
                             )
-                        return''')
-rep('''                self._stop.wait(_engine.cycle_backoff(attempt))
+                        return""",
+)
+rep(
+    """                self._stop.wait(_engine.cycle_backoff(attempt))
                 if self._retry_declined(longest):
-                    with self._lock:''', '''                self._stop.wait(_engine.cycle_backoff(attempt))
+                    with self._lock:""",
+    """                self._stop.wait(_engine.cycle_backoff(attempt))
                 if self._retry_declined(longest):
                     self._exit_declining = True
-                    with self._lock:''')
+                    with self._lock:""",
+)
 # a successful attempt at exit records its duration too
-rep('''                try:
+rep(
+    """                try:
                     sink.emit(batch)
-                    return''', '''                try:
+                    return""",
+    """                try:
                     sink.emit(batch)
                     if self._exit_deadline is not None:
                         self._exit_longest = max(getattr(self, "_exit_longest", 0.0), time.monotonic() - started)
-                    return''')
+                    return""",
+)
 open(p, "w").write(s)
