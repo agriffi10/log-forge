@@ -34,7 +34,7 @@ changes the pins point at.
   (FR-002).
 - The oracles a cell is judged by: time, a wait cut short, closes, the ledger, the end state and
   a forked child's report (FR-003).
-- The pin table, fixed here from measurement: 20 pinned cells, 175 withheld, 442 that must pass,
+- The pin table, fixed here from measurement: 20 pinned cells, 168 withheld, 449 that must pass,
   and one pinned reproduction; four new open items and one correction in `docs/architecture.md`
   §12 (FR-004).
 - Proof that the cells bite: they fail, for the stated reason, at the parents of three fixed
@@ -366,23 +366,25 @@ under `### Open` in `docs/architecture.md` §12. A pinned cell runs, and is repo
 expected failure only when its verdict equals its pin's; a pass, or any other verdict, fails the
 suite. A pin on a one-operation script also **withholds** every longer script that contains it
 at the same personality, site and path, and may name one sibling operation, the same defect in a
-form the time oracle cannot see, whose scripts are withheld too. A withheld cell is not run, and
-is not collected as a test item, neither run nor skipped: it is the pinned defect again, and each
-costs seconds of waiting. Everything a pin withholds is
-computed from the pin, so deleting the pin brings it back.
+form the time oracle cannot see, whose two-operation scripts are withheld too. The sibling's
+one-operation script runs: it is the one cell at that place where a call with a finite timeout
+spends its budget on a real wait, so it is where `BoundExceeded` meets one (FR-003). A withheld
+cell is not run, and is not collected as a test item, neither run nor skipped: it is the pinned
+defect again, and each costs seconds of waiting. Everything a pin withholds is computed from the
+pin, so deleting the pin brings it back.
 
 | Pin | Pinned cells | Verdict | Withheld | Item |
 |---|---|---|---|---|
-| `drain-flush` | `flush-none` at `reentrant` `emit`/`worker`, `reentrant` `swap-emit`/`worker`, `factory` `factory`/`worker` (3) | `HangFound:flush-none@worker.flush` | at those three: every longer script with `flush-none`, and every script with the sibling `flush` (75) | existing, corrected by this spec: see below |
-| `nested-shutdown` | `shutdown-none` at `reentrant` `close` and `swap-close`, both paths (4) | `Stalled:shutdown-none` | at those four: every longer script with `shutdown-none`, and every script with the sibling `shutdown` (100) | "`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close" (audit finding 20) |
+| `drain-flush` | `flush-none` at `reentrant` `emit`/`worker`, `reentrant` `swap-emit`/`worker`, `factory` `factory`/`worker` (3) | `HangFound:flush-none@worker.flush` | at those three: every longer script with `flush-none`, and every two-operation script with the sibling `flush` (72) | existing, corrected by this spec: see below |
+| `nested-shutdown` | `shutdown-none` at `reentrant` `close` and `swap-close`, both paths (4) | `Stalled:shutdown-none` | at those four: every longer script with `shutdown-none`, and every two-operation script with the sibling `shutdown` (96) | "`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close" (audit finding 20) |
 | `empty-submission` | `reentrant` `setter`/`worker` with `flush` or `flush-none` beside `shutdown` or `shutdown-none`, in either order (8) | `LedgerBroken:spans+1` | none | new, (a) below |
 | `orphan-arm-in-close` | `reentrant` `close`, both paths, `configure+info` (2) | `CloseBroken:never-closed@1` | none | new, (b) below |
 | `installed-closed-twice` | `reentrant` `swap-emit`/`worker` with `info+shutdown` and `info+shutdown-none` (2) | `CloseBroken:repeat@1` | none | new, (c) below |
 | `fork-mid-swap` | `forker` `swap-emit`/`worker` (1) | `ChildBroken:two-sinks` | none | "A child forked while a sink change is in flight sends its spans to the old sink and its orphan logs to the new one" (audit finding 6) |
 | `orphan-write-after-close` | none: a reproduction test | `CloseBroken:unreleased@1` | none | new, (d) below |
 
-That is 20 pinned cells, 175 withheld and 442 that run and must pass. Of the 105 red cells, 20
-are the pinned ones and 85 are among the withheld. The other 90 withheld cells are green: 84
+That is 20 pinned cells, 168 withheld and 449 that run and must pass. Of the 105 red cells, 20
+are the pinned ones and 85 are among the withheld. The other 83 withheld cells are green: 77
 hold only a sibling operation, and 6 hold `flush-none` after a nested shutdown has already
 retired the worker.
 
@@ -453,11 +455,11 @@ which is the `drain-flush` pin's item.
 #### Acceptance Criteria:
 
 - [ ] `PINS` holds the seven pins above, and a test asserts as literals that the table has 637
-      cells, 20 pinned, 175 withheld and 442 run-and-must-pass.
+      cells, 20 pinned, 168 withheld and 449 run-and-must-pass.
 - [ ] A pinned cell is reported as an expected failure only when its verdict equals its pin's
       verdict exactly; a pinned cell that passes, or fails with any other verdict, fails the
       suite.
-- [ ] Every one of the 442 cells passes on the branch, and the six local gates are green.
+- [ ] Every one of the 449 cells passes on the branch, and the six local gates are green.
 - [ ] A test asserts every pinned cell is a member of the generated table, every pin's
       reproduction names a test function of the cells file, and every pin's item is the bold lead
       of a bullet between `### Open` and `### Resolved` in `docs/architecture.md`.
@@ -468,7 +470,7 @@ which is the `drain-flush` pin's item.
 - [ ] Against a tree exported from the branch head with the `_swap_sink` mutant above as its only
       change, each of the eight named `reentrant` `emit`/`worker` cells has a
       `CloseBroken:repeat@<count>` signature in its verdict;
-      against the unmutated export the cells test, `test_model_cells.py::test_cell`, reads 442
+      against the unmutated export the cells test, `test_model_cells.py::test_cell`, reads 449
       passed and 20 expected failures, and the reproduction and its control in the same file add
       one expected failure and one pass; the delivery doc records both counts and that
       `log_foundry.__file__` was under each export.
@@ -685,7 +687,7 @@ build re-measures it, and FR-004 says what happens when a number has moved.
 | What | Measurement |
 |---|---|
 | The whole table at `a0f44b5f` | 637 cells, 105 red, identical verdicts in 4 runs under `-n 12` |
-| The cells that run | 462 cells (442 pass, 20 pinned), identical in 4 runs, 3 of them at a load average of 50; 15 s wall under `-n 12`, against 57 s for all 637 |
+| The cells that run | 469 cells (449 pass, 20 pinned), identical in 3 runs at the commit after `00ebc198`, at loads of 16.4, 9.7 and 14.1; 15 to 20 s wall under `-n 12`, against 57 s for all 637. The seven one-operation sibling cells take 2.02 to 3.05 s each. At `a0f44b5f`, before they ran: 462 cells (442 pass, 20 pinned), identical in 4 runs, 3 of them at a load average of 50; 15 s wall |
 | Slowest call that had nothing to wait for | 0.09 s own time across the 442 passing cells at load 50; 0.375 s across the passive model's calls at load 33 to 45; an independent reviewer measured 18 ms over 7,365 calls |
 | `drain-flush` | 36 red: at each of three site-paths, 12 of the 14 scripts holding `flush-none` never return, hung in `worker.flush`; the 2 that return follow a nested `shutdown`. A nested `flush(timeout=2.0)` takes 2.00 s and passes. A `configure(sink=…)` from the same place returns in 0.00 s |
 | `nested-shutdown` | 56 red: all 14 scripts holding `shutdown-none`, at 4 site-paths, 2.00 s each; a nested `shutdown(timeout=3.0)` takes 2.00 s and passes |
@@ -723,3 +725,6 @@ build re-measures it, and FR-004 says what happens when a number has moved.
 - **2026-11-15, corrected after the diff review.** The `orphan-arm-in-close` evidence row counted
   events where the harness counts delivery calls (FR-003, `Recorder`), so its `span` case now reads
   each sink closed once, entered at count 1, rather than closes entered at counts 1 and 3.
+- **2026-11-15, revised in place to run the seven one-operation sibling cells**, because no
+  running cell made a finite-timeout call spend its budget, so `BoundExceeded` was never
+  exercised on a real wait.

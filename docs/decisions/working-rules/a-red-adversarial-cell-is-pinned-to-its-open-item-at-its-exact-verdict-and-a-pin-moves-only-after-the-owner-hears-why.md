@@ -21,11 +21,13 @@ the defect. Its item then leaves *Open* as
 says.
 
 **Why what is withheld comes from the pin alone.** A pin on a one-operation script withholds the
-longer scripts holding that operation at the same place, and the scripts holding its sibling: the
-pinned defect again, at seconds of waiting each. A withheld cell is not collected at all, so a
-hand-kept list of them would leave cells hidden after their pin was deleted, with no defect behind
-them and nothing to say so. `withheld()` reads `PINS` at the time of the call, and a test empties
-`PINS` and asserts that all 637 cells are scheduled.
+longer scripts holding that operation at the same place, and the two-operation scripts holding its
+sibling: the pinned defect again, at seconds of waiting each. The sibling's one-operation script
+runs, because it is where a call with a finite timeout spends its budget on a real wait, and
+withheld it left `BoundExceeded` met by no running cell. A withheld cell is not collected at all,
+so a hand-kept list of them would leave cells hidden after their pin was deleted, with no defect
+behind them and nothing to say so. `withheld()` reads `PINS` at the time of the call, and a test
+empties `PINS` and asserts that all 637 cells are scheduled.
 
 **Why a pin moves only after the owner hears why.** Editing the register is the one change that
 turns the gate green while leaving it looking intact: pinning a new red as a known defect silences
@@ -54,3 +56,5 @@ before the differing verdict has reached the owner.
 
 - **Settled** by SPEC-085 at its completion, as the register the `audit-2026-11-14` arc's later
   specs build on.
+- **Narrowed** by SPEC-085's in-place revision: a pin's sibling withholds only its two-operation
+  scripts, so the seven one-operation sibling cells run and `BoundExceeded` meets a real wait.

@@ -8,9 +8,10 @@ pinned cell runs, and is an expected failure only at its pin's verdict, so it fa
 day the defect is fixed or a new one appears beside it.
 
 A pin on a one-operation script also **withholds** every longer script that holds that operation
-at the same personality, site and path, and every script holding its sibling: the pinned defect
-again, in a form that would cost seconds of waiting per cell. Everything withheld is computed from
-:data:`PINS` here, so deleting a pin brings its cells back.
+at the same personality, site and path, and every two-operation script holding its sibling: the
+pinned defect again, in a form that would cost seconds of waiting per cell. The one-operation
+sibling script runs, since it is where a finite timeout spends its budget on a real wait.
+Everything withheld is computed from :data:`PINS` here, so deleting a pin brings its cells back.
 
 This module imports the standard library only, and is one of the four files a run at an older
 commit copies (FR-005).
@@ -75,8 +76,8 @@ class Pin:
       cells: The pinned cells, each run and strict; empty for a pin held by a reproduction.
       verdict: The exact verdict every pinned cell has.
       item: The bold lead of a bullet under ``### Open`` in ``docs/architecture.md`` §12.
-      sibling: An operation whose scripts are withheld with the pinned one: the same defect in
-        a form the time oracle cannot see.
+      sibling: An operation whose two-operation scripts are withheld with the pinned one: the
+        same defect in a form the time oracle cannot see. Its one-operation script runs.
       reproduction: The name of a test function in ``tests/test_model_cells.py`` that holds the
         pin instead of a cell.
     """
@@ -278,7 +279,9 @@ def withheld(cell: Cell) -> bool:
 
     A pinned cell is never withheld. Otherwise a cell is withheld when a pin holds a
     one-operation cell at the same personality, site and path, and the cell's script is longer
-    and holds that operation, or holds the pin's sibling at any length.
+    and holds that operation or the pin's sibling. The one-operation sibling script runs: it is
+    the one cell at that place whose call with a finite timeout spends its budget on a real wait,
+    so it is what exercises ``BoundExceeded`` (FR-003).
 
     Args:
       cell: The cell.
@@ -296,9 +299,10 @@ def withheld(cell: Cell) -> bool:
         for held in pin.cells:
             if len(held.script) != 1 or (held.personality, held.site, held.path) != place:
                 continue
-            if len(cell.script) > 1 and held.script[0] in cell.script:
-                return True
-            if pin.sibling is not None and pin.sibling in cell.script:
+            if len(cell.script) > 1 and (
+                held.script[0] in cell.script
+                or (pin.sibling is not None and pin.sibling in cell.script)
+            ):
                 return True
     return False
 

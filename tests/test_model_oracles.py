@@ -1086,9 +1086,9 @@ def test_the_table_and_the_pins_hold_these_counts() -> None:
     pinned = [cell for cell in table if pin_of(cell) is not None]
     held = [cell for cell in table if withheld(cell)]
     assert len(pinned) == 20
-    assert len(held) == 175
-    assert len(table) - len(pinned) - len(held) == 442
-    assert len(scheduled()) == 462
+    assert len(held) == 168
+    assert len(table) - len(pinned) - len(held) == 449
+    assert len(scheduled()) == 469
 
 
 def test_every_cell_id_is_unique_and_spells_its_cell() -> None:
@@ -1155,9 +1155,32 @@ def test_everything_withheld_repeats_a_pinned_operation_or_its_sibling() -> None
             for held in pin.cells
             if len(held.script) == 1
             and (held.personality, held.site, held.path) == place
+            and len(cell.script) > 1
             and (held.script[0] in cell.script or pin.sibling in cell.script)
         ]
         assert reasons, cell_id(cell)
+
+
+def test_a_pins_one_operation_sibling_script_is_scheduled() -> None:
+    """FR-004: the bare sibling runs, as the cell whose finite timeout spends its budget waiting."""
+    expected = {
+        Cell(held.personality, held.site, held.path, (pin.sibling,))
+        for pin in PINS
+        if pin.sibling is not None
+        for held in pin.cells
+        if len(held.script) == 1
+    }
+    assert {cell_id(cell) for cell in expected} == {
+        "reentrant-emit-worker-flush",
+        "reentrant-swap-emit-worker-flush",
+        "factory-factory-worker-flush",
+        "reentrant-close-orphan-shutdown",
+        "reentrant-close-worker-shutdown",
+        "reentrant-swap-close-orphan-shutdown",
+        "reentrant-swap-close-worker-shutdown",
+    }
+    assert not [cell_id(cell) for cell in expected if withheld(cell)]
+    assert expected <= set(scheduled())
 
 
 def test_no_pin_expects_a_crash() -> None:
