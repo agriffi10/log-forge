@@ -971,8 +971,43 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "popped the absent sink with a default released it a second time (20 of 20 forced "
             "at `624d817f`, for shutdown() and the exit drain). A question about the record, not "
             "the worker; filed in this row because it is a term of the same boolean. Skipping a "
-            "release of a sink the record no longer owes cannot orphan it: every route out of "
-            "the record is a take whose taker closes it."
+            "release of a sink the record no longer owes cannot orphan it: the worker's sink "
+            "leaves the record only by a take whose taker closes it, since a cede (SPEC-087) is "
+            "only of a kept sink in the section that arms its holder."
+        ),
+    ),
+    (
+        "_swap_sink",
+        "[sink for sink in _state._closes.owed.values() if sink is old or _state.held(sink)]",
+        0,
+    ): (
+        MOMENT,
+        (
+            "the stale take's test of what something may be inside (SPEC-087 FR-003): the "
+            "worker's current sink, or an owed sink `held` says a drain thread or a close may "
+            "still be inside. A stale sink lying in the graph of one of these is passed over and "
+            "stays owed. A sink kept by one swap and armed again as a root by a straddling orphan "
+            "log is otherwise closed under the drain thread that is inside it through its holder: "
+            "measured, 5 of 9 queued events arrived. `held` for the close, not `in_flight`, as "
+            "the stale loop asks."
+        ),
+    ),
+    (
+        "_swap_sink",
+        (
+            "[sink for sink in _state._closes.owed.values() if kept.get(id(sink)) is sink and "
+            "sink is not new_sink and (fenced_out if sink is previous else not _state.held(sink))]"
+        ),
+        0,
+    ): (
+        MOMENT,
+        (
+            "the join after the retarget (SPEC-087 FR-001): an owed sink the installed graph "
+            "holds leaves the record with no close and joins that graph, but only where the swap "
+            "would have released it — the displaced sink once its fence is confirmed (the fenced "
+            "test, `held` and `owes` included), or a stale sink nothing may still be inside. One "
+            "displaced without a confirmed fence, or still `held`, stays in the record as before, "
+            "where the worker's own record still names it."
         ),
     ),
     ("_swap_sink", "worker.retarget(new_sink, op.deadline)", 0): (

@@ -5,8 +5,11 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Three scripts here are not the audit's.** They were written on 2026-11-15 while authoring
-SPEC-086, against `5447d26a`, and each says so in its first line.
+**Four scripts here are not the audit's.** Three were written on 2026-11-15 while authoring
+SPEC-086, against `5447d26a`, and the fourth while building SPEC-087; each says so in its first
+line. `lifecycle/leaves_remaining_holder.py` was written for SPEC-087: it is the probe behind the
+open item in `docs/architecture.md` §12 for a wrapper that leaves its member alone, which is then
+closed by nobody.
 `lifecycle/p9_second_stop_in_fork_repair.py` and `lifecycle/p10_fork_with_stderr_lock_held.py`
 are the probes behind two open items in `docs/architecture.md` §12 that the audit did not find.
 `lifecycle/p8_second_close_after_a_rearm.py` is behind no open item: it traces a sink closed

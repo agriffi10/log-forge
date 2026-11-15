@@ -1052,7 +1052,11 @@ class Worker:
         reports: whether the previous sink is **still owed**, read after that flush. Not owed, the
         retiring shutdown took it — a take happens only once nothing of the drain can be inside
         the sink, and the taker performs the close — so the verdict is ``declined``, with no
-        ``incomplete_swaps`` and no line. Read as ``unfenced``, as it was until this fix, a setter
+        ``incomplete_swaps`` and no line. The sink asked about is this worker's own, which no
+        swap cedes (a cede is of a kept sink in the section that arms its holder, after this
+        returns) and which the closer takes only once the drain thread has ended; its guard
+        passes a take over, and puts the sink back, only for a sink lying beneath one still held
+        (SPEC-087). Read as ``unfenced``, as it was until this fix, a setter
         calling ``shutdown()`` counted an incomplete swap and wrote that the previous sink "could
         not be confirmed drained" and was "left open", though the shutdown had already closed it.
         **Still owed, it stays** ``unfenced``, line and count as before: the retiring shutdown has
