@@ -596,13 +596,20 @@ specs:
     depends_on: ["SPEC-021", "SPEC-034", "SPEC-036", "SPEC-050", "SPEC-051", "SPEC-072", "SPEC-088"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-089-flush-loss-counts.md"
+  - id: "SPEC-090"
+    title: "Under a Backlog the Worker Sends Larger Batches, and the Exit Drain Sends Its Backlog in Batches"
+    description: "Lets the worker drain a backlog in batches sized to what its sink delivers in half a flush interval, capped at 1,000 events and with no new setting, and has the exit drain send its backlog by the same rule, so a burst loses fewer events and an expired shutdown leaves at most one batch whose fate is unknown."
+    spec_status: "Draft"
+    depends_on: ["SPEC-004", "SPEC-021", "SPEC-039", "SPEC-054", "SPEC-062", "SPEC-068", "SPEC-072", "SPEC-088"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-090-backlog-batching.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
