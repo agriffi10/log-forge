@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from log_foundry import _diag
 from log_foundry.config import _live_config
 from log_foundry.ids import new_log_id
 from log_foundry.sanitize import _type_name, sanitize_fields, truncate_str, truncate_tail
@@ -380,7 +381,7 @@ def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
     for event in span.events:
         if event.get("message") in (_START_MESSAGE, _END_MESSAGE):
             fields = event.get("fields")
-            if isinstance(fields, dict):
+            if _diag.is_a(fields, dict):
                 event["fields"] = {**fields, **safe}
                 if clipped:
                     event[_TRUNCATED] = True

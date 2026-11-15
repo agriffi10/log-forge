@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from datetime import UTC, datetime, timedelta
 
+from log_foundry import _diag
+
 __all__ = ["epoch_nanos", "epoch_seconds"]
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -26,7 +28,7 @@ def epoch_seconds(timestamp: object) -> float:
     Raises:
       None.
     """
-    if isinstance(timestamp, str):
+    if _diag.is_a(timestamp, str):
         try:
             return datetime.fromisoformat(timestamp).timestamp()
         except ValueError:
@@ -55,7 +57,7 @@ def epoch_nanos(timestamp: object) -> int:
     Raises:
       None.
     """
-    if isinstance(timestamp, str):
+    if _diag.is_a(timestamp, str):
         try:
             parsed = datetime.fromisoformat(timestamp)
             if parsed.utcoffset() is None:

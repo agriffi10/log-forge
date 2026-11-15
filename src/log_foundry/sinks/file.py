@@ -194,7 +194,7 @@ def _curable(err: Exception) -> bool:
     Raises:
       None. A caller asks through ``is_retryable``, which reads a raise here as False.
     """
-    return isinstance(err, OSError) and err.errno in _RETRY_ERRNOS
+    return _diag.is_a(err, OSError) and err.errno in _RETRY_ERRNOS
 
 
 def _taken(counts: list[int], size: int) -> int:
@@ -216,7 +216,7 @@ def _taken(counts: list[int], size: int) -> int:
     """
     total = 0
     for count in counts:
-        if not isinstance(count, int) or not 0 < count <= size - total:
+        if not _diag.is_a(count, int) or not 0 < count <= size - total:
             break
         total += count
     return total
@@ -422,7 +422,7 @@ class _Writes:
         self._torn: int | None = None
         self._own: tuple[int, _Tail, object] | None = None
         note = self._context.notes(owner).get(_TORN)
-        if isinstance(note, tuple):
+        if _diag.is_a(note, tuple):
             event, tail = note
             for position in positions:
                 if batch[position] is event:

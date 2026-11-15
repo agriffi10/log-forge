@@ -321,13 +321,13 @@ def column_value(value: object, *, int64: bool) -> object:
     Raises:
       UnicodeEncodeError: If ``value`` is a string holding a lone surrogate.
     """
-    if value is None or isinstance(value, float):
+    if value is None or _diag.is_a(value, float):
         return value
-    if isinstance(value, str):
+    if _diag.is_a(value, str):
         if not str.isascii(value):
             str.encode(value, "utf-8")
         return value
-    if isinstance(value, int):
+    if _diag.is_a(value, int):
         number = int.__int__(value)
         if not int64 or _INT64_MIN <= number <= _INT64_MAX:
             return value
@@ -465,27 +465,27 @@ def _walk(value: object, *, values: bool, ints: bool) -> tuple[object, bool]:
     Raises:
       RecursionError: If the value nests deeper than the interpreter allows.
     """
-    if isinstance(value, str):
+    if _diag.is_a(value, str):
         if values and _NUL in value:
             return value.replace(_NUL, _REPLACEMENT), True
         return value, False
-    if isinstance(value, bool):
+    if _diag.is_a(value, bool):
         return value, False
-    if isinstance(value, int):
+    if _diag.is_a(value, int):
         if ints and (int.__lt__(value, _INT64_MIN) or int.__gt__(value, _INT64_MAX)):
             return int_placeholder(value), True
         return value, False
-    if isinstance(value, dict):
+    if _diag.is_a(value, dict):
         rebuilt: dict[object, object] = {}
         changed = False
         for key, item in value.items():
-            if isinstance(key, str) and _NUL in key:
+            if _diag.is_a(key, str) and _NUL in key:
                 key = key.replace(_NUL, _REPLACEMENT)
                 changed = True
             rebuilt[key], item_changed = _walk(item, values=values, ints=ints)
             changed = changed or item_changed
         return rebuilt, changed
-    if isinstance(value, list | tuple):
+    if _diag.is_a(value, (list, tuple)):
         pairs = [_walk(item, values=values, ints=ints) for item in value]
         return [item for item, _ in pairs], any(changed for _, changed in pairs)
     return value, False

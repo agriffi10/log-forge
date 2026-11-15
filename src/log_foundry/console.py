@@ -126,6 +126,6 @@ def _is_permanent(exc: Exception) -> bool:
     Raises:
       None.
     """
-    if isinstance(exc, BrokenPipeError):
+    if _diag.is_a(exc, BrokenPipeError):
         return True
-    return isinstance(exc, ValueError) and not isinstance(exc, UnicodeError)
+    return _diag.is_a(exc, ValueError) and not _diag.is_a(exc, UnicodeError)

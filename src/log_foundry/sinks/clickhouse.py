@@ -468,7 +468,7 @@ class ClickHouseSink:
                 "OperationalError",
             ),
         )
-        return isinstance(err, retried)
+        return _diag.is_a(err, retried)
 
     def _ensure_schema(self) -> None:
         """Idempotently creates the target ``MergeTree`` table.

@@ -2475,7 +2475,7 @@ def _walk_after_fork(repair: _fork._Repair) -> None:
         _state._marking_failed = True
         _diag.absorbed("marking the sinks a forked child inherited", exc, _LAST_RESORT)
         return
-    if isinstance(scanned, Exception):
+    if _diag.is_a(scanned, Exception):
         _state._marking_failed = True
         _diag.absorbed("marking the sinks a forked child inherited", scanned, _LAST_RESORT)
     elif scanned is False:

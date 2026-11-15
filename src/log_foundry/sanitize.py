@@ -1402,9 +1402,9 @@ def sanitize_fields(
         result = coercer.mapping(fields, -1)
     except Exception:
         return {}, True
-    if not isinstance(result, dict):
+    if not issubclass(type(result), dict):
         return {}, True
-    return result, coercer.truncated
+    return cast("dict[str, object]", result), coercer.truncated
 
 
 _TRANSFORM_MAX_DEPTH = 100
@@ -1479,6 +1479,6 @@ def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], b
     """
     coercer = _Coercer(cast("Config", _TypesOnly()), budgeted=False)
     result = coercer.mapping(event, -1)
-    if not isinstance(result, dict):
+    if not issubclass(type(result), dict):
         raise TypeError(f"a transform's coercion produced {_type_name(result)}, not a dict")
-    return result, coercer.truncated
+    return cast("dict[str, object]", result), coercer.truncated

@@ -178,7 +178,7 @@ def _read_failed(payload: bytes) -> bool:
     Raises:
       None.
     """
-    return isinstance(payload, _UnreadBody)
+    return _diag.is_a(payload, _UnreadBody)
 
 
 class _Pending(Protocol):
@@ -1447,7 +1447,14 @@ def _refuse_empty_credential(value: object, owner: str, argument: str) -> None:
 
 
 _NOT_A_PAIR = (set, frozenset, Mapping)
-"""Containers that unpack into two items but hold no ``(user, password)`` order (SPEC-049)."""
+"""Containers that unpack into two items but hold no ``(user, password)`` order (SPEC-049).
+
+Tested through ``issubclass(type(auth), …)`` under a guard in :func:`_copied_pair`, never by
+``is_a``: ``Mapping`` knows ``dict``, ``MappingProxyType`` and third-party maps such as
+``pyrsistent.pmap`` only by ``register``, which a real-MRO test cannot see, and a map unpacked as a
+pair sends its two keys as the credentials. The ABC check hashes the class into its cache, which
+runs a metaclass ``__hash__`` of the caller's; one that raises is read as unordered and refused.
+"""
 
 
 def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
@@ -1459,7 +1466,9 @@ def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
     ``401`` on every request otherwise; a mapping unpacks into its keys. Those containers hold no
     order, so they are judged by their real type **before** the unpack, and none of their
     methods — an ``__iter__`` that raises with the caller's text, say — runs; a wrong-length one
-    gets this refusal rather than the unpack's.
+    gets this refusal rather than the unpack's. The test asks ``Mapping``'s ABC check, because a
+    map ``Mapping`` knows only by ``register`` is one of them, and that check can run the class's
+    metaclass ``__hash__``: a raise from it is read as unordered and refused, never propagated.
 
     The unpack is then the one ``_authorization`` used to perform on every ``emit``, so what it
     refuses and the message it gets are unchanged for every other value — a non-iterable raises
@@ -1485,8 +1494,12 @@ def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
       ValueError: If the value does not unpack into exactly two items, is a ``set``,
         ``frozenset`` or mapping, or either item is not a ``str``.
     """
-    if issubclass(type(auth), _NOT_A_PAIR):
-        raise ValueError(  # noqa: TRY004
+    try:
+        unordered = issubclass(type(auth), _NOT_A_PAIR)
+    except Exception:
+        unordered = True
+    if unordered:
+        raise ValueError(
             f"{owner} auth must be a str token or a pair of two str, not {_diag.type_name(auth)}"
         )
     failure: str | None = None
@@ -3062,7 +3075,7 @@ class HTTPSink:
         Raises:
           None.
         """
-        return isinstance(err, (urllib.error.URLError, OSError, http.client.HTTPException))
+        return _diag.is_a(err, (urllib.error.URLError, OSError, http.client.HTTPException))
 
     def _response_limit(self) -> int | None:
         """The most response bytes :meth:`_attempt` reads, or ``None`` for the unbounded read.
@@ -3289,7 +3302,7 @@ class HTTPSink:
             reason = f"connection error, {_diag.type_name(err)} {_diag.errno_of(err)}".rstrip()
             if is_retryable(self._retryable_error, err):
                 return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
-            if not count_unexpected and not isinstance(err, SinkDeliveryError):
+            if not count_unexpected and not _diag.is_a(err, SinkDeliveryError):
                 return _Answer(Outcome.REJECTED, error=err)
             return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
         if 200 <= status < 300:

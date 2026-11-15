@@ -297,12 +297,12 @@ class OTLPSink(HTTPSink):
             data = json.loads(payload, parse_int=str)
         except Exception:
             return accepted
-        if not isinstance(data, dict):
+        if not _diag.is_a(data, dict):
             return accepted
         partial = data.get("partialSuccess")
         if partial is None:
             return accepted
-        if not isinstance(partial, dict):
+        if not _diag.is_a(partial, dict):
             return self._unadjudicated(items, unreadable, _NOUN)
         count = partial.get("rejectedLogRecords")
         if count is None:
@@ -360,7 +360,7 @@ def _rejected_count(count: object) -> int | None:
     Raises:
       None.
     """
-    if isinstance(count, bool) or not isinstance(count, str):
+    if _diag.is_a(count, bool) or not _diag.is_a(count, str):
         return None
     if not count.isascii() or not count.isdigit() or len(count) > _MAX_COUNT_DIGITS:
         return None

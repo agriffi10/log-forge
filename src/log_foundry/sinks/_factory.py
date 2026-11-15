@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from log_foundry import _diag, _lifecycle, _sink_arg
 from log_foundry.sinks._wrapper import ForwardedStopSignal
@@ -61,7 +61,7 @@ class _FactorySink:
     a new one by ``_lifecycle._adopt_factory_after_fork``, so the child builds its own.
 
     **The build.** One thread claims the build under :attr:`_build_lock`, then calls the factory
-    once with **no lock held**; its result is checked with ``isinstance(result, Sink)``, stamped
+    once with **no lock held**; its result is checked with ``isinstance(result, Sink)`` under a guard, stamped
     for this process (``_lifecycle.stamp``) and recorded as :attr:`_pending` under the lock again.
     Concurrent first emits wait on the build with no lock held, and the factory runs once between
     them. The factory is the caller's code and may call back into the library: held under the
@@ -293,6 +293,15 @@ class _FactorySink:
     def _checked(self, result: object) -> Sink:
         """Refuses what the factory returned unless it is a sink with no loop; stamps it if so.
 
+        The shape test is ``isinstance(result, Sink)``, the protocol check, kept on purpose and
+        read under its own guard: the factory and what it returns are the caller's code, which the
+        library calls by design, and the protocol check is what ``configure(sink=…)``'s callers
+        and the 1.x contract mean by a sink, a ``MagicMock(spec=…)`` and a proxy that forwards
+        ``__class__`` included. It asks the ABC machinery first, which reads the result's
+        ``__class__`` and hashes its type, so a ``__class__`` property or metaclass ``__hash__``
+        that raises is read as a refusal, as any non-sink is, rather than escaping past
+        ``SinkDeliveryError``. ``tests/test_class_check_roster.py`` exempts this one site.
+
         Args:
           result: What the factory returned.
 
@@ -304,7 +313,11 @@ class _FactorySink:
           SinkDeliveryError: When it is not a ``Sink``, or leads back to this wrapper or to a
             wrapper of its own (``_sink_arg.loop_in``).
         """
-        if not isinstance(result, Sink):
+        try:
+            shaped = isinstance(result, Sink)
+        except Exception:
+            shaped = False
+        if not shaped:
             stored = _diag._STR_STR(_diag._STORED_NAME(type(result)))
             refusal = SinkDeliveryError("sink_factory did not return a sink")
             self._announce(refusal, f"it returned {stored}, not a sink")
@@ -321,7 +334,7 @@ class _FactorySink:
             self._announce(refusal, f"what it returned {where}")
             raise refusal
         _lifecycle.stamp(result, built=True)
-        return result
+        return cast("Sink", result)
 
     def _discard(self, built: Sink) -> None:
         """Releases a sink built under a claim another thread took over, absorbing its failure.

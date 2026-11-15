@@ -130,7 +130,7 @@ def pop_span(token: contextvars.Token[tuple[Span, ...]]) -> None:
         _span_stack.reset(token)
     except Exception:
         old = getattr(token, "old_value", None)
-        _span_stack.set(old if isinstance(old, tuple) else ())
+        _span_stack.set(old if _diag.is_a(old, tuple) else ())
 
 
 def get_baggage() -> dict[str, object]:
@@ -255,7 +255,7 @@ def pop_baggage_scope(token: contextvars.Token[dict[str, object]]) -> None:
         _baggage.reset(token)
     except Exception:
         old = getattr(token, "old_value", None)
-        _baggage.set(old if isinstance(old, dict) else {})
+        _baggage.set(old if _diag.is_a(old, dict) else {})
 
 
 def reset_context() -> None:

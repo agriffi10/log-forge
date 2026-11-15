@@ -502,14 +502,14 @@ class PostgresSink:
         Raises:
           None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
         """
-        if isinstance(err, TRANSIENT_BUILTINS):
+        if _diag.is_a(err, TRANSIENT_BUILTINS):
             return True
-        if not isinstance(err, driver_classes("psycopg.errors", "OperationalError")):
+        if not _diag.is_a(err, driver_classes("psycopg.errors", "OperationalError")):
             return False
         state = getattr(err, "sqlstate", None)
         if state is None:
             return not _refused(str(err))
-        if not isinstance(state, str):
+        if not _diag.is_a(state, str):
             return False
         return state[:2] in _RETRYABLE_CLASSES or state in _RETRYABLE_STATES
 

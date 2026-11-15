@@ -321,7 +321,7 @@ class StdoutSink:
         if stage == _WRITE:
             if _unbuffered(self._stream):
                 accepted = handed
-            elif isinstance(error, OSError) and not isinstance(error, io.UnsupportedOperation):
+            elif _diag.is_a(error, OSError) and not _diag.is_a(error, io.UnsupportedOperation):
                 unsure = handed + 1
             else:
                 unsure = handed
@@ -387,7 +387,7 @@ class StdoutSink:
         Raises:
           None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
         """
-        return isinstance(err, OSError) and err.errno in _RETRYABLE_ERRNOS
+        return _diag.is_a(err, OSError) and err.errno in _RETRYABLE_ERRNOS
 
     def _encode(self, event: dict[str, object]) -> str:
         """Encodes one event as its newline-terminated JSON line.

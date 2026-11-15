@@ -460,7 +460,7 @@ class AzureEventHubsSink:
         Raises:
           None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
         """
-        if isinstance(err, driver_classes("azure.eventhub.exceptions", "AuthenticationError")):
+        if _diag.is_a(err, driver_classes("azure.eventhub.exceptions", "AuthenticationError")):
             return False
         retried = (
             *TRANSIENT_BUILTINS,
@@ -471,7 +471,7 @@ class AzureEventHubsSink:
                 "OperationTimeoutError",
             ),
         )
-        return isinstance(err, retried)
+        return _diag.is_a(err, retried)
 
     def _send(self, event_batch: Any) -> Called[None]:
         """Sends one ``EventDataBatch`` once (SPEC-074 FR-004); the engine resends it later.

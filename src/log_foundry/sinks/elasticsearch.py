@@ -188,7 +188,7 @@ class ElasticsearchSink(HTTPSink):
             data = json.loads(payload)
         except Exception:
             return self._unadjudicated(items, _detail(sent))
-        if not isinstance(data, dict):
+        if not _diag.is_a(data, dict):
             return self._unadjudicated(items, _detail(sent))
         if not data.get("errors"):
             return (Outcome.ACCEPTED,) * sent
@@ -268,7 +268,7 @@ def _has_error(item: dict[str, object]) -> bool:
     Raises:
       None.
     """
-    return any(isinstance(result, dict) and result.get("error") for result in item.values())
+    return any(_diag.is_a(result, dict) and result.get("error") for result in item.values())
 
 
 class OpenSearchSink(ElasticsearchSink):

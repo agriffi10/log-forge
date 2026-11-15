@@ -528,7 +528,7 @@ def _code(err: object) -> str:
     deliberately narrow: only an ``int`` is written, so a stub or a future version returning
     something else contributes nothing rather than smuggling text past the type-name rule. The
     ``int()`` sits inside the guard for the reason ``_diag.errno_of`` puts it there —
-    ``isinstance(code, int)`` admits a subclass whose ``__int__`` is Python that can raise.
+    ``_diag.is_a(value, int)`` admits a subclass whose ``__int__`` is Python that can raise.
 
     Args:
       err: The delivery error.
@@ -543,6 +543,6 @@ def _code(err: object) -> str:
     try:
         code = getattr(err, "code", None)
         value = code() if callable(code) else None
-        return f" code={int(value)}" if isinstance(value, int) else ""
+        return f" code={int(value)}" if _diag.is_a(value, int) else ""
     except Exception:
         return ""

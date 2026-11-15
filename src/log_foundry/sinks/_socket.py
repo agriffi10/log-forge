@@ -538,7 +538,7 @@ class SocketTransport:
         Raises:
           None. :func:`~log_foundry.sinks._classify.is_retryable` reads a raise here as False.
         """
-        return isinstance(err, OSError) and err.errno not in _PERMANENT_ERRNOS
+        return _diag.is_a(err, OSError) and err.errno not in _PERMANENT_ERRNOS
 
     def _socket(self) -> socket.socket:
         """Returns the held socket, opening one if none is held.
