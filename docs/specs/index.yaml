@@ -589,13 +589,20 @@ specs:
     depends_on: ["SPEC-017", "SPEC-019", "SPEC-030", "SPEC-036", "SPEC-039", "SPEC-050", "SPEC-054", "SPEC-062", "SPEC-068", "SPEC-072"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-088-event-ledger.md"
+  - id: "SPEC-089"
+    title: "flush() Counts What Its Window Lost, and Stays Truthy Over It"
+    description: "Gives FlushResult event counts of what the process lost while a flush() call was outstanding, read from the event ledger, without changing what bool(flush()) reports, so a handler can see a loss a truthy flush covers; and rewrites in place every statement that said a truthy flush meant delivery."
+    spec_status: "Draft"
+    depends_on: ["SPEC-021", "SPEC-034", "SPEC-036", "SPEC-050", "SPEC-051", "SPEC-072", "SPEC-088"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-089-flush-loss-counts.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
