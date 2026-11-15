@@ -502,8 +502,9 @@ what it had not yet written. A line not handed is resent only when the sink's `e
 says a resend can cure the error. A raise that is not an `OSError` took nothing, since the `io`
 contract raises `ValueError` for a closed stream before any I/O, so a closed `StringIO` fails
 every batch rather than settling it; so did `io.UnsupportedOperation`, which a stream opened for
-reading raises before any I/O though it is also an `OSError`. On the exact shape `python -u` gives `sys.stdout`, a `write`
-that returned landed and one that raised took nothing. **The fault latch is the NATS case above
+reading raises before any I/O though it is also an `OSError`. On the exact shape `python -u`
+gives `sys.stdout`, a `write` that raised took nothing, and one that returned landed on a blocking
+descriptor. **The fault latch is the NATS case above
 in another sink:** once a round leaves a handed line `UNKNOWN`, later rounds call such lines
 `REJECTED` until a round's final flush returns. So a stream that keeps nothing after a fault, such
 as a dead pipe block-buffered at 4096 or 8192 bytes, fails every batch after the one that
@@ -515,7 +516,10 @@ cannot see inside a stream it does not own. (1) A stream that discards the unwri
 line it cut leaves a torn prefix, which the next line joins into one unparseable line: at the
 block-buffered 10,500 and 12,000-byte caps, and three times in one run on a non-blocking stream.
 (2) A short write on the unbuffered shape tears a line that is called `ACCEPTED`, at every cap
-the review's prototype tried, as in 1.x. (3) The batch during which a fault begins settles, and
+the review's prototype tried, as in 1.x; over a non-blocking descriptor a write that would block
+writes nothing, so whole lines are lost while called `ACCEPTED`, with no line and `losses()`
+`None` (200 `ACCEPTED` and 64 landed for 200 events of about 1 KB to a pipe, on macOS and Linux),
+as in 1.x. (3) The batch during which a fault begins settles, and
 every later batch fails; a buffered stream handed at least one line before the raise in every
 sustained-fault configuration probed. (4) While the latch is set, a line a partial write did land
 is reported `REJECTED`, an over-count within invariant 2's bound. (5) A latched run that fails

@@ -13,7 +13,8 @@
   and is never resent. A line that was not handed is `RETRYABLE` or `REJECTED`. A raise that is
   not an `OSError`, or is `io.UnsupportedOperation` (a stream opened for reading), took nothing.
   On the exact unbuffered shape (`_unbuffered`), a `write` that
-  returned is `ACCEPTED`. The fault latch, `_faulted`, makes a handed line `REJECTED` until a
+  returned is `ACCEPTED`; it landed on a blocking descriptor, and on a non-blocking one may not
+  have (residue 2). The fault latch, `_faulted`, makes a handed line `REJECTED` until a
   round's final flush returns.
 - **The predicate and the lines** (FR-003). `_retryable_error` is the `errno` set
   `_RETRYABLE_ERRNOS` (`ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`, `EAGAIN`). Every encodable event is
@@ -88,7 +89,9 @@ These are the seven residues in the spec's *Overview*, each with its measurement
 invariant 7:
 
 - a torn prefix that the next line joins;
-- a short write on the unbuffered shape;
+- a short write on the unbuffered shape, and over a non-blocking descriptor a write that would
+  block writing nothing, which loses whole lines called `ACCEPTED` (200 `ACCEPTED`, 64 landed, in
+  the second diff review's probe; 1.x loses the same lines);
 - the straddling batch, which settles;
 - the latch over-counting a landed line;
 - the latch handing a line to a catcher that resends whole;

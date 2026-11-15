@@ -52,8 +52,11 @@ def _unbuffered(stream: object) -> bool:
     """Reports whether the stream is exactly the shape ``python -u`` gives ``sys.stdout``.
 
     That shape is a ``TextIOWrapper`` with ``write_through`` set over a raw ``FileIO``: each
-    ``write`` is one ``write(2)``, so a ``write`` that returned put its line in the kernel and one
-    that raised took nothing. The types are compared exactly, never with ``isinstance``, so no
+    ``write`` is one ``write(2)``, so on a blocking descriptor a ``write`` that returned put its
+    line in the kernel, and one that raised took nothing. On a non-blocking descriptor a ``write``
+    that would block returns having written nothing, and ``TextIOWrapper`` ignores that, so a
+    returned ``write`` may not have landed; no raise happens there, so this check is never asked
+    and the sink cannot tell. The types are compared exactly, never with ``isinstance``, so no
     caller code runs and a subclass, which may buffer as it likes, gets the general rule. The round
     reads it only after a call raised, so a clean round pays nothing.
 
@@ -87,15 +90,16 @@ class StdoutSink:
     an upper bound and announced as one that may have landed, never resent. A line not yet handed
     is ``RETRYABLE`` when a resend can cure the error and ``REJECTED`` otherwise. Two cases are
     exact: a raise that is not an ``OSError``, or is ``io.UnsupportedOperation``, took nothing,
-    and on the unbuffered shape ``python -u`` gives ``sys.stdout`` a ``write`` that returned
-    landed and one that raised took nothing. A **fault latch** makes a sustained fault fail: once
+    and on the unbuffered shape ``python -u`` gives ``sys.stdout``, over a blocking descriptor, a
+    ``write`` that returned landed and one that raised took nothing. A **fault latch** makes a sustained fault fail: once
     a round leaves a handed line ``UNKNOWN``, later rounds call such lines ``REJECTED`` until a
     round's final flush returns. Only the batch during which a fault begins is counted rather than
     raised; every later one fails.
 
     What it cannot close, because it cannot see inside a stream it does not own: a stream that
     discards the tail of a line it cut leaves a torn prefix the next line joins; a short write on
-    the unbuffered shape tears a line called ``ACCEPTED``; the latch can over-count a line a
+    the unbuffered shape tears a line called ``ACCEPTED``, and over a non-blocking descriptor a
+    write that would block writes nothing and drops whole lines called ``ACCEPTED``; the latch can over-count a line a
     partial write did land, and hand such a line to a catcher that resends whole; another
     writer's fault can drop this sink's pending lines, which its returned flush then calls
     ``ACCEPTED``; and a forked child's flush writes the parent's kept bytes too.
@@ -343,7 +347,8 @@ class StdoutSink:
                 lost.append(position)
         context = run_context()
         name = type(self).__name__
-        kind = f"{type(error).__name__} {_diag.errno_of(error)}".rstrip()
+        name_of = _diag._STR_STR(_diag._STORED_NAME(type(error)))
+        kind = f"{name_of} {_diag.errno_of(error)}".rstrip()
         whole = unencodable_in_run(self)
         context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
         losses = Lost(self)

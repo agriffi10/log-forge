@@ -47,7 +47,12 @@ does not own:
 2. **A short write on the unbuffered shape.** `FileIO.write` can return a short count, which
    `TextIOWrapper` ignores. That line is torn and called `ACCEPTED`, and the next line joins it.
    Measured with the review's prototype: at every cap, one unparseable line holding two `ACCEPTED`
-   events. 1.x has this too.
+   events. Over a non-blocking descriptor the count can be none at all: `FileIO.write` returns
+   `None` when the write would block, having written nothing, and whole lines are lost while called
+   `ACCEPTED`, with no line and `losses()` `None`. Measured on macOS and on Linux 3.12 and 3.13:
+   one `deliver` of 200 events of about 1 KB through `TextIOWrapper(FileIO(w), write_through=True)`
+   over a pipe set non-blocking, 200 `ACCEPTED` and 64 lines landed. 1.x has this too: its `emit`
+   returned and lost the same lines.
 3. **The straddle.** On a buffered stream, the batch during which a fault begins hands at least one
    line before the raise (it did in every sustained-fault configuration probed). That run settles,
    with its handed lines `UNKNOWN`, counted and announced, and every later batch fails and raises,
@@ -197,8 +202,10 @@ an `OSError`, `StdoutSink(open(path))` returned from its first batch with three 
 shape `python -u` and `PYTHONUNBUFFERED=1` give `sys.stdout`: `type(stream) is io.TextIOWrapper`,
 `stream.write_through` is true, and `type(stream.buffer) is io.FileIO`. The types are compared
 exactly, so no caller code runs, and the check is read only after a raise, so a clean round pays
-nothing. On that shape each `write` is one `write(2)`. A `write` that returned put its line in the
-kernel, and one that raised took nothing, so the rows after the pre-flush change. On this shape
+nothing. On that shape each `write` is one `write(2)`. On a blocking descriptor a `write` that
+returned put its line in the kernel, and one that raised took nothing, so the rows after the
+pre-flush change. On a non-blocking descriptor a returned `write` may have written nothing
+(residue 2), and no raise happens, so the shape is never consulted. On this shape
 its table wins for every raise, one that is not an `OSError` included, so the lines before `i` are
 `ACCEPTED` there too:
 
@@ -654,4 +661,8 @@ What each listed test change is for:
   draft named its earlier `twelve`), and FR-004 now names `StderrSink`'s docstring, which repeats
   the sentence about nothing pending between calls. The diff review then found
   `io.UnsupportedOperation`, an `OSError` that took nothing, judged as a write that may have taken
-  its line; FR-002's row and paragraph for a raise that is not an `OSError` now name it.
+  its line; FR-002's row and paragraph for a raise that is not an `OSError` now name it. The
+  second diff review found that on the unbuffered shape over a non-blocking descriptor a returned
+  `write` can have written nothing, so whole lines are lost while called `ACCEPTED`, as in 1.x;
+  residue 2 and the unbuffered-shape paragraph now say so, and the shape rule is unchanged,
+  because no raise happens there for it to judge.

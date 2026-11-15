@@ -483,16 +483,67 @@ def test_a_curable_pre_flush_fault_counts_once_per_run_through_the_worker(
     assert SENTINEL not in err
 
 
-def test_an_inline_third_write_fault_writes_two_lines(capsys: pytest.CaptureFixture[str]) -> None:
-    stream = _Recorder(write_faults={2: lambda: _oserror(errno.ENOSPC)})
+@pytest.mark.parametrize(
+    ("raised", "kind"),
+    [
+        (lambda: _oserror(errno.ENOSPC), f"OSError errno={errno.ENOSPC}"),
+        (_epipe, f"BrokenPipeError errno={errno.EPIPE}"),
+    ],
+    ids=["ENOSPC", "EPIPE"],
+)
+def test_an_inline_third_write_fault_writes_two_lines(
+    raised: Callable[[], Exception], kind: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two groups, two lines. Under ``EPIPE`` both are ``ALWAYS``, so only their keys part them."""
+    stream = _Recorder(write_faults={2: raised})
     StdoutSink(stream).emit(_events(5))  # type: ignore[arg-type]
     assert _sink_lines(capsys.readouterr().err) == [
         (
-            "log-foundry: lost 3 event(s); StdoutSink, 1 attempt(s), OSError errno=28; "
+            f"log-foundry: lost 3 event(s); StdoutSink, 1 attempt(s), {kind}; "
             "outcome unknown; they may have landed"
         ),
-        "log-foundry: lost 2 event(s); StdoutSink, 1 attempt(s), OSError errno=28",
+        f"log-foundry: lost 2 event(s); StdoutSink, 1 attempt(s), {kind}",
     ]
+
+
+class _NamelessMeta(type):
+    """A metaclass whose ``__name__`` raises: caller code that reading the name would run."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("no name for you")
+
+
+class _Nameless(OSError, metaclass=_NamelessMeta):
+    """An ``OSError`` whose class name cannot be read through ordinary access."""
+
+
+def _deliver_or_fail(sink: Any, batch: list[dict[str, object]]) -> Any:
+    """Runs ``deliver``, turning any raise into a plain failure that names no ``_Nameless``.
+
+    A raise escaping ``deliver`` here carries the ``_Nameless`` error as its context, and pytest
+    reads that class's ``__name__`` while reporting it, which ends the run with an internal error
+    rather than a failure. So the outcome is recorded inside the ``except`` and failed outside it.
+    """
+    escaped = ""
+    try:
+        return sink.deliver(batch)
+    except Exception as err:
+        escaped = f"deliver raised {repr(err.args)[:80]}"
+    pytest.fail(escaped, pytrace=False)
+
+
+def test_a_raise_whose_class_name_raises_still_returns_a_verdict(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The line names the stored type name, read without running the metaclass's code."""
+    stream = _Recorder(write_faults={2: lambda: _Nameless(errno.ENOSPC, "full")})
+    sink = StdoutSink(stream)  # type: ignore[arg-type]
+    assert _deliver_or_fail(sink, _events(5)).outcomes == (U, U, U, R, R)
+    lines = _sink_lines(capsys.readouterr().err)
+    assert lines[0].startswith(
+        f"log-foundry: lost 3 event(s); StdoutSink, 1 attempt(s), _Nameless errno={errno.ENOSPC}"
+    ), lines
 
 
 def test_an_unknown_line_is_written_though_a_later_round_accepts_the_rest(
