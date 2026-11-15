@@ -18,7 +18,7 @@
   the new decision in `docs/decisions/pipeline/` and four rewritten in place; the README;
   `docs/release-notes/v1.2.1.md`, created here, which also carries SPEC-082's owed notes; the new
   probe `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`.
-- **Tests**: `tests/test_shared_sink_swap.py` (129 collected); the old pin in `tests/test_owed_closes.py`
+- **Tests**: `tests/test_shared_sink_swap.py` (131 collected); the old pin in `tests/test_owed_closes.py`
   rewritten to both directions and one close.
 - **Deviation, FR-003's concurrent criterion** (revised in the spec). Under four logging threads a
   non-shared member was sometimes closed twice, in sequence: a log with no span read the wrapper, a
@@ -117,6 +117,18 @@ and each is now killed: `release` restoring no keep after a nested forward, kill
 `test_the_stale_take_guard_reads_an_unread_graph_as_unknown`. Testing the guard before kept in the stale loop **survived** at first —
 on the worker path the second section cedes in either order — and is killed by the `[retired]`
 case of `test_a_stale_sink_both_kept_and_beneath_a_sink_in_use_is_ceded`, added for it.
+The second diff review found three more held only by the predicate roster's text, and each is now
+killed by behaviour in `test_shared_sink_swap.py`: the first section's *remaining* leaving out the
+worker's current sink, killed by
+`test_a_member_beneath_the_workers_sink_is_not_closed_by_a_stale_wrapper`, where a stale
+wrapper's forward otherwise closes a member under the drain thread; ceding the displaced sink
+without a confirmed fence, killed by `test_an_unconfirmed_swap_keeps_the_outcome[forward]`, which
+now asserts the unfenced kept sink stays owed; and ceding a held kept sink, killed by
+`test_a_held_kept_sink_stays_owed`. One mutant survives and is equivalent: the second section's
+keep given a closed map of its own rather than the decision's. The only sink the second section
+takes is the displaced one, which was the worker's current sink at the first section and so in
+that section's *remaining*; no first-section forward can claim it, or any member beneath it, so
+the two maps never contend.
 The completion ran `gen-index.sh` (no diff), `docs-lint.sh`, `spec-lint.sh` and
 `docstring-lint.py` on the branch. The first diff review's fixes changed `src/` only in docstrings,
 two annotations and one constant's name, and added tests; the three `p4` probes and

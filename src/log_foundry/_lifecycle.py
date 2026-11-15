@@ -3379,11 +3379,16 @@ class _Keep:
       sharing a member, taken in one pass, closed that member twice, overlapping.
 
     It holds no lock, which is safe here and is the deliberate exception ``python.md`` §13 asks to
-    be named: a claim is one ``dict.setdefault`` on a builtin ``dict``, which CPython performs
-    atomically, so of two threads claiming one sink exactly one reads back its own token; nothing
-    else writes the map once the decision's sections have recorded their takes, under
-    ``_state._lock``, before any close starts; and two threads that both read the remaining graphs
-    compute the same map from static reads, so the second assignment changes nothing. It holds the sinks strongly only for as long as the
+    be named. A claim is one ``dict.setdefault`` on a builtin ``dict``, which CPython performs
+    atomically, so of two threads claiming one sink exactly one reads back its own token. A take
+    writes the map under ``_state._lock``: the first section's before any of its closes starts,
+    and the second section's ``previous`` after the first section's closers may already be
+    running, which is safe because ``previous`` is the worker's current sink at the first section
+    and so in that section's *remaining*, so none of those closers' forwards can claim it. Two
+    threads that both read the remaining graphs compute the same map from static reads, unless a
+    remaining holder changes between them — a ``_FactorySink`` that builds its sink in between,
+    FR-004's unbuilt-factory shape — in which case the later read can see a member the earlier
+    did not, and the map last assigned wins. It holds the sinks strongly only for as long as the
     decision's releases hold it.
 
     Attributes:
@@ -3485,8 +3490,11 @@ def _lies_beneath(
 ) -> bool:
     """Whether the swap's stale take passes *stale* over, as beneath a sink in use (FR-003).
 
-    A sink a straddling orphan log armed again after the swap that kept it is a root in the
-    record once more, while the drain thread is inside it through its holder. Taking it there
+    A kept sink can come back into the record as a root after the swap that ceded it, by two
+    routes: a straddling orphan log that read the configured sink before the swap and arms it
+    after, and :func:`rearm_if_released`, which arms the sink an emit is about to write to when a
+    stop-signal setter released it. Either leaves it a root while the drain thread is inside it
+    through its holder. Taking it there
     closed it under that thread. So a stale sink lying in the graph of an owed sink something may
     be inside stays owed, as a held one does, and a later swap or ``shutdown()`` closes it. A sink
     in use whose graph was not read — armed after the read — makes every stale sink pass over,
@@ -5211,9 +5219,10 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     that one, through the wrapper.
 
     **No sink lying beneath one the take left in the record is handed to a closer** (SPEC-087
-    FR-003). A kept sink is out of the record and a member of the graph that holds it, but a log
-    with no span that read the configured sink before a swap kept it arms it again after, as a
-    root, where :meth:`Runtime.held` cannot see the drain thread inside it through its holder.
+    FR-003). A kept sink is out of the record and a member of the graph that holds it, but two
+    routes arm it again as a root — a log with no span that read the configured sink before a swap
+    kept it and arms it after, and :func:`rearm_if_released` — where :meth:`Runtime.held` cannot
+    see the drain thread inside it through its holder.
     So once the take has left something behind, and before any close starts, this reads the
     graphs of what it left (the keep's *remaining*, read eagerly here and reused by every forward
     of the call), and a taken sink lying in one of them is passed over: it stays among the sinks
@@ -5906,9 +5915,9 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     released is the outgoing wrapper, which the new graph does not reach, and it was the
     wrapper's forward that closed the live sink.
 
-    **The stale take passes over a sink lying beneath one still in use** (SPEC-087 FR-003). A log
-    with no span that read the configured sink before a swap kept it arms it after, as a root
-    again. So when the record holds more than one sink, the graph of each is read before the
+    **The stale take passes over a sink lying beneath one still in use** (SPEC-087 FR-003). A kept
+    sink can be armed again as a root after a swap kept it: by a log with no span that read the
+    configured sink before the swap, or by :func:`rearm_if_released`. So when the record holds more than one sink, the graph of each is read before the
     first section, with no lock held, and the stale loop leaves owed a sink lying in the graph of
     the worker's current sink or of one :meth:`Runtime.held` says something may be inside; where
     such a sink was armed after the read, every stale sink is left (:func:`_lies_beneath`). Kept

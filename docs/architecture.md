@@ -1142,7 +1142,8 @@ close it.
   own** (SPEC-087 FR-004's fifth shape; read from the code and not reproduced). A log with no span
   reads the configured sink and arms it a moment later (`api.py`, `_ensure_sink()` then
   `_note_orphan_emit`); a swap that keeps that sink and runs between the two leaves it a root in
-  the record again. SPEC-087's guard covers the two places a sink is taken to be closed, the
+  the record again. `rearm_if_released` is a second route back, arming the sink an emit is about
+  to write to when a stop-signal setter released it. SPEC-087's guard covers the two places a sink is taken to be closed, the
   closer's take and the swap's stale take. `Runtime.in_flight`, which decides whether a sink is
   handed a refreshed stop signal, still decides by identity, so such a sink can be handed one
   directly while the worker drains into it through its wrapper. Nothing is closed in this shape;

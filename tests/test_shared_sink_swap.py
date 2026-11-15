@@ -862,7 +862,11 @@ def test_a_stale_sink_both_kept_and_beneath_a_sink_in_use_is_ceded(
 def test_an_unconfirmed_swap_keeps_the_outcome(
     direction: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """FR-003 AC6: one incomplete swap and its line, and A still closed once, after its events."""
+    """FR-003 AC6: one incomplete swap and its line, and A still closed once, after its events.
+
+    Forward, A is the displaced sink and kept, but its drain was not confirmed: it stays owed, as
+    before SPEC-087, where the worker's record still names it, rather than joining the new graph.
+    """
     a, b = Shared("A"), Shared("B")
     wrapper = MultiSink(a, b)
     first, second = (a, wrapper) if direction == "forward" else (wrapper, a)
@@ -870,11 +874,67 @@ def test_an_unconfirmed_swap_keeps_the_outcome(
     _write("spans")
     _unconfirmed(monkeypatch, a, second)
     assert "could not be confirmed drained" in capsys.readouterr().err
+    if direction == "forward":
+        assert _lifecycle._state._closes.owes(a), "an unfenced kept sink was ceded"
     _write("spans", 2)
     log_foundry.shutdown(timeout=5.0)
     join_graced()
     assert a.closes == 1 and a.refused == 0 and a.overlaps == 0, a
     assert a.events_at_close == [a.events], a
+
+
+def test_a_held_kept_sink_stays_owed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-001: a kept sink something may still be inside stays in the record, as before.
+
+    An unconfirmed swap from A to B leaves A owed and among the sinks the drain thread may be
+    inside. A later swap to `MultiSink(A, C)` keeps A, but A is held: the section after the
+    retarget leaves it owed rather than ceding it, and the shutdown closes it once.
+    """
+    a, b, c = Shared("A"), Shared("B"), Shared("C")
+    log_foundry.configure(service="held-kept", sink=a)
+    _write("spans")
+    _unconfirmed(monkeypatch, a, b)
+    assert _lifecycle._state.held(a), "the premise: A is held after the unconfirmed swap"
+    log_foundry.configure(sink=MultiSink(a, c))
+    assert _lifecycle._state._closes.owes(a), "a held kept sink was ceded"
+    _write("spans")
+    log_foundry.shutdown(timeout=5.0)
+    join_graced()
+    assert (a.closes, b.closes, c.closes) == (1, 1, 1), (a, b, c)
+    assert a.refused == 0 and a.overlaps == 0, a
+
+
+def test_a_member_beneath_the_workers_sink_is_not_closed_by_a_stale_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-002: the first section's *remaining* holds the worker's current sink.
+
+    `S = MultiSink(X, Y)` is armed again by a straddle beside the worker's
+    `MultiSink(X, Z)`, and the drain thread is parked inside X through the latter. A swap to C
+    takes S as stale; S's forward of X is skipped because X lies beneath the worker's sink, which
+    that section leaves in the record. Leaving the worker's sink out of *remaining* closed X under
+    the drain thread.
+    """
+    x, y, z, c = Shared("X"), Shared("Y"), Shared("Z"), Shared("C")
+    stale = MultiSink(x, y)
+    log_foundry.configure(service="remaining-old", sink=stale)
+    _write("spans")
+    _straddle(monkeypatch, stale, MultiSink(x, z))
+    assert y.closes == 1, "the first swap took the stale wrapper once"
+    x.park_emit = threading.Event()
+    _span()
+    assert x.parked.wait(GATE)
+    swap = threading.Thread(target=lambda: log_foundry.configure(sink=c), name="swapper")
+    swap.start()
+    assert _wait(lambda: y.closes == 2), "the premise: the swap took the re-armed wrapper again"
+    time.sleep(0.2)
+    assert x.closes == 0 and x.closed_while_inside == 0, x
+    _leave(x)
+    swap.join(GATE)
+    assert not swap.is_alive()
+    log_foundry.shutdown(timeout=5.0)
+    join_graced()
+    assert x.closes == 1 and x.closed_while_inside == 0 and x.refused == 0, x
 
 
 class Reconfigures(Shared):

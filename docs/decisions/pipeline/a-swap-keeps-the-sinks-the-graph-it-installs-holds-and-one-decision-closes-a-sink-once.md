@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A swap keeps the sinks the graph it installs holds, and one decision closes a sink once"
-description: "a `configure()` reads the graph it installs once, from its argument, and an owed sink in it is ceded, not released: it joins that graph and its holder's forward closes it; every release one decision starts carries a `_Keep`, so a forward skips a sink kept, beneath one still owed, or already closed by that decision. Never leave a kept sink in the record as a root; never take to close a sink beneath one in use; never re-read the configuration at a release; never keep a stored per-sink count; never defer the displaced graph's release. (SPEC-087)"
+description: "a `configure()` reads the graph it installs once, from its argument, and an owed sink in it is ceded, not released: it joins that graph and its holder's forward closes it; every release one decision starts carries a `_Keep`, so a forward skips a sink kept, beneath one still owed, or already closed by that decision. Never leave a kept sink the swap would have released owed as a root (an unfenced or held one stays owed, as before, closed by its own take); never take to close a sink beneath one in use; never re-read the configuration at a release; never keep a stored per-sink count; never defer the displaced graph's release. (SPEC-087)"
 ---
 
 **The defect.** `configure(A)` then `configure(MultiSink(A, B))`, or the reverse, closed A at the
@@ -107,8 +107,10 @@ shared sink refuses after close):
   it, which the library cannot tell apart; the closer ordering a member after its holder is what
   would close it, and that is the lifecycle command-path spec's.
 
-**Do NOT** leave a kept sink in the record as a root: the five readers above decide by the identity
-of the worker's top-level sink and do not see the drain thread inside it. **Do NOT** take, to
+**Do NOT** leave a kept sink the swap would have released in the record as a root: the five
+readers above decide by the identity of the worker's top-level sink and do not see the drain
+thread inside it. A kept sink displaced without a confirmed fence, or still held, stays owed as
+before, where the worker's own record still names it, and is closed by its own take. **Do NOT** take, to
 close, a sink that lies beneath one still in use; pass it over and leave it owed. **Do NOT** re-read
 the configuration at a release: the swap answers from the sink it is handed, and a later change
 must not answer for an earlier one. **Do NOT** keep a stored per-sink count of holders. **Do NOT**

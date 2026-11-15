@@ -1171,7 +1171,10 @@ both delivery paths:
 
 - **Build it on a shipped wrapper and inherit its `close()`** — `class MyWrapper(TransformSink)`,
   or `FilteringSink` or `MultiSink`. Its member then sits where the library can see it, and the
-  library closes the member exactly once.
+  library closes the member exactly once. The inherited `close()` must run on the thread that
+  calls your wrapper's `close()`: a `close()` that hands `super().close()` to another thread
+  forwards the member's close where the library cannot tell it is part of a sink change, so it
+  cannot spare a member the new sink still holds.
 - **Leave the member's close out of your wrapper's `close()`, and close the member yourself** after
   `shutdown()`. The library then closes the member only when you configure it directly.
 
