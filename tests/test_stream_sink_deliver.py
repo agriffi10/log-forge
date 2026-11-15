@@ -25,8 +25,9 @@ import log_foundry
 from conftest import install_worker, run_concurrently
 from file_handles import A, D, J, R, Rounds, U, run
 from log_foundry.sinks import _engine
+from log_foundry.sinks import stdout as stdout_module
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-from log_foundry.sinks.stdout import StderrSink, StdoutSink, _unbuffered
+from log_foundry.sinks.stdout import StderrSink, StdoutSink
 from log_foundry.sinks.verdict import read_deliver
 from log_foundry.worker import Worker
 from verdict_sinks import WaitRecorder
@@ -282,6 +283,7 @@ def test_the_shape_check_is_exact_and_safe(tmp_path: Path) -> None:
     def raw() -> io.FileIO:
         return io.FileIO(tmp_path / "shape.txt", "w")
 
+    _unbuffered = stdout_module._unbuffered
     exact = io.TextIOWrapper(raw(), write_through=True)
     assert _unbuffered(exact)
     exact.close()
