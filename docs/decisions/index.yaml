@@ -243,7 +243,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-delivery/a-refusal-no-retry-can-cure-is-marked-and-the-worker-abandons-it-at-once.md"
       - title: "A sink declares what it retries, and anything else fails at once"
-        fence: "every engine sink's round asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`; the file sinks' predicate is an `errno` set and accepts neither. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver`, whose refused events are final. (SPEC-070, SPEC-073, SPEC-074, SPEC-082)"
+        fence: "every engine sink's round asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`; the file and stream sinks' predicates are `errno` sets and accept neither. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver`, whose refused events are final. (SPEC-070, SPEC-073, SPEC-074, SPEC-082, SPEC-084)"
         status: "stable"
         path: "docs/decisions/sink-delivery/a-sink-declares-what-it-retries-and-anything-else-fails-at-once.md"
       - title: "A sink imports its extra through `import_extra`, and a missing one is refused naming it"

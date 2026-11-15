@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A sink declares what it retries, and anything else fails at once"
-description: "every engine sink's round asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`; the file sinks' predicate is an `errno` set and accepts neither. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver`, whose refused events are final. (SPEC-070, SPEC-073, SPEC-074, SPEC-082)"
+description: "every engine sink's round asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`; the file and stream sinks' predicates are `errno` sets and accept neither. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver`, whose refused events are final. (SPEC-070, SPEC-073, SPEC-074, SPEC-082, SPEC-084)"
 ---
 
 **A sink declares what it retries, and anything else fails at once** — before SPEC-070 ten SDK and
@@ -49,8 +49,8 @@ The drivers are imported lazily — `PostgresSink._connect` imports `psycopg` on
 set resolved at import or in `__init__` would be `()` and stay `()`, failing every transient error
 at once. Every driver predicate also accepts the builtin `ConnectionError` and `TimeoutError`, what an
 injected client or a stand-in raises for a dropped connection or a timeout. The file sinks'
-predicate does not (SPEC-082): a file has no connection to drop, so it retries an `OSError` by
-its `errno` alone, and a builtin `ConnectionError` or `TimeoutError`, which carries none of those
+predicate does not (SPEC-082), nor does the stream sinks' (SPEC-084): a file or a stream has no
+connection to drop, so each retries an `OSError` by its `errno` alone, and a builtin `ConnectionError` or `TimeoutError`, which carries none of those
 codes, fails at once like any other exception.
 
 **What each sink retries**, read at the locked driver versions:
@@ -67,6 +67,7 @@ codes, fails at once like any other exception.
 | `AzureEventHubsSink` | `ConnectionLostError`, `ConnectError` except `AuthenticationError`, `OperationTimeoutError` | `EventDataError`, `EventDataSendError`, `ClientClosedError`, a bare `EventHubError` | azure-eventhub 5.15.1 `exceptions.py`, `_transport/_pyamqp_transport.py` |
 | `PostgresSink` | an `OperationalError` whose SQLSTATE class is `08`, `40`, `53` or `57`, or which is `55P03` or `55006`; one with no SQLSTATE that is not a connect-time refusal | class `28`, `54`, the rest of `55` and every other `OperationalError`; `DataError`, `IntegrityError`, `ProgrammingError`, `InternalError`, `InterfaceError`, `NotSupportedError` | psycopg 3.3.6 `errors.py`, which files every server condition under `OperationalError`, so the SQLSTATE decides; PostgreSQL's *Appendix A* for the classes |
 | `FileSink`, `RotatingFileSink` | an `OSError` whose `errno` is `ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`, `EAGAIN`, `EMFILE` or `ENFILE`, and no builtin by its class | `EACCES`, `EPERM`, `EROFS`, an `OSError` with no `errno`, and any exception that is not an `OSError` | SPEC-082 FR-004: what a resend can cure, space freed, a limit raised or a descriptor released |
+| `StdoutSink`, `StderrSink` | an `OSError` whose `errno` is `ENOSPC`, `EDQUOT`, `EFBIG`, `EIO` or `EAGAIN`, and no builtin by its class | `EPIPE`, `EBADF`, an `OSError` with no `errno`, a closed stream's `ValueError`, a `UnicodeEncodeError`, and any exception that is not an `OSError` | SPEC-084 FR-003: the file sinks' set less `EMFILE` and `ENFILE`, since a stream sink opens nothing |
 
 **PostgreSQL's connect-time refusal is recognised by its text**, because nothing structured carries
 it: psycopg raises every failed connect as a plain `OperationalError` with `sqlstate=None`, and at
@@ -129,8 +130,8 @@ See above: a lazily imported driver would leave the set empty for good.
 predicate that imports its driver, or a cached class set. `tests/test_classify.py` holds the loops
 to the rule with a roster derived from the AST (every `for` over `range(...)` naming `retries`, a
 floor shared with the engine rounds, a fixture corpus; restated by SPEC-074 over the engine sinks'
-rounds, every class defining `deliver` less its named exclusions, floor 13 since SPEC-082 added
-the two file sinks, eleven before), holds `http.py` to reaching `_attempt` only
+rounds, every class defining `deliver` less its named exclusions, floor 14 since SPEC-084 added
+`StdoutSink`, 13 since SPEC-082 added the two file sinks, eleven before), holds `http.py` to reaching `_attempt` only
 through `_exchange` inside an engine round, holds SQS and SNS to reading `SenderFault` only through
 `sender_fault`, and — on the integration workflow's extras leg — checks every class name a
 predicate resolves exists in the installed driver, so a rename cannot empty a set unnoticed.
@@ -139,6 +140,11 @@ predicate resolves exists in the installed driver, so a rename cannot empty a se
 
 ### 2026-11-15
 
+- **Refined** by SPEC-084: `StdoutSink` joins the engine rounds (`StderrSink` inherits its
+  round) with an `errno` predicate that, like the file sinks', accepts neither builtin, so the
+  fence, the builtins paragraph and the table name the stream sinks too. The engine-round floor
+  is 14, and `StdoutSink` is excluded by name from the retry sweep, its predicate held in
+  `tests/test_stream_sink_deliver.py`. 1.x's worker resent a stream sink on every raise.
 - **Refined** by SPEC-082: `FileSink` and `RotatingFileSink` join the engine rounds with a
   predicate over `errno`, the first that does not accept builtin `ConnectionError` and
   `TimeoutError`, so the fence and the paragraph that said every predicate accepts them are

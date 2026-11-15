@@ -261,6 +261,29 @@ def test_the_latch_rejects_handed_lines_until_a_clean_round() -> None:
     assert sink._faulted
 
 
+def test_a_latched_round_writes_its_own_line_for_the_handed_lines(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The latched handed lines get a group of their own, which still says they may have landed."""
+    enospc = lambda: _oserror(errno.ENOSPC)  # noqa: E731
+    stream = _Recorder(write_faults={2: enospc, 5: enospc})
+    sink = StdoutSink(stream)  # type: ignore[arg-type]
+    sink.emit(_events(5, "a"))
+    assert sink._faulted, "the premise: the first round left its handed lines unknown"
+    capsys.readouterr()
+    with pytest.raises(SinkDeliveryError):
+        sink.emit(_events(5, "b"))
+    err = capsys.readouterr().err
+    assert _sink_lines(err) == [
+        (
+            "log-foundry: lost 3 event(s); StdoutSink, 1 attempt(s), OSError errno=28; "
+            "after an earlier fault; they may have landed"
+        ),
+        "log-foundry: lost 2 event(s); StdoutSink, 1 attempt(s), OSError errno=28",
+    ]
+    assert SENTINEL not in err
+
+
 def test_a_first_flush_raising_broken_pipe_fails_the_emit_and_one_worker_batch() -> None:
     stream = _Recorder(flush_faults={0: _epipe})
     with pytest.raises(BrokenPipeError):
