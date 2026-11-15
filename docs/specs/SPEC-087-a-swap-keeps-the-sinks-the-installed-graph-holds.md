@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-087
 title: "A Swap Keeps the Sinks the Graph It Installs Still Holds"
 description: "Stops configure(sink=...) from closing a sink that the outgoing and the incoming sink graph share, so a caller who adds a destination beside a sink, or drops one, loses no event, and every sink is still closed exactly once."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-032, SPEC-042, SPEC-045, SPEC-054, SPEC-078, SPEC-079, SPEC-081]
 arc: audit-2026-11-14
 arc_order: 3
