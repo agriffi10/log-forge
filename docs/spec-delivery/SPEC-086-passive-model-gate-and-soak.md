@@ -41,10 +41,16 @@
 ## Verification
 
 All of the runs below were on macOS, Python 3.13.1 and 10 cores. Loads are one-minute averages.
-They were run at `acf5196e` unless a row says otherwise. Between that commit and the head,
-`a4391701`, `src/` and `.github/` did not change. The tests changed in only two places: a red soak
-item now raises its report instead of asserting it, and the refused-switch tests took their shape
-at the head. `git diff --stat origin/main -- .github/ src/` is empty for the branch (FR-003).
+They were run at `acf5196e` unless a row says otherwise. That is the build commit on the
+library of `6bd0b66e`, before the branch was rebased onto `bb6656ff`. The gating set and the
+whole suite were run again at the rebased `8bc746c3`. Between `acf5196e` and the head, the branch
+itself changed no file under `src/` or `.github/`. Its tests changed in four places:
+- a red soak item raises its report instead of asserting it;
+- the refused-switch tests took their final shape;
+- the wiring test runs once per passive form;
+- the rerun note has a test of its own.
+
+`git diff --stat origin/main -- .github/ src/` is empty for the rebased branch (FR-003).
 
 **FR-001, the owed CI margin.** This is owed to the pull request's green run of the `CI` workflow.
 Each leg must be at most 0.5 s.
@@ -54,16 +60,23 @@ Each leg must be at most 0.5 s.
 | Python 3.12 | **OWED: fill in after CI** | **OWED** | **OWED** |
 | Python 3.13 | **OWED: fill in after CI** | **OWED** | **OWED** |
 
-These are the local readings. The whole suite at `a4391701` gave 10972 passed, 35 skipped and 21
-xfailed, and its `model gate:` line read 0.031 s at `[deliver-seed15]`. At `acf5196e` the whole
+These are the local readings. The whole suite at the rebased `8bc746c3` gave 11352 passed, 39
+skipped and 21 xfailed, and its `model gate:` line read 0.009 s at `[http-seed12]`. At
+`a4391701` it gave 10972 passed, 35 skipped and 21 xfailed, at 0.031 s at `[deliver-seed15]`. At
+`acf5196e` the whole
 suite gave 10968 passed, 35 skipped and 21 xfailed, at 0.006 s at `[http-seed14]`, and `-n 0` on
 the model file read 0.008 s at `[seed0]`.
 
-**FR-002, the gating set over seeds 0 to 999.** The command was
-`LOG_FOUNDRY_MODEL_SEEDS=0-999 poetry run pytest tests/test_invariants_model.py -p no:cacheprovider -q`.
-It ran green: exit 0, with **4007 passed** in 80.66 s at `-n 12`. That is 3,000 concurrent items,
-1,000 sequential items and 7 others, at a load of 6.4 before and 11.8 after. The gate line read
-0.108 s at `[http-seed764]`.
+**FR-002, the gating set over seeds 0 to 999, at the rebased `8bc746c3`.** The command was
+`LOG_FOUNDRY_MODEL_SEEDS=0-999 poetry run pytest tests/test_invariants_model.py -p no:cacheprovider -q`,
+run alone. It ran green: exit 0, with **4012 passed** in 91.33 s at `-n 12`. That is 3,000
+concurrent items, 1,000 sequential items and 12 others, at a load of 11.5 before and 19.6 after.
+The gate line read 0.061 s at `[http-seed208]`. The commits after `8bc746c3` change only this
+document. If `main` moves before the merge, the branch is rebased again inside the queue lock,
+and the pull request says so.
+
+Before the rebase, at `acf5196e`, the same command gave 4007 passed in 80.66 s (load 6.4 to 11.8),
+with the gate line at 0.108 s at `[http-seed764]`.
 
 **FR-004, the parent of #339, `31dda162`.** The tree was exported with `git archive 31dda162 | tar -x`
 into a scratch directory, and `tests/test_invariants_model.py` and `tests/model_oracles.py` at
@@ -145,6 +158,14 @@ row, which ran in the worktree at `a4391701`.
 | `pytest_configure` swallows the `ValueError` | the refused-switch test and the session-hook test | at `a4391701`, 10 of 10 red; each nested session read `63 passed, 12 errors`, exit 1 |
 
 **Test ids, collected by the runner.** The ids were collected with `-n 0 --collect-only` from
-exports of `886b303c` and `a4391701`. Base has 10,968 ids and head has 11,028. After the model's
-renamed ids are mapped (`[3-deliver]` to `[deliver-seed3]`), **0 are removed and 60 are added**:
-four soak tests in the model file and 56 in `test_model_oracles.py`.
+exports of the rebased `8bc746c3` and of `origin/main` at `bb6656ff`. Base has 11,347 ids and
+head has 11,412. After the model's renamed ids are mapped (`[3-deliver]` to `[deliver-seed3]`,
+and the bare wiring id to `[emit]`), **0 are removed and 65 are added**. Nine of them are in the
+model file: the three wiring items, the three unwrappable-name items and the three rerun items.
+The other 56 are in `test_model_oracles.py`.
+
+The same diff against `886b303c` finds 2 removed and 446 added. Both removals, and every added id
+outside the two files above, come from `main`'s #377 to #379.
+The two removed ids are `test_numeric_door_roster.py` ids that carry `sinks/http.py` line
+numbers, which #379 moved. The earlier diff, from exports of `886b303c` and `a4391701`, found 0
+removed and 60 added: four soak tests in the model file and 56 in `test_model_oracles.py`.
