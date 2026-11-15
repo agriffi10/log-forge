@@ -1641,7 +1641,8 @@ def test_the_switches_decide_which_items_are_collected(
     assert all(re.search(r"\[seed\d+\]$", line) for line in driven)
     if switches:
         assert {line.rsplit("seed", 1)[1] for line in soaked + driven} == {"3]", "40]", "41]"}
-    assert any(line.endswith("::test_the_soak_is_wired") for line in ids), ids
+    wired = sorted(line.rsplit("::", 1)[1] for line in ids if "::test_the_soak_is_wired[" in line)
+    assert wired == [f"test_the_soak_is_wired[{form}]" for form in ("deliver", "emit", "http")], ids
 
 
 @pytest.mark.parametrize(
