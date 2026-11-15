@@ -86,11 +86,12 @@ class StdoutSink:
     dropped what it had not yet written, so a handed line is ``UNKNOWN``, counted in ``failed`` as
     an upper bound and announced as one that may have landed, never resent. A line not yet handed
     is ``RETRYABLE`` when a resend can cure the error and ``REJECTED`` otherwise. Two cases are
-    exact: a raise that is not an ``OSError`` took nothing, and on the unbuffered shape ``python
-    -u`` gives ``sys.stdout`` a ``write`` that returned landed and one that raised took nothing. A
-    **fault latch** makes a sustained fault fail: once a round leaves a handed line ``UNKNOWN``,
-    later rounds call such lines ``REJECTED`` until a round's final flush returns. Only the batch
-    during which a fault begins is counted rather than raised; every later one fails.
+    exact: a raise that is not an ``OSError``, or is ``io.UnsupportedOperation``, took nothing,
+    and on the unbuffered shape ``python -u`` gives ``sys.stdout`` a ``write`` that returned
+    landed and one that raised took nothing. A **fault latch** makes a sustained fault fail: once
+    a round leaves a handed line ``UNKNOWN``, later rounds call such lines ``REJECTED`` until a
+    round's final flush returns. Only the batch during which a fault begins is counted rather than
+    raised; every later one fails.
 
     What it cannot close, because it cannot see inside a stream it does not own: a stream that
     discards the tail of a line it cut leaves a torn prefix the next line joins; a short write on
@@ -178,10 +179,13 @@ class StdoutSink:
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Delivers the batch through the engine inline, keeping the 1.x ``emit`` contract.
 
-        One round, as 1.x's ``emit`` was one call. It returns when anything was accepted or a
-        handed line's fate is unknown, with what did not land counted in ``failed`` and not
-        written again. It raises only when the round delivered nothing, and then as 1.x did: the
-        stream's own error, as an instance of both ``SinkDeliveryError`` and its own class, so
+        One round, as 1.x's ``emit`` was one call. It returns when the run settled — anything was
+        accepted, or a handed line's fate is unknown — with what did not land counted in
+        ``failed`` and not written again. It raises when the run failed: nothing was accepted and
+        no handed line's fate is unknown, which includes a round whose handed lines the fault
+        latch made ``REJECTED``. So on a buffered stream the batch during which a fault begins
+        returns where 1.x raised, and later batches raise. It raises as 1.x did: the stream's own
+        error, as an instance of both ``SinkDeliveryError`` and its own class, so
         ``except OSError``, ``except BrokenPipeError`` and ``except SinkDeliveryError`` all still
         catch it.
 
@@ -192,7 +196,7 @@ class StdoutSink:
           None.
 
         Raises:
-          Exception: What the stream raised, when the round delivered nothing, as an instance of
+          Exception: What the stream raised, when the run failed, as an instance of
             ``SinkDeliveryError`` too with the original as its ``__cause__`` — or the original
             itself, unchanged, if the dual-typed exception cannot be built.
         """
@@ -276,7 +280,9 @@ class StdoutSink:
         from the ``write`` of line ``i`` may have taken part or all of it, so lines up to and
         including ``i`` were handed; any other exception from that ``write`` took nothing, since
         the ``io`` contract raises ``ValueError`` before any I/O and an encoding error comes
-        before the binary layer, so lines before ``i`` were handed; and a raising final flush
+        before the binary layer, so lines before ``i`` were handed. ``io.UnsupportedOperation``,
+        which a stream opened for reading raises, is both an ``OSError`` and a ``ValueError`` with
+        no ``errno``, and is raised before any I/O, so it too took nothing. A raising final flush
         leaves every line handed. A handed line is ``UNKNOWN``, or ``REJECTED`` while the latch
         is set, and sets the latch; a line not handed is ``RETRYABLE`` or ``REJECTED`` as the
         predicate answers. **On the unbuffered shape** each ``write`` is one ``write(2)``, so
@@ -311,7 +317,7 @@ class StdoutSink:
         if stage == _WRITE:
             if _unbuffered(self._stream):
                 accepted = handed
-            elif isinstance(error, OSError):
+            elif isinstance(error, OSError) and not isinstance(error, io.UnsupportedOperation):
                 unsure = handed + 1
             else:
                 unsure = handed

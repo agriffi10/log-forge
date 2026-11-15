@@ -501,7 +501,8 @@ that may have landed, because after a raise the stream does not say whether it k
 what it had not yet written. A line not handed is resent only when the sink's `errno` predicate
 says a resend can cure the error. A raise that is not an `OSError` took nothing, since the `io`
 contract raises `ValueError` for a closed stream before any I/O, so a closed `StringIO` fails
-every batch rather than settling it. On the exact shape `python -u` gives `sys.stdout`, a `write`
+every batch rather than settling it; so did `io.UnsupportedOperation`, which a stream opened for
+reading raises before any I/O though it is also an `OSError`. On the exact shape `python -u` gives `sys.stdout`, a `write`
 that returned landed and one that raised took nothing. **The fault latch is the NATS case above
 in another sink:** once a round leaves a handed line `UNKNOWN`, later rounds call such lines
 `REJECTED` until a round's final flush returns. So a stream that keeps nothing after a fault, such

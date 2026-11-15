@@ -11,7 +11,8 @@
 - **The round** (FR-002). It runs a pre-flush, then one `write` per encodable line, then one final
   `flush()`, and it judges each event by which call raised (`_lose`). A handed line is `UNKNOWN`
   and is never resent. A line that was not handed is `RETRYABLE` or `REJECTED`. A raise that is
-  not an `OSError` took nothing. On the exact unbuffered shape (`_unbuffered`), a `write` that
+  not an `OSError`, or is `io.UnsupportedOperation` (a stream opened for reading), took nothing.
+  On the exact unbuffered shape (`_unbuffered`), a `write` that
   returned is `ACCEPTED`. The fault latch, `_faulted`, makes a handed line `REJECTED` until a
   round's final flush returns.
 - **The predicate and the lines** (FR-003). `_retryable_error` is the `errno` set
@@ -51,8 +52,9 @@
 
 - **The latched group's line** reads `<Class>, N attempt(s), <Type>; after an earlier fault; they
   may have landed`. The spec fixes only the ending. `; after an earlier fault` was chosen to
-  distinguish this line from the `UNKNOWN` group's `; outcome unknown`. No test asserts the
-  latched line's text: a grep for `earlier fault` over `tests/` finds nothing.
+  distinguish this line from the `UNKNOWN` group's `; outcome unknown`.
+  `test_a_latched_round_writes_its_own_line_for_the_handed_lines` holds the wording: a mutant
+  that writes `; outcome unknown` for the latched group reddens it.
 - **On macOS, a line-buffered dead pipe raises at the pre-flush** of every batch after the first,
   so its batches fail without the latch. Only the block-buffered dead-pipe case reaches the latch
   through a real stream. This was re-run for this record on Python 3.13.1: block-buffered, every

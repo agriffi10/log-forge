@@ -275,7 +275,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-delivery/a-sinks-own-driver-error-is-counted-announced-and-raised-as-both-types.md"
       - title: "A stream sink reports what the stream took and never resends it"
-        fence: "`StdoutSink` and `StderrSink` pre-flush each round, hand the stream one `write` per line and flush once, and judge each event by which call raised. A line handed to the stream is `UNKNOWN` and never handed again; a raise that is not an `OSError` took nothing; the exact unbuffered shape is read by type; and a fault latch fails every batch after the one a sustained fault began in. Do NOT flush per line, write a guard newline, or read what the stream holds. (SPEC-084)"
+        fence: "`StdoutSink` and `StderrSink` pre-flush each round, hand the stream one `write` per line and flush once, and judge each event by which call raised. A line handed to the stream is `UNKNOWN` and never handed again; a raise that is not an `OSError`, or is `io.UnsupportedOperation`, took nothing; the exact unbuffered shape is read by type; and a fault latch fails every batch after the one a sustained fault began in. Do NOT flush per line, write a guard newline, or read what the stream holds. (SPEC-084)"
         status: "stable"
         path: "docs/decisions/sink-delivery/a-stream-sink-reports-what-the-stream-took-and-never-resends-it.md"
       - title: "A wrapper offers `deliver` exactly when what it wraps does, and counts only its own decisions"

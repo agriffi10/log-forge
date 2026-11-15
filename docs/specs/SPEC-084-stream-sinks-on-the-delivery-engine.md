@@ -180,7 +180,7 @@ order, then one `flush()`. Each event's outcome follows from which call raised. 
 |---|---|
 | the pre-flush raised | none was handed to the stream: every one `RETRYABLE` or `REJECTED`, as the predicate (FR-003) answers, and no `write` is called |
 | the pre-flush returned and the `write` of line `i` raised an `OSError` | every line up to and including `i` `UNKNOWN`; every later line `RETRYABLE` or `REJECTED` by the predicate |
-| the `write` of line `i` raised an exception that is not an `OSError` | every line before `i` `UNKNOWN`; line `i` and every later line `REJECTED` by the predicate |
+| the `write` of line `i` raised an exception that is not an `OSError`, or `io.UnsupportedOperation` | every line before `i` `UNKNOWN`; line `i` and every later line `REJECTED` by the predicate |
 | every `write` returned and the final `flush()` raised | every one `UNKNOWN` |
 | every call returned | every one `ACCEPTED` |
 
@@ -188,7 +188,10 @@ order, then one `flush()`. Each event's outcome follows from which call raised. 
 closed or detached stream before any I/O, and an encoding error is raised before the text reaches
 the binary layer. So that line was not taken. Without this rule a closed `StringIO`, whose
 `flush()` returns and whose `write` raises `ValueError`, made line 1 `UNKNOWN` and settled every
-batch.
+batch. **`io.UnsupportedOperation` is judged the same way**, though it is an `OSError` as well as
+a `ValueError`: a stream opened for reading raises it, with no `errno`, before any I/O. Judged as
+an `OSError`, `StdoutSink(open(path))` returned from its first batch with three events counted
+`failed` and a line saying they may have landed, where 1.x raised on every call.
 
 **The unbuffered shape.** When a call raises, the round checks whether the stream is exactly the
 shape `python -u` and `PYTHONUNBUFFERED=1` give `sys.stdout`: `type(stream) is io.TextIOWrapper`,
@@ -649,4 +652,6 @@ What each listed test change is for:
   only the runtime sweep; FR-001's second criterion and the File & Folder Structure say so now. The
   floor test `test_a_tree_of_fourteen_fails_the_floor` is named as it stands since SPEC-082 (the
   draft named its earlier `twelve`), and FR-004 now names `StderrSink`'s docstring, which repeats
-  the sentence about nothing pending between calls.
+  the sentence about nothing pending between calls. The diff review then found
+  `io.UnsupportedOperation`, an `OSError` that took nothing, judged as a write that may have taken
+  its line; FR-002's row and paragraph for a raise that is not an `OSError` now name it.

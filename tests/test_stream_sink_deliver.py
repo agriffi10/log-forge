@@ -227,9 +227,18 @@ def test_an_all_unencodable_batch_touches_the_stream_not_at_all() -> None:
     assert sink.losses() == SinkLosses(dropped=2, failed=0)
 
 
-def test_a_non_oserror_write_raise_took_nothing() -> None:
-    """A ``ValueError`` from line 3's ``write`` leaves lines 1 and 2 handed and line 3 not."""
-    stream = _Recorder(write_faults={2: lambda: ValueError("detached")})
+@pytest.mark.parametrize(
+    "raised",
+    [lambda: ValueError("detached"), lambda: io.UnsupportedOperation("not writable")],
+    ids=["ValueError", "UnsupportedOperation"],
+)
+def test_a_non_oserror_write_raise_took_nothing(raised: Callable[[], Exception]) -> None:
+    """A raise from line 3's ``write`` that took nothing leaves lines 1 and 2 handed and 3 not.
+
+    ``io.UnsupportedOperation`` is an ``OSError`` as well as a ``ValueError``, with no ``errno``,
+    and is raised before any I/O, so it is judged as taking nothing too.
+    """
+    stream = _Recorder(write_faults={2: raised})
     sink = StdoutSink(stream)  # type: ignore[arg-type]
     assert sink.deliver(_events(5)).outcomes == (U, U, J, J, J)
 
@@ -242,6 +251,31 @@ def test_a_closed_stream_fails_three_batches_in_a_row(closed: Callable[[], Any])
         with pytest.raises(SinkDeliveryError):
             sink.emit(_events(3))
     assert seen.outcomes == [(J, J, J)] * 3
+
+
+def test_a_read_only_stream_fails_every_batch_as_1x_raised(tmp_path: Path) -> None:
+    """A stream opened for reading raises ``io.UnsupportedOperation`` at the first ``write``.
+
+    The diff review's input: before the fix the first batch returned with three events counted
+    ``failed`` and a line saying they may have landed, where 1.x raised on every call.
+    """
+    path = tmp_path / "read-only.txt"
+    path.write_text("", encoding="utf-8")
+    with open(path, encoding="utf-8") as stream:
+        sink = StdoutSink(stream)
+        seen = Rounds(sink)
+        for _ in range(3):
+            with pytest.raises(io.UnsupportedOperation) as raised:
+                sink.emit(_events(3))
+            assert isinstance(raised.value, SinkDeliveryError)
+        assert seen.outcomes == [(J, J, J)] * 3
+        assert not sink._faulted
+
+        worker = _worker(sink, 3)
+        worker.submit(_events(2, "w"))
+        assert not worker.flush(timeout=30.0)
+        assert seen.outcomes[3:] == [(J, J)], "one deliver: nothing a resend can cure"
+        assert worker.failed_batches == 1
 
 
 def test_the_latch_rejects_handed_lines_until_a_clean_round() -> None:
@@ -282,6 +316,96 @@ def test_a_latched_round_writes_its_own_line_for_the_handed_lines(
         "log-foundry: lost 2 event(s); StdoutSink, 1 attempt(s), OSError errno=28",
     ]
     assert SENTINEL not in err
+
+
+def test_a_latched_run_lost_whole_announces_its_unencodable_events_with_the_handed_ones(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every encodable line handed, the final flush raising, the latch set: one line for all.
+
+    The run fails, so its unencodable event is counted in ``failed`` with the rest and the one
+    line the round writes for the handed lines must cover it too: 2 handed and 1 unencodable.
+    """
+    enospc = lambda: _oserror(errno.ENOSPC)  # noqa: E731
+    sink = StdoutSink(_Recorder(flush_faults={1: enospc, 3: enospc}))  # type: ignore[arg-type]
+    sink.emit(_events(2, "a"))
+    assert sink._faulted, "the premise: the first round's final flush left its lines unknown"
+    capsys.readouterr()
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([*_events(2, "b"), _bad()])
+    assert _sink_lines(capsys.readouterr().err) == [
+        (
+            "log-foundry: lost 3 event(s); StdoutSink, 1 attempt(s), OSError errno=28; "
+            "after an earlier fault; they may have landed"
+        )
+    ]
+    assert sink.losses() == SinkLosses(dropped=0, failed=5)
+
+
+def test_a_raising_final_flush_on_the_unbuffered_shape_accepts_every_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On the unbuffered shape every returned ``write`` reached the kernel, whatever flush says.
+
+    The real shape's final flush has nothing to write and cannot be made to raise, so the shape
+    check is patched to answer True over a double whose final flush raises.
+    """
+    monkeypatch.setattr(stdout_module, "_unbuffered", lambda stream: True)
+    stream = _Recorder(flush_faults={1: lambda: _oserror(errno.EIO)})
+    sink = StdoutSink(stream)  # type: ignore[arg-type]
+    assert sink.deliver(_events(3)).outcomes == (A, A, A)
+    assert not sink._faulted
+    assert sink.losses() is None
+
+
+def _present(*names: str) -> list[int]:
+    return [code for name in names if (code := getattr(errno, name, None)) is not None]
+
+
+def _curable(code: int) -> Callable[[], Exception]:
+    return lambda: OSError(code, os.strerror(code))
+
+
+_PREDICATE_TABLE: list[tuple[str, Callable[[], Exception], bool]] = [
+    *[
+        (name, _curable(code), True)
+        for name in ("ENOSPC", "EDQUOT", "EFBIG", "EIO", "EAGAIN")
+        if (code := getattr(errno, name, None)) is not None
+    ],
+    ("BlockingIOError", lambda: BlockingIOError(errno.EAGAIN, "would block"), True),
+    ("EPIPE", lambda: BrokenPipeError(errno.EPIPE, "Broken pipe"), False),
+    ("EBADF", lambda: OSError(errno.EBADF, "Bad file descriptor"), False),
+    ("EMFILE", lambda: OSError(errno.EMFILE, "Too many open files"), False),
+    ("errno-None", lambda: OSError("no errno"), False),
+    ("ValueError", lambda: ValueError("I/O operation on closed file"), False),
+    (
+        "UnicodeEncodeError",
+        lambda: UnicodeEncodeError("ascii", "\u20ac", 0, 1, "ordinal not in range"),
+        False,
+    ),
+    ("UnsupportedOperation", lambda: io.UnsupportedOperation("not writable"), False),
+    ("not-an-OSError", lambda: RuntimeError("not an OSError"), False),
+]
+"""FR-003's predicate, row by row; a curable ``errno`` this platform lacks is skipped."""
+
+
+@pytest.mark.parametrize(
+    ("error", "retried"),
+    [(error, retried) for _, error, retried in _PREDICATE_TABLE],
+    ids=[name for name, _, _ in _PREDICATE_TABLE],
+)
+def test_the_predicate_retries_exactly_the_curable_errnos(
+    error: Callable[[], Exception], retried: bool
+) -> None:
+    built = error()
+    assert StdoutSink(io.StringIO())._retryable_error(built) is retried, repr(built)
+
+
+def test_the_curable_set_is_exactly_the_five_names() -> None:
+    """The table above covers every member: an ``errno`` added to the set fails here."""
+    expected = frozenset(_present("ENOSPC", "EDQUOT", "EFBIG", "EIO", "EAGAIN"))
+    actual = stdout_module._RETRYABLE_ERRNOS
+    assert actual == expected
 
 
 def test_a_first_flush_raising_broken_pipe_fails_the_emit_and_one_worker_batch() -> None:
