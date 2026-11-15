@@ -1109,12 +1109,12 @@ close it.
   | A wrapper that closes its member | 1 close, under the drain thread | 1 close | 2 closes, overlapping |
 
   For the two installed sequences, 0 closes, where `5cb0f449` closed A once at the swap and lost
-  the events after it; measured again at `f4d45665`, each delivered 3 of 3 events with no loss
+  the events after it; measured again at the commit that merged SPEC-087, each delivered 3 of 3 events with no loss
   term moved and `A.close()` never called. The reproduction is
   `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`, written for SPEC-087 and
   not one of the audit's own: `configure(Leaves(A))`, a span; a second span parks the drain thread
   inside `A.emit`; `shutdown(timeout=0.2)`; `configure(MultiSink(A, B))`, a log with no span;
-  `shutdown(timeout=0.3)`; the emit released; `shutdown()`. Its output at `f4d45665`:
+  `shutdown(timeout=0.3)`; the emit released; `shutdown()`. Its output at the commit that merged SPEC-087:
 
   ```
   log-foundry: shutdown timed out after 0.2s; the sink is left open because the worker thread is still using it; 2 event(s) in flight, counted when the emit returns
@@ -1880,7 +1880,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   every release one decision starts carries a keep, so a shipped wrapper's forwarded release
   skips a sink that is kept, lies beneath a sink still owed, or that the decision already closed;
   and the closer's take and the swap's stale take pass over a sink lying beneath one still in
-  use. At `f4d45665` both `p4b` probes print 4 lines of 4 and 8 lines of 8 with every loss term
+  use. At the commit that merged SPEC-087 both `p4b` probes print 4 lines of 4 and 8 lines of 8 with every loss term
   0, and `p4_shared_child_swap.py` prints `X.closes=1` and `X.events_after_its_close=0` on all
   four rows. `tests/test_shared_sink_swap.py` holds every shipped wrapper in each direction, with
   and without spans, against a double that refuses after `close()` and against a `FileSink`; run
@@ -1893,7 +1893,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   read". **First, that rule closes one direction only.** In the reverse direction the sink
   released is the outgoing wrapper, which the new graph does not reach, and it was the wrapper's
   forwarded release that closed the live sink; so the closure is the kept read and the keep on
-  every forwarded release together (SPEC-087 FR-001 and FR-002). Evidence: at `f4d45665`, with
+  every forwarded release together (SPEC-087 FR-001 and FR-002). Evidence: at the commit that merged SPEC-087, with
   the keep's skip in `release` replaced by `False` and the read left in place, all 16 reverse
   rows of `tests/test_shared_sink_swap.py`'s table fail and all 12 forward rows pass.
   **Second, "decidable only against a live config read" is wrong as a requirement.** The swap is
@@ -2439,7 +2439,7 @@ and a third copy is a fork with no merge.
   sink is closed when its holder is released. For a shipped wrapper that is the library's own
   forwarded release, which skips what the decision keeps. For a wrapper the package does not ship
   it is the wrapper's own `close()`, which no rule in `release` can reach, and the read itself
-  stops at a bound. The counts below were measured at `f4d45665` with the refusing double of
+  stops at a bound. The counts below were measured at the commit that merged SPEC-087 with the refusing double of
   `tests/test_shared_sink_swap.py` (a sink that refuses after `close()` and counts its closes),
   one write before the swap and two after, then `shutdown()`; "spans" is a span per write, two
   events each, and every refused event is counted and announced, so invariant 2 holds and the

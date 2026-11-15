@@ -14,7 +14,7 @@
   use (`_lies_beneath`). Kept is tested first.
 - **The record** (FR-004, FR-006). `docs/architecture.md` §7 step 4, §12 (the item struck under
   *Resolved* with its two corrections; two new open items, the wrapper that leaves its member
-  alone and the stop-signal hand), §13 (the four shapes, re-measured at `f4d45665`); invariant 5;
+  alone and the stop-signal hand), §13 (the four shapes, re-measured on SPEC-087's merged tree); invariant 5;
   the new decision in `docs/decisions/pipeline/` and four rewritten in place; the README;
   `docs/release-notes/v1.2.1.md`, created here, which also carries SPEC-082's owed notes; the new
   probe `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`.
@@ -48,7 +48,7 @@ Forward `MultiSink` moves no top-level term because it absorbs a member's refusa
 counters, as before. The seeded concurrency test failed every seed there, A closed 116 to 136
 times.
 
-## Probes on the built tree (`f4d45665`)
+## Probes on the built tree (the commit that merged SPEC-087)
 
 `p4_shared_child_swap.py`: `X.closes=1 X.events_after_its_close=0` on all four rows (`multi` and
 `filter`, orphan and worker), stderr empty. `p4b_forward.py` and `p4b_shared_child_shipped_sink.py`:
@@ -112,10 +112,11 @@ claim, or remaining (killed); the closer's guard off, the swap's guard off (kill
 only (killed); a forward not inheriting the enclosing keep (killed); `_capture` bound at
 definition time (killed). Testing the guard before kept in the stale loop **survived** at first —
 on the worker path the second section cedes in either order — and is killed by the `[retired]`
-case of `test_a_stale_sink_both_kept_and_beneath_a_sink_in_use_is_ceded`, added in `f4d45665`.
+case of `test_a_stale_sink_both_kept_and_beneath_a_sink_in_use_is_ceded`, added for it.
 The completion ran `gen-index.sh` (no diff), `docs-lint.sh`, `spec-lint.sh` and
-`docstring-lint.py` on the branch. `f4d45665` is the build's head; the completion's commit
-changes no file under `src/` or `tests/`, so measurements taken there hold for the merged tree.
+`docstring-lint.py` on the branch. Every measurement here was taken on the build's code, which
+the completion's commit does not touch: no file under `src/` or `tests/` changes after it, so each
+is re-measurable at the commit that merged SPEC-087 into `main`.
 
 ## What changed from earlier specs?
 
