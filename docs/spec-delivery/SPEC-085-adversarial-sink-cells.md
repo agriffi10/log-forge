@@ -58,7 +58,7 @@ sibling) each reddened the test that guards it.
 **FR-004, the comparison with the spec.** No cell's verdict differed from the spec. On macOS the
 table ran with no cell pinned or withheld: during Phase 2, 104 red of the 616 calling cells in
 two runs, and at `c34c26d8` 105 red of 637, 0 differences each. On Linux under Python 3.12 and 3.13, which ran the
-scheduled cells and not the withheld ones, the cells and oracle files gave 552 passed and 21
+scheduled cells and not the withheld ones, the cells and oracle files at `c34c26d8` gave 552 passed and 21
 expected failures on each leg: the 20 pinned cells and the reproduction, each at its pin's verdict.
 
 **FR-005, the parents of three fixes**, each with the four model files copied over the export's
