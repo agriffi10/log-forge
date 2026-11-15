@@ -315,7 +315,7 @@ class PicklableHostile(OSError, metaclass=_BasesMeta):
 
 
 def test_a_dual_type_pickles_as_the_original_past_a_metaclass_bases_property() -> None:
-    """``__reduce__`` is documented ``Raises: None``; it reads the stored bases, never the property."""
+    """``__reduce__`` is documented ``Raises: None``; it names the original it closed over."""
     dual = delivery_error(PicklableHostile(5, "SENTINEL"))
     assert isinstance(dual, SinkDeliveryError)
     restored = pickle.loads(pickle.dumps(dual))  # noqa: S301
@@ -342,7 +342,7 @@ class FlippingFilename(OSError):
 
 
 def test_a_dual_type_still_pickles_when_an_attribute_raises_after_it_was_built() -> None:
-    """``__reduce__`` is documented ``Raises: None``; it pickles the original with nothing copied."""
+    """``__reduce__`` is documented ``Raises: None``; it reads ``filename``'s slot, not the property."""
     FlippingFilename.reads = 0
     dual = delivery_error(FlippingFilename(5, "SENTINEL"))
     assert isinstance(dual, SinkDeliveryError)
