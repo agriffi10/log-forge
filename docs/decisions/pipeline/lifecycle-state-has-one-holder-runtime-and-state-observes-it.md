@@ -19,8 +19,10 @@ home.
 and for a detached close its thread — held in four places (`_owed`, `_closing_now`, `_closers` and
 `_close_owed`'s local thread list), with the moves between them written out at each site.
 `_CloseRegistry`, held as `Runtime._closes`, owns all of them: `arm`, `take` (owed to in flight in
-one call under `_lock`, so no instant has a sink neither owed nor in flight), `put_back`,
-`register`, `finish`, and the reads. Each in-flight entry, a `_Close`, records its rule —
+one call under `_lock`, so no instant has a sink taken to be closed neither owed nor in flight),
+`put_back`, `cede` (out of the record with no close, for a sink the graph a swap installs still
+holds, which is then closed by that graph's forward; a ceded sink is neither owed nor in flight by
+design, SPEC-087), `register`, `finish`, and the reads. Each in-flight entry, a `_Close`, records its rule —
 `INLINE`, `JOINED` (a shutdown's fan-out, joined in full, SPEC-046) or `GRACED` (detached, given
 the call's one grace) — and its thread, and holds no sink, because the fork walk reaches the
 registry. An entry counts its participants, so a forwarded release joining a detached close still
@@ -103,10 +105,17 @@ both, by name. Do NOT let a library call decide
 on `Runtime.state`; it reads `_column()` under its own lock. Do NOT add lifecycle state at module
 scope in `_lifecycle.py`, or a field to `Runtime`, `Worker` or `_CloseRegistry`, without a row in
 the inventory test. Do NOT merge the three locks without re-deriving the lock order. Do NOT touch
-the owed record outside `_CloseRegistry.arm`, `take` and `put_back`. (SPEC-077 FR-001 to FR-003,
-SPEC-078 FR-001 to FR-004)
+the owed record outside `_CloseRegistry.arm`, `take`, `put_back` and `cede`. (SPEC-077 FR-001 to
+FR-003, SPEC-078 FR-001 to FR-004, SPEC-087 FR-001)
 
 ## History
+
+### 2026-11-15
+
+- **Refined by SPEC-087**: the close registry gains `cede`, the one move out of the owed record that
+  closes nothing, made by a swap for a sink the graph it installs still holds. The registry's list
+  of moves and the Do-NOT line name it, and the claim that no instant has a sink neither owed nor in
+  flight is narrowed to a sink taken to be closed, since a ceded sink is neither by design.
 
 ### 2026-11-13
 

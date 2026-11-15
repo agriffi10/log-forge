@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A shutdown waits for a swap in flight to decide, and a swap releases only what the record owes"
-description: "a `shutdown()` or the exit drain waits on each swap in flight's `_Operation.decided`, snapshotted in its entry section, within its one closer grace and never on its own thread or a `log-foundry-` thread, before it drains; and a swap's fenced branch releases the displaced sink only while `_CloseRegistry.owes` it. Never hold or wait on `config._sink_lock` for this. (fix after SPEC-079)"
+description: "a `shutdown()` or the exit drain waits on each swap in flight's `_Operation.decided`, snapshotted in its entry section, within its one closer grace and never on its own thread or a `log-foundry-` thread, before it drains; and a swap's fenced branch releases the displaced sink only while `_CloseRegistry.owes` it, and cedes it instead, closing nothing, when the graph the swap installs still holds it. Never hold or wait on `config._sink_lock` for this. (fix after SPEC-079; SPEC-087)"
 ---
 
 **The defect.** `configure(sink=B)` with a live worker on A retargets the worker (A to B, verdict
@@ -22,12 +22,27 @@ take only from the record's own values. This is what keeps A once on every path 
 cannot cover — a re-entrant `shutdown()`, one whose wait ran out, and the unserialized configure
 pair. **It is not the arm re-check the `_sink_lock` decision rejected.** Skipping an *arm* can leave
 a sink owed by nobody, because nothing else may arm it. Skipping a *release* of a sink the record
-no longer owes cannot, because every route out of the record is a take whose taker performs the
-close (`take` moves it to in flight in one call), and the worker's sink is always armed — the build
+no longer owes cannot, because the worker's sink leaves the record only by a take whose taker
+performs the close (`take` moves it to in flight in one call). The two other ways a sink leaves the
+record since SPEC-087 never apply to it: the closer's guard passes over only a sink lying beneath
+one still in use, and puts it back, so it reads as owed again; and `_CloseRegistry.cede`, the one
+route out that closes nothing, is made only of a kept sink, in the section that arms the graph
+holding it, never of the worker's current sink. And the worker's sink is always armed — the build
 arms it, the swap arms what it installs, a forked child re-arms `worker.sink` — so "not owed" on the
 fenced branch means "taken", never "never armed". An unserialized second swap retargeting B to C
 before B's swap has armed B finds B not owed and skips it; B's own swap then arms it, so B is closed
 once, later, instead of twice.
+
+**When the graph the swap installs still holds the displaced sink, the fenced branch cedes it
+rather than releasing it** (SPEC-087). The swap reads that graph once, before its first critical
+section; where the displaced sink is in it and the record owes it, the branch takes it out of the
+record with `_CloseRegistry.cede` and closes nothing, so the sink joins the installed graph and is
+closed once, by that graph's own forward, when it is released. The `owes` and `held` terms still
+decide whether the branch acts on the sink at all; the cede only replaces the release. Releasing it
+here closed the live destination: `configure(A)` then `configure(MultiSink(A, B))` lost every
+later event a sink that refuses after `close()` was offered. The rule, and what it rejected:
+*A swap keeps the sinks the graph it installs holds, and one decision closes a sink once*, in this
+directory.
 
 **Part 2: a shutdown waits for each swap in flight to take its decision.** `_Operation` carries
 `decided`, a `threading.Event`, and `thread`, the ident of the call that built it. `_swap_sink` sets
@@ -80,8 +95,9 @@ longer owed.** A re-entrant `shutdown()` from the new sink's stop-signal setter,
 one that retires the worker before the retarget's fence flush reads the count, makes that flush
 answer `retired` without trying. The verdict turns on the fact the unconfirmed-swap line reports:
 whether the displaced sink is still owed, read after that flush. Not owed, the retiring shutdown
-took it — a take happens only once nothing of the drain can be inside it, and the taker closes it
-— so `Worker.retarget` reports `declined`; it used to read `unfenced`, so `incomplete_swaps` went
+took it — a take happens only once nothing of the drain can be inside it, and the taker closes it;
+no swap cedes the worker's own sink, and the closer's guard puts back only a sink lying beneath one
+still held — so `Worker.retarget` reports `declined`; it used to read `unfenced`, so `incomplete_swaps` went
 to 1 and a line said the displaced sink "could not be confirmed drained" and was "left open"
 though it had been closed. **Still owed, it stays `unfenced`**, line and count as before: a
 cross-thread shutdown waiting for this swap's decision has not taken it yet, and one that expired
@@ -119,6 +135,15 @@ grace); accepted, because invariant 3 still bounds it and a fix needs a thread-l
 code.
 
 ## History
+
+### 2026-11-15
+
+- **Refined by SPEC-087**: the fenced branch cedes the displaced sink, closing nothing, when the
+  graph the swap installs still holds it, rather than releasing it under the graph that now
+  delivers to it; fence and Part 1 say so. Part 1's reason that "not owed" means "taken" no longer
+  rests on every route out of the record being a take, which `cede` and the closer's guard made
+  false as written: it now says why neither applies to the worker's sink. The retirement
+  paragraph's verdict is unchanged, with the same reason added.
 
 ### 2026-11-12
 

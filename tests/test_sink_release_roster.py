@@ -625,7 +625,8 @@ _LATCH_DISPOSITIONS = {
         "records nothing, and does not need to: `_close_owed` takes the sink out of the owed "
         "record and registers its close in **one** critical section under _state._lock before "
         "any close starts, so two callers cannot perform the same close and there is no instant "
-        "at which the sink is neither owed nor in flight (SPEC-054 FR-002, FR-003). The "
+        "at which a sink it takes is neither owed nor in flight (SPEC-054 FR-002, FR-003); a "
+        "kept sink a swap cedes is neither, by design, as its holder is owed (SPEC-087). The "
         "closed-sink latch this column was named for is retired: an emit that lands re-arms, "
         "always, and what it protected against is answered at close time by `held`"
     ),

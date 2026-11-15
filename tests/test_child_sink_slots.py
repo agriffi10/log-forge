@@ -56,6 +56,10 @@ _NOT_CHILD_SINK_SLOTS: dict[tuple[str, str], dict[str, str]] = {
         "owed": "the owed-close record: a record of sinks, never a wrapper's child; it seeds "
         "the marking frontier and is never walked as a holder",
     },
+    ("_lifecycle", "_Keep"): {
+        "remaining": "a decision's record of sinks, alive only for that decision's closes "
+        "(SPEC-087 FR-002), never a wrapper's child",
+    },
     ("config", "Config"): {
         "sink_factory": "a callable that builds a sink, never a sink; its built sink is recorded "
         "from the factory wrapper's `_inner`",

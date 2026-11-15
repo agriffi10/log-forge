@@ -719,8 +719,8 @@ def test_a_worker_that_did_adopt_the_recorded_sink_leaves_one_close() -> None:
     assert sink.closes == 1, f"a mixed process closes once, in either order: {sink}"
 
 
-_RECORD_MOVES = frozenset({"arm", "take", "put_back"})
-"""The close registry's methods that arm or drop an owed sink (SPEC-078 FR-001)."""
+_RECORD_MOVES = frozenset({"arm", "take", "put_back", "cede"})
+"""The close registry's methods that arm or drop an owed sink (SPEC-078 FR-001, SPEC-087)."""
 
 _RECORD_WRITERS = frozenset(
     {
@@ -728,6 +728,7 @@ _RECORD_WRITERS = frozenset(
         "_CloseRegistry.arm",
         "_CloseRegistry.take",
         "_CloseRegistry.put_back",
+        "_CloseRegistry.cede",
     }
 )
 """The only functions allowed to touch the owed record other than to read it."""
@@ -736,7 +737,9 @@ _RECORD_MUTATORS = frozenset(
     {"pop", "popitem", "setdefault", "clear", "update", "__setitem__", "__delitem__"}
 )
 
-OWED_WRITE_OUTSIDE = "the owed record is written outside the close registry's arm/take/put_back"
+OWED_WRITE_OUTSIDE = (
+    "the owed record is written outside the close registry's arm, take, put_back and cede"
+)
 
 
 def _qualified_scopes(tree: ast.AST) -> dict[int, str]:
@@ -766,9 +769,9 @@ def _orphan_record_sites(
     """Every site that arms or drops an owed sink, and every write to the record, in one walk.
 
     One walker, for both properties asserted over this population (SPEC-078 FR-001 AC-1): the
-    disposition table below, and that nothing outside the registry's own three moves writes the
-    record. Since SPEC-078 the record is ``_state._closes.owed`` and every arm, take and put-back
-    is a call to the registry, so the *sites* are those calls, by enclosing function and
+    disposition table below, and that nothing outside the registry's own four moves writes the
+    record. Since SPEC-078 the record is ``_state._closes.owed`` and every arm, take, put-back and
+    cede (SPEC-087) is a call to the registry, so the *sites* are those calls, by enclosing function and
     occurrence; a write is any subscript of the record (a read included — the record is read
     whole, through ``.values()`` or ``in``, everywhere else), a ``del`` of one, a mutating method
     call on it, or a rebind.
@@ -829,9 +832,9 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
 
     SPEC-045 made the record a `dict` rather than a single slot, which collapsed three separate
     clears into one transition. SPEC-054 FR-002 then merged four records into it and FR-003 gave
-    it one closer. SPEC-078 FR-001 moved it onto the close registry, so every arm, take and
-    put-back is now a call to the registry, and the record itself is written only inside those
-    three methods: the second assertion is that scan, and its corpus is below.
+    it one closer. SPEC-078 FR-001 moved it onto the close registry, so every arm, take, put-back
+    and, since SPEC-087, cede is now a call to the registry, and the record itself is written only
+    inside those four methods: the second assertion is that scan, and its corpus is below.
 
     The set equality **is** the floor: an exact comparison against a hand-written table cannot
     shrink unnoticed, so a separate `>= n` assertion beside it would read as a second safety net
@@ -877,16 +880,28 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "removed per sink — the previous sink, once the worker confirmed its fence, so "
             "nothing can still be inside it; released detached and joined to the swap's budget"
         ),
+        ("_swap_sink", "cede", 0): (
+            "removed with no close — no live worker: an owed sink the graph this swap installs "
+            "still holds is kept, so it leaves the record and joins that graph in the section that "
+            "arms it, closed later by the graph's forward (SPEC-087 FR-001)"
+        ),
+        ("_swap_sink", "cede", 1): (
+            "removed with no close — after the retarget: the displaced sink once its fence is "
+            "confirmed, or a stale sink the first section passed over, when the graph armed in "
+            "this section still holds it; it joins that graph (SPEC-087 FR-001)"
+        ),
         ("_close_owed", "take", 0): (
             "removed per sink — the one closer performs that sink's close, and the take records "
-            "it in flight in the **same** call, so there is no instant at which the sink is "
-            "neither owed nor in flight (SPEC-054 FR-003)"
+            "it in flight in the **same** call, so there is no instant at which a sink it takes "
+            "is neither owed nor in flight (SPEC-054 FR-003)"
         ),
         ("_close_owed", "put_back", 0): (
             "re-armed — a sink this call took but never handed to a closer is put back, so an "
             "interrupt between the take and the close leaves it owed rather than owed by nobody. "
             "`setdefault`, so a re-arm that landed meanwhile keeps its own entry. Measured "
-            "before it: three sinks, `closes=[0, 0, 0]`, and an empty record"
+            "before it: three sinks, `closes=[0, 0, 0]`, and an empty record. Also a sink the "
+            "take found lying beneath one the take left in the record, which the guard passed "
+            "over, so a later call closes it once nothing holds it (SPEC-087 FR-003)"
         ),
     }
     found = set(_orphan_record_sites()[0])

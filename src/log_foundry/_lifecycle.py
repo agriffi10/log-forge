@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from log_foundry import _diag, _fork, _sink_arg
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from log_foundry.results import FlushResult
     from log_foundry.sinks.base import Sink
@@ -294,12 +294,19 @@ class _CloseRegistry:
     (``Runtime._owed``), **in flight** (``_closing_now`` under its own leaf lock) and, for a
     detached close, **its thread** (``_closers`` under another), plus the fan-out threads
     :func:`_close_owed` kept in a local list. The moves between them were written out at each
-    site, and the rule all of them keep — no instant at which a sink is neither owed nor in flight
-    (SPEC-054 FR-003) — was restated at each. Here :meth:`take` removes a sink from ``owed`` and
-    records its entry in one call made under ``_state._lock``, so the rule has one home.
+    site, and the rule all of them keep — no instant at which a sink taken to be closed is
+    neither owed nor in flight (SPEC-054 FR-003) — was restated at each. Here :meth:`take` removes
+    a sink from ``owed`` and records its entry in one call made under ``_state._lock``, so the rule
+    has one home.
+
+    **Four moves, and one of them closes nothing** (SPEC-087 FR-001). A sink leaves the record by a
+    :meth:`take`, whose taker closes it, or a take the closer's guard passes over, which ends in a
+    :meth:`put_back` and is closed by a later call; or by :meth:`cede`, which closes nothing,
+    because the sink is kept by the graph a swap installs and that graph's own forward closes it.
+    A ceded sink is neither owed nor in flight, by design: its holder is owed.
 
     **Two locks guard it, by half.** ``owed`` is guarded by ``Runtime._lock``, which every caller
-    that arms, takes or puts back already holds. The in-flight half is guarded by :attr:`_lock`, a
+    that arms, takes, cedes or puts back already holds. The in-flight half is guarded by :attr:`_lock`, a
     leaf: :meth:`Runtime.held` and :meth:`Runtime.in_flight` are asked with ``_state._lock`` held
     and read it, and closer threads discharge it without ``_state._lock``. That leaf replaces two
     (``_closing_now_lock`` and ``_closers_lock``), which were both leaves under ``_state._lock``
@@ -402,6 +409,35 @@ class _CloseRegistry:
         """
         self.owed.pop(id(sink), None)
         return self._enter(sink, rule)
+
+    def cede(self, sink: Sink) -> None:
+        """Takes a kept sink out of the record with no close; the caller holds ``_state._lock``.
+
+        The one route out of the record that closes nothing (SPEC-087 FR-001). A ``configure()``
+        whose installed graph still holds an owed sink would otherwise release it while it is the
+        live destination, and a sink that has released its transport refuses every later event.
+        So :func:`_swap_sink` cedes such a sink here instead, and only in the critical section
+        that arms the sink holding it: the sink is then a member of that graph and nothing else,
+        closed when its holder is released, by the holder's forward. A ceded sink is neither owed
+        nor in flight, by design, because its holder is owed.
+
+        It is not left in the record as a root, because five readers decide by the identity of
+        the worker's top-level sink (:meth:`Runtime.held`, :meth:`Runtime.in_flight`,
+        ``Worker.holds_unfenced``, :func:`_inline_close_choice` and the swap's stale loop), and to
+        each of them such a root is a sink nothing is using while the drain thread is inside it
+        through the wrapper. Identity rather than ``in``, for :meth:`owes`'s reason.
+
+        Args:
+          sink: A sink the record owes that the graph being armed holds.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if self.owed.get(id(sink)) is sink:
+            del self.owed[id(sink)]
 
     def put_back(self, sink: Sink, close: _Close) -> bool:
         """Re-arms a sink whose close was never handed off, and discharges its entry.
@@ -2762,6 +2798,7 @@ def release(
     detached: bool = False,
     owner: object = None,
     closing: _Close | None = None,
+    keeping: _Keep | None = None,
 ) -> threading.Thread | None:
     """Closes a sink on the library's behalf — the one path by which it ever does (SPEC-042 FR-002).
 
@@ -2809,6 +2846,23 @@ def release(
     replace what ``close()`` raised. A refused release and a detached one perform no close here;
     the detached one's thread comes back through this inline path.
 
+    **A forwarded release asks the decision's keep before it closes** (SPEC-087 FR-002). A
+    decision — one :func:`_swap_sink` call, or one take in :func:`_close_owed` — passes its
+    :class:`_Keep` as ``keeping``, carried to a detached close's thread by :func:`_start_closer`,
+    and this holds it on :attr:`Runtime._releasing_here` beside the depth for the length of
+    ``sink.close()``. A shipped wrapper's ``close()`` forwards ``release(member, owner=self)``,
+    which reads that keep from the thread, so no wrapper's ``close()`` changes and one rule here
+    covers every shipped wrapper, the ``sink_factory`` wrapper included. A forward whose sink the
+    keep spares — kept by the graph a swap installs, lying beneath a sink still in the record, or
+    already closed by the same decision — performs no close, registers none and returns as a
+    refused release does; the wrapper's other members are still closed. The skip comes **after**
+    :func:`releasable`, so a sink this process may not release is refused first, as before. A
+    forward nested inside a forward inherits the keep of the release that encloses both, and a
+    forward outside any release the library started finds none, so a caller closing a wrapper
+    themselves still closes every member. A finalizer that the collector runs on a thread inside a
+    library release inherits that release's keep too; every sink it would then skip is live or
+    closed by another owner, so the skip is in the safe direction.
+
     Args:
       sink: The sink to close.
       detached: Whether to close on a daemon thread rather than inline. Detached is for a sink
@@ -2823,6 +2877,9 @@ def release(
         caller that did not take one, in which case one is registered here: ``GRACED`` before a
         detached thread starts, so the thread is attached to it and counted, and ``INLINE``
         around an inline close, which is how a wrapper's forwarded release reaches the registry.
+      keeping: The deciding call's keep, passed by :func:`_swap_sink` and :func:`_close_owed`
+        and by the closer threads they start; ``None`` for a forward, which reads the keep of the
+        release it is inside, and for every other caller.
 
     Returns:
       The started closer thread for a detached release, or ``None`` — for a refused release, for
@@ -2843,20 +2900,28 @@ def release(
         if _state._closes.finish(sink, closing):
             _hand_after_close(sink)
         return None
+    active = keeping if keeping is not None else (_active_keep() if owner is not None else None)
+    if owner is not None and active is not None and active.spares(sink):
+        if _state._closes.finish(sink, closing):
+            _hand_after_close(sink)
+        return None
     if detached:
         entry = closing if closing is not None else _state._closes.register(sink, _Rule.GRACED)
-        closer = _start_closer(sink, entry)
+        closer = _start_closer(sink, entry, keeping=active)
         if closer is None and _state._closes.finish(sink, entry):
             _hand_after_close(sink)
         return closer
     epoch = _close_clock(sink)
     depth = _release_depth()
     registration = closing if closing is not None else _state._closes.register(sink, _Rule.INLINE)
+    prior = _active_keep()
     try:
         _state._releasing_here.depth = depth + 1
+        _state._releasing_here.keep = active
         sink.close()
     finally:
         _state._releasing_here.depth = depth
+        _state._releasing_here.keep = prior
         try:
             if _state._closes.finish(sink, registration):
                 _hand_after_close(sink)
@@ -3103,6 +3168,13 @@ def _capture(demoted: list[object]) -> tuple[list[object], int]:
     (:attr:`Runtime._capture_announced`), a trip through ``_diag.pending`` and a raise through
     ``_diag.absorbed``. It takes no lock: it runs between ``_repin``'s sections.
 
+    **The loop is** :func:`_walk_beneath`, **shared with the swap's read of the graph it
+    installs** (SPEC-087 FR-001), so there is one walk beneath a sink rather than two. The bound
+    and the per-holder reader are passed here explicitly, read from this module when the call is
+    made, so a test that lowers :data:`_MARKING_CEILING` still trips this capture; a default bound
+    when the function was defined would not see it. The announcement stays this function's own:
+    :func:`_announce_capture` and its once-per-process flag belong to the demotion alone.
+
     Args:
       demoted: The sinks whose entries are about to go weak.
 
@@ -3112,31 +3184,10 @@ def _capture(demoted: list[object]) -> tuple[list[object], int]:
     Raises:
       None.
     """
-    roots = {id(sink) for sink in demoted}
-    seen: set[int] = set()
-    stack: list[object] = list(demoted)
-    found: list[object] = []
-    visits = 0
-    tripped = False
-    try:
-        while stack:
-            holder = stack.pop()
-            if id(holder) in seen or not _may_be_a_sink(holder) or _fork._is_module(holder):
-                continue
-            if visits >= _MARKING_CEILING:
-                tripped = True
-                break
-            seen.add(id(holder))
-            visits += 1
-            if id(holder) not in roots and (
-                _fork._sink_shaped(holder) or _fork._is_weak_proxy(holder)
-            ):
-                found.append(holder)
-            stack.extend(_beneath(holder, found))
-    except Exception as exc:
+    found, visits, tripped, exc = _walk_beneath(demoted, ceiling=_MARKING_CEILING, read=_beneath)
+    if exc is not None:
         _announce_capture(exc)
-        return found, visits
-    if tripped:
+    elif tripped:
         _announce_capture(None)
     return found, visits
 
@@ -3200,6 +3251,291 @@ def _announce_capture(exc: Exception | None) -> None:
         _diag.pending(_CAPTURE_SHORT)
     else:
         _diag.absorbed("recording the sinks beneath a superseded sink", exc, _CAPTURE_SHORT)
+
+
+def _walk_beneath(
+    roots: list[object],
+    *,
+    ceiling: int = _MARKING_CEILING,
+    read: Callable[[object, list[object]], list[object]] = _beneath,
+) -> tuple[list[object], int, bool, Exception | None]:
+    """Walks beneath some sinks: ``_capture``'s loop, factored out so the swap reads with it too.
+
+    The reach and the bound are :func:`_capture`'s, which documents them: a holder this package
+    defines is entered through its declared child-sink slots and its sink-shaped attributes, any
+    other holder through its namespace and its own members, a plain container one level, every
+    read static, and at most ``ceiling`` objects entered. A sink-shaped object or a ``weakref``
+    proxy met beneath the roots is found; the roots themselves are not, unless a holder's declared
+    slot names one. It announces nothing: :func:`_capture` writes its own once-per-process line,
+    and :func:`_installed_graph` writes the swap's line, each time.
+
+    Args:
+      roots: The sinks to walk beneath.
+      ceiling: The most objects to enter before stopping as tripped.
+      read: What to enter next beneath one holder, recording its positional sinks into the list
+        it is given; :func:`_beneath` everywhere but a test that faults the read.
+
+    Returns:
+      What it found, how many objects it entered, whether it tripped ``ceiling``, and what
+      ``read`` raised, or ``None``. A trip or a raise keeps what had been found.
+
+    Raises:
+      None.
+    """
+    roots_ids = {id(sink) for sink in roots}
+    seen: set[int] = set()
+    stack: list[object] = list(roots)
+    found: list[object] = []
+    visits = 0
+    tripped = False
+    try:
+        while stack:
+            holder = stack.pop()
+            if id(holder) in seen or not _may_be_a_sink(holder) or _fork._is_module(holder):
+                continue
+            if visits >= ceiling:
+                tripped = True
+                break
+            seen.add(id(holder))
+            visits += 1
+            if id(holder) not in roots_ids and (
+                _fork._sink_shaped(holder) or _fork._is_weak_proxy(holder)
+            ):
+                found.append(holder)
+            stack.extend(read(holder, found))
+    except Exception as exc:
+        return found, visits, tripped, exc
+    return found, visits, tripped, None
+
+
+_SHARED_RISK = "a sink it shares with another may be closed while still in use"
+"""What a read of a sink graph that stopped short means, ending both of its lines (SPEC-087)."""
+
+
+def _installed_graph(
+    root: object,
+    *,
+    ceiling: int = _MARKING_CEILING,
+    read: Callable[[object, list[object]], list[object]] = _beneath,
+) -> dict[int, object]:
+    """Returns a sink and every sink :func:`_walk_beneath` finds beneath it, by ``id`` (FR-001).
+
+    The one read of a sink graph the swap and the closer make (SPEC-087): the graph a
+    ``configure()`` installs, the graphs of the sinks a take leaves in the record (FR-002's
+    *remaining*), and the graph of each owed sink the swap's stale take asks about (FR-003's
+    guard). Membership is tested by identity, ``graph.get(id(s)) is s``, never by equality.
+
+    **A read that trips its bound or raises keeps what it had found**, and the caller goes on.
+    It writes one line each time, naming no sink change because three different callers make
+    it: a trip through ``_diag.pending``, a raise through ``_diag.absorbed`` naming the
+    exception's type only. What the read did not reach is then decided as it was before
+    SPEC-087, which may close a shared sink while it is still in use, and the line says so.
+    Nothing is stored to make the line once-only, so it adds no state; :func:`_announce_capture`
+    and its flag stay the demotion's.
+
+    Args:
+      root: The sink whose graph is read.
+      ceiling: The most objects to enter; a test passes a small one to trip the read.
+      read: The per-holder reader; a test passes one that raises to fault the read.
+
+    Returns:
+      The root and every sink found beneath it, keyed by ``id``.
+
+    Raises:
+      None.
+    """
+    found, _visits, tripped, exc = _walk_beneath([root], ceiling=ceiling, read=read)
+    if exc is not None:
+        _diag.absorbed(
+            "reading the sinks beneath a sink",
+            exc,
+            f"it stopped short; {_SHARED_RISK}",
+        )
+    elif tripped:
+        _diag.pending(f"reading the sinks beneath a sink stopped short; {_SHARED_RISK}")
+    graph: dict[int, object] = {id(root): root}
+    graph.update((id(sink), sink) for sink in found)
+    return graph
+
+
+class _Keep:
+    """What one release of one decision must not close through a wrapper's forward (FR-002).
+
+    A **decision** is one :func:`_swap_sink` call or one take in :func:`_close_owed`. Every
+    release it starts carries a keep, and a shipped wrapper's forwarded release made inside it,
+    on the thread performing the release and at any depth of wrapper, asks :meth:`spares` before
+    it closes. Each part answers a measured double close or a close of a live sink:
+
+    - **kept**: the graph a swap installs, read once before its first critical section. Without
+      it the outgoing wrapper's forward closed the sink the new graph still delivers to.
+    - **remaining**: the sinks the record still holds once the section that starts the release
+      has made its takes; their graphs are read on the first forward that asks, with no lock
+      held, and never if none asks. Without it a ``shutdown()`` that took one wrapper closed a
+      member a retired drain thread was still inside through another.
+    - **closed**: the sinks this decision closes, one map shared by every release it starts. A
+      take records its sink with the token ``None`` before any of the decision's closes start; a
+      forward claims its sink with a token of its own and goes ahead only if the claim it reads
+      back is that token, so of two forwards that race, one closes. Without it two owed wrappers
+      sharing a member, taken in one pass, closed that member twice, overlapping.
+
+    It holds no lock, which is safe here and is the deliberate exception ``python.md`` §13 asks to
+    be named. A claim is one ``dict.setdefault`` on a builtin ``dict``, which CPython performs
+    atomically, so of two threads claiming one sink exactly one reads back its own token. A take
+    writes the map under ``_state._lock``: the first section's before any of its closes starts,
+    and the second section's ``previous`` after the first section's closers may already be
+    running, which is safe because ``previous`` is the worker's current sink at the first section
+    and so in that section's *remaining*, so none of those closers' forwards can claim it. Two
+    threads that both read the remaining graphs compute the same map from static reads, unless a
+    remaining holder changes between them — a ``_FactorySink`` that builds its sink in between,
+    FR-004's unbuilt-factory shape — in which case the later read can see a member the earlier
+    did not, and the map last assigned wins. It holds the sinks strongly only for as long as the
+    decision's releases hold it.
+
+    Attributes:
+      kept: The installed graph by ``id``; empty for the closer's take.
+      remaining: The sinks the record still held after the section's takes.
+      closed: By ``id``, each sink this decision closes and the token of the claim on it.
+    """
+
+    def __init__(
+        self,
+        kept: Mapping[int, object],
+        remaining: Sequence[Sink],
+        closed: dict[int, tuple[object, object]],
+    ) -> None:
+        """Builds a keep from its three parts, reading no graph yet.
+
+        Args:
+          kept: The installed graph, or an empty map for the closer's take.
+          remaining: The sinks the record still holds after the section's takes.
+          closed: The decision's one map of the sinks it closes, shared across its sections.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.kept = kept
+        self.remaining = remaining
+        self.closed = closed
+        self._remaining_graph: dict[int, object] | None = None
+
+    def took(self, sink: object) -> None:
+        """Records a sink the decision took, before any of its closes starts.
+
+        Its token is ``None``, which no forward holds, so a forward of a sink this decision takes
+        is skipped and the take performs the one close.
+
+        Args:
+          sink: The sink the decision took to close.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.closed[id(sink)] = (sink, None)
+
+    def remaining_graph(self) -> dict[int, object]:
+        """Returns the remaining sinks and every sink beneath them, read once, with no lock held.
+
+        The remaining sinks themselves are in it: a sink still in the record is closed by its own
+        take, so a forward of it is skipped as well.
+
+        Args:
+          None.
+
+        Returns:
+          The union of :func:`_installed_graph` over the remaining sinks, by ``id``.
+
+        Raises:
+          None.
+        """
+        graph = self._remaining_graph
+        if graph is None:
+            graph = {}
+            for sink in self.remaining:
+                graph.update(_installed_graph(sink))
+            self._remaining_graph = graph
+        return graph
+
+    def spares(self, sink: object) -> bool:
+        """Whether a forwarded release of *sink* is skipped; claims the sink when it is not.
+
+        Args:
+          sink: The sink a wrapper is forwarding a release of.
+
+        Returns:
+          Whether it is kept, lies in the graph of a remaining sink, or is already claimed by
+          this decision, in which case the forward performs no close.
+
+        Raises:
+          None.
+        """
+        if self.kept.get(id(sink)) is sink:
+            return True
+        if self.remaining and self.remaining_graph().get(id(sink)) is sink:
+            return True
+        token = object()
+        claim = self.closed.setdefault(id(sink), (sink, token))
+        return not (claim[0] is sink and claim[1] is token)
+
+
+def _lies_beneath(
+    stale: object,
+    in_use: list[Sink],
+    graphs: Mapping[int, tuple[object, Mapping[int, object]]],
+) -> bool:
+    """Whether the swap's stale take passes *stale* over, as beneath a sink in use (FR-003).
+
+    A kept sink can come back into the record as a root after the swap that ceded it, by two
+    routes: a straddling orphan log that read the configured sink before the swap and arms it
+    after, and :func:`rearm_if_released`, which arms the sink an emit is about to write to when a
+    stop-signal setter released it. Either leaves it a root while the drain thread is inside it
+    through its holder. Taking it there
+    closed it under that thread. So a stale sink lying in the graph of an owed sink something may
+    be inside stays owed, as a held one does, and a later swap or ``shutdown()`` closes it. A sink
+    in use whose graph was not read — armed after the read — makes every stale sink pass over,
+    because what lies beneath it is unknown.
+
+    Args:
+      stale: An owed sink the stale take would release.
+      in_use: The owed sinks something may be inside: the worker's current sink, or one
+        :meth:`Runtime.held`.
+      graphs: Each owed sink's graph by ``id``, read before the section, with the sink it was
+        read from.
+
+    Returns:
+      Whether the take passes it over.
+
+    Raises:
+      None.
+    """
+    for sink in in_use:
+        entry = graphs.get(id(sink))
+        if entry is None or entry[0] is not sink:
+            return True
+        if entry[1].get(id(stale)) is stale:
+            return True
+    return False
+
+
+def _active_keep() -> _Keep | None:
+    """The keep of the release this thread is performing right now, or ``None`` outside one.
+
+    Args:
+      None.
+
+    Returns:
+      The keep :func:`release` set for the length of its ``close()`` on this thread.
+
+    Raises:
+      None.
+    """
+    keep: _Keep | None = getattr(_state._releasing_here, "keep", None)
+    return keep
 
 
 def _pin_inherited() -> None:
@@ -3478,7 +3814,9 @@ def _pay_a_mark_the_stop_missed() -> None:
     _pay_marks_after_stop()
 
 
-def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
+def _start_closer(
+    sink: Sink, closing: _Close, *, keeping: _Keep | None = None
+) -> threading.Thread | None:
     """Starts a daemon close of a sink no longer being delivered to (SPEC-030 FR-003).
 
     The thread is returned rather than joined, so a caller holding a lock can start under it and
@@ -3500,6 +3838,7 @@ def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
     Args:
       sink: The sink that was swapped out.
       closing: The in-flight entry the thread discharges.
+      keeping: The deciding call's keep, which the thread's release holds for its close.
 
     Returns:
       The started thread, or ``None`` when the platform would not give the process another one.
@@ -3512,7 +3851,7 @@ def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
     """
     closer = threading.Thread(
         target=_close_guarded,
-        args=(sink, closing),
+        args=(sink, closing, keeping),
         name="log-foundry-sink-close",
         daemon=True,
     )
@@ -3529,7 +3868,7 @@ def _start_closer(sink: Sink, closing: _Close) -> threading.Thread | None:
     return closer
 
 
-def _close_guarded(sink: Sink, closing: _Close) -> None:
+def _close_guarded(sink: Sink, closing: _Close, keeping: _Keep | None = None) -> None:
     """Closes a swapped-out sink on its own thread, absorbing a failure.
 
     The guard is what makes the thread safe to leave unattended: an exception escaping here
@@ -3541,6 +3880,7 @@ def _close_guarded(sink: Sink, closing: _Close) -> None:
     Args:
       sink: The sink to close.
       closing: The in-flight entry the close discharges.
+      keeping: The deciding call's keep, handed on to :func:`release` (SPEC-087 FR-002).
 
     Returns:
       None.
@@ -3549,7 +3889,7 @@ def _close_guarded(sink: Sink, closing: _Close) -> None:
       None.
     """
     try:
-        release(sink, closing=closing)
+        release(sink, closing=closing, keeping=keeping)
     except Exception as exc:
         _diag.absorbed("closing a swapped-out sink", exc, "it may still hold its resources")
 
@@ -4672,7 +5012,7 @@ def rearm_if_released(sink: Sink) -> None:
         _state._closes.arm(sink)
 
 
-def _close_taken(sink: Sink, closing: _Close) -> None:
+def _close_taken(sink: Sink, closing: _Close, keeping: _Keep | None = None) -> None:
     """Closes one sink the closer took, absorbing whatever the close raised (SPEC-046).
 
     Factored out so the inline close and the threaded ones are provably the same call, and
@@ -4690,6 +5030,7 @@ def _close_taken(sink: Sink, closing: _Close) -> None:
     Args:
       sink: The sink to close.
       closing: The in-flight entry to discharge, whatever the close does.
+      keeping: The take's keep, handed on to :func:`release` (SPEC-087 FR-002).
 
     Returns:
       None.
@@ -4704,7 +5045,7 @@ def _close_taken(sink: Sink, closing: _Close) -> None:
         here rather than left to be discovered.
     """
     try:
-        release(sink, closing=closing)
+        release(sink, closing=closing, keeping=keeping)
     except Exception as exc:
         _diag.absorbed("closing the sink", exc, "it may still hold its resources")
 
@@ -4780,9 +5121,9 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
 
     **The take, under** ``_state._lock``. Every owed sink that is not :meth:`Runtime.held` goes
     through :meth:`_CloseRegistry.take`, which removes it from the record and records its close in
-    flight **in one call**, so there is no instant at which a sink is neither owed nor in flight —
-    a gap a preempted orphan emit re-arms and a racing ``shutdown()`` then closes alongside
-    (SPEC-054 FR-003). Each take names the entry's rule (SPEC-078 FR-002): ``GRACED`` for a sink
+    flight **in one call**, so there is no instant at which a sink this call takes to close is
+    neither owed nor in flight — a gap a preempted orphan emit re-arms and a racing
+    ``shutdown()`` then closes alongside (SPEC-054 FR-003). Each take names the entry's rule (SPEC-078 FR-002): ``GRACED`` for a sink
     the worker holds unfenced whose thread has since ended (SPEC-050 FR-004), ``JOINED`` for every
     other. A sink left behind is either inside a live drain thread or already being closed by
     somebody else, and the two are answered differently below.
@@ -4819,7 +5160,8 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     returns from its wait.
 
     **A sink this call did not hand off is put back and its entry discharged**, however the call
-    leaves (:meth:`_CloseRegistry.put_back`). A ``KeyboardInterrupt`` delivered between the take
+    leaves (:meth:`_CloseRegistry.put_back`): a sink the guard below passed over, and a sink an
+    interrupt cut off. A ``KeyboardInterrupt`` delivered between the take
     and a close would otherwise leave an entry nobody sets — that sink is then skipped by the
     signal refresh forever, never taken by a later closer, and every later bystander waits out the
     whole grace on it. Discharging alone is not enough: the take has already removed the sink from
@@ -4869,6 +5211,30 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     on that has decided since: that swap's arm landed before this take, so the sink it installed
     is closed here, and :func:`_announce_unsettled` must not say it may be left open.
 
+    **One take is one decision, and its closes carry a keep** (SPEC-087 FR-002). The section
+    records every sink it takes in the keep's *closed* map before any close starts, and the sinks
+    the take left in the record as its *remaining*, so a shipped wrapper's forwarded release
+    closes no member that this call also took, that another forward of this call already closed,
+    or that lies beneath a sink still in the record — a retired drain thread may still be inside
+    that one, through the wrapper.
+
+    **No sink lying beneath one the take left in the record is handed to a closer** (SPEC-087
+    FR-003). A kept sink is out of the record and a member of the graph that holds it, but two
+    routes arm it again as a root — a log with no span that read the configured sink before a swap
+    kept it and arms it after, and :func:`rearm_if_released` — where :meth:`Runtime.held` cannot
+    see the drain thread inside it through its holder.
+    So once the take has left something behind, and before any close starts, this reads the
+    graphs of what it left (the keep's *remaining*, read eagerly here and reused by every forward
+    of the call), and a taken sink lying in one of them is passed over: it stays among the sinks
+    the call did not hand off, the put-back below returns it to the record and discharges its
+    entry, and a later call closes it once nothing holds it. That adds no lock and no lock site:
+    the put-back section was reached only after an interrupt before, and is now reached on a call
+    that passed a sink over too. Until the put-back the sink reads as having a close in flight,
+    for about the length of this call's inline close, so a swap passes it over meanwhile and a
+    second ``shutdown()`` counts it among the closes it waits for, which ends no later than this
+    call's own closes. The read is made with no lock held and inside the ``try``, so an interrupt
+    during it is put back like any other.
+
     Args:
       op: The ``STOP`` this closer runs for, whose deadline bounds the grace and which carries the
         call's one ``grace_end``. ``None`` only for a direct call from a test, which gets an
@@ -4907,6 +5273,9 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
             if worker is not None and worker.holds_unfenced(sink):
                 rule = _Rule.GRACED
             entries.append((sink, _state._closes.take(sink, rule)))
+        keep = _Keep({}, list(_state._closes.owed.values()), {})
+        for sink in taken:
+            keep.took(sink)
         mine = {id(sink) for sink in taken}
         if not declined:
             operation.unsettled = [
@@ -4919,17 +5288,23 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
             operation.drained = True
     undischarged = {id(sink): (sink, close) for sink, close in entries}
     try:
+        passed = (
+            {id(sink) for sink in taken if keep.remaining_graph().get(id(sink)) is sink}
+            if keep.remaining
+            else set()
+        )
+        taken = [sink for sink in taken if id(sink) not in passed]
         inline = _inline_close_choice(taken, worker) if taken else None
         for sink, close in entries:
-            if sink is inline:
+            if sink is inline or id(sink) in passed:
                 continue
             del undischarged[id(sink)]
             if close.rule is _Rule.GRACED:
-                release(sink, detached=True, closing=close)
+                release(sink, detached=True, closing=close, keeping=keep)
                 continue
             closer = threading.Thread(
                 target=_close_taken,
-                args=(sink, close),
+                args=(sink, close, keep),
                 name="log-foundry-owed-close",
                 daemon=True,
             )
@@ -4941,7 +5316,7 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
                     exc,
                     "it is closed inline instead",
                 )
-                _close_taken(sink, close)
+                _close_taken(sink, close, keep)
             else:
                 _state._closes.attach(close, closer)
                 joined.append(close)
@@ -4949,7 +5324,7 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
             if sink is inline:
                 close.rule = _Rule.INLINE
                 del undischarged[id(sink)]
-                _close_taken(sink, close)
+                _close_taken(sink, close, keep)
     finally:
         owed_hands: list[Sink] = []
         if undischarged:
@@ -5397,7 +5772,9 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
 
     - **fenced** — the worker confirmed its drain reached the new sink, so nothing *of the
       worker's* can still be inside the old one. Where :meth:`Runtime.held` also says nothing
-      else is, it leaves the record and is released detached, joined to this call's budget.
+      else is, it leaves the record and is released detached, joined to this call's budget — or,
+      when the graph this call installs still holds it, it is ceded instead and closes nothing
+      here (SPEC-087 FR-001).
 
       **The ``held`` term is not redundant with the fence**, and leaving it out is a second close
       running *concurrently* with a first. ``retarget`` takes the old sink out of the worker's
@@ -5415,10 +5792,13 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
       make popped the absent sink with a default and released it a second time on
       ``log-foundry-sink-close`` (measured at ``624d817f``, 20 of 20 forced runs, and the same
       for the exit drain). So the old sink is released only while the record still owes it
-      (:meth:`_CloseRegistry.owes`). Skipping the release cannot leave it owed by nobody: every
-      route out of the record is a take whose taker performs the close, and the worker's sink is
-      always armed — the build arms it, this function arms what it installs, a forked child
-      re-arms ``worker.sink`` — so "not owed" here means "taken", never "never armed".
+      (:meth:`_CloseRegistry.owes`). Skipping the release cannot leave it owed by nobody. The
+      worker's sink is always armed — the build arms it, this function arms what it installs, a
+      forked child re-arms ``worker.sink`` — and it leaves the record only by a take whose taker
+      performs the close: the closer's guard passes over only a sink lying beneath one still in
+      use and puts it back, and :meth:`_CloseRegistry.cede` is made only here, of a kept sink, in
+      the section that arms the graph holding it, which is never the worker's current sink. So
+      "not owed" here means "taken", never "never armed".
     - **unfenced** — the drain could not be confirmed within the budget, so the old sink stays in
       the record and the worker keeps it among the sinks it may be inside. A later ``shutdown()``
       that finds the drain thread ended closes it (SPEC-050 FR-004); ``incomplete_swaps`` counts
@@ -5462,8 +5842,10 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     adoption here.
 
     Every discharge from the record and the registration that replaces it happen in **one**
-    critical section under ``_state._lock``, so a preempted orphan emit cannot re-arm a sink in a
-    gap where it is neither owed nor in flight (FR-003).
+    critical section under ``_state._lock``, so a preempted orphan emit cannot re-arm a sink this
+    call takes in a gap where it is neither owed nor in flight (FR-003). The one sink that leaves
+    the record with neither is a kept one, ceded in the section that arms the graph holding it,
+    which is what owes its close (SPEC-087 FR-001).
 
     **During a drain with no live worker it declines at entry, while the drain still has a take
     ahead of it** (SPEC-078 FR-004, :meth:`Runtime._take_ahead`): no retarget, no close and no
@@ -5500,10 +5882,51 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     wait for it outlasted the budget still runs here alongside the holder, announced. **The**
     ``owes`` **term on the fenced branch is not that re-check**: skipping an *arm* can orphan a
     sink, because nothing else may arm it, while skipping a *release* of a sink the record no
-    longer owes cannot, because every route out of the record is a take whose taker closes it.
+    longer owes cannot, because a sink the worker delivered to leaves the record only by a take
+    whose taker closes it (the bullet on the fenced branch says why a cede never applies there).
     On the unserialized pair it makes the second route close A once, and a second swap that
     retargets B to C before B's swap has armed B finds B not owed and skips it; B's own swap then
     arms B, so B is closed once, later, instead of twice.
+
+    **It keeps every sink the graph it installs still holds** (SPEC-087). Before its first
+    critical section, with no lock held, it reads that graph once (:func:`_installed_graph`):
+    the sink it is handed and every sink beneath it, by identity, from its argument alone and
+    never from the configuration. An owed sink in that graph is **kept**. Where the swap would
+    have released it — a stale sink, or the displaced sink once its fence is confirmed — it is
+    ceded instead (:meth:`_CloseRegistry.cede`): it leaves the record with no close and is a
+    member of the installed graph and nothing else, closed when that graph is released, by its
+    forward. The cede is made in the section that arms the holder: the first with no worker, and
+    the one after the retarget with one, where a kept stale sink the first section left joins
+    too, on every verdict, since that section arms ``new_sink`` on every verdict; a retarget that
+    raises makes no second section and leaves it owed, as before. One displaced without a
+    confirmed fence, one a retired worker keeps and one that is held stay in the record as
+    before, where the worker's own record still names them. Out of the record matters: five
+    readers decide by the identity of the worker's top-level sink, and to each a kept sink left
+    owed as a root was one nothing is using while the drain thread is inside it through the
+    wrapper — measured, an expired ``shutdown(timeout=0.3)`` closed it under that thread.
+
+    **Every release it starts carries one decision's keep** (:class:`_Keep`): the installed graph,
+    the sinks the record still holds after the section's takes (worked out under the lock before
+    anything is taken, because each take stays inside its own ``release`` call), and one map of
+    what this call closes, shared by both sections, into which every take of a section is
+    recorded before that section's first release starts a thread. A shipped wrapper's forward
+    made in a detached close then skips a sink that is kept, still held by a sink in the record,
+    or already closed by this call. That is what stops the reverse direction: there the sink
+    released is the outgoing wrapper, which the new graph does not reach, and it was the
+    wrapper's forward that closed the live sink.
+
+    **The stale take passes over a sink lying beneath one still in use** (SPEC-087 FR-003). A kept
+    sink can be armed again as a root after a swap kept it: by a log with no span that read the
+    configured sink before the swap, or by :func:`rearm_if_released`. So when the record holds more than one sink, the graph of each is read before the
+    first section, with no lock held, and the stale loop leaves owed a sink lying in the graph of
+    the worker's current sink or of one :meth:`Runtime.held` says something may be inside; where
+    such a sink was armed after the read, every stale sink is left (:func:`_lies_beneath`). Kept
+    is tested first, so a sink both kept and beneath one in use is ceded, which both its holders
+    then account for. The record is read for that walk without the lock, as one
+    ``list(...values())`` of a builtin ``dict``, which runs no Python code and so cannot see the
+    dict change size under it. That is safe because the snapshot only decides which graphs to walk:
+    the critical section re-reads the record under ``_state._lock`` for every decision it makes,
+    and a sink armed after the snapshot has no graph, which the guard reads as unknown.
 
     **A shutdown waits for this call's decision** (:func:`_await_swap_decisions`). Between the
     retarget and the decision the sink installed is the worker's but not yet owed, so a
@@ -5574,6 +5997,14 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     token: object | None = None
     event: threading.Event | None = None
     try:
+        kept = _installed_graph(new_sink)
+        closed: dict[int, tuple[object, object]] = {}
+        owed_now = list(_state._closes.owed.values())
+        graphs = (
+            {id(sink): (sink, _installed_graph(sink)) for sink in owed_now}
+            if len(owed_now) > 1
+            else {}
+        )
         with _state._lock:
             worker = _state.live_worker()
             old = None if worker is None else worker.sink
@@ -5582,15 +6013,40 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             if worker is None and _state._column() is State.DRAINING and _state._take_ahead():
                 return
             _state._swaps_running.add(op)
+            joining: list[Sink] = []
+            taking: list[Sink] = []
+            in_use = [
+                sink for sink in _state._closes.owed.values() if sink is old or _state.held(sink)
+            ]
             for stale in list(_state._closes.owed.values()):
                 if stale is new_sink or stale is old or _state.held(stale):
                     continue
+                if kept.get(id(stale)) is stale:
+                    joining.append(stale)
+                    continue
+                if _lies_beneath(stale, in_use, graphs):
+                    continue
+                taking.append(stale)
+            leaving = {id(stale) for stale in taking}
+            keep = _Keep(
+                kept,
+                [sink for sink in _state._closes.owed.values() if id(sink) not in leaving],
+                closed,
+            )
+            for stale in taking:
+                keep.took(stale)
+            for stale in taking:
                 closer = release(
-                    stale, detached=True, closing=_state._closes.take(stale, _Rule.GRACED)
+                    stale,
+                    detached=True,
+                    closing=_state._closes.take(stale, _Rule.GRACED),
+                    keeping=keep,
                 )
                 if closer is not None:
                     closers.append(closer)
             if worker is None:
+                for sink in joining:
+                    _state._closes.cede(sink)
                 hand = _will_hand(new_sink)
                 if hand:
                     token = _open_hand()
@@ -5622,11 +6078,31 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                         and not _state.held(previous)
                         and _state._closes.owes(previous)
                     )
-                    if fenced_out and previous is not None:
+                    joins = [
+                        sink
+                        for sink in _state._closes.owed.values()
+                        if kept.get(id(sink)) is sink
+                        and sink is not new_sink
+                        and (fenced_out if sink is previous else not _state.held(sink))
+                    ]
+                    for sink in joins:
+                        _state._closes.cede(sink)
+                    if (
+                        fenced_out
+                        and previous is not None
+                        and kept.get(id(previous)) is not previous
+                    ):
+                        second = _Keep(
+                            kept,
+                            [sink for sink in _state._closes.owed.values() if sink is not previous],
+                            closed,
+                        )
+                        second.took(previous)
                         closer = release(
                             previous,
                             detached=True,
                             closing=_state._closes.take(previous, _Rule.GRACED),
+                            keeping=second,
                         )
                         if closer is not None:
                             closers.append(closer)

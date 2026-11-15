@@ -295,7 +295,10 @@ def configure(
     (arch §7). It **swaps the live delivery target**: the previous sink is closed and subsequent
     events go to the new one, so "repeated calls compose rather than reset" holds for the sink
     too, at the cost of one bounded wait. Passing the sink that is already live is a no-op: no
-    drain, no close.
+    drain, no close. **A sink the new one still holds is not closed** (SPEC-087): with
+    ``configure(sink=MultiSink(file, other))`` after ``configure(sink=file)``, or the reverse,
+    ``file`` stays open and is closed once, with the graph that holds it, at ``shutdown()``, at
+    exit, or by a later call that drops it.
 
     **Every sink this has been given is closed** (SPEC-045), whatever races the call and however
     many are outstanding. Handing the previous sink back to a later call is therefore supported

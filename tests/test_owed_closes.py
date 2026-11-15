@@ -395,24 +395,30 @@ def test_a_sink_written_to_after_its_close_is_owed_another(build_worker: bool) -
     )
 
 
-def test_a_sink_shared_with_the_graph_that_replaces_it_is_not_stranded() -> None:
-    """FR-002 AC-3. `configure(A)` then `configure(MultiSink(A, B))`, A live inside the wrapper.
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_a_sink_shared_with_the_graph_that_replaces_it_is_not_stranded(direction: str) -> None:
+    """FR-002 AC-3, rewritten by SPEC-087 FR-005: a sink both graphs hold is closed once, later.
 
-    The swap closes A while A is a child of the new live sink, which predates this spec and is
-    recorded in `architecture.md` §12. What must hold is that A is not left holding a buffer:
-    it keeps taking events through the wrapper, so it is owed a further close. Measured at
-    `A.LOST == 2` on a draft that vetoed the repeat close.
+    `configure(A)` then `configure(MultiSink(A, B))`, and the reverse. A sink the outgoing and the
+    incoming graph share is not closed by the swap: it stays open while the graph that replaced
+    it delivers to it, and is closed exactly once, at `shutdown()`. The double keeps accepting
+    after `close()` and delivers only when closed, so a close that is skipped is the loss here, and
+    a close made at the swap shows as a second close. The test SPEC-045 shipped could not fail on
+    the defect: its double never refused, and it ran one direction.
     """
     from log_foundry.sinks import multi
 
     first, second = BufferingSink("A"), BufferingSink("B")
-    log_foundry.configure(service="t", sink=first)
+    wrapper = multi.MultiSink(first, second)
+    graphs = [first, wrapper] if direction == "forward" else [wrapper, first]
+    log_foundry.configure(service="t", sink=graphs[0])
     log_foundry.info("one")
-    log_foundry.configure(sink=multi.MultiSink(first, second))
+    log_foundry.configure(sink=graphs[1])
     log_foundry.info("two")
     log_foundry.info("three")
     log_foundry.shutdown()
 
+    assert first.closes == 1, f"A is closed once, at shutdown — got {first!r}"
     assert first.buffered == 0, f"nothing A took is stranded — got {first!r}"
     assert first.delivered == first.events == 3, (
         f"and A delivered every event that reached it — got {first!r}"
@@ -428,8 +434,9 @@ def test_the_owed_close_record_is_emptied_by_one_transition() -> None:
     A caller that read the record and cleared it in two steps would let a second caller take the
     same sink and close it twice. SPEC-054 FR-002/FR-003 moved that step out of a wholesale
     `take_orphan_owed` and into `_close_owed`'s critical section, which takes **per sink** and
-    registers each close in the same section — so there is no instant at which a sink is neither
-    owed nor in flight. `tests/test_lifecycle_races.py` holds the AST roster that keeps it the
+    registers each close in the same section — so there is no instant at which a sink taken to be
+    closed is neither owed nor in flight. A kept sink a swap cedes leaves the record with neither,
+    by design, because the graph holding it is owed (SPEC-087). `tests/test_lifecycle_races.py` holds the AST roster that keeps it the
     only such site.
 
     Asserted on the closes rather than on a returned list, which is what the take is *for*: a
