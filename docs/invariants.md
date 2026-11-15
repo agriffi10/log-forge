@@ -45,7 +45,9 @@ deadline), `tests/test_baggage_header.py` (a hostile baggage value, on either in
 `current_baggage_header()` returning before a deadline, SPEC-064), `tests/test_inbound_totality.py`
 (every hostile probe, in each of `continue_trace`'s arguments, returns before a deadline and runs
 none of its own code, SPEC-067), `tests/test_numeric_doors.py` (a refused `flush()` or `shutdown()`
-timeout moves no counter and does not retire, SPEC-066);
+timeout moves no counter and does not retire, SPEC-066), `tests/test_driver_error_corpus.py` (a
+hostile driver exception class runs none of its own code where `_driver_error` copies it, and a
+file sink raises it as the dual type, or as the original when the class refuses the subclass);
 `tests/test_invariants_model.py` asserts it over random interleavings.
 
 ## 2. Every accepted event is delivered, or counted and announced — exactly once

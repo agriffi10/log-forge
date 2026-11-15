@@ -18,12 +18,9 @@ delivery-callback paths, `GooglePubSubSink` and the HTTP `auth` unpack. The deli
 absorbed it on the engine sinks, so a refused round was reported as unconfirmed and its loss line
 was never written. The file sinks could not build their dual-typed `SinkDeliveryError` and raised
 the bare original. The same rule covers the rest of what `sinks/_driver_error.py` copies from a
-driver's class: its `__module__` and, in `_reduce`, its `__bases__` are read through `type`'s own
-descriptors too, and its `__doc__` from the class's own namespace, copied only as a `str`, since
-`type`'s `__doc__` descriptor calls a descriptor stored there. A metaclass property or
-`__getattribute__` on any of them had the same effect, and `_reduce`, documented `Raises: None`,
-raised. Other ways a driver's class can stop `_driver_error` building the dual type are not
-name reads and remain open: `docs/architecture.md` §12 lists them.
+driver's class, which since the driver-error rework reads nothing through attribute lookup at all:
+*The dual type reads only what the driver stores, and only Python's own subclassing can refuse it*
+(this area) has the mechanism and the hostile-class corpus that holds it.
 
 The roster reports a `.__name__` or `.__qualname__` read on **any** receiver, not only on
 `type(...)`, because a class held in a local is as much the caller's class as `type(x)` is and no
@@ -48,5 +45,10 @@ its output.
 
 ### 2026-11-15
 
+- **Revised by the driver-error rework.** The entry said `_driver_error` read its `__module__` and,
+  in `_reduce`, its `__bases__` through `type`'s descriptors and its `__doc__` from the class
+  namespace, and that the other ways in stayed open in `docs/architecture.md` §12. The rework
+  replaced that module's reads wholesale and closed the item; the entry now points at the decision
+  that records it.
 - **Settled.** The sweep moved every remaining read in `src/` onto `_diag.type_name` and added the
   roster, its fixture corpus and the behavioural tests.

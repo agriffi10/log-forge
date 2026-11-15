@@ -1021,23 +1021,6 @@ close it.
 
 ### Open
 
-- **A driver exception class can still stop `delivery_error` building the dual type, or raise from
-  it** (invariant 1; no spec — found by the stored-name sweep's third diff review, 2026-11-15).
-  `sinks/_driver_error.py` copies a driver's class into one derived from `SinkDeliveryError`; the
-  sweep moved its name, qualname, module, doc and bases reads onto stored values, and these remain,
-  each reproduced at `0ecb77b3`: `built.__cause__ = err` runs a raising `__setattr__` or
-  `__cause__` setter outside `delivery_error`'s guard, so it raises despite `Raises: None`; an
-  `args` property that raises at pickle time raises out of `_reduce`; the cache key
-  (`_CLASSES.get(original)`) runs a metaclass `__hash__`, and an unhashable class cannot be keyed
-  at all; a stored `__module__` carrying `__set_name__` is run by `type()`; and a raising
-  attribute property makes `_set_attributes`, documented as raising, cost the whole dual type.
-  Each leaves a file sink raising the bare original, which `except SinkDeliveryError` misses, or
-  the engine reporting its round as unconfirmed. **Closed by** a structural rework, since the
-  same class recurred in three review rounds: build the derived class only from exact `str` or
-  `None` values, key the cache by identity, read and write through `BaseException`'s and `type`'s
-  own descriptors, and hold it with one hostile-class corpus run against `delivery_error`,
-  `pickle.dumps` and both file-sink rigs.
-
 - **One value `ClickHouseSink`'s typed columns refuse costs its whole insert chunk** (invariant 8;
   no spec — deferred past 1.2.0 by Andrew, 2026-11-13). A non-`str`, non-`None` value or a lone
   surrogate in a `Nullable(String)` column, or a `str`, `list` or `dict` in `duration_ms`'s
@@ -1883,6 +1866,37 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `docs/process/completion-ritual.md` asks of a volatile number.
 
 ### Resolved
+
+- ~~**A driver exception class can still stop `delivery_error` building the dual type, or raise
+  from it.**~~ (invariant 1; no spec — found by the stored-name sweep's third diff review,
+  2026-11-15) → **closed by the driver-error rework** (no spec, 2026-11-15).
+  `sinks/_driver_error.py` copies a driver's class into one derived from `SinkDeliveryError`, and
+  the stored-name sweep had moved its name, qualname, module, doc and bases reads onto stored
+  values. Five ways in remained, each reproduced at `0ecb77b3`: `built.__cause__ = err` ran a
+  raising `__setattr__` or `__cause__` setter outside `delivery_error`'s guard, so it raised despite
+  `Raises: None`; an `args` property that raised at pickle time raised out of `_reduce`; the cache
+  key (`_CLASSES.get(original)`) ran a metaclass `__hash__`, and an unhashable class could not be
+  keyed at all; a stored `__module__` carrying `__set_name__` was run by `type()`; and a raising
+  attribute property made `_set_attributes` cost the whole dual type. Each left a file sink raising
+  the bare original, which `except SinkDeliveryError` misses, or the engine reporting its round as
+  unconfirmed. The same class of defect had recurred in three review rounds, so the fix replaced
+  the mechanism rather than the sites. `_driver_error` now reads a driver's class and instance only
+  through `BaseException`'s, `OSError`'s and `type`'s own descriptors, or by walking a stored
+  `dict`'s entries and comparing only exact `str` keys; it keys its cache by `id` with the original
+  held in the entry, copies onto the derived class only an exact `str` or `None`, writes the cause
+  and the copied attributes through the same descriptors, checks by identity that the class it
+  built stores both bases in its MRO, and closes the derived class's `__reduce__` over the original
+  rather than reading it back. What remains able to refuse the dual type is what Python's own
+  subclassing and instantiation run — a metaclass, `__init_subclass__`, the constructor, and the
+  lookups subclassing makes in the original's namespace — inside the one guard, after which the
+  original is raised unchanged. `tests/test_driver_error_corpus.py` holds every way in, and its neighbours, as a
+  hostile fixture run against `delivery_error`, the derived class's `__reduce__`, `pickle`, a
+  traceback line and both file-sink rigs, each fixture asserting the failure it names. Run against
+  `6bd0b66e`'s `_driver_error.py`, 22 of its fixtures fail, and every guard in the new module was
+  mutation-tested against it. Two readers stay outside the library's reach: `pickle` and
+  `traceback` look the class up themselves, so a hostile class hook reached that way fails them on
+  the driver's own exception too. Decision: `docs/decisions/failure-paths/` (*The dual type reads
+  only what the driver stores, and only Python's own subclassing can refuse it*).
 
 - ~~**A sink can be released while it is still live inside the graph that replaced it.**~~
   (2026-11-14 audit, finding 4; invariants 5 and 2) → **closed by SPEC-087.** `configure(A)` then
