@@ -1040,6 +1040,61 @@ close it.
   releasing a sink reachable from the graph just handed over, which is decidable only against a live
   config read, and by a test that holds a shipped sink which releases its transport to every event
   delivered, in both directions.
+- **A sink the library has released loses every later event when it is handed back, and two
+  documents disagree about whether handing it back is allowed** (invariants 2, 5 and 13, each as
+  below; no spec yet; found while SPEC-087 was authored, which leaves it Out of Scope). `configure(F)`, an event,
+  `configure(M)`, then `configure(F)` again shares no sink between the two graphs at either swap,
+  so it is not the item above: the first swap releases F rightly, because nothing installed holds
+  it. A sink that released its transport refuses from then on (invariant 7, SPEC-032), so every
+  event written after the hand-back is lost. The probe is
+  `docs/audits/2026-11-14-probes/lifecycle/released_sink_handed_back.py`, written while SPEC-087
+  was authored and not one of the audit's own. Its output at `5cb0f449`, with a shipped
+  `FileSink` as F:
+
+  ```
+  orphan exit=0 events written by the caller=3 lines in the file=1 | orphan_lost=2 failed_batches=0 queued=0 sink=None
+         stderr: log-foundry: absorbed a failure while emitting an orphan log (SinkDeliveryError); the event was lost | log-foundry: absorbed a failure while emitting an orphan log (SinkDeliveryError); the event was lost
+  worker exit=0 events written by the caller=6 lines in the file=2 | orphan_lost=0 failed_batches=1 queued=0 sink=None
+         stderr: log-foundry: lost 4 event(s); batch abandoned after 1 emit attempts
+  ```
+
+  The same probe against the tree at `v1.0.0` (`git archive v1.0.0 src`, which is `a85b6f08`)
+  leaves the same lines in the file and differs only in the attempts before the abandon:
+
+  ```
+  orphan exit=0 events written by the caller=3 lines in the file=1 | orphan_lost=2 failed_batches=0 queued=0 sink=None
+         stderr: log-foundry: absorbed a failure while emitting an orphan log (SinkDeliveryError); the event was lost | log-foundry: absorbed a failure while emitting an orphan log (SinkDeliveryError); the event was lost
+  worker exit=0 events written by the caller=6 lines in the file=2 | orphan_lost=0 failed_batches=1 queued=0 sink=None
+         stderr: log-foundry: lost 4 event(s); batch abandoned after 4 emit attempts
+  ```
+
+  **Invariant 2 holds**: every lost event is counted and announced, so this is a loss a caller
+  can see. **Invariant 5 holds only by its recorded exception**, and the exception's reason does
+  not: F is closed twice, by the first swap and at `shutdown()`, which the page records as "a
+  sink written to after its close is owed a second close" (SPEC-045), but a shipped F took
+  nothing after its close, so the second close flushes nothing. **Invariant 13's observable
+  fails**, and no recorded exception names the case: `configure(sink=F)` accepts an argument that
+  then raises from every `emit`. The nearest exception accepts a `sink=` that `configure()`
+  "cannot prove unpatchable" (SPEC-079 FR-005), and this one it can judge, because the ownership
+  record marks a sink this process closed (`_Entry.closed`, read true after the first swap) and
+  `stamp` clears that mark when the sink is handed over again.
+  **The two documents.** `configure()`'s docstring, `src/log_foundry/config.py:301-303` at
+  `5cb0f449`: "Handing the previous sink back to a later call is therefore supported rather than
+  forbidden: it is closed again, because it took events again, and what it took after the
+  hand-back is flushed by that second close." `README.md:299-300` at the same commit: "The
+  previous sink **is** closed, so do not hand it back to a later call." The docstring's claim is
+  SPEC-045 FR-002's first two criteria, pinned by
+  `tests/test_owed_closes.py::test_a_sink_written_to_after_its_close_is_owed_another` with
+  `BufferingSink`, the double whose `emit` never refuses, so the pin holds for a sink that keeps
+  accepting after `close()` and for no sink that releases a transport. **Closed by** one of two
+  things, and neither is chosen here. Either the handed-back sink is refused at `configure()`,
+  where it is written (invariant 13's rule), which narrows SPEC-045's "supported" and widens the
+  fence *A sink factory builds each process's own sink lazily, and sink= refuses only what can
+  never work* (`docs/decisions/sink-lifecycle/`), and has to say what becomes of a sink that does
+  keep accepting. Or the hand-back is made to work, which means a released sink re-acquires its
+  transport when it is handed over again, against SPEC-032's rule that it refuses. Either way
+  the docstring and the README are brought into agreement, and the pin gains a shipped sink that
+  refuses after `close()`.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
   of it is the seam lint guarding the prose in its own data table rather than the rule. The case
