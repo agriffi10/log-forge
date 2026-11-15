@@ -1185,7 +1185,8 @@ if SOAK:
         soak = _SoakRecord()
         with _rerun_on_failure(request, seed, concurrent=True, soak=True):
             _interleaving(seed, form, monkeypatch, capfd, soak)
-            assert not soak.report, soak.report
+            if soak.report:
+                raise AssertionError(soak.report)
 
 
 WIRING_SEED = 1

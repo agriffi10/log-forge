@@ -33,6 +33,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import conftest
 import log_foundry
 import model_oracles
 import model_pins
@@ -1643,23 +1644,52 @@ def test_the_switches_decide_which_items_are_collected(
     assert any(line.endswith("::test_the_soak_is_wired") for line in ids), ids
 
 
-@pytest.mark.parametrize("workers", [["-n", "0"], []], ids=["serial", "distributed"])
 @pytest.mark.parametrize(
     ("variable", "value"),
-    [(SEEDS_VARIABLE, ""), (SEEDS_VARIABLE, "0-x"), (SOAK_VARIABLE, "yes")],
-    ids=["empty-seeds", "malformed-seeds", "malformed-soak"],
+    [(SEEDS_VARIABLE, "0-x"), (SOAK_VARIABLE, "yes")],
+    ids=["malformed-seeds", "malformed-soak"],
 )
-def test_a_refused_switch_stops_the_session_before_any_test(
-    variable: str, value: str, workers: list[str]
-) -> None:
+def test_a_refused_switch_stops_the_session_before_any_test(variable: str, value: str) -> None:
     """FR-002, FR-003: a bad value is a usage error naming it, and no test in any file runs.
 
     Under the default ``-n 12`` an import error in the model file would fail that file alone
     while the workers ran every other file, so ``tests/conftest.py`` refuses the value before
-    collection; the session here also names a file that never imports the model.
+    collection; the session here, distributed as the default is, also names a file that never
+    imports the model. One session per variable, because each costs a fresh interpreter: every
+    other refused value is held in process, by the parsers' corpus and by
+    :func:`test_the_session_hook_refuses_every_bad_switch_value`.
     """
-    result = _collect({variable: value}, *workers, _MODEL_FILE, "tests/test_ids.py")
+    result = _collect({variable: value}, _MODEL_FILE, "tests/test_ids.py")
     output = result.stdout + result.stderr
     assert result.returncode == pytest.ExitCode.USAGE_ERROR, output[-4000:]
     assert f"{variable}={value!r} is refused" in output, output[-4000:]
     assert not re.search(r"\d+ (passed|failed|error)", output), output[-4000:]
+
+
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        (SEEDS_VARIABLE, ""),
+        (SEEDS_VARIABLE, " "),
+        (SEEDS_VARIABLE, "3,"),
+        (SEEDS_VARIABLE, "5-3"),
+        (SEEDS_VARIABLE, "0-x"),
+        (SOAK_VARIABLE, ""),
+        (SOAK_VARIABLE, "0"),
+        (SOAK_VARIABLE, "yes"),
+    ],
+)
+def test_the_session_hook_refuses_every_bad_switch_value(
+    variable: str, value: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-002, FR-003: ``conftest.pytest_configure`` raises a usage error naming each bad value.
+
+    Called in process with the variable set, so the many refused values cost no session; the
+    two nested sessions above prove that the error stops a distributed session.
+    """
+    monkeypatch.delenv(SEEDS_VARIABLE, raising=False)
+    monkeypatch.delenv(SOAK_VARIABLE, raising=False)
+    conftest.pytest_configure(None)
+    monkeypatch.setenv(variable, value)
+    with pytest.raises(pytest.UsageError, match=re.escape(f"{variable}={value!r} is refused")):
+        conftest.pytest_configure(None)
