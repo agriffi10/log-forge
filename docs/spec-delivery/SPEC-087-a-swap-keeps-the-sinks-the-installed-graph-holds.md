@@ -18,7 +18,7 @@
   the new decision in `docs/decisions/pipeline/` and four rewritten in place; the README;
   `docs/release-notes/v1.2.1.md`, created here, which also carries SPEC-082's owed notes; the new
   probe `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`.
-- **Tests**: `tests/test_shared_sink_swap.py` (126 collected); the old pin in `tests/test_owed_closes.py`
+- **Tests**: `tests/test_shared_sink_swap.py` (129 collected); the old pin in `tests/test_owed_closes.py`
   rewritten to both directions and one close.
 - **Deviation, FR-003's concurrent criterion** (revised in the spec). Under four logging threads a
   non-shared member was sometimes closed twice, in sequence: a log with no span read the wrapper, a
@@ -110,13 +110,18 @@ Mutants in `_lifecycle.py`, each restored by copy with `__pycache__` cleared, ru
 claim, or remaining (killed); the closer's guard off, the swap's guard off (killed); `cede` a no-op
 (killed); either decision's `took` loop removed (killed); `_installed_graph` returning the root
 only (killed); a forward not inheriting the enclosing keep (killed); `_capture` bound at
-definition time (killed). Testing the guard before kept in the stale loop **survived** at first —
+definition time (killed). The first diff review planted two more that survived the whole suite,
+and each is now killed: `release` restoring no keep after a nested forward, killed by the
+`kept-after-nested` reverse row, whose kept sink is forwarded after a nested sibling; and
+`_lies_beneath` treating an unread graph as clear, killed by
+`test_the_stale_take_guard_reads_an_unread_graph_as_unknown`. Testing the guard before kept in the stale loop **survived** at first —
 on the worker path the second section cedes in either order — and is killed by the `[retired]`
 case of `test_a_stale_sink_both_kept_and_beneath_a_sink_in_use_is_ceded`, added for it.
 The completion ran `gen-index.sh` (no diff), `docs-lint.sh`, `spec-lint.sh` and
-`docstring-lint.py` on the branch. Every measurement here was taken on the build's code, which
-the completion's commit does not touch: no file under `src/` or `tests/` changes after it, so each
-is re-measurable at the commit that merged SPEC-087 into `main`.
+`docstring-lint.py` on the branch. The first diff review's fixes changed `src/` only in docstrings,
+two annotations and one constant's name, and added tests; the three `p4` probes and
+`leaves_remaining_holder.py` were re-run on the branch's final head and printed the output quoted
+above, so each measurement here is re-measurable at the commit that merged SPEC-087 into `main`.
 
 ## What changed from earlier specs?
 
