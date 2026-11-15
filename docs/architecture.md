@@ -1787,8 +1787,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
   decision on whether they are the default.
 - **The one generative test cannot find the lifecycle defects it is cited as guarding** (2026-11-14
   audit, finding 21; it breaks no invariant, and invariants 1, 2, 5, 6 and 12 name it under
-  *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` (`:109`) holds its
-  stop signal as a plain class attribute (`:132`) and never waits on it, calls back or forks. Its
+  *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` holds its
+  stop signal as a plain class attribute and never waits on it, calls back or forks. Its
   concurrent half is scheduled by the operating system, ~~its time bound carries `BOUND_SLACK = 10.0`
   (`:103`), and its close oracle sees a sink never closed and two closes that overlap (`:579-580`)
   but not two closes with no write between them~~ — SPEC-086 holds every call in both halves to its

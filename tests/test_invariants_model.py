@@ -1019,7 +1019,7 @@ def _sink_record(index: int, keys: list[str], events: list[SinkEvent], closes: C
             between = " ".join(marks) or "nothing"
             lines.append(
                 f"  close {seen}: entered at {event.count}, returned at {returned}, on "
-                f"{event.thread}{gap}; arms and takes before it: {between}"
+                f"{event.thread}{gap}; arms, writes and takes before it: {between}"
             )
             previous = event.at
             seen += 1
@@ -1028,6 +1028,8 @@ def _sink_record(index: int, keys: list[str], events: list[SinkEvent], closes: C
             marks.append("arm(writer)" if event.by_writer else "arm(change)")
         elif isinstance(event, Take):
             marks.append("take")
+        elif isinstance(event, Write):
+            marks.append(f"write({event.thread})")
     return "\n".join(lines)
 
 
@@ -1189,15 +1191,20 @@ if SOAK:
                 raise AssertionError(soak.report)
 
 
-WIRING_SEED = 1
-"""The seed the wiring test soaks: odd, so ``shutdown()`` is not in its mix, and measured fast."""
+WIRING_SEED = 2
+"""The seed the wiring test soaks: measured among the fastest in all three forms."""
 
 
+@pytest.mark.parametrize("form", FORMS)
 def test_the_soak_is_wired(
-    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+    form: str, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """SPEC-086 FR-003: the soak's body for one seed, asserting its wiring and never its verdict.
 
+    Once per passive form, because each form counts its writes in a method of its own:
+    ``emit``, ``DeliverRecorder.deliver`` and ``HTTPRecorder.deliver``. With only the ``emit``
+    form here, deleting the count from either ``deliver`` left every soak item green, since a
+    sink with no writes recorded has no write after its last close and no repeat it can blame.
     The three wrappers are installed; arms, takes, writes and closes are recorded, writes on a
     drain thread and on an actor's; ``_note_orphan_emit`` was entered; both rules were evaluated
     once per sink; and every close discharged a take, since a close with no take means the take
@@ -1207,7 +1214,7 @@ def test_the_soak_is_wired(
     recorded as a writer's.
     """
     soak = _SoakRecord()
-    ledger, _ = _interleaving(WIRING_SEED, "emit", monkeypatch, capfd, soak)
+    ledger, _ = _interleaving(WIRING_SEED, form, monkeypatch, capfd, soak)
     assert soak.installed == [label for _, _, label in _WRAPPED]
     events = soak.all_events()
     kinds = collections.Counter(type(event).__name__ for event in events)
@@ -1236,6 +1243,47 @@ def test_the_soak_is_wired(
         Arm(by_writer=True),
         Write(threading.current_thread().name),
     ], soak.events_of(fresh)
+
+
+class _Node:
+    """A stand-in for ``request.node``: the one attribute the rerun note reads."""
+
+    nodeid = "tests/test_invariants_model.py::test_x[emit-seed7]"
+
+
+class _Request:
+    """A stand-in for ``pytest.FixtureRequest`` in :func:`test_a_failure_ends_with_its_rerun`."""
+
+    node = _Node()
+
+
+@pytest.mark.parametrize(
+    ("raised", "concurrent", "soak"),
+    [
+        (AssertionError("an invariant broke"), True, False),
+        (ValueError("a child's report did not parse"), False, False),
+        (AssertionError("a soak report"), True, True),
+    ],
+    ids=["assertion-concurrent", "exception-sequential", "assertion-soak"],
+)
+def test_a_failure_ends_with_its_rerun(raised: Exception, concurrent: bool, soak: bool) -> None:
+    """SPEC-086 FR-002: a failure inside the wrapper is re-raised unchanged, with the command last.
+
+    The same exception comes out, message intact, and its last note ends with the command that
+    re-runs the item alone; a concurrent item's note also says the seed replays its draw and not
+    its schedule, and a sequential one's does not.
+    """
+    request: Any = _Request()
+    with (
+        pytest.raises(type(raised)) as caught,
+        _rerun_on_failure(request, 7, concurrent=concurrent, soak=soak),
+    ):
+        raise raised
+    assert caught.value is raised
+    note = (getattr(caught.value, "__notes__", None) or [""])[-1]
+    expected = rerun_command(_Node.nodeid, 7, soak=soak)
+    assert note.endswith(f"Re-run it alone: {expected}"), note
+    assert ("replays its draw" in note) is concurrent, note
 
 
 @pytest.mark.parametrize(

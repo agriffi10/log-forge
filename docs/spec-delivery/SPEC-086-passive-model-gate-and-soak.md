@@ -18,8 +18,9 @@
   `LOG_FOUNDRY_MODEL_SOAK=1`. It wraps `_CloseRegistry.arm`, `_CloseRegistry.take` and
   `api._note_orphan_emit` by name, records `Arm` / `Take` / `Write` / `Close` events per sink, pairs
   each close with the earliest undischarged take (`take_of_each_close`), and judges by
-  `check_unowed_repeat` and `check_late_write`. `test_the_soak_is_wired` and
-  `test_a_name_the_soak_cannot_wrap_fails_it` run in every session.
+  `check_unowed_repeat` and `check_late_write`. `test_the_soak_is_wired`, once per passive form
+  at seed 2, and `test_a_name_the_soak_cannot_wrap_fails_it` run in every session, and
+  `test_a_failure_ends_with_its_rerun` holds the rerun note.
 - **The record** (FR-005). The two §12 items and three probes came with the Draft. The build adds
   the sink-change taker and its forced measurement to the body of SPEC-085's orphan-log item without
   touching its lead, and strikes the stale clauses of "The one generative test cannot find the
@@ -94,12 +95,25 @@ assertion. One example is `http-seed6`, sink 2: two closes at count 1, 2.5 ms ap
 | `repeat@0` | `deliver-seed502`: sink 1 had no writes and was closed twice by the runner thread, 2.3 ms apart, with `arm(change) take` before each close. Its stderr had "lost 1 submission(s); logged after shutdown(), which is terminal" |
 | `repeat@1` | `http-seed578`: sink 1 had one write and was closed by two runner threads, 5.8 ms apart. The arms and takes were `arm(writer) take arm(change)` before the first close and `take` before the second |
 
-These 13 late writes are the defect in SPEC-085's orphan-log item. **The two unowed repeat closes
-are new.** The spec's evidence found none in 6,900 runs at `5447d26a`. Both are seeds with
-`shutdown()` in their mix, and both have only a non-writer's arm between their takes. The record
-cannot tell a swap's arm from `_get_worker`'s, because `arm(change)` stands for any arm made
-outside `_note_orphan_emit`. Neither one came back in the 480 head runs. A separate session will
-trace these two after this spec lands. Under FR-003 they did not hold the merge.
+These 13 late writes are the defect in SPEC-085's orphan-log item.
+
+**Three unowed repeat closes.** The first diff review reproduced a third at `07362573`:
+`deliver-seed470`, `CloseBroken:repeat@1`, about 1 in 650 runs over 13 seeds. Its record is
+`arm(writer) write(Thread-1) take arm(change)` before the first close, then `take` before the
+second, on `log-foundry-sink-close`, 5.4 ms later. All three are seeds with `shutdown()` in
+their mix, and in each the only arm between the two takes is not a writer's. The record cannot
+tell a swap's arm from `_get_worker`'s, because `arm(change)` stands for any arm made outside
+`_note_orphan_emit`. None of them came back in the 480 head runs.
+
+**"New" means not seen on the earlier library. It does not mean proven a regression.** `src/`
+changed between the spec's measurements at `5447d26a` and these, made on the library of
+`6bd0b66e`: 46 files, including SPEC-087's swap change (#374). The spec's evidence found no
+unowed repeat in 6,900 runs on the earlier library. Nobody has traced these three, so whether one
+is a defect, or which change brought it, is not known.
+
+A session to trace all three is proposed for Andrew to start. It would instrument the taker and
+the arm, bisect across `5447d26a..origin/main`, and file a §12 item with a probe for each one
+that is a defect. Under FR-003 they did not hold the merge.
 
 **FR-005, the three probes at the head**, each run with `.venv/bin/python -B` from
 `docs/audits/2026-11-14-probes/lifecycle/`:
@@ -126,6 +140,8 @@ row, which ran in the worktree at `a4391701`.
 | the same mutant with the pre-spec model file (`886b303c`) | sequential driver | 24 of 24 green: the old checks cannot see it |
 | `release`'s inline path calls `close()` twice | sequential driver | 24 of 24 red at `CloseBroken:repeat@<n>` |
 | the soak's `_note_orphan_emit` wrapper never marks the thread | `test_the_soak_is_wired` | red, recording `Arm(by_writer=False)` |
+| `self.record.wrote(self)` deleted from `DeliverRecorder.deliver` and `HTTPRecorder.deliver` (in the worktree, restored by copy) | `test_the_soak_is_wired` | `[deliver]` and `[http]` red, `[emit]` green. Before the wiring test took the three forms, the first diff review measured this mutant at 249 passed, and 48 of 48 soak items passed |
+| `_rerun_on_failure`'s `add_note` removed (in the worktree, restored by copy) | `test_a_failure_ends_with_its_rerun` | 3 of 3 red |
 | `pytest_configure` swallows the `ValueError` | the refused-switch test and the session-hook test | at `a4391701`, 10 of 10 red; each nested session read `63 passed, 12 errors`, exit 1 |
 
 **Test ids, collected by the runner.** The ids were collected with `-n 0 --collect-only` from
