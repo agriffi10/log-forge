@@ -1297,8 +1297,8 @@ close it.
   `shutdown()`** (SPEC-085; invariant 5, first observable). Measured at `a0f44b5f`, 2 cells red:
   `configure(sink=B)` then `info()` from inside the close: B has one write and no close when
   `shutdown()` returns, is in the owed record, and nothing is written to stderr; the exit drain
-  closes it. A `span` from the same place is closed by the same `shutdown()` (closes entered at
-  counts 1 and 3). **Closed by** the shutdown's final pass taking what was armed during its own
+  closes it. A `span` from the same place is closed by the same `shutdown()` (each closed once,
+  entered at count 1). **Closed by** the shutdown's final pass taking what was armed during its own
   closes, as it does for a worker built there.
 - **A sink a swap installs is closed twice with nothing written between when an orphan log armed it
   and a re-entrant `shutdown()` closed it before the swap decided** (SPEC-085; invariant 5).

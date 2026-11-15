@@ -690,7 +690,7 @@ build re-measures it, and FR-004 says what happens when a number has moved.
 | `drain-flush` | 36 red: at each of three site-paths, 12 of the 14 scripts holding `flush-none` never return, hung in `worker.flush`; the 2 that return follow a nested `shutdown`. A nested `flush(timeout=2.0)` takes 2.00 s and passes. A `configure(sink=…)` from the same place returns in 0.00 s |
 | `nested-shutdown` | 56 red: all 14 scripts holding `shutdown-none`, at 4 site-paths, 2.00 s each; a nested `shutdown(timeout=3.0)` takes 2.00 s and passes |
 | `empty-submission` | 8 red. `flush` then `shutdown` from the setter during the worker's build: the span is delivered once, yet `queued=1` with an empty list on the retired queue, `submitted_after_shutdown=1` and one "lost 1 submission(s)" line. `shutdown` then `flush`: `queued=2`, `submitted_after_shutdown=2` for one span |
-| `orphan-arm-in-close` | 2 red. `configure(sink=B)` then `info()` from inside the close: B has one write and no close when `shutdown()` returns, is in the owed record, and nothing is written to stderr; the exit drain closes it. A `span` from the same place is closed by the same `shutdown()` (closes entered at counts 1 and 3) |
+| `orphan-arm-in-close` | 2 red. `configure(sink=B)` then `info()` from inside the close: B has one write and no close when `shutdown()` returns, is in the owed record, and nothing is written to stderr; the exit drain closes it. A `span` from the same place is closed by the same `shutdown()` (each closed once, entered at count 1) |
 | `installed-closed-twice` | 2 red. The installed sink has one write and closes entered at counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0 |
 | `fork-mid-swap` | 1 red: the child's orphan log lands in the installed sink and its span in the outgoing one. The other 8 `forker` cells pass |
 | `orphan-write-after-close` | the reproduction: `writes=2`, one close entered and returned at count 1, nothing owed, `orphan_lost=0`, on 7 of 7 runs and on 3 of 3 by an independent reviewer; the unparked control closes at count 2. Unforced: 3 of 900 runs of the concurrent model with `shutdown()` in its mix |
@@ -720,3 +720,6 @@ build re-measures it, and FR-004 says what happens when a number has moved.
   only scheduled cells are test items, a pin's reproduction is a test name, the four files FR-005
   copies to a parent, which test the 442 and 20 count, and that a visit inside a script asks no
   hook; and fixes the reproduction's ordering and its control's.
+- **2026-11-15, corrected after the diff review.** The `orphan-arm-in-close` evidence row counted
+  events where the harness counts delivery calls (FR-003, `Recorder`), so its `span` case now reads
+  each sink closed once, entered at count 1, rather than closes entered at counts 1 and 3.
