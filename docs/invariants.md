@@ -186,7 +186,10 @@ under `MultiSink`, SPEC-075), and `tests/test_sinks_nats_engine_matrix.py` (NATS
 `tests/test_file_sink_deliver.py` (the file sinks' counts once per run, the torn event's
 `UNKNOWN` and the declined-run residue, SPEC-082);
 `tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,
-holding each term to its exact share, and for an `HTTPSink` behind a scripted opener.
+holding each term to its exact share, and for an `HTTPSink` behind a scripted opener;
+`tests/test_model_cells.py` that both ledger identities balance, with a batch the worker abandoned
+counted, in every cell whose sink calls back from its own code, except the cells pinned to
+`architecture.md` §12 open items and the cells those pins withhold (SPEC-085).
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
@@ -264,6 +267,11 @@ shape that keeps the hand the build or the retarget defers from being paid under
 `Worker.retarget`, and holds a setter that holds its own lock to never being run again inside
 itself: in the child, from the forking thread, from another thread of the child and from its
 resumed drain thread through a factory wrapper, and, during a retarget, in the parent (SPEC-083).
+`tests/test_model_cells.py` holds every call a sink makes from its own stop-signal setter, `emit`,
+`close` or factory, on both paths, to its budget plus one second of its own time, and a waiting
+sink's wait to ending within a second of the stop that should cut it, for a wait in `emit` or
+`close` in the parent and in `emit` in a forked child, except in the cells pinned to `architecture.md` §12
+open items and the cells those pins withhold (SPEC-085).
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -327,7 +335,11 @@ lock, its connection released once, and a forked child releases nothing (SPEC-06
 the guard releases once, waits for the call inside, and counts a call its release overtook
 (SPEC-076); `tests/test_ownership_record.py` that a sink on a reused `id` is closed once by its
 owner, and `tests/test_fork_heap_marking.py` that a last-resort child closes the sinks the library
-built and no `sink=` (SPEC-081).
+built and no `sink=` (SPEC-081); `tests/test_model_cells.py` that, with a sink that calls back
+from its own code, every sink written to has had a close when the `shutdown()` returns, no two closes enter at one
+count unless two sink changes overlapped, and no write enters after the last close once the exit
+drain has run, except in the cells and the reproduction pinned to `architecture.md` §12 open items
+and the cells those pins withhold (SPEC-085).
 
 ## 6. Twin paths keep the same promises
 
@@ -684,7 +696,11 @@ child's interpreter exit),
 `tests/test_file_sink_fork.py` (a file sink's child writes none of its parent's pending tail,
 under a real `os.fork`, SPEC-082),
 `tests/test_invariants_model.py` (a child forked at a step boundary of the sequential driver,
-from each lifecycle state, SPEC-077).
+from each lifecycle state, SPEC-077),
+`tests/test_model_cells.py` (a child forked from inside a sink's setter, `emit` or `close`, on
+both paths and during a sink change: it closes nothing it inherited, its two events land in one
+sink or move a counter, and it ends `CLOSED`, except in the cell pinned to an `architecture.md`
+§12 open item, SPEC-085).
 
 ## 13. A bad argument is refused where it is written, never later on the drain thread
 

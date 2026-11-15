@@ -564,7 +564,7 @@ specs:
   - id: "SPEC-085"
     title: "Adversarial Sink Cells: Sinks That Wait, Call Back and Fork, One Deterministic Cell at a Time"
     description: "Adds a table of 637 deterministic test cells in which a sink waits on its stop signal, calls back into the library, is built by a factory or forks, each judged by tight time, close and ledger oracles in a watched child, with every cell that is red on v1.2.0 either pinned to an open item or withheld with the pin it repeats, so a lifecycle defect of these shapes fails a test and not the review of the next change."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-077", "SPEC-079"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-085-adversarial-sink-cells.md"
