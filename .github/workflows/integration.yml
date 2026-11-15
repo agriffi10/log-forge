@@ -65,6 +65,10 @@ jobs:
     runs-on: ubuntu-latest
     # A ceiling well above the observed runtime (the suite itself is seconds; the image pulls and
     # Logstash's JVM start are the cost), so a hung service fails rather than burning an hour.
+    # The slowest of the 15 green runs of this job before the hang guard took 329 s (run
+    # 43093189328). A hung TEST in either pytest step is cut off sooner, with every thread's
+    # stack, by `faulthandler_timeout` in pyproject.toml (600 s); 30 minutes leaves room for that
+    # dump in both steps.
     timeout-minutes: 30
 
     steps:
