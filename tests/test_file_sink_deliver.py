@@ -1025,6 +1025,55 @@ def test_a_round_lost_to_enospc_registers_one_line_on_the_last_round(
 
 
 @BOTH
+def test_a_torn_event_left_unknown_is_announced_as_one_that_may_have_landed(
+    cls: type, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Invariant 11: the next section finishes the torn line, so its line does not call it lost.
+
+    An inline ``emit`` whose first write takes five bytes of event 1, and a run whose last round
+    takes event 1 whole and six bytes of event 2. The torn event has a line of its own and the
+    events after it keep the plain one; the torn event is still counted in ``failed``. A tear on
+    a round that is not the run's last is ``RETRYABLE``, and when a later round finishes it no
+    line is written at all.
+    """
+    name = cls.__name__
+    inline = cls(str(tmp_path / "inline.ndjson"))
+    budget(inline, 5, once=True)
+    inline.emit(list(EVENTS[:3]))
+    assert _lost(capsys.readouterr().err) == [
+        (
+            f"log-foundry: lost 1 event(s); {name}, 1 attempt(s), OSError errno=28; "
+            "outcome unknown; they may have landed"
+        ),
+        f"log-foundry: lost 2 event(s); {name}, 1 attempt(s), OSError errno=28",
+    ]
+    assert inline.losses() == SinkLosses(dropped=0, failed=3)
+    inline.emit(list(EVENTS[3:4]))
+    inline.close()
+    assert (tmp_path / "inline.ndjson").read_bytes() == LINES[0] + LINES[3]
+
+    last = cls(str(tmp_path / "last.ndjson"))
+    handle = budget(last, 0)
+    seen = Rounds(last, lambda number: handle.refill(30) if number == 1 else None)
+    run(last, list(EVENTS), retries=1)
+    assert seen.outcomes[1] == (A, U, R, R, R)
+    assert _lost(capsys.readouterr().err) == [
+        (
+            f"log-foundry: lost 1 event(s); {name}, 2 attempt(s), OSError errno=28; "
+            "outcome unknown; they may have landed"
+        ),
+        f"log-foundry: lost 3 event(s); {name}, 2 attempt(s), OSError errno=28",
+    ]
+    assert last.losses() == SinkLosses(dropped=0, failed=4)
+
+    finished = cls(str(tmp_path / "finished.ndjson"))
+    budget(finished, 52, once=True)
+    run(finished, list(EVENTS), retries=1)
+    assert _lost(capsys.readouterr().err) == [], "a tear a later round finished is no loss"
+    assert finished.losses() is None
+
+
+@BOTH
 def test_the_worker_the_orphan_path_and_the_adapter_all_reach_deliver(
     cls: type, tmp_path: Path
 ) -> None:

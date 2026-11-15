@@ -211,6 +211,11 @@ class Sink(Protocol):
     ``log_foundry.sinks.verdict`` — which runs the same engine inline and raises when the
     run fails, so a wrapper calling ``inner.emit(batch)`` sees what a 1.x ``emit`` showed it.
     **A ``deliver`` must not call its own ``emit``**, and must not mutate the list it is given.
+    **A wrapper that forwards ``deliver`` hands the inner sink the same event objects in every
+    round of a run**, as the shipped wrappers do. A file sink matches the event whose line a
+    write cut partway by identity (SPEC-082), so a wrapper that copies the events between rounds
+    makes the torn event look new: its line is written whole after its tail, and that second
+    copy is counted nowhere.
 
     **A direct ``deliver`` call outside any engine run is a single round with no memory of
     earlier calls** (SPEC-074 handover item 1a, SPEC-075). It is a detached run of its own: the

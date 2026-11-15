@@ -581,7 +581,7 @@ class _Writes:
         self._torn = torn
 
     def lose(self, error: Exception, retryable: bool, name: str) -> None:
-        """Settles every position that did not land as lost to ``error``, and announces it once.
+        """Settles every position that did not land as lost to ``error``, and announces the loss.
 
         The lost events are ``RETRYABLE`` when the sink's predicate retries the error and
         ``REJECTED`` otherwise. **The torn event is the exception** (SPEC-082 FR-002): it is
@@ -592,9 +592,14 @@ class _Writes:
         prefix is on disk and the next section writes its tail, so it may land; reported lost it
         could fail the run, and a catcher that resends whole would write the line again.
 
-        One line through ``Lost``, as SPEC-074's sinks write it: ``LAST`` for a retried error and
-        ``ALWAYS`` otherwise, naming the class, the exception's type and its ``errno`` when it
-        carries one. A run that fails on this round counts its unencodable events in ``failed``
+        One line through ``Lost`` for the events that did not land, as SPEC-074's sinks write
+        it: ``LAST`` for a retried error and ``ALWAYS`` otherwise, naming the class, the
+        exception's type and its ``errno`` when it carries one. **An** ``UNKNOWN`` **torn event
+        has a line of its own**, ``ALWAYS``, that ends ``; outcome unknown; they may have
+        landed``, the words the HTTP sinks write for an event they cannot adjudicate: the next
+        section finishes its line, so a line calling it simply lost would say what did not
+        happen (invariant 11). It is still counted in ``failed`` with the rest, the upper bound
+        invariant 2 records. A run that fails on this round counts its unencodable events in ``failed``
         with the rest, as 1.x's ``emit`` counted a failed batch whole (``When.FAILED``), and the
         inline adapter raises the error as both ``SinkDeliveryError`` and its own type
         (``raise_on_failure``), or the original where that dual type cannot be built.
@@ -623,14 +628,25 @@ class _Writes:
         kind = f"{type(error).__name__} {_diag.errno_of(error)}".rstrip()
         whole = unencodable_in_run(self._owner)
         context.count(self._owner.log_foundry_counters, "failed_events", whole, when=When.FAILED)
+        unsure = [] if again or self._torn is None else [self._torn]
+        rest = [position for position in lost if position not in unsure]
         losses = Lost(self._owner)
-        losses.add(
-            [self._batch[position] for position in lost],
-            when=When.LAST if retryable else When.ALWAYS,
-            key=kind,
-            line=raised_line("event", name, kind),
-            whole=whole,
-        )
+        if unsure:
+            losses.add(
+                [self._batch[position] for position in unsure],
+                when=When.ALWAYS,
+                key=f"{kind} unknown",
+                line=raised_line("event", name, kind, "; outcome unknown; they may have landed"),
+                whole=0 if rest else whole,
+            )
+        if rest:
+            losses.add(
+                [self._batch[position] for position in rest],
+                when=When.LAST if retryable else When.ALWAYS,
+                key=kind,
+                line=raised_line("event", name, kind),
+                whole=whole,
+            )
         losses.register()
         built = delivery_error(error)
         context.raise_on_failure(error if built is None else built)

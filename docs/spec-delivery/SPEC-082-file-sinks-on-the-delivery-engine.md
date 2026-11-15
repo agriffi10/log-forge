@@ -15,7 +15,8 @@
 - **The tail** (FR-002). `_Tail` is the unwritten rest of a line a write cut partway. It is
   written first in every round and in the release a `close()` runs, and before any rotation. The
   run keeps `(event, tail)` in its notes and finds its torn occurrence as the first offered event
-  that is that object. A torn event the run will not be offered again is `UNKNOWN`.
+  that is that object. A torn event the run will not be offered again is `UNKNOWN`, and is
+  announced on a line of its own that ends `; outcome unknown; they may have landed`.
 - **The stored count** (FR-002). `_take` stores each write call's return with
   `counts.extend(map(stream.write, (chunk,)))`. One idempotent step (`_shorten` for a tail,
   `_Writes._judge` for lines) brings the tail, `_size` and the owed byte order mark to the stored
@@ -128,7 +129,10 @@ caller-visible changes are recorded here for the release after 1.2.0:
 - A closed file-sink subclass that inherits `emit` is not resent, even if it would re-open
   itself. A subclass that wants the resend overrides `emit`.
 - The loss line reads `<Class>, N attempt(s), <Type>` where 1.x wrote `<Class>, <Type>`, each
-  followed by `errno=N` only when the exception carries one.
+  followed by `errno=N` only when the exception carries one. An event whose line a write cut
+  partway, and which the run will not offer again, is on a line of its own that ends
+  `; outcome unknown; they may have landed`, since the next write finishes its line; it is still
+  counted in `failed`.
 - A codec that is not a text encoding is refused at construction, now before any file is
   created.
 - Both sinks gain `deliver`, `log_foundry_counters` and `log_foundry_stop_signal`.
@@ -138,9 +142,10 @@ caller-visible changes are recorded here for the release after 1.2.0:
 - A third-party wrapper whose `emit` calls the file sink's `emit` is a one-round caller too,
   with the inline `emit` and a `MultiSink` child. When a write lands part of a batch, the rest
   is lost and counted, and `emit` returns. The count shows in the file sink's own `losses()`
-  and in its one `lost N event(s); FileSink, 1 attempt(s), OSError errno=N` line, and nowhere
-  the worker reads: `flush()` returns true, `failed_batches` stays 0, and `health().sink` stays
-  `None` for a wrapper that offers no `losses()`. In 1.x the raise reached the worker through
+  and in its `lost N event(s); FileSink, 1 attempt(s), OSError errno=N` line, with the torn
+  event on a line of its own that says it may have landed, and nowhere the worker reads:
+  `flush()` returns true, `failed_batches` stays 0, and `health().sink` stays `None` for a
+  wrapper that offers no `losses()`. In 1.x the raise reached the worker through
   the wrapper, and its resend put the head of the batch on disk twice.
 - An orphan log, one written outside any span, that a file sink lands nothing of is announced by
   the engine's line. The sink writes `lost 1 event(s); FileSink, 1 attempt(s), OSError errno=N`
@@ -149,6 +154,10 @@ caller-visible changes are recorded here for the release after 1.2.0:
   `ENOSPC`, the sink's line had no `1 attempt(s),` and the second line was
   `absorbed a failure while emitting an orphan log (OSError); the event was lost`. `orphan_lost`
   and `losses()` count the same as before.
+- For the `iso2022_*` codecs, a file sink appending to a non-empty file no longer writes the
+  three bytes `ESC ( B` ahead of its first line, which 1.x's text stream wrote there. Into a
+  regular file, every other codec the sweep above covered, and these codecs into an empty file,
+  get the bytes 1.x wrote.
 
 ## Verification
 
@@ -164,4 +173,6 @@ failure. Not run: the GitHub runner itself, and Windows, which no workflow cover
 
 The tests added at the first diff review were each watched to fail under a planted mutant: the
 fork hook's re-test of the byte order mark, a round of nothing encodable under a pending tail
-for each sink, and the real-worker twin of FR-004's second criterion.
+for each sink, and the real-worker twin of FR-004's second criterion. At the second, the
+test of the torn event's own line went red with the round announced as one group, and again
+with that line written while the torn event was still `RETRYABLE`.

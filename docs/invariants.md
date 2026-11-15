@@ -111,10 +111,11 @@ can land before a raise and again each time the worker retries that batch — th
 sinks are on the engine, where each event that did not land is in `failed` once per run. Their
 `failed` has an upper bound of its own. An event whose line a write cut partway, and which the run
 will not be offered again, is reported `UNKNOWN` and counted, though the next section on the sink
-writes the rest of its line and it may land. And a torn event a round left `RETRYABLE` is
-counted when the worker then declines the run, or the sink is closed during the backoff, and if
-nothing else landed it is in `failed_batches` too, the bound for a failed run stated below; in
-both cases `close()` or the next section finishes the line, and nothing is written twice. ~~The SQS and SNS sender faults and a failure the retry predicate
+writes the rest of its line and it may land; its line says it may have landed. And a torn event
+a round left `RETRYABLE` is counted when the worker then declines the run, or the sink is closed
+during the backoff, and if nothing else landed it is in `failed_batches` too, the bound for a
+failed run stated below; in both cases `close()` or the next section finishes the line, and
+nothing is written twice. ~~The SQS and SNS sender faults and a failure the retry predicate
 refuses, counted before `emit` raised (SPEC-070)~~ — superseded by SPEC-074: those sinks are on the
 engine, where each lost event lands in `failed` once per run. The HTTP family's `failed` lands once per batch since SPEC-073: it
 is registered on the run context and committed when the run ends, once per request refused for

@@ -67,11 +67,18 @@ never handed back for a whole-batch resend. It targets the first release after 1
   appending to the same path would lose the lines it wrote in between (invariant 12).
 - **Flushing per line and reporting instead of raising.** It is rejected because the unwritten rest
   of the batch is lost rather than resent.
-- Cross-process coordination. If another process appends to the same path between a partial write
-  and the completion of its torn line, that process's first line joins the torn prefix and does not
-  parse. A child forked while a tail is pending is that case too (FR-005). No single process can
+- Cross-process coordination. If another process appends to the same path, or truncates it,
+  between a partial write and the completion of its torn line, a line does not parse: an appended
+  line joins the torn prefix, and after a truncation the tail lands alone at the head of the file.
+  A child forked while a tail is pending is the first case too (FR-005). No single process can
   prevent this, and `FileSink`'s docstring already puts two processes appending to one path out of
   scope.
+- **A `deliver` wrapper that copies the events between rounds.** A file sink finds the event whose
+  line a write cut partway by object identity, so a wrapper that hands it copies in a later round
+  makes the torn event look new: its line is written whole after its tail, and that copy is
+  counted nowhere. The requirement is stated on the `deliver` contract in `sinks/base.py` and in
+  `architecture.md`: a wrapper forwards the same event objects in every round of a run, as every
+  shipped wrapper does.
 - Durability. `ACCEPTED` means the write call returned the bytes as taken, exactly what 1.x's
   `flush()` returning meant. No `fsync` is added.
 - A `max_retries` on either file sink. The inline `emit` stays one round, as 1.x's `emit` was one
@@ -421,7 +428,14 @@ carries one. The engine and the worker's abandon line add nothing to it. **The l
 changes.** Through `raised_line` its detail reads `<Class>, N attempt(s), <Type> errno=N`, where
 1.x wrote `<Class>, <Type> errno=N`. The `errno=N` appears only when the exception carries an
 integer `errno`: the detail is `FileSink, 1 attempt(s), TypeError` for a `TypeError`, and
-`FileSink, 1 attempt(s), OSError` for an `OSError` with none.
+`FileSink, 1 attempt(s), OSError` for an `OSError` with none. **A torn event left `UNKNOWN` has a
+line of its own**, `When.ALWAYS`, through the same `raised_line` with the suffix
+`; outcome unknown; they may have landed`, the words the HTTP sinks write for an event they
+cannot adjudicate. The next section finishes its line, so a line calling it lost would say what
+did not happen (invariant 11). It is still counted in `failed` with the rest, the upper bound
+invariant 2 records. The events after it keep the plain line. A torn event a round left
+`RETRYABLE` is in no line of that round, and when a later round finishes it, in none at all.
+Added 2026-11-15 (*Revision history*).
 
 The inline `emit` keeps SPEC-069's promise that no `except` clause changes. When a run fails, it
 raises the dual-typed error that `_driver_error.delivery_error` builds from the exception of the
@@ -477,11 +491,17 @@ refusal on its first attempt only.
       `test_a_refusal_after_a_transient_failure_stops_the_resend_where_it_lands` run on `SQLiteSink`
       and pass. With the worker changed to abandon a final refusal on its first attempt only, the
       second fails.
-- [ ] A round lost to `ENOSPC` registers exactly one line through `Lost`, naming the sink's class,
-      `OSError` and `errno=28` and no event data. It is written once per run, on the last round. For
-      an inline `FileSink.emit` of two events it reads
+- [ ] A round lost to `ENOSPC` that cut no line registers exactly one line through `Lost`,
+      naming the sink's class, `OSError` and `errno=28` and no event data. It is written once per
+      run, on the last round. For an inline `FileSink.emit` of two events it reads
       `log-foundry: lost 2 event(s); FileSink, 1 attempt(s), OSError errno=28`, and for an
       `OSError` with no `errno` it ends `FileSink, 1 attempt(s), OSError`.
+- [ ] An inline `FileSink.emit` of three events whose first write takes five bytes and then
+      raises `ENOSPC` writes two lines:
+      `log-foundry: lost 1 event(s); FileSink, 1 attempt(s), OSError errno=28; outcome unknown; they may have landed`
+      and `log-foundry: lost 2 event(s); FileSink, 1 attempt(s), OSError errno=28`, and
+      `losses()` is `SinkLosses(dropped=0, failed=3)`. A run whose last round tears a line writes
+      the same two groups, and a run whose torn line a later round finishes writes no line.
 - [ ] The worker, the orphan path and the inline adapter all reach `deliver`, held by
       `tests/test_delivery_paths.py`'s pattern. `tests/test_engine_sinks_roster.py` finds both sinks,
       with its floor raised from 13 to 15.
@@ -691,7 +711,8 @@ that raises fails at once naming the original exception.
   - a non-retryable `errno` costs one attempt;
   - a closed file-sink subclass that inherits `emit` is not resent (FR-004);
   - the loss line reads `<Class>, N attempt(s), <Type>` where 1.x wrote `<Class>, <Type>`, each
-    followed by `errno=N` only when the exception carries one (FR-004);
+    followed by `errno=N` only when the exception carries one, and a torn event left `UNKNOWN`
+    has a line of its own ending `; outcome unknown; they may have landed` (FR-004);
   - a non-text codec is refused at construction.
 
 ---
@@ -909,3 +930,19 @@ that raises fails at once naming the original exception.
   - *FR-004's second criterion.* It says "through the worker", and its test drove
     `_engine.run_delivery`. A twin on a real `Worker` now sits beside it, with the engine's wait
     recorded, so the criterion keeps its wording.
+- **2026-11-15, second diff review.** The system frame found one line that said what did not
+  happen, one wrapper requirement stated nowhere, and one gap in *Out of Scope*:
+  - *The torn event's line.* The round's one line counted a torn `UNKNOWN` event among the lost,
+    though the next section finishes its line: an inline `emit` whose first write took five bytes
+    wrote `lost 3 event(s)` and left event 1 whole on disk after the next `emit` (invariant 11).
+    FR-004 now gives that event a line of its own ending `; outcome unknown; they may have
+    landed`, the HTTP sinks' words for an event they cannot adjudicate, and gains a criterion for
+    the two lines. The first ENOSPC criterion now says it covers a round that cut no line. The
+    counters are unchanged: the torn event stays in `failed`, the upper bound invariant 2 records.
+  - *A wrapper that copies the events.* A third-party `deliver` wrapper that hands the file sink
+    copies between rounds had the torn line written whole after its tail, counted nowhere. *Out
+    of Scope* now says so, and the `deliver` contract in `sinks/base.py` and `architecture.md`
+    states the requirement the shipped wrappers already meet.
+  - *A truncation.* *Out of Scope*'s cross-process bullet now covers another process truncating
+    the file as well as appending to it: after a truncation the tail lands alone at the head of
+    the file and does not parse.

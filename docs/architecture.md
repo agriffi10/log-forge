@@ -544,7 +544,11 @@ indices and count only their own decisions: a declined event is `SKIPPED`, a cal
 wrapper's positions, and for a malformed inner verdict inside a run sets aside what the inner
 call registered, as the engine does for a bare sink. Caller code runs once per event per run:
 `TransformSink` keeps each event's result and `FilteringSink` each forwarded event's decision, so a
-later round forwards the same object without asking the function or the predicate again. `LogstashSink` returns its backend's verdict unmapped. No wrapper
+later round forwards the same object without asking the function or the predicate again. That
+is a requirement on any wrapper that forwards `deliver`, a third party's included: a file sink
+matches the event whose line a write cut partway by identity (SPEC-082), so a wrapper that copies
+the events between rounds has the torn line written whole after its tail, a second copy counted
+nowhere. `LogstashSink` returns its backend's verdict unmapped. No wrapper
 declares idempotence or calls its inner sink's `emit` from `deliver`, and each wrapper's own `emit`
 keeps its 1.x body. `MultiSink` offers no `deliver`: it cannot give one verdict for an event one
 child took and another refused, so it keeps calling each child's `emit`, and an engine child's
