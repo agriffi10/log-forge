@@ -1359,7 +1359,13 @@ close it.
   1, nothing owed, `orphan_lost=0`, on 7 of 7 runs and on 3 of 3 by an independent reviewer; the
   unparked control closes at count 2. Unforced: 3 of 900 runs of the concurrent model with
   `shutdown()` in its mix. The measurement used a recorder that keeps accepting after `close()`; a
-  shipped sink behind the closed guard was not measured. **Closed by** a mark around the orphan
+  shipped sink behind the closed guard was not measured. A sink change takes the sink the same way
+  (SPEC-086): with the log parked after its owed check, a displacing `configure(sink=…)` made and
+  returned, and the log then released, the first sink has `writes=2` and one close entered and
+  returned at count 1, and nothing is owed after a later `shutdown()` and the exit drain, on 7 of 7
+  forced runs at `acf5196e`, the unparked control closing at count 2 on 7 of 7. Unforced, it is
+  SPEC-086's soak failing the late-write rule at `519-http`, `1335-http` and `1695-http`, measured
+  at `5447d26a` while that spec was authored. **Closed by** a mark around the orphan
   path's delivery call that a closer waits for or that re-arms the sink once the call returns, or
   by one lifecycle command path.
 
