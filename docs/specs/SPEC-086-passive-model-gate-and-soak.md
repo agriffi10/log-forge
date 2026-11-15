@@ -192,7 +192,12 @@ run, and a rename of any of them fails the item instead of silencing it, because
 installed by name: `_lifecycle._CloseRegistry.arm`, `_lifecycle._CloseRegistry.take`, and
 `log_foundry.api._note_orphan_emit`, the orphan path's call that arms a sink for a write. An arm
 recorded on a thread that is inside `_note_orphan_emit` is a **writer's arm**. A close's take is
-the last `take` of that sink recorded before the close entered.
+the earliest `take` of that sink recorded before the close entered that no earlier close has
+discharged. Not the latest: a sink change can hand its close to a closer thread that has not
+started when a `shutdown()` takes the re-armed sink and closes it inline, so two takes precede two
+closes, the latest would serve both, and the writer's arm between them would be missed. A close
+with no take left to discharge is reported as `CloseBroken:untaken@<count>`, a wiring failure the
+wiring test also asserts, and is never judged against a wider window.
 
 - **Unowed repeat close.** Two closes of a sink that entered at one write count are a finding
   unless a writer's arm of that sink was recorded between the first close's take and the
@@ -306,6 +311,12 @@ and the exit drain. This spec's build adds that to the item's body, with its for
 and the three seeds. It does not change the item's lead, which SPEC-085's `orphan-write-after-close`
 pin carries.
 
+**One item goes stale and is corrected in place.** §12's "The one generative test cannot find the
+lifecycle defects it is cited as guarding" says the model's bound carries `BOUND_SLACK = 10.0` and
+that its close oracle cannot see two closes with no write between them. The build strikes those
+two clauses in that item's body with what the model now asserts, leaves its lead alone, and leaves
+it open: its sink is still passive.
+
 #### Acceptance Criteria:
 
 - [ ] `docs/architecture.md` §12 carries the two items above under `### Open`, each naming its
@@ -363,8 +374,11 @@ The corpora for both functions go in SPEC-085's `tests/test_model_oracles.py`.
 | `LOG_FOUNDRY_MODEL_SEEDS` | concurrent seeds 0 to 15, sequential 0 to 23 | a comma-separated list of integers and inclusive `a-b` ranges; both halves run exactly those |
 | `LOG_FOUNDRY_MODEL_SOAK` | no soak item is collected | `1`: one soak item per form and seed, which does not gate |
 
-Both are read at collection by the model file only. Neither is a library setting, and an empty
-or unrecognised value of either is a collection error.
+Both are read at collection by the model file only, and validated before collection by
+`tests/conftest.py`'s `pytest_configure`, through the model's own parsers, which raises
+`pytest.UsageError` naming the variable and the value: under the default `-n 12` an import error in
+the model file fails that file alone while every other file runs. Neither is a library setting,
+and an empty or unrecognised value of either stops the session before any test, with exit code 4.
 
 ```bash
 # Soak the gating set:
@@ -441,6 +455,12 @@ reviews' independent builds. The library's source is the same at `a0f44b5f` and 
 | The three probes | *Review 3:* `p9` matches row for row; `p10` 100, 98 and 0 of 100; `p8` 2 of 300, nothing on stderr |
 
 ## Revision history
+
+- **2026-11-15, revised during the build** after the plan review. The soak pairs each close with
+  the earliest undischarged take rather than the latest, and reports a close with none as
+  `untaken`; the switches are validated in `tests/conftest.py`, because a collection error in one
+  file does not stop a `-n 12` session (measured: 24 passed, 12 errors, exit 1); and FR-005 names
+  the correction to the finding-21 item.
 
 - **2026-11-14, cut from SPEC-085's first draft** after its review, as the generative half.
 - **2026-11-15, replaced after two reviews of that half.** The adversarial generative run is out

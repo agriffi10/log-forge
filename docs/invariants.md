@@ -279,6 +279,11 @@ resumed drain thread through a factory wrapper, and, during a retarget, in the p
 sink's wait to ending within a second of the stop that should cut it, for a wait in `emit` or
 `close` in the parent and in `emit` in a forked child, except in the cells pinned to `architecture.md` §12
 open items and the cells those pins withhold (SPEC-085).
+`tests/test_invariants_model.py` holds every call its two halves make with a passive sink to
+returning within its own timeout plus one second: in the concurrent half each `info()` and traced
+call (budget zero), `flush()`, `shutdown()` and `configure(sink=…)` from four threads, and in the
+sequential half every step, the fork and each of a forked child's three calls; the session prints
+the worst margin over the passing runs, and only the default seed range gates (SPEC-086).
 
 ## 4. Inside a span, the caller's thread never carries sink I/O; outside one, it does
 
@@ -350,7 +355,12 @@ one a walk that raised first never reached (SPEC-081 FR-006).
 `shutdown()` or the exit drain landing mid-swap closes the displaced sink once and the installed
 one before it returns, and that a swap whose worker such a `shutdown()` retires after the
 reassign closes the displaced sink once and leaves the installed one owed, counting no incomplete
-swap when that shutdown took the displaced sink and one when it left it owed; `tests/test_invariants_model.py` asserts the first observable;
+swap when that shutdown took the displaced sink and one when it left it owed; `tests/test_invariants_model.py`
+that every sink written to is closed and no two closes overlap, in both halves, and in its
+sequential half, where one caller makes the count exact, that no close enters at the write count of
+the close before it, after every step, and that no sink is written after its last close returned,
+after every `shutdown()` and exit drain (SPEC-086); its soak, run only on request and gating
+nothing, judges the same count under four callers by the library's own arms and takes;
 `tests/test_sinks_nats_liveness.py` that a `NATSSink` close in flight is waited for under its
 lock, its connection released once, and a forked child releases nothing (SPEC-061);
 `tests/test_closed_guard.py`, `tests/test_sink_post_close.py` and `tests/test_sinks_kafka.py` that

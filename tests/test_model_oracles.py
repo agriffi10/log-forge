@@ -10,6 +10,10 @@ each carry accepted and rejected samples, in the manner of
 
 The runner tests fork; each costs one child, and the two that wait for the watchdog cost its
 deadline of ``EPSILON`` plus ``HANG_AFTER`` seconds of own time.
+
+SPEC-086 adds the gating model's corpora at the end: the late-write and unowed-repeat rules, the
+two switches' parsers and the session's refusal of a bad value, the rerun command, the gate's
+margin line, and a nested collection of ``tests/test_invariants_model.py`` under each switch.
 """
 
 from __future__ import annotations
@@ -36,31 +40,47 @@ import model_sinks
 import test_model_cells
 from model_oracles import (
     EPSILON,
+    GATE_MARGIN,
     HANG_AFTER,
     MARGIN,
     MARGIN_REDERIVE,
+    SEEDS_VARIABLE,
+    SOAK_VARIABLE,
     WAITER_HOLD,
     WATCHDOG,
+    Arm,
     Call,
     ChildReport,
+    Close,
     Closes,
     Interval,
     Ledger,
     ModelFailure,
+    Take,
     Wait,
+    Write,
     changes_overlapped,
     check_call,
     check_child,
     check_closed,
     check_end,
+    check_late_write,
     check_ledger,
     check_released,
     check_repeat,
+    check_unowed_repeat,
     check_wait,
+    gate_margin_line,
     hang_signature,
     margin_line,
     overdue,
     own_time,
+    parse_seeds,
+    parse_soak,
+    rerun_command,
+    seeds_from,
+    soak_from,
+    take_of_each_close,
 )
 from model_pins import PINS, Cell, PinnedVerdict, cell_id, cells, judge, pin_of, scheduled, withheld
 from model_sinks import ChildRun, Forker, Reentrant, Waiter, factory, install_sink, run_body
@@ -1040,26 +1060,66 @@ def test_the_session_prints_the_worst_margin_line(workers: list[str]) -> None:
 
     A nested session over one passing cell and one pinned cell, from the repo root with this
     interpreter. The pinned cell's margin is not in the line. The nested session is a new
-    interpreter started with ``subprocess``, not a fork of this process.
+    interpreter started with ``subprocess``, not a fork of this process. SPEC-086 FR-001 adds one
+    gating model run to the same session, whose own line names it and which the cells' line does
+    not read; the model's switches are dropped from the nested environment so a developer's soak
+    settings cannot rename that run.
     """
     passing = "tests/test_model_cells.py::test_cell[reentrant-emit-orphan-info]"
     pinned = "tests/test_model_cells.py::test_cell[reentrant-close-orphan-shutdown-none]"
-    env = {name: value for name, value in os.environ.items() if not name.startswith("PYTEST_")}
+    gating = (
+        "tests/test_invariants_model.py::test_the_sequential_driver_holds_the_state_table[seed0]"
+    )
     result = subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *workers, passing, pinned],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            *workers,
+            passing,
+            pinned,
+            gating,
+        ],
         cwd=TESTS.parent,
-        env=env,
+        env=_nested_env(),
         capture_output=True,
         text=True,
         timeout=600,
         check=False,
     )
     lines = [line for line in result.stdout.splitlines() if line.startswith("model cells:")]
+    gate = [line for line in result.stdout.splitlines() if line.startswith("model gate:")]
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
-    assert "1 passed, 1 xfailed" in result.stdout, result.stdout[-2000:]
+    assert "2 passed, 1 xfailed" in result.stdout, result.stdout[-2000:]
     assert len(lines) == 1, result.stdout[-4000:]
     assert "reentrant-emit-orphan-info]" in lines[0]
     assert "shutdown-none" not in lines[0]
+    assert len(gate) == 1, result.stdout[-4000:]
+    assert "::test_the_sequential_driver_holds_the_state_table[seed0] (" in gate[0], gate
+
+
+def _nested_env(**switches: str) -> dict[str, str]:
+    """Returns this environment for a nested session, without pytest's or the model's variables.
+
+    Args:
+      **switches: Model switches to set, by variable name.
+
+    Returns:
+      The environment.
+
+    Raises:
+      None.
+    """
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("PYTEST_", "LOG_FOUNDRY_MODEL_"))
+    }
+    env.update(switches)
+    return env
 
 
 # -- the table and its pins ---------------------------------------------------------------
@@ -1322,3 +1382,284 @@ def test_a_waiter_waits_on_the_event_it_holds_when_the_wait_begins() -> None:
     assert outcome.verdict == frozenset(), outcome.text
     assert outcome.properties["waited"] == "held:True"
     assert outcome.properties["waits"] == "1"
+
+
+# -- SPEC-086: the gating model's close count, the soak's rule, and the switches -----------------
+
+
+@pytest.mark.parametrize(
+    ("closes", "expected"),
+    [
+        (Closes(3, (), ()), frozenset()),
+        (Closes(0, (0,), (0,)), frozenset()),
+        (Closes(2, (1, 2), (1, 2)), frozenset()),
+        (Closes(2, (1,), (2,)), frozenset()),
+        (Closes(2, (1,), (1,)), frozenset({"CloseBroken:late-write@1"})),
+        (Closes(4, (1, 2), (1, 3)), frozenset({"CloseBroken:late-write@3"})),
+    ],
+    ids=[
+        "written-never-closed",
+        "closed-unwritten",
+        "written-again-and-closed-again",
+        "write-entered-before-the-close-returned",
+        "write-after-the-last-close-returned",
+        "reads-the-last-return",
+    ],
+)
+def test_the_late_write_rule(closes: Closes, expected: frozenset[str]) -> None:
+    """FR-001: a write above the count at the last close's return, and nothing else, is late.
+
+    The ``<count>`` is the count at that return, as ``unreleased@`` names the count at the last
+    close; a write that entered while the close ran is counted at its return and is silent.
+    """
+    assert _signatures(check_late_write, closes) == expected
+
+
+def _close(count: int, thread: str = "log-foundry-sink-close") -> Close:
+    """A close event at one count, at a fixed instant.
+
+    Args:
+      count: The write count at its entry.
+      thread: The closing thread's name.
+
+    Returns:
+      The event.
+
+    Raises:
+      None.
+    """
+    return Close(count, thread, 0.0)
+
+
+_WRITE = Write("Thread-1 (runner)")
+_BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        (
+            [_BY_WRITER, Take(), _BY_WRITER, _WRITE, _close(1), Take(), _close(1)],
+            frozenset(),
+        ),
+        (
+            [_BY_WRITER, _WRITE, Take(), _BY_WRITER, _close(1, "MainThread"), Take(), _close(1)],
+            frozenset(),
+        ),
+        (
+            [_BY_WRITER, Take(), _BY_WRITER, Take(), _WRITE, _close(1), _close(1, "MainThread")],
+            frozenset(),
+        ),
+        ([_BY_WRITER, _WRITE, Take(), _close(1), _WRITE, Take(), _close(2)], frozenset()),
+        ([_BY_WRITER, _WRITE, Take(), _close(1)], frozenset()),
+        (
+            [_BY_WRITER, _WRITE, Take(), _close(1), Take(), _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [_BY_WRITER, _WRITE, Take(), _BY_CHANGE, _close(1), Take(), _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [_BY_WRITER, _WRITE, _BY_WRITER, Take(), _close(1), Take(), _close(1)],
+            frozenset({"CloseBroken:repeat@1"}),
+        ),
+        (
+            [Take(), _BY_WRITER, _WRITE, _close(1), _WRITE, _close(2), Take(), _close(2)],
+            frozenset({"CloseBroken:untaken@2", "CloseBroken:repeat@2"}),
+        ),
+        (
+            [Take(), _close(0), Take(), _close(0), _WRITE, Take(), _close(1), Take(), _close(1)],
+            frozenset({"CloseBroken:repeat@0", "CloseBroken:repeat@1"}),
+        ),
+    ],
+    ids=[
+        "the-traced-rearm",
+        "the-same-with-a-shutdown-as-first-taker",
+        "two-takes-before-two-closes",
+        "two-counts",
+        "one-close",
+        "no-arm-between-the-takes",
+        "only-a-sink-changes-arm-between",
+        "a-writers-arm-before-the-first-take-excuses-nothing",
+        "a-close-with-no-take-is-not-excused-by-a-wider-window",
+        "two-counts-each-repeated",
+    ],
+)
+def test_the_unowed_repeat_rule(events: list[object], expected: frozenset[str]) -> None:
+    """FR-003: two closes at one count need a writer's arm between their takes, or they are found.
+
+    The traced sequence at seed 1653 is silent, with a sink change or a ``shutdown()`` as the
+    first taker; #339's shape, a sink change's arm between the takes, is not. A writer's arm
+    before the first take lies outside the window and excuses nothing. A close with no take of
+    its own is a wiring failure, ``untaken``, and is never judged against a wider window: the
+    earlier take there belongs to the first close, so a wider window would reach back past it to
+    the writer's arm and excuse the repeat.
+    """
+    assert _signatures(check_unowed_repeat, events) == expected
+
+
+def test_each_close_discharges_the_earliest_take_left() -> None:
+    """FR-003: takes pair with closes first in, first out, and a close with none left is ``None``.
+
+    Two takes can both precede their closes, which can enter in either order, so the latest take
+    would serve both; the earliest undischarged take is what each close owns.
+    """
+    events = [Take(), _BY_WRITER, Take(), _close(1), _close(1), _close(1), Take(), _close(2)]
+    assert take_of_each_close(events) == [0, 2, None, 6]
+
+
+@pytest.mark.parametrize(
+    ("value", "seeds"),
+    [
+        ("0", (0,)),
+        ("0-3", (0, 1, 2, 3)),
+        ("3,17,40-44", (3, 17, 40, 41, 42, 43, 44)),
+        (" 5 , 1-2 ", (1, 2, 5)),
+        ("4,4,3-4", (3, 4)),
+        ("7-7", (7,)),
+    ],
+)
+def test_the_seed_switch_reads_integers_and_ranges(value: str, seeds: tuple[int, ...]) -> None:
+    """FR-002: a comma-separated list of integers and inclusive ranges, sorted, each once."""
+    assert parse_seeds(value) == seeds
+    assert seeds_from({SEEDS_VARIABLE: value}, range(3)) == seeds
+
+
+@pytest.mark.parametrize("value", ["", " ", "3,", ",3", "a", "+3", "-1", "5-3", "1-", "1--2", "٣"])
+def test_the_seed_switch_refuses_what_does_not_parse(value: str) -> None:
+    """FR-002: every refusal names the variable and quotes the value, an empty one included."""
+    with pytest.raises(ValueError, match=re.escape(f"{SEEDS_VARIABLE}={value!r} is refused")):
+        parse_seeds(value)
+
+
+def test_an_unset_seed_switch_runs_the_defaults() -> None:
+    """FR-002: unset, the default range is returned whatever it is."""
+    assert seeds_from({}, range(16)) == tuple(range(16))
+    assert seeds_from({"OTHER": "3"}, range(24)) == tuple(range(24))
+
+
+@pytest.mark.parametrize("value", ["", "0", "true", "yes", " 1", "1 ", "01"])
+def test_the_soak_switch_accepts_only_one(value: str) -> None:
+    """FR-003: ``1`` is the one value; any other, the empty one included, is refused by name."""
+    assert parse_soak("1") is True
+    assert soak_from({}) is False
+    assert soak_from({SOAK_VARIABLE: "1"}) is True
+    with pytest.raises(ValueError, match=re.escape(f"{SOAK_VARIABLE}={value!r} is refused")):
+        soak_from({SOAK_VARIABLE: value})
+
+
+def test_the_rerun_command_names_the_item_its_seed_and_a_serial_run() -> None:
+    """FR-002: one command, the switch set to the seed, ``-n 0``, the id quoted for the shell."""
+    nodeid = "tests/test_invariants_model.py::test_x[emit-seed7]"
+    assert rerun_command(nodeid, 7, soak=False) == (
+        f"{SEEDS_VARIABLE}=7 poetry run pytest -n 0 '{nodeid}'"
+    )
+    assert rerun_command(nodeid, 7, soak=True) == (
+        f"{SOAK_VARIABLE}=1 {SEEDS_VARIABLE}=7 poetry run pytest -n 0 '{nodeid}'"
+    )
+
+
+def test_the_gate_margin_line_reads_its_own_property_only() -> None:
+    """FR-001: the gate's line names the worst gating margin and ignores the cells' property."""
+
+    def report(nodeid: str, when: str, *props: tuple[str, object]) -> SimpleNamespace:
+        return SimpleNamespace(nodeid=nodeid, when=when, user_properties=list(props))
+
+    reports = [
+        report("a", "call", (GATE_MARGIN, "0.010")),
+        report("b", "call", (GATE_MARGIN, "0.120"), (MARGIN, "0.900")),
+        report("c", "setup", (GATE_MARGIN, "0.800")),
+        report("d", "call", (MARGIN, "0.700")),
+    ]
+    line = gate_margin_line(reports)
+    assert line is not None
+    assert line.startswith("model gate:")
+    assert " 0.120 s at b " in line
+    assert "within" in line
+    cells = margin_line(reports)
+    assert cells is not None
+    assert " 0.900 s at b " in cells
+    assert gate_margin_line([report("d", "call", (MARGIN, "0.700"))]) is None
+    above = gate_margin_line([report("e", "call", (GATE_MARGIN, str(MARGIN_REDERIVE + 0.1)))])
+    assert above is not None
+    assert "ABOVE" in above
+
+
+_MODEL_FILE = "tests/test_invariants_model.py"
+
+
+def _collect(switches: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+    """Runs a nested session over the model file in a fresh interpreter with these switches.
+
+    Args:
+      switches: The model's variables to set; every other model variable is removed.
+      *args: Further arguments for ``pytest``.
+
+    Returns:
+      The finished process.
+
+    Raises:
+      None.
+    """
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", *args],
+        cwd=TESTS.parent,
+        env=_nested_env(**switches),
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("switches", "soak", "concurrent", "sequential"),
+    [
+        ({}, 0, 48, 24),
+        ({SOAK_VARIABLE: "1", SEEDS_VARIABLE: "3,40-41"}, 9, 9, 3),
+    ],
+    ids=["unset", "soak-three-seeds"],
+)
+def test_the_switches_decide_which_items_are_collected(
+    switches: dict[str, str], soak: int, concurrent: int, sequential: int
+) -> None:
+    """FR-002, FR-003: unset, no soak item and the default seeds; set, exactly the seeds named.
+
+    Collected in a fresh interpreter, because the switches are read at import. Every id names
+    its form and seed, or its seed; nothing is run.
+    """
+    result = _collect(switches, "-n", "0", "--collect-only", _MODEL_FILE)
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]
+    ids = [line for line in result.stdout.splitlines() if "::" in line]
+    soaked = [line for line in ids if "::test_soak_the_close_count_under_concurrency[" in line]
+    gated = [line for line in ids if "::test_the_accounting_identity_holds_under_every" in line]
+    driven = [line for line in ids if "::test_the_sequential_driver_holds_the_state_table[" in line]
+    assert (len(soaked), len(gated), len(driven)) == (soak, concurrent, sequential), ids
+    assert all(re.search(r"\[(emit|deliver|http)-seed\d+\]$", line) for line in soaked + gated)
+    assert all(re.search(r"\[seed\d+\]$", line) for line in driven)
+    if switches:
+        assert {line.rsplit("seed", 1)[1] for line in soaked + driven} == {"3]", "40]", "41]"}
+    assert any(line.endswith("::test_the_soak_is_wired") for line in ids), ids
+
+
+@pytest.mark.parametrize("workers", [["-n", "0"], []], ids=["serial", "distributed"])
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [(SEEDS_VARIABLE, ""), (SEEDS_VARIABLE, "0-x"), (SOAK_VARIABLE, "yes")],
+    ids=["empty-seeds", "malformed-seeds", "malformed-soak"],
+)
+def test_a_refused_switch_stops_the_session_before_any_test(
+    variable: str, value: str, workers: list[str]
+) -> None:
+    """FR-002, FR-003: a bad value is a usage error naming it, and no test in any file runs.
+
+    Under the default ``-n 12`` an import error in the model file would fail that file alone
+    while the workers ran every other file, so ``tests/conftest.py`` refuses the value before
+    collection; the session here also names a file that never imports the model.
+    """
+    result = _collect({variable: value}, *workers, _MODEL_FILE, "tests/test_ids.py")
+    output = result.stdout + result.stderr
+    assert result.returncode == pytest.ExitCode.USAGE_ERROR, output[-4000:]
+    assert f"{variable}={value!r} is refused" in output, output[-4000:]
+    assert not re.search(r"\d+ (passed|failed|error)", output), output[-4000:]

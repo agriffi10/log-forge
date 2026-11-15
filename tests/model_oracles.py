@@ -14,6 +14,12 @@ held by ``test_no_oracle_fails_a_duration_for_being_short`` rather than by the t
 This module imports the standard library only. It is one of the four files a run at an older
 commit copies over that commit's ``tests/`` (FR-005), and ``tests/conftest.py``'s summary hook
 calls :func:`margin_line` from here so that the hook stays a thin caller those commits lack.
+
+**SPEC-086 adds the gating model's half** (``tests/test_invariants_model.py``): the late-write
+rule, the soak's event record and its unowed-repeat rule, the two switches' parsers, the rerun
+command and the gate's margin line. The model file is copied to an older commit with this module
+for the same reason the cells are, and ``tests/conftest.py`` validates the switches through the
+parsers here before any file is collected.
 """
 
 from __future__ import annotations
@@ -21,11 +27,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
 
 EPSILON = 1.0
 """Seconds a call's own time may exceed its budget.
@@ -640,17 +647,7 @@ def margin_line(reports: Iterable[object]) -> str | None:
     Raises:
       None.
     """
-    worst: tuple[float, str] | None = None
-    for report in reports:
-        if getattr(report, "when", None) != "call":
-            continue
-        for name, value in getattr(report, "user_properties", ()) or ():
-            if name != MARGIN:
-                continue
-            margin = float(value)
-            nodeid = str(getattr(report, "nodeid", "?"))
-            if worst is None or margin > worst[0]:
-                worst = (margin, nodeid)
+    worst = _worst(reports, MARGIN)
     if worst is None:
         return None
     mark = "within" if worst[0] <= MARGIN_REDERIVE else "ABOVE"
@@ -658,3 +655,322 @@ def margin_line(reports: Iterable[object]) -> str | None:
         f"model cells: worst own time less budget over passing cells is {worst[0]:.3f} s at "
         f"{worst[1]} ({mark} the {MARGIN_REDERIVE:.3f} s re-derive mark)"
     )
+
+
+def gate_margin_line(reports: Iterable[object]) -> str | None:
+    """Returns the gating model's worst-margin line over its passing runs, or ``None`` (SPEC-086).
+
+    The twin of :func:`margin_line` for ``tests/test_invariants_model.py``: each gating run
+    records its worst ``elapsed - budget`` under :data:`GATE_MARGIN`, a property of its own, so
+    neither line reads the other's runs. A soak item records none, because it does not gate.
+
+    Args:
+      reports: The session's ``passed`` reports.
+
+    Returns:
+      One line naming the worst ``elapsed - budget`` and its test id.
+
+    Raises:
+      None.
+    """
+    worst = _worst(reports, GATE_MARGIN)
+    if worst is None:
+        return None
+    mark = "within" if worst[0] <= MARGIN_REDERIVE else "ABOVE"
+    return (
+        f"model gate: worst elapsed less budget over passing runs is {worst[0]:.3f} s at "
+        f"{worst[1]} ({mark} the {MARGIN_REDERIVE:.3f} s re-derive mark)"
+    )
+
+
+def _worst(reports: Iterable[object], prop: str) -> tuple[float, str] | None:
+    """Returns the largest value recorded under one property over call-phase reports, and its id.
+
+    Args:
+      reports: The session's ``passed`` reports.
+      prop: The recorded property's name.
+
+    Returns:
+      ``(margin, nodeid)``, or ``None`` when no report recorded the property.
+
+    Raises:
+      None.
+    """
+    worst: tuple[float, str] | None = None
+    for report in reports:
+        if getattr(report, "when", None) != "call":
+            continue
+        for name, value in getattr(report, "user_properties", ()) or ():
+            if name != prop:
+                continue
+            margin = float(value)
+            nodeid = str(getattr(report, "nodeid", "?"))
+            if worst is None or margin > worst[0]:
+                worst = (margin, nodeid)
+    return worst
+
+
+# -- SPEC-086: the gating model's close count, the soak's record, and the two switches ------------
+
+GATE_MARGIN = "model_gate_margin"
+"""The property each gating run of ``tests/test_invariants_model.py`` records its margin under."""
+
+SEEDS_VARIABLE = "LOG_FOUNDRY_MODEL_SEEDS"
+"""The environment variable that names the seeds both halves of the model run."""
+
+SOAK_VARIABLE = "LOG_FOUNDRY_MODEL_SOAK"
+"""The environment variable that adds the soak items, when it holds exactly ``1``."""
+
+_SEED_ITEM = re.compile(r"[0-9]+(?:-[0-9]+)?")
+
+
+def check_late_write(closes: Closes) -> None:
+    """Holds a sink to no write entering after its last close returned (SPEC-086 FR-001).
+
+    Judged only after a step that closes, because a log made after a ``shutdown()`` leaves its
+    sink written and owed until the next one, which invariant 5 records as correct. A write that
+    entered while a close was running is counted at that close's return, so it is silent here.
+    A sink with no returned close is silent: :func:`check_closed` owns a written sink never closed.
+
+    Args:
+      closes: One sink's record, read after a ``shutdown()`` or the exit drain returned.
+
+    Returns:
+      None.
+
+    Raises:
+      CloseBroken: ``late-write@<count at the last close's return>``.
+    """
+    if closes.at_return and closes.writes > closes.at_return[-1]:
+        raise CloseBroken(f"late-write@{closes.at_return[-1]}", detail=f"{closes}")
+
+
+@dataclass(frozen=True)
+class Arm:
+    """The library armed a sink in its owed record (``_CloseRegistry.arm``).
+
+    Attributes:
+      by_writer: Whether the arm was recorded on a thread inside ``api._note_orphan_emit``, the
+        orphan path's call that arms a sink for the write it is about to make.
+    """
+
+    by_writer: bool
+
+
+@dataclass(frozen=True)
+class Take:
+    """The library took a sink out of its owed record to close it (``_CloseRegistry.take``)."""
+
+
+@dataclass(frozen=True)
+class Write:
+    """A delivery call entered the sink.
+
+    Attributes:
+      thread: The name of the thread that made it.
+    """
+
+    thread: str
+
+
+@dataclass(frozen=True)
+class Close:
+    """A close entered the sink.
+
+    Attributes:
+      count: The delivery calls that had entered the sink when this close entered.
+      thread: The name of the closing thread.
+      at: The monotonic instant the close entered.
+    """
+
+    count: int
+    thread: str
+    at: float
+
+
+SinkEvent = Arm | Take | Write | Close
+
+
+def take_of_each_close(events: Sequence[SinkEvent]) -> list[int | None]:
+    """Returns, for each close in order, the index of the take it discharges, or ``None``.
+
+    Each close discharges the earliest take of the sink not yet discharged that was recorded
+    before it entered. Earliest and not latest, because two takes can both precede the closes
+    they own: a ``configure()`` hands its close to a closer thread that has not started when a
+    ``shutdown()`` takes the re-armed sink and closes it inline, so the closes enter in the
+    reverse of the takes' order and the latest take would serve both. Whichever close a take is
+    paired with, the stretch between two closes' takes is the same. A close with no take left
+    to discharge is ``None``: the record missed a take, which is a wiring failure, never a
+    reason to judge that close against a wider window.
+
+    Args:
+      events: One sink's events, in the order recorded.
+
+    Returns:
+      One entry per :class:`Close`, in order.
+
+    Raises:
+      None.
+    """
+    pending: list[int] = []
+    owners: list[int | None] = []
+    for index, event in enumerate(events):
+        if isinstance(event, Take):
+            pending.append(index)
+        elif isinstance(event, Close):
+            owners.append(pending.pop(0) if pending else None)
+    return owners
+
+
+def check_unowed_repeat(events: Sequence[SinkEvent]) -> None:
+    """Holds a sink to no second close at one write count that no writer's arm made owed.
+
+    SPEC-086 FR-003. Two consecutive closes that entered at one count are a finding unless an
+    arm recorded on a thread inside ``api._note_orphan_emit`` lies strictly between the take the
+    first close discharges and the take the second discharges: that is a writer arming the sink
+    again after the first take, which invariant 5 records as owed a second close (SPEC-045). A
+    sink change's arm between the takes excuses nothing, since that is #339's double close. A
+    close with no take of its own is reported as ``untaken`` and excuses nothing either.
+
+    Args:
+      events: One sink's events, in the order recorded.
+
+    Returns:
+      None.
+
+    Raises:
+      CloseBroken: ``repeat@<count>`` once for each count at which it happened, and
+        ``untaken@<count>`` for each close with no take to discharge.
+    """
+    closes = [(index, event) for index, event in enumerate(events) if isinstance(event, Close)]
+    owners = take_of_each_close(events)
+    keys: list[str] = []
+    for (_, close), owner in zip(closes, owners, strict=True):
+        if owner is None and f"untaken@{close.count}" not in keys:
+            keys.append(f"untaken@{close.count}")
+    pairs = zip(closes, closes[1:], owners, owners[1:], strict=False)
+    for (_, first), (_, second), first_take, second_take in pairs:
+        if first.count != second.count or f"repeat@{second.count}" in keys:
+            continue
+        if first_take is not None and second_take is not None:
+            low, high = sorted((first_take, second_take))
+            between = events[low + 1 : high]
+            if any(isinstance(event, Arm) and event.by_writer for event in between):
+                continue
+        keys.append(f"repeat@{second.count}")
+    if keys:
+        raise CloseBroken(*keys, detail=f"{list(events)}")
+
+
+def parse_seeds(value: str) -> tuple[int, ...]:
+    """Reads :data:`SEEDS_VARIABLE`: a comma-separated list of integers and inclusive ``a-b`` ranges.
+
+    Strict, because a fallback would let a mistyped soak run the defaults and report green: an
+    empty value or element, anything but ASCII digits and one hyphen, and a descending range are
+    each refused. Whitespace around an element is ignored; the seeds come back sorted, each once.
+
+    Args:
+      value: The variable's value.
+
+    Returns:
+      The seeds.
+
+    Raises:
+      ValueError: Naming the variable and quoting the value, for anything it refuses.
+    """
+    seeds: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not _SEED_ITEM.fullmatch(item):
+            raise ValueError(_refusal(SEEDS_VARIABLE, value, f"{item!r} is not a seed or a range"))
+        low, _, high = item.partition("-")
+        first, last = int(low), int(high or low)
+        if last < first:
+            raise ValueError(_refusal(SEEDS_VARIABLE, value, f"{item!r} runs downward"))
+        seeds.update(range(first, last + 1))
+    return tuple(sorted(seeds))
+
+
+def parse_soak(value: str) -> bool:
+    """Reads :data:`SOAK_VARIABLE`, whose one accepted value is ``1``.
+
+    Args:
+      value: The variable's value.
+
+    Returns:
+      ``True``.
+
+    Raises:
+      ValueError: Naming the variable and quoting the value, for any other value, empty included.
+    """
+    if value != "1":
+        raise ValueError(_refusal(SOAK_VARIABLE, value, "the one accepted value is 1"))
+    return True
+
+
+def seeds_from(environ: Mapping[str, str], default: Iterable[int]) -> tuple[int, ...]:
+    """Returns the seeds :data:`SEEDS_VARIABLE` names, or the default when it is unset.
+
+    Args:
+      environ: The environment.
+      default: The seeds a run with the variable unset uses.
+
+    Returns:
+      The seeds.
+
+    Raises:
+      ValueError: From :func:`parse_seeds`, for a set value it refuses.
+    """
+    value = environ.get(SEEDS_VARIABLE)
+    return tuple(default) if value is None else parse_seeds(value)
+
+
+def soak_from(environ: Mapping[str, str]) -> bool:
+    """Returns whether :data:`SOAK_VARIABLE` asks for the soak items.
+
+    Args:
+      environ: The environment.
+
+    Returns:
+      ``False`` when the variable is unset, ``True`` when it holds ``1``.
+
+    Raises:
+      ValueError: From :func:`parse_soak`, for a set value it refuses.
+    """
+    value = environ.get(SOAK_VARIABLE)
+    return False if value is None else parse_soak(value)
+
+
+def _refusal(variable: str, value: str, why: str) -> str:
+    """Returns the message for a switch value that is refused.
+
+    Args:
+      variable: The variable's name.
+      value: Its value.
+      why: What is wrong with it.
+
+    Returns:
+      The message.
+
+    Raises:
+      None.
+    """
+    return f"{variable}={value!r} is refused: {why}; unset it to run the defaults"
+
+
+def rerun_command(nodeid: str, seed: int, *, soak: bool) -> str:
+    """Returns the one command that re-runs a model item alone, serially, at its seed.
+
+    Args:
+      nodeid: The item's id.
+      seed: Its seed.
+      soak: Whether it is a soak item, which needs :data:`SOAK_VARIABLE` set as well.
+
+    Returns:
+      A command for a POSIX shell, from the repository root.
+
+    Raises:
+      None.
+    """
+    switches = f"{SOAK_VARIABLE}=1 " if soak else ""
+    return f"{switches}{SEEDS_VARIABLE}={seed} poetry run pytest -n 0 {shlex.quote(nodeid)}"

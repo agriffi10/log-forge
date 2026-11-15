@@ -1783,9 +1783,13 @@ an item leaves this list when a spec closes it, not because the arc names it.
   audit, finding 21; it breaks no invariant, and invariants 1, 2, 5, 6 and 12 name it under
   *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` (`:109`) holds its
   stop signal as a plain class attribute (`:132`) and never waits on it, calls back or forks. Its
-  concurrent half is scheduled by the operating system, its time bound carries `BOUND_SLACK = 10.0`
+  concurrent half is scheduled by the operating system, ~~its time bound carries `BOUND_SLACK = 10.0`
   (`:103`), and its close oracle sees a sink never closed and two closes that overlap (`:579-580`)
-  but not two closes with no write between them. By the verification frame's calibration, none of
+  but not two closes with no write between them~~ — SPEC-086 holds every call in both halves to its
+  own timeout plus one second, and its sequential half to no close at the write count of the close
+  before it and no write after a sink's last close returned; under four callers that count is a
+  soak run on request that reads the library's arms and takes, and gates nothing. The sink is still
+  passive, which is what this item is about. By the verification frame's calibration, none of
   the twelve lifecycle and sink fixes from `95945c0f` to `717d0c68` was found by it, eight of the
   twelve needed a sink that waits on its signal or calls back, and those fixes added no line to it.
   **Closed by** sink personalities that wait on the stop signal, call back and fork, a bound of the
