@@ -98,11 +98,15 @@ All three were caught as stated. At `c34c26d8` all twelve `waiter` cells pass, n
 **FR-003, the worst margin over passing cells** (bound `MARGIN_REDERIVE`, 0.5 s): macOS, Python
 3.13.1, 0.080 to 0.094 s in every run at `c34c26d8` and 0.079 to 0.084 s at the commit after
 `00ebc198`; Linux in a container, 0.174 s and 0.077 s on
-Python 3.12 and 0.075 s on Python 3.13. The two CI legs, Python 3.12 and Python 3.13, are owed: they
-settle on the pull request's green CI run and are recorded here after it.
+Python 3.12 and 0.075 s on Python 3.13. On CI, in the pull request's green run at `cd6ea672` (run
+`43728010362`), 0.072 s on Python 3.12 and 0.073 s on Python 3.13, both at
+`factory-factory-orphan-span+flush-none`, so the criterion holds on both legs.
 
 **Wall time** at `-n 12` on macOS: the cells file alone, 13 s in each of three runs at a load near
 6; 15 s at `00ebc198` (load 27.2) and 15 to 20 s at the commit after it (loads 9.7 to 16.4), whose
 seven sibling cells add about 2 s each to the workers they land on. The whole suite, 86 s at `ae0b7674` (load 6.7 before) and 111 s at `c34c26d8` (load 38.4
 before), one run each, back to back. Those two runs began at very different loads, so the 25 s
-difference is an upper reading of the cost, not a measurement of it.
+difference is an upper reading of the cost, not a measurement of it. The `CI / test` pytest step
+took 158 s on Python 3.12 and 163 s on Python 3.13 at `cd6ea672`, against 186 s and 116 s on `main`
+at `9b54b370`; runner variance between those runs is wider than the cells' cost, so CI does not
+resolve it either.
