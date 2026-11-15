@@ -835,6 +835,30 @@ def test_absorbed_is_not_hijacked_by_a_str_subclass_name(err: _Stderr) -> None:
     assert err.getvalue() == "log-foundry: absorbed a failure while x (Stored)\n"
 
 
+def test_type_name_reads_the_stored_name_past_a_raising_metaclass_name() -> None:
+    """The metaclass property never runs, so the read cannot raise into a ``Raises: None`` path."""
+    hostile = _stored_exception(__name__=property(_raising_name))()
+    with pytest.raises(RuntimeError, match="name"):
+        _ = type(hostile).__name__
+    assert _diag.type_name(hostile) == "Stored"
+
+
+def test_type_name_is_not_renamed_by_a_metaclass_name_property() -> None:
+    """A property answering another string is not consulted: the type is named for what it stores."""
+    renamed = _stored_exception(__name__=property(lambda cls: "Renamed"))()
+    assert type(renamed).__name__ == "Renamed"
+    assert _diag.type_name(renamed) == "Stored"
+
+
+def test_type_name_returns_a_str_subclass_name_as_exact_text() -> None:
+    """A ``str`` subclass stored as the name comes back as an exact ``str``, its methods unrun."""
+    exc_cls = type("Stored", (Exception,), {})
+    exc_cls.__name__ = _HijackName("Stored")
+    name = _diag.type_name(exc_cls())
+    assert type(name) is str
+    assert f"{name}" == "Stored"
+
+
 def test_an_orphan_loss_from_a_hostile_exception_class_is_counted_and_announced(
     err: _Stderr,
 ) -> None:

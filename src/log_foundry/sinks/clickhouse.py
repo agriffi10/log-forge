@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from log_foundry import _diag
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
 from log_foundry.sinks._chunk import chunk_list, valid_identifier
@@ -335,7 +336,7 @@ class ClickHouseSink:
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
             context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
-            pairs = encode_round(self, batch, self._row, sink=type(self).__name__)
+            pairs = encode_round(self, batch, self._row, sink=_diag.type_name(self))
             if not pairs:
                 return Verdict(outcomes=tuple(fates))
             lost = Lost(self)
@@ -349,7 +350,7 @@ class ClickHouseSink:
                     outcome = Outcome.ACCEPTED
                 else:
                     outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
-                    kind = type(called.error).__name__
+                    kind = _diag.type_name(called.error)
                     lost.add(
                         carried,
                         when=When.LAST if called.retryable else When.ALWAYS,

@@ -453,7 +453,7 @@ class SentrySink:
         except Exception as err:
             with self._counter_lock:
                 self.transport_errors += 1
-            _diag.lost("event", 1, f"SentrySink, {type(err).__name__}")
+            _diag.lost("event", 1, f"SentrySink, {_diag.type_name(err)}")
             return False
         return True
 

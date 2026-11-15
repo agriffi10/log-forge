@@ -6,6 +6,7 @@ import json
 import re
 from typing import Unpack
 
+from log_foundry import _diag
 from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
@@ -110,7 +111,7 @@ class DatadogSink(HTTPSink):
         """
         _refuse_userinfo(
             f"https://http-intake.logs.{site}/api/v2/logs",
-            type(self).__name__,
+            _diag.type_name(self),
             "site",
             self._CREDENTIALS,
         )
@@ -119,18 +120,18 @@ class DatadogSink(HTTPSink):
             if _holds_at(site) or _holds_delimiter(site):
                 shown = "; the site is not quoted, since it holds an '@', '/', '?' or '#'"
             raise ValueError(
-                f"{type(self).__name__} site must be a Datadog site's host name, such as "
+                f"{_diag.type_name(self)} site must be a Datadog site's host name, such as "
                 f"'datadoghq.com' or 'us5.datadoghq.com'{shown}"
             )
         url = _valid_url(
-            f"https://http-intake.logs.{site}/api/v2/logs", type(self).__name__, name="site"
+            f"https://http-intake.logs.{site}/api/v2/logs", _diag.type_name(self), name="site"
         )
         self._service = service
         self._ddtags = ddtags
         headers = merge_headers(
             {"DD-API-KEY": api_key},
             http_kwargs,
-            owner=type(self).__name__,
+            owner=_diag.type_name(self),
             argument="api_key",
         )
         super().__init__(
@@ -139,7 +140,7 @@ class DatadogSink(HTTPSink):
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]
         )
-        _refuse_empty_credential(api_key, type(self).__name__, "api_key")
+        _refuse_empty_credential(api_key, _diag.type_name(self), "api_key")
 
     def _render(self, event: dict[str, object]) -> str:
         """Serializes one enriched entry for the JSON array (FR-007).

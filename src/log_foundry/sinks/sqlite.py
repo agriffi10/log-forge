@@ -341,7 +341,7 @@ class SQLiteSink:
         placeholders = ", ".join("?" * (len(_COLUMNS) + 1))
         columns = ", ".join((*_COLUMNS, "event"))
         with Deferral(self) as pending:
-            encoded = encode_events(batch, self._row, pending, sink=type(self).__name__)
+            encoded = encode_events(batch, self._row, pending, sink=_diag.type_name(self))
             try:
                 with self._guard.enter() as section:
                     if not section:
@@ -356,7 +356,7 @@ class SQLiteSink:
             except sqlite3.Error as err:
                 with self._counter_lock:
                     self._failed += len(batch)
-                _diag.lost("event", len(batch), f"{type(self).__name__}, {type(err).__name__}")
+                _diag.lost("event", len(batch), f"{_diag.type_name(self)}, {_diag.type_name(err)}")
                 built = delivery_error(err)
                 if built is None:
                     raise

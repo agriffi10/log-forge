@@ -203,7 +203,7 @@ class LogstashSink:
                     f"LogstashSink cannot apply {', '.join(unusable)} to the HTTP backend that "
                     "url= selects; drop them, or drop url= to use the socket backend"
                 )
-            _valid_url(url, type(self).__name__)
+            _valid_url(url, _diag.type_name(self))
             self._http: HTTPSink | None = HTTPSink(
                 url, body_format=body_format, timeout=timeout, max_retries=max_retries,
                 **http_kwargs,
@@ -229,7 +229,7 @@ class LogstashSink:
                     else DEFAULT_MAX_DATAGRAM_BYTES
                 ),
                 frame=self._frame,
-                sink_name=type(self).__name__,
+                sink_name=_diag.type_name(self),
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")

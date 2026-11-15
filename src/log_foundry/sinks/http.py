@@ -610,7 +610,7 @@ def _refuse_url(
     if head == url:
         detail = f" ({err})" if err is not None else ""
         raise ValueError(f"{owner} {name} {reason}{detail}: {url!r}") from err
-    detail = f" ({type(err).__name__})" if err is not None else ""
+    detail = f" ({_diag.type_name(err)})" if err is not None else ""
     raise ValueError(
         f"{owner} {name} {reason}{detail}: {head!r}; only the scheme and host are quoted, since a "
         f"path, query or fragment may hold a credential"
@@ -1010,7 +1010,7 @@ def _sent_value(value: object) -> tuple[_HeaderValue | None, str | None]:
                 return None, _NOT_CONTIGUOUS
             return view.tobytes(), None
     except (ValueError, TypeError) as err:
-        return None, type(err).__name__
+        return None, _diag.type_name(err)
 
 
 def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, object]]:
@@ -1041,7 +1041,7 @@ def _copied_headers(headers: dict[str, str], owner: str) -> list[tuple[str, obje
     copied: list[tuple[str, object]] = []
     for name, value in headers.items():
         if not issubclass(type(name), str):
-            raise TypeError(f"{owner} header name must be a str, not {_type_name(name)}")
+            raise TypeError(f"{owner} header name must be a str, not {_diag.type_name(name)}")
         text = _diag._STR_STR(value) if issubclass(type(value), str) else value
         copied.append((_diag._STR_STR(name), text))
     return copied
@@ -1292,7 +1292,7 @@ def _unsendable_header(name: str, value: _HeaderValue) -> str | None:
     try:
         _started_request("localhost", "POST", "/").putheader(name, value)
     except (ValueError, TypeError) as err:
-        return type(err).__name__
+        return _diag.type_name(err)
     return None
 
 
@@ -1487,36 +1487,21 @@ def _copied_pair(auth: object, owner: str) -> tuple[str, str]:
     """
     if issubclass(type(auth), _NOT_A_PAIR):
         raise ValueError(  # noqa: TRY004
-            f"{owner} auth must be a str token or a pair of two str, not {_type_name(auth)}"
+            f"{owner} auth must be a str token or a pair of two str, not {_diag.type_name(auth)}"
         )
     failure: str | None = None
     try:
         user, password = cast("tuple[object, object]", auth)
     except (ValueError, TypeError) as err:
-        failure = type(err).__name__
+        failure = _diag.type_name(err)
     if failure is not None:
         raise ValueError(f"{owner} auth cannot be sent over HTTP ({failure})")
     if not (issubclass(type(user), str) and issubclass(type(password), str)):
         raise ValueError(  # noqa: TRY004
             f"{owner} auth must be a str token or a pair of two str, not a pair of "
-            f"({_type_name(user)}, {_type_name(password)})"
+            f"({_diag.type_name(user)}, {_diag.type_name(password)})"
         )
     return _diag._STR_STR(cast("str", user)), _diag._STR_STR(cast("str", password))
-
-
-def _type_name(value: object) -> str:
-    """Returns the name ``value``'s real type stores, as an exact ``str``, asking the value nothing.
-
-    Args:
-      value: Any object.
-
-    Returns:
-      The type's stored name.
-
-    Raises:
-      None.
-    """
-    return _diag._STR_STR(_diag._STORED_NAME(type(value)))
 
 
 def _built_authorization(auth: str | tuple[str, str]) -> tuple[str | None, str | None]:
@@ -1537,7 +1522,7 @@ def _built_authorization(auth: str | tuple[str, str]) -> tuple[str | None, str |
     try:
         return _authorization(auth), None
     except UnicodeEncodeError as err:
-        return None, type(err).__name__
+        return None, _diag.type_name(err)
 
 
 def _authorization(auth: str | tuple[str, str]) -> str:
@@ -1996,7 +1981,7 @@ def _announce_unlined(
     Raises:
       None.
     """
-    name = type(sink).__name__
+    name = _diag.type_name(sink)
     placed = [outcome for at, outcome in zip(where, outcomes, strict=True) if at is not None]
     final = sum(1 for outcome in placed if outcome in (Outcome.REJECTED, Outcome.DROPPED))
     unknown = placed.count(Outcome.UNKNOWN)
@@ -2031,7 +2016,7 @@ def _unbuilt(drops: _Pending, name: str, lost: int, fault: Exception) -> None:
     Raises:
       None.
     """
-    kind = _type_name(fault)
+    kind = _diag.type_name(fault)
     drops.count("_unrenderable", lost)
     drops.announce(lambda: _diag.lost("event", lost, f"{name}, rendering raised {kind}"))
 
@@ -2289,40 +2274,40 @@ class HTTPSink:
             ``emit`` or silently ignored for the life of the process (SPEC-049 FR-001, FR-002 and
             FR-004), and inherited by every subclass, whose own name the message carries.
         """
-        require_callable(opener, "opener", type(self).__name__)
-        self.url = _valid_url(url, type(self).__name__, credentials=self._CREDENTIALS)
+        require_callable(opener, "opener", _diag.type_name(self))
+        self.url = _valid_url(url, _diag.type_name(self), credentials=self._CREDENTIALS)
         if body_format not in _BODY_FORMATS:
             raise ValueError(
-                f"{type(self).__name__} body_format must be one of {sorted(_BODY_FORMATS)}, "
+                f"{_diag.type_name(self)} body_format must be one of {sorted(_BODY_FORMATS)}, "
                 f"not {body_format!r}"
             )
-        self.method = _valid_method(method, type(self).__name__)
+        self.method = _valid_method(method, _diag.type_name(self))
         self._headers = _valid_headers(
-            dict(headers) if headers is not None else {}, type(self).__name__
+            dict(headers) if headers is not None else {}, _diag.type_name(self)
         )
         gzip = gzip if type(gzip) is bool else bool(gzip)
         library_body = _library_body(self)
-        _valid_encoding(gzip, self._headers, type(self).__name__, library_body=library_body)
+        _valid_encoding(gzip, self._headers, _diag.type_name(self), library_body=library_body)
         self._fixed_compression = (
             None if _caller_encoding(self._headers) is None else gzip and library_body
         )
         self._auth, self._authorization_value = _valid_auth(
-            auth, type(self).__name__, self._headers, self._AUTH_CONFLICT
+            auth, _diag.type_name(self), self._headers, self._AUTH_CONFLICT
         )
         self.body_format = body_format
-        self.timeout = require_timeout(timeout, "timeout", type(self).__name__)
+        self.timeout = require_timeout(timeout, "timeout", _diag.type_name(self))
         self.gzip = gzip
-        self.max_retries = floor_count(max_retries, 0, "max_retries", type(self).__name__)
+        self.max_retries = floor_count(max_retries, 0, "max_retries", _diag.type_name(self))
         self.max_retry_after = exact_seconds(
-            max_retry_after, "max_retry_after", type(self).__name__
+            max_retry_after, "max_retry_after", _diag.type_name(self)
         )
         self.max_batch_count = (
-            floor_count(max_batch_count, 1, "max_batch_count", type(self).__name__)
+            floor_count(max_batch_count, 1, "max_batch_count", _diag.type_name(self))
             if max_batch_count is not None
             else max(self.MAX_BATCH_COUNT, 1)
         )
         self.max_batch_bytes = (
-            require_positive(max_batch_bytes, "max_batch_bytes", type(self).__name__)
+            require_positive(max_batch_bytes, "max_batch_bytes", _diag.type_name(self))
             if max_batch_bytes is not None
             else self.MAX_BATCH_BYTES
         )
@@ -2469,7 +2454,7 @@ class HTTPSink:
         context = _engine.run_context()
         notes = context.notes(self)
         drops = context.drops(self)
-        name = type(self).__name__
+        name = _diag.type_name(self)
         mark = context._mark()
         try:
             budget = cast("int", notes.get("budget", self._chunk_budget()))
@@ -2540,7 +2525,7 @@ class HTTPSink:
                 context._rewind(mark)
                 where = positions[index : index + len(chunk)]
                 if sent:
-                    detail = f"handling its response raised {_type_name(err)}"
+                    detail = f"handling its response raised {_diag.type_name(err)}"
                     _settle(fates, where, HTTPSink._unadjudicated(self, chunk, detail))
                 else:
                     faults += len(chunk)
@@ -2585,7 +2570,8 @@ class HTTPSink:
                 result = self._outcomes(payload, chunk)
         except Exception as err:
             context._rewind(mark)
-            return self._unadjudicated(chunk, f"reading a 2xx response raised {_type_name(err)}")
+            detail = f"reading a 2xx response raised {_diag.type_name(err)}"
+            return self._unadjudicated(chunk, detail)
         try:
             outcomes = _engine.outcomes_of(Verdict(outcomes=result), len(chunk))
         except Exception:
@@ -2649,7 +2635,7 @@ class HTTPSink:
         context = _engine.run_context()
         when = When.LAST if context.resends_unknown(self) else When.ALWAYS
         sent = len(items)
-        name = type(self).__name__
+        name = _diag.type_name(self)
         context.count(self, "dropped_unadjudicated", sent, when=when)
         context.announce(
             lambda: _diag.lost(noun, sent, f"{name} {detail}; they may have landed; not retried"),
@@ -2761,7 +2747,7 @@ class HTTPSink:
           None.
         """
         context = _engine.run_context()
-        name = type(self).__name__
+        name = _diag.type_name(self)
         size = len(chunk)
         context.count(self, "failed", 1, when=When.ALWAYS)
         context.announce(
@@ -2814,7 +2800,7 @@ class HTTPSink:
             lambda: _diag.lost(
                 "event",
                 refused,
-                f"{type(self).__name__}, refused at the smallest request this sink can build",
+                f"{_diag.type_name(self)}, refused at the smallest request this sink can build",
             )
         )
 
@@ -2870,16 +2856,16 @@ class HTTPSink:
                 lambda: _diag.lost(
                     "event",
                     dropped,
-                    f"{type(self).__name__}, up to {largest} bytes exceeds the "
+                    f"{_diag.type_name(self)}, up to {largest} bytes exceeds the "
                     f"{ceiling}-byte per-event ceiling",
                 )
             )
         if first is not None:
-            kind = _type_name(first)
+            kind = _diag.type_name(first)
             pending.count("_unrenderable", failures)
             pending.announce(
                 lambda: _diag.lost(
-                    "event", failures, f"{type(self).__name__}, rendering raised {kind}"
+                    "event", failures, f"{_diag.type_name(self)}, rendering raised {kind}"
                 )
             )
         return items
@@ -3251,13 +3237,13 @@ class HTTPSink:
             raise sent.raised
         answer = sent.answer
         if answer is None:
-            raise SinkDeliveryError(f"{type(self).__name__} made no attempt")
+            raise SinkDeliveryError(f"{_diag.type_name(self)} made no attempt")
         if answer.outcome is Outcome.ACCEPTED:
             return answer.payload
         if answer.error is not None:
             raise answer.error
         if answer.outcome is None:
-            raise _PayloadTooLarge(f"{type(self).__name__}, HTTP 413", len(body))
+            raise _PayloadTooLarge(f"{_diag.type_name(self)}, HTTP 413", len(body))
         raise SinkDeliveryError(answer.detail)
 
     def _exchange(
@@ -3300,7 +3286,7 @@ class HTTPSink:
         try:
             status, payload, retry_after = self._attempt(request)
         except Exception as err:
-            reason = f"connection error, {_type_name(err)} {_diag.errno_of(err)}".rstrip()
+            reason = f"connection error, {_diag.type_name(err)} {_diag.errno_of(err)}".rstrip()
             if is_retryable(self._retryable_error, err):
                 return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
             if not count_unexpected and not isinstance(err, SinkDeliveryError):
@@ -3336,7 +3322,7 @@ class HTTPSink:
         Raises:
           None.
         """
-        detail = f"{type(self).__name__}, {context.round} attempt(s), {reason}"
+        detail = f"{_diag.type_name(self)}, {context.round} attempt(s), {reason}"
         context.count(self, "failed", 1, when=when)
         context.announce(lambda: _diag.lost("request", 1, detail), when=when)
         return detail

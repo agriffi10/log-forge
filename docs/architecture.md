@@ -251,8 +251,8 @@ this is what turns logs into queryable data). Base fields stamped on **every** e
   > `docs/decisions/event-assembly/` (*A destination's refusal is repaired at the sink*).
 - **The rule holds for what the library says about *itself*, not just for events.** A stderr
   diagnostic is also a place caller data was not asked to reach, and an exception's message
-  routinely carries the value that provoked it — so an absorbed failure is reported by
-  `type(exc).__name__`, never its message, and `sanitize`'s placeholder is a type name for the
+  routinely carries the value that provoked it — so an absorbed failure is reported by its
+  type's stored name (`_diag.type_name`), never its message, and `sanitize`'s placeholder is a type name for the
   same reason (as is SPEC-019's `Health.stopped_reason`). Every such line goes through one
   module, `src/log_foundry/_diag.py`, whose docstring states this rule and the two that travel
   with it. A test asserts no other module *calls* `stderr.write` (or `print(file=…)`, or
@@ -1020,6 +1020,23 @@ constraints — a register saying it was empty when it was not. Each entry below
 close it.
 
 ### Open
+
+- **A driver exception class can still stop `delivery_error` building the dual type, or raise from
+  it** (invariant 1; no spec — found by the stored-name sweep's third diff review, 2026-11-15).
+  `sinks/_driver_error.py` copies a driver's class into one derived from `SinkDeliveryError`; the
+  sweep moved its name, qualname, module, doc and bases reads onto stored values, and these remain,
+  each reproduced at `0ecb77b3`: `built.__cause__ = err` runs a raising `__setattr__` or
+  `__cause__` setter outside `delivery_error`'s guard, so it raises despite `Raises: None`; an
+  `args` property that raises at pickle time raises out of `_reduce`; the cache key
+  (`_CLASSES.get(original)`) runs a metaclass `__hash__`, and an unhashable class cannot be keyed
+  at all; a stored `__module__` carrying `__set_name__` is run by `type()`; and a raising
+  attribute property makes `_set_attributes`, documented as raising, cost the whole dual type.
+  Each leaves a file sink raising the bare original, which `except SinkDeliveryError` misses, or
+  the engine reporting its round as unconfirmed. **Closed by** a structural rework, since the
+  same class recurred in three review rounds: build the derived class only from exact `str` or
+  `None` values, key the cache by identity, read and write through `BaseException`'s and `type`'s
+  own descriptors, and hold it with one hostile-class corpus run against `delivery_error`,
+  `pickle.dumps` and both file-sink rigs.
 
 - **One value `ClickHouseSink`'s typed columns refuse costs its whole insert chunk** (invariant 8;
   no spec — deferred past 1.2.0 by Andrew, 2026-11-13). A non-`str`, non-`None` value or a lone

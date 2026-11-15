@@ -259,7 +259,7 @@ class GooglePubSubSink:
         with Deferral(self) as pending:
             refused: list[str] = []
             encoded = encode_events(
-                batch, self._encode, pending, sink=type(self).__name__, counter="rejected"
+                batch, self._encode, pending, sink=_diag.type_name(self), counter="rejected"
             )
             if not encoded:
                 return
@@ -267,7 +267,7 @@ class GooglePubSubSink:
                 try:
                     future = self.client.publish(self.topic, data=data)
                 except Exception as err:
-                    refused.append(type(err).__name__)
+                    refused.append(_diag.type_name(err))
                     continue
                 with self._futures_lock:
                     orphaned = self._closed
@@ -611,7 +611,7 @@ class GooglePubSubSink:
                 return False
             with self._counter_lock:
                 self.failed += 1
-            _diag.lost("event", 1, f"GooglePubSubSink publish unconfirmed, {type(err).__name__}")
+            _diag.lost("event", 1, f"GooglePubSubSink publish unconfirmed, {_diag.type_name(err)}")
         return True
 
     def flush(self) -> None:

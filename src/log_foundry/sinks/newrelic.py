@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Unpack
 
+from log_foundry import _diag
 from log_foundry.sinks.http import (
     HTTPPlatformKwargs,
     HTTPSink,
@@ -67,12 +68,12 @@ class NewRelicSink(HTTPSink):
         region = region.upper()
         if region not in _HOSTS:
             raise ValueError(
-                f"{type(self).__name__} region must be one of {sorted(_HOSTS)}, not {region!r}"
+                f"{_diag.type_name(self)} region must be one of {sorted(_HOSTS)}, not {region!r}"
             )
         headers = merge_headers(
             {"Api-Key": api_key},
             http_kwargs,
-            owner=type(self).__name__,
+            owner=_diag.type_name(self),
             argument="api_key",
         )
         super().__init__(
@@ -81,4 +82,4 @@ class NewRelicSink(HTTPSink):
             body_format="json_array",
             **http_kwargs,  # type: ignore[misc]
         )
-        _refuse_empty_credential(api_key, type(self).__name__, "api_key")
+        _refuse_empty_credential(api_key, _diag.type_name(self), "api_key")

@@ -896,7 +896,7 @@ class FileSink:
           None. A ``BaseException`` that is not an ``Exception`` propagates from the handle,
             after the tail and the owed mark were brought to the counts the write calls stored.
         """
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
         with self._guard.enter() as section:
             if not section:
                 run_context().refuse(
@@ -912,7 +912,8 @@ class FileSink:
                     writes.finish_tail()
                     writes.write(writes.rest(pairs), self._bom if self._bom_owed else b"")
                 except Exception as err:
-                    writes.lose(err, is_retryable(self._retryable_error, err), type(self).__name__)
+                    retryable = is_retryable(self._retryable_error, err)
+                    writes.lose(err, retryable, _diag.type_name(self))
             return writes.verdict()
 
     def _baseline(self) -> int:
@@ -1361,7 +1362,7 @@ class RotatingFileSink:
           None. A ``BaseException`` that is not an ``Exception`` propagates from the handle,
             after the tail and ``_size`` were brought to the counts the write calls stored.
         """
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
         with self._guard.enter() as section:
             if not section:
                 run_context().refuse(
@@ -1388,7 +1389,8 @@ class RotatingFileSink:
                         held += len(pair[1])
                     writes.write(staged)
                 except Exception as err:
-                    writes.lose(err, is_retryable(self._retryable_error, err), type(self).__name__)
+                    retryable = is_retryable(self._retryable_error, err)
+                    writes.lose(err, retryable, _diag.type_name(self))
             return writes.verdict()
 
     def _baseline(self) -> int:

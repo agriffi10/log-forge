@@ -694,8 +694,8 @@ no later event.
 ## 11. A diagnostic names a type, never a value, says what happened, and one module writes them all
 
 Every stderr line the library writes about itself goes through `_diag`, is throttled where it can
-repeat, and names an exception by `type(exc).__name__` — never `repr`, which reprints a psycopg
-statement with its bound parameters (SPEC-029). What the line says happened — how many, after how
+repeat, and names an exception by its type's stored name (`_diag.type_name`) — never `repr`, which
+reprints a psycopg statement with its bound parameters (SPEC-029). What the line says happened — how many, after how
 many attempts, on which path — is true, or the line is a defect.
 
 *Observable:* `grep` of the library's stderr output for any caller value, header, token, URL or

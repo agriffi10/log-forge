@@ -403,7 +403,7 @@ class PostgresSink:
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
             context = run_context()
             fates = [Outcome.DROPPED] * len(batch)
-            pairs = encode_round(self, batch, self._row, sink=type(self).__name__)
+            pairs = encode_round(self, batch, self._row, sink=_diag.type_name(self))
             if not pairs:
                 return Verdict(outcomes=tuple(fates))
             positions = [position for position, _ in pairs]
@@ -426,7 +426,7 @@ class PostgresSink:
                     if not self._owns_connection and self._is_broken()
                     else ""
                 )
-                kind = type(called.error).__name__
+                kind = _diag.type_name(called.error)
                 whole = unencodable_in_run(self)
                 context.count(self.log_foundry_counters, "failed_events", whole, when=When.FAILED)
                 lost = Lost(self)

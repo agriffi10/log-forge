@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any, NamedTuple, cast
 
+from log_foundry import _diag
+
 __all__ = [
     "ABSENT",
     "Adjudication",
@@ -244,7 +246,7 @@ def describe_count(failed_count: object) -> str:
         return "no failed count"
     if type(failed_count) is int:
         return f"failed count {failed_count}"
-    return f"a failed count of type {type(failed_count).__name__}"
+    return f"a failed count of type {_diag.type_name(failed_count)}"
 
 
 def results_rejected(raw: Any) -> bool:

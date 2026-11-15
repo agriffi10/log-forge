@@ -241,7 +241,7 @@ class FirehoseSink:
         """
         context = run_context()
         fates = [Outcome.DROPPED] * len(batch)
-        pairs = encode_round(self, batch, self._encode, sink=type(self).__name__)
+        pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
         records = self._records(pairs, context.drops(self))
         lost = Lost(self)
         for chunk in chunk_items(

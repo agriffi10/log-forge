@@ -1480,5 +1480,5 @@ def _coerce_unbounded(event: Mapping[str, object]) -> tuple[dict[str, object], b
     coercer = _Coercer(cast("Config", _TypesOnly()), budgeted=False)
     result = coercer.mapping(event, -1)
     if not isinstance(result, dict):
-        raise TypeError(f"a transform's coercion produced {type(result).__name__}, not a dict")
+        raise TypeError(f"a transform's coercion produced {_type_name(result)}, not a dict")
     return result, coercer.truncated

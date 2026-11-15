@@ -677,6 +677,10 @@ and checks three things:
 - It reports `file:line` for any `raise TypeError(...)` whose message formats `type(x).__name__` or
   `x.__class__.__name__` for an `x` other than `self` or `cls`, outside an exemption set compared
   exactly with `{sanitize._coerce_unbounded, TransformSink._apply}`.
+
+  > **Superseded 2026-11-15 (stored-name sweep, no spec).** Both raises now name the result's type
+  > through the stored name, so the exemption set is empty and was retired from the guard. The
+  > current rule is `docs/decisions/sink-delivery/an-argument-door-asks-the-type-never-the-value.md`.
 - It reports any `isinstance(p, ...)` on a parameter `p` of a door, or of a same-module function a
   door passes `p` to (one level, as `tests/test_numeric_door_roster.py` follows). The only
   exemption is `decorator._refuse_unusable`, named.

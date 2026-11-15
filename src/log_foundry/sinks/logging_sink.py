@@ -128,7 +128,7 @@ class LoggingSink:
                     _diag.absorbed(
                         "flushing a logging handler",
                         err,
-                        f"{type(handler).__name__} still holds records",
+                        f"{_diag.type_name(handler)} still holds records",
                     )
             logger = logger.parent if logger.propagate else None
         if first_error is not None:

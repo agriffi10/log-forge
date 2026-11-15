@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Unpack
 
+from log_foundry import _diag
 from log_foundry.sinks._time import epoch_nanos
 from log_foundry.sinks.http import HTTPPlatformKwargs, HTTPSink, _Item, _valid_base_url
 
@@ -73,7 +74,7 @@ class LokiSink(HTTPSink):
             forwarded ``headers``, in any case, refused by
             :class:`~log_foundry.sinks.http.HTTPSink` naming this class.
         """
-        _valid_base_url(url, type(self).__name__, _PUSH_PATH, credentials=self._CREDENTIALS)
+        _valid_base_url(url, _diag.type_name(self), _PUSH_PATH, credentials=self._CREDENTIALS)
         self._labels = labels
         super().__init__(
             url.rstrip("/") + _PUSH_PATH, body_format="json_array", **http_kwargs

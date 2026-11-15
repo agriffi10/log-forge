@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+from log_foundry import _diag
 from log_foundry.sinks.base import SinkDeliveryError
 
 __all__ = ["delivery_error"]
@@ -31,8 +32,8 @@ def delivery_error(err: Exception) -> Exception | None:
     landed nothing (``RunContext.raise_on_failure``, SPEC-082).
 
     It is an instance of a class derived at run time from ``SinkDeliveryError`` and the
-    original's own class, one per original class (:func:`_dual`). The class keeps the original's
-    ``__name__``, so a line naming the exception's type — the worker's abandon line — reads as it
+    original's own class, one per original class (:func:`_dual`). The class keeps the name the
+    original stores, so a line naming the exception's type — the worker's abandon line — reads as it
     did. The instance is made from the original's ``args`` and given only the attributes the
     original actually set and ``args`` does not carry, so ``str()``, ``args``, ``errno``,
     ``filename`` and ``sqlite_errorcode`` equal the original's, and the original is its
@@ -49,8 +50,9 @@ def delivery_error(err: Exception) -> Exception | None:
 
     Returns:
       The dual-typed exception, or ``None`` when it cannot be built — an exception class whose
-      constructor rejects its own ``args``, or one that cannot share a layout with
-      ``SinkDeliveryError``. The sink then raises the original unchanged, because the library
+      constructor rejects its own ``args``, one that cannot share a layout with
+      ``SinkDeliveryError``, or one whose ``__init_subclass__`` or metaclass refuses the derived
+      class. The sink then raises the original unchanged, because the library
       never fails the caller on its own fault (invariant 1).
 
     Raises:
@@ -64,6 +66,44 @@ def delivery_error(err: Exception) -> Exception | None:
         return None
     built.__cause__ = err
     return built
+
+
+_STORED_QUALNAME = type.__dict__["__qualname__"].__get__
+_STORED_MODULE = type.__dict__["__module__"].__get__
+_CLASS_DICT = type.__dict__["__dict__"].__get__
+_STORED_BASES = type.__dict__["__bases__"].__get__
+"""``type``'s own descriptors for what :func:`_dual` and :func:`_reduce` copy, unbound.
+
+Read through ``original.__module__`` and the like, each lookup consults the metaclass first, so a
+metaclass whose ``__module__``, ``__doc__`` or ``__bases__`` is a raising property, or whose
+``__getattribute__`` raises, ran the caller's code here: :func:`delivery_error` then returned
+``None`` and the file sinks raised the bare original, which an ``except SinkDeliveryError``
+misses, and :func:`_reduce`, documented ``Raises: None``, raised. A metaclass cannot define a
+``__qualname__`` property at all, since ``type`` refuses one in a class body, so that read is
+guarded only against ``__getattribute__``. The name is read through ``_diag._STORED_NAME``, and it
+and the qualified name are copied with ``_diag._STR_STR``, because ``type()`` and the class
+namespace want an exact ``str``. ``__doc__`` is read from the class's own namespace
+(``_CLASS_DICT``) rather than through ``type``'s ``__doc__`` descriptor, which calls the ``__get__``
+of a descriptor stored there as ``__doc__``, and is copied only as a ``str`` (:func:`_doc_of`).
+"""
+
+
+def _doc_of(original: type) -> str | None:
+    """Returns the docstring a class defines itself, as an exact ``str``, calling no descriptor.
+
+    Args:
+      original: The driver exception's class.
+
+    Returns:
+      The class's own ``__doc__`` when it is a ``str``, copied with ``_diag._STR_STR``; otherwise
+      ``None``, as for a class with no docstring, so a descriptor stored as ``__doc__`` is never
+      called and never copied onto the derived class.
+
+    Raises:
+      None.
+    """
+    doc = _CLASS_DICT(original).get("__doc__")
+    return _diag._STR_STR(doc) if issubclass(type(doc), str) else None
 
 
 _CLASSES: dict[type, type[Exception]] = {}
@@ -95,14 +135,13 @@ def _dual(original: type[Exception]) -> type[Exception]:
     if found is not None:
         return found
     namespace: dict[str, Any] = {
-        "__module__": original.__module__,
-        "__qualname__": original.__qualname__,
-        "__doc__": original.__doc__,
+        "__module__": _STORED_MODULE(original),
+        "__qualname__": _diag._STR_STR(_STORED_QUALNAME(original)),
+        "__doc__": _doc_of(original),
         "__reduce__": _reduce,
     }
-    built = cast(
-        "type[Exception]", type(original.__name__, (SinkDeliveryError, original), namespace)
-    )
+    name = _diag._STR_STR(_diag._STORED_NAME(original))
+    built = cast("type[Exception]", type(name, (SinkDeliveryError, original), namespace))
     return _CLASSES.setdefault(original, built)
 
 
@@ -116,7 +155,9 @@ def _set_attributes(err: BaseException) -> dict[str, object]:
       Each attribute to copy, by name.
 
     Raises:
-      None.
+      Exception: Whatever an attribute's own lookup raises other than ``AttributeError``, such as
+        a property on the driver's class; :func:`delivery_error` absorbs it and :func:`_reduce`
+        pickles with no attributes instead.
     """
     found: dict[str, object] = {}
     for name in _PATH_ATTRIBUTES:
@@ -136,6 +177,11 @@ def _reduce(self: BaseException) -> tuple[Any, ...]:
     pickling fails for every instance; rebuilding the original class from its ``args`` and the
     copied attributes is what a process on the far side of a pickle can reconstruct.
 
+    The copied attributes are read again here, through the original class's own attributes, which
+    may be properties: one that read cleanly when the instance was built and raises now would
+    otherwise raise out of ``pickle.dumps``. It then pickles with no copied attributes, as an
+    original that set none would.
+
     Args:
       self: The dual-typed exception.
 
@@ -145,7 +191,11 @@ def _reduce(self: BaseException) -> tuple[Any, ...]:
     Raises:
       None.
     """
-    return _rebuild, (type(self).__bases__[1], self.args, _set_attributes(self))
+    try:
+        attrs = _set_attributes(self)
+    except Exception:
+        attrs = {}
+    return _rebuild, (_STORED_BASES(type(self))[1], self.args, attrs)
 
 
 def _rebuild(

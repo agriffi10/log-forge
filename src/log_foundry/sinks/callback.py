@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from log_foundry import _diag
 from log_foundry.sinks._args import require_callable
 
 if TYPE_CHECKING:
@@ -51,8 +52,8 @@ class CallbackSink:
             refused here rather than raised out of every ``emit`` or out of ``close()``
             (SPEC-071 FR-005).
         """
-        require_callable(fn, "fn", type(self).__name__, optional=False)
-        require_callable(on_close, "on_close", type(self).__name__)
+        require_callable(fn, "fn", _diag.type_name(self), optional=False)
+        require_callable(on_close, "on_close", _diag.type_name(self))
         self._fn = fn
         self._on_close = on_close
 

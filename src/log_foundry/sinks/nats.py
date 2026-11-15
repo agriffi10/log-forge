@@ -1655,7 +1655,7 @@ class NATSSink:
                     fates.append(("abandoned", ""))
                     break
             except Exception as err:
-                fates.append(("raised", type(err).__name__))
+                fates.append(("raised", _diag.type_name(err)))
             else:
                 fates.append(("ok", ""))
         fates.extend([("unattempted", "")] * (len(batch) - len(fates)))

@@ -59,10 +59,11 @@ A door is a function raising a `TypeError` that names, through the stored name, 
 its parameters other than `self` or `cls`; the derived set must equal ten written out by name, so a
 door removed, renamed or inlined back reddens by name and a new one is a visible edit. It reports a
 `raise TypeError` formatting `type(x).__name__` or `x.__class__.__name__` for a non-`self` `x`,
-outside two exempt raises held exactly (`sanitize._coerce_unbounded` and `TransformSink._apply`,
-which judge a transform's *result* once per event, where invariants 2 and 8 govern and 13 does
-not), and any `isinstance` on a door's parameter, or on the parameter of a same-module function the
-door passes it to. Its one exemption is `decorator._refuse_unusable`'s kept proxy test, SPEC-080's
+with no exemption: the two raises once exempt, `sanitize._coerce_unbounded` and
+`TransformSink._apply`, which judge a transform's *result* once per event, now name it through the
+stored name too, as every type name in `src/` does (the `failure-paths` decision *A type is named
+by the name it stores*), and any `isinstance` on a door's parameter, or on the parameter of a
+same-module function the door passes it to. Its one exemption is `decorator._refuse_unusable`'s kept proxy test, SPEC-080's
 on purpose, held as an exact multiset of its two expressions after the function's `not callable(fn)`
 refusal, so a rewritten earlier test or a second copy of an exempt one is still reported. A mutation
 sweep rewrites every door back to `isinstance` and `type(p).__name__` in memory and requires a
@@ -87,10 +88,18 @@ parameters by name.
 
 **Do NOT** call `isinstance`, read `type(v).__name__` or `v.__class__`, or call anything that
 dispatches through the value's own type on a door's parameter before its real type is known; add a
-door without adding it to the guard's pinned set; or extend the guard's exemptions beyond the two
-named raises and the one multiset. (SPEC-071, invariants 13 and 6)
+door without adding it to the guard's pinned set; or give the guard an exemption beyond the one
+multiset. (SPEC-071, invariants 13 and 6)
 
 ## History
+
+### 2026-11-15
+
+- **Refined (stored-name sweep, no spec).** The guard's two exempt raises,
+  `sanitize._coerce_unbounded` and `TransformSink._apply`, now name the transform result's type
+  through the stored name, so the exemption set and its stale-exemption check were retired and a
+  revert of either raise is reported like any other. The rule they followed is now held for all
+  of `src/` by `tests/test_stored_name_roster.py`.
 
 ### 2026-11-07
 
