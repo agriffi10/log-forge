@@ -64,6 +64,25 @@ order agents asked, with `main` settled and green before the next**.
 - **Never move the shared checkout out from under a peer.** Build in your own worktree off fresh
   `origin/main` — not the shared tree, not a peer's branch — and leave the tree on the branch you
   found it on. Uncommitted changes in a shared tree are not yours to commit, stash or revert.
+- **The Docker daemon is shared too: remove the containers you started, and only those; leave
+  images.** Name a container or network you start by hand `lf-<tag>-…`, where `<tag>` is short and
+  your own (your branch's spec number, say), since peers use the `lf` prefix as well and a bare
+  `lf-pg` collides; remove it by that name with `docker rm -f` or `docker network rm` before your
+  last turn. **The integration stack is one per machine:** `tests/integration/docker-compose.yml`
+  publishes fixed host ports and `tests/integration/test_nats.py` drives it under the default
+  project name, so run it as `docker compose -f tests/integration/docker-compose.yml …` with no
+  `-p` (a custom `-p` needs `COMPOSE_PROJECT_NAME` set to match for pytest, or the NATS outage tests
+  fail). Check `docker compose -f tests/integration/docker-compose.yml ps` first: if a peer's stack
+  is up, use it and leave it running; take it down with `down -v` only if you started it. Leave
+  images cached so the next session does not pull them again
+  (`docs/decisions/working-rules/sessions-keep-docker-images-cached.md`). Never prune: `docker
+  container prune` and `docker system prune` remove every stopped container on the machine, other
+  sessions' and other repos' included. `.claude/settings.json` allows the read-only commands,
+  pulls, the stack's own subcommands and lifecycle commands on `lf…` names without a prompt; it
+  denies the prunes and image removal, and leaves `docker run` and any other `docker compose`
+  subcommand to prompt, because a mount or a second compose file in their arguments cannot be held
+  to read-only by a rule. An allow rule matches text, so `docker rm -f lf-a other` passes it too:
+  name only your own. The rules match the relative path, so write it from the repo root.
 - **Brief each session explicitly** from `docs/templates/multi-agent-briefing.md`: its own worktree
   off fresh `origin/main`, who else is running and on what, the files two agents will both edit, and
   that a rebase conflict is never resolved by discarding a peer's work. An unbriefed session does the

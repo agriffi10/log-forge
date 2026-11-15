@@ -22,6 +22,10 @@ Never work in the shared checkout, never switch, reset or checkout a branch you 
 and never delete or force-push a peer's branch. Rebase onto fresh `origin/main` before you push —
 `main` will have moved while you worked.
 
+**The Docker daemon is shared.** Before you start containers, read *The Docker daemon is shared
+too* in `docs/process/several-agents.md`: name what you start as your own, remove only that, run
+the integration stack once per machine, and never remove images.
+
 **Who else is running.** [One line per peer: session, spec, branch. "You are the only one" is also an
 answer, and a useful one.]
 

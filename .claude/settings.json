@@ -29,7 +29,42 @@
       "Bash(gh pr checks *)",
       "Bash(gh pr merge *)",
       "Bash(gh run list *)",
-      "Bash(gh run view *)"
+      "Bash(gh run view *)",
+      "Bash(docker info *)",
+      "Bash(docker version *)",
+      "Bash(docker ps *)",
+      "Bash(docker images *)",
+      "Bash(docker logs *)",
+      "Bash(docker pull *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml up *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml down *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml ps *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml logs *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml stop *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml start *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml pause *)",
+      "Bash(docker compose -f tests/integration/docker-compose.yml unpause *)",
+      "Bash(docker compose ps *)",
+      "Bash(docker start lf*)",
+      "Bash(docker stop lf*)",
+      "Bash(docker restart lf*)",
+      "Bash(docker pause lf*)",
+      "Bash(docker unpause lf*)",
+      "Bash(docker exec lf*)",
+      "Bash(docker rm lf*)",
+      "Bash(docker rm -f lf*)",
+      "Bash(docker network create lf*)",
+      "Bash(docker network rm lf*)",
+      "Bash(docker network connect lf*)",
+      "Bash(docker network disconnect lf*)",
+      "Bash(pgrep *)"
+    ],
+    "deny": [
+      "Bash(docker compose * --rmi*)",
+      "Bash(docker * prune *)",
+      "Bash(docker * prune)",
+      "Bash(docker rmi *)",
+      "Bash(docker image rm *)"
     ]
   }
 }
