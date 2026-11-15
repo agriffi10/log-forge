@@ -467,7 +467,7 @@ def _counted(cls: type) -> type:
 
 
 def _reverse_wrappers() -> list[Any]:
-    """FR-001's four `W`s, each built from a subclass that counts its own close."""
+    """FR-001's four `W`s, and a kept sink after a nested sibling, each counting its close."""
     multi, filtering = _counted(MultiSink), _counted(FilteringSink)
     transform = _counted(TransformSink)
     return [
@@ -475,6 +475,7 @@ def _reverse_wrappers() -> list[Any]:
         pytest.param(lambda a, b: filtering(a), id="filtering"),
         pytest.param(lambda a, b: transform(a, lambda event: event), id="transform"),
         pytest.param(lambda a, b: multi(FilteringSink(a), b), id="nested"),
+        pytest.param(lambda a, b: multi(FilteringSink(b), a), id="kept-after-nested"),
     ]
 
 
@@ -628,6 +629,24 @@ def test_remaining__a_member_inside_a_retired_drain_is_not_closed_under_it() -> 
     log_foundry.shutdown(timeout=5.0)
     join_graced()
     assert a.closes == 1 and a.closed_while_inside == 0 and a.refused == 0, a
+
+
+def test_the_stale_take_guard_reads_an_unread_graph_as_unknown() -> None:
+    """FR-003: a sink in use whose graph was not read makes every stale sink pass over.
+
+    A sink armed after the swap's unlocked read has no graph, or a graph read from another
+    object that held its ``id``; what lies beneath it is unknown, so nothing stale is taken.
+    The controls: a known graph holding the stale sink passes it over, and one that does not
+    takes it.
+    """
+    from log_foundry._lifecycle import _lies_beneath
+
+    stale, holder, other = Shared("S"), Shared("H"), Shared("O")
+    assert _lies_beneath(stale, [holder], {}) is True
+    assert _lies_beneath(stale, [holder], {id(holder): (other, {})}) is True
+    assert _lies_beneath(stale, [holder], {id(holder): (holder, {id(stale): stale})}) is True
+    assert _lies_beneath(stale, [holder], {id(holder): (holder, {id(other): other})}) is False
+    assert _lies_beneath(stale, [], {}) is False
 
 
 def test_a_callers_own_wrapper_close_still_closes_every_member() -> None:
@@ -1108,8 +1127,7 @@ def test_concurrent_callers_over_seeds(seed: int, monkeypatch: pytest.MonkeyPatc
     it, never two at once. A wrapper is armed again when a log with no span read it as the
     configured sink before a swap took it and arms it after, which invariant 5 records as owing a
     second close (SPEC-045, `p8_second_close_after_a_rearm.py`); under four logging threads that
-    happens on some seeds, with or without SPEC-087, so the count is held to the arms rather than
-    to one.
+    happens on some seeds, so the count is held to the arms rather than to one.
     """
     rng = random.Random(seed)  # noqa: S311
     a = Shared("A")

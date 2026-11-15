@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from log_foundry import _diag, _fork, _sink_arg
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from log_foundry.results import FlushResult
     from log_foundry.sinks.base import Sink
@@ -3308,11 +3308,8 @@ def _walk_beneath(
     return found, visits, tripped, None
 
 
-_SHARED_SHORT = (
-    "reading the sinks beneath a sink stopped short; a sink it shares with another may be "
-    "closed while still in use"
-)
-"""The detail of the line a read of a sink graph writes when it trips its bound (SPEC-087)."""
+_SHARED_RISK = "a sink it shares with another may be closed while still in use"
+"""What a read of a sink graph that stopped short means, ending both of its lines (SPEC-087)."""
 
 
 def _installed_graph(
@@ -3352,10 +3349,10 @@ def _installed_graph(
         _diag.absorbed(
             "reading the sinks beneath a sink",
             exc,
-            "it stopped short; a sink it shares with another may be closed while still in use",
+            f"it stopped short; {_SHARED_RISK}",
         )
     elif tripped:
-        _diag.pending(_SHARED_SHORT)
+        _diag.pending(f"reading the sinks beneath a sink stopped short; {_SHARED_RISK}")
     graph: dict[int, object] = {id(root): root}
     graph.update((id(sink), sink) for sink in found)
     return graph
@@ -3381,8 +3378,12 @@ class _Keep:
       back is that token, so of two forwards that race, one closes. Without it two owed wrappers
       sharing a member, taken in one pass, closed that member twice, overlapping.
 
-    It holds no lock: a claim is one ``dict.setdefault``, and two threads that both read the
-    remaining graphs read the same thing. It holds the sinks strongly only for as long as the
+    It holds no lock, which is safe here and is the deliberate exception ``python.md`` §13 asks to
+    be named: a claim is one ``dict.setdefault`` on a builtin ``dict``, which CPython performs
+    atomically, so of two threads claiming one sink exactly one reads back its own token; nothing
+    else writes the map once the decision's sections have recorded their takes, under
+    ``_state._lock``, before any close starts; and two threads that both read the remaining graphs
+    compute the same map from static reads, so the second assignment changes nothing. It holds the sinks strongly only for as long as the
     decision's releases hold it.
 
     Attributes:
@@ -3393,8 +3394,8 @@ class _Keep:
 
     def __init__(
         self,
-        kept: dict[int, object],
-        remaining: list[Sink],
+        kept: Mapping[int, object],
+        remaining: Sequence[Sink],
         closed: dict[int, tuple[object, object]],
     ) -> None:
         """Builds a keep from its three parts, reading no graph yet.
@@ -5912,7 +5913,11 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     the worker's current sink or of one :meth:`Runtime.held` says something may be inside; where
     such a sink was armed after the read, every stale sink is left (:func:`_lies_beneath`). Kept
     is tested first, so a sink both kept and beneath one in use is ceded, which both its holders
-    then account for.
+    then account for. The record is read for that walk without the lock, as one
+    ``list(...values())`` of a builtin ``dict``, which runs no Python code and so cannot see the
+    dict change size under it. That is safe because the snapshot only decides which graphs to walk:
+    the critical section re-reads the record under ``_state._lock`` for every decision it makes,
+    and a sink armed after the snapshot has no graph, which the guard reads as unknown.
 
     **A shutdown waits for this call's decision** (:func:`_await_swap_decisions`). Between the
     retarget and the decision the sink installed is the worker's but not yet owed, so a
