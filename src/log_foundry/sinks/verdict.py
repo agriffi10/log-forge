@@ -396,7 +396,11 @@ def emit_via_deliver(
       TypeError: When the sink has no usable ``deliver`` or no ``log_foundry_counters`` that is
         exactly a ``SinkCounters``, naming its type's stored name and the missing member.
       SinkDeliveryError: When the run delivered nothing and something was rejected, unresolved
-        or raised, naming counts and the sink's type, never a value.
+        or raised, naming counts and the sink's type, never a value. A shipped sink whose 1.x
+        ``emit`` raised its driver's own error registers that error for such a run, and it is
+        raised in this one's place: an instance of ``SinkDeliveryError`` that is the driver's
+        type as well, as the file sinks raise (SPEC-082), or the driver's own error where that
+        dual type cannot be built.
       BaseException: Whatever ``deliver`` raises that is not an ``Exception``, unchanged.
     """
     from log_foundry.sinks import _engine
