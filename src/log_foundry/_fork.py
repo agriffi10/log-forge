@@ -771,6 +771,7 @@ _GLOBAL_PRIMITIVES: tuple[tuple[str, str], ...] = (
     ("decorator", "_sweep_lock"),
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),
+    ("_ledger", "_registry.lock"),
 )
 """Every lock and event the package holds as module state, listed (SPEC-079 FR-001).
 

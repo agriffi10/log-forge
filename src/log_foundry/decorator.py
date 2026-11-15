@@ -10,7 +10,7 @@ from collections.abc import Callable
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
-from log_foundry import _diag, _lifecycle, context
+from log_foundry import _diag, _ledger, _lifecycle, context
 from log_foundry.ids import (
     is_valid_span_id,
     is_valid_trace_id,
@@ -435,6 +435,11 @@ def _sweep_open_spans() -> None:
     stops before detaching anything, releases the lock, resolves the worker and sweeps again; a
     flush that finds nothing buffered still builds nothing.
 
+    **Each take is a hand-over in the event ledger** (SPEC-088 FR-001), credited in the calling
+    thread's cell after ``submit`` returns, so every event the credit counts is already in the
+    queue's taken-in count or in ``overflow_lost``. The length is read under the lock, at the
+    swap, so a racing append cannot change what is counted.
+
     Args:
       None.
 
@@ -459,7 +464,9 @@ def _sweep_open_spans() -> None:
                 backfill_baggage(span, context._live_baggage())
                 span.swept = True
                 buffered, span.events = span.events, []
+                count = len(buffered)
                 worker.submit(buffered)
+                _ledger.cell().handed += count
             if not needs_worker:
                 return
         worker = _lifecycle._get_worker()
@@ -569,6 +576,11 @@ def _flush(span: Span) -> None:
     SPEC-036 FR-004 window rather than widening it — the gap between detaching and submitting
     falls from the whole of ``_get_worker()`` to a lock release.
 
+    **The hand-over is credited after** ``submit`` **returns** (SPEC-088 FR-001), in the calling
+    thread's cell, by the length read at the detach. Credited before, a submission ``submit`` lost
+    without a count would read as balanced; after, it leaves the meeting of the caller's
+    hand-overs with the queue's taken-in count positive, which the shutdown check reports.
+
     Args:
       span: The finished span whose buffered events are submitted.
 
@@ -581,7 +593,9 @@ def _flush(span: Span) -> None:
     worker = _lifecycle._get_worker()
     with _sweep_lock:
         events, span.events = span.events, []
+        count = len(events)
     worker.submit(events)
+    _ledger.cell().handed += count
 
 
 type _SpanScope = tuple[
@@ -608,6 +622,10 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
     :func:`~log_foundry.context.current_span` before :func:`_open_span`, which is what makes
     the new span current.
 
+    **The call's** ``span.start`` **is credited first, before the** ``try`` (SPEC-088 FR-001):
+    accepted means asked for, so a guard that forgets its debit leaves a remainder a check can
+    see, where a credit after the build would hide exactly the events a failed open lost.
+
     Args:
       name: The span name, normally the decorated function's qualified name.
       defaults: Per-decorator default fields, or ``None``.
@@ -622,6 +640,7 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
     span: Span | None = None
     token: contextvars.Token[tuple[Span, ...]] | None = None
     scope: contextvars.Token[dict[str, object]] | None = None
+    _ledger.cell().span += 1
     try:
         if context.current_span() is None:
             scope = context.push_baggage_scope()
@@ -665,6 +684,9 @@ def _end(
     and it is recorded **before** the announcement for the reason every other site here is:
     stderr may be wedged, and the counter must not be lost to it.
 
+    **A span's** ``span.end`` **is credited before the close is tried** (SPEC-088 FR-001), for the
+    reason :func:`_begin` credits ``span.start`` before its ``try``.
+
     Args:
       span: The span to close, or ``None`` if none was opened.
       token: The span-stack token to release, or ``None``.
@@ -681,6 +703,7 @@ def _end(
         runtime's intent and must still reach the caller.
     """
     if span is not None:
+        _ledger.cell().span += 1
         try:
             _close_span(span, status, error)
         except Exception as exc:

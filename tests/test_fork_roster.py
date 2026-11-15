@@ -63,6 +63,7 @@ _EXPECTED_ROSTER = (
     ("decorator", "_sweep_lock"),
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),
+    ("_ledger", "_registry.lock"),
 )
 
 _EMPTIED_IN_CHILD = {"_lifecycle._state._closes._in_flight": "_clear_after_fork"}
@@ -70,6 +71,7 @@ _EMPTIED_IN_CHILD = {"_lifecycle._state._closes._in_flight": "_clear_after_fork"
 
 _PRIMITIVE_HOMES = {
     "Runtime": "roster",
+    "_Registry": "roster",
     "_CloseRegistry": "roster",
     "ConsoleWriter": "roster",
     "ClosedGuard": "walk",

@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
-from log_foundry import _diag, _lifecycle
+from log_foundry import _diag, _ledger, _lifecycle
 from log_foundry.results import FlushResult
 from log_foundry.sinks import _engine
 from log_foundry.sinks._refusal import is_final_refusal
@@ -106,6 +106,145 @@ def _bounded_seconds(timeout: float | None) -> str:
         return f"{float(timeout):g}s" if timeout is not None else "no timeout"
     except Exception:
         return "?"
+
+
+@dataclass(frozen=True, kw_only=True)
+class EventLedger:
+    """Every accepted event, in the one term it is in now, counted in events (SPEC-088 FR-001).
+
+    An event is credited to ``accepted`` at the call that asks for it, before the library tries
+    to build it, and from then on it is in exactly one other term: still on its way (the three
+    gauges), out through an exit (``delivered``, ``skipped``), or lost (the six ``*_lost`` terms
+    and ``stranded``). So ``accepted == pending + delivered + skipped + lost`` once no library call
+    is in progress. A gauge can fall; every other term only rises in a process, which is what
+    lets the events lost between two points be read as the fieldwise difference of two readings.
+
+    ``unaccounted`` is not a term. It is how far the terms are from balancing, the events the
+    ledger cannot place, and it is zero in a correct library. A gauge that would read below zero
+    is published as zero and its deficit is counted there instead, so a reader never meets a
+    negative count.
+
+    Attributes:
+      accepted: Events asked for: a traced call's ``span.start`` and ``span.end``, and each level
+        call, whether or not the event could then be built.
+      open_spans: Events buffered on a span and not yet handed to the worker. A remainder, so it
+        also holds the events the recorded append window strands on a closed span
+        (``architecture.md`` §13).
+      queued: Events in the worker's queue while its drain thread runs. Events, where
+        ``Health.queued`` counts submissions and markers.
+      in_flight: Events the drain thread has taken and not finished with, plus orphan logs whose
+        call is still running.
+      delivered: Events whose ``emit`` returned, or that a ``deliver`` sink answered
+        ``ACCEPTED``.
+      skipped: Events a ``deliver`` sink answered ``SKIPPED``.
+      in_span_lost: Events that could not be built or handed over inside a span; the same value
+        as ``Health.in_span_lost``.
+      orphan_lost: Orphan logs that could not be built, or whose run failed or raised; the same
+        value as ``Health.orphan_lost``.
+      overflow_lost: Events whose submission met a full queue. ``Health.dropped`` counts the
+        same submissions.
+      batch_lost: Events of a batch abandoned after its retries, or whose retry was declined.
+      sink_lost: Events of a settled run that ended neither ``ACCEPTED`` nor ``SKIPPED``.
+      drain_lost: Events the drain thread held when it died.
+      stranded: Events in the queue of a worker whose drain thread has ended.
+      unaccounted: Events the terms cannot place; zero when they balance.
+    """
+
+    accepted: int = 0
+    open_spans: int = 0
+    queued: int = 0
+    in_flight: int = 0
+    delivered: int = 0
+    skipped: int = 0
+    in_span_lost: int = 0
+    orphan_lost: int = 0
+    overflow_lost: int = 0
+    batch_lost: int = 0
+    sink_lost: int = 0
+    drain_lost: int = 0
+    stranded: int = 0
+    unaccounted: int = 0
+
+    @property
+    def pending(self) -> int:
+        """Events still on their way: ``open_spans + queued + in_flight``.
+
+        Args:
+          None.
+
+        Returns:
+          The sum of the three gauges.
+
+        Raises:
+          None.
+        """
+        return self.open_spans + self.queued + self.in_flight
+
+    @property
+    def lost(self) -> int:
+        """Events lost: the six ``*_lost`` terms and ``stranded``.
+
+        Args:
+          None.
+
+        Returns:
+          The sum of the seven loss terms.
+
+        Raises:
+          None.
+        """
+        return (
+            self.in_span_lost
+            + self.orphan_lost
+            + self.overflow_lost
+            + self.batch_lost
+            + self.sink_lost
+            + self.drain_lost
+            + self.stranded
+        )
+
+
+class _CountingQueue(queue.Queue[object]):
+    """The worker's queue, counting the events of each submission it takes in (SPEC-088 FR-001).
+
+    ``_put`` runs under the mutex ``put`` and ``put_nowait`` already hold, so the count is exact
+    and :meth:`Worker.submit` writes no counter of its own on the accept path. Flush markers and
+    the shutdown sentinel are not lists and count nothing.
+
+    Attributes:
+      entered: Events of the submissions this queue has taken in.
+    """
+
+    def __init__(self, maxsize: int = 0) -> None:
+        """Builds the queue with nothing taken in.
+
+        Args:
+          maxsize: The bound, as ``queue.Queue`` takes it.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.entered = 0
+        super().__init__(maxsize)
+
+    def _put(self, item: object) -> None:
+        """Counts a submission's events, then queues it.
+
+        Args:
+          item: A submission, a flush marker or the shutdown sentinel.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if isinstance(item, list):
+            self.entered += len(item)
+        super()._put(item)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -316,6 +455,149 @@ class _FlushMarker:
         self.seen_failures = seen_failures
 
 
+class _Reading:
+    """One reading of the event ledger, with the residuals the published terms leave out.
+
+    The published ``EventLedger`` is what a caller reads. The residuals are kept beside it for the
+    test suite's balance fixture (SPEC-088 FR-006), which reads at rest and so can hold each one
+    to zero where the shutdown check, which may read while calls run, counts only the positive
+    side.
+
+    Attributes:
+      ledger: The published terms.
+      orphan_residual: Orphan credits less the orphan gauge, exits and ``orphan_lost``.
+      meeting_residual: Hand-overs since the process worker was built less what its queue took
+        in and what overflowed, or ``None`` with no process worker.
+      drain_residual: The process worker's taken events less those held and settled.
+    """
+
+    __slots__ = ("drain_residual", "ledger", "meeting_residual", "orphan_residual")
+
+    def __init__(
+        self,
+        ledger: EventLedger,
+        orphan_residual: int,
+        meeting_residual: int | None,
+        drain_residual: int,
+    ) -> None:
+        """Records one reading.
+
+        Args:
+          ledger: The published terms.
+          orphan_residual: The orphan residual.
+          meeting_residual: The meeting residual, or ``None``.
+          drain_residual: The drain residual.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.ledger = ledger
+        self.orphan_residual = orphan_residual
+        self.meeting_residual = meeting_residual
+        self.drain_residual = drain_residual
+
+
+def _read_ledger(worker: Worker | None) -> _Reading:
+    """Reads the event ledger once, in the order that keeps every reading sound (SPEC-088 FR-001).
+
+    A reading is several loads, not one, and calls run while it is taken, so the order is what
+    stops a call that is balancing correctly from reading as an imbalance. **The order**, built as
+    the plan review checked it (M2): the process worker (read by the caller), then its drain's
+    liveness, taking count, held events and exits; ``in_span_lost``; every cell's hand-overs (pass 1); the queue's
+    taken-in count and ``_overflow_lost``; every cell's span credits (pass 2); the orphan pass,
+    cell by cell; ``orphan_lost``. Each property rests on one rule, that a count is read before
+    any count written earlier in the life of the same events:
+
+    - ``accepted`` is never below the worker path's exits and losses: every one of them was
+      written after its events' credits, and is read before them.
+    - ``open_spans`` never reads below zero: a hand-over pass 1 reads was written after the take,
+      the take after the append, the append after the credit, whichever thread's cell holds it;
+      pass 2 runs later, from a fresh snapshot, and reads it. Read cell by cell instead, a span
+      shared through a copied context (``asyncio.to_thread``) can read its hand-over without its
+      credit, so the shutdown check would fire on a call that was balancing.
+    - ``queued`` never reads below zero: the taking count is read before the taken-in count.
+    - The meeting residual never reads above zero while hand-overs run: a hand-over is credited
+      after ``Worker.submit`` returns, so pass 1 reads it only after the queue counted it or it
+      overflowed, and both are read after pass 1.
+    - The drain and orphan residuals never read above zero: each is read in the reverse of the
+      order its writer writes it, the gauge raised before the credit and lowered after the exit.
+
+    It takes the registration lock once per pass and no other lock: not ``Runtime._lock``,
+    ``Worker._lock``, the queue's mutex or ``decorator._loss_lock``, whose counters are each read
+    as one load. So it waits behind no ``submit``, drain or lifecycle call, and it may run on any
+    thread, the drain thread included.
+
+    Args:
+      worker: The process worker, read by the caller before anything here, or ``None``.
+
+    Returns:
+      The published terms, with the three residuals.
+
+    Raises:
+      None.
+    """
+    from log_foundry import decorator
+
+    if worker is None:
+        at_build = 0
+        alive, taken, held = False, 0, 0
+        w_delivered = w_skipped = w_sink_lost = batch_lost = drain_lost = 0
+    else:
+        at_build = worker._handed_at_build
+        (
+            alive,
+            taken,
+            held,
+            w_delivered,
+            w_skipped,
+            w_sink_lost,
+            batch_lost,
+            drain_lost,
+        ) = worker._drain_terms()
+    in_span_lost = decorator._in_span_lost
+    handed = _ledger.handed()
+    entered = 0 if worker is None else worker._queue.entered
+    overflow_lost = 0 if worker is None else worker._overflow_lost
+    span = _ledger.spans()
+    orphan, orphan_open, o_delivered, o_skipped, o_sink_lost = _ledger.orphans()
+    orphan_lost = decorator._orphan_lost
+    in_queue = entered - taken
+    open_spans = span - in_span_lost - handed
+    drain_residual = taken - held - (w_delivered + w_skipped + w_sink_lost + batch_lost + drain_lost)
+    orphan_residual = orphan - orphan_open - (o_delivered + o_skipped + o_sink_lost) - orphan_lost
+    meeting = None if worker is None else handed - at_build - entered - overflow_lost
+    unaccounted = (
+        (0 if alive else max(0, held))
+        + max(0, orphan_residual)
+        + max(0, meeting or 0)
+        + max(0, drain_residual)
+        + max(0, -open_spans)
+        + max(0, -in_queue)
+        + max(0, -held)
+        + max(0, -orphan_open)
+    )
+    ledger = EventLedger(
+        accepted=span + orphan,
+        open_spans=max(0, open_spans),
+        queued=max(0, in_queue) if alive else 0,
+        in_flight=max(0, held) + max(0, orphan_open),
+        delivered=w_delivered + o_delivered,
+        skipped=w_skipped + o_skipped,
+        in_span_lost=in_span_lost,
+        orphan_lost=orphan_lost,
+        overflow_lost=overflow_lost,
+        batch_lost=batch_lost,
+        sink_lost=w_sink_lost + o_sink_lost,
+        drain_lost=drain_lost,
+        stranded=0 if alive else max(0, in_queue),
+        unaccounted=unaccounted,
+    )
+    return _Reading(ledger, orphan_residual, meeting, drain_residual)
+
+
 class Worker:
     """Owns a bounded queue and daemon thread that batch and flush events to a sink.
 
@@ -384,12 +666,23 @@ class Worker:
         gate over. ``_join_taken_over`` records that the debt was paid, so the caller that took
         it over queues no second sentinel. Both are written under ``_lock`` by :meth:`claim_stop`
         and reset with ``_stopped`` where :meth:`_reinit_after_fork` starts a drain thread.
-        ``_in_flight`` is the
-        size of the batch :meth:`_emit` is holding, from before its first attempt until it returns,
-        so an expired join can say how many events are inside the emit it gave up waiting on
-        (FR-005). It is written by the drain thread and read without the lock by the stopper, as
-        :attr:`draining` is read: a single assignment, so a reader sees one of two answers, both
-        true at the instant.
+        ~~``_in_flight`` is the
+        size of the batch :meth:`_emit` is holding, from before its first attempt until it returns~~
+        — superseded by SPEC-088: ``_in_flight`` counts every event the drain thread has taken
+        from the queue and not yet settled, which under this drain is the batch inside
+        :meth:`_emit` whenever an emit is running, so an expired join can still say how many events
+        are inside the emit it gave up waiting on (SPEC-062 FR-005), and it is the ledger's
+        ``in_flight`` too, one counter the stopper reads once. It is written by the drain thread
+        only, through :meth:`_hold` and :meth:`_settle`, and read without the lock by the stopper,
+        as :attr:`draining` is read.
+
+        **The ledger's worker terms** (SPEC-088 FR-001). ``_taken`` counts the events the drain
+        has taken, ``_delivered``, ``_skipped``, ``_sink_lost``, ``_batch_lost`` and
+        ``_drain_lost`` the exits it has written, all on the drain thread only; ``_overflow_lost``
+        counts the events of overflowed submissions under ``_lock``, beside ``dropped``; and the
+        queue counts what it took in. ``_handed_at_build`` is the process's hand-over count when
+        this worker was built, so the meeting of the caller's hand-overs with this queue counts
+        only the hand-overs it could have received.
 
         ``sink_released=`` used to sit here and is retired (SPEC-054 FR-002). It made a worker
         built during a ``shutdown()`` inherit a discharged close for a sink that shutdown's orphan
@@ -435,7 +728,7 @@ class Worker:
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
         self._max_queue = max_queue
-        self._queue: queue.Queue[object] = queue.Queue(maxsize=max_queue)
+        self._queue = _CountingQueue(maxsize=max_queue)
         self._stop = _lifecycle._state.refresh_stop_signal()
         self._epoch = _lifecycle._state.retirements
         self._drain_finished = threading.Event()
@@ -445,6 +738,14 @@ class Worker:
         self._join_owed = False
         self._join_taken_over = False
         self._in_flight = 0
+        self._taken = 0
+        self._delivered = 0
+        self._skipped = 0
+        self._sink_lost = 0
+        self._batch_lost = 0
+        self._drain_lost = 0
+        self._overflow_lost = 0
+        self._handed_at_build = _ledger.handed()
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()
@@ -481,7 +782,9 @@ class Worker:
 
         ``_in_flight`` is reset on both branches beside the other per-drain fields, because a
         child inherits the parent's value for a drain thread that does not exist in it
-        (SPEC-062 FR-005). ``_exit_deadline`` is reset only where a drain thread is started: a
+        (SPEC-062 FR-005). The ledger's worker terms are reset with it, and the queue is a new
+        counting queue: the child's ledger restarts (SPEC-088 FR-005), and its hand-over count
+        restarts at zero with it, so ``_handed_at_build`` is zero too. ``_exit_deadline`` is reset only where a drain thread is started: a
         worker whose ``stop()`` was called directly rather than through ``shutdown()`` never
         moved the retirement count, so :func:`_lifecycle._rebuild_worker_after_fork` still
         resumes it, and without the reset every retry in that child would be declined against
@@ -581,13 +884,21 @@ class Worker:
         Raises:
           None.
         """
-        self._queue = queue.Queue(maxsize=self._max_queue)
+        self._queue = _CountingQueue(maxsize=self._max_queue)
         self.dropped = 0
         self.failed_batches = 0
         self.submitted_after_shutdown = 0
         self.incomplete_swaps = 0
         self.stopped_reason = None
         self._in_flight = 0
+        self._taken = 0
+        self._delivered = 0
+        self._skipped = 0
+        self._sink_lost = 0
+        self._batch_lost = 0
+        self._drain_lost = 0
+        self._overflow_lost = 0
+        self._handed_at_build = 0
         self._taken_markers = []
         self._held = [self.sink]
         if not resume:
@@ -674,6 +985,7 @@ class Worker:
         except queue.Full:
             with self._lock:
                 self.dropped += 1
+                self._overflow_lost += len(events)
                 total = self.dropped
             if total == 1 or total % _diag.WARN_EVERY == 0:
                 _diag.lost("submission", total, "log queue full; count is cumulative")
@@ -1670,6 +1982,12 @@ class Worker:
         The queued figure is items rather than event-lists and says so, making it a floor on
         what was lost, which is the useful direction.
 
+        **The events the thread held are debited to** ``drain_lost`` (SPEC-088 FR-002 item 3),
+        before the line, for the record-first reason above. They were in no counter at all: the
+        thread had taken them from the queue, so ``queued`` no longer held them, and nothing
+        would ever emit them. What is queued behind the thread is the ledger's ``stranded`` once
+        the thread has ended, read rather than counted.
+
         Args:
           exc: The exception that ended the drain thread.
           undrained: How many event-lists the loop still held in hand.
@@ -1682,6 +2000,8 @@ class Worker:
         """
         with self._lock:
             self.stopped_reason = _diag.type_name(exc)
+        held = self._in_flight
+        self._settle(held, drain_lost=held)
         try:
             queued: object = self._queue.qsize()
         except Exception:
@@ -1740,7 +2060,9 @@ class Worker:
             if item is _SHUTDOWN:
                 break
             if item is not None:
-                pending.append(cast("list[dict[str, object]]", item))
+                events = cast("list[dict[str, object]]", item)
+                self._hold(events)
+                pending.append(events)
             now = time.monotonic()
             if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
                 self._emit_pending(pending)
@@ -1764,6 +2086,102 @@ class Worker:
         if pending:
             self._emit(pending)
             pending.clear()
+
+    def _hold(self, events: list[dict[str, object]]) -> None:
+        """Counts a submission the drain thread has just taken from the queue (SPEC-088 FR-001).
+
+        The gauge rises before the taking count, as an orphan call raises its gauge before it
+        credits, so a reading that has counted the take finds the events either still held or
+        already in an exit: the drain residual, taken less held less exits, never reads above
+        zero for a drain that is balancing (FR-003). Drain thread only, and the one place a take is
+        counted, so a later drain that takes differently calls this rather than writing a counter.
+
+        Args:
+          events: The submission taken.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        count = len(events)
+        self._in_flight += count
+        self._taken += count
+
+    def _settle(
+        self,
+        size: int,
+        *,
+        delivered: int = 0,
+        skipped: int = 0,
+        sink_lost: int = 0,
+        batch_lost: int = 0,
+        drain_lost: int = 0,
+    ) -> None:
+        """Debits events the drain thread has finished with to their exits (SPEC-088 FR-001).
+
+        The exits are written before the gauge falls, for the reason :meth:`_hold` raises the gauge
+        first. Drain thread only, and the one place an exit is written: every route out of
+        :meth:`_emit` calls it, and so does :meth:`_terminal_failure` for what a dying thread
+        held.
+
+        Args:
+          size: The events settled, which leave ``in_flight``.
+          delivered: Of those, the ones whose ``emit`` returned or that ended ``ACCEPTED``.
+          skipped: The ones a ``deliver`` sink answered ``SKIPPED``.
+          sink_lost: The ones a settled run ended neither ``ACCEPTED`` nor ``SKIPPED``.
+          batch_lost: The ones of a batch abandoned or whose retry was declined.
+          drain_lost: The ones the drain thread held when it died.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._delivered += delivered
+        self._skipped += skipped
+        self._sink_lost += sink_lost
+        self._batch_lost += batch_lost
+        self._drain_lost += drain_lost
+        self._in_flight -= size
+
+    def _drain_terms(self) -> tuple[bool, int, int, int, int, int, int, int]:
+        """Reads this worker's drain-side terms, without a lock, in the order a reading needs.
+
+        The thread's liveness is read first: once it reads ended, nothing will take a queued event
+        or debit a held one, and reading it after the counts lets a debit land between the two
+        (SPEC-088 FR-001). ``_drain_finished`` is not the test, because :meth:`_run` sets it
+        before :meth:`_terminal_failure` debits what the thread held. The taking count is read
+        before the gauge and the gauge before the exits, the reverse of the order the drain
+        writes them in. The queue's taken-in count and ``_overflow_lost`` are left to the caller,
+        which reads them after the caller-side hand-overs. Each read is one attribute load, so
+        this waits behind nothing, the drain thread included.
+
+        Args:
+          None.
+
+        Returns:
+          Whether the drain thread is alive, then the taken, held, delivered, skipped, sink-lost,
+          batch-lost and drain-lost counts.
+
+        Raises:
+          None.
+        """
+        alive = self._thread.is_alive()
+        taken = self._taken
+        held = self._in_flight
+        return (
+            alive,
+            taken,
+            held,
+            self._delivered,
+            self._skipped,
+            self._sink_lost,
+            self._batch_lost,
+            self._drain_lost,
+        )
 
     def _nothing_lost_since(self, marker: _FlushMarker) -> bool:
         """Reports whether any batch was abandoned while a marker was outstanding (FR-001).
@@ -1816,7 +2234,9 @@ class Worker:
                 self._take_marker(item)
                 continue
             if item is not None and item is not _SHUTDOWN:
-                pending.append(cast("list[dict[str, object]]", item))
+                events = cast("list[dict[str, object]]", item)
+                self._hold(events)
+                pending.append(events)
         try:
             self._emit_pending(pending)
             for marker in markers:
@@ -1909,10 +2329,14 @@ class Worker:
         distinct from the exhausted wording so a reader can tell "the sink stayed broken" from
         "the shutdown ran out of time" (FR-002). The abandon line is not written as well.
 
-        ``_in_flight`` holds the batch size from before the first attempt until this method
-        returns by any route — delivered, abandoned, declined, or a ``BaseException`` escaping
-        the sink — so the stopper's expiry line can name the events inside an emit it gave up
-        waiting on (FR-005). It is reset in a ``finally`` for exactly the escaping case.
+        ~~``_in_flight`` holds the batch size from before the first attempt until this method
+        returns by any route~~ — superseded by SPEC-088: ``_in_flight`` already holds the batch,
+        because :meth:`_hold` counted each submission as the drain took it, and every route out
+        that settles the batch — delivered, abandoned, declined, or a settled engine run — debits
+        it through :meth:`_settle` to one exit. A ``BaseException`` escaping the sink settles
+        nothing here: the events stay held, and :meth:`_terminal_failure` debits them to
+        ``drain_lost`` when the thread dies, which the ``finally`` that zeroed the gauge used to
+        hide.
 
         Args:
           event_lists: The accumulated per-span event-lists to flatten and emit.
@@ -1932,60 +2356,68 @@ class Worker:
         retries = max(self.max_retries, 0)
         longest = 0.0
         size = len(batch)
-        self._in_flight = size
-        try:
-            delivery = _engine.run_delivery(
-                self.sink,
-                batch,
-                worker_retries=self.max_retries,
-                stop=self._stop,
-                decline=self._retry_declined,
-            )
-            if delivery is not None:
-                if delivery.failed:
-                    with self._lock:
-                        self.failed_batches += 1
-                    if delivery.declined:
-                        _diag.lost(
-                            "event",
-                            size,
-                            f"retry declined after {delivery.attempts} emit attempt(s); the next "
-                            f"was predicted to end after the shutdown() deadline",
-                        )
-                    else:
-                        _diag.lost(
-                            "event",
-                            size,
-                            f"batch abandoned after {delivery.cycles} emit attempts",
-                        )
-                return
-            for attempt in range(retries + 1):
-                started = time.monotonic()
-                sink = self.sink
-                try:
-                    sink.emit(batch)
-                    return
-                except Exception as err:
-                    longest = max(longest, time.monotonic() - started)
-                    if attempt >= retries or is_final_refusal(err, sink):
-                        with self._lock:
-                            self.failed_batches += 1
-                        _diag.lost(
-                            "event",
-                            len(batch),
-                            f"batch abandoned after {attempt + 1} emit attempts",
-                        )
-                        return
-                self._stop.wait(_engine.cycle_backoff(attempt))
-                if self._retry_declined(longest):
-                    with self._lock:
-                        self.failed_batches += 1
+        delivery = _engine.run_delivery(
+            self.sink,
+            batch,
+            worker_retries=self.max_retries,
+            stop=self._stop,
+            decline=self._retry_declined,
+        )
+        if delivery is not None:
+            if delivery.failed:
+                with self._lock:
+                    self.failed_batches += 1
+                self._settle(size, batch_lost=size)
+                if delivery.declined:
                     _diag.lost(
                         "event",
-                        len(batch),
-                        f"retry declined after {attempt + 1} emit attempt(s); the next was "
-                        f"predicted to end after the shutdown() deadline",
+                        size,
+                        f"retry declined after {delivery.attempts} emit attempt(s); the next "
+                        f"was predicted to end after the shutdown() deadline",
+                    )
+                else:
+                    _diag.lost(
+                        "event",
+                        size,
+                        f"batch abandoned after {delivery.cycles} emit attempts",
+                    )
+                return
+            self._settle(
+                size,
+                delivered=delivery.accepted,
+                skipped=delivery.skipped,
+                sink_lost=size - delivery.accepted - delivery.skipped,
+            )
+            return
+        for attempt in range(retries + 1):
+            started = time.monotonic()
+            sink = self.sink
+            try:
+                sink.emit(batch)
+            except Exception as err:
+                longest = max(longest, time.monotonic() - started)
+                if attempt >= retries or is_final_refusal(err, sink):
+                    with self._lock:
+                        self.failed_batches += 1
+                    self._settle(size, batch_lost=size)
+                    _diag.lost(
+                        "event",
+                        size,
+                        f"batch abandoned after {attempt + 1} emit attempts",
                     )
                     return
-        finally:
-            self._in_flight = 0
+            else:
+                self._settle(size, delivered=size)
+                return
+            self._stop.wait(_engine.cycle_backoff(attempt))
+            if self._retry_declined(longest):
+                with self._lock:
+                    self.failed_batches += 1
+                self._settle(size, batch_lost=size)
+                _diag.lost(
+                    "event",
+                    size,
+                    f"retry declined after {attempt + 1} emit attempt(s); the next was "
+                    f"predicted to end after the shutdown() deadline",
+                )
+                return

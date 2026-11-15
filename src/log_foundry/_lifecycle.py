@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
     from log_foundry.results import FlushResult
     from log_foundry.sinks.base import Sink
-    from log_foundry.worker import Health, Worker
+    from log_foundry.worker import EventLedger, Health, Worker, _Reading
 
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 """Seconds :meth:`Worker.stop` will wait for the drain thread (SPEC-027 FR-004).
@@ -6378,6 +6378,51 @@ def _worker_health() -> Health:
         orphan_lost=orphan_lost,
         in_span_lost=in_span_lost,
     )
+
+
+def _ledger_reading() -> _Reading:
+    """Reads the event ledger once, with the process worker's terms (SPEC-088 FR-001).
+
+    The process worker is read first, by reference, and everything else is read by
+    :func:`log_foundry.worker._read_ledger`, beside the counters it reads, in the order that
+    keeps every reading sound; its docstring carries that order and why. This takes no lock of
+    its own.
+
+    Args:
+      None.
+
+    Returns:
+      The published terms, with the three residuals.
+
+    Raises:
+      None.
+    """
+    from log_foundry.worker import _read_ledger
+
+    return _read_ledger(_state.worker_exists())
+
+
+def _ledger_snapshot() -> EventLedger:
+    """Returns one reading of the event ledger, for the arc's next spec (SPEC-088 FR-004).
+
+    Callable from any thread, the drain thread answering a flush marker included. It takes only
+    the ledger's registration lock, re-entrantly, so it cannot wait behind a ``submit``, a drain or
+    a lifecycle call (:func:`_ledger_reading`). Every loss term is non-decreasing in a process,
+    across a retired thread's cell too, since a fold moves its counts into the base in the same
+    step that drops it, so the events lost between two points are the fieldwise difference of two
+    snapshots. The two falls are a forked child, whose ledger restarts, and a test that replaces
+    the process worker by hand.
+
+    Args:
+      None.
+
+    Returns:
+      The ledger as it reads now.
+
+    Raises:
+      None.
+    """
+    return _ledger_reading().ledger
 
 
 _fork.register_pin(_pin_inherited)

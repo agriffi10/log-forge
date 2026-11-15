@@ -1482,8 +1482,14 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 92, "log_foundry.decorator": 4}
+_SITE_FLOOR = {"log_foundry._lifecycle": 94, "log_foundry.decorator": 4}
 """The floor each walked module must still meet, by name.
+
+**Raised from 92 to 94 at SPEC-088, to the count measured.** `_per_module_sites()` read 94 for
+`_lifecycle` on `main` at `9d05e793`, the two sites added by the specs since the last raise having
+left the floor behind, and SPEC-088 adds none: the ledger's reading lives in `worker.py`, which
+the roster does not walk, and `_lifecycle._ledger_reading` hands `_state.worker_exists()` to it
+without asking a question of it. `decorator` stays at 4.
 
 **Raised to the derived counts by the fix after SPEC-079 for a late build's signal, 60 -> 92 and
 2 -> 4.** Measured with this file's `_sites`, diffing the site list of `_lifecycle.py` at

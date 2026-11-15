@@ -61,7 +61,12 @@ from test_fork_lifecycle import _PRIMITIVES, _primitive_constructions, _threadin
 
 _SRC = pathlib.Path(log_foundry.__file__).resolve().parent
 
-FILES = ("_lifecycle.py", "worker.py", "_fork.py", "config.py", "decorator.py", "console.py")
+FILES = (
+    "_lifecycle.py", "worker.py", "_fork.py", "config.py", "decorator.py", "console.py", "_ledger.py"
+)
+"""The files whose lock constructions are inventoried. ``_ledger.py`` joined at SPEC-088 for its
+registration lock, a counter lock like ``decorator._loss_lock``, so the roster pair
+``_fork._GLOBAL_PRIMITIVES`` names for it has its row (plan review, m2)."""
 PAIR = ("_lifecycle.py", "worker.py")
 FIELD_CLASSES = ("Runtime", "Worker", "_CloseRegistry")
 """The classes whose every ``self`` field is a lifecycle field.
@@ -78,8 +83,11 @@ REPAIR_ITSELF = ("_fork", "_reinit_after_fork")
 CHILD_VALUE = re.compile(r"^(walk|roster|inherited|none|reset: [A-Za-z_][\w]*\.[A-Za-z_]\w*)$")
 
 PAIR_FLOOR = 10
-OUTSIDE_FLOOR = 9
-"""Construction floors: 10 in the pair and 9 outside it.
+OUTSIDE_FLOOR = 10
+"""Construction floors: 10 in the pair and 10 outside it.
+
+**Outside rose from 9 to 10 at SPEC-088**, for ``_ledger._Registry.__init__``'s registration lock,
+when ``_ledger.py`` joined :data:`FILES`; measured on the branch as 10 outside.
 
 Measured at ``3d65cf32`` as 11 and 9. **The pair's fell by exactly one at SPEC-078 (FR-006), for
 the merged leaf lock**: ``Runtime.__init__``'s ``_closers_lock`` and ``_closing_now_lock`` became
@@ -912,6 +920,12 @@ INVENTORY: dict[Key, Row] = {
     _c("decorator.py", "<module>", "_loss_lock", "Lock"): Row(
         "decorator", _R, "no lifecycle state; deliberately not the lifecycle lock"
     ),
+    _c("_ledger.py", "_Registry.__init__", "self.lock", "RLock"): Row(
+        "_Registry",
+        _R,
+        "the ledger's registration lock; re-entrant so a __del__ or handler that logs on a thread "
+        "with no cell cannot wait on itself (SPEC-088)",
+    ),
     _c("_fork.py", "<module>", "_RLOCK_TYPE", "RLock"): Row(
         "none", _NONE, "a type probe at import, fed to type(); stores no primitive"
     ),
@@ -1075,7 +1089,19 @@ INVENTORY: dict[Key, Row] = {
     _wk("_exit_deadline"): Row("Worker", (_REBUILD,), "the drain's deadline (SPEC-062)"),
     _wk("_join_owed"): Row("Worker", (_REBUILD,), "the join a stop on the drain thread owes"),
     _wk("_join_taken_over"): Row("Worker", (_REBUILD,), "whether a later caller took it over"),
-    _wk("_in_flight"): Row("Worker", (_REBUILD,), "the batch the drain thread is inside"),
+    _wk("_in_flight"): Row(
+        "Worker", (_REBUILD,), "every event the drain thread holds (SPEC-088; was the batch)"
+    ),
+    _wk("_taken"): Row("Worker", (_REBUILD,), "events the drain took from the queue (SPEC-088)"),
+    _wk("_delivered"): Row("Worker", (_REBUILD,), "a ledger exit, drain thread only (SPEC-088)"),
+    _wk("_skipped"): Row("Worker", (_REBUILD,), "a ledger exit, drain thread only (SPEC-088)"),
+    _wk("_sink_lost"): Row("Worker", (_REBUILD,), "a ledger loss, drain thread only (SPEC-088)"),
+    _wk("_batch_lost"): Row("Worker", (_REBUILD,), "a ledger loss, drain thread only (SPEC-088)"),
+    _wk("_drain_lost"): Row("Worker", (_REBUILD,), "what a dying drain held (SPEC-088)"),
+    _wk("_overflow_lost"): Row("Worker", (_REBUILD,), "overflowed events, under _lock (SPEC-088)"),
+    _wk("_handed_at_build"): Row(
+        "Worker", (_REBUILD,), "the hand-over count at the build; zero in a child (SPEC-088)"
+    ),
     _wk("_taken_markers"): Row("Worker", (_REBUILD,), "flush() callers owed; in _FORK_SKIP"),
     _wk("_held"): Row("Worker", (_REBUILD,), "sinks the drain thread may be inside"),
     _wk("_lock"): Row("Worker", _W, "guards the worker's counters"),
@@ -1089,7 +1115,7 @@ INVENTORY: dict[Key, Row] = {
 
 
 def _live_sources() -> dict[str, str]:
-    """The six files, as they are."""
+    """The inventoried files, as they are."""
     return {name: (_SRC / name).read_text(encoding="utf-8") for name in FILES}
 
 
