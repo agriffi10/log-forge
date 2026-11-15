@@ -2,7 +2,7 @@
 type: Spec
 id: SPEC-082
 title: "File Sinks on the Delivery Engine: Resend Only What Did Not Land"
-description: "Moves FileSink and RotatingFileSink onto deliver, so a write that fails partway reports each event by the bytes the operating system took and the engine resends only the events that did not land, which closes the duplicate lines a partial write and the worker's whole-batch retry produce today."
+description: "Moves FileSink and RotatingFileSink onto deliver, so a write that fails partway reports each event by the bytes the operating system took and the engine resends only the events that did not land (on a one-round run they are counted, not resent), which closes the duplicate lines a partial write and the worker's whole-batch retry produce today."
 spec_status: In Progress
 depends_on: [SPEC-048, SPEC-069, SPEC-070, SPEC-072, SPEC-074, SPEC-075, SPEC-076]
 ---
@@ -22,9 +22,10 @@ follow-up fix of 2026-11-13.
 This spec closes it for the two file sinks. Each one offers `deliver(batch) -> Verdict`
 (SPEC-072), writes through a handle whose every write call says how many bytes the operating system
 took, and reports an event `ACCEPTED` only when its whole line was taken. The delivery engine then
-resends only the events that did not land. A line cut in half is finished, once, before anything
-else reaches its file, and a run that cut a line is never handed back for a whole-batch resend. It
-targets the first release after 1.2.0.
+resends only the events that did not land, where the run has a later round: on a one-round run (an
+inline `emit`, a `MultiSink` child) the events after a failure are counted, not resent. A line cut
+in half is finished, once, before anything else reaches its file, and a run that cut a line is
+never handed back for a whole-batch resend. It targets the first release after 1.2.0.
 
 ## Scope
 
@@ -38,7 +39,8 @@ targets the first release after 1.2.0.
 - A torn line: the unwritten remainder of a line a write cut partway, kept by the sink and written
   before anything else reaches that file.
 - A write call that raises something other than an `OSError`, and a `BaseException` passing
-  through a write section: in both, the sink's state follows the bytes taken (FR-001, FR-002).
+  through a write section: in both, the sink's state follows the counts its write calls returned
+  (FR-001, FR-002).
 - `RotatingFileSink`'s rotation on the new write path, under SPEC-048 FR-006's flush-before-rotate
   rule.
 - A retry predicate for the file sinks, and the inline `emit` keeping SPEC-069's raise as both
@@ -98,7 +100,8 @@ is raised inside that loop after `k` bytes of the round's own lines have been ta
 - every later event is `RETRYABLE` or `REJECTED`, as the retry predicate (FR-004) answers for the
   error;
 - the torn event is `RETRYABLE` only when the predicate retries the error and the round is inside
-  an engine run and is not that run's last (`RunContext.last`). It is `UNKNOWN` otherwise, a direct
+  an engine run (`RunContext._in_run()`) and is not that run's last (`RunContext.last`). It is
+  `UNKNOWN` otherwise, a direct
   `deliver` outside any run included (FR-002). ~~`RETRYABLE` whenever the round is not the run's
   last~~: superseded 2026-11-14 (*Revision history*).
 
@@ -112,11 +115,19 @@ section and then its whole line written again, which is the duplicate this spec 
 
 **The round handles any `Exception` raised inside its write loop, not only an `OSError` from a
 write call.** The bytes taken before it decide the outcomes and the tail exactly as for an
-`OSError`. The predicate answers false for it (FR-004), so the later events are `REJECTED` and a
-torn event is `UNKNOWN`. With `OSError` alone handled, a handle that took 9 bytes and then raised
-`ValueError` (or a `MemoryError` from slicing the remainder) under `MultiSink` left a cut line
-with no tail, and the worker's whole-batch resend glued the next line to it, which is the defect
-this spec closes. A `BaseException` that is not an `Exception` is FR-002's.
+`OSError`. That is true of an exception a signal handler raises just after a write call returned
+as well (the `signal.alarm` idiom raising `TimeoutError`), because FR-002 stores each call's count
+where no handler can run first. The predicate answers false for it (FR-004), so the later events
+are `REJECTED` and a torn event is `UNKNOWN`. With `OSError` alone handled, a handle that took 9
+bytes and then raised `ValueError` (or a `MemoryError` from slicing the remainder) under
+`MultiSink` left a cut line with no tail, and the worker's whole-batch resend glued the next line
+to it, which is the defect this spec closes. A `BaseException` that is not an `Exception` is
+FR-002's.
+
+**One residue stays, as it was in 1.x.** An exception a signal handler raises after the write
+section has finished and before `emit` returns reaches the caller with the batch already on disk,
+so a caller that retries on it writes the batch again. No design measured at the review of this
+spec's revision closed it (*Revision history*).
 
 **Encoding.** The construction refuses a codec that is not a text encoding with `LookupError`,
 as 1.x's `open()` did, so a codec such as `"base64"`, which the incremental encoder would accept,
@@ -183,7 +194,7 @@ returned `10500` and the next raised `EFBIG`.
 - [ ] The rule above keeps invariants 7 and 2: no event a round called `ACCEPTED` is written again,
       and no event that did not land is called `ACCEPTED`.
 
-### FR-002: A torn line is finished before anything else reaches its file, once, and never resent whole
+### FR-002: A torn line is finished before anything else reaches its file, once, and the library never resends it whole
 
 #### Description:
 
@@ -240,18 +251,33 @@ only then. A transient partial write under one of these callers therefore loses 
 batch, counted, where 1.x could deliver it with duplicates. A file sink the worker drives directly
 has later rounds, and there the engine resends what did not land.
 
-**A `BaseException` passing through a write section leaves no cut line without a tail.** A
-`KeyboardInterrupt` lands, in practice, just after a write call has returned and before its count
-is stored, so the count the sink holds is short by that call's bytes. 1.x's `BufferedWriter` did
-not have this exposure, because it kept its unwritten remainder. Each write-call sequence, a
-tail's and a round's lines alike, therefore notes the descriptor's end-of-file offset before its
-first call. When a `BaseException` passes through, the sequence reads the offset again and takes
-the difference, capped at the bytes it was writing, as the bytes taken. The sink's state then
-follows those bytes exactly as on an `OSError`: the tail is shortened or recorded, and
-`RotatingFileSink`'s `_size` and the owed byte order mark are updated. The exception propagates
-unchanged, with no counter moved and no verdict returned. A handle that cannot seek skips the
-guard. One corner remains: another process appending to the path inside that same window makes the
-difference over-count, which the cap bounds. It is the cross-process case under *Out of Scope*.
+**The count a write call returns is stored where no signal handler can run first, and the sink's
+state follows the stored counts when an exception passes through.** Two rules give that, for a
+tail's write calls and a round's lines alike.
+
+- The count a write call returns is stored with no bytecode boundary between the call returning
+  and the store. An exception a signal handler raises (a `KeyboardInterrupt`, or the `signal.alarm`
+  idiom's `TimeoutError`) is delivered at a bytecode boundary. With a Python-level assignment it
+  lands after the call has returned and before its count is stored, and the count is lost. The
+  reference form is under *Data Model*.
+- The sink's state (the tail shortened or recorded, `RotatingFileSink`'s `_size`, the owed byte
+  order mark) is brought to the stored counts by one idempotent step. That step also runs when a
+  `BaseException` or an `Exception` passes through anywhere from the first write call to the end
+  of the step, so an exception that lands after the last count is stored and before the state is
+  updated is covered too.
+
+A `BaseException` then propagates unchanged, with no counter moved and no verdict returned. The
+step reads no offset and no file size, so a handle that cannot seek is covered like any other. It
+covers the exception that passes through; a second one that lands while the step is running for
+the first is not covered.
+
+**This hardens a pipe beyond 1.x and makes a regular file's bookkeeping exact. It repairs no
+regression.** A blocking write to a pipe is cut short by a signal and returns a partial count, so
+on a FIFO an interrupt really cuts a line, and 1.x left that cut line too. On a regular file a
+write is taken whole and an interrupt never cuts a line, in 1.x or here. What a lost count damages
+there is bookkeeping: a second byte order mark, or a stale `_size`. ~~1.x's `BufferedWriter` did
+not have this exposure~~: superseded 2026-11-14, since that is true only on a regular file, where
+no line is cut either way (*Revision history*).
 
 #### Acceptance Criteria:
 
@@ -289,19 +315,26 @@ difference over-count, which the cap bounds. It is the cross-process case under 
 - [ ] `close()` with a tail pending tries the tail once and closes the descriptor whatever that try
       does. It raises the `OSError` when the try failed and returns when it succeeded. A second
       `close()` is a no-op.
-- [ ] A handle double really writes `k` bytes of a line and then raises `KeyboardInterrupt` in
-      place of returning the count. The exception propagates by identity and no counter moves. The
-      next section finishes the line, every line parses, and a marker unique to the cut line
-      appears on disk exactly once.
-- [ ] The same double inside a tail's write: the exception propagates by identity, no counter
-      moves, the tail is shorter by the `k` bytes written, and after the next section a marker
-      unique to the tail appears on disk exactly once.
-- [ ] On a handle that cannot seek, the same `KeyboardInterrupt` propagates by identity, and the
-      sink records no tail and moves no counter.
-- [ ] These keep invariants 7, 2 and 5: no byte of a tail is written twice, a line cut by an
-      exception of any kind gets its tail, the torn event of a run that ends on the tearing round
-      is counted once and in one term, a `BaseException` moves no counter, and a close releases the
-      descriptor once even when the tail fails.
+- [ ] POSIX only, for `FileSink` and `RotatingFileSink`: the sink writes a batch larger than the
+      pipe's capacity to a FIFO nobody drains, and a timer signal whose handler raises
+      `KeyboardInterrupt` fires while the write is blocked. The exception propagates by identity
+      and no counter moves. Once a reader drains the pipe and the sink's next section has run,
+      every line the reader received parses and a marker unique to the cut line appears once.
+- [ ] POSIX only: the same, with the interrupt landing inside a pending tail's write. Every line
+      the reader received parses, and a marker unique to the tail appears once.
+- [ ] On a regular file, a handle double really writes and returns a count that raises
+      `KeyboardInterrupt` at its first use by the sink. With `utf-16` into an empty file, the file
+      holds exactly one byte order mark after the next section. On `RotatingFileSink`, `_size` has
+      grown by exactly the bytes taken.
+- [ ] With `utf-16` into an empty file, a `KeyboardInterrupt` raised before any byte is taken
+      records no tail and leaves the byte order mark owed: the next section writes exactly one.
+- [ ] With the count stored by a Python-level assignment in place of the reference form, the
+      first FIFO criterion above fails.
+- [ ] These keep invariants 7, 2 and 5: no byte of a tail is written twice, a line a write call
+      left cut gets its tail whether an `OSError`, another `Exception` or a `BaseException`
+      followed the call, the torn event of a run that ends on the tearing round is counted once
+      and in one term, a `BaseException` moves no counter, and a close releases the descriptor
+      once even when the tail fails.
 
 ### FR-003: `RotatingFileSink` keeps both rules across a rotation
 
@@ -348,9 +381,9 @@ tests. The ordering is guarded by the first and second criteria below.
       un-rotated file, and SPEC-048 FR-006's tests in `tests/test_sinks_file.py` pass (`_stream`
       keeps its name). The write-before-rotate ordering is guarded by this FR's first and second
       criteria: a build that rotates before writing the staged lines fails one of them.
-      `test_a_failed_flush_still_leaves_every_event_on_disk` is re-aimed at the binary handle, or
-      reworded for what it still proves, and its docstring no longer names it as the ordering's
-      guard.
+      `test_a_failed_flush_still_leaves_every_event_on_disk` stays, with its double adapted to the
+      binary handle and its docstring reworded for what it still proves, and is not named as the
+      ordering's guard.
 - [ ] These keep invariants 7 and 2 across a rotation.
 
 ### FR-004: The file sinks count once per run, retry what a resend can cure, and keep 1.x's `emit`
@@ -377,9 +410,12 @@ worker resent them on every raise.
 
 A round that lost events registers its line as SPEC-074's sinks do, through `_rounds.Lost` with
 `raised_line`: `When.LAST` for a retryable error and `When.ALWAYS` otherwise, naming the sink's
-class, the round's exception type and, as SPEC-069's line did, `errno=N`. The engine and the
-worker's abandon line add nothing to it. **The line's text changes.** Through `raised_line` its
-detail reads `<Class>, N attempt(s), <Type> errno=N`, where 1.x wrote `<Class>, <Type> errno=N`.
+class, the round's exception type and, as SPEC-069's line did, `errno=N` when the exception
+carries one. The engine and the worker's abandon line add nothing to it. **The line's text
+changes.** Through `raised_line` its detail reads `<Class>, N attempt(s), <Type> errno=N`, where
+1.x wrote `<Class>, <Type> errno=N`. The `errno=N` appears only when the exception carries an
+integer `errno`: the detail is `FileSink, 1 attempt(s), TypeError` for a `TypeError`, and
+`FileSink, 1 attempt(s), OSError` for an `OSError` with none.
 
 The inline `emit` keeps SPEC-069's promise that no `except` clause changes. When a run fails, it
 raises the dual-typed error that `_driver_error.delivery_error` builds from the exception of the
@@ -419,8 +455,8 @@ refusal on its first attempt only.
       exception that is an instance of both `ValueError` and `SinkDeliveryError`.
 - [ ] Through the worker with `max_retries=3`, a handle that raises `TypeError` on every write gets
       exactly one `deliver` call and no backoff wait. `losses()` and `failed_batches` equal what a
-      run exhausted on `ENOSPC` leaves for the same batch, and the sink's one line says
-      `1 attempt(s)` and names `TypeError`.
+      run exhausted on `ENOSPC` leaves for the same batch, and the sink's one line ends
+      `FileSink, 1 attempt(s), TypeError`.
 - [ ] `losses()` is `None` after a batch that lands whole. After a settled run with `d` unencodable
       events and `f` events lost, it is `SinkLosses(dropped=d, failed=f)`. After a failed run of `n`
       events of which `u` were unencodable, it is `SinkLosses(dropped=0, failed=n)`, so
@@ -438,7 +474,8 @@ refusal on its first attempt only.
 - [ ] A round lost to `ENOSPC` registers exactly one line through `Lost`, naming the sink's class,
       `OSError` and `errno=28` and no event data. It is written once per run, on the last round. For
       an inline `FileSink.emit` of two events it reads
-      `log-foundry: lost 2 event(s); FileSink, 1 attempt(s), OSError errno=28`.
+      `log-foundry: lost 2 event(s); FileSink, 1 attempt(s), OSError errno=28`, and for an
+      `OSError` with no `errno` it ends `FileSink, 1 attempt(s), OSError`.
 - [ ] The worker, the orphan path and the inline adapter all reach `deliver`, held by
       `tests/test_delivery_paths.py`'s pattern. `tests/test_engine_sinks_roster.py` finds both sinks,
       with its floor raised from 13 to 15.
@@ -489,7 +526,17 @@ class _Tail:
 # In the run's notes (RunContext.notes(sink)), never on the sink:
 #   the torn occurrence's position in the run, and the _Tail object cut from it, compared by
 #   identity to sink._tail to learn whether it is still pending.
+
+# The reference form for storing a write call's count (FR-002). `counts` is a list that exists
+# before the call, and the append happens inside C, so no bytecode boundary falls between the
+# write returning and its count being stored:
+counts.extend(map(self._stream.write, (chunk,)))
+# The form FR-002 rules out, where a signal handler can raise before the store:
+#   wrote = self._stream.write(chunk)
 ```
+
+That no bytecode boundary falls inside the reference form is a property of CPython, not of the
+language, so FR-002's FIFO criterion and its mutation pin it on every Python version CI runs.
 
 ## API / Interface Contract
 
@@ -539,8 +586,8 @@ tests/
 ├── test_run_context.py                # raise_on_failure, its precedence and its rewind
 ├── test_final_refusal.py              # the file sinks join the engine cases; two 1.x-loop guards
 │                                      #   move to SQLiteSink (FR-004)
-├── test_sinks_file.py                 # no stream-double change; the FR-006 flush test re-aimed
-│                                      #   or reworded (FR-003)
+├── test_sinks_file.py                 # the FR-006 flush test's double adapted and its docstring
+│                                      #   reworded (FR-003); nothing else changes
 ├── test_sinks_encode.py               # through the rig; the frozen surface gains the engine names
 ├── test_sink_concurrency.py           # the deliver and emit locker sets
 ├── test_sink_post_close.py            # the file sinks move to the engine's closed population
@@ -593,7 +640,7 @@ that raises fails at once naming the original exception.
   entry:
   - *A sink's own driver error is counted, announced and raised as both types*: the file sinks'
     accepted edge is resolved, and the dual type is kept on the inline `emit` of a run that landed
-    nothing;
+    nothing, where it is now built for any `Exception` the handle raises, not only an `OSError`;
   - *A sink that delivered nothing raises; one that delivered something reports*: its SPEC-069
     sentence on the file sinks;
   - *A raising `emit` counts nothing*: the file sinks' immediate `_failed` leaves the allowlist it
@@ -601,9 +648,11 @@ that raises fails at once naming the original exception.
   - *An event a sink cannot encode costs only itself…*: the closing sentence of its *Do NOT*
     paragraph, on a stream or file that fails partway through a batch, is reworded, since the file
     sinks no longer leave that duplicate and the stream sinks still do;
-  - *A refusal no retry can cure…*: a History entry for FR-004's closed file-sink subclass and the
-    two guards moved to `SQLiteSink`;
-  - *A sink declares what it retries…*: a History entry for the file sinks' `errno` set.
+  - *A sink declares what it retries, and anything else fails at once*: its fence and its body
+    both say every predicate also accepts builtin `ConnectionError` and `TimeoutError`. The file
+    sinks' `errno` predicate accepts neither, so both sentences are rewritten for that;
+  - *A refusal no retry can cure…*: a History entry only, for FR-004's closed file-sink subclass
+    and the two guards moved to `SQLiteSink`.
 - The pipeline decision *A value the child inherits is stranded, never merely detached*
   (`docs/decisions/pipeline/`), rewritten in place with a dated History entry: the `dup2` step is
   retired for the file sinks.
@@ -632,8 +681,8 @@ that raises fails at once naming the original exception.
   - `failed` counts once per run;
   - a non-retryable `errno` costs one attempt;
   - a closed file-sink subclass that inherits `emit` is not resent (FR-004);
-  - the loss line reads `<Class>, N attempt(s), <Type> errno=N` where 1.x wrote
-    `<Class>, <Type> errno=N` (FR-004);
+  - the loss line reads `<Class>, N attempt(s), <Type>` where 1.x wrote `<Class>, <Type>`, each
+    followed by `errno=N` only when the exception carries one (FR-004);
   - a non-text codec is refused at construction.
 
 ---
@@ -761,3 +810,48 @@ that raises fails at once naming the original exception.
     stream-double change. Phase 4 gained the records that still state a claim this spec changes,
     one new decision file for this spec's fences, three caller-visible changes, and where the
     release notes go while no pending file exists.
+- **2026-11-14, review of the revision.** The spec review of the entry above replaced one
+  mechanism and corrected what was written around it:
+  - *FR-002's `BaseException` requirement: the offset guard is replaced.* Three measurements
+    retired it. It was skipped on a handle that cannot seek, and a FIFO is the one handle on which
+    an interrupt really cuts a line: a blocking write to a pipe is cut short by a signal and returns
+    a partial count. With the guard skipped, 101 of 109 and 118 of 123 real interrupts left a line
+    that does not parse (the reviewer's figures, as are the next two; the prototype was not re-run
+    for this entry). "The descriptor's end-of-file offset" also named two quantities, and the
+    descriptor's own offset is wrong whenever another descriptor appended between two of the sink's
+    sections, which is FR-005's supported case: a tail of 1 byte was recorded where 52 were owed.
+    And the difference had no lower bound. The requirement is now that a write call's count is
+    stored with no bytecode boundary before the store, and that one idempotent step brings the
+    sink's state to the stored counts, running on the exception path too. With the reference form
+    in *Data Model* the stored count was exact in 40 of 40 interrupts on Python 3.12.12 and on
+    3.13.1, where a Python-level store was short in 40 of 40 (re-run for this entry on 3.13.1 only,
+    with the same result). The cannot-seek exemption and the cross-process corner went with the
+    guard. One limit is stated in their place: a second exception landing while the step runs for
+    the first is not covered.
+  - *The sentence about 1.x.* "1.x's `BufferedWriter` did not have this exposure" is true only on
+    a regular file, where a write is taken whole and no line is cut either way. On a FIFO 1.x left
+    the same cut line: 97 of 103 and 100 of 106 interrupts at the review, 99 of 116 and 110 of 120
+    when re-run for this entry. So the requirement hardens a pipe beyond 1.x and makes a regular
+    file's bookkeeping exact (one byte order mark, a true `_size`). It repairs no regression.
+  - *The `BaseException` criteria.* A Python-level double that writes and then raises in place of
+    returning cannot exercise a store made in C, and a real `io.FileIO.write` never behaves that
+    way, so that shape is dropped. The criteria now use a real FIFO and a real signal, a double
+    whose returned count raises at its first use, an interrupt before any byte is taken, and the
+    mutation that proves the FIFO criterion is live.
+  - *FR-001's `Exception` rule.* An exception a signal handler raises (the `signal.alarm` idiom's
+    `TimeoutError`) lands in the same window as a `KeyboardInterrupt`, so FR-001 now says the rule
+    rests on FR-002's stored count. FR-001 also records the residue no design closed: a handler's
+    exception raised after the write section has finished and before `emit` returns reaches a
+    retrying caller with the batch on disk. It duplicated 7 to 13 batches in 400 rounds under
+    every variant measured and on 1.x (12 and 13 on 1.x when re-run for this entry).
+  - *The loss line.* `errno=N` appears only when the exception carries one, which FR-004, its
+    criteria and Phase 4's caller-visible list now say.
+  - *Phase 4.* *A sink declares what it retries, and anything else fails at once* is rewritten in
+    place, not given a History entry only, because its fence and body say every predicate accepts
+    builtin `ConnectionError` and `TimeoutError` and the file sinks' accepts neither. *A sink's own
+    driver error…* also records that the dual type is built for any `Exception` the handle raises.
+  - *Smaller shapes.* "Inside an engine run" names `RunContext._in_run()`. FR-003's sixth criterion
+    lost its either/or. The *In Scope* bullet and FR-002's title say no more than the mechanism
+    gives: the state follows the counts the write calls returned, and it is the library that never
+    resends a torn line whole. The Overview and the frontmatter `description` say that a one-round
+    run counts the events after a failure and does not resend them.
