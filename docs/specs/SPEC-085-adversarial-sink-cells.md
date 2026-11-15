@@ -96,11 +96,13 @@ makes a traced call and then waits.
 the value is stored, in `emit` after the write is counted and the events kept, in `close` after
 the entry count is recorded and before the return count. The setter is called on every
 assignment, `None` included; a cell's script runs on the first visit to the cell's site and
-never again. A thread inside a script starts no second script. No personality holds a lock of
-its own while a script, a wait or a fork runs.
+never again. A thread inside a script starts no second script: its visit returns without asking
+the `script` hook, so no answer is drawn and discarded during a script. No personality holds a
+lock of its own while a script, a wait or a fork runs.
 
 **Who decides what runs at a visit.** A personality does not hold a script. It is built with
-two **hooks** and asks them: `script(sink, site)` at every visit to a site, which returns the
+two **hooks** and asks them: `script(sink, site)` at every visit to a site by a thread not
+already inside a script, which returns the
 script to run there or `None`, and `new_sink()` for the sink a script's `configure` installs. A
 `forker` asks the same `script` hook and forks when it answers `("fork",)`; a `factory`'s
 callable asks it at every build; a `waiter` takes its hold as a constructor argument and is
@@ -147,13 +149,14 @@ reports where its two events landed, what it closed and its state.
 
 - [ ] The four personalities exist in `tests/model_sinks.py` with the behaviours above, and each
       script, wait and fork runs with no lock of the personality's own held.
-- [ ] A personality asks its `script` hook at every visit to a site and its `new_sink` hook for
+- [ ] A personality asks its `script` hook at every visit to a site by a thread not already
+      inside a script, and its `new_sink` hook for
       every sink a script's `configure` installs; a test drives one `reentrant` sink with hooks
       that answer on the second visit and asserts the script ran then and not on the first.
 - [ ] The cell table is generated from the tables above and holds exactly 637 cells: 504, 112, 9
       and 12; a test asserts those four numbers as literals.
-- [ ] Every cell is one test item whose id is `personality-site-path-script`, with a two-operation
-      script joined by `+`, and can be selected by that id and run alone.
+- [ ] Every **scheduled** cell is one test item whose id is `personality-site-path-script`, with
+      a two-operation script joined by `+`, and can be selected by that id and run alone.
 - [ ] Every cell follows the one procedure above, on the orphan path and on the worker path, so
       one script is judged on both delivery paths (invariant 6).
 - [ ] A cell whose site was never reached fails as `NotExercised`, so a cell cannot pass by doing
@@ -363,8 +366,9 @@ under `### Open` in `docs/architecture.md` §12. A pinned cell runs, and is repo
 expected failure only when its verdict equals its pin's; a pass, or any other verdict, fails the
 suite. A pin on a one-operation script also **withholds** every longer script that contains it
 at the same personality, site and path, and may name one sibling operation, the same defect in a
-form the time oracle cannot see, whose scripts are withheld too. A withheld cell is not run: it
-is the pinned defect again, and each costs seconds of waiting. Everything a pin withholds is
+form the time oracle cannot see, whose scripts are withheld too. A withheld cell is not run, and
+is not collected as a test item, neither run nor skipped: it is the pinned defect again, and each
+costs seconds of waiting. Everything a pin withholds is
 computed from the pin, so deleting the pin brings it back.
 
 | Pin | Pinned cells | Verdict | Withheld | Item |
@@ -388,8 +392,10 @@ after the close, and the sink is owed nothing. The test
 `test_an_orphan_log_parked_after_its_owed_check_writes_after_the_close`, in a child, installs a
 recorder, logs once outside a span, patches `log_foundry.api._note_orphan_emit` (the name
 `api.py` imports and calls) to call the real function and then park on an event, starts a thread
-whose `info()` parks there, calls `shutdown()`, releases and joins the thread, runs the exit
-drain and applies the released rule. It is the pin's strict expected failure.
+whose `info()` parks there, waits until that thread has reached the park, calls `shutdown()`,
+releases and joins the thread, runs the exit drain and applies the released rule. It is the
+pin's strict expected failure. Its unparked control joins its thread before calling
+`shutdown()`.
 
 **A mutant the close oracle must kill.** The repeat-close rule guards a fixed class of defect,
 so it is run against one. In `_lifecycle._swap_sink`, in the section that decides what a swap
@@ -453,7 +459,7 @@ which is the `drain-flush` pin's item.
       suite.
 - [ ] Every one of the 442 cells passes on the branch, and the six local gates are green.
 - [ ] A test asserts every pinned cell is a member of the generated table, every pin's
-      reproduction is a test function of the cells file, and every pin's item is the bold lead
+      reproduction names a test function of the cells file, and every pin's item is the bold lead
       of a bullet between `### Open` and `### Resolved` in `docs/architecture.md`.
 - [ ] The withheld set is computed from `PINS` alone; a test asserts that with `PINS` emptied
       nothing is withheld and all 637 cells are scheduled.
@@ -462,8 +468,10 @@ which is the `drain-flush` pin's item.
 - [ ] Against a tree exported from the branch head with the `_swap_sink` mutant above as its only
       change, each of the eight named `reentrant` `emit`/`worker` cells has a
       `CloseBroken:repeat@<count>` signature in its verdict;
-      against the unmutated export the same run reads 442 passed and 20 expected failures; the
-      delivery doc records both counts and that `log_foundry.__file__` was under each export.
+      against the unmutated export the cells test, `test_model_cells.py::test_cell`, reads 442
+      passed and 20 expected failures, and the reproduction and its control in the same file add
+      one expected failure and one pass; the delivery doc records both counts and that
+      `log_foundry.__file__` was under each export.
 - [ ] The reproduction test fails as `CloseBroken:unreleased@1` on every run at the branch head,
       and the same body without the park passes.
 - [ ] `docs/architecture.md` §12 gains items (a) to (d) with the leads above, and the drain-thread
@@ -492,8 +500,10 @@ A class alone is not a reason, since any hang is a `HangFound`, so each row name
 | #345, `83550f01` | `144f87c8` | `factory-factory-orphan-span+flush-none`, `factory-factory-orphan-span+shutdown-none` | `HangFound:flush-none@worker.flush`, `HangFound:shutdown-none@worker.stop` | a `log-foundry-worker` thread's stack is inside `sinks/_factory.py`: the drain thread is waiting on the build the factory is running |
 
 **How, without rewriting history.** `git archive <parent> | tar -x -C <scratch>` exports the
-parent's whole tree; the model files (*File & Folder Structure*) are copied over its `tests/`;
-the named cells are run from that directory. This repo has been caught by an editable install
+parent's whole tree; the four new files a run there imports, `model_oracles.py`,
+`model_sinks.py`, `model_pins.py` and `test_model_cells.py`, are copied over its `tests/`, and
+`tests/conftest.py` is not, because the head's version writes state the parents lack; the named
+cells are run from that directory. This repo has been caught by an editable install
 resolving a copied tree back to the original and every mutant "passing", so every cell's report
 carries `log_foundry.__file__` and a run is void unless that path is under the scratch
 directory. The model files import from `tests/` only `run_in_child` and `_child_pipe`, which
@@ -610,10 +620,10 @@ class Pin:
     verdict: Verdict
     item: str                    # the bold lead of a §12 Open bullet
     sibling: str | None = None   # an operation whose scripts are withheld with the pinned one
-    reproduction: Callable[[], None] | None = None
+    reproduction: str | None = None   # a test function's name in test_model_cells.py
 
 class Hooks(Protocol):
-    def script(self, sink: object, site: str) -> tuple[str, ...] | None: ...   # asked at every visit
+    def script(self, sink: object, site: str) -> tuple[str, ...] | None: ...   # not asked mid-script
     def new_sink(self) -> object: ...                 # the sink a script's `configure` installs
 
 PINS: tuple[Pin, ...]
@@ -706,3 +716,7 @@ build re-measures it, and FR-004 says what happens when a number has moved.
   speak of passing cells; the child's timeout, the hooks the next spec drives, the abandoned
   term's observable, a nested child's ending and the verdict keys' numbers are stated; and the
   #341 row asserts the innermost frame per operation.
+- **2026-11-15, revised in place after the plan review.** States five readings the plan builds:
+  only scheduled cells are test items, a pin's reproduction is a test name, the four files FR-005
+  copies to a parent, which test the 442 and 20 count, and that a visit inside a script asks no
+  hook; and fixes the reproduction's ordering and its control's.
