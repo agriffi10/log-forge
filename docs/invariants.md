@@ -115,7 +115,11 @@ writes the rest of its line and it may land; its line says it may have landed. A
 a round left `RETRYABLE` is counted when the worker then declines the run, or the sink is closed
 during the backoff, and if nothing else landed it is in `failed_batches` too, the bound for a
 failed run stated below; in both cases `close()` or the next section finishes the line, and
-nothing is written twice. ~~The SQS and SNS sender faults and a failure the retry predicate
+nothing is written twice. The stream sinks joined the engine with SPEC-084: they counted no
+`failed` in 1.x, and now each event that did not land is in `failed` once per run. A line handed to
+the stream before it raised is reported `UNKNOWN`, or `REJECTED` while the sink's fault latch is
+set, and counted though the stream may still write it, so it joins the same upper bound; its line
+says it may have landed. ~~The SQS and SNS sender faults and a failure the retry predicate
 refuses, counted before `emit` raised (SPEC-070)~~ — superseded by SPEC-074: those sinks are on the
 engine, where each lost event lands in `failed` once per run. The HTTP family's `failed` lands once per batch since SPEC-073: it
 is registered on the run context and committed when the run ends, once per request refused for
@@ -184,7 +188,8 @@ SPEC-074), `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_childre
 ledger against the bare sink's over real HTTP, SQS and NATS sinks, and an engine child's counts
 under `MultiSink`, SPEC-075), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
 `tests/test_file_sink_deliver.py` (the file sinks' counts once per run, the torn event's
-`UNKNOWN` and the declined-run residue, SPEC-082);
+`UNKNOWN` and the declined-run residue, SPEC-082); `tests/test_stream_sink_deliver.py` (the stream
+sinks' counts once per run, a handed line's `UNKNOWN` or latched `REJECTED`, SPEC-084);
 `tests/test_invariants_model.py` is the identity itself, for an `emit` sink, for a `deliver` sink,
 holding each term to its exact share, and for an `HTTPSink` behind a scripted opener;
 `tests/test_model_cells.py` that both ledger identities balance, with a batch the worker abandoned
@@ -472,11 +477,12 @@ accepted, its events counted in `failed_events` and resent only by a sink that d
 a run of nothing but `DROPPED` events, counted in `dropped_events`, and a run of nothing but
 `SKIPPED` events, a deliberate non-send the engine counts nowhere. An exception escaping `deliver`
 is not this exception: no response is in hand, so its round's events fail the run.
-A second recorded exception, separate from the may-have-landed ones above: a stream write
-that fails partway can land events twice, accepted for 1.2.0 (Andrew's ruling, 2026-11-13). A
-`StdoutSink` or `StderrSink` stream that raises after it took earlier lines of the batch leaves
-them there and raises, and the worker's retry writes the whole batch again, so a fault that
-clears between the attempts duplicates the batch's lines, up to all of them. ~~A `FileSink` or
+A second recorded exception, separate from the may-have-landed ones above: a write that fails
+partway. ~~A stream write that fails partway can land events twice, accepted for 1.2.0 (Andrew's
+ruling, 2026-11-13). A `StdoutSink` or `StderrSink` stream that raises after it took earlier lines
+of the batch leaves them there and raises, and the worker's retry writes the whole batch again,
+so a fault that clears between the attempts duplicates the batch's lines, up to all of them.~~ —
+superseded by SPEC-084, below. ~~A `FileSink` or
 `RotatingFileSink` write did the same (69 to 200 of a 200-event batch, measured at `a8e91fac`
 with the file size capped, and at some caps one unparseable line where a partly written line was
 glued to the retry's first)~~ — superseded by SPEC-082: the file sinks offer `deliver` and report
@@ -487,7 +493,40 @@ child: the events after a failure are counted in `failed` and not written, where
 deliver them with duplicates. The measurement and the rejected remedies are in *A sink's own
 driver error is counted, announced and raised as both types*, the closure in *A file write
 reports each event by the bytes taken, and a torn line is finished once*
-(`docs/decisions/sink-delivery/`); the stream sinks' closure is SPEC-084.
+(`docs/decisions/sink-delivery/`).
+**The stream sinks since SPEC-084** offer `deliver` and report each event by which call the
+stream raised in: a round flushes first, hands the stream one `write` per line, then flushes
+once. A line the sink handed is never handed again: it is `UNKNOWN`, counted and announced as one
+that may have landed, because after a raise the stream does not say whether it kept or dropped
+what it had not yet written. A line not handed is resent only when the sink's `errno` predicate
+says a resend can cure the error. A raise that is not an `OSError` took nothing, since the `io`
+contract raises `ValueError` for a closed stream before any I/O, so a closed `StringIO` fails
+every batch rather than settling it. On the exact shape `python -u` gives `sys.stdout`, a `write`
+that returned landed and one that raised took nothing. **The fault latch is the NATS case above
+in another sink:** once a round leaves a handed line `UNKNOWN`, later rounds call such lines
+`REJECTED` until a round's final flush returns. So a stream that keeps nothing after a fault, such
+as a dead pipe block-buffered at 4096 or 8192 bytes, fails every batch after the one that
+straddles the fault's onset, and only that one is counted rather than raised. Measured at
+`864d71e5`, with the file size capped partway through a 200-event batch and lifted before the next
+round: 1.x wrote 43 to 200 of the 200 events twice, and the spec's prototype of the round wrote
+none twice at any of six caps, block- or line-buffered. Seven residues stay, because the sink
+cannot see inside a stream it does not own. (1) A stream that discards the unwritten tail of a
+line it cut leaves a torn prefix, which the next line joins into one unparseable line: at the
+block-buffered 10,500 and 12,000-byte caps, and three times in one run on a non-blocking stream.
+(2) A short write on the unbuffered shape tears a line that is called `ACCEPTED`, at every cap
+the review's prototype tried, as in 1.x. (3) The batch during which a fault begins settles, and
+every later batch fails; a buffered stream handed at least one line before the raise in every
+sustained-fault configuration probed. (4) While the latch is set, a line a partial write did land
+is reported `REJECTED`, an over-count within invariant 2's bound. (5) A latched run that fails
+hands those lines to a catcher that resends whole: a `MultiSink` whose every child raised, a
+subclass that overrides `emit`, or a caller's own retry. That duplicates a line only when a
+partial write landed it during the fault and the fault clears before the resend; probed through
+an `emit` override, two lines landed twice, and none with the latch never set. (6) Another
+writer's fault on the same stream can make the text layer drop this sink's pending lines, which
+its returned flush then calls `ACCEPTED`: 67 lines in the review's probe, as in 1.x. (7) A forked
+child's flush writes the parent's kept bytes too (`architecture.md`'s fork-hazard paragraph). The
+closure is *A stream sink reports what the stream took and never resends it*
+(`docs/decisions/sink-delivery/`).
 *Guarded:* `tests/test_sink_losses.py` (a roster over the remote transports), the per-sink tests,
 `tests/test_sinks_encode.py` (an all-unencodable batch settles on every record-building sink,
 SPEC-069), `tests/test_classify.py` and `tests/test_sinks_sns.py` (a batch lost only to sender
@@ -509,7 +548,11 @@ resend, and every closed-guard section refuses through `final_refusal`), and
 `tests/test_file_sink_partial_write.py` and `tests/test_file_sink_interrupt.py` (a file write
 that fails partway: each event by the bytes taken, the tail before anything else, no event twice
 through the worker, `MultiSink`, an inline `emit` and a direct `deliver`, under a real file-size
-limit and a real signal on a pipe, SPEC-082).
+limit and a real signal on a pipe, SPEC-082), and `tests/test_stream_sink_deliver.py` and
+`tests/test_stream_sink_partial_write.py` (a stream that raises partway: each event by which call
+raised, no handed line resent, a closed stream and a sustained fault raising from the second
+batch, no event twice under a real file-size limit in three buffering modes, and a dead pipe,
+SPEC-084).
 
 ## 8. An event is safe by construction, once, at assembly
 

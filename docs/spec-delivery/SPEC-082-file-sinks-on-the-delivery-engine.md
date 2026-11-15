@@ -114,50 +114,9 @@ Each figure is the wall-clock median of 100 runs; pairs alternate which side run
 
 The median of the nine ratios is 1.49, against a bound of 2.0.
 
-## Release notes owed
+## Release notes
 
-No pending file existed in `docs/release-notes/` on `main` when this spec completed, so the
-caller-visible changes are recorded here for the release after 1.2.0:
-
-- A `FileSink` or `RotatingFileSink` write that fails partway returns where it raised. What did
-  not land is counted in `losses().failed`; through the worker it is resent, and only it.
-- On a run of one round, an inline `emit` or a `MultiSink` child, a partial write loses the rest
-  of that batch, counted. 1.x could deliver it, with the head of the batch on disk twice.
-- `failed` counts each lost event once per run, not once per worker attempt.
-- An error no resend cures (`EACCES`, `EPERM`, `EROFS`, an `OSError` with no `errno`, any
-  exception that is not an `OSError`) costs one attempt. 1.x's worker resent on every raise.
-- A closed file-sink subclass that inherits `emit` is not resent, even if it would re-open
-  itself. A subclass that wants the resend overrides `emit`.
-- The loss line reads `<Class>, N attempt(s), <Type>` where 1.x wrote `<Class>, <Type>`, each
-  followed by `errno=N` only when the exception carries one. An event whose line a write cut
-  partway, and which the run will not offer again, is on a line of its own that ends
-  `; outcome unknown; they may have landed`, since the next write finishes its line; it is still
-  counted in `failed`.
-- A codec that is not a text encoding is refused at construction, now before any file is
-  created.
-- Both sinks gain `deliver`, `log_foundry_counters` and `log_foundry_stop_signal`.
-- `FileSink(fifo, encoding="utf-8-sig")` no longer writes a byte order mark into a pipe. 1.x
-  wrote one on every open, a second open of the same FIFO included. `utf-16` and `utf-32` wrote
-  none into a pipe and write none now.
-- A third-party wrapper whose `emit` calls the file sink's `emit` is a one-round caller too,
-  with the inline `emit` and a `MultiSink` child. When a write lands part of a batch, the rest
-  is lost and counted, and `emit` returns. The count shows in the file sink's own `losses()`
-  and in its `lost N event(s); FileSink, 1 attempt(s), OSError errno=N` line, with the torn
-  event on a line of its own that says it may have landed, and nowhere the worker reads:
-  `flush()` returns true, `failed_batches` stays 0, and `health().sink` stays `None` for a
-  wrapper that offers no `losses()`. In 1.x the raise reached the worker through
-  the wrapper, and its resend put the head of the batch on disk twice.
-- An orphan log, one written outside any span, that a file sink lands nothing of is announced by
-  the engine's line. The sink writes `lost 1 event(s); FileSink, 1 attempt(s), OSError errno=N`
-  and the orphan path then writes
-  `lost 1 event(s); orphan log not delivered after 1 delivery round(s)`. In 1.x, for the same
-  `ENOSPC`, the sink's line had no `1 attempt(s),` and the second line was
-  `absorbed a failure while emitting an orphan log (OSError); the event was lost`. `orphan_lost`
-  and `losses()` count the same as before.
-- For the `iso2022_*` codecs, a file sink appending to a non-empty file no longer writes the
-  three bytes `ESC ( B` ahead of its first line, which 1.x's text stream wrote there. Into a
-  regular file, every other codec the sweep above covered, and these codecs into an empty file,
-  get the bytes 1.x wrote.
+The caller-visible changes are in `docs/release-notes/v1.2.1.md`, under *Changed*.
 
 ## Verification
 

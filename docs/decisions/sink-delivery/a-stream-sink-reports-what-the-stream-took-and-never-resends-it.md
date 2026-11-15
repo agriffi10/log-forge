@@ -1,0 +1,35 @@
+---
+type: Decision
+title: "A stream sink reports what the stream took and never resends it"
+description: "`StdoutSink` and `StderrSink` pre-flush each round, hand the stream one `write` per line and flush once, and judge each event by which call raised. A line handed to the stream is `UNKNOWN` and never handed again; a raise that is not an `OSError` took nothing; the exact unbuffered shape is read by type; and a fault latch fails every batch after the one a sustained fault began in. Do NOT flush per line, write a guard newline, or read what the stream holds. (SPEC-084)"
+---
+
+**A stream sink can see only which lines it handed.** It writes to a `TextIO` that the caller or the process owns, with no descriptor of its own, so it cannot count bytes the way the file sinks do (*A file write reports each event by the bytes taken, and a torn line is finished once*). A `write` that returned means only that the stream took the line. After a raise, CPython's text stream sometimes keeps the unwritten bytes and writes them at its next flush, and sometimes discards them, and it never says which. A line-buffered stream at a 10,500-byte cap kept the 60-byte tail of a cut line and finished it on the next flush. So a handed line is `UNKNOWN`. It is counted in `failed` as the upper bound and announced on a line ending `; outcome unknown; they may have landed`, and the engine never resends it, since neither sink declares `log_foundry_idempotent`. A line the sink did not hand is `RETRYABLE` when the `errno` predicate says a resend can cure the error, and `REJECTED` otherwise. In 1.2.0 the worker resent the whole batch. Measured at `864d71e5`, with a file-size cap partway through a 200-event batch and lifted before the next round, that resend wrote 43 to 200 of the 200 events twice. The round wrote none twice at any of six caps, block- or line-buffered.
+
+**The round runs a pre-flush, one `write` per line, and one final `flush()`.** A stream still holding bytes from an earlier fault raises at the pre-flush, before anything of this round is handed, so this round's lines stay resendable rather than ambiguous. The pre-flush cost 1.043 ms against 1.020 ms per 1,000-event batch into a file. A raising pre-flush handed nothing. An `OSError` from the `write` of line `i` may have taken part or all of that line, so lines up to and including `i` are handed. A raising final flush leaves every line handed.
+
+**Two cases are exact rather than unknown.** First, a raise that is not an `OSError` took nothing. The `io` contract raises `ValueError` for a closed or detached stream before any I/O, and an encoding error is raised before the text reaches the binary layer. Without this rule, a closed `StringIO`, whose `flush()` returns and whose `write` raises, made line 1 `UNKNOWN` and settled every batch. Second, there is the shape `python -u` and `PYTHONUNBUFFERED=1` give `sys.stdout`: `type(stream) is io.TextIOWrapper`, `write_through` true, and `type(stream.buffer) is io.FileIO`. On that shape each `write` is one `write(2)`, so a `write` that returned is `ACCEPTED` and one that raised took nothing. The types are compared exactly, so no caller code runs, and a subclass gets the general rule. The check is read only after a raise, so a clean round pays nothing.
+
+**The fault latch makes a sustained fault fail.** A stream that keeps nothing after a fault passes every pre-flush. A pipe whose reader has gone, block-buffered at `buffer_size=4096` or `8192`, raised at a `write` on every round and kept nothing, so under the general rule every batch settled `UNKNOWN` and none ever raised. CPython sizes a pipe's buffer from `st_blksize`, which is 4096 on Linux. So the sink holds one plain `bool`, `_faulted`. A round sets it when it leaves a handed line `UNKNOWN`, and clears it when its final flush returns. While it is set, a handed line is `REJECTED` instead, still never resent, and a run in which nothing else landed fails. The inline `emit` then raises the stream's own class and `SinkDeliveryError`, and the worker moves `failed_batches`. This is the shape `NATSSink` already has under invariant 7: only the batch that straddles a fault's onset is counted rather than raised. The latch was chosen over another shape rule because the spec review and then the build review each found the same class of defect, first `python -u` and then the dead pipe and the closed `StringIO`, and one mechanism answers the class. It has two costs. A line a partial write did land is reported `REJECTED` while the latch is set. And a latched run that fails hands those lines to any catcher that resends whole: a `MultiSink` whose every child raised, a subclass that overrides `emit`, or a caller's own retry.
+
+**Rejected.** *Flushing per line* would narrow a fault's `UNKNOWN` lines to one. It cost 2.725 ms against 1.020 ms per 1,000-event batch into a file, and 1.999 ms against 0.961 ms into `/dev/null`, so the default sink would run two to three times slower on every batch to buy precision on a fault path. *A guard newline after a raise* would end a possibly torn prefix. But the sink cannot tell a kept tail from a discarded one, and in every line-buffered case measured it would write a blank line into a stream the sink does not own, while the torn prefix would still not parse. *Reading what the stream holds*, such as a buffer's contents or a byte count, is rejected because even CPython's buffered layers do not say whether a raise kept or dropped bytes. The sink reads only `write_through` and `buffer`, and only on exact CPython types. *A transport lock, a closed guard, a fork hook and a `max_retries`* are rejected for the reasons SPEC-028, SPEC-032 and SPEC-084 give: the sinks release nothing and own no buffer, and the inline `emit` stays one round, as 1.x's was one call.
+
+**What stays open** is invariant 7's seven residues, because the sink cannot see inside a stream it does not own:
+
+- a torn prefix that the next line joins;
+- a short write on the unbuffered shape;
+- the straddling batch;
+- the latch's over-count;
+- the latch's hand-off to a whole-batch catcher;
+- another writer's fault making this sink's dropped lines read `ACCEPTED`;
+- a fork's shared buffer.
+
+**Do NOT** resend a line the stream was handed; do NOT flush per line; do NOT write a guard newline; do NOT read a stream's buffer or byte counts; do NOT match the unbuffered shape with `isinstance`; do NOT read `RunContext.last` to decide an outcome; do NOT declare either stream sink idempotent. (SPEC-084)
+
+## History
+
+### 2026-11-15
+
+- **Settled** by SPEC-084, which closed the partial-write edge that 1.2.0 recorded as an exception
+  to invariant 7 for the stream sinks, as SPEC-082 closed it for the file sinks. The latched
+  group's line ending, `; after an earlier fault; they may have landed`, was chosen in the build.
