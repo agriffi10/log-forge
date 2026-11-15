@@ -37,6 +37,8 @@ targets the first release after 1.2.0.
   count the write calls returned.
 - A torn line: the unwritten remainder of a line a write cut partway, kept by the sink and written
   before anything else reaches that file.
+- A write call that raises something other than an `OSError`, and a `BaseException` passing
+  through a write section: in both, the sink's state follows the bytes taken (FR-001, FR-002).
 - `RotatingFileSink`'s rotation on the new write path, under SPEC-048 FR-006's flush-before-rotate
   rule.
 - A retry predicate for the file sinks, and the inline `emit` keeping SPEC-069's raise as both
@@ -72,6 +74,9 @@ targets the first release after 1.2.0.
   `flush()` returning meant. No `fsync` is added.
 - A `max_retries` on either file sink. The inline `emit` stays one round, as 1.x's `emit` was one
   call, and the worker's `max_retries` budgets the worker path, as it does today.
+- **Resending only the unlanded events of a `MultiSink` child.** A `MultiSink` child gets one
+  round inside the fan-out's `emit`, so the events after a tear are counted and not written
+  (FR-002). Resending only those needs `MultiSink` itself on `deliver`, which is not this spec.
 - `architecture.md` §12's item on a rotation that keeps failing being retried once per event.
 
 ---
@@ -85,23 +90,43 @@ targets the first release after 1.2.0.
 `FileSink` defines `deliver` as one round per call (`_engine.one_round`). A round encodes the
 round's events once per run (`_encode.encode_round`). It turns the encodable lines into bytes in
 batch order, writes them through an unbuffered binary handle (`open(path, "ab", buffering=0)`,
-still held as `_stream`) in a loop, and adds up what each write call returned. When a write raises
-`OSError` after `k` bytes of the round's own lines have been taken:
+still held as `_stream`) in a loop, and adds up what each write call returned. When an `Exception`
+is raised inside that loop after `k` bytes of the round's own lines have been taken:
 
 - an event whose line's last byte lies below byte `k` is `ACCEPTED`;
 - the event whose line has some bytes below `k` and some at or after it is the torn event (FR-002);
 - every later event is `RETRYABLE` or `REJECTED`, as the retry predicate (FR-004) answers for the
   error;
-- the torn event is `RETRYABLE` when the predicate retries the error and the round is not the run's
-  last (`RunContext.last`), and `UNKNOWN` otherwise (FR-002).
+- the torn event is `RETRYABLE` only when the predicate retries the error and the round is inside
+  an engine run and is not that run's last (`RunContext.last`). It is `UNKNOWN` otherwise, a direct
+  `deliver` outside any run included (FR-002). ~~`RETRYABLE` whenever the round is not the run's
+  last~~: superseded 2026-11-14 (*Revision history*).
 
 A round in which every write returned is `ACCEPTED` throughout.
 
+**A direct `deliver` outside an engine run never reports a torn event `RETRYABLE`.** There
+`RunContext.last` answers false, and the notes that say which occurrence was torn end with the
+call. A caller that resent a `RETRYABLE` torn event would see its tail written by the next call's
+section and then its whole line written again, which is the duplicate this spec closes. As
+`UNKNOWN` it is not resent, and the next section on the sink finishes its line.
+
+**The round handles any `Exception` raised inside its write loop, not only an `OSError` from a
+write call.** The bytes taken before it decide the outcomes and the tail exactly as for an
+`OSError`. The predicate answers false for it (FR-004), so the later events are `REJECTED` and a
+torn event is `UNKNOWN`. With `OSError` alone handled, a handle that took 9 bytes and then raised
+`ValueError` (or a `MemoryError` from slicing the remainder) under `MultiSink` left a cut line
+with no tail, and the worker's whole-batch resend glued the next line to it, which is the defect
+this spec closes. A `BaseException` that is not an `Exception` is FR-002's.
+
 **Encoding.** The construction refuses a codec that is not a text encoding with `LookupError`,
 as 1.x's `open()` did, so a codec such as `"base64"`, which the incremental encoder would accept,
-is never reached at write time. A byte order mark is written once, as the first bytes of the first
-line to reach an empty file. It belongs to that line's byte count and is still owed until a write
-call has taken it, so a round that fails before it lands writes it in a later round.
+is never reached at write time. A byte order mark is owed only when the handle is seekable and at
+offset 0 when it is opened, which is what 1.x's text stream wrote, and the same test is made when
+the handle is reopened after a fork (FR-005). An owed mark is written once, as the first bytes of
+the first line to reach the file. It belongs to that line's byte count and is still owed until a
+write call has taken it, so a round that fails before it lands writes it in a later round. A path
+that cannot seek is owed none: `FileSink(fifo, encoding="utf-16")` constructs and writes no mark,
+as 1.x did.
 
 The buffered text stream is retired because its state after a failure is not a statement of what
 landed. Measured at `c21755f1`, CPython's `BufferedWriter` sometimes kept the unwritten bytes and
@@ -116,14 +141,23 @@ returned `10500` and the next raised `EFBIG`.
 
 #### Acceptance Criteria:
 
-- [ ] With a handle double that takes `k` bytes of a round that is not the run's last and then
-      raises `OSError(ENOSPC)`, the verdict's outcome tuple equals the expected one at each of these
-      `k`:
+- [ ] Inside an engine run of more than one round, with a handle double that takes `k` bytes of a
+      round that is not the run's last and then raises `OSError(ENOSPC)`, the verdict's outcome
+      tuple equals the expected one at each of these `k`:
       - `k = 0`: every event `RETRYABLE`;
       - a byte inside the third line: the third event torn and `RETRYABLE`;
-      - the offset of the third line's newline: the third event torn with a one-byte tail;
+      - the offset of the third line's newline: the same outcome tuple as the case above, and the
+        pending tail is exactly one byte long;
       - the offset just past that newline: the third event `ACCEPTED`;
       - one byte short of the whole round.
+- [ ] A direct `deliver` outside any run, with a handle double that tears the first of three lines
+      under `ENOSPC`, reports `UNKNOWN, RETRYABLE, RETRYABLE`. A caller that then calls `deliver`
+      with the two `RETRYABLE` events leaves each of the three events on disk exactly once, with
+      every line parsing.
+- [ ] With a handle double that takes 9 bytes and then raises `ValueError`, a four-event batch
+      through a `MultiSink` and a real `Worker` leaves, once the next section on the sink has run,
+      every line parsing and no event on disk twice. The same holds with `MemoryError` in place of
+      `ValueError`.
 - [ ] A subprocess sets `RLIMIT_FSIZE` and `FileSink`'s handle lifts the limit after its first
       `EFBIG`. A 200-event batch then delivered through the worker at its default `max_retries`
       leaves the file holding each event exactly once, with every line parsing as JSON. `flush()` is
@@ -132,16 +166,20 @@ returned `10500` and the next raised `EFBIG`.
       line before this spec.
 - [ ] For a batch that fails nowhere, the file's bytes equal what 1.x's text stream wrote for the
       same batch. This is checked for `utf-8`, and for `utf-16` both into an empty file (one byte
-      order mark, at the start) and into a non-empty one (none).
+      order mark, at the start) and into a non-empty one (none). On POSIX only, it is also checked
+      for `utf-16` into a FIFO: the sink constructs, and the reader receives the bytes 1.x's text
+      stream sends, which hold no mark.
 - [ ] With `utf-16` into an empty file and a round whose write takes 0 bytes and raises, the
       resent round writes the byte order mark first and the file holds exactly one.
 - [ ] `FileSink(path, encoding="no-such-codec")` and `FileSink(path, encoding="base64")` both
       raise `LookupError` at construction.
-- [ ] The delivery doc records at least five interleaved before-and-after pairs of the median time
-      of a 1,000-event batch through `FileSink.emit`, on one machine, each a median of its own runs,
-      with the events and encoding of the prototype in *Revision history* (lines of 312 to 316
-      bytes, `utf-8`). The median of the pairs' ratios is no more than 2.0. The prototype measured
-      1.50 to 1.56 times, so 2.0 leaves the build about a third in headroom at that event size.
+- [ ] The delivery doc records at least five interleaved before-and-after pairs of the median
+      wall-clock time of a 1,000-event batch through `FileSink.emit`, on one machine, each a median
+      of its own runs, with the events and encoding of the prototype in *Revision history* (lines
+      of 312 to 316 bytes, `utf-8`). The pairs are taken with the one-minute load average below the
+      machine's core count, and the load average is recorded beside them. The median of the pairs'
+      ratios is no more than 2.0. The prototype measured 1.50 to 1.56 times, so 2.0 leaves the
+      build about a third in headroom at that event size.
 - [ ] The rule above keeps invariants 7 and 2: no event a round called `ACCEPTED` is written again,
       and no event that did not land is called `ACCEPTED`.
 
@@ -171,16 +209,49 @@ two things:
   finished that tail, it reports the event `ACCEPTED` without writing anything for it.
 
 **A torn event the run will not offer again is `UNKNOWN`, never `REJECTED`, and never
-`RETRYABLE` on the run's last round.** That covers a tear on the last round and a tear under an
-error the predicate does not retry. Its prefix is on disk and its tail will be written by the next section on this sink, so it may land. If it
+`RETRYABLE` on the run's last round.** That covers a tear on the last round, a tear under an
+error the predicate does not retry, and a tear in a direct `deliver` outside any run (FR-001). Its prefix is on disk and its tail will be written by the next section on this sink, so it may land. If it
 were `RETRYABLE` or `REJECTED`, a run in which nothing else landed would fail, and every catcher that resends
 whole would write the line again after the tail: `MultiSink`, which offers no `deliver` and is
 resent by the worker's 1.x loop, a third-party wrapper calling `inner.emit`, or a caller's own
 `except OSError` retry. The spec review reproduced that with a prototype, which put event 0 on
 disk twice. As `UNKNOWN`, the run settles (SPEC-072's rule), so `emit` returns and no catcher resends.
 The event is counted once in `failed_events`. Because it may land later, that is the recorded upper
-bound on `failed`, and it is never also in a catcher's term (`failed_batches`, `orphan_lost`),
-since a settled run has no catcher.
+bound on `failed`. When the run ends on the tearing round, the event is never also in a catcher's
+term (`failed_batches`, `orphan_lost`), since a settled run has no catcher. ~~It is never also in a
+catcher's term~~: superseded 2026-11-14 by the residue below.
+
+**The residue is a torn event left `RETRYABLE` by a run that then stops.** A torn event reported
+`RETRYABLE` on a round that was not the run's last stays unresolved when the worker then declines
+the run (the exit drain), or when the sink is closed during the backoff. If nothing else landed,
+that run fails, and the torn event can be counted in `failed_batches` as well as `failed_events`. That
+is the upper bound invariant 2 already records: an event of a failed run is also in its catcher's
+term. Nothing is written twice, because the worker never resends an engine run whole and `close()`
+finishes the tail.
+
+**On a one-round run, the events after a tear are counted as lost and are not written.** An inline
+`emit`, a `MultiSink` child, a third-party wrapper calling `emit` and the orphan path each give the
+sink one round, so a round that tears is the run's last. The torn event is `UNKNOWN`, the run
+settles and `emit` returns. The events after the torn one did not land and are not offered again:
+they are counted in `failed_events` and are absent from the file. 1.x raised there, and a catcher
+that resent the batch whole wrote those events and put the head of the batch on disk twice. For
+`MultiSink` that resend happened only when every child raised, because it re-raises to the worker
+only then. A transient partial write under one of these callers therefore loses the rest of that
+batch, counted, where 1.x could deliver it with duplicates. A file sink the worker drives directly
+has later rounds, and there the engine resends what did not land.
+
+**A `BaseException` passing through a write section leaves no cut line without a tail.** A
+`KeyboardInterrupt` lands, in practice, just after a write call has returned and before its count
+is stored, so the count the sink holds is short by that call's bytes. 1.x's `BufferedWriter` did
+not have this exposure, because it kept its unwritten remainder. Each write-call sequence, a
+tail's and a round's lines alike, therefore notes the descriptor's end-of-file offset before its
+first call. When a `BaseException` passes through, the sequence reads the offset again and takes
+the difference, capped at the bytes it was writing, as the bytes taken. The sink's state then
+follows those bytes exactly as on an `OSError`: the tail is shortened or recorded, and
+`RotatingFileSink`'s `_size` and the owed byte order mark are updated. The exception propagates
+unchanged, with no counter moved and no verdict returned. A handle that cannot seek skips the
+guard. One corner remains: another process appending to the path inside that same window makes the
+difference over-count, which the cap bounds. It is the cross-process case under *Out of Scope*.
 
 #### Acceptance Criteria:
 
@@ -193,24 +264,44 @@ since a settled run has no catcher.
       `run_concurrently`) before A's next round. That section writes A's tail and then its own line.
       A's next round writes nothing for event 1 and reports it `ACCEPTED`. The file holds each event
       once and every line parses.
-- [ ] A `MultiSink` wrapping a `FileSink`, driven by a real `Worker`, with a tear inside the batch's
-      first line and the fault cleared before the worker's next attempt, leaves each event on disk
-      exactly once and every line parsing. The same holds for an inline `FileSink.emit` followed by a
-      caller resending the same batch. In both, the first `emit` returned rather than raised.
+- [ ] ~~A `MultiSink` child's torn batch leaves each event on disk exactly once~~: superseded
+      2026-11-14, because it cannot hold for a batch of more than one event (*Revision history*).
+      A `MultiSink` wrapping a `FileSink`, driven by a real `Worker`, is handed a batch of `n > 1`
+      events. The handle tears the first line, and the fault is lifted after that first failure.
+      The file sink's `emit` is called exactly once and returns. Once the next section on the sink
+      has run (the next batch or `close()`), every line parses, no event is on disk twice, the torn
+      event is on disk once, events 2 to `n` are absent, and the child's `losses().failed == n`.
+- [ ] The inline twin: the same tear through an inline `FileSink.emit`, in a caller that resends
+      the batch on `except OSError`, never resends, because `emit` returned. Once the next section
+      has run, the file is the one the criterion above describes.
 - [ ] A tear inside the first line under `EACCES` on the first of four rounds reports the torn
       event `UNKNOWN` and the rest `REJECTED`, and the run settles, so `emit` returns.
-- [ ] A run that ends with a tail pending reports the torn event `UNKNOWN` and settles. That event
-      is in `failed_events` once, and in neither `failed_batches` nor `orphan_lost`. The next batch's
-      first round writes the tail before its own lines, and every line in the file parses.
+- [ ] A run that ends on the round that tore a line reports the torn event `UNKNOWN` and settles.
+      That event is in `failed_events` once, and in neither `failed_batches` nor `orphan_lost`. The
+      next batch's first round writes the tail before its own lines, and every line in the file
+      parses.
+- [ ] A worker run whose first round tears a line under `ENOSPC`, reporting the torn event
+      `RETRYABLE`, and whose next round the worker declines, writes nothing more in that run. After
+      `close()` the torn event is on disk once and every line parses.
 - [ ] A batch holding one event object twice, with the first occurrence torn, writes that object's
       whole line exactly once on the resend (for the second occurrence) and the first occurrence's
       tail exactly once.
 - [ ] `close()` with a tail pending tries the tail once and closes the descriptor whatever that try
       does. It raises the `OSError` when the try failed and returns when it succeeded. A second
       `close()` is a no-op.
-- [ ] These keep invariants 7, 2 and 5: no byte of a tail is written twice, the torn event is
-      counted at most once and in one term, and a close releases the descriptor once even when the
-      tail fails.
+- [ ] A handle double really writes `k` bytes of a line and then raises `KeyboardInterrupt` in
+      place of returning the count. The exception propagates by identity and no counter moves. The
+      next section finishes the line, every line parses, and a marker unique to the cut line
+      appears on disk exactly once.
+- [ ] The same double inside a tail's write: the exception propagates by identity, no counter
+      moves, the tail is shorter by the `k` bytes written, and after the next section a marker
+      unique to the tail appears on disk exactly once.
+- [ ] On a handle that cannot seek, the same `KeyboardInterrupt` propagates by identity, and the
+      sink records no tail and moves no counter.
+- [ ] These keep invariants 7, 2 and 5: no byte of a tail is written twice, a line cut by an
+      exception of any kind gets its tail, the torn event of a run that ends on the tearing round
+      is counted once and in one term, a `BaseException` moves no counter, and a close releases the
+      descriptor once even when the tail fails.
 
 ### FR-003: `RotatingFileSink` keeps both rules across a rotation
 
@@ -232,6 +323,12 @@ bytes the write calls returned, not by the bytes the sink meant to write. An abs
 failure behaves as SPEC-048 FR-006 left it: one line per outage, and the batch continues on the
 un-rotated file.
 
+SPEC-048 FR-006's tests no longer guard the write-before-rotate ordering. On an unbuffered handle
+there is no buffered line for `_rotate`'s close to lose, so
+`test_a_failed_flush_still_leaves_every_event_on_disk` cannot fail for its stated reason, and at
+the plan review a mutant that rotated before writing the staged lines passed all three FR-006
+tests. The ordering is guarded by the first and second criteria below.
+
 #### Acceptance Criteria:
 
 - [ ] A batch whose fourth event triggers a size rotation, with a handle double that raises
@@ -248,8 +345,12 @@ un-rotated file.
       on disk exactly once.
 - [ ] After a round whose write took `k` bytes and then raised, `_size` has grown by exactly `k`.
 - [ ] An absorbed rotation failure still writes exactly one line per outage and continues on the
-      un-rotated file. SPEC-048 FR-006's tests in `tests/test_sinks_file.py` pass, with only their
-      stream doubles adapted to the binary handle (`_stream` keeps its name).
+      un-rotated file, and SPEC-048 FR-006's tests in `tests/test_sinks_file.py` pass (`_stream`
+      keeps its name). The write-before-rotate ordering is guarded by this FR's first and second
+      criteria: a build that rotates before writing the staged lines fails one of them.
+      `test_a_failed_flush_still_leaves_every_event_on_disk` is re-aimed at the binary handle, or
+      reworded for what it still proves, and its docstring no longer names it as the ordering's
+      guard.
 - [ ] These keep invariants 7 and 2 across a rotation.
 
 ### FR-004: The file sinks count once per run, retry what a resend can cure, and keep 1.x's `emit`
@@ -268,24 +369,40 @@ something is counted (SPEC-069), so a process that only logs clean events still 
 `_retryable_error` answers `True` only for an `OSError` whose `errno` a resend can cure, because
 space can be freed, a quota or limit raised, or a descriptor released: `ENOSPC`, `EDQUOT`, `EFBIG`,
 `EIO`, `EAGAIN`, `EMFILE` and `ENFILE`, each resolved with `getattr(errno, name, None)` so a
-platform lacking one skips it. Anything else, `EACCES`, `EPERM`, `EROFS` and an `errno` of `None`
-among them, is `REJECTED` at its first attempt. This is SPEC-070's rule (*A sink declares what it
+platform lacking one skips it. Anything else, `EACCES`, `EPERM`, `EROFS`, an `errno` of `None` and
+an exception that is not an `OSError` at all (FR-001) among them, is `REJECTED` at its first
+attempt. This is SPEC-070's rule (*A sink declares what it
 retries, and anything else fails at once*) reaching the file sinks as they join the engine. 1.x's
 worker resent them on every raise.
 
 A round that lost events registers its line as SPEC-074's sinks do, through `_rounds.Lost` with
 `raised_line`: `When.LAST` for a retryable error and `When.ALWAYS` otherwise, naming the sink's
 class, the round's exception type and, as SPEC-069's line did, `errno=N`. The engine and the
-worker's abandon line add nothing to it.
+worker's abandon line add nothing to it. **The line's text changes.** Through `raised_line` its
+detail reads `<Class>, N attempt(s), <Type> errno=N`, where 1.x wrote `<Class>, <Type> errno=N`.
 
 The inline `emit` keeps SPEC-069's promise that no `except` clause changes. When a run fails, it
-raises the dual-typed error that `_driver_error.delivery_error` builds from the `OSError` of the
-round that ended the run (`OSError`, its own subclass such as `PermissionError`, and
-`SinkDeliveryError`, with the original as `__cause__`), or the original when the dual type cannot be
-built. A run that landed anything, or tore a line, settles instead: `emit` returns and the unlanded
-events are counted, which is invariant 7's rule for a sink that delivered something. A closed or
-closing sink refuses through `final_refusal` and `RunContext.refuse` and counts nothing, as every
-engine sink does since SPEC-076.
+raises the dual-typed error that `_driver_error.delivery_error` builds from the exception of the
+round that ended the run, recorded through `raise_on_failure(delivery_error(err) or err)`. For an
+`OSError` that is `OSError`, its own subclass such as `PermissionError`, and `SinkDeliveryError`,
+with the original as `__cause__`, or the original when the dual type cannot be built. An exception
+that is not an `OSError` takes the same route, so a run that landed nothing on a `ValueError`
+raises an instance of `ValueError` and `SinkDeliveryError`, and a caller's `except ValueError`
+still catches it. A run that landed anything, or tore a line, settles instead: `emit` returns and
+the unlanded events are counted, which is invariant 7's rule for a sink that delivered something.
+A closed or closing sink refuses through `final_refusal` and `RunContext.refuse` and counts
+nothing, as every engine sink does since SPEC-076.
+
+**A closed file sink is not resent, which supersedes 1.x for a caller's subclass.** In 1.x the
+worker resent a caller's subclass of a file sink that inherits `emit` and re-opens itself after a
+close (`tests/test_final_refusal.py`, the `subclass` shape of
+`test_a_callers_sink_that_routes_emit_without_a_frame_keeps_the_resend`). On the engine the worker
+calls that subclass's `deliver`, and a closed sink's round is a final refusal, so the subclass is
+no longer resent. A subclass that wants the resend overrides `emit`. The worker's 1.x loop keeps
+both of its guards on a specimen still off the engine: that test's `subclass` shape and
+`test_a_refusal_after_a_transient_failure_stops_the_resend_where_it_lands` move to `SQLiteSink`.
+At the plan review the second was the only test that failed when the worker abandoned a final
+refusal on its first attempt only.
 
 #### Acceptance Criteria:
 
@@ -298,6 +415,12 @@ engine sink does since SPEC-076.
       instance of `PermissionError`, `OSError` and `SinkDeliveryError`, with the original as
       `__cause__`. One whose run landed some events returns normally, and `losses().failed` equals the
       number that did not land.
+- [ ] An inline `emit` whose run lands nothing on a `ValueError` from the handle raises an
+      exception that is an instance of both `ValueError` and `SinkDeliveryError`.
+- [ ] Through the worker with `max_retries=3`, a handle that raises `TypeError` on every write gets
+      exactly one `deliver` call and no backoff wait. `losses()` and `failed_batches` equal what a
+      run exhausted on `ENOSPC` leaves for the same batch, and the sink's one line says
+      `1 attempt(s)` and names `TypeError`.
 - [ ] `losses()` is `None` after a batch that lands whole. After a settled run with `d` unencodable
       events and `f` events lost, it is `SinkLosses(dropped=d, failed=f)`. After a failed run of `n`
       events of which `u` were unencodable, it is `SinkLosses(dropped=0, failed=n)`, so
@@ -305,8 +428,17 @@ engine sink does since SPEC-076.
 - [ ] A closed sink's `emit` raises the `final_refusal` error by identity and moves no counter.
       A `close()` from another thread during a worker backoff returns before the next round would
       start, and that round writes nothing and refuses through `final_refusal` with no counter moved.
+- [ ] Through the worker, a closed `FileSink` subclass that inherits `emit` and would re-open
+      itself in the first backoff gets exactly one `deliver` call, and no backoff is entered.
+- [ ] In `tests/test_final_refusal.py`, the `subclass` shape of
+      `test_a_callers_sink_that_routes_emit_without_a_frame_keeps_the_resend` and
+      `test_a_refusal_after_a_transient_failure_stops_the_resend_where_it_lands` run on `SQLiteSink`
+      and pass. With the worker changed to abandon a final refusal on its first attempt only, the
+      second fails.
 - [ ] A round lost to `ENOSPC` registers exactly one line through `Lost`, naming the sink's class,
-      `OSError` and `errno=28` and no event data. It is written once per run, on the last round.
+      `OSError` and `errno=28` and no event data. It is written once per run, on the last round. For
+      an inline `FileSink.emit` of two events it reads
+      `log-foundry: lost 2 event(s); FileSink, 1 attempt(s), OSError errno=28`.
 - [ ] The worker, the orphan path and the inline adapter all reach `deliver`, held by
       `tests/test_delivery_paths.py`'s pattern. `tests/test_engine_sinks_roster.py` finds both sinks,
       with its floor raised from 13 to 15.
@@ -394,18 +526,40 @@ src/log_foundry/sinks/
 ├── file.py        # both sinks on deliver; the text stream and _reopen_discarding retired
 └── _engine.py     # RunContext.raise_on_failure, Delivery.raise_on_failure, the adapter's raise
 tests/
-├── test_file_sink_deliver.py          # FR-001, FR-002, FR-004 (new)
+├── file_handles.py                    # the binary handle doubles the new tests share (new helper)
+├── test_file_sink_deliver.py          # FR-001, FR-002, FR-004, and the retry sweep's four
+│                                      #   properties for the file sinks (new)
 ├── test_rotating_file_sink_deliver.py # FR-003 (new)
 ├── test_file_sink_partial_write.py    # the RLIMIT_FSIZE subprocess proof (new, POSIX only)
 ├── test_file_sink_fork.py             # FR-005 under a real os.fork (new)
+├── sink_rigs.py                       # the file rigs on a binary handle double and the engine's counters
 ├── test_engine_sinks_roster.py        # floor 13 -> 15
+├── test_classify.py                   # engine-round floor 11 -> 13; the file sinks excluded by name
+│                                      #   from the retry sweep (no max_retries, an errno predicate)
 ├── test_run_context.py                # raise_on_failure, its precedence and its rewind
-├── test_sinks_file.py                 # stream doubles adapted to the binary handle
-├── test_driver_error.py               # its text-stream double replaced; its counts unchanged
+├── test_final_refusal.py              # the file sinks join the engine cases; two 1.x-loop guards
+│                                      #   move to SQLiteSink (FR-004)
+├── test_sinks_file.py                 # no stream-double change; the FR-006 flush test re-aimed
+│                                      #   or reworded (FR-003)
+├── test_sinks_encode.py               # through the rig; the frozen surface gains the engine names
+├── test_sink_concurrency.py           # the deliver and emit locker sets
+├── test_sink_post_close.py            # the file sinks move to the engine's closed population
+├── test_driver_error.py               # its text-stream double replaced and the line's new text;
+│                                      #   its counts unchanged
 ├── test_deferral.py                   # the file sinks leave the immediate-store allowlist
 ├── test_fork_lifecycle.py             # the file sinks' fork cases on the new hook
-└── test_sink_ownership.py             # the file sink case on the new handle
+├── test_fork_one_walk.py              # the inherited-bytes window restated on the tail
+├── test_fork_roster.py                # the file sinks assign no primitive to self any more
+└── test_sink_ownership.py             # no stream-double change; prose only
 ```
+
+The retry sweep in `tests/test_classify.py` sets a sink's own `max_retries` and expects
+`ConnectionError` to be retried, and the file sinks have neither a `max_retries` nor a predicate
+that retries by exception class. They are excluded from the sweep by name, with that reason, and
+its four properties are tested for them in `tests/test_file_sink_deliver.py`: an exception no
+resend cures costs one attempt and is counted as exhaustion is, a retried error gets
+`max_retries + 1` attempts, a `KeyboardInterrupt` propagates and moves no counter, and a predicate
+that raises fails at once naming the original exception.
 
 ## Implementation Phases
 
@@ -431,8 +585,10 @@ tests/
 
 - Invariant 7: remove the file sinks from the partial-write exception the SPEC-069 follow-up fix
   recorded, and keep the stream sinks in it. Invariant 2: drop the file sinks from the sentence on a
-  sink's own `failed` landing before a raise, and add the torn event's `UNKNOWN` to the engine's
-  upper bound on `failed`.
+  sink's own `failed` landing before a raise, and add to the engine's upper bound on `failed` the
+  torn event's `UNKNOWN` and FR-002's residue, the torn event of a run that is declined or closed
+  after the tearing round. Invariant 12: its sentence "a value the child inherits is stranded, not
+  detached" gains the file sinks' case, a dropped tail and no buffer to strand.
 - Rewrite these decisions in place (`docs/decisions/sink-delivery/`), each with a dated History
   entry:
   - *A sink's own driver error is counted, announced and raised as both types*: the file sinks'
@@ -441,15 +597,43 @@ tests/
   - *A sink that delivered nothing raises; one that delivered something reports*: its SPEC-069
     sentence on the file sinks;
   - *A raising `emit` counts nothing*: the file sinks' immediate `_failed` leaves the allowlist it
-    names.
-- `architecture.md`: the fork-hazard paragraph that says `StdoutSink` "carries the file sinks'
-  duplication hazard". The file sinks no longer have a buffer to carry, so the paragraph is reworded
-  for `StdoutSink` alone.
-- `_rotate_or_continue`'s residue paragraph, the inventory row, and the release notes of the release
-  after 1.2.0. The caller-visible changes for those notes are:
+    names;
+  - *An event a sink cannot encode costs only itself…*: the closing sentence of its *Do NOT*
+    paragraph, on a stream or file that fails partway through a batch, is reworded, since the file
+    sinks no longer leave that duplicate and the stream sinks still do;
+  - *A refusal no retry can cure…*: a History entry for FR-004's closed file-sink subclass and the
+    two guards moved to `SQLiteSink`;
+  - *A sink declares what it retries…*: a History entry for the file sinks' `errno` set.
+- The pipeline decision *A value the child inherits is stranded, never merely detached*
+  (`docs/decisions/pipeline/`), rewritten in place with a dated History entry: the `dup2` step is
+  retired for the file sinks.
+- One new decision file in `docs/decisions/sink-delivery/`, fence and entry together, carrying this
+  spec's fences: the tail belongs to the sink and the torn occurrence to the run; a tear the run
+  will not offer again is `UNKNOWN`; do NOT truncate, do NOT flush per line, do NOT keep run state
+  on the sink, do NOT add an inline retry.
+- `architecture.md`:
+  - the fork-hazard paragraph that says `StdoutSink` "carries the file sinks' duplication hazard".
+    The file sinks no longer have a buffer to carry, so the paragraph is reworded for `StdoutSink`
+    alone;
+  - the fork repair's description of the child stranding its copy with `dup2` to `/dev/null`;
+  - the `SERIAL` guard sentence counting "the five engine sinks" beside `FileSink`,
+    `RotatingFileSink` and `SQLiteSink`;
+  - "the discard hook" in the paragraph on both processes rotating;
+  - "nothing is lost, since `emit` flushes per batch".
+- `README.md`: the sentence that a forked child "re-opens any buffered stream it inherited", and
+  the sentence listing which sinks offer `deliver`.
+- `_rotate_or_continue`'s residue paragraph and the inventory row.
+- The release notes. They go into the pending `docs/release-notes/` file if one exists on `main`
+  when this spec completes, and otherwise into the delivery doc under a "Release notes owed"
+  heading. The caller-visible changes for those notes are:
   - a partial write returns rather than raising;
+  - a one-round run's partial write (an inline `emit`, a `MultiSink` child) loses the rest of that
+    batch, counted (FR-002);
   - `failed` counts once per run;
   - a non-retryable `errno` costs one attempt;
+  - a closed file-sink subclass that inherits `emit` is not resent (FR-004);
+  - the loss line reads `<Class>, N attempt(s), <Type> errno=N` where 1.x wrote
+    `<Class>, <Type> errno=N` (FR-004);
   - a non-text codec is refused at construction.
 
 ---
@@ -519,3 +703,61 @@ tests/
   per-line-flush `emit` as about 2.3 times 1.x's from figures (2.02 ms against 1.48 ms) that give
   1.36. Under a 2.0 bound that cost is no reason to reject per-line flushing, so the bullet now
   rests on its first reason alone, the unwritten rest of the batch being lost.
+- **2026-11-14, plan review.** Revised mid-build to record what the review of the implementation
+  plan settled. The five FRs keep their numbers; what changed, and why:
+  - *FR-002's `MultiSink` criterion.* It asked for each event on disk exactly once, which cannot
+    hold for a batch of more than one event: the inline `emit` is one round, so the tearing round
+    is the run's last, the torn event is `UNKNOWN`, the run settles and `emit` returns. The plan's
+    prototype, with five events through `MultiSink` and a real `Worker`, measured one `emit` call,
+    `flush()` truthy, `failed_batches == 0` and the child's `losses().failed == 5`, and once the
+    next section had finished the tail the file held the first event only. The criterion now says
+    what holds, its inline twin is a criterion of its own, FR-002's description states the
+    consequence for every one-round run, and resending only a `MultiSink` child's unlanded events
+    is under *Out of Scope*.
+  - *The torn event outside an engine run.* FR-001's rule read `RunContext.last`, which answers
+    false for a direct `deliver`, where the run's notes also end with the call. The torn event is
+    now `RETRYABLE` only inside an engine run whose round is not its last. FR-001's first
+    criterion says it is driven inside such a run, its one-byte-tail case asserts the tail's
+    length (its outcome tuple equals the mid-line case's), and a direct-`deliver` criterion is
+    added.
+  - *A closed sink's subclass.* FR-004 now states that a caller's file-sink subclass inheriting
+    `emit` is no longer resent after a close, which 1.x did, and moves the two tests that guard the
+    worker's 1.x loop to `SQLiteSink`.
+  - *The catcher's term.* FR-002 said a torn event is never also in a catcher's term. That holds
+    for a run that ends on the tearing round. The residue, a run declined or closed after a round
+    that reported the torn event `RETRYABLE`, is recorded with a criterion for the decline.
+  - *An exception that is not an `OSError`.* The plan let one escape the round, as it escaped 1.x's
+    `emit`. The plan reviewer showed that a handle taking 9 bytes and then raising `ValueError` or
+    `MemoryError` under `MultiSink` left a cut line with no tail, which the worker's whole-batch
+    resend glued the next line to. The round now handles any `Exception` raised inside its write
+    loop, and FR-004 keeps the caller's `except` clause for it. *In Scope* gained a line for this
+    and for the next item.
+  - *A `BaseException` through a write section.* A new requirement under FR-002, which the plan had
+    recorded as a residue with no code. It widens the spec on the project owner's standing rule
+    that a failure mode judged unreachable in practice is guarded anyway. The plan reviewer's probe
+    raised `KeyboardInterrupt` from a timer signal around a write loop on a real unbuffered
+    append-mode file. In every interrupt that landed (36 of 36; 30 of 30 when the probe was re-run
+    for this revision) a write call had returned and its count was lost, and the descriptor's
+    offset equalled the bytes the file had gained. The guard "record a tail from the count known
+    so far" was rejected, because that count is short by exactly the call that matters.
+  - *The byte order mark on a path that cannot seek.* The prototype asked the handle for its
+    offset, so `FileSink(fifo, encoding="utf-16")` raised `ESPIPE` at construction and leaked the
+    descriptor. 1.x constructs and writes no mark there (re-run at `20281c89` on Python 3.13.1,
+    macOS), so the mark is owed only on a seekable handle at offset 0, and the byte-parity
+    criterion gained the FIFO case.
+  - *The loss line.* FR-004 routes it through `raised_line`, which adds `N attempt(s),` to 1.x's
+    text. FR-004 and Phase 4's caller-visible changes now say so.
+  - *FR-003's sixth criterion.* It listed SPEC-048 FR-006's tests as passing with adapted doubles.
+    On an unbuffered handle `test_a_failed_flush_still_leaves_every_event_on_disk` cannot fail for
+    its stated reason, and the plan reviewer's mutant that rotated before writing the staged lines
+    passed all three FR-006 tests, so the ordering's guard is now named as this FR's first and
+    second criteria.
+  - *The timing criterion.* The bound is unchanged. The plan measured 2.62 by wall clock at a load
+    average of 28, and the plan reviewer 1.45 at 5.7 on the same prototype, with the wall-clock and
+    thread-CPU medians agreeing only in the second. The criterion now names the clock and asks for
+    a one-minute load below the machine's core count, recorded beside the pairs.
+  - *File & Folder Structure and Phase 4.* The affected-tests list was short: the suite run against
+    the prototype failed tests in files the list did not name, and two files it named needed no
+    stream-double change. Phase 4 gained the records that still state a claim this spec changes,
+    one new decision file for this spec's fences, three caller-visible changes, and where the
+    release notes go while no pending file exists.
