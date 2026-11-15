@@ -117,6 +117,14 @@ buffers on every shape where a sink outlives the configuration that installed it
       undelivered. The sink is closed while live inside the wrapper, which this spec does not
       repair, but it must not become a loss.
 
+      > **Superseded 2026-11-14 by the post-1.2.0 audit (finding 4; no spec yet).** This holds
+      > only for a sink that keeps accepting after its `close()`, as the criterion's test double
+      > does. A sink that releases its transport refuses from then on, so the same sequence loses
+      > every later event A is offered, counted and announced: a `FileSink` kept 1 of 4 lines at
+      > `a0f44b5f`, and at `v1.0.0`. The corrected claim and what closes it are in
+      > `docs/architecture.md` §12, *A sink can be released while it is still live inside the
+      > graph that replaced it*.
+
 ### FR-003: The record is emptied by one transition, and mutated in place
 
 #### Description:

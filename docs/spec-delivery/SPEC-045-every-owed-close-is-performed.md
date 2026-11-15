@@ -32,6 +32,13 @@ that it must not become a loss), the exit close running the owed set inline and 
 `health().inherited_sink` reading the record's last entry, which arming order does not make the
 installed sink.
 
+> **Superseded 2026-11-14 by the post-1.2.0 audit (finding 4; no spec yet).** The first of those
+> limits is a loss for a shipped sink. The criterion's pin holds only for a sink that keeps
+> accepting after its `close()`; a `FileSink` released while still live in the wrapper kept 1 of 4
+> lines at `a0f44b5f`, and at `v1.0.0`. The corrected claim and what closes it are in
+> `docs/architecture.md` §12, *A sink can be released while it is still live inside the graph that
+> replaced it*.
+
 ## What changed from earlier specs?
 
 - `_Lifecycle._orphan_closed_sink` is **untouched**: SPEC-044 FR-004 sets it for a sink a swap

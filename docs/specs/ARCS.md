@@ -29,6 +29,7 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 - [Coercer and invariant 8](#coercer-and-invariant-8) — arc `coercer-and-invariant-8`
 - [OpenTelemetry-shaped output](#opentelemetry-shaped-output) — arc `opentelemetry-shaped-output`
 - [1.2.0 stability redesign](#120-stability-redesign) — arc `stability-redesign`
+- [The 2026-11-14 post-1.2.0 audit](#the-2026-11-14-post-120-audit) — arc `audit-2026-11-14`
 
 ## Core logging pipeline
 
@@ -412,3 +413,84 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   child whose marking tripped could still claim a parent's sink it handed over again. Andrew chose
   its heap fallback with the question tool on 2026-11-12.
 
+## The 2026-11-14 post-1.2.0 audit
+
+- **The 2026-11-14 post-1.2.0 audit:** recorded in
+  [`docs/audits/2026-11-14-post-1.2.0-audit.md`](../audits/2026-11-14-post-1.2.0-audit.md), which
+  was run against `a0f44b5f` the day `v1.2.0` was tagged. Five frames (history, lifecycle, the core
+  pipeline, the sinks and verification) ranked 23 findings, most of them by running a probe, and the
+  diagnosis beneath them is why the arc exists: the standing suite does not find this library's
+  defects. Reviews and probes of the neighbouring change find them, one at a time, and each fix then
+  adds a test written from its own reproduction. A choke point quieted its class of defect wherever
+  one was made: the delivery engine and the closed-guard helper in the 1.2.0 redesign, and the
+  diagnostics module earlier, under SPEC-029. The lifecycle was given one state holder four times
+  and no choke point, and it kept being fixed one interleaving at a time. So the arc is not a list
+  of 23 fixes: it builds what would have found them, and it replaces the mechanisms that keep
+  producing them. Each finding's open item, with its evidence and what closes it, is in
+  `docs/architecture.md` §12, except the duplicate lines of the file and stream sinks, which two
+  earlier specs already own.
+
+  The arc is cut into five tracks. A track groups a concern; it does not partition the source, and
+  the tracks do meet in files. **Harness** is tests only: the model test gains sinks that wait on
+  their stop signal, call back and fork, a time bound of the timeout plus an epsilon and a
+  close-once-per-write oracle, and a derived matrix sets every callback against every public call,
+  with a fork and a signal handler as calls. **Pipeline** is one event-unit ledger, the accounting
+  defects that become assertion failures under it, the exit drain, and three things that wait on
+  Andrew: what a truthy `flush()` means, capacity, and an open span's events shipped before the span
+  closes. **Sinks** is acknowledgement classes with one conformance corpus, the writes nothing
+  acknowledges, and the sends whose reply is lost. SPEC-082 and SPEC-084, the file sinks' and the
+  stream sinks' specs, predate the audit and are built alongside this arc, not in it: membership has
+  one home, a spec's frontmatter, and neither names this arc. **Lifecycle** is the release rule for
+  a sink still reachable from the graph just installed, one lifecycle command path, one stable stop
+  signal per sink, and a forked child rebuilt from its configuration. **CI** is the workflows and
+  `pyproject.toml`. Whether two specs may build at once is decided for that pair when each is ready,
+  by the test in `docs/process/several-agents.md` (neither needs the other's result, and they touch
+  different source files), and never by the tracks they sit in. The files the tracks are known to
+  share, so that the specs touching them are chained: `worker.py`, which holds the ledger's counts,
+  `Worker._reinit_after_fork` for the fork rebuild, and the queue mutex the signal-handler item
+  names; `_lifecycle.py`, where `_worker_health` assembles `Health` for the ledger; `__init__.py`,
+  which holds `flush`, `health` and `shutdown` and belongs to no track; and every module that reads
+  `log_foundry_stop_signal`, which is about half the modules under `sinks/` together with
+  `worker.py`, `api.py`, `config.py`, `_fork.py` and `_lifecycle.py` (`grep -rl
+  log_foundry_stop_signal src/` lists them). One dependency crosses tracks on purpose: the lifecycle
+  command path is judged against the harness's adversarial model, because each of the four ownership
+  redesigns before it was judged by tests that had missed the defects.
+
+  Andrew made the decisions in chat on 2026-11-14, after the findings were reported: "I'll take your
+  recommendations other than the mac os specific one", and "You can additionally evaluate and do any
+  of the outstanding spec work as a part of this". Taken: an adversarial model test; one event-unit
+  ledger; one sink conformance corpus keyed on acknowledgement class, and SPEC-082 and SPEC-084
+  built; lifecycle commands serialized through one owner in place of a fifth round of case fixes,
+  prototyped against the adversarial harness before it is committed to; one stable stop signal per
+  sink, with the change to the public `log_foundry_stop_signal` protocol stated to him, which
+  `docs/architecture.md` §12 holds open until a spec says whether 1.x sinks keep working or
+  invariant 10 takes a recorded exception; and a CI hang timeout with a stack dump and a nightly
+  soak of the model test. Declined: a macOS CI leg, which is a decision of its own in
+  `docs/decisions/working-rules/`. Not decided, three things. `flush()` judged on the ledger was in
+  the recommendation he accepted, but by the orchestrating session's account he was not told that
+  the settled record is divided on what a truthy `flush()` means, so it waits on him with both
+  closures weighed in §12 and neither the default. Shipping an open span's events before the span
+  closes is the orchestrating session's proposed direction, put to him as his call with no
+  recommendation attached and unanswered when this was written. Coverage measurement, a job timeout,
+  `ResourceWarning` as an error and a property-based sink-graph generator are that session's plan
+  for the CI track, coverage having been stated to him as an observation. One direction was set by
+  the orchestrating session under that authority and is confirmed or reversed in its spec's review:
+  a send whose reply was lost gains a count of the sends that may have duplicated, and an
+  idempotency key wherever the destination can honour one. It changes neither settled rule: an
+  `UNKNOWN` outcome or an exception escaping `deliver` is never resent, and what stays resendable,
+  at the cost already accepted, is a client exception the sink's retry predicate accepts, caught
+  inside `deliver` and answered `RETRYABLE`.
+
+  The arc works inside five earlier decisions. It reopens none of them by itself, and where one of
+  its directions cannot be built without reopening one, that direction waits on Andrew. The engine
+  keeps the 1.x total retry budget (Andrew, 2026-11-04, the *1.2.0 stability redesign* arc above),
+  so sixteen sends of one event is the budget working. A batch with nothing encodable settles,
+  counted, rather than raising (his, the same day and section); that is one side of a settled record
+  divided over what a truthy `flush()` means, the other being the decision that `True` means the
+  sink took the events, and choosing between them is the first of the three things above. A client
+  exception costs its chunk at an accepted risk of duplication, a cost its own decision records
+  (`docs/decisions/sink-delivery/`), so only the uncounted, unkeyed resend is a defect. A dead drain
+  thread is reported, not restarted (`docs/decisions/failure-paths/`), so only the batch it held is
+  uncounted. The worker's tunables stay unreachable from `configure()`
+  (`docs/decisions/public-api/`), and nothing decided on 2026-11-14 names that decision, so whether
+  capacity becomes a setting is still Andrew's to say.

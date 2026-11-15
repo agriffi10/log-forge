@@ -230,6 +230,10 @@ line-length = 100
 # Deliberately no `target-version`: ruff infers it from `requires-python`, so the two can never
 # drift. If one is ever added it must match the floor above.
 
+# An audit's probe scripts are its evidence, kept as they were run so a later session can re-run
+# them; linting them would mean editing the record. `extend-`, so ruff's own defaults still apply.
+extend-exclude = ["docs/audits/2026-11-14-probes"]
+
 [tool.ruff.lint]
 # THE RULE SET IS CHOSEN HERE, NOT INHERITED. Ruff's default set is not a stable contract:
 # 0.16.0 widened it from 59 rules to 413. Selecting explicitly means a ruff release can add
