@@ -82,7 +82,6 @@ _PRIMITIVE_HOMES = {
     "GooglePubSubSink": "walk",
     "SentrySink": "walk",
     "SQLiteSink": "walk",
-    "StdoutSink": "walk",
     "TransformSink": "walk",
     "SinkCounters": "walk",
     "Worker": "walk",

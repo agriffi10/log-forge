@@ -1206,13 +1206,14 @@ def test_the_same_child_blocks_when_the_wrappers_count_lock_is_put_back() -> Non
 def test_a_child_does_not_block_on_a_stream_sinks_inherited_counter_lock(cls: type) -> None:
     """SPEC-069 FR-001. The counter lock the stream sinks gained is repaired in a forked child.
 
-    The child's batch carries one unencodable event beside a good one, so ``emit`` commits a
-    count and takes the lock — a clean batch takes no lock and would prove nothing — and
-    ``losses()`` takes it again.
+    Since SPEC-084 the lock is the engine counters' (``log_foundry_counters._counter_lock``), the
+    one the stream sinks' own retired with their ``Deferral``. The child's batch carries one
+    unencodable event beside a good one, so ``emit`` commits a count and takes the lock — a clean
+    batch takes no lock and would prove nothing — and ``losses()`` takes it again.
     """
     sink = cls(stream=io.StringIO())
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
-    released, holder = _held_by_a_parent_thread(sink._counter_lock)
+    released, holder = _held_by_a_parent_thread(sink.log_foundry_counters._counter_lock)
 
     def emit_then_read() -> str:
         sink.emit([{"ok": 1}, {"bad": b"x"}])
@@ -1233,12 +1234,12 @@ def test_the_same_child_blocks_when_a_stream_sinks_counter_lock_is_put_back() ->
     """The positive control for the test above: the inherited lock restored, the child hangs."""
     sink = StdoutSink(stream=io.StringIO())
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
-    inherited = sink._counter_lock
+    inherited = sink.log_foundry_counters._counter_lock
     released, holder = _held_by_a_parent_thread(inherited)
     at_the_call = "at-the-call"
 
     def unrepair_then_emit() -> str:
-        sink._counter_lock = inherited  # type: ignore[assignment]
+        sink.log_foundry_counters._counter_lock = inherited
         report_from_child(at_the_call)
         sink.emit([{"ok": 1}, {"bad": b"x"}])
         return "returned"

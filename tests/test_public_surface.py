@@ -907,9 +907,9 @@ def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
     `_lifecycle._get_worker`), so the order is lifecycle -> config and must stay one-way:
     anything under `_config_lock` that reached back for the lifecycle lock, or blocked on I/O,
     would deadlock or stall every configure and every zero-config log behind it. Today only `replace()` and
-    `StdoutSink()` run there, and `StdoutSink.__init__` binds the stream and creates the
-    unencodable counter and the `threading.Lock` that guards it (SPEC-069) — three assignments,
-    nothing that blocks and nothing that reaches for another lock.
+    `StdoutSink()` run there, and `StdoutSink.__init__` binds the stream, clears its fault latch
+    and builds a `SinkCounters` (SPEC-084), which creates a `threading.Lock` and adds itself to a
+    `WeakSet` — nothing that blocks and nothing that reaches for another lock.
 
     Asserted as a whitelist rather than a search for the bad case: the set of things that would
     be unsafe is open, and the set that is currently safe is three.
@@ -919,7 +919,9 @@ def test_nothing_expensive_or_reentrant_runs_under_the_config_lock() -> None:
     publication is the `replace()` inside this lock, so moving it out means either stamping a
     sink that may lose the construction race or stamping after another thread can already reach
     it. It clears both hazards this test names. It cannot block: its argument here is a
-    freshly-built `StdoutSink`, a one-object walk measured at 0.005 ms, and the only lock it
+    freshly-built `StdoutSink`, so the static walk starts from the few attributes one constructor
+    just assigned (a stream, a `SinkCounters`, a `None` stop signal) and does no I/O; no timing
+    is claimed, since the one measured was of the sink before it held its counters. The only lock it
     takes is `_owned_lock`, which is *last* in the process order (`_worker_lock` ->
     `_config_lock` -> `_owned_lock`) and held only across dict writes. The second assertion
     below checks the reach-back directly rather than leaving it to this paragraph.

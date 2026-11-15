@@ -168,7 +168,7 @@ def stdout(mp: pytest.MonkeyPatch, tmp: Path, cls_name: str = "StdoutSink") -> R
 
     state = State()
     sink = getattr(mod, cls_name)(stream=_Stream(state))
-    return Rig(sink, state, _lines, sink, "_unencodable")
+    return Rig(sink, state, _lines, sink.log_foundry_counters, "dropped_events")
 
 
 def stderr(mp: pytest.MonkeyPatch, tmp: Path) -> Rig:
