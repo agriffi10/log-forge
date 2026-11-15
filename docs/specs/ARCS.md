@@ -435,9 +435,11 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   their stop signal, call back and fork, a time bound of the timeout plus an epsilon and a
   close-once-per-write oracle, and a derived matrix sets every callback against every public call,
   with a fork and a signal handler as calls. **Pipeline** is one event-unit ledger, the accounting
-  defects that become assertion failures under it, the exit drain, and three things that wait on
-  Andrew: what a truthy `flush()` means, capacity, and an open span's events shipped before the span
-  closes. **Sinks** is acknowledgement classes with one conformance corpus, the writes nothing
+  defects that become assertion failures under it, the exit drain, the loss counts `FlushResult`
+  gains, the larger batches the worker sends under a backlog, and one thing that waits on Andrew:
+  an open span's events shipped before the span closes. Three things waited on him when this was
+  written; he answered two on 2026-11-15, and the paragraph below that carries that date records
+  them. **Sinks** is acknowledgement classes with one conformance corpus, the writes nothing
   acknowledges, and the sends whose reply is lost. SPEC-082 and SPEC-084, the file sinks' and the
   stream sinks' specs, predate the audit and are built alongside this arc, not in it: membership has
   one home, a spec's frontmatter, and neither names this arc. **Lifecycle** is the release rule for
@@ -466,12 +468,13 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   `docs/architecture.md` §12 holds open until a spec says whether 1.x sinks keep working or
   invariant 10 takes a recorded exception; and a CI hang timeout with a stack dump and a nightly
   soak of the model test. Declined: a macOS CI leg, which is a decision of its own in
-  `docs/decisions/working-rules/`. Not decided, three things. `flush()` judged on the ledger was in
-  the recommendation he accepted, but by the orchestrating session's account he was not told that
-  the settled record is divided on what a truthy `flush()` means, so it waits on him with both
-  closures weighed in §12 and neither the default. Shipping an open span's events before the span
-  closes is the orchestrating session's proposed direction, put to him as his call with no
-  recommendation attached and unanswered when this was written. Coverage measurement, a job timeout,
+  `docs/decisions/working-rules/`. Not decided on 2026-11-14, three things. `flush()`
+  judged on the ledger was in the recommendation he accepted, but by the orchestrating session's
+  account he was not told that the settled record is divided on what a truthy `flush()` means, so it
+  waited on him with both closures weighed in §12 and neither the default. Shipping an open span's
+  events before the span closes is the orchestrating session's proposed direction, put to him as his
+  call with no recommendation attached and unanswered when this was written; it still waits on him,
+  and it is now the only thing in the pipeline track that does. Coverage measurement, a job timeout,
   `ResourceWarning` as an error and a property-based sink-graph generator are that session's plan
   for the CI track, coverage having been stated to him as an observation. One direction was set by
   the orchestrating session under that authority and is confirmed or reversed in its spec's review:
@@ -481,19 +484,32 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   at the cost already accepted, is a client exception the sink's retry predicate accepts, caught
   inside `deliver` and answered `RETRYABLE`.
 
+  Andrew answered two of the open questions on 2026-11-15. Asked "Should flush() stay truthy over a
+  counted loss and gain loss counts, or turn falsy?", he answered "Keep truthy, add counts": the
+  truthiness of `flush()` does not change, and `FlushResult` gains event counts of what was lost
+  (in the call's window, by closure (b)'s wording in §12 rather than his), read from the ledger
+  SPEC-088 specifies and added by the spec after it, which also
+  rewrites, in place and dated, the statements that answer reverses (§12 lists them). Asked "For
+  burst capacity, should the worker send larger batches under backlog, or expose settings?", he
+  answered "Larger batches, no setting": the worker's tunables stay unreachable from `configure()`,
+  and a later spec of this arc has the worker drain a backlog in larger batches, measured against
+  `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`. Both §12 items stay open until those
+  specs are built.
+
   The arc works inside five earlier decisions. It reopens none of them by itself, and where one of
   its directions cannot be built without reopening one, that direction waits on Andrew. The engine
   keeps the 1.x total retry budget (Andrew, 2026-11-04, the *1.2.0 stability redesign* arc above),
   so sixteen sends of one event is the budget working. A batch with nothing encodable settles,
   counted, rather than raising (his, the same day and section); that is one side of a settled record
   divided over what a truthy `flush()` means, the other being the decision that `True` means the
-  sink took the events, and choosing between them is the first of the three things above. A client
+  sink took the events, and Andrew chose between them on 2026-11-15: the truthy result stays, and
+  the other side is the one rewritten. A client
   exception costs its chunk at an accepted risk of duplication, a cost its own decision records
   (`docs/decisions/sink-delivery/`), so only the uncounted, unkeyed resend is a defect. A dead drain
   thread is reported, not restarted (`docs/decisions/failure-paths/`), so only the batch it held is
   uncounted. The worker's tunables stay unreachable from `configure()`
-  (`docs/decisions/public-api/`), and nothing decided on 2026-11-14 names that decision, so whether
-  capacity becomes a setting is still Andrew's to say.
+  (`docs/decisions/public-api/`), and nothing decided on 2026-11-14 names that decision; on
+  2026-11-15 Andrew kept it ("Larger batches, no setting"), so capacity is not a setting.
 
   **The generative run under the adversarial personalities depends on SPEC-085's built modules,
   and is specified against them.**
