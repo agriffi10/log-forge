@@ -597,7 +597,8 @@ A few conventions hold across every sink below:
   open for you to manage.
 - **Forking.** A forked child repairs the library automatically — it rebuilds the worker so it keeps
   delivering, re-initialises every lock (without which the child's *first* log call can deadlock),
-  and re-opens any buffered stream it inherited so the parent's pending bytes are not written twice.
+  and re-opens any file it inherited, leaving unwritten whatever the parent still had pending, so
+  the parent's bytes are not written twice.
   What it does **not** do is give the child a sink of its own: the child inherits the same object, so
   one socket, one SQLite handle or one file is now written by two processes. It will generally not
   be *closed* by both — the library records which process it was handed each sink in, and a child
@@ -681,8 +682,8 @@ lf.configure(sink=MultiSink(
 level is unknown or missing fails open (is forwarded).
 
 **Wrapping a sink that reports per event.** When the sink inside `FilteringSink` or `TransformSink`
-offers `deliver`, as the HTTP family, `SyslogSink` and the SDK and driver sinks other than
-`KafkaSink` and `GooglePubSubSink` do, the wrapper offers it too. The
+offers `deliver`, as the HTTP family, `SyslogSink`, `FileSink`, `RotatingFileSink` and the SDK
+and driver sinks other than `KafkaSink` and `GooglePubSubSink` do, the wrapper offers it too. The
 library then retries the wrapped sink exactly as it would retry that sink configured alone: the
 same number of attempts, its own `max_retries` and `max_retry_after`, and only the events that can
 still land. The wrapped sink's losses are reported where they would be alone, and the wrapper adds

@@ -673,9 +673,10 @@ def _fresh_primitive(value: Any, memo: dict[int, Any], keepalive: list[Any]) -> 
 _REACQUIRE_HOOK = "reacquire_after_fork"
 """The optional sink member a forked child asks to take its transport over.
 
-Named for the larger half of what it does (SPEC-042 FR-005): stranding the parent's pending
-bytes is one consequence, and re-acquiring the transport is the step — a sink that returns from
-it has claimed the transport as this process's own, which is what makes releasing it safe.
+Named for the larger half of what it does (SPEC-042 FR-005): leaving the parent's pending
+bytes unwritten is one consequence, and re-acquiring the transport is the step — a sink that
+returns from it has claimed the transport as this process's own, which is what makes releasing it
+safe.
 
 Probed by name, as ``losses()`` and ``log_foundry_stop_signal`` are, so no existing sink stops
 satisfying ``Sink`` by not having it. ``sinks/base.py`` states the contract; this is the only
@@ -723,7 +724,7 @@ reference the sinks this process acquired that are still alive, and in a forked 
 each inherited one strongly from the first step of the repair (SPEC-081), so without an opt-out
 the walk reaches sinks the process abandoned several ``configure()`` calls ago — replacing their
 locks, which is merely wasteful, and calling their fork hooks, which is not. Measured: a forked
-child announced a buffer-discard failure for a sink that had been superseded, and a ``FileSink`` in
+child announced a failed re-acquisition for a sink that had been superseded, and a ``FileSink`` in
 that state would have its file reopened on every fork for the life of the process.
 
 Declared by the holder of the state — a module, or a class whose instance holds it, since
@@ -966,12 +967,15 @@ def register_pin(fn: Callable[[], None]) -> None:
 
 
 def _reacquire_transports(holders: list[Any]) -> list[Any]:
-    """Asks each sink that owns a buffered stream to re-acquire it in this child (FR-004).
+    """Asks each sink that owns a transport to re-acquire it in this child (FR-004).
 
-    A fork landing inside ``emit`` — after the write loop, before the flush — leaves the child
-    holding the parent's unflushed bytes, which both processes then write: measured, the event
-    at the fork point appeared on disk twice. Without a ``before`` handler there is nowhere to
-    empty the buffer from (FR-001), so the child re-opens instead, which strands the copy.
+    A child inherits whatever the parent had pending and must not write it a second time. When
+    this was written that was a buffer: a fork landing inside a file sink's ``emit``, after the
+    write loop and before the flush, left both processes holding the same unflushed bytes, and
+    measured, the event at the fork point appeared on disk twice. Without a ``before`` handler
+    there is nowhere to empty a buffer from (FR-001), so the child re-opens instead. Since
+    SPEC-082 the file sinks hold no buffer, and what their hook leaves unwritten is the parent's
+    pending tail, the rest of a line a write cut partway, which the parent finishes.
 
     **Which hooks returned normally is published rather than acted on** (SPEC-042 FR-005). A
     sink that returns from the hook has claimed the transport as this process's own, which is an
@@ -987,9 +991,9 @@ def _reacquire_transports(holders: list[Any]) -> list[Any]:
 
     Raises:
       None. One sink's failure is absorbed separately from the rest, so a hook that cannot
-        strand its buffer costs that sink a duplicated batch rather than costing every other
-        sink its repair — and the consequence is named, because an absorbed failure is
-        invisible apart from that line.
+        re-acquire costs that sink alone, at worst the parent's pending bytes written again,
+        rather than costing every other sink its repair — and the consequence is named, because
+        an absorbed failure is invisible apart from that line.
     """
     reacquired: list[Any] = []
     for holder in holders:

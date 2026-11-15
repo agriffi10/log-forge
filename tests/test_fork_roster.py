@@ -73,8 +73,6 @@ _PRIMITIVE_HOMES = {
     "_CloseRegistry": "roster",
     "ConsoleWriter": "roster",
     "ClosedGuard": "walk",
-    "FileSink": "walk",
-    "RotatingFileSink": "walk",
     "FilteringSink": "walk",
     "HTTPSink": "walk",
     "KafkaSink": "walk",

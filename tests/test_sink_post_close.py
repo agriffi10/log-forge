@@ -48,9 +48,13 @@ ENGINE_CLOSED: dict[str, Callable[[int], str]] = {
     "RedisStreamsSink": lambda n: (
         f"RedisStreamsSink delivered none of {n} event(s): the sink is closed"
     ),
+    "FileSink": lambda n: f"FileSink wrote none of {n} event(s): the sink is closed",
+    "RotatingFileSink": lambda n: f"RotatingFileSink wrote none of {n} event(s): the sink is closed",
 }
 """Each engine adopter's closed message, fda134a's text (``SocketTransport`` counts the batch, as
-SPEC-074 made it). ``NATSSink`` keeps its own closed state (SPEC-061) and answers the same way."""
+SPEC-074 made it). ``NATSSink`` keeps its own closed state (SPEC-061) and answers the same way.
+The two file sinks joined from ``EMIT_ONLY_CLOSED`` when SPEC-082 put them on the engine, their
+1.x text unchanged."""
 
 ENGINE_CLOSING: dict[str, Callable[[int], str]] = {
     **ENGINE_CLOSED,
@@ -59,8 +63,6 @@ ENGINE_CLOSING: dict[str, Callable[[int], str]] = {
 """While a close is in flight: the closed message, except ``NATSSink``'s own closing one."""
 
 EMIT_ONLY_CLOSED: dict[str, Callable[[int], str]] = {
-    "FileSink": lambda n: f"FileSink wrote none of {n} event(s): the sink is closed",
-    "RotatingFileSink": lambda n: f"RotatingFileSink wrote none of {n} event(s): the sink is closed",
     "SQLiteSink": lambda n: f"SQLiteSink inserted none of {n} event(s): the sink is closed",
     "KafkaSink": lambda n: f"KafkaSink produced none of {n} message(s): the sink is closed",
 }
@@ -348,7 +350,11 @@ def test_a_sink_closed_between_two_rounds_settles_and_counts_the_refused_round_o
 def test_the_worker_and_orphan_paths_leave_one_ledger(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """AC-7: one event to a closed engine sink leaves the same ``SinkLosses`` on either path."""
+    """AC-7: one event to a closed engine sink leaves the same ``SinkLosses`` on either path.
+
+    The two file sinks answer ``None`` while nothing is counted (SPEC-069, kept by SPEC-082),
+    which is this test's claim in their own words, so it is read as the zero ledger.
+    """
     ledgers: list[SinkLosses] = []
     for path in ("worker", "orphan"):
         (tmp_path / path).mkdir()
@@ -362,7 +368,8 @@ def test_the_worker_and_orphan_paths_leave_one_ledger(
         else:
             log_foundry.configure(service="t", version="0", env="test", sink=built.outer)
             log_foundry.info("after close")
-        ledgers.append(built.target.losses())
+        losses = built.target.losses()
+        ledgers.append(SinkLosses(dropped=0, failed=0) if losses is None else losses)
         log_foundry.shutdown(timeout=LIMIT)
     assert ledgers[0] == ledgers[1] == SinkLosses(dropped=0, failed=0)
 

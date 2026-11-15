@@ -100,6 +100,9 @@ class Delivery:
       failed: Whether the run failed, by the rule above.
       refused: The refusal marker (:meth:`RunContext.refuse`) of the run's last round, when the
         run failed and that round was a refusal; the inline adapter raises it by identity.
+      raise_on_failure: The error a round registered for the inline adapter to raise
+        (:meth:`RunContext.raise_on_failure`), when the run failed; the adapter raises it by
+        identity unless ``refused`` is set, which takes precedence (SPEC-082).
     """
 
     attempts: int
@@ -114,6 +117,7 @@ class Delivery:
     skipped: int
     failed: bool
     refused: Exception | None = None
+    raise_on_failure: Exception | None = None
 
 
 _SETTLED_EMPTY: Final = Delivery(
@@ -496,6 +500,7 @@ class RunContext:
         "_last",
         "_lines",
         "_notes",
+        "_raise_on_failure",
         "_refused",
         "_resends_unknown",
         "_round",
@@ -523,6 +528,7 @@ class RunContext:
         self._final: list[object] = []
         self._counted: list[object] = []
         self._refused: Exception | None = None
+        self._raise_on_failure: Exception | None = None
 
     @property
     def round(self) -> int:
@@ -748,6 +754,31 @@ class RunContext:
         if not self._immediate:
             self._refused = error
 
+    def raise_on_failure(self, error: Exception) -> None:
+        """Records the error the inline adapter raises, by identity, if this run fails.
+
+        A sink whose 1.x ``emit`` raised its driver's own error for a batch that delivered
+        nothing registers that error here, so ``emit_via_deliver`` raises it in place of the
+        engine's own ``SinkDeliveryError`` and every ``except`` clause a caller wrote still
+        matches (SPEC-082, SPEC-069 FR-004). Unlike :meth:`refuse` it marks nothing final and
+        moves no count to the catcher: the run's events are counted into ``failed_events`` as for
+        any failed run. The last call in the run wins, since it is not cleared between rounds;
+        :meth:`_rewind` restores it with the marks, so a round the engine sets aside leaves the
+        earlier round's error standing, and :meth:`_close` drops it. A refusal recorded in the
+        run's last round takes precedence over it. Outside any run it does nothing.
+
+        Args:
+          error: What the 1.x ``emit`` raised for this failure.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not self._immediate:
+            self._raise_on_failure = error
+
     def sink_counted(self, indices: Iterable[int]) -> None:
         """Marks ``RETRYABLE`` indices whose loss this round the sink registered itself.
 
@@ -872,20 +903,21 @@ class RunContext:
         """
         return _Drops(self, owner)
 
-    def _mark(self) -> tuple[int, int, int, int, Exception | None]:
+    def _mark(self) -> tuple[int, int, int, int, Exception | None, Exception | None]:
         """Returns a point :meth:`_rewind` can return the context to.
 
         Its first two members are what a caller compares: the counts and the lines registered
         so far. The rest are SPEC-074's marks — the final rejections, the sink-counted indices
         and the refusal — so a rewind discards a mark a faulting hook set as it discards the
-        hook's counts.
+        hook's counts, and last the error registered by :meth:`raise_on_failure` (SPEC-082),
+        appended so no earlier member moves.
 
         Args:
           None.
 
         Returns:
           How many counts, lines, final rejections and sink-counted indices are registered so
-          far, and the refusal registered so far.
+          far, the refusal registered so far, and the error to raise on failure so far.
 
         Raises:
           None.
@@ -896,9 +928,10 @@ class RunContext:
             len(self._final),
             len(self._counted),
             self._refused,
+            self._raise_on_failure,
         )
 
-    def _rewind(self, mark: tuple[int, int, int, int, Exception | None]) -> None:
+    def _rewind(self, mark: tuple[int, int, int, int, Exception | None, Exception | None]) -> None:
         """Discards every count, line and mark registered since ``mark``.
 
         A caller guarding a hook that may register a count and then raise uses it to replace
@@ -925,6 +958,7 @@ class RunContext:
         del self._final[mark[2] :]
         del self._counted[mark[3] :]
         self._refused = mark[4]
+        self._raise_on_failure = mark[5]
 
     def _begin(self, number: int, *, last: bool = False) -> None:
         """Records the round about to run.
@@ -1081,6 +1115,7 @@ class RunContext:
         self._final = []
         self._counted = []
         self._refused = None
+        self._raise_on_failure = None
 
 
 class _Whole:
@@ -1730,6 +1765,7 @@ def _run(
             declined,
             final=final_of,
             refused=refusals.get(attempts),
+            raise_on_failure=context._raise_on_failure,
         )
         lost_fates = (Outcome.REJECTED, Outcome.RETRYABLE, Outcome.UNKNOWN, _RAISED, _UNREAD)
         excluded = sum(
@@ -1839,6 +1875,7 @@ def _tally(
     *,
     final: Sequence[bool] = (),
     refused: Exception | None = None,
+    raise_on_failure: Exception | None = None,
 ) -> Delivery:
     """Counts the final fates of one run and applies the run-failed rule.
 
@@ -1853,6 +1890,7 @@ def _tally(
       declined: Whether the run was declined.
       final: Per index, whether its ``REJECTED`` is a final rejection; empty reads as none.
       refused: The refusal marker to record when the run fails.
+      raise_on_failure: The registered error to record when the run fails (SPEC-082).
 
     Returns:
       The run's record.
@@ -1884,6 +1922,7 @@ def _tally(
         skipped=sum(1 for one in fate if one is Outcome.SKIPPED),
         failed=failed,
         refused=refused if failed else None,
+        raise_on_failure=raise_on_failure if failed else None,
     )
 
 
@@ -1963,7 +2002,9 @@ def emit_via_deliver(
         ``SinkCounters``, naming its stored type name and the missing member, so a misspelt
         member is a counted failure rather than events that vanish.
       SinkDeliveryError: When the run failed, naming counts and the sink's type, never a value.
-      Exception: The refusal marker of a failed run's last round, by identity (SPEC-074).
+      Exception: The refusal marker of a failed run's last round, by identity (SPEC-074); or,
+        with no such refusal, the error a round registered through
+        :meth:`RunContext.raise_on_failure`, by identity (SPEC-082).
       BaseException: Whatever ``deliver`` raises that is not an ``Exception``.
     """
     events = _snapshot(batch)
@@ -1999,6 +2040,8 @@ def emit_via_deliver(
     if delivery.failed:
         if delivery.refused is not None:
             raise delivery.refused
+        if delivery.raise_on_failure is not None:
+            raise delivery.raise_on_failure
         raise SinkDeliveryError(
             f"delivered none of {len(events)} event(s): rejected {delivery.rejected}, "
             f"unresolved {delivery.unresolved}, raised {delivery.raised} after "

@@ -25,7 +25,10 @@ def delivery_error(err: Exception) -> Exception | None:
     ``SQLiteSink`` and the two file sinks let ``sqlite3.Error`` and ``OSError`` escape, so
     callers wrote ``except sqlite3.Error`` and ``except OSError`` around them; the library's own
     word for "this sink delivered none of the batch" is ``SinkDeliveryError``. The instance built
-    here is both, so every one of those ``except`` clauses still matches (SPEC-069 FR-004).
+    here is both, so every one of those ``except`` clauses still matches (SPEC-069 FR-004). The
+    file sinks build it for whatever ``Exception`` their handle raised, a ``ValueError`` as much
+    as an ``OSError``, and hand it to the delivery engine to raise from an ``emit`` whose run
+    landed nothing (``RunContext.raise_on_failure``, SPEC-082).
 
     It is an instance of a class derived at run time from ``SinkDeliveryError`` and the
     original's own class, one per original class (:func:`_dual`). The class keeps the original's

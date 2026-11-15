@@ -12,29 +12,30 @@ from __future__ import annotations
 import ast
 import gc
 import pathlib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import log_foundry
+from file_handles import budget
 from log_foundry import _fork, _lifecycle
 from log_foundry.sinks import verdict
 from log_foundry.sinks.file import FileSink
 from log_foundry.sinks.memory import MemorySink
 from log_foundry.sinks.multi import MultiSink
 from log_foundry.sinks.verdict import SinkCounters
-from log_foundry.worker import Worker
+from test_file_sink_fork import TAIL_MARKER
 from test_fork_lifecycle import (
     _AdapterEngineSink,
-    _GatingStream,
     _held_by_a_parent_thread,
-    _lines_holding,
     _log_in_child,
-    _park_inside_a_buffered_batch,
     run_in_child,
 )
 from test_lifecycle_races import _HOOKED, _HookSink
 from test_sink_ownership import StructuralSink, ThirdPartyWrapper
+
+if TYPE_CHECKING:
+    from log_foundry.worker import Worker
 
 _SRC = pathlib.Path(log_foundry.__file__).resolve().parent
 
@@ -252,49 +253,45 @@ class _Buried(MemorySink):
         self.buried = [[inner]]
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Delivers through the buried sink, so the parent's drain thread parks inside it."""
+        """Delivers through the buried sink."""
         self.buried[0][0].emit(batch)
 
 
-def _forwarded_file_sink(
-    tmp_path: pathlib.Path, shape: str
-) -> tuple[Any, _GatingStream, pathlib.Path]:
+def _fork_with_a_tail_pending(tmp_path: pathlib.Path, shape: str) -> bytes:
+    """Forks with a forwarded ``FileSink`` holding a pending tail, and returns the file after.
+
+    Since SPEC-082 what a file sink's child could write twice is the parent's pending tail, not
+    a buffer: nine bytes of a line are on disk and the rest, which ends in ``TAIL_MARKER``, is
+    the parent's to write. The child logs once, then the parent's next section finishes the line.
+    A line is on disk before the fork, so a child reopening in ``"w"`` mode would be seen.
+    """
     path = tmp_path / f"{shape}.ndjson"
     inner = FileSink(str(path))
     inner.emit([{"msg": "before-the-fork"}])
-    stream = _GatingStream(inner._stream, park_after=1)
-    inner._stream = stream  # type: ignore[assignment]
+    budget(inner, 9, once=True)
+    inner.emit([{"msg": "parent-torn", "end": TAIL_MARKER.decode()}])
+    assert inner._tail is not None and TAIL_MARKER not in path.read_bytes()
     sink: Any = ThirdPartyWrapper(inner) if shape == "wrapper" else _Buried(inner)
     log_foundry.configure(service="walk", version="0", env="test", sink=sink)
-    return sink, stream, path
-
-
-def _fork_inside_the_batch(tmp_path: pathlib.Path, shape: str) -> str:
-    sink, stream, path = _forwarded_file_sink(tmp_path, shape)
-    worker = Worker(sink, batch_size=1, flush_interval=0.01)
-    _lifecycle._state._worker = worker
-    gate = _park_inside_a_buffered_batch(stream, worker)
-    try:
-        child = run_in_child(_log_in_child, timeout=6)
-    finally:
-        gate.release.set()
+    child = run_in_child(_log_in_child, timeout=6)
     assert child.output == "logged", child.output
-    assert log_foundry.flush(timeout=5.0)
-    return path.read_text(encoding="utf-8")
+    inner.emit([{"msg": "parent-next"}])
+    return path.read_bytes()
 
 
 @pytest.mark.parametrize("shape", ["wrapper", "buried"])
-def test_a_forwarded_file_sink_strands_the_parents_pending_bytes(
+def test_a_forwarded_file_sink_drops_the_parents_pending_tail(
     tmp_path: pathlib.Path, shape: str
 ) -> None:
-    """FR-003: behind a third-party wrapper or two containers down, the child writes none again."""
-    written = _fork_inside_the_batch(tmp_path, shape)
-    for marker in ("before-the-fork", "parent-a", "parent-b"):
-        assert _lines_holding(written, marker) == 1, f"{marker} in {written!r}"
+    """FR-003: behind a third-party wrapper or two containers down, the child writes none of it."""
+    written = _fork_with_a_tail_pending(tmp_path, shape)
+    assert written.count(TAIL_MARKER) == 1, written
+    assert written.count(b"before-the-fork") == 1, written
+    assert b'"message": "child"' in written
 
 
 @pytest.mark.parametrize("shape", ["wrapper", "buried"])
-def test_without_forwarded_hooks_the_same_child_duplicates(
+def test_without_forwarded_hooks_the_same_child_writes_the_tail(
     tmp_path: pathlib.Path, shape: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control: a marking frontier that collects no hooks from forwarded seeds duplicates."""
@@ -305,8 +302,8 @@ def test_without_forwarded_hooks_the_same_child_duplicates(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(_lifecycle, "_mark_frontier", no_hooks)
-    written = _fork_inside_the_batch(tmp_path, shape)
-    assert _lines_holding(written, "parent-a") == 2, written
+    written = _fork_with_a_tail_pending(tmp_path, shape)
+    assert written.count(TAIL_MARKER) == 2, written
 
 
 def test_a_forwarded_seed_is_repaired_before_the_ceiling(

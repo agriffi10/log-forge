@@ -455,3 +455,126 @@ def test_only_an_engine_runs_last_round_is_last() -> None:
     one_round(Probe().deliver, [{"i": 0}])
     assert seen == [(1, False)], "a detached round's caller owns any later round"
     assert run_context().last is False
+
+
+# --- SPEC-082: the error a failed run's adapter raises ------------------------------------------
+
+
+def _registering(
+    error: Exception | None,
+    outcome: Outcome = R,
+    *,
+    refuse: Exception | None = None,
+    then_raise: bool = False,
+) -> Any:
+    """A script step that registers ``error`` to raise on failure, then answers ``outcome``."""
+
+    def step(batch: list[dict[str, object]]) -> Verdict:
+        context = run_context()
+        if error is not None:
+            context.raise_on_failure(error)
+        if refuse is not None:
+            context.refuse(refuse)
+        if then_raise:
+            raise RuntimeError("the round raised after registering")
+        return Verdict.uniform(outcome, len(batch))
+
+    return step
+
+
+def _inline(script: list[Any]) -> Scripted:
+    sink = Scripted(script, max_retries=len(script) - 1)
+    sink.log_foundry_stop_signal = _stop()
+    return sink
+
+
+def test_raise_on_failure_is_raised_by_identity_when_the_run_fails() -> None:
+    """The adapter raises the registered error itself, in place of its own."""
+    registered = PermissionError(13, "denied")
+    sink = _inline([_registering(registered, J)])
+    with pytest.raises(PermissionError) as caught:
+        sink.emit(events(2))
+    assert caught.value is registered
+
+
+def test_the_last_raise_on_failure_of_a_run_wins() -> None:
+    """It is not cleared between rounds, and a later round's call replaces an earlier one's."""
+    first, second = OSError(28, "first"), OSError(28, "second")
+    sink = _inline([_registering(first), _registering(second)])
+    with pytest.raises(OSError) as caught:
+        sink.emit(events(1))
+    assert caught.value is second
+
+    kept = OSError(28, "kept")
+    sink = _inline([_registering(kept), _registering(None)])
+    with pytest.raises(OSError) as caught:
+        sink.emit(events(1))
+    assert caught.value is kept, "a round that registers nothing leaves the earlier error"
+
+
+def test_a_round_set_aside_restores_the_earlier_raise_on_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A round that raises is rewound, its registration with it, so the earlier error stands."""
+    first, second = OSError(28, "first"), OSError(28, "second")
+    sink = _inline([_registering(first), _registering(second, then_raise=True)])
+    with pytest.raises(OSError) as caught:
+        sink.emit(events(1))
+    assert caught.value is first
+    assert "RuntimeError" in capsys.readouterr().err
+
+
+def test_a_refusal_in_the_last_round_takes_precedence() -> None:
+    registered = OSError(28, "full")
+    refusal = RuntimeError("the sink is closed")
+    sink = _inline([_registering(registered), _registering(None, J, refuse=refusal)])
+    with pytest.raises(RuntimeError) as caught:
+        sink.emit(events(1))
+    assert caught.value is refusal
+
+    both = _inline([_registering(registered, J, refuse=refusal)])
+    with pytest.raises(RuntimeError) as caught:
+        both.emit(events(1))
+    assert caught.value is refusal, "registered in the same round, the refusal still wins"
+
+
+def test_a_settled_run_raises_nothing() -> None:
+    """A run that settles returns whatever was registered, and its record carries no error."""
+    sink = _inline([_registering(OSError(28, "full"), Outcome.UNKNOWN)])
+    sink.emit(events(1))
+    delivery = _deliver(Scripted([_registering(OSError(28, "full"), Outcome.UNKNOWN)]), events(1))
+    assert (delivery.failed, delivery.raise_on_failure) == (False, None)
+
+
+def test_close_drops_it_and_an_immediate_context_ignores_it() -> None:
+    """Invariant 12: a closed context holds no exception, and through it no sink."""
+    kept: list[RunContext] = []
+    registered = OSError(28, "full")
+
+    def step(batch: list[dict[str, object]]) -> Verdict:
+        context = run_context()
+        kept.append(context)
+        context.raise_on_failure(registered)
+        assert context._raise_on_failure is registered
+        return Verdict.uniform(J, len(batch))
+
+    delivery = _deliver(Scripted([step]), events(1))
+    assert delivery.raise_on_failure is registered, "the record carries it out of the run"
+    assert kept[0]._raise_on_failure is None, "the closed context does not"
+
+    outside = RunContext(immediate=True)
+    outside.raise_on_failure(registered)
+    assert outside._raise_on_failure is None, "outside any run it does nothing"
+
+
+def test_raise_on_failure_moves_no_count_to_the_catcher() -> None:
+    """Unlike a refusal, the failed run's events are still counted in ``failed_events``."""
+    registering = _inline([_registering(OSError(28, "full"), J)])
+    with pytest.raises(OSError):
+        registering.emit(events(3))
+    assert registering.log_foundry_counters.losses().failed == 3
+
+    refusing = _inline([_registering(None, J, refuse=RuntimeError("closed"))])
+    with pytest.raises(RuntimeError):
+        refusing.emit(events(3))
+    assert refusing.log_foundry_counters.losses().failed == 0, "the contrast: a refusal counts none"

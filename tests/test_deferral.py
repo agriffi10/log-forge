@@ -236,7 +236,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/kafka.py": {"KafkaSink": ("emit",)},
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
     "sinks/stdout.py": {"StdoutSink": ("emit",)},
-    "sinks/file.py": {"FileSink": ("emit",), "RotatingFileSink": ("emit",)},
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
     "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
@@ -268,14 +267,7 @@ IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
     ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
     ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
-    ("RotatingFileSink", "emit"): frozenset({"_size", "_failed"}),
-    ("FileSink", "emit"): frozenset({"_failed"}),
     ("SQLiteSink", "emit"): frozenset({"_failed"}),
-    ("RotatingFileSink", "_rotate_or_continue"): frozenset(
-        {"_stream", "_size", "_next_rollover", "_rotation_failing"}
-    ),
-    ("RotatingFileSink", "_rotate"): frozenset({"_stream", "_size", "_next_rollover"}),
-    ("RotatingFileSink", "_ensure_open"): frozenset({"_stream", "_size"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -296,12 +288,12 @@ counts as it happens rather than through the ``Deferral``:
   expired; the same upper bound.
 - ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
   pending list, rebound as futures settle or are put back; state, not a count.
-- ``RotatingFileSink.emit``, ``_rotate_or_continue``, ``_rotate`` and ``_ensure_open`` / ``_size``, ``_stream``,
-  ``_next_rollover``, ``_rotation_failing``: the active file's handle, its tracked size, the
-  next time trigger and the once-per-outage flag; state, not a count.
-- ``FileSink.emit``, ``RotatingFileSink.emit`` and ``SQLiteSink.emit`` / ``_failed``: a batch
-  whose write, flush or insert raised a driver error, counted before the raise (SPEC-069 FR-004);
-  an upper bound, the recorded exception of invariant 2, never a ``dropped`` counter.
+- ``SQLiteSink.emit`` / ``_failed``: a batch whose insert raised a driver error, counted before
+  the raise (SPEC-069 FR-004); an upper bound, the recorded exception of invariant 2, never a
+  ``dropped`` counter. The file sinks held the same entry, and four more for the handle, the
+  tracked size, the time trigger and the once-per-outage flag, until SPEC-082 put them on the
+  delivery engine: they left this table with ``sinks/file.py``'s place in the roster above, as
+  each of SPEC-074's sinks did.
 
 - ``KafkaSink.emit`` / ``failed``: the messages a call handed to the producer while the close's
   release overtook it (SPEC-076 FR-003), counted beside ``_on_delivery``'s and only when the call

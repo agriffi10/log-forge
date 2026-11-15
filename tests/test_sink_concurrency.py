@@ -1013,22 +1013,27 @@ DELIVER_LOCKERS = frozenset(
     {
         "AzureEventHubsSink",
         "ClickHouseSink",
+        "FileSink",
         "NATSSink",
         "PostgresSink",
         "RabbitMQSink",
+        "RotatingFileSink",
         "SocketTransport",
     }
 )
-"""SPEC-074 FR-006: the engine sinks whose ``deliver`` enters the transport lock, by name."""
+"""SPEC-074 FR-006: the engine sinks whose ``deliver`` enters the transport lock, by name.
+
+Eight since SPEC-082 put the two file sinks on the engine, where they were ``EMIT_LOCKERS``.
+"""
 
 
-def test_the_engine_sinks_that_lock_in_deliver_are_the_six() -> None:
-    """FR-006's floor for the re-aimed lock roster: the walk from ``deliver`` finds all six.
+def test_the_engine_sinks_that_lock_in_deliver_are_the_eight() -> None:
+    """FR-006's floor for the re-aimed lock roster: the walk from ``deliver`` finds all eight.
 
     :func:`_takes_the_transport_lock` now follows a helper a ``deliver`` hands on as well as one
-    it calls; were that walk to stop reaching ``_round``, these six would fall through to the
+    it calls; were that walk to stop reaching ``_round``, these eight would fall through to the
     docstring check rather than fail, so the set is pinned by name. Equality, not a floor, so a
-    seventh locking ``deliver`` is a decision someone writes here.
+    ninth locking ``deliver`` is a decision someone writes here.
     """
     found: set[str] = set()
     for _, cls in _sink_classes_with_an_emit():
@@ -1041,16 +1046,19 @@ def test_the_engine_sinks_that_lock_in_deliver_are_the_six() -> None:
     assert found == DELIVER_LOCKERS
 
 
-EMIT_LOCKERS = frozenset({"FileSink", "RotatingFileSink", "SQLiteSink"})
-"""SPEC-076 FR-005: the local sinks whose ``emit`` enters a ``SERIAL`` guard, by name."""
+EMIT_LOCKERS = frozenset({"SQLiteSink"})
+"""SPEC-076 FR-005: the local sinks whose ``emit`` enters a ``SERIAL`` guard, by name.
+
+Three until SPEC-082: ``FileSink`` and ``RotatingFileSink`` now lock in ``deliver``.
+"""
 
 
-def test_the_local_sinks_that_lock_in_emit_are_the_three() -> None:
-    """SPEC-076 FR-005: the three local ``SERIAL`` adopters are found locking through ``emit``.
+def test_the_local_sink_that_locks_in_emit_is_the_one() -> None:
+    """SPEC-076 FR-005: the one local ``SERIAL`` adopter still off the engine locks in ``emit``.
 
-    Their lock moved from ``with self._lock`` into the guard, so the walk must read
-    ``with self._guard.enter()`` in a ``SERIAL`` class; were it to stop, these three would fall
-    through to the docstring check and fail there, but pinning them by name says why. Equality,
+    Its lock moved from ``with self._lock`` into the guard, so the walk must read
+    ``with self._guard.enter()`` in a ``SERIAL`` class; were it to stop, it would fall
+    through to the docstring check and fail there, but pinning it by name says why. Equality,
     as ``DELIVER_LOCKERS`` is: a class without ``deliver`` that locks in ``emit`` is a decision.
     """
     found: set[str] = set()
@@ -2263,8 +2271,8 @@ SERIAL_DRIVERS = {
     "AzureEventHubsSink": ("_EHProducer", "send_batch"),
     "RabbitMQSink": ("_Channel", "basic_publish"),
     "SyslogSink": ("_Socket", "sendto"),
-    "FileSink": ("_Stream", "write"),
-    "RotatingFileSink": ("_Stream", "write"),
+    "FileSink": ("_Handle", "write"),
+    "RotatingFileSink": ("_Handle", "write"),
     "SQLiteSink": ("_SQLiteProxy", "executemany"),
 }
 """Each ``SERIAL`` adopter's rig and the one driver method a round reaches (``SyslogSink`` stands

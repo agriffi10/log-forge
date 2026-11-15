@@ -222,8 +222,11 @@ def test_sender_fault_is_the_truthiness_sqs_always_tested(value, fault) -> None:
 
 # --- FR-001: the loop roster -----------------------------------------------------------------
 
-_LOOP_FLOOR = 11
+_LOOP_FLOOR = 13
 """The retry loops: twelve when SPEC-070 was built, eleven since SPEC-073 deleted ``HTTPSink._send``'s.
+
+Thirteen since SPEC-082: the loops became engine rounds in SPEC-074, and ``FileSink`` and
+``RotatingFileSink`` joined them, each with a ``_retryable_error`` its round asks.
 
 Exactly the count rather than below it: a refactor that hides a loop from the scan — a ``while``,
 a bound named otherwise — must fail here rather than shrink the population silently. Raise it
@@ -424,10 +427,10 @@ def engine_round_findings(
 
 
 def test_every_retry_loop_asks_its_sinks_predicate() -> None:
-    """FR-001 AC-10, restated by SPEC-074 FR-006 over the engine rounds, floor 11.
+    """FR-001 AC-10, restated by SPEC-074 FR-006 over the engine rounds, floor 13 since SPEC-082.
 
     No retry loop is left in the tree; :func:`retry_loop_findings` still judges one should it
-    return. The eleven engine sinks other than the named exclusions are held to the rule instead.
+    return. The thirteen engine sinks other than the named exclusions are held to the rule instead.
     """
     engine, engine_findings = engine_round_findings(_SINKS)
     loops, findings = retry_loop_findings(_SINKS, floor=0)
@@ -499,13 +502,13 @@ def test_removing_a_wrapper_exclusion_reddens_naming_it(wrapper: str) -> None:
     """SPEC-075 FR-001: each wrapper now defines ``deliver``, so its exclusion is load-bearing.
 
     Before SPEC-075 no wrapper defined ``deliver`` and removing the entry changed nothing; now the
-    roster names the class, and the population with every exclusion in place stays eleven.
+    roster names the class, and the population with every exclusion in place stays thirteen.
     """
     exclusions = {k: v for k, v in ENGINE_EXCLUSIONS.items() if k != wrapper}
     owners, findings = engine_round_findings(_SINKS, exclusions)
     assert wrapper in owners
     assert any(wrapper in f and "defines no _retryable_error" in f for f in findings), findings
-    assert len(engine_round_findings(_SINKS)[0]) == 11
+    assert len(engine_round_findings(_SINKS)[0]) == 13
 
 
 _CORPUS_HEAD = '"""A fixture sink module."""\n\nfrom x import is_retryable\n\n'
@@ -575,11 +578,11 @@ def test_the_loop_roster_names_the_class_and_the_reason(tmp_path, source, reason
     assert findings[0].startswith("fixture.py:")
 
 
-@pytest.mark.parametrize(("count", "silent"), [(10, False), (11, True)])
-def test_the_loop_roster_fails_ten_conforming_loops_on_its_floor(
+@pytest.mark.parametrize(("count", "silent"), [(12, False), (13, True)])
+def test_the_loop_roster_fails_twelve_conforming_loops_on_its_floor(
     tmp_path, count: int, silent: bool
 ) -> None:
-    """Eleven conforming loops are silent; ten fail on the floor alone, by the same path."""
+    """Thirteen conforming loops are silent; twelve fail on the floor alone, by the same path."""
     body = "".join(_corpus_class(f"Good{i}", _GOOD) for i in range(count))
     (tmp_path / "fixture.py").write_text(_CORPUS_HEAD + body, encoding="utf-8")
     loops, findings = retry_loop_findings(tmp_path)
@@ -588,7 +591,7 @@ def test_the_loop_roster_fails_ten_conforming_loops_on_its_floor(
         assert findings == []
     else:
         expected = (
-            "the scan found 10 retry loops, under its floor of 11: a refactor hid one from it, "
+            "the scan found 12 retry loops, under its floor of 13: a refactor hid one from it, "
             "or one was deleted without lowering the floor"
         )
         assert findings == [expected]
@@ -834,11 +837,27 @@ _LOOPS: dict[str, Callable[[pytest.MonkeyPatch, Path, int], _Built]] = {
 }
 """Each loop class, by the class that owns the loop, and how to build it at a chosen bound."""
 
+_SWEEP_EXCLUSIONS: dict[str, str] = {
+    "FileSink": (
+        "no max_retries of its own and a predicate over errno, never over ConnectionError "
+        "(SPEC-082); the sweep's four properties are held for it in "
+        "tests/test_file_sink_deliver.py"
+    ),
+    "RotatingFileSink": "as FileSink",
+}
+"""Engine rounds the sweep below cannot drive, each with its reason and where it is held instead.
+
+The sweep sets a sink's own ``max_retries`` and expects builtin ``ConnectionError`` to be retried
+``max_retries + 1`` times through ``emit``. A file sink's inline ``emit`` is one round, and its
+predicate retries an ``OSError`` by ``errno`` alone.
+"""
+
 
 def test_the_sweep_covers_every_retry_loop_the_roster_finds() -> None:
     loops, _ = retry_loop_findings(_SINKS, floor=0)
     engine, _ = engine_round_findings(_SINKS)
-    assert {loop.owner for loop in loops} | set(engine) == set(_LOOPS)
+    assert {loop.owner for loop in loops} | set(engine) == set(_LOOPS) | set(_SWEEP_EXCLUSIONS)
+    assert not set(_LOOPS) & set(_SWEEP_EXCLUSIONS)
 
 
 _EVENTS = [{"log_id": "a", "level": "INFO", "message": "one"}]

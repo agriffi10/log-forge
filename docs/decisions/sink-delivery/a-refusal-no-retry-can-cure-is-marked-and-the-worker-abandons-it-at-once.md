@@ -104,6 +104,16 @@ case under a real `os.fork`.
 
 ## History
 
+### 2026-11-15
+
+- **Narrowed** by SPEC-082: `FileSink` and `RotatingFileSink` are engine sinks now, so they
+  leave the closed emit-only sinks this entry lists and are spared the resend as every engine
+  sink is. That supersedes 1.x for one shape the provenance rule had kept: a caller's subclass
+  of a file sink that inherits `emit` and re-opens itself after a close is no longer resent,
+  because the worker calls its `deliver` and a closed sink's round is final; a subclass that
+  wants the resend overrides `emit`. The two tests guarding the worker's 1.x loop on that
+  shape, and on a refusal after a transient failure, moved to `SQLiteSink`.
+
 ### 2026-11-12
 
 - **Settled.** The maintainer chose the private mark over putting the refusing sinks on the engine,

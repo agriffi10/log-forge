@@ -65,23 +65,19 @@ def test_sqlite_raises_a_dual_typed_error_counted_and_announced(
 # --- the file sinks ---------------------------------------------------------------------------
 
 
-class FailingStream:
-    """A stream whose write or flush raises the given error; the other call succeeds."""
+class FailingHandle:
+    """A binary handle whose every write raises the given error, having taken nothing.
 
-    def __init__(self, error: OSError, *, at: str) -> None:
+    The file sinks write through an unbuffered handle since SPEC-082, so a write call is the
+    only place a full disk can surface: there is no flush to fail separately, which is why the
+    ``flush`` half of these cases went with the text stream.
+    """
+
+    def __init__(self, error: OSError) -> None:
         self._error = error
-        self._at = at
-        self.written: list[str] = []
 
-    def write(self, data: str) -> int:
-        if self._at == "write":
-            raise self._error
-        self.written.append(data)
-        return len(data)
-
-    def flush(self) -> None:
-        if self._at == "flush":
-            raise self._error
+    def write(self, data: bytes) -> int:
+        raise self._error
 
     def close(self) -> None:
         pass
@@ -97,14 +93,16 @@ def _file_sink(cls: type, tmp_path: Path, stream: object) -> Any:
 FILE_SINKS = [FileSink, RotatingFileSink]
 
 
-@pytest.mark.parametrize("at", ["write", "flush"])
 @pytest.mark.parametrize("cls", FILE_SINKS, ids=lambda c: c.__name__)
 def test_a_full_disk_raises_a_dual_typed_oserror_counted_and_announced(
-    cls: type, at: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    cls: type, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """FR-004 AC2: ``OSError(28)`` from a write, and separately a flush."""
+    """FR-004 AC2: ``OSError(28)`` from a write that took nothing.
+
+    The line names the attempts since SPEC-082 routed it through the engine's ``raised_line``.
+    """
     original = OSError(28, "No space left on device")
-    sink = _file_sink(cls, tmp_path, FailingStream(original, at=at))
+    sink = _file_sink(cls, tmp_path, FailingHandle(original))
     with pytest.raises(OSError) as caught:
         sink.emit([dict(e) for e in BATCH])
     err = caught.value
@@ -114,7 +112,7 @@ def test_a_full_disk_raises_a_dual_typed_oserror_counted_and_announced(
     assert err.__cause__ is original
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
     assert _lost_lines(capsys.readouterr().err) == [
-        f"log-foundry: lost 2 event(s); {cls.__name__}, OSError errno=28"
+        f"log-foundry: lost 2 event(s); {cls.__name__}, 1 attempt(s), OSError errno=28"
     ]
 
 
@@ -124,7 +122,7 @@ def test_a_permission_error_stays_a_permission_error_and_plain_text_stays_plain(
 ) -> None:
     """FR-004 AC2: the subclass is kept, and no unset attribute corrupts ``str()``."""
     denied = PermissionError(13, "Permission denied", "/var/log/app.ndjson")
-    sink = _file_sink(cls, tmp_path, FailingStream(denied, at="write"))
+    sink = _file_sink(cls, tmp_path, FailingHandle(denied))
     with pytest.raises(PermissionError) as caught:
         sink.emit([dict(e) for e in BATCH])
     assert isinstance(caught.value, SinkDeliveryError)
@@ -132,7 +130,7 @@ def test_a_permission_error_stays_a_permission_error_and_plain_text_stays_plain(
     assert caught.value.filename == "/var/log/app.ndjson"
 
     plain = OSError("plain")
-    sink = _file_sink(cls, tmp_path, FailingStream(plain, at="write"))
+    sink = _file_sink(cls, tmp_path, FailingHandle(plain))
     with pytest.raises(OSError) as caught_plain:
         sink.emit([dict(e) for e in BATCH])
     assert str(caught_plain.value) == "plain"
@@ -146,9 +144,7 @@ def _raise_from(build: str, tmp_path: Path) -> BaseException:
     if build == "sqlite":
         sink: Any = _sqlite_with_its_table_dropped(tmp_path)
     else:
-        sink = _file_sink(
-            FileSink, tmp_path, FailingStream(OSError(28, "No space left on device"), at="write")
-        )
+        sink = _file_sink(FileSink, tmp_path, FailingHandle(OSError(28, "No space left on device")))
     try:
         sink.emit([dict(e) for e in BATCH])
     except BaseException as err:
@@ -208,21 +204,19 @@ def test_a_factory_that_cannot_build_leaves_the_original_raised(
     """FR-004 AC6: the original, unchanged, still counted and announced."""
     original = Picky(28, why="full")
     assert delivery_error(original) is None
-    sink = _file_sink(cls, tmp_path, FailingStream(original, at="write"))
+    sink = _file_sink(cls, tmp_path, FailingHandle(original))
     with pytest.raises(Picky) as caught:
         sink.emit([dict(e) for e in BATCH])
     assert caught.value is original
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
     assert _lost_lines(capsys.readouterr().err) == [
-        f"log-foundry: lost 2 event(s); {cls.__name__}, Picky errno=28"
+        f"log-foundry: lost 2 event(s); {cls.__name__}, 1 attempt(s), Picky errno=28"
     ]
 
 
 def test_the_worker_path_is_as_before_and_the_sink_now_reports_failed(tmp_path: Path) -> None:
     """FR-004 AC7, worker path: ``failed_batches`` and ``flush()`` as before, ``failed`` moves."""
-    sink = _file_sink(
-        FileSink, tmp_path, FailingStream(OSError(28, "No space left on device"), at="write")
-    )
+    sink = _file_sink(FileSink, tmp_path, FailingHandle(OSError(28, "No space left on device")))
     log_foundry.configure(service="t", sink=sink)
 
     @log_foundry.trace
@@ -240,9 +234,7 @@ def test_the_worker_path_is_as_before_and_the_sink_now_reports_failed(tmp_path: 
 
 def test_the_orphan_path_counts_the_event_and_the_sink_moves_with_it(tmp_path: Path) -> None:
     """FR-004 AC7, orphan path: ``orphan_lost`` and the sink's ``failed`` both move."""
-    sink = _file_sink(
-        FileSink, tmp_path, FailingStream(OSError(28, "No space left on device"), at="write")
-    )
+    sink = _file_sink(FileSink, tmp_path, FailingHandle(OSError(28, "No space left on device")))
     log_foundry.configure(service="t", sink=sink)
     log_foundry.info("outside any span")
     health = log_foundry.health()
@@ -274,9 +266,7 @@ def test_an_unencodable_event_beside_a_driver_error_is_in_failed(
     if build == "sqlite":
         sink: Any = _sqlite_with_its_table_dropped(tmp_path)
     else:
-        sink = _file_sink(
-            FileSink, tmp_path, FailingStream(OSError(28, "No space left on device"), at="write")
-        )
+        sink = _file_sink(FileSink, tmp_path, FailingHandle(OSError(28, "No space left on device")))
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"log_id": "a"}, {"log_id": "b", "blob": b"x"}])
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
@@ -384,7 +374,7 @@ def test_a_failed_reopen_is_counted_and_the_sink_recovers(
     losses = sink.losses()
     assert losses is not None and losses.failed == 1 + 2
     assert _lost_lines(capsys.readouterr().err) == [
-        "log-foundry: lost 2 event(s); RotatingFileSink, PermissionError errno=13"
+        "log-foundry: lost 2 event(s); RotatingFileSink, 1 attempt(s), PermissionError errno=13"
     ]
 
     monkeypatch.undo()

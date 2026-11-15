@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A sink declares what it retries, and anything else fails at once"
-description: "every sink retry loop, and since SPEC-074 every engine sink's round, asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver` (the HTTP family since SPEC-073, the SDK, driver and socket sinks since SPEC-074), whose refused events are final. (SPEC-070, SPEC-073, SPEC-074)"
+description: "every engine sink's round asks `is_retryable(self._retryable_error, err)` and retries only what its sink's predicate names: the driver's documented transient classes, resolved per call and never imported, plus builtin `ConnectionError` and `TimeoutError`; the file sinks' predicate is an `errno` set and accepts neither. Anything else, a predicate that raises included, is counted and announced at its first attempt with no backoff; `emit` still raises when nothing landed, so the worker re-sends it, except to an engine sink offered `deliver`, whose refused events are final. (SPEC-070, SPEC-073, SPEC-074, SPEC-082)"
 ---
 
 **A sink declares what it retries, and anything else fails at once** — before SPEC-070 ten SDK and
@@ -47,8 +47,11 @@ that wrapper, which is why the loop roster refuses it.
 its module is loaded, so a sink given an injected client with no extra installed imports nothing.
 The drivers are imported lazily — `PostgresSink._connect` imports `psycopg` on first connect — so a
 set resolved at import or in `__init__` would be `()` and stay `()`, failing every transient error
-at once. Every predicate also accepts the builtin `ConnectionError` and `TimeoutError`, what an
-injected client or a stand-in raises for a dropped connection or a timeout.
+at once. Every driver predicate also accepts the builtin `ConnectionError` and `TimeoutError`, what an
+injected client or a stand-in raises for a dropped connection or a timeout. The file sinks'
+predicate does not (SPEC-082): a file has no connection to drop, so it retries an `OSError` by
+its `errno` alone, and a builtin `ConnectionError` or `TimeoutError`, which carries none of those
+codes, fails at once like any other exception.
 
 **What each sink retries**, read at the locked driver versions:
 
@@ -63,6 +66,7 @@ injected client or a stand-in raises for a dropped connection or a timeout.
 | `RabbitMQSink` | `AMQPConnectionError` except `AuthenticationError`, `ProbableAuthenticationError`, `ProbableAccessDeniedError`, `IncompatibleProtocolError`, `ConnectionClosedByClient` and `ConnectionOpenAborted`; `ChannelWrongStateError` | `ChannelClosedByBroker`, `ProtocolSyntaxError` | pika 1.4.4 `exceptions.py`; `NackError` and `UnroutableError` are unreachable, since the sink enables neither `confirm_delivery` nor `mandatory` |
 | `AzureEventHubsSink` | `ConnectionLostError`, `ConnectError` except `AuthenticationError`, `OperationTimeoutError` | `EventDataError`, `EventDataSendError`, `ClientClosedError`, a bare `EventHubError` | azure-eventhub 5.15.1 `exceptions.py`, `_transport/_pyamqp_transport.py` |
 | `PostgresSink` | an `OperationalError` whose SQLSTATE class is `08`, `40`, `53` or `57`, or which is `55P03` or `55006`; one with no SQLSTATE that is not a connect-time refusal | class `28`, `54`, the rest of `55` and every other `OperationalError`; `DataError`, `IntegrityError`, `ProgrammingError`, `InternalError`, `InterfaceError`, `NotSupportedError` | psycopg 3.3.6 `errors.py`, which files every server condition under `OperationalError`, so the SQLSTATE decides; PostgreSQL's *Appendix A* for the classes |
+| `FileSink`, `RotatingFileSink` | an `OSError` whose `errno` is `ENOSPC`, `EDQUOT`, `EFBIG`, `EIO`, `EAGAIN`, `EMFILE` or `ENFILE`, and no builtin by its class | `EACCES`, `EPERM`, `EROFS`, an `OSError` with no `errno`, and any exception that is not an `OSError` | SPEC-082 FR-004: what a resend can cure, space freed, a limit raised or a descriptor released |
 
 **PostgreSQL's connect-time refusal is recognised by its text**, because nothing structured carries
 it: psycopg raises every failed connect as a plain `OperationalError` with `sqlstate=None`, and at
@@ -124,13 +128,24 @@ See above: a lazily imported driver would leave the set empty for good.
 **Do NOT build** a retry loop that does not ask `is_retryable(self._retryable_error, err)`, a
 predicate that imports its driver, or a cached class set. `tests/test_classify.py` holds the loops
 to the rule with a roster derived from the AST (every `for` over `range(...)` naming `retries`, a
-floor of eleven since SPEC-073, a fixture corpus; restated by SPEC-074 over the engine sinks'
-rounds, every class defining `deliver` less its named exclusions, floor 11), holds `http.py` to reaching `_attempt` only
+floor shared with the engine rounds, a fixture corpus; restated by SPEC-074 over the engine sinks'
+rounds, every class defining `deliver` less its named exclusions, floor 13 since SPEC-082 added
+the two file sinks, eleven before), holds `http.py` to reaching `_attempt` only
 through `_exchange` inside an engine round, holds SQS and SNS to reading `SenderFault` only through
 `sender_fault`, and — on the integration workflow's extras leg — checks every class name a
 predicate resolves exists in the installed driver, so a rename cannot empty a set unnoticed.
 
 ## History
+
+### 2026-11-15
+
+- **Refined** by SPEC-082: `FileSink` and `RotatingFileSink` join the engine rounds with a
+  predicate over `errno`, the first that does not accept builtin `ConnectionError` and
+  `TimeoutError`, so the fence and the paragraph that said every predicate accepts them are
+  rewritten. `tests/test_classify.py`'s engine-round floor is 13, and the two are excluded by
+  name from its retry sweep, which sets a sink's own `max_retries`; the sweep's four properties
+  are held for them in `tests/test_file_sink_deliver.py`. 1.x's worker resent a file sink on
+  every raise.
 
 ### 2026-11-12
 
