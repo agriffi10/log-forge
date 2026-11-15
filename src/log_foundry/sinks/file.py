@@ -256,7 +256,7 @@ def _take(stream: io.FileIO, data: bytes, counts: list[int]) -> None:
     size = len(data)
     taken = 0
     while taken < size:
-        counts.extend(map(stream.write, (data[taken:] if taken else data,)))
+        counts.extend(map(stream.write, (data[taken:] if taken > 0 else data,)))
         reached = _taken(counts, size)
         if reached == taken:
             raise OSError(errno.EAGAIN, "the write call took no bytes")
@@ -354,9 +354,13 @@ def _owes_mark(stream: io.FileIO, mark: bytes) -> bool:
     """Reports whether a handle just opened owes its file a byte order mark.
 
     A mark is owed only when the codec has one, the handle is seekable and it stands at offset 0
-    when opened, which is the test 1.x's text stream made: an empty regular file gets one mark,
-    a non-empty one none, and a path that cannot seek, a FIFO, none. The handle is closed if
-    asking it raises, so a construction or a fork hook that fails here leaks no descriptor.
+    when opened: an empty regular file gets one mark, a non-empty one none, and a path that
+    cannot seek, a FIFO, none. On a regular file that is what 1.x's text stream wrote for every
+    codec with a mark, and on a pipe it is what 1.x wrote for ``utf-16`` and ``utf-32``. It is
+    not what 1.x wrote for ``utf-8-sig`` on a pipe: there 1.x wrote the mark on every open, so a
+    reader that stayed across two opens of one FIFO found a mark in the middle of its stream,
+    and this sink writes none (SPEC-082). The handle is closed if asking it raises, so a
+    construction or a fork hook that fails here leaks no descriptor.
 
     Args:
       stream: The handle, as ``open`` returned it.
@@ -805,7 +809,7 @@ class FileSink:
           None.
         """
         found = self.log_foundry_counters.losses()
-        if not (found.dropped or found.failed):
+        if found.dropped == 0 and found.failed == 0:
             return None
         return found
 
@@ -925,7 +929,7 @@ class FileSink:
         Raises:
           None.
         """
-        self._bom_owed = bool(baseline) and not taken
+        self._bom_owed = baseline != 0 and taken == 0
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed write is worth another round (SPEC-082 FR-004, SPEC-070).
@@ -1263,7 +1267,7 @@ class RotatingFileSink:
           None.
         """
         found = self.log_foundry_counters.losses()
-        if not (found.dropped or found.failed):
+        if found.dropped == 0 and found.failed == 0:
             return None
         return found
 

@@ -211,3 +211,31 @@ def test_the_hook_closes_the_handle_it_inherited(tmp_path: pathlib.Path, cls: ty
     sink.emit([{"msg": "after"}])
     sink.close()
     assert path.read_bytes() == b'{"msg": "before"}\n{"msg": "after"}\n'
+
+
+def test_the_hook_owes_the_mark_again_when_the_file_was_emptied(tmp_path: pathlib.Path) -> None:
+    """The hook asks the handle it opened, not the parent's record of having written the mark."""
+    path = tmp_path / "emptied.ndjson"
+    sink = FileSink(str(path), encoding="utf-8-sig")
+    sink.emit([{"msg": "before"}])
+    assert path.read_bytes() == b'\xef\xbb\xbf{"msg": "before"}\n'
+    os.truncate(path, 0)
+    sink.reacquire_after_fork()
+    sink.emit([{"msg": "after"}])
+    sink.close()
+    assert path.read_bytes() == b'\xef\xbb\xbf{"msg": "after"}\n'
+
+
+def test_the_hook_owes_no_mark_when_another_descriptor_wrote_first(tmp_path: pathlib.Path) -> None:
+    """A sink that never wrote still owes its mark, until the hook finds the file not empty."""
+    path = tmp_path / "shared.ndjson"
+    sink = FileSink(str(path), encoding="utf-8-sig")
+    other = FileSink(str(path), encoding="utf-8-sig")
+    other.emit([{"msg": "theirs"}])
+    other.close()
+    sink.reacquire_after_fork()
+    sink.emit([{"msg": "ours"}])
+    sink.close()
+    written = path.read_bytes()
+    assert written.count(b"\xef\xbb\xbf") == 1
+    assert written == b'\xef\xbb\xbf{"msg": "theirs"}\n{"msg": "ours"}\n'

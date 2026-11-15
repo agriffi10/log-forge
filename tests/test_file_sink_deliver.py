@@ -298,6 +298,26 @@ def test_a_pending_tail_shortens_by_exactly_what_a_failed_try_took(tmp_path: Pat
     assert (tmp_path / "j.ndjson").read_bytes() == WHOLE[:59]
 
 
+@BOTH
+def test_a_round_of_nothing_encodable_leaves_a_pending_tail_unwritten(
+    cls: type, tmp_path: Path
+) -> None:
+    """A round with no line to write makes no write call, so the tail waits for one that has."""
+    path = tmp_path / "nothing.ndjson"
+    sink = cls(str(path))
+    handle = budget(sink, 9, once=True)
+    sink.emit(list(EVENTS[:1]))
+    assert sink._tail is not None and sink._tail.remaining == b'"pad": "aaaa"}\n'
+    offered = len(handle.calls)
+    verdict = sink.deliver([{"blob": b"unencodable"}, {"blob": b"nor this"}])
+    assert verdict.outcomes == (D, D)
+    assert len(handle.calls) == offered, "no write call, for the tail or for anything else"
+    assert sink._tail is not None and sink._tail.remaining == b'"pad": "aaaa"}\n'
+    assert path.read_bytes() == b'{"n": 1, ', "the healthy handle was not asked to finish it"
+    sink.close()
+    assert path.read_bytes() == b'{"n": 1, "pad": "aaaa"}\n'
+
+
 def test_another_section_finishing_the_tail_leaves_the_run_nothing_to_write(
     tmp_path: Path,
 ) -> None:
@@ -701,6 +721,44 @@ def test_an_errno_no_resend_cures_costs_one_deliver_call_and_no_wait(
     waited = WaitRecorder()
     _engine.run_delivery(curable, list(EVENTS), worker_retries=3, stop=waited)
     assert len(again.outcomes) == 4 and len(waited.waits) == 3
+
+
+@pytest.mark.parametrize(
+    ("name", "calls", "waits"),
+    [("EACCES", 1, 0), ("ENOSPC", 4, 3)],
+    ids=["no-resend-cures-it", "a-resend-can-cure-it"],
+)
+@BOTH
+def test_a_real_worker_resends_only_what_a_resend_can_cure(
+    cls: type,
+    name: str,
+    calls: int,
+    waits: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The criterion above on the worker's own drain thread, at ``max_retries=3``.
+
+    The engine's wait is replaced by a recorder that returns at once, so the count of waits is
+    read from the engine itself and the curable case does not sleep its backoff.
+    """
+    entered: list[float] = []
+
+    def recorded(delay: float, stop: threading.Event | None) -> threading.Event | None:
+        entered.append(delay)
+        return stop
+
+    monkeypatch.setattr(_engine, "_wait", recorded)
+    sink = cls(str(tmp_path / "worker.ndjson"))
+    budget(sink, 0, _raises(getattr(errno, name)))
+    seen = Rounds(sink)
+    worker = _worker(sink, 3)
+    worker.submit(list(EVENTS))
+    assert not worker.flush(timeout=30.0)
+    assert len(seen.outcomes) == calls
+    assert len(entered) == waits
+    assert worker.failed_batches == 1
+    assert sink.losses() == SinkLosses(dropped=0, failed=5)
 
 
 @pytest.mark.parametrize(

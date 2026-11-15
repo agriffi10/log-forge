@@ -132,12 +132,13 @@ spec's revision closed it (*Revision history*).
 **Encoding.** The construction refuses a codec that is not a text encoding with `LookupError`,
 as 1.x's `open()` did, so a codec such as `"base64"`, which the incremental encoder would accept,
 is never reached at write time. A byte order mark is owed only when the handle is seekable and at
-offset 0 when it is opened, which is what 1.x's text stream wrote, and the same test is made when
-the handle is reopened after a fork (FR-005). An owed mark is written once, as the first bytes of
-the first line to reach the file. It belongs to that line's byte count and is still owed until a
-write call has taken it, so a round that fails before it lands writes it in a later round. A path
-that cannot seek is owed none: `FileSink(fifo, encoding="utf-16")` constructs and writes no mark,
-as 1.x did.
+offset 0 when it is opened, and the same test is made when the handle is reopened after a fork
+(FR-005). ~~which is what 1.x's text stream wrote~~: superseded 2026-11-15, since 1.x wrote a
+`utf-8-sig` mark into a pipe on every open (*Revision history*). An owed mark is written once, as
+the first bytes of the first line to reach the file. It belongs to that line's byte count and is
+still owed until a write call has taken it, so a round that fails before it lands writes it in a
+later round. A path that cannot seek is owed none: `FileSink(fifo, encoding="utf-16")` constructs
+and writes no mark, as 1.x did.
 
 The buffered text stream is retired because its state after a failure is not a statement of what
 landed. Measured at `c21755f1`, CPython's `BufferedWriter` sometimes kept the unwritten bytes and
@@ -270,6 +271,11 @@ A `BaseException` then propagates unchanged, with no counter moved and no verdic
 step reads no offset and no file size, so a handle that cannot seek is covered like any other. It
 covers the exception that passes through; a second one that lands while the step is running for
 the first is not covered.
+
+A write call that returns no usable count (anything that is not an integer, `None` included,
+zero, or a number outside the bytes still unwritten) has not said what it took. The sequence
+ends there as an `OSError` carrying `EAGAIN`, which the predicate retries (FR-004), and the state
+follows the counts stored before it. Added 2026-11-15 (*Revision history*).
 
 **This hardens a pipe beyond 1.x and makes a regular file's bookkeeping exact. It repairs no
 regression.** A blocking write to a pipe is cut short by a signal and returns a partial count, so
@@ -524,8 +530,11 @@ class _Tail:
     remaining: bytes   # the unwritten bytes; shrinks by what each write call takes
 
 # In the run's notes (RunContext.notes(sink)), never on the sink:
-#   the torn occurrence's position in the run, and the _Tail object cut from it, compared by
-#   identity to sink._tail to learn whether it is still pending.
+#   the torn event object and the _Tail object cut from it, the tail compared by identity to
+#   sink._tail to learn whether it is still pending. The first offered event that is the torn
+#   object is the torn occurrence.
+#   Superseded 2026-11-15 (Revision history): this read "the torn occurrence's position in the
+#   run", which a sink handed only a round's batch cannot know.
 
 # The reference form for storing a write call's count (FR-002). `counts` is a list that exists
 # before the call, and the append happens inside C, so no bytecode boundary falls between the
@@ -861,8 +870,9 @@ that raises fails at once naming the original exception.
     macOS, that is true of `utf-16` and `utf-32` and false of `utf-8-sig`: into a FIFO 1.x's text
     stream wrote the `utf-8-sig` mark. The build follows the rule as written, so
     `FileSink(fifo, encoding="utf-8-sig")` writes no mark where 1.x wrote one. The criterion
-    checks `utf-16`, and into a regular file the two agree for every codec probed. Whether to
-    match 1.x for `utf-8-sig` on a pipe is left open for the project owner.
+    checks `utf-16`. ~~Into a regular file the two agree for every codec probed. Whether to
+    match 1.x for `utf-8-sig` on a pipe is left open for the project owner~~: superseded
+    2026-11-15 by the diff-review entry below, which names what was swept and closes the question.
   - *Where the criteria are tested.* FR-002's FIFO and real-signal criteria are in
     `tests/test_file_sink_interrupt.py`, a file *File & Folder Structure* does not list, each
     case in a child process: a handler that raises in the test runner's main thread would
@@ -874,3 +884,28 @@ that raises fails at once naming the original exception.
     before a tear is final, so the first offered event that is that object is the torn
     occurrence. The write sequence raises what stopped it, and each sink's own round handler
     asks its predicate, which is the shape `tests/test_classify.py`'s engine-round roster reads.
+- **2026-11-15, diff review.** Corrections from the first review of the diff. No requirement
+  changed, and the byte order mark's rule is the one FR-001 already states:
+  - *What the rule matches in 1.x.* FR-001 no longer says the rule "is what 1.x's text stream
+    wrote". It is what 1.x wrote on a regular file for the three codecs that have a mark
+    (`utf-8-sig`, `utf-16`, `utf-32`), and on a pipe for `utf-16` and `utf-32`. For `utf-8-sig`
+    on a pipe 1.x wrote the mark on every open. The review re-measured at `a0f44b5f` that a
+    second `FileSink` opened on the same FIFO wrote the mark again, so a reader that stayed
+    across the two found a mark in the middle of its stream. That is the reason the rule stays
+    as written and this sink writes none there, which closes what the completion entry left open.
+  - *What "every codec probed" was.* The completion entry's sentence named no population. The
+    sweep is every codec the `encodings.aliases` table names on Python 3.13.1, macOS, plus
+    `utf-8-sig`, `locale`, `UTF8` and `Utf-16`, each into an empty and a non-empty regular file
+    with two emits, comparing the sink's bytes with a text stream's opened in append mode.
+    1.x's sink at `a0f44b5f` matches the text stream in every case. The built sink matches it in
+    every case but one family: for the `iso2022_*` codecs into a non-empty file the text stream
+    wrote the three bytes `ESC ( B` ahead of its first line, and the sink writes none.
+  - *The data model.* The comment under *Data Model* said the notes hold a position in the run.
+    It is marked in place: they hold the torn event object and its tail record.
+  - *A write call that returns no count.* FR-002 now says that a return that is not an
+    integer, zero or a number outside the bytes still unwritten ends the sequence as `EAGAIN`.
+    The build already did this, and `tests/test_file_sink_deliver.py` holds it for `None`, `0`,
+    `-1`, a number past the end and a string.
+  - *FR-004's second criterion.* It says "through the worker", and its test drove
+    `_engine.run_delivery`. A twin on a real `Worker` now sits beside it, with the engine's wait
+    recorded, so the criterion keeps its wording.
