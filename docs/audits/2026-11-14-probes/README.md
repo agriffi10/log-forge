@@ -83,6 +83,16 @@ audit's.** `core-pipeline/p17_log_after_an_interrupted_close.py`, written on 202
 the caller's `except` handler and from a task created inside the span, against a task that
 outlives a span that closed normally. SPEC-088 FR-002 cites it.
 
+**Twelve scripts were added while SPEC-090 was authored, and are not the audit's.** They were
+written on 2026-11-15 against `3e27a0a6`, each says so in its first line, and each is named
+`core-pipeline/spec090_*.py`. Eleven are probes, runnable against the tree with `PYTHONPATH=src`:
+they measure batch sizes under a backlog and at exit, the exit drain's budget and lines, a frozen
+clock, a per-event sink, a JetStream `NATSSink` behind a slow ack, the caller's burst, a full
+queue's memory and the delay with no backlog. `spec090_exit_budget.py` adapts SPEC-090's spec
+review's probe. `spec090_prototype.py` is not a probe: it rewrites a scratch copy of `worker.py`
+into the prototype the spec's "rule" numbers come from, and must never be run on a checkout's own
+`src/`. SPEC-090's Evidence section records their output.
+
 **Not brought in:** the probes' own output files, the `*.stripped.txt` module views, the pytest
 collection listing and the commit bodies. So `verification/cats.py` does not run as it stands: it
 reads a `perfile.txt` of collected tests per file that was derived from that listing.
