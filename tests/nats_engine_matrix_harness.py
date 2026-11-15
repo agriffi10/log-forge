@@ -37,17 +37,28 @@ LINE_PREFIX = "log-foundry:"
 
 
 class Clock:
-    """A ``time`` stand-in for ``log_foundry.sinks.nats``: real time plus an offset.
+    """A ``time`` stand-in for ``log_foundry.sinks.nats``: a fixed base plus an offset.
+
+    The reading does not advance with real time, so a deadline the sink computes from it passes
+    only when a double moves ``offset``, never because the runner was slow: a loaded CI runner
+    once spent a case's whole ``PUBLISH_TIMEOUT`` between two events, and the sink recorded the
+    rest as unattempted. Every bounded wait in the sink is an ``asyncio`` timeout on the loop's
+    own clock, which this does not replace, so a publish that holds is still abandoned on time.
+    The one loop that polls this clock until a deadline passes is ``_drained``, and it exits at
+    once because ``Client.pending_data_size`` is always zero; a double that reports pending bytes
+    must move ``offset`` too, or that loop never ends.
 
     Attributes:
+      base: The real ``monotonic()`` reading taken when the clock was made.
       offset: Seconds added to every reading; a double moves it to pass a deadline at once.
     """
 
     def __init__(self) -> None:
+        self.base = real_time.monotonic()
         self.offset = 0.0
 
     def monotonic(self) -> float:
-        return real_time.monotonic() + self.offset
+        return self.base + self.offset
 
     def __getattr__(self, name: str) -> Any:
         return getattr(real_time, name)
