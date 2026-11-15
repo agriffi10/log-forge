@@ -1,0 +1,22 @@
+tests/integration/test_nats.py:351	sleep(1.0)	in test_a_late_pong_leaves_the_reader_alive_and_a_second_stall_is_refused	next: deadline = time.monotonic() + 5.0
+tests/test_decorator_sync.py:286	sleep(0.05)	in slow_flush	next: real_flush(span)
+tests/test_factory_reentrant.py:148	sleep(0.2)	in factory	next: return a
+tests/test_orphan_sink_handoff.py:1232	sleep(0.2)	in test_a_close_released_inside_the_grace_is_performed_by_the_second_caller	next: sink.may_finish.set()
+tests/test_public_surface.py:789	sleep(0.2)	in slow_replace	next: return real_replace(obj, **kw)
+tests/test_public_surface.py:829	sleep(0.2)	in slow_replace	next: return real_replace(obj, **kw)
+tests/test_reentrant_stop_signal.py:1879	sleep(0.1)	in work	next: handed = 0 if live is None else sum(1 for event in sink.offers if event is live._stop)
+tests/test_reentrant_stop_signal.py:1841	sleep(0.2)	in release_first_close	next: sink.go.set()
+tests/test_reentrant_stop_signal.py:2786	sleep(0.2)	in release_first_close	next: sink.go.set()
+tests/test_shutdown_mid_swap.py:163	sleep(0.3)	in test_a_shutdown_in_the_window_waits_for_the_decision_and_closes_each_sink_once	next: waiting = shutdown.is_alive()
+tests/test_shutdown_mid_swap.py:529	sleep(0.7)	in test_the_wait_does_not_charge_the_drain_to_the_grace	next: park = _ParkFor(monkeypatch, b, 0.15)
+tests/test_shutdown_mid_swap.py:803	sleep(0.1)	in test_a_shutdown_during_a_swap_held_by_a_backoff_cuts_it_short	next: start = time.monotonic()
+tests/test_shutdown_mid_swap.py:651	sleep(0.2)	in test_a_swaps_slow_displaced_close_is_not_waited_out_before_the_drain	next: gate.release.set()
+tests/test_sink_retry.py:260	sleep(0.2)	in test_shutdown_is_not_held_by_a_sink_mid_backoff	next: 
+tests/test_sink_retry.py:526	sleep(0.2)	in _drain_one	next: started = time.monotonic()
+tests/test_sinks_nats_liveness.py:462	sleep(0.5)	in test_the_drivers_background_tasks_run_between_calls	next: sink.emit([{"n": 1}])
+tests/test_sinks_nats_liveness.py:599	sleep(5.0)	in wedge	next: 
+tests/test_sinks_nats_liveness.py:1235	sleep(0.4)	in second	next: results["second"] = _timed(lambda: sink.emit([{"n": 2}]))
+tests/test_timing_floors.py:2023	sleep(0.05)	in test_release_after_clock_releases_once_when_the_timed_call_returns_early	next: assert len(calls) == 1, "the cancelled timer did not release a second time"
+tests/test_worker.py:304	sleep(0.4)	in test_idle_worker_does_not_busy_spin	next: # A correct worker blocks ~one get() per flush_interval while idle (~8 over 0.4s). A
+tests/test_worker.py:2853	sleep(0.6)	in slow_release	next: real_release(marker)  # type: ignore[arg-type]
+tests/test_wrapper_verdicts.py:1635	sleep(0.5)	in slow_refusal	next: raise ConnectionRefusedError(errno.ECONNREFUSED, "refused")

@@ -1019,10 +1019,27 @@ close it.
 
 - **A sink can be released while it is still live inside the graph that replaced it.**
   `configure(A)` then `configure(MultiSink(A, B))`, or the reverse: the swap closes A as the
-  outgoing sink while A is a child of the new one. Pre-dates SPEC-045, which pinned only that it
-  must not become a *loss* — A keeps taking events through the wrapper, is owed a further close,
-  and delivers everything. **Closed by** not releasing a sink reachable from the graph just handed
-  over, which is decidable only against a live config read.
+  outgoing sink while A is a child of the new one. ~~Pre-dates SPEC-045, which pinned only that it
+  must not become a *loss* — A keeps taking events through the wrapper, is owed a further close, and
+  delivers everything.~~ **Corrected 2026-11-14 (audit finding 4; invariants 5 and 2): it is a loss
+  for every sink that refuses after its `close()`.** It pre-dates SPEC-045, whose pin that it "must
+  not become a loss" holds only for a sink that keeps accepting after it is closed, which is what
+  the pin's own test double does (`BufferingSink` in `tests/test_owed_closes.py`, whose `emit` never
+  refuses). A sink that released its transport refuses from then on (invariant 7, SPEC-032), so once
+  the swap has closed it every later event it is offered is lost, counted and announced. Both
+  directions are probed with a shipped `FileSink`, under `docs/audits/2026-11-14-probes/lifecycle/`,
+  and at `a0f44b5f` each left 1 of 4 orphan events and 2 of 8 span events in the file.
+  `p4b_forward.py` is the direction this item leads with, and there the rest is counted in
+  `health().sink.failed` (3 and 6) and announced as a skipped `MultiSink` child.
+  `p4b_shared_child_shipped_sink.py` is the reverse, `MultiSink(FileSink, MemorySink)` then that
+  `FileSink` alone, and there it is `orphan_lost=3` and `lost 6 event(s); batch abandoned`.
+  `p4_shared_child_swap.py` shows the sink closed at the swap and again at shutdown, on both
+  delivery paths and for a `FilteringSink` too. The audit's lifecycle frame dates the loss from
+  SPEC-076's closed guard, and that is wrong: both probes lose the same events against the trees at
+  `v1.0.0`, `v1.1.0` and `3835a30e`, the parent of SPEC-076's commit `3d65cf32`. **Closed by** not
+  releasing a sink reachable from the graph just handed over, which is decidable only against a live
+  config read, and by a test that holds a shipped sink which releases its transport to every event
+  delivered, in both directions.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
   of it is the seam lint guarding the prose in its own data table rather than the rule. The case
@@ -1202,6 +1219,384 @@ close it.
   closer takes and closes the sink under the emit that called it. A sink whose `emit` and `close`
   share a non-reentrant lock never returns from `info()`. The same before SPEC-068. **Closed by** a
   per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
+
+**Filed from the 2026-11-14 audit.** Every item from here to *Resolved* was filed from
+`docs/audits/2026-11-14-post-1.2.0-audit.md`, whose findings table gives each its number: the
+pipeline's accounting first, then the lifecycle, the sinks, and the verification that should have
+found them. Each measurement was taken at `a0f44b5f` by the probe the item names, and
+`docs/audits/2026-11-14-probes/README.md` gives the command that re-runs it. The last three items
+are things a frame raised and nobody verified, and each says what verifying it takes. Arc
+`audit-2026-11-14` (`docs/specs/ARCS.md`) says how the remediation is cut and what Andrew decided;
+an item leaves this list when a spec closes it, not because the arc names it.
+
+- **`flush()` is truthy when the sink lost some or all of the events it flushed, and the settled
+  record is divided on whether it should be** (2026-11-14 audit, finding 2; invariants 2 and 7).
+  *Measured.* An engine run settles unless nothing was accepted and nothing ended unknown
+  (`sinks/_engine.py:1873`), and `flush()` is judged on `failed_batches` alone (`worker.py:910`,
+  `:1784`). So a verdict sink that takes 1 of 30 events, drops all 30 or answers `UNKNOWN` for all
+  30 leaves `flush()` at `ok=True`, with the loss in `health().sink` and one stderr line
+  (`docs/audits/2026-11-14-probes/core-pipeline/p09_flush_barrier.py`, four of its five cases).
+  *What a truthy result over a counted loss rests on.* §13's first constraint, *`flush()` reports
+  success over events `NATSSink`'s publish deadline absorbed*, calls it "SPEC-026's routing working
+  as designed" and says `flush()`'s verdict "is built on `failed_batches`". *An event a sink cannot
+  encode costs only itself, and a batch of nothing encodable settles, counted*
+  (`docs/decisions/sink-delivery/`) is Andrew's decision of 2026-11-04, recorded under *1.2.0
+  stability redesign* in `docs/specs/ARCS.md` and shipped in `docs/release-notes/v1.2.0.md`
+  ("`flush()` is truthy and `failed_batches` stays 0 for it", `:126`, and again at `:982`).
+  Invariant 7's recorded exceptions restate both, and carry the all-dropped and all-unknown cases.
+  *A sink that delivered nothing raises; one that delivered something reports*
+  (`docs/decisions/sink-delivery/`) is the routing §13 cites and supports the partial cases only:
+  its own fence counts a `flush()` that "returns `True` while everything is lost" as the defect it
+  exists to prevent. *What it contradicts.* *`flush()` reports delivery, and answers from the drain
+  that carried the events* (`docs/decisions/pipeline/`) says in its entry that "`True` means the
+  sink took them" and that "no added path can produce `ok=True` over lost events". `results.py:61`
+  says the same ("the sink took them"), and so do `README.md:1374` and `:1414-1417` ("evidence of
+  delivery"), while `README.md:767-769` says what the code does. The Lambda handler idiom at
+  `README.md:1501-1502` omits the `h.sink` term the general idiom carries at `:1258`, so a handler
+  written from it sees none of these losses. *Two closures, neither the default; the choice is
+  Andrew's.* On 2026-11-14 he accepted the recommendation that `flush()` be judged on the ledger's
+  loss total; by the orchestrating session's account he was not told that the settled record is
+  divided, so it is not yet a decision, and it was unanswered when this was written. Under (a),
+  `flush()`'s truthiness reflects any loss in its window. That fulfils the `flush()` decision, the
+  docstring and the README's wording, and it reverses §13's constraint, the shipped consequence of
+  the 2026-11-04 decision and invariant 7's recorded exceptions. It costs a behaviour change inside
+  1.x for every caller that branches on `flush()`, and a falsy result for losses no retry cures, an
+  oversized or unencodable event among them. Under (b), truthiness stays and `FlushResult` gains
+  event counts of what was lost in its window, which is additive under invariant 10. That keeps
+  §13's constraint, the 2026-11-04 decision and the release notes, and it reverses the `flush()`
+  decision's "`True` means the sink took them", `results.py:61` and the README's "evidence of
+  delivery". It costs a truthy `flush()` that goes on covering lost events, and every caller having
+  to read the new fields to see a loss, the README's handler idioms first. **Closed by** his choice,
+  and then by the side it reverses being rewritten in place, dated, with the release notes carrying
+  whatever a caller can see. A staleness risk, not a change: SPEC-084, not yet built, holds a
+  settled run that lost events to `failed_batches == 0`
+  (`docs/specs/SPEC-084-stream-sinks-on-the-delivery-engine.md:293`), so its criteria are re-read
+  against the answer before it is built.
+- **`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**
+  (2026-11-14 audit, finding 18; invariant 2, whose recorded exception at `docs/invariants.md:62`
+  stands). `dropped` counts submissions, `failed_batches` counts batches, the sink, orphan and
+  in-span terms count events, and nothing counts what was accepted.
+  `docs/audits/2026-11-14-probes/core-pipeline/p01_overflow.py`: 36,000 events accepted and 30,030
+  delivered, with `dropped=1990` standing for 5,970 missing events.
+  `core-pipeline/p05_raise_nth.py`: 300 events lost to ten abandoned batches read as
+  `failed_batches=10` in `health()` and as an event count only on stderr. **Closed by** one
+  event-unit ledger on the runtime, which Andrew took on 2026-11-14: every accept site credits an
+  accepted count and every exit debits delivered, exactly one named loss term or a pending gauge,
+  with the balance asserted at `shutdown()` and by a test fixture. The ledger appends event-unit
+  terms to `Health` (invariant 10). The existing counters keep their units and the recorded
+  exception stands; nothing is reopened. Nor is this the in-library metrics that `CLAUDE.md` rules
+  out, which are measurements of the application, to be derived downstream from its logs: the terms
+  extend the library's account of its own delivery, which `Health` already carries.
+- **A submission that overflows the queue after `shutdown()` is counted in two loss terms**
+  (2026-11-14 audit, finding 16; invariant 2). `Worker.submit` counts `submitted_after_shutdown`
+  before the put (`worker.py:669-671`) and `dropped` again when the put raises `queue.Full`
+  (`:674-680`), although its own docstring says counting a dropped submission in both fields "would
+  double-report one loss" (`:657-658`).
+  `docs/audits/2026-11-14-probes/core-pipeline/p03_shutdown_race.py 2000`, in the core frame's run:
+  `dropped=1994` sat inside `submitted_after_shutdown=11994`, and each of the 1,994 was announced on
+  both lines. This is not the item *The after-shutdown submission line announces a loss the final
+  drain can still deliver*, which is the 11 submissions the final drain delivered in the frame's run
+  of the same probe at 400. **Closed by** counting a retired submission only once its put has
+  succeeded, or by the event ledger debiting each event to one term.
+- **A drain thread that dies leaves the batch it was holding in no counter** (2026-11-14 audit,
+  finding 7; invariant 2). `Worker._terminal_failure` sets `stopped_reason` and announces the held
+  work in event-lists, not events, and moves no loss term (`worker.py:1679-1690`).
+  `docs/audits/2026-11-14-probes/core-pipeline/p08_worker_death.py`: of 50 spans accepted, 10 were
+  delivered, 10 were held by the dead thread and are in no counter, and 30 stayed queued. **Bounded
+  by a settled decision:** a dead worker is reported, not restarted
+  (`docs/decisions/failure-paths/a-dead-worker-is-reported-not-restarted--and-as-a-reason-not-a-liveness-flag.md`),
+  so the 30 later spans that are never delivered are that decision working and are not open here.
+  **Closed by** counting the held events in a loss term at the moment the thread dies.
+- **A span that fails to open loses its two boundary events uncounted, and a failed close
+  undercounts by one** (2026-11-14 audit, finding 17; invariant 2, whose observable puts an event
+  that could not be built in `in_span_lost`). The open guard in `decorator._begin` announces and
+  counts nothing (`decorator.py:630-635`); the close guard counts `len(span.events)` (`:687`), which
+  omits the `span.end` that `:721` failed to build.
+  `docs/audits/2026-11-14-probes/core-pipeline/p11_assembly.py`: an injected fault at the open left
+  `in_span_lost` at 0 with neither boundary event built, the in-span log being delivered as an
+  orphan on a fresh trace; an injected fault at the close lost 3 events and moved `in_span_lost` by
+  2; and a traced recursion into `RecursionError`, with nothing injected, left 6 of 398 events
+  unaccounted, a split the core frame did not determine. **Closed by** a count at the open guard for
+  the two events that call will never build, and one more at the close guard.
+- **The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
+  that batch behind a promise of a count that never comes** (2026-11-14 audit, finding 9; invariants
+  2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
+  (`worker.py:1804-1817`), and when `shutdown()` expires the line says the events in flight are
+  "counted when the emit returns" (`:1449-1450`), which at interpreter exit they never are.
+  `docs/audits/2026-11-14-probes/core-pipeline/p04_exit.py 0.02 10000`, in the core frame's run: the
+  exit took 30.3 s, the sink was handed 19,980 events in one call and had taken 11,630 of the 20,000
+  when the process ended, `close()` never ran, and that one stderr line was the only trace of the
+  8,370 lost. **Closed by** draining the backlog at exit in batches of the worker's own size, so
+  that an expiry costs one batch, and by an expiry line that counts the batch in flight or stops
+  promising to.
+- **The queue holds 10,000 submissions and a batch is 10 submissions, and neither can be changed**
+  (2026-11-14 audit, finding 10; invariant 2's `dropped` term). `Worker.__init__` sets both defaults
+  (`worker.py:361-363`), `_lifecycle.py:3796` builds the worker with them, and `configure()` exposes
+  neither (`config.py:272-284`). `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`, in the
+  core frame's run: 30,000 spans in 0.42 s against a sink taking 20 ms a call lost 19,820
+  submissions to `dropped`, counted and announced, and the backlog then left in 1,018 calls of
+  exactly 20 events over 23.5 s. **Bounded by a settled decision, which nothing has reopened:** the
+  worker's tunables are unreachable from `configure()` by *A frozen surface is keyword-first, and
+  says what it will not grow* (`docs/decisions/public-api/`; invariant 10). The arc plans capacity
+  beside the exit drain, and Andrew's decisions of 2026-11-14 name neither. **Closed by** a spec
+  that sizes the queue and the batch without a new public argument and leaves that decision
+  standing, or by Andrew rewriting the decision to admit a capacity setting; which of the two is his
+  to say.
+- **A span's events stay on the span until it closes, so a process killed mid-handler loses the
+  whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
+  document states it). By the core frame's reading, only the close, or a `flush()` called on the
+  same thread or task from inside the traced code, moves a span's buffer to the worker: the worker's
+  time and count triggers read the queue only, and `shutdown()` does not sweep.
+  `docs/audits/2026-11-14-probes/core-pipeline/p12_kill.py`: a `SIGKILL` 3.5 s into an open root
+  span delivered 0 of its 51 events and 9 of 9 from its closed child spans, and a `SIGTERM` straight
+  after five spans closed delivered 0 of 15 with nothing on stderr. `README.md:1455-1512` covers a
+  Lambda freeze and not a timeout or out-of-memory kill, and neither the README nor this document
+  says that a `SIGKILL`, a `SIGTERM` or `os._exit` loses what is buffered. **Closed by** Andrew's
+  decision on whether an open span's events leave before the span closes, and then by whatever that
+  decision needs. Shipping them on the worker's interval is the orchestrating session's proposed
+  direction; it was put to him as his call, with no recommendation attached, and was unanswered when
+  this was written. Whichever way he answers, the documents still owe the sentence that a kill loses
+  what is buffered.
+- **`shutdown()` called from a signal handler deadlocks for good when the signal interrupts a
+  library lock section** (2026-11-14 audit, finding 3; invariants 1 and 3). `Runtime._lock` is a
+  plain `threading.Lock` (`_lifecycle.py:1018`) and `_shutdown_worker` takes it at `:5273`, so a
+  handler that runs on a thread already inside one of the library's lock sections waits on its own
+  thread. `docs/audits/2026-11-14-probes/lifecycle/p1a_signal_shutdown_injected.py` raises `SIGTERM`
+  at the first line inside `_flush_live_sink`'s section (`:5688`), patching no library code, and the
+  handler's `shutdown(timeout=2)` never returns. `lifecycle/p1b_run.py`, with a one-shot timer at a
+  random instant and nothing injected, hung 6, 19 and 40 of 200 fresh processes in its three loops
+  in the lifecycle frame's run; those loops spend nearly all their time inside lock sections, so the
+  rate is an upper bound for a real program, and the mechanism does not depend on the rate. The
+  frame found the handler blocked on `Runtime._lock`, the close registry's lock, `Worker._lock` and,
+  by inference, the queue's mutex. **The documents promise this caller, and the code breaks the
+  promise.** `docs/invariants.md`, in invariant 5's recorded exceptions, describes what a re-entrant
+  `shutdown()` made from "a signal handler" leaves behind, and
+  `docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md`
+  does the same at lines 71 and 111. Both treat the handler as a caller that returns, and neither
+  says the call can deadlock; §13 records only the finalizer form of this hazard. **Closed by**
+  lifecycle commands serialized through one owner, where a re-entrant caller is queued or refused
+  rather than taking a lock, which Andrew took on 2026-11-14, to be prototyped against the
+  adversarial model test before it is committed to; and by the emit path's queue mutex being covered
+  too; the item *One stable stop signal per sink changes a documented public protocol* names the
+  decisions that path meets. The spec that fixes it makes those two documents true; it does not
+  reword them to match the defect.
+- **`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close**
+  (2026-11-14 audit, finding 20; invariant 3, whose bound still holds).
+  `docs/audits/2026-11-14-probes/lifecycle/p3_reentry_from_close.py`: the nested call returned after
+  2.00 s, which is `DEFAULT_CLOSER_GRACE`, on the orphan path and the worker path and with
+  `timeout=None`, with nothing on stderr, while a `flush()`, a `configure()`, a log and a span made
+  from the same place returned at once. The wait is `_close_owed`'s bystander wait
+  (`_lifecycle.py:4915`, `:4967`) on the close the caller is itself inside. It is a sibling of the
+  drain-thread self-wait item above. **Closed by** the one lifecycle command path of the item above,
+  or by `_close_owed` not treating a close running on the calling thread as one to wait for.
+- **One stable stop signal per sink changes a documented public protocol, and with the one-owner
+  command path it deletes mechanisms that settled decisions fence; neither is specified yet**
+  (2026-11-14 audit, the lifecycle frame's structural changes 1 and 2; invariant 10). Andrew took
+  both directions on 2026-11-14, and the protocol change was stated to him when he did. Today the
+  library assigns `log_foundry_stop_signal` onto a sink, and `README.md` documents that to a sink's
+  author: the 1.0.0 upgrade note at `:80`, and the protocol at `:1111-1151`, which says the
+  attribute "may be assigned more than once, from more than one thread at the same moment" and gives
+  a wrapper the forwarding property that relies on it. Invariant 10 promises that a consumer written
+  against the frozen surface runs against every later release of the same major, and a signal handed
+  once is a different protocol for a 1.x sink written to that text. The decisions the two directions
+  meet are found by searching the register for the mechanisms the lifecycle frame says they delete,
+  not by listing them here:
+  `grep -l "_await_swap_decisions\|_take_declines\|_shutdown_running\|_sink_lock\|_hand_out\|_settle_signal\|_hand_retargeted\|_fork_offers" docs/decisions/*/*.md`
+  returns nine files at `f78693fc`, in `pipeline/`, `public-api/` and `sink-lifecycle/`. As examples
+  only: *Concurrent sink changes are serialized by one lock whose wait is spent from the swap
+  budget* (`docs/decisions/public-api/`) is one of the nine; and *Lifecycle state has one holder,
+  Runtime, and the stored State decides the transitions* (`docs/decisions/pipeline/`), whose fence
+  says "Three locks remain, not one", is met too and is not among them, which is why the search has
+  to be run over what the spec actually deletes. **Closed by** a spec that settles which of two
+  things the stable signal is, and says so: a form that keeps every 1.x sink working unchanged, or a
+  break recorded as Andrew's accepted exception to invariant 10. The same spec derives the full list
+  of decisions it rewrites by that search, over the mechanisms it deletes, and rewrites each in
+  place, dated.
+- **A child forked while a sink change is in flight sends its spans to the old sink and its orphan
+  logs to the new one** (2026-11-14 audit, finding 6; invariants 12 and 6). `_clear_after_fork`
+  clears the swap token and re-arms the worker's sink (`_lifecycle.py:1749`, `:1764-1766`), and
+  nothing reconciles the worker's sink with the configuration.
+  `docs/audits/2026-11-14-probes/lifecycle/p6_fork_mid_swap.py`, with nothing patched: the child
+  reports `config.sink=B worker.sink=A state=RUNNING swaps_running=0`, its span landed in A and its
+  orphan log in B, and the parent ended with both on B. Nothing was lost in the probe; the events
+  went to a sink the configuration no longer names, and by the frame's reading they do for as long
+  as the child lives. The window is the whole of the swap's first drain, up to 5 s by the lifecycle
+  frame's reading. **Closed by** a forked child rebuilding its worker's sink from its configuration
+  rather than from the state it inherited mid-operation.
+- **A fork from inside a sink's `close()` during a no-worker `shutdown()` leaves the child's
+  `_shutdown_running` at −1** (2026-11-14 audit, finding 19; invariant 5's observable).
+  `_clear_after_fork` zeroes the count (`_lifecycle.py:1752`) on the premise that no such call
+  survived the fork (`:1680-1682`), and the forking thread's `shutdown()` then decrements it in the
+  child (`:5301`). `docs/audits/2026-11-14-probes/lifecycle/p7_fork_inside_close.py`: a later
+  `shutdown()` in that child returned with `state=RUNNING`, the worker and its drain thread alive
+  and the span undelivered, one event at the sink against three in the control row. The lifecycle
+  frame rates it unlikely; what it shows is that the premise is checked only for the setter case
+  SPEC-083 closed. **Closed by** the child rebuilding from its configuration, as in the item above,
+  or by the fork handler recording that the forking thread is inside a `shutdown()`.
+- **A TCP `SyslogSink` or `LogstashSink` counts a frame as accepted when `sendall` returns, so
+  frames written after the peer closed vanish uncounted** (2026-11-14 audit, finding 1; invariants 2
+  and 7). `SocketTransport._send_one` calls `sendall` (`sinks/_socket.py:517`) and the round marks
+  the frame `ACCEPTED` (`:406-407`); the class documents `failed` as "Messages not confirmed" and
+  nothing is ever confirmed. `docs/audits/2026-11-14-probes/sinks/probe_socket.py`: a first batch
+  lands, the listener closes the accepted connection, and of a second batch of 50 the collector
+  received 38 from `SyslogSink` and 36 from `LogstashSink` in the sinks frame's run, with
+  `failed=0`, no raise and no stderr line. The size of the loss depends on timing and was never
+  zero, between 2 and 25 of 50 across the runs the audit records, and the silence was the same in
+  every one; a peer that reset instead lost nothing. The default UDP transport to a port with no
+  listener lost 100 of 100 uncounted, which is inherent to UDP and is not this item. **Closed by**
+  the transport noticing that its peer has closed before it writes a batch into the connection, and
+  counting what it wrote into a closed one, held by a test double that closes between batches.
+- **A send whose reply is lost is sent again, and the resend is neither counted nor keyed**
+  (2026-11-14 audit, finding 5; invariant 7's "no event landed twice"). Every engine adapter maps a
+  raised retryable exception to `RETRYABLE` (`sinks/sqs.py:796-797`, `sinks/http.py:3301-3305`,
+  `sinks/postgres.py:466-468`). With one reply lost after the destination accepted: 35 messages for
+  25 events on an SQS standard queue (`docs/audits/2026-11-14-probes/sinks/probe_sqs.py`, case D),
+  50 stored for 25 through `HTTPSink` and 50 rows for 25 through `PostgresSink`
+  (`sinks/probe_misc.py`, cases 6 and 1), each with `failed=0` and no line. With every reply lost,
+  through the real worker, each of 10 events landed 16 times while the ledger read `failed=10`
+  (`sinks/probe_aws_more.py`). An SQS FIFO queue with de-duplication took no duplicate. **The
+  duplication is the accepted cost of settled decisions, and none of them is open.** *A client
+  exception costs its chunk, and is provable non-delivery for it* (`docs/decisions/sink-delivery/`)
+  records in its own entry that a read timeout means the reply was lost and a re-send may duplicate,
+  "taken on expected cost" because an unreachable endpoint is the common client exception. That
+  decision was written for finding R2 of `docs/audits/2026-09-02-pre-1.0-audit.md`, a client raising
+  mid-batch, and it is its entry, not either earlier audit, that records the lost-reply cost. For
+  `HTTPSink` and the other engine sinks the resend is the predicate rule of *A sink declares what it
+  retries, and anything else fails at once* (`docs/decisions/sink-delivery/`). Sixteen sends is the
+  1.x total retry budget the engine keeps, by Andrew's decision of 2026-11-04 (`docs/specs/ARCS.md`,
+  *1.2.0 stability redesign*). So what this audit adds is narrow: the resend is uncounted, with
+  `failed=0` and no line when one reply is lost, and it carries no key a destination could
+  de-duplicate on. `README.md:629-632` says of a sink that delivered none that "there is nothing
+  downstream to duplicate", without the cost that decision records. **Closed by** a count of the
+  sends that may have duplicated, and an idempotency key derived from `log_id` wherever the
+  destination can honour one. That direction is the orchestrating session's, made under Andrew's
+  authority of 2026-11-14 and to be confirmed in the spec's review, and it changes neither settled
+  rule: an `UNKNOWN` outcome or an exception escaping `deliver` is never resent (*No shipped sink
+  declares itself idempotent*, `docs/decisions/sink-delivery/`), and what stays resendable, at the
+  accepted cost, is a client exception the sink's retry predicate accepts, caught inside `deliver`
+  and answered `RETRYABLE`. The JetStream `Nats-Msg-Id` item above is this item for one sink.
+- **An AWS batch reply that names no failure is read as full delivery** (2026-11-14 audit, finding
+  14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
+  and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads
+  a Kinesis or Firehose reply with no failed count and no coded record as delivered
+  (`sinks/_batch.py:216-217`). `docs/audits/2026-11-14-probes/sinks/probe_sqs.py`, cases G1 and G2,
+  and `sinks/probe_aws_more.py`: a reply listing 7 of each 10 in `Successful` left 6 of 25 SQS
+  messages and 6 of 25 SNS messages missing, and a reply of `{}` left 25 of 25 SQS messages and 25
+  of 25 Kinesis records missing, with nothing counted or written in any of the four. **Bounded by a
+  settled decision:** *A positional response adjudicates all of a chunk or none of it*
+  (`docs/decisions/sink-delivery/`) reads a keyed reply by what `Failed` names, real AWS names every
+  entry, and so this needs a proxy, an emulator or a broken mock. What is open is that a reply which
+  is not reply-shaped at all is told apart from success by nothing; the `ElasticsearchSink` item
+  above is the same shape for `_bulk`. **Closed by** deciding whether a reply that carries neither
+  `Failed` nor `Successful`, or neither a count nor records, is unadjudicated, and holding the
+  answer in the conformance corpus.
+- **`SentrySink`'s SDK backend counts an event the SDK discarded as sent** (2026-11-14 audit,
+  finding 11; invariant 2). `SentrySink._capture` ignores what `capture_event` returns
+  (`sinks/sentry.py:448-458`), so by the sinks frame's reading sampling, `before_send`, a rate limit
+  and the SDK's bounded queue all read as delivery.
+  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, case 5: with a stand-in SDK keeping 1 event
+  in 5, `sent` read 25 and `losses()` read nothing lost while 5 were kept. The class documents
+  `sent` as "Events captured or sent to Sentry" (`:84`). The audit used a stand-in and did not read
+  what the real SDK returns for an event it discards. **Closed by** reading the installed SDK for
+  what it reports about a discarded event and counting on that, or, if it reports nothing, by
+  `sent`'s docstring saying what the count does not prove.
+- **`KafkaSink` and `GooglePubSubSink` give their verdict when the client queues a message, not when
+  the broker answers** (2026-11-14 audit, finding 12; invariant 7's observable). `KafkaSink.emit`
+  returns once `produce()` has queued each message (`sinks/kafka.py:312-318`), and its `flush`
+  raises only for messages still queued (`:431-436`).
+  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, case 3: with every delivery report an error,
+  0 of 25 landed and `health().sink.failed` read 25 with 25 lines, so the loss is counted, yet
+  `flush()` returned `ok=True` and `failed_batches` stayed 0. Case 4: with the client's queue full
+  after 10 of 25, the other 15 were counted `dropped` and never retried, although a full queue is
+  the transient case. `GooglePubSubSink` has the same shape by reading (`sinks/pubsub.py:268-275`)
+  and was not run. A truthy `flush()` over a counted loss stands here on the same divided record as
+  for the engine sinks. **Closed by** the choice the `flush()` item above puts to Andrew, which
+  covers this case with the engine's and names what each option reverses, and by a decision on
+  whether a full client queue is retried.
+- **An injected autocommit connection breaks the database sinks' all-or-nothing write** (2026-11-14
+  audit, finding 15; invariants 2 and 7). `PostgresSink` commits once after every chunk of a batch
+  (`sinks/postgres.py:457-468`) and `SQLiteSink` relies on `with self._conn`
+  (`sinks/sqlite.py:409-412`); neither checks or documents autocommit on a connection it is handed.
+  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, cases 2 and 7: on PostgreSQL, chunk 2 of 3
+  failing once left 35 rows for 25 events with nothing counted; on SQLite, one row refused by the
+  caller's `CHECK` left 17 distinct rows written four times each over four attempts while `failed`
+  read 100. An unlikely configuration. **Closed by** refusing a connection in autocommit mode where
+  it is handed over (invariant 13), or by a recorded exception that says the sinks do not support
+  one.
+- **`RabbitMQSink` publishes without confirms, so an unroutable message or one written to a dead
+  socket reads as accepted** (2026-11-14 audit, the sinks frame's unranked item, read and not run;
+  invariant 2). `basic_publish` returning is the verdict (`sinks/rabbitmq.py:429`), with neither
+  publisher confirms nor `mandatory`, and the class docstring says that "written" is not
+  "acknowledged" (`:60-62`). There is no probe, because no driver extra was installed for the audit.
+  **Closed by** publisher confirms, measured against a real broker by the integration suite, with a
+  decision on whether they are the default.
+- **The one generative test cannot find the lifecycle defects it is cited as guarding** (2026-11-14
+  audit, finding 21; it breaks no invariant, and invariants 1, 2, 5, 6 and 12 name it under
+  *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` (`:109`) holds its
+  stop signal as a plain class attribute (`:132`) and never waits on it, calls back or forks. Its
+  concurrent half is scheduled by the operating system, its time bound carries `BOUND_SLACK = 10.0`
+  (`:103`), and its close oracle sees a sink never closed and two closes that overlap (`:579-580`)
+  but not two closes with no write between them. By the verification frame's calibration, none of
+  the twelve lifecycle and sink fixes from `95945c0f` to `717d0c68` was found by it, eight of the
+  twelve needed a sink that waits on its signal or calls back, and those fixes added no line to it.
+  **Closed by** sink personalities that wait on the stop signal, call back and fork, a bound of the
+  timeout plus a small epsilon, and a close-once-per-write oracle
+  (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
+  callback against every public call, with a fork and a signal handler as calls.
+- **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
+  breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
+  of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
+  fail whole calls only, it covers the record-building sinks and leaves out the HTTP family, NATS,
+  Sentry and the wrappers, and no double anywhere models "accepted, then the call raised", "peer
+  closed between batches" or "client buffer never acknowledged", or compares what the backend holds
+  with the ledger. The frame judges that findings 1, 5, 11, 12, 14 and 15 would have been caught by
+  one. **Closed by** each sink declaring its acknowledgement class as data, one stateful fake and
+  one fault script per class, and one assertion, that what landed once and what was counted once add
+  up to the batch with a line for each loss, each sink's permitted departures being rows of the
+  table.
+- **CI cannot see a hang, a platform difference or an untested line** (2026-11-14 audit, finding 23;
+  no invariant). At `a0f44b5f` the behavioural job runs on `ubuntu-latest` only
+  (`.github/workflows/ci.yml:73`), on Python 3.12 and 3.13 (`:95`), with no `timeout-minutes`, no
+  `faulthandler_timeout` or `pytest-timeout`, no repeated or soak run of the model test, no
+  `ResourceWarning` raised as an error and no coverage measured although `pytest-cov` is installed;
+  and the `main` ruleset requires no status check (`ci.yml:15-17`). **Decided by Andrew on
+  2026-11-14:** a hang timeout with a stack dump and a nightly soak of the model test are taken. A
+  macOS leg is declined, which is settled and recorded as *CI runs on Linux only: a macOS leg was
+  offered and declined* (`docs/decisions/working-rules/`), so the two macOS-only defects in the
+  record (`2ff9de9e`, `01fd73cd`) remain something only a developer's machine shows and that part of
+  this item is not open. **Closed by** those two in the workflows and `pyproject.toml`, for the hang
+  and the soak; the rest of this item stays open until it is decided or built. Coverage measurement,
+  a job timeout, `ResourceWarning` as an error and a property-based sink-graph generator, whose
+  `hypothesis` dependency is noted in `CLAUDE.md` before it is added, are the orchestrating
+  session's plan for the arc's CI track and not his decision: that coverage is unmeasured was stated
+  to him as an observation. A required status check and free-threaded builds were named by the audit
+  and not decided.
+- **Four delivery docs still carry an "Owed until the PR's CI is green" line that nobody struck**
+  (2026-11-14 audit, raised by the history frame and unverified; no invariant).
+  `docs/spec-delivery/SPEC-067-total-inbound-trace-context.md:73`,
+  `SPEC-069-encoding-and-driver-errors.md:71`, `SPEC-070-retry-classification.md:69` and
+  `SPEC-080-trace-intake-by-real-type.md:57` each name acceptance criteria that could not settle
+  before their push. Neither the frame nor the audit checked whether any of them settled on the
+  green run, so each line is either a stale sentence or a criterion nobody ever confirmed, and which
+  it is has not been established. **Closed by** reading the CI and Integration runs of the pull
+  request that landed each spec (#294, #307, #308 and #299 in that order), and for each line
+  striking it with the run that settled it, or filing here what did not settle.
+- **`SQSSink.MAX_BYTES` may be below what the service now accepts** (2026-11-14 audit, raised by the
+  sinks frame from memory and unverified; invariant 2's `dropped_oversized`). The class holds 256
+  KiB (`sinks/sqs.py:186`) and an event whose message exceeds it is dropped, counted (`:690`). The
+  frame believes AWS raised the SQS message limit to 1 MiB during 2025 and did not check; if that is
+  right, the sink drops events the queue would take. Nothing here has been measured or read.
+  **Closed by** reading the live AWS documentation for the limit, not memory, and then either
+  raising the constant or striking this item with the page that confirms 256 KiB.
+- **Three comments give a suite time that CI may no longer show** (2026-11-14 audit, raised by the
+  verification frame and unverified here; no invariant). `.github/workflows/ci.yml:131` says the
+  pytest step fell to about 49 s, `:108` reasons from that figure, and `pyproject.toml`'s comments
+  give 34.8 s at 1,899 tests (`:137`, `:208-211`). The frame read 141 to 143 s for that step on both
+  legs of one run at `a0f44b5f`, through `gh`, and nobody repeated the reading. Those numbers are
+  the stated reasoning for the worker count, so a stale one misleads whoever tunes it next. **Closed
+  by** the arc's CI track timing the step when it edits those files, which is what verifying it
+  takes, and then anchoring each number to a commit or deleting it, as
+  `docs/process/completion-ritual.md` asks of a volatile number.
 
 ### Resolved
 

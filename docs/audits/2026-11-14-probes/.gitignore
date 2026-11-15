@@ -1,0 +1,6 @@
+# Four probes write their output beside themselves when run (core-pipeline/p04, p07 and p12, and
+# sinks/probe_file). The output is a run's by-product, never the record.
+core-pipeline/p04_out.txt*
+core-pipeline/*.jsonl
+core-pipeline/*.ready
+sinks/probe-file-*/
