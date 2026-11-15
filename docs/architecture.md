@@ -1488,6 +1488,36 @@ an item leaves this list when a spec closes it, not because the arc names it.
   frame rates it unlikely; what it shows is that the premise is checked only for the setter case
   SPEC-083 closed. **Closed by** the child rebuilding from its configuration, as in the item above,
   or by the fork handler recording that the forking thread is inside a `shutdown()`.
+- **A second `shutdown()` made from a stop-signal setter during a forked child's fork repair
+  waits on a drain thread the repair has not started** (found while authoring SPEC-086,
+  2026-11-15; invariants 3 and 12). In the child, `Worker._reinit_after_fork` clears the worker's
+  drain events and hands the inherited sink its stop signal (`worker.py:602-605`) before it starts
+  the child's drain thread (`:606`), and a setter is the sink's own code.
+  `docs/audits/2026-11-14-probes/lifecycle/p9_second_stop_in_fork_repair.py`, with nothing patched,
+  at `5447d26a`: a setter that calls `shutdown()` once there returns at once; one that calls
+  `shutdown(timeout=3.0)` and then `shutdown(timeout=None)` never leaves the repair, and the stack
+  the child wrote when asked is `stop < _shutdown_worker < shutdown <` the setter `<
+  offer_stop_signal < _reinit_after_fork < _rebuild_worker_after_fork < _reinit_after_fork`, the
+  wait being `Worker.stop`'s on `_drain_settled` (`:1424`); with a finite second timeout the child
+  leaves the repair after 3.0 s, its whole budget; and the same two calls from a setter in a
+  process that never forked take 0.0 s. A spec review confirmed all four rows on its own build.
+  **Closed by** the probe's two-stop rows returning as its `outside` row does.
+- **A child forked while another thread of the parent is writing to `sys.stderr` hangs on its
+  first diagnostic** (found while authoring SPEC-086, 2026-11-15; invariant 12's observable, "never
+  hangs on a parent's lock"). The library announces a loss by writing to `sys.stderr`
+  (`_diag.py`), and a buffered stream's lock that another thread held at the fork stays held in
+  the child. `docs/audits/2026-11-14-probes/lifecycle/p10_fork_with_stderr_lock_held.py`, with
+  nothing patched, at `5447d26a`, with a second thread writing to `sys.stderr` without pause and
+  the stream a `TextIOWrapper` over a `BufferedWriter`: 100 of 100 children that shut down and
+  then log, which the library announces with `_diag.lost`, hung until their alarm; with no writer
+  thread, 0 of 100. The probe's control matters as much: a child that runs no library code and
+  writes one line to `sys.stderr` itself also hung 100 of 100, so the lock is the interpreter's
+  stream's, not the library's, and this is the generic fork hazard §13 records for a lock the
+  caller's code owns, reached through the library's own diagnostic. The writer thread makes the
+  rate an upper bound; a spec review saw 4 to 10 of 200 forked children hang this way in a
+  concurrent prototype, and none once the run replaced `sys.stderr`. **Closed by** a recorded
+  constraint beside that hazard in §13, or by a diagnostic write in a forked child that does not
+  wait on the stream lock it inherited; the probe's `library` row reading 0 is the second.
 - **A TCP `SyslogSink` or `LogstashSink` counts a frame as accepted when `sendall` returns, so
   frames written after the peer closed vanish uncounted** (2026-11-14 audit, finding 1; invariants 2
   and 7). `SocketTransport._send_one` calls `sendall` (`sinks/_socket.py:517`) and the round marks

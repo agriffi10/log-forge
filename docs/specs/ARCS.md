@@ -494,3 +494,26 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   uncounted. The worker's tunables stay unreachable from `configure()`
   (`docs/decisions/public-api/`), and nothing decided on 2026-11-14 names that decision, so whether
   capacity becomes a setting is still Andrew's to say.
+
+  **The generative run under the adversarial personalities depends on SPEC-085's built modules,
+  and is specified against them.**
+  It was drafted twice inside SPEC-086 and cut out after two spec reviews: each built it and
+  found wrong the combinations of half, personality and oracle that the authoring prototype had
+  not run, on top of a layer that did not yet exist. The reviews measured three obstacles that are
+  structural, not slips, and the later spec has to design around them. In the concurrent half,
+  sink-changing `configure` calls overlap so constantly that an exemption for a double close under
+  overlapping changes covers 90 to 94 percent of sinks, so the repeat-close rule either hides
+  everything, the defect #339 fixed included, or flags what the public-api decision permits (second
+  review). A script running on a closer thread or the drain thread is a second caller, so a visit
+  ordinal is raced even in the sequential half, and between one and four seeds in 200 draw a
+  different set of scripts from one run to the next (first and second reviews, and the author's
+  seed 144). And a draw that answers the same script at every visit passes every replay check that
+  compares a run with itself, and reads greener (second review). What the prototypes showed, which
+  that spec must explain or pin: the sequential half under `reentrant` is red on roughly 29 to 44
+  of 200 seeds with a repeat close no SPEC-085 cell expresses (29 and 30 in the author's
+  prototypes, 39 in the first review's build, 44 in the second's); the concurrent half under
+  `reentrant` is red mostly with `LedgerBroken:spans+1` (second review, 20 of 200); and a
+  sequential `factory` seed exists whose steps never build a factory sink, so no exercise floor it
+  can meet (second review, seed 29). The last draft is on no branch: the checkout that ran the arc
+  keeps it under the local ref `refs/archive/2026-11-14/spec-086-adversarial-generative-draft`,
+  which a clone does not hold.
