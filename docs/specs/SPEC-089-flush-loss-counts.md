@@ -113,9 +113,11 @@ still is. `dataclasses.asdict` and `replace` carry them. The release notes say a
       on each every count and `lost` read 0 (invariant 10).
 - [ ] `bool(FlushResult(ok=True, sink_lost=3)) is True` and
       `bool(FlushResult(ok=False, reason="abandoned", batch_lost=3)) is False` (invariant 10).
-- [ ] `FlushResult` is frozen, its five new fields are `int`s defaulting to 0, `lost` is their
-      sum and cannot be assigned, `FlushResult.__match_args__ == ()`, and a positional build is
-      refused with the keyword-only message (invariant 10).
+- [ ] `FlushResult` is frozen, its five new fields are `int`s defaulting to 0, and `lost` is their
+      sum and cannot be assigned (invariant 10).
+- [ ] As regression guards, both passing at `9b54b370`: `FlushResult.__match_args__ == ()`, and
+      `FlushResult(True)` raises `TypeError` with the message `FlushResult.__init__() takes 1
+      positional argument but 2 were given` (invariant 10).
 - [ ] `ContinueResult`'s fields are still exactly `ok` and `reason`, and
       `ContinueResult(ok=True, sink_lost=1)` raises `TypeError` (invariant 10).
 - [ ] `tests/typed_consumer/accepts.py` reads `flush().lost` and `flush().sink_lost` and builds
@@ -139,7 +141,10 @@ there could not count it.
 has emitted everything ahead of the marker and computed `delivered`, and before it sets the
 marker's event. The marker carries the snapshot back, as it already carries `delivered`. By then
 every event ahead of the marker has left the queue and settled, so each of its losses has been
-debited. The window does not stay open while the caller wakes, so a batch the drain loses after
+debited. The drain takes this snapshot only for a marker that asks for one, and only
+`_flush_worker` asks. The two internal flushes of `Worker.retarget` (`worker.py:1116`, `:1130`)
+build markers that do not ask, so a swap pays nothing and its timing does not change. FR-003
+gives the interface between the two layers. The window does not stay open while the caller wakes, so a batch the drain loses after
 answering is not counted. The verdict's window ends at the same point, because
 `_nothing_lost_since` reads `failed_batches` there, so a truthy result and a zero count are judged
 at the same moment. Both answerers of a marker take the snapshot: `_drain`'s marker branch and
@@ -169,8 +174,11 @@ are process-wide differences and over-count in three ways:
   `sink_lost` on both delivery paths.
 
 A non-zero count therefore says that the process lost events in the window, not that this
-caller's events were among them. A zero count says that none of the call's events was lost
-between its start and its answer.
+caller's events were among them. A zero count says that none of the call's events was lost to a
+term the ledger counts between the call's start and its answer. It says nothing about a loss a
+sink takes inside an `emit` that returned, such as a failed Kafka delivery report, an `emit`-only
+sink's own internal loss or a `MultiSink` child that raised (Out of Scope). The docstring and
+README text that FR-004 and FR-005 prescribe carry the same qualification.
 
 **What the counts are not.** A loss debited before the call starts is outside the window. That
 includes a batch the worker's own trigger abandoned, which is the scope the verdict already
@@ -207,45 +215,78 @@ does not sweep (Out of Scope).
       no count, and `health().events.open_spans == 2` after the call (invariant 2).
 - [ ] A flush whose marker is answered by `shutdown()`'s exit drain, with a sink that drops every
       event, returns `sink_lost` equal to the events ahead of its marker (invariants 2 and 6).
-- [ ] With the calling thread held by an injected hook after the drain answered its marker, a
-      batch the drain then loses is in none of the counts, and the next `flush()` counts it
-      (invariant 2).
+- [ ] With the first flush's calling thread held by an injected hook after the drain answered its
+      marker, a second `flush()` started on another thread carries a batch the sink drops. The
+      second result counts that batch, and the first counts none of it (invariant 2).
 
 ### FR-003: Every other outcome carries the counts read on the caller, and no read closes on a dying drain
 
 #### Description:
 
+**The two layers.** `Worker.flush(timeout)` keeps its signature and its verdict, and
+`Worker.retarget` keeps calling it. Both now go through one private method,
+`Worker._flush_marked(timeout, *, counted)`, which returns the verdict and the marker it queued,
+or `None` when it returned before queueing one. `Worker.flush` calls it with `counted=False`,
+which builds a marker that asks the drain for no snapshot, and returns the verdict alone.
+`_flush_worker` calls it with `counted=True`, and everything this FR adds is done there, in
+`_lifecycle.py`, on the calling thread: the start read, the choice between the marker's ledger
+and its own end read, the wait for a dying drain, and attaching the counts. So `retarget` never
+waits on a dying drain and never reads a snapshot, and a swap's timing is unchanged.
+`Worker._flush_marked`'s verdict constructions (`worker.py:906-931` at `9b54b370`) stay as they
+are, without counts. Every result `log_foundry.flush()` returns passes through one function in
+`_lifecycle.py` that attaches the window's counts to whichever verdict was chosen.
+
 **A window the drain did not close is closed on the calling thread.** Sometimes no drain answers
-the marker with a snapshot. The worker may not exist, `Worker.flush` may return before it queues
-a marker (`"retired"`, `"thread-died"`, `"queue-full"`, or an `"abandoned"` given up before the
+the marker with a snapshot. The worker may not exist, the call may return before it queues a
+marker (`"retired"`, `"thread-died"`, `"queue-full"`, or an `"abandoned"` given up before the
 put), the wait may time out, or the marker may be answered pessimistically by an expired
-`shutdown()` or the terminal sweep. In each case the window ends on the calling thread when
-`Worker.flush` returns, and before `_flush_live_sink()` runs. Every `FlushResult` `flush()`
+`shutdown()` or the terminal sweep. In each case `_flush_worker` reads the end when
+`_flush_marked` returns, and before `_flush_live_sink()` runs. Every `FlushResult` `flush()`
 returns carries its window's counts, whatever its reason. That includes `"abandoned"` from a
 failed sweep, `"thread-died"` from `_flush_worker`, and `"sink-flush"`, whose counts are the
 drain's window, since a sink's own client-buffer flush is outside the ledger. A process with no
-worker returns zero counts: SPEC-088 reports the worker's terms as zero there.
+worker takes the difference like any other. `overflow_lost`, `batch_lost`, `drain_lost` and
+`stranded` read zero there. `sink_lost` does not always: SPEC-088 keeps the orphan path's exits
+in the caller-side cells, so another thread's orphan log that a sink drops in the window is
+counted, which is the third over-count FR-002 names.
 
 **A dying drain is waited for before the read.** A drain thread dying on a `BaseException` from
-the sink answers the marker it holds in `_drain`'s `finally`, before `_terminal_failure` debits
-`drain_lost`. SPEC-088 counts the queue in `stranded` only once `Worker._thread.is_alive()`
-returns `False`. A caller that reads at once can therefore miss both. Measured at `9b54b370`,
-with a switch interval of 1e-6, the caller's read came before `_terminal_failure` had recorded in
-1 of 96 runs and before the thread had ended in 10 of 96. At the default interval it came after
-both in 200 of 200 (Evidence). So a marker answered while the drain unwinds an exception is
-marked as such. A call whose marker is so marked, or whose read finds the drain finished
-(`_drain_finished` set) while its thread is still alive, waits for the thread to end, then
-reads. The wait is idle and lasts at most what is left of the call's timeout, or indefinitely
-for `timeout=None`, as the rest of the call does. A call whose budget runs out first reads what
-has been debited by then. An expired `shutdown()` leaves `_drain_finished` clear on a drain that
-is still working, so its pessimistic answer causes no wait.
+the sink answers the markers it holds in a `finally`, before `_terminal_failure` debits
+`drain_lost`. Both answerers do this: `_drain`'s marker branch (`worker.py:1726-1735`), and
+`_final_drain` (`worker.py:1820-1823`), which runs inside `_drain`, before `_run` sets
+`_drain_finished` (`worker.py:1531-1533`). SPEC-088 counts the queue in `stranded` only once
+`Worker._thread.is_alive()` returns `False`. A caller that reads at once can therefore miss both.
+Measured at `9b54b370`, with a switch interval of 1e-6, the caller's read came before
+`_terminal_failure` had recorded in 1 of 96 runs and before the thread had ended in 10 of 96. At
+the default interval it came after both in 200 of 200 (Evidence).
+
+So each answerer marks a marker it answers while unwinding an exception (`_FlushMarker.unwinding`).
+`_flush_worker` waits for the drain thread to end, then reads, when the marker is so marked or
+when it finds `_drain_finished` set while the thread is still alive. The wait is idle and lasts
+at most what is left of the call's timeout. With `timeout=None` it is unbounded, as the rest of
+the call is. That is a change a caller can see: today a `flush(timeout=None)` whose drain dies
+under it returns `"abandoned"` at once, and it will wait until `_terminal_failure` has written
+its line, which takes as long as `sys.stderr` takes to accept it. The release notes say so
+(FR-004). A call whose budget runs out first reads what has been debited by then. An expired
+`shutdown()` leaves `_drain_finished` clear on a drain that is still working, so its pessimistic
+answer causes no wait.
+
+**The wait is skipped on the drain thread itself.** `_terminal_failure` writes through `_diag`
+to `sys.stderr`, which a caller may have replaced, and a `flush()` made from that write runs on
+the dying drain thread. Waiting there would wait for its own thread: `Thread.join` raises
+`RuntimeError`, and an unbounded wait would never end. So `_flush_worker` skips the wait when
+`threading.current_thread() is worker._thread`, the guard `Worker.claim_stop` and `Worker.stop`
+already use (`worker.py:1307`, `:1417`), and reads at once.
 
 **A window a fork crosses is the child's.** SPEC-088 FR-005 restarts a forked child's ledger
-with every loss term at zero. The start snapshot is stamped with the pid it was read in. If the
+with every loss term at zero, and the child's worker starts a fresh drain on a fresh queue
+(`worker.py:584`, `:606-615`). The start snapshot is stamped with the pid it was read in. If the
 end is read in another process, the counts are the end snapshot's five terms, which are the
 child's losses since the fork, all inside the window. Each count is also published as zero
 rather than negative. In one process a count can fall only when a test replaces the process
-worker by hand.
+worker by hand. A fork after the marker has been queued leaves the marker in the parent's queue,
+which the child replaces, so that child's flush times out. This FR makes no promise about such a
+call beyond its counts being its own and never negative.
 
 **A fault in a read is absorbed.** The drain thread's snapshot runs inside its marker branch,
 and an exception escaping there would end the only thread that delivers. A fault in it is
@@ -265,17 +306,29 @@ verdict unchanged, because a flush is the call most likely to be made in a `fina
 - [ ] The sink holds the flush's 9-event batch until another thread has queued 6 more events,
       then raises `SystemExit`. The flush returns falsy with `drain_lost == 9` and
       `stranded == 6`, in 200 of 200 runs under a switch interval of 1e-6 (invariants 2 and 3).
+- [ ] A flush whose marker `shutdown()`'s exit drain answers, with a sink that raises
+      `SystemExit` on that drain's batch, returns `drain_lost` equal to the events ahead of its
+      marker, in 200 of 200 runs under a switch interval of 1e-6 (invariants 2 and 6).
 - [ ] With the dying drain held by an injected hook inside `_terminal_failure`, `flush(0.5)`
       returns within 0.5 s plus 50 ms of wall time and with near-zero CPU, while the thread is
       still held (invariant 3).
+- [ ] A `flush()` made on the dying drain thread, from a replaced `sys.stderr` that
+      `_terminal_failure` writes to, returns within 50 ms and raises nothing (invariants 1 and 3).
+- [ ] `Worker.retarget`'s markers carry no ledger, and with the drain held by a hook inside
+      `_terminal_failure`, a `configure(sink=...)` returns without waiting for that thread to end
+      (invariant 3).
 - [ ] A drain whose batch settled with 3 events dropped, under a sink whose own `flush()` raises,
       returns `"sink-flush"` with `sink_lost == 3` (invariants 2 and 6).
-- [ ] No `FlushResult` is built in `worker.py` or `_lifecycle.py` except through the one function
-      that attaches the window's counts, and a test that derives the constructions from the tree
-      fails on a new one built any other way (invariant 6).
-- [ ] The parent's worker has counted 5 events in `overflow_lost`. A child forked from a hook
-      inside a flush's window returns counts equal to the child's own losses since the fork, none
-      negative, and the parent's flush is unaffected (invariant 12).
+- [ ] With no worker, another thread's orphan log that the sink drops while the flush runs, held
+      inside the window by an injected hook, gives the flush `sink_lost == 1`, and every other
+      count 0 (invariant 2).
+- [ ] Every `return` in `_flush_worker` passes its result through the one function that attaches
+      the window's counts, and a test that derives those returns from the tree fails on one that
+      does not (invariant 6).
+- [ ] The parent's worker has counted 5 events in `sink_lost` before the call. A child forked from
+      a hook in `_flush_worker` after the start read and before `_flush_marked` closes a span
+      whose 2 events the sink drops, and its flush returns truthy with `sink_lost == 2`; the
+      parent's flush is unaffected (invariant 12).
 - [ ] A fault injected into the drain thread's snapshot is announced by type once, the drain
       thread stays alive, and the flush's counts match the same case uninjected
       (invariants 1 and 11).
@@ -302,6 +355,14 @@ lost are counted on the result, not folded into its truth. The marker mechanism,
 a flush reports over, and SPEC-050's narrowing all stand. The title "reports delivery" is
 rewritten to say what is reported. The file name is kept (`knowledge-layout.md`).
 
+**Standing, with its reason.**
+`docs/decisions/sink-delivery/a-sink-that-delivered-nothing-raises-one-that-delivered-something-reports.md`
+fences "a sink that absorbs a total failure is a sink the worker *believes*: retry never
+engages, counters stay at zero, and `flush()` returns `True` while everything is lost". This spec
+leaves a truthy `flush()` over an all-dropped or all-unknown batch, and the decision stands
+unedited. The defect it names is a total loss that no counter sees, and an all-dropped or
+all-unknown batch is counted in `health().sink`, in SPEC-088's `sink_lost` and now on the result.
+
 **Refined.**
 `docs/decisions/public-api/a-result-that-can-grow-a-reason-must-stop-being-a-bool-before-10-not-after.md`
 fences "`FlushResult`/`ContinueResult` grow by new reason values only", and invariant 10 says
@@ -314,6 +375,7 @@ untouched, and both texts say so.
 - `results.py:20-21`, "It grows by new ``reason`` values";
 - `results.py:61`, "``ok=True`` carries the guarantee instead: the sink took them";
 - `__init__.py:64-65`, "so a truthy result means they were delivered";
+- `worker.py:885`, "truthy once the worker has delivered them";
 - `worker.py:895-897`, "``ok=True`` is unaffected and still means the sink took them";
 - `_lifecycle.py:5734`, "truthy when everything outstanding was delivered".
 
@@ -339,17 +401,22 @@ so the entry goes in the pending notes for the next tag, whichever spec of the a
 - [ ] The result-type decision's fence and entry, and invariant 10's text, say that a result
       grows by new reason values and by appended keyword fields and never by a changed
       `__bool__`, and the decision gains a dated History entry (invariant 10).
-- [ ] None of the five docstrings this FR lists still states the claim quoted for it.
-      `FlushResult`'s docstring names the five counts, the window and the over-count, and
-      `docstring-lint.py` passes (invariant 10).
+- [ ] None of the six docstrings this FR lists still states the claim quoted for it.
+      `FlushResult`'s docstring names the five counts, the window, the over-count and that a zero
+      count covers only the terms the ledger counts, and `docstring-lint.py` passes
+      (invariant 10).
 - [ ] A superseded marker naming this spec and the decision's path stands at
       `docs/release-notes/v1.0.0.md:288` (invariant 10).
-- [ ] `git grep` for "sink took them", "evidence of delivery", "means they were delivered" and
-      "everything landed" finds no hit outside a superseded marker, `docs/audits/`,
-      `docs/specs/` and `docs/spec-delivery/` (invariant 10).
+- [ ] `git grep` for "sink took them", "evidence of delivery", "means they were delivered",
+      "everything landed" and "has delivered them" over `README.md`, `docs/invariants.md`, the two
+      decision files and the four source files this FR lists finds no hit; at `9b54b370` it
+      finds seven (invariant 10).
 - [ ] The pending release notes carry one entry. It names the five fields and `lost`, says that
-      truthiness is unchanged, describes the window and the over-count, and says that `repr()`
-      and `==` now include the counts (invariant 10).
+      truthiness is unchanged, describes the window, the over-count and what a zero count does
+      not cover, and says that `repr()` and `==` now include the counts (invariant 10).
+- [ ] The same entry says that a `flush(timeout=None)` whose drain dies under it now waits for the
+      drain thread to end, including its stderr line, where it returned `"abandoned"` at once
+      (invariants 3 and 10).
 - [ ] The `docs/architecture.md` §12 item for finding 2 is struck as closed by this spec. The
       item for finding 12 records that a loss a sink counts after its `emit` returned is in none
       of the counts, and stays open for its acknowledgement fix (invariant 2).
@@ -369,8 +436,12 @@ branch.
 The drain snippet's comment (`:1375`, "truthy when everything landed") and the `FlushResult`
 paragraph (`:1415-1418`, "A truthy result is evidence of delivery") are rewritten to say what a
 truthy result means. They name `lost`, the five fields, the window and the over-count.
-`:767-769` already says that a truthy `flush()` means the drain completed and not that every
-chunk landed, and it stays.
+The `"sink-flush"` row of the reason table (`:1429`) says "Everything queued reached the sink"
+and "the library delivered". FR-003 gives that reason counts of the drain's window, which can be
+non-zero, so the row is rewritten to say that the drain finished and the sink's own `flush()`
+raised, with the counts saying what the drain lost. Every rewritten passage says that a zero count
+covers only the terms the ledger counts (FR-002). `:767-769` already says that a truthy `flush()`
+means the drain completed and not that every chunk landed, and it stays.
 
 #### Acceptance Criteria:
 
@@ -381,9 +452,10 @@ chunk landed, and it stays.
       nothing, is false (invariant 2).
 - [ ] The Lambda idiom's condition reads `drained.lost` and the `h.sink` term, and its comment
       says that a truthy `drained` can carry a non-zero `lost` (invariant 2).
-- [ ] `README.md` no longer says "truthy when everything landed" or "evidence of delivery". Its
-      `FlushResult` section names `lost` and the five fields, with the window and the over-count
-      (invariants 2 and 10).
+- [ ] `README.md` no longer says "truthy when everything landed", "evidence of delivery" or, in
+      the `"sink-flush"` row, "Everything queued reached the sink". Its `FlushResult` section names
+      `lost` and the five fields, with the window, the over-count and what a zero count does not
+      cover (invariants 2 and 10).
 
 ---
 
@@ -406,8 +478,16 @@ class FlushResult(_Result):
 # src/log_foundry/worker.py, private
 class _FlushMarker:
     ...  # delivered, event, seen_failures, unchanged
+    counted: bool  # whether the drain snapshots when it answers; False for retarget's markers
     ledger: EventLedger | None  # the drain's end snapshot, written before event.set()
-    unwinding: bool  # answered by a drain unwinding an exception; the caller waits, then reads
+    unwinding: bool  # set by either answerer when it answers while unwinding an exception
+
+
+class Worker:
+    def flush(self, timeout: float | None = 5.0) -> FlushResult: ...  # unchanged; counted=False
+    def _flush_marked(
+        self, timeout: float | None, *, counted: bool
+    ) -> tuple[FlushResult, _FlushMarker | None]: ...  # the verdict, and the marker it queued
 ```
 
 ---
@@ -421,9 +501,12 @@ if not r:
 if r.lost:
     ...  # the process lost events while the call ran; r.sink_lost and the rest say where
 
-# private
-start = _lifecycle._ledger_snapshot()  # calling thread, before the sweep
-end = marker.ledger or _lifecycle._ledger_snapshot()  # drain's answer, else the caller's read
+# private, all in _lifecycle._flush_worker, on the calling thread
+start = _lifecycle._ledger_snapshot()  # before the sweep, stamped with os.getpid()
+verdict, marker = worker._flush_marked(timeout, counted=True)
+# when marker is None or carries no ledger: wait for a dying drain (FR-003), unless on it, then
+end = marker.ledger if marker and marker.ledger else _lifecycle._ledger_snapshot()
+return _with_counts(verdict, start, end)  # the one function that attaches the counts
 ```
 
 ## File & Folder Structure
@@ -431,8 +514,8 @@ end = marker.ledger or _lifecycle._ledger_snapshot()  # drain's answer, else the
 ```
 src/log_foundry/
 ├── results.py          # FlushResult's five fields and lost
-├── worker.py           # _FlushMarker.ledger and .unwinding; both answerers snapshot; the wait
-├── _lifecycle.py       # _flush_worker: the start read, the end read, the one constructor
+├── worker.py           # _FlushMarker's three fields, _flush_marked, both answerers snapshot
+├── _lifecycle.py       # _flush_worker: the reads, the wait for a dying drain, the counts
 └── __init__.py         # flush()'s docstring
 tests/
 ├── test_flush_loss_counts.py   # FR-002, FR-003
@@ -494,7 +577,17 @@ with a fresh sink per trial.
 
 At the default interval the change read in the window equalled the sink's loss in every trial:
 29, 29, 30 and 30, with `failed_batches +1` for "all 30 REJECTED" and 0 for a sink accepting
-everything. At 1e-6 the count trigger sometimes emitted the batch before the call. "1 accepted,
+everything. At 1e-6 the count trigger sometimes emitted the batch before the call.
+
+The two columns count different things, which is why the second exceeds the first in three cases
+(18 against 16, 17 against 16, 57 against 51). The first counts a `deliver` call that began
+before the prototype set its flag on entry to `_flush_worker`. The second counts a trial whose
+change between the prototype's two `health()` reads differed from the sink's loss. The prototype
+sets the flag and then reads `health()`, so under a 1e-6 switch interval a run can begin after
+the flag and settle before that first read. Such a trial is not counted as early, yet its loss
+falls outside the window. In "All 30 REJECTED" the second column counts only a
+`failed_batches` change other than 1, and an early `deliver` can still be abandoned after the
+first read, so there the second column is the smaller. "1 accepted,
 29 never land" stayed inside the window anyway, because its four rounds outlast the call's
 start. "All 30 REJECTED" then read `ok=True` in some trials, which is today's verdict scope
 working as written. So FR-002's criteria put the triggers out of reach.
@@ -519,6 +612,36 @@ so the four were not reproduced and are not explained.
 ---
 
 ## Revision history
+
+- **2026-11-15, revised after the spec review**, which found three blocking defects and ten
+  smaller ones, all fixed here.
+  - ~~A marker answered while the drain unwinds is marked in `_drain`~~: `_final_drain` answers
+    in a `finally` too, before `_drain_finished` is set, so both answerers now mark it, and a
+    criterion holds the exit drain.
+  - ~~`end = marker.ledger or ...` in `_flush_worker`~~: the marker was a local of
+    `Worker.flush`. `_flush_marked` now returns it, the wait lives in `_flush_worker`, and
+    `retarget` neither snapshots nor waits.
+  - ~~No `FlushResult` built in `worker.py` except through the one function~~: that
+    contradicted `Worker.flush`'s eleven constructions. The criterion now holds
+    `_flush_worker`'s returns.
+  - ~~A `git grep` outside `docs/audits/`, `docs/specs/` and `docs/spec-delivery/`~~: it hit the
+    §12 item FR-004 strikes and an unrelated `sinks/_batch.py` line. It is now run over named
+    files.
+  - Sites added: `worker.py:885` and the `"sink-flush"` row at `README.md:1429`.
+  - Wordings corrected:
+    - ~~A zero count says that none of the call's events was lost~~: it covers only the
+      terms the ledger counts.
+    - ~~A process with no worker returns zero counts~~: an orphan-path `sink_lost` is
+      counted there.
+    - ~~"refused with the keyword-only message"~~: CPython's message is named.
+  - Behaviour now stated:
+    - the wait is skipped on the drain thread;
+    - `flush(timeout=None)` now waits out a dying drain's stderr line, and the release notes
+      say so;
+    - the second flush in the after-the-answer criterion runs on another thread;
+    - the fork criterion pins its hook before the marker is queued;
+    - the sink-delivery decision on total failure stands, with its reason.
+  - The Evidence table's two columns are explained.
 
 - **2026-11-15, drafted** from Andrew's answer of the same day to the question the §12 item for
   finding 2 put to him. The item weighed two closures, and this spec is closure (b). Closure (a)
