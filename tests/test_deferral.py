@@ -235,7 +235,6 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/multi.py": {"MultiSink": ("emit",)},
     "sinks/kafka.py": {"KafkaSink": ("emit",)},
     "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
-    "sinks/stdout.py": {"StdoutSink": ("emit",)},
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
     "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
@@ -243,8 +242,9 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
 
 SPEC-058 listed the first five modules, SPEC-059 the next ten, and SPEC-069 the rest, each of
 whose ``emit`` enters a ``Deferral`` for its encode step. SPEC-074 takes each sink it puts on the
-delivery engine off the list, as SPEC-073 took ``sinks/http.py``: its drops register on the run
-context ``SETTLED``, and its counts commit in ``_engine._run``'s one ``Deferral``. SPEC-073 took ``sinks/http.py`` off the
+delivery engine off the list, as SPEC-073 took ``sinks/http.py``, SPEC-082 the file sinks and
+SPEC-084 ``sinks/stdout.py``: its drops register on the run context ``SETTLED``, and its counts
+commit in ``_engine._run``'s one ``Deferral``. SPEC-073 took ``sinks/http.py`` off the
 list: ``HTTPSink`` counts through the delivery engine's run context, whose one commit is
 ``_engine._commit``, listed below, and whose ``SETTLED`` rule for a dropped counter
 :func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it.

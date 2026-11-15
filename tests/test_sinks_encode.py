@@ -821,13 +821,17 @@ ENGINE_GAINED["LogstashSink"] = frozenset(
 ENGINE_GAINED["FileSink"] = ENGINE_GAINED["RotatingFileSink"] = frozenset(
     {"deliver", "log_foundry_counters", "log_foundry_stop_signal"}
 )
+ENGINE_GAINED["StdoutSink"] = ENGINE_GAINED["StderrSink"] = frozenset(
+    {"deliver", "log_foundry_counters", "log_foundry_stop_signal"}
+)
 """SPEC-074 FR-006: what each sink it puts on the delivery engine adds to its public names.
 
 ``deliver`` and ``log_foundry_counters`` are SPEC-072's contract; the surface only grows
 (invariant 10), so a name appearing beyond these is still a finding. ``LogstashSink``'s entry is
 SPEC-075 FR-003's: it delegates ``deliver`` and copies its backend's budget, read-only. The two
 file sinks' entries are SPEC-082's: they had no stop signal in 1.1.0, since nothing in them waited,
-and gain the attribute the engine's inline waits read.
+and gain the attribute the engine's inline waits read. The two stream sinks' entries are SPEC-084's,
+for the same reason.
 """
 ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
 """SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""

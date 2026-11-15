@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-084
 title: "Stream Sinks on the Delivery Engine: Never Resend What the Stream Took"
 description: "Moves StdoutSink and StderrSink onto deliver, so a stream that raises partway reports each event by what the stream was handed, counts what did not land once per run, and is never handed a line again that it already took, which closes the duplicate lines the worker's whole-batch retry writes today."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-028, SPEC-031, SPEC-032, SPEC-069, SPEC-070, SPEC-072, SPEC-074, SPEC-076, SPEC-082]
 ---
 
@@ -47,7 +47,12 @@ does not own:
 2. **A short write on the unbuffered shape.** `FileIO.write` can return a short count, which
    `TextIOWrapper` ignores. That line is torn and called `ACCEPTED`, and the next line joins it.
    Measured with the review's prototype: at every cap, one unparseable line holding two `ACCEPTED`
-   events. 1.x has this too.
+   events. Over a non-blocking descriptor the count can be none at all: `FileIO.write` returns
+   `None` when the write would block, having written nothing, and whole lines are lost while called
+   `ACCEPTED`, with no line and `losses()` `None`. Measured on macOS and on Linux 3.12 and 3.13:
+   one `deliver` of 200 events of about 1 KB through `TextIOWrapper(FileIO(w), write_through=True)`
+   over a pipe set non-blocking, 200 `ACCEPTED` and 64 lines landed. 1.x has this too: its `emit`
+   returned and lost the same lines.
 3. **The straddle.** On a buffered stream, the batch during which a fault begins hands at least one
    line before the raise (it did in every sustained-fault configuration probed). That run settles,
    with its handed lines `UNKNOWN`, counted and announced, and every later batch fails and raises,
@@ -151,8 +156,9 @@ sinks is `tests/test_delivery_paths.py`'s pattern and `tests/test_stream_sink_de
 - [ ] `tests/test_engine_sinks_roster.py`'s AST scan finds `StdoutSink`, the class that defines
       `deliver`, with its floor raised from 15 (where SPEC-082 leaves it) to 16. It holds
       `StderrSink` by its check that no class below the one defining `deliver` defines `emit`.
-- [ ] `tests/test_classify.py`'s `ENGINE_EXCLUSIONS` names `StdoutSink` with its reason, and that
-      file's tests pass with its population unchanged by this spec.
+- [ ] `tests/test_classify.py`'s engine-round roster finds `StdoutSink` and holds its round to
+      asking `is_retryable(self._retryable_error, err)`, with `_LOOP_FLOOR` raised from 13 to 14;
+      `_SWEEP_EXCLUSIONS` names `StdoutSink` with its reason, and that file's tests pass.
 - [ ] The worker, the orphan path and the inline adapter all reach `deliver` for both sinks, held by
       `tests/test_delivery_paths.py`'s pattern.
 - [ ] A batch that fails nowhere writes into a `StringIO` exactly the bytes 1.x's `emit` wrote for
@@ -179,7 +185,7 @@ order, then one `flush()`. Each event's outcome follows from which call raised. 
 |---|---|
 | the pre-flush raised | none was handed to the stream: every one `RETRYABLE` or `REJECTED`, as the predicate (FR-003) answers, and no `write` is called |
 | the pre-flush returned and the `write` of line `i` raised an `OSError` | every line up to and including `i` `UNKNOWN`; every later line `RETRYABLE` or `REJECTED` by the predicate |
-| the `write` of line `i` raised an exception that is not an `OSError` | every line before `i` `UNKNOWN`; line `i` and every later line `REJECTED` by the predicate |
+| the `write` of line `i` raised an exception that is not an `OSError`, or `io.UnsupportedOperation` | every line before `i` `UNKNOWN`; line `i` and every later line `REJECTED` by the predicate |
 | every `write` returned and the final `flush()` raised | every one `UNKNOWN` |
 | every call returned | every one `ACCEPTED` |
 
@@ -187,14 +193,19 @@ order, then one `flush()`. Each event's outcome follows from which call raised. 
 closed or detached stream before any I/O, and an encoding error is raised before the text reaches
 the binary layer. So that line was not taken. Without this rule a closed `StringIO`, whose
 `flush()` returns and whose `write` raises `ValueError`, made line 1 `UNKNOWN` and settled every
-batch.
+batch. **`io.UnsupportedOperation` is judged the same way**, though it is an `OSError` as well as
+a `ValueError`: a stream opened for reading raises it, with no `errno`, before any I/O. Judged as
+an `OSError`, `StdoutSink(open(path))` returned from its first batch with three events counted
+`failed` and a line saying they may have landed, where 1.x raised on every call.
 
 **The unbuffered shape.** When a call raises, the round checks whether the stream is exactly the
 shape `python -u` and `PYTHONUNBUFFERED=1` give `sys.stdout`: `type(stream) is io.TextIOWrapper`,
 `stream.write_through` is true, and `type(stream.buffer) is io.FileIO`. The types are compared
 exactly, so no caller code runs, and the check is read only after a raise, so a clean round pays
-nothing. On that shape each `write` is one `write(2)`. A `write` that returned put its line in the
-kernel, and one that raised took nothing, so the rows after the pre-flush change. On this shape
+nothing. On that shape each `write` is one `write(2)`. On a blocking descriptor a `write` that
+returned put its line in the kernel, and one that raised took nothing, so the rows after the
+pre-flush change. On a non-blocking descriptor a returned `write` may have written nothing
+(residue 2), and no raise happens, so the shape is never consulted. On this shape
 its table wins for every raise, one that is not an `OSError` included, so the lines before `i` are
 `ACCEPTED` there too:
 
@@ -381,7 +392,9 @@ clears it.
 
 `StdoutSink`'s docstring keeps the claim that it keeps **no** client buffer (SPEC-036 FR-002), but
 its sentence "nothing of this sink's is left pending between calls" becomes: the sink keeps
-nothing, but the stream may still hold lines a run reported `UNKNOWN`.
+nothing, but the stream may still hold lines a run reported `UNKNOWN`. `StderrSink`'s docstring
+repeats the same sentence beside its own client-buffer claim, which `tests/test_sink_concurrency.py`
+reads, and changes the same way.
 
 #### Acceptance Criteria:
 
@@ -455,7 +468,7 @@ tests/
 ├── test_stream_sink_deliver.py       # FR-001 to FR-004 (new)
 ├── test_stream_sink_partial_write.py # the RLIMIT_FSIZE proof, the dead pipe, the unbuffered shape (new, POSIX only)
 ├── test_engine_sinks_roster.py       # StdoutSink in ENGINE_SINKS, floor 15 -> 16; neither sink in _RIGGED
-├── test_classify.py                  # StdoutSink joins ENGINE_EXCLUSIONS
+├── test_classify.py                  # StdoutSink joins the engine rounds and _SWEEP_EXCLUSIONS
 ├── test_wrapper_failures.py          # a transform's failure over a StdoutSink writes the engine's line
 ├── test_fork_roster.py               # StdoutSink's row leaves _PRIMITIVE_HOMES
 ├── test_deferral.py                  # the sinks/stdout.py row leaves DEFERRING_SITES
@@ -471,12 +484,15 @@ tests/
 What each listed test change is for:
 
 - `tests/test_engine_sinks_roster.py`: `StdoutSink` joins `ENGINE_SINKS` and `FLOOR` becomes 16.
-  `test_a_tree_of_twelve_fails_the_floor` hard-codes the floor in its expected message, so the
-  message moves with it. Neither sink joins `_RIGGED`, for FR-001's reason.
-- `tests/test_classify.py`: `engine_round_findings` would find `StdoutSink`, and the `_LOOPS` sweep
-  assumes a sink `max_retries` and drives `ConnectionError`, which the stream predicate rejects.
-  `ENGINE_EXCLUSIONS` names `StdoutSink` with the reason "no `max_retries`; its predicate is held by
-  `tests/test_stream_sink_deliver.py`", so the population the file asserts is unchanged.
+  `test_a_tree_of_fourteen_fails_the_floor` hard-codes the floor in its expected message, so it
+  becomes `test_a_tree_of_fifteen_fails_the_floor` and the message moves with it. Neither sink joins `_RIGGED`, for FR-001's reason.
+- `tests/test_classify.py`: `engine_round_findings` finds `StdoutSink`, and its round asks
+  `is_retryable` as the rule requires, so `_LOOP_FLOOR` and every count of that population move
+  from 13 to 14, `test_the_loop_roster_fails_twelve_conforming_loops_on_its_floor` becoming
+  `..._fails_thirteen_...`, as SPEC-082 moved them for the file sinks. The `_LOOPS` sweep assumes a
+  sink `max_retries` and drives `ConnectionError`, which the stream predicate rejects, so
+  `_SWEEP_EXCLUSIONS` names `StdoutSink` with the reason "no `max_retries`; its predicate is held
+  by `tests/test_stream_sink_deliver.py`".
 - `tests/test_wrapper_failures.py`: once `StdoutSink` offers `deliver`, a `TransformSink` or
   `FilteringSink` around it offers it too (SPEC-075), so the batch takes the engine path.
   `test_a_transform_failing_for_one_event_costs_only_that_event` then sees the engine round's line,
@@ -636,3 +652,17 @@ What each listed test change is for:
   criterion, 1.x reddens all seven new tests, and the pass corrected four records (the
   `test_model_b` count, the override catcher, the unbuffered shape's precedence, and the latched
   group's line).
+- **2026-11-15, plan review.** `tests/test_classify.py` takes `StdoutSink` the way SPEC-082 took
+  the file sinks, not through `ENGINE_EXCLUSIONS`: that exclusion removed it from the engine-round
+  roster altogether, so nothing checked that its round asks its predicate through `is_retryable`.
+  It stays in that roster, which rises from 13 to 14, and joins `_SWEEP_EXCLUSIONS`, which skips
+  only the runtime sweep; FR-001's second criterion and the File & Folder Structure say so now. The
+  floor test `test_a_tree_of_fourteen_fails_the_floor` is named as it stands since SPEC-082 (the
+  draft named its earlier `twelve`), and FR-004 now names `StderrSink`'s docstring, which repeats
+  the sentence about nothing pending between calls. The diff review then found
+  `io.UnsupportedOperation`, an `OSError` that took nothing, judged as a write that may have taken
+  its line; FR-002's row and paragraph for a raise that is not an `OSError` now name it. The
+  second diff review found that on the unbuffered shape over a non-blocking descriptor a returned
+  `write` can have written nothing, so whole lines are lost while called `ACCEPTED`, as in 1.x;
+  residue 2 and the unbuffered-shape paragraph now say so, and the shape rule is unchanged,
+  because no raise happens there for it to judge.

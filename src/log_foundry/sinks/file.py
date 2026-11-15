@@ -625,7 +625,8 @@ class _Writes:
             self._fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
         if self._torn is not None:
             self._fates[self._torn] = Outcome.RETRYABLE if again else Outcome.UNKNOWN
-        kind = f"{type(error).__name__} {_diag.errno_of(error)}".rstrip()
+        name_of = _diag._STR_STR(_diag._STORED_NAME(type(error)))
+        kind = f"{name_of} {_diag.errno_of(error)}".rstrip()
         whole = unencodable_in_run(self._owner)
         context.count(self._owner.log_foundry_counters, "failed_events", whole, when=When.FAILED)
         unsure = [] if again or self._torn is None else [self._torn]

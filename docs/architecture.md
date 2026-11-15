@@ -1378,9 +1378,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (`docs/decisions/pipeline/`), `results.py:61`, and the README's "evidence of delivery"
   (`README.md:1374`, `:1414-1417`), with the Lambda handler idiom at `README.md:1501-1502` reading
   the loss and the release notes carrying what a caller can see. A staleness risk, not a change:
-  SPEC-084, not yet built, holds a settled run that lost events to `failed_batches == 0`
-  (`docs/specs/SPEC-084-stream-sinks-on-the-delivery-engine.md:293`), which is what closure (b)
-  keeps, so the answer leaves that criterion as written.
+  SPEC-084 holds a settled run that lost events to `failed_batches == 0`
+  (`test_a_capped_stream_never_writes_an_event_twice` in
+  `tests/test_stream_sink_partial_write.py`), which is what closure (b) keeps, so the answer
+  leaves that assertion as written.
 - **`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**
   (2026-11-14 audit, finding 18; invariant 2, whose recorded exception at `docs/invariants.md:62`
   stands). `dropped` counts submissions, `failed_batches` counts batches, the sink, orphan and

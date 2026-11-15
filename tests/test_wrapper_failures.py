@@ -129,7 +129,12 @@ def _lost_lines(err: str) -> list[str]:
 
 
 def test_a_transform_failing_for_one_event_costs_only_that_event(capsys) -> None:
-    """Ten spans through a ``StdoutSink``: 29 lines, one counted drop, one line naming the type."""
+    """Ten spans through a ``StdoutSink``: 29 lines, one counted drop, one line naming the type.
+
+    Since SPEC-084 the inner ``StdoutSink`` offers ``deliver``, so the wrapper does too (SPEC-075)
+    and the batch takes the engine path, whose round writes the absorbed line in place of the 1.x
+    body's ``lost`` line. The counts are unchanged.
+    """
     stream = io.StringIO()
 
     def fn(event: dict[str, object]) -> dict[str, object]:
@@ -154,9 +159,14 @@ def test_a_transform_failing_for_one_event_costs_only_that_event(capsys) -> None
     health = log_foundry.health()
     assert health.failed_batches == 0
     assert health.sink == SinkLosses(dropped=1, failed=0)
-    assert _lost_lines(capsys.readouterr().err) == [
-        "log-foundry: lost 1 event(s); TransformSink, the transform failed with ValueError"
+    err = capsys.readouterr().err
+    assert [line for line in err.splitlines() if "TransformSink" in line] == [
+        (
+            "log-foundry: absorbed a failure while transforming a batch (ValueError); "
+            "TransformSink did not forward 1 event(s) its function failed on"
+        )
     ]
+    assert _lost_lines(err) == []
 
 
 def test_a_predicate_failing_for_one_event_costs_only_that_event(capsys) -> None:
@@ -591,9 +601,13 @@ def test_model_b_a_wrapper_turning_reporting_loses_nothing() -> None:
     """FR-003 and FR-007's model (b), over four direct three-event ``MultiSink.emit`` calls.
 
     The first batch: ``fn`` fails for its first event and the stream takes the other two, so the
-    wrapper counts one and becomes a reporting child. Every later batch: the stream raises, the
-    wrapper raises having counted nothing, and the fan-out absorbs all three. Under SPEC-036's
-    silent-only rule the nine would be counted nowhere, reading ``(1, 0)``.
+    wrapper counts one and becomes a reporting child. The second: the stream raises an ``OSError``
+    with no ``errno`` at its first line, which the inner sink (on the engine since SPEC-084) counts
+    as three lost — one handed and ``UNKNOWN``, two rejected — and the batch settles. The third
+    and fourth: its fault latch is set, so nothing settles, the inner sink counts three each before
+    it raises, and the fan-out absorbs three more each: ``3 + 6 + 6 = 15``, the engine child under
+    ``MultiSink`` double count invariant 2 records. Under SPEC-036's silent-only rule the losses
+    would be counted nowhere, reading ``(1, 0)``.
     """
     stream = _BreaksAfter(2)
     wrapper = TransformSink(StdoutSink(stream=stream), lambda e: _fail_for(e, 0))
@@ -604,7 +618,7 @@ def test_model_b_a_wrapper_turning_reporting_loses_nothing() -> None:
     log_foundry.configure(service="t", sink=multi)
 
     assert len(stream.getvalue().splitlines()) == 2, "the premise: the stream took two lines"
-    assert log_foundry.health().sink == SinkLosses(dropped=1, failed=9)
+    assert log_foundry.health().sink == SinkLosses(dropped=1, failed=15)
 
 
 def _http_500(opener: FakeOpener | None = None) -> HTTPSink:

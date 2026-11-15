@@ -702,6 +702,50 @@ def test_a_lost_batch_is_counted_once_per_run_through_the_worker(cls: type, tmp_
     assert worker.failed_batches == 1
 
 
+class _NamelessMeta(type):
+    """A metaclass whose ``__name__`` raises: caller code that reading the name would run."""
+
+    @property
+    def __name__(cls) -> str:  # type: ignore[override]
+        raise RuntimeError("no name for you")
+
+
+class _Nameless(OSError, metaclass=_NamelessMeta):
+    """An ``OSError`` whose class name cannot be read through ordinary access."""
+
+
+def _deliver_or_fail(sink: Any, batch: list[dict[str, object]]) -> Any:
+    """Runs ``deliver``, turning any raise into a plain failure that names no ``_Nameless``.
+
+    A raise escaping ``deliver`` here carries the ``_Nameless`` error as its context, and pytest
+    reads that class's ``__name__`` while reporting it, which ends the run with an internal error
+    rather than a failure. So the outcome is recorded inside the ``except`` and failed outside it.
+    """
+    escaped = ""
+    try:
+        return sink.deliver(batch)
+    except Exception as err:
+        escaped = f"deliver raised {repr(err.args)[:80]}"
+    pytest.fail(escaped, pytrace=False)
+
+
+@BOTH
+def test_a_raise_whose_class_name_raises_still_returns_a_verdict(
+    cls: type, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The line names the stored type name, read without running the metaclass's code (SPEC-084).
+
+    The stream sinks' twin: both judge a raise by its class name, so both read it the same way.
+    """
+    sink = cls(str(tmp_path / "nameless.ndjson"))
+    budget(sink, 0, lambda: _Nameless(errno.ENOSPC, "full"))
+    assert _deliver_or_fail(sink, list(EVENTS)).outcomes == (R, R, R, R, R)
+    assert _lost(capsys.readouterr().err) == [
+        f"log-foundry: lost 5 event(s); {cls.__name__}, 1 attempt(s), _Nameless errno=28"
+    ]
+    sink.close()
+
+
 @BOTH
 def test_an_errno_no_resend_cures_costs_one_deliver_call_and_no_wait(
     cls: type, tmp_path: Path

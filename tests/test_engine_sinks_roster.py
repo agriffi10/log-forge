@@ -7,11 +7,14 @@ emit(self, batch)`` whose body is the one call ``emit_via_deliver(self, batch)``
 that defines ``deliver``, with no class below it defining ``emit``; its module must neither call
 ``wait`` nor assign a backoff constant; and it may write a counter only in ``__init__``, the
 ``failed`` setter or the ``_counter_lock`` setter, never registering a run-context count against
-``failed``, whose setter takes the lock a commit holds. The floor is 15, exactly the fifteen:
-SPEC-074's thirteen and, since SPEC-082, ``FileSink`` and ``RotatingFileSink``. A runtime half
-builds each sink over its double and reads what the AST cannot; the two file sinks have a case of
-their own there, because their ``losses()`` is ``None`` until something is counted (SPEC-069) and
-they never had a public ``failed`` to keep assignable. The gate carries
+``failed``, whose setter takes the lock a commit holds. The floor is 16, exactly the sixteen:
+SPEC-074's thirteen, ``FileSink`` and ``RotatingFileSink`` since SPEC-082, and ``StdoutSink``
+since SPEC-084, whose subclass ``StderrSink`` the check on classes below the one defining
+``deliver`` holds. A runtime half builds each sink over its double and reads what the AST cannot;
+the two file sinks have a case of their own there, because their ``losses()`` is ``None`` until
+something is counted (SPEC-069) and they never had a public ``failed`` to keep assignable. The two
+stream sinks share that ``losses()`` rule and have no ``failed`` at all, so they are kept out of
+its runtime list too; ``tests/test_stream_sink_deliver.py`` holds them at run time. The gate carries
 a fixture corpus asserting each check's reason, a floor case, and a silent case. Serves
 invariants 2, 6, 7, 10 and 12.
 """
@@ -54,9 +57,10 @@ ENGINE_SINKS = frozenset(
         "SyslogSink",
         "FileSink",
         "RotatingFileSink",
+        "StdoutSink",
     }
 )
-FLOOR = 15
+FLOOR = 16
 
 _WRAPPER_REASON = (
     "SPEC-075's wrapper: its emit is a 1.x body, its losses() is a 1.x formula, and its deliver "
@@ -196,7 +200,7 @@ def engine_sink_findings(root: Path, floor: int = FLOOR) -> tuple[set[str], list
     return found, findings
 
 
-def test_the_engine_sinks_are_the_fifteen() -> None:
+def test_the_engine_sinks_are_the_sixteen() -> None:
     found, findings = engine_sink_findings(SINKS)
     assert findings == [], "\n".join(findings)
     assert found == ENGINE_SINKS
@@ -210,7 +214,7 @@ def test_removing_a_wrapper_exclusion_reddens_naming_it(
 
     Before SPEC-075 no wrapper defined ``deliver`` and removing the entry changed nothing; now the
     roster finds the class and names its 1.x ``emit``, and with every exclusion in place the
-    population is still exactly the fifteen.
+    population is still exactly the sixteen.
     """
     monkeypatch.delitem(EXCLUSIONS, wrapper)
     found, findings = engine_sink_findings(SINKS)
@@ -273,12 +277,12 @@ def test_a_conforming_fixture_is_silent(tmp_path: Path) -> None:
     assert engine_sink_findings(tmp_path, floor=1) == ({"Good"}, [])
 
 
-def test_a_tree_of_fourteen_fails_the_floor(tmp_path: Path) -> None:
-    body = "".join(_GOOD.replace("class Good", f"class Good{i}") for i in range(14))
+def test_a_tree_of_fifteen_fails_the_floor(tmp_path: Path) -> None:
+    body = "".join(_GOOD.replace("class Good", f"class Good{i}") for i in range(15))
     (tmp_path / "m.py").write_text(textwrap.dedent(body), encoding="utf-8")
     found, findings = engine_sink_findings(tmp_path)
-    assert len(found) == 14
-    assert findings == ["the scan found 14 engine sinks, under its floor of 15"]
+    assert len(found) == 15
+    assert findings == ["the scan found 15 engine sinks, under its floor of 16"]
 
 
 # --- the runtime half ---------------------------------------------------------------------------
@@ -343,6 +347,9 @@ def test_every_engine_sink_reports_its_counters(
 _FILE_SINKS = ("FileSink", "RotatingFileSink")
 """The engine sinks whose ``losses()`` is ``None`` until something is counted (SPEC-082)."""
 
+_STREAM_SINKS = ("StdoutSink", "StderrSink")
+"""The stream sinks (SPEC-084): out of ``_RIGGED`` for FR-001's reason, in the cases below."""
+
 
 @pytest.mark.parametrize("name", _FILE_SINKS)
 def test_a_file_sink_reports_its_counters_once_it_has_any(
@@ -385,7 +392,7 @@ def test_no_shipped_sink_declares_itself_idempotent() -> None:
     assert declared == []
 
 
-@pytest.mark.parametrize("name", (*_RIGGED, "NATSSink", *_FILE_SINKS))
+@pytest.mark.parametrize("name", (*_RIGGED, "NATSSink", *_FILE_SINKS, *_STREAM_SINKS))
 def test_an_emit_override_is_delivered_through_its_emit(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -452,7 +459,7 @@ def test_an_emit_override_counts_a_lost_batch_once_per_emit_call_as_1x(
         sink.close()
 
 
-@pytest.mark.parametrize("name", (*_ALL, *_FILE_SINKS))
+@pytest.mark.parametrize("name", (*_ALL, *_FILE_SINKS, *_STREAM_SINKS))
 def test_a_forked_child_completes_an_emit_while_the_parent_holds_the_counter_lock(
     name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
