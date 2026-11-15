@@ -16,7 +16,7 @@
   *Resolved* with its two corrections; two new open items, the wrapper that leaves its member
   alone and the stop-signal hand), §13 (the four shapes, re-measured on SPEC-087's merged tree); invariant 5;
   the new decision in `docs/decisions/pipeline/` and four rewritten in place; the README;
-  `docs/release-notes/v1.2.1.md`, created here, which also carries SPEC-082's owed notes; the new
+  the *Fixed* entry in `docs/release-notes/v1.2.1.md`, the pending notes SPEC-084 created; the new
   probe `docs/audits/2026-11-14-probes/lifecycle/leaves_remaining_holder.py`.
 - **Tests**: `tests/test_shared_sink_swap.py` (131 collected); the old pin in `tests/test_owed_closes.py`
   rewritten to both directions and one close.
