@@ -227,8 +227,8 @@ whose cost is per event was handed single-span batches under a backlog.
       the size target (invariant 2).
 - [ ] With the target set to the cap, 499 two-event spans then a 600-event span then 10 more
       two-event spans, all queued at once, are sent as batches of 998 and 620 events (invariant 2).
-- [ ] A sink costing 2 ms per event, sent 200 spans at once, receives all 400 events and is never
-      held in one emit for longer than 1 s (invariant 3).
+- [ ] A sink costing 2 ms per event, sent 1,000 spans at once, receives all 2,000 events and is
+      never held in one emit for longer than 1 s (invariant 3).
 - [ ] With `time.monotonic` patched to a constant, a backlog of 2,000 spans is delivered whole, no
       batch exceeds 1,000 events, and `health().stopped_reason` stays `None` (invariants 1 and 2).
 - [ ] After a batch that is abandoned, after `configure(sink=...)` installs a sink, after a batch
@@ -456,10 +456,10 @@ to a sink's verdict, which this spec's Out of Scope leaves to the sinks track.
 - [ ] A test derives every public sink class under `src/log_foundry/sinks/` from the tree and fails
       on one missing from a table that names how it takes a batch, as the table above does
       (invariant 2).
-- [ ] `spec090_nats_ack_backlog.py 0.002 200 10`, a JetStream `NATSSink` behind a 2 ms ack with the
-      default `publish_timeout` sent 200 spans through the worker, acks all 400 events with
-      `health().sink.failed == 0`, and no `deliver` call lasts longer than 1 s (invariants 2
-      and 3).
+- [ ] `spec090_nats_ack_backlog.py 0.002 1000 10`, a JetStream `NATSSink` behind a 2 ms ack with
+      the default `publish_timeout` sent 1,000 spans through the worker, acks all 2,000 events
+      with `health().sink.failed == 0`, and no `deliver` call lasts longer than 1 s
+      (invariants 2 and 3).
 - [ ] `docs/architecture.md` §12 carries the `NATSSink` residual with its probe, its measured
       numbers and its closure, and names this spec (invariant 2).
 
@@ -803,6 +803,16 @@ kept, and the build's own run is the one that counts.
 
 ## Revision history
 
+- **2026-11-16, after the first diff review: two criteria's 200 spans could not fail.** FR-001's
+  sixth criterion and FR-004's fourth sent 200 spans, 400 events at 2 ms each, which is 0.8 s of
+  sink time in all, so no call could last a second, and a fixed cap with no measured target
+  passed both. They now send 1,000 spans, 2,000 events: a batch at the cap would hold the sink
+  for 2 s, and the rule's half interval about 0.5 s. The suite runs each on a clock that only the
+  sink advances, so the worker measures the cost exactly and the test does not spend the 4 s.
+  Measured against the build on 3.12.12 and 3.13.1: `spec090_nats_ack_backlog.py 0.002 1000 10`
+  acked 2,000 with `sink.failed=0` in 12 `deliver` calls, largest 188 to 192 events, longest
+  0.505 to 0.513 s; `spec090_per_event_sink.py 0.002 1000` received 2,000 in 10 emits, largest
+  248, longest 0.50 to 0.51 s.
 - **2026-11-16, at completion: the record reached further than FR-005's table.** The build found
   more sites stating a claim FR-001 or FR-003 made false, and rewrote or marked each: in
   `worker.py`, the `max_retries` Args text, `_emit`'s "the first attempt of a batch is never

@@ -254,8 +254,9 @@ class _CountingQueue(queue.Queue[object]):
         **A submission is classified as the drain classifies it**: anything that is neither the
         shutdown sentinel, by identity, nor a flush marker, by its exact type, which
         :meth:`Worker._final_drain` and :meth:`Worker._drain` then take and count through
-        :meth:`Worker._take`, whose first call is :meth:`Worker._hold`. So the taken-in count and the taking count agree by construction,
-        and the test reads the item's real type, never a class hook the item could answer with.
+        :meth:`Worker._take`, whose first call is :meth:`Worker._hold`. So the taken-in count and
+        the taking count agree by construction, and the test reads the item's real type, never a
+        class hook the item could answer with.
         ~~``isinstance(item, list)``~~ — replaced after the rebase onto ``bb6656ff``, whose
         ``tests/test_class_check_roster.py`` refuses an ``isinstance`` that runs a value's class
         hook; it also asked a different question from the drain's. ``_FlushMarker`` has no
@@ -1714,10 +1715,11 @@ class Worker:
         the takeover sets ``_join_taken_over`` in the same critical section, and :meth:`stop`
         reads it to skip the sentinel, which the drain-thread winner already queued. A second one
         is not harmless. Taken over while :meth:`_final_drain`'s emit is running, it lands after
-        the bound that drain fixed when it began (SPEC-090 FR-002), is never consumed, and ``health().queued`` reads 1 for the life
-        of the process with ``submitted_after_shutdown`` at 0 — measured in 33 of 300 unforced
-        runs. The drain needs no wake-up from it either: the drain-thread winner has set the stop
-        event, and the drain loop tests that as soon as the emit it is inside returns.
+        the bound that drain fixed when it began (SPEC-090 FR-002), is never consumed, and
+        ``health().queued`` reads 1 for the life of the process with ``submitted_after_shutdown``
+        at 0 — measured in 33 of 300 unforced runs. The drain needs no wake-up from it either:
+        the drain-thread winner has set the stop event, and the drain loop tests that as soon as
+        the emit it is inside returns.
 
         Whether this caller is the drain thread is read **before** the lock, so the lock is still
         held across no call. In a forked child, ``self._thread`` names the inherited dead thread
@@ -2245,11 +2247,14 @@ class Worker:
         always made. A later one is declined, through :meth:`_decline_exit_batch`, when an
         exit batch has declined a retry or a batch was declined (``_exit_declining``), or when
         :meth:`_retry_declined` predicts from the longest attempt any exit batch has made that
-        this one would end past the deadline; a deadline of ``None`` declines nothing. A
-        declined batch was not emitted and leaves the target as it was, so the batches the rest
-        of the backlog is cut into are the rule's. The size is summed from the list rather than
-        read from ``_pending_events``, so the measurement holds on any path that appends
-        without :meth:`_take`.
+        this one would end past the deadline. A deadline of ``None`` declines nothing, latch or
+        not: it is read first, because a caller off the drain thread that takes over an owed
+        join records its own deadline (:meth:`claim_stop`), which can be ``None`` after a batch
+        was declined, and the decline line would then claim a deadline there is not (diff
+        review, 2026-11-16). A declined batch was not emitted and leaves the target as it was,
+        so the batches the rest of the backlog is cut into are the rule's. The size is summed
+        from the list rather than read from ``_pending_events``, so the measurement holds on any
+        path that appends without :meth:`_take`.
 
         Args:
           pending: The accumulated event-lists, cleared in place.
@@ -2272,6 +2277,7 @@ class Worker:
         if (
             exit_batch
             and self._exit_batches
+            and self._exit_deadline is not None
             and (self._exit_declining or self._retry_declined(self._exit_longest))
         ):
             self._decline_exit_batch(size)
@@ -2444,7 +2450,9 @@ class Worker:
         ``batch_lost``, as a declined retry's do, and it is added to the declined tally, which
         :meth:`_write_exit_tallies` announces in one line. :meth:`_settle` runs **before** the
         locked count and tally, so a batch :meth:`stop` finds in a tally it took has already
-        left ``_in_flight``, which it reads after the take. No line is written here.
+        left ``_in_flight``, which it reads after the take. No line is written here. The mark
+        declines a later batch only while a deadline stands: :meth:`_emit_pending` reads a
+        deadline of ``None`` first, and declines nothing under it.
 
         Args:
           size: The events the batch held.
@@ -2798,12 +2806,13 @@ class Worker:
         is kept in ``_exit_longest`` for the decision before the next exit batch. A declined
         retry of an exit batch, through the 1.x loop or an engine run that reports
         ``declined``, sets ``_exit_declining``, so every later exit batch is declined
-        unattempted. The first abandoned exit batch writes the abandon line as any batch does;
-        every later one is added to the abandon tally under the lock, beside ``failed_batches``,
-        and announced by :meth:`_write_exit_tallies`, so a dead sink at exit writes two lines
-        where a line per batch would write a thousand. On every route that can tally,
-        :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a tally
-        it took has already left ``_in_flight``.
+        unattempted while a deadline stands; a deadline of ``None`` declines nothing, as
+        :meth:`_emit_pending` says. The first abandoned exit batch writes the abandon line as
+        any batch does; every later one is added to the abandon tally under the lock, beside
+        ``failed_batches``, and announced by :meth:`_write_exit_tallies`, so a dead sink at exit
+        writes two lines where a line per batch would write a thousand. On every route that can
+        tally, :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a
+        tally it took has already left ``_in_flight``.
 
         ~~``_in_flight`` holds the batch size from before the first attempt until this method
         returns by any route~~ — superseded by SPEC-088: ``_in_flight`` already holds the batch,

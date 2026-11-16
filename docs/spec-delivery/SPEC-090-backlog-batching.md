@@ -17,7 +17,7 @@
 - **The sinks** (FR-004): `tests/test_batch_bound_roster.py` derives every public sink from the
   tree against a table of how it takes a batch, hands every `RIGS` sink and the HTTP family 1,000
   events, and runs a JetStream `NATSSink` behind a slow ack. No sink's code changed; `nats.py`'s
-  and `http.py`'s prose did.
+  prose did.
 - **The record** (FR-005): the decision *A backlog drains in larger batches, and capacity is not a
   setting* (`docs/decisions/pipeline/`); the exit-drain decision in `docs/decisions/sink-lifecycle/`
   rewritten in place, its file name kept; §12's findings 9 and 10 struck and the `NATSSink`
@@ -46,7 +46,7 @@ to 36. Each pair of figures is 3.13.1, then 3.12.12.
 | FR-002 AC1, FR-003 AC2 | `p04_exit.py 0.02 10000` | 2 calls, largest 19,980; `close()` not run; `19980 event(s) in flight` | 60 and 61 calls, largest 234 and 200; `close()` run; one line declining 8,918 and 9,260 events, which with the 11,082 and 10,740 received make 20,000 |
 | FR-003 AC1 | `spec090_exit_budget.py` | `batched`: 1.20 s, join expired, 3 attempts, `close()` 0 times | `tree`: 1.07 s, join completed, 2 attempts, `close()` once, `failed_batches=3` |
 | FR-003 AC3 | `spec090_dead_sink_exit_lines.py` | 2 lines, 20,002 events, `failed_batches=2` | 3 lines, 20,002 events, `failed_batches=1001`, the last `999 more exit batch(es) abandoned` |
-| FR-004 AC4 | `spec090_nats_ack_backlog.py 0.002 200 10` | not run | 400 acked, `failed` 0, longest `deliver` 0.510 s and 0.505 s |
+| FR-004 AC4 | `spec090_nats_ack_backlog.py ~~0.002 200 10~~ 0.002 1000 10` | not run | ~~400 acked, `failed` 0, longest `deliver` 0.510 s and 0.505 s~~ 2,000 acked, `failed` 0, 12 calls, longest `deliver` 0.505 s and 0.513 s, re-run after the first diff review found 200 spans could not fail the criterion (the spec's revision history) |
 
 The first 3.13.1 build run of `p13` met a 2.81 s burst at a load average near 27 and left no
 backlog (`dropped=0`, drained in 0.1 s); the row above is its re-run at a load near 10. Also run,

@@ -15,16 +15,19 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 import log_foundry
+from log_foundry import worker as worker_mod
 from log_foundry.sinks.base import read_losses
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.nats import NATSSink
 from sink_rigs import RIGS, ok
+from test_backlog_batching import _Clock
 from test_sink_concurrency import _sink_classes_with_an_emit
 from test_sinks_http import FakeOpener, FakeResponse
 from test_sinks_http_render import _RECIPES, _shipped_http_subclasses
@@ -197,7 +200,7 @@ def test_the_http_family_takes_a_capped_batch_in_predicted_requests(cls: type[HT
 
 
 class _JetStream:
-    """A JetStream context whose publish waits the ack time."""
+    """A JetStream context whose publish takes the ack time, on a fake clock when it has one."""
 
     def __init__(self, client: _NatsClient, ack: float) -> None:
         self.client = client
@@ -210,20 +213,25 @@ class _JetStream:
         *,
         timeout: float | None = None,  # noqa: ASYNC109
     ) -> None:
-        """Waits the ack, then counts it."""
-        await asyncio.sleep(self.ack)
+        """Takes the ack, then counts it."""
+        if self.client.clock is not None:
+            self.client.clock.advance(self.ack)
+            await asyncio.sleep(0)
+        else:
+            await asyncio.sleep(self.ack)
         self.client.acked += 1
 
 
 class _NatsClient:
     """An injected NATS client that is always connected; its JetStream acks after a delay."""
 
-    def __init__(self, ack: float) -> None:
+    def __init__(self, ack: float, clock: _Clock | None = None) -> None:
         self.is_connected = True
         self.pending_data_size = 0
         self.stats = {"reconnects": 0}
         self.acked = 0
         self.ack = ack
+        self.clock = clock
 
     async def publish(self, subject: str, payload: bytes) -> None:
         """Counts a core publish."""
@@ -244,17 +252,41 @@ class _NatsClient:
 
 
 class _TimedNATS(NATSSink):
-    """A ``NATSSink`` that records how long each ``deliver`` call took."""
+    """A ``NATSSink`` that times each ``deliver`` call, and can hold its first.
+
+    Attributes:
+      durations: Each call's duration, on ``clock``.
+      clock: The clock the calls are timed on.
+      gate: When set, the event the first call waits on.
+      entered: Set once the first call has begun.
+    """
 
     durations: list[float]
+    clock: Any = time.monotonic
+    gate: threading.Event | None = None
+    entered: threading.Event
 
     def deliver(self, batch: list[dict[str, object]]) -> Any:
         """Delivers as the sink does, timing the call."""
-        began = time.monotonic()
+        if not self.durations and self.gate is not None:
+            self.entered.set()
+            self.gate.wait(30.0)
+        began = self.clock()
         try:
             return super().deliver(batch)
         finally:
-            self.durations.append(time.monotonic() - began)
+            self.durations.append(self.clock() - began)
+
+
+class _WorkerTime:
+    """The ``time`` module as ``worker.py`` reads it, with ``monotonic`` replaced."""
+
+    def __init__(self, monotonic: Any) -> None:
+        self.monotonic = monotonic
+
+    def __getattr__(self, name: str) -> Any:
+        """Every other name is the real module's."""
+        return getattr(time, name)
 
 
 @log_foundry.trace
@@ -262,21 +294,43 @@ def _work() -> None:
     pass
 
 
-def test_a_jetstream_nats_sink_behind_a_slow_ack_keeps_its_calls_short() -> None:
-    """FR-004 AC4, in the suite: ``spec090_nats_ack_backlog.py 0.002 200 10``.
+def test_a_jetstream_nats_sink_behind_a_slow_ack_keeps_its_calls_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-004 AC4, in the suite: ``spec090_nats_ack_backlog.py 0.002 ~~200~~ 1000 10``.
 
-    A JetStream ``NATSSink`` behind a 2 ms ack, with the default ``publish_timeout``, sent 200
-    spans through the library's own worker: all 400 events are acked, the sink counts nothing
-    failed, and no ``deliver`` call lasts as long as a second.
+    A JetStream ``NATSSink`` behind a 2 ms ack, with the default ``publish_timeout``, sent
+    ~~200~~ 1,000 spans through the library's own worker: all ~~400~~ 2,000 events are acked,
+    the sink counts nothing failed, and no ``deliver`` call lasts as long as a second.
+
+    **1,000 spans, a held first call and a fake clock** (diff review, 2026-11-16). 200 spans
+    are 400 acks, 0.8 s in all, so no call could last a second and a fixed cap with no measured
+    target passed. 1,000 spans are 4 s of acks: a batch at the cap would last 2 s, the rule's
+    half interval about 0.5 s. The first call is held until every span is queued, so the
+    backlog is there whatever the runner's speed. Each ack advances a clock that only the
+    worker reads, in place of ``time.monotonic``, rather than idling, so the worker measures
+    the ack time exactly and the test does not spend those 4 s; the sink's own
+    ``publish_timeout`` runs on the real clock and is never approached.
     """
-    client = _NatsClient(0.002)
+    clock = _Clock()
+    client = _NatsClient(0.002, clock)
     sink = _TimedNATS("s", client=client, jetstream=True)
     sink.durations = []
+    sink.clock = clock
+    sink.gate = threading.Event()
+    sink.entered = threading.Event()
+    monkeypatch.setattr(worker_mod, "time", _WorkerTime(clock))
     log_foundry.configure(sink=sink)
-    for _ in range(200):
-        _work()
+    try:
+        for _ in range(1_000):
+            _work()
+        assert sink.entered.wait(10), "the premise: the first call is held"
+    finally:
+        sink.gate.set()
     assert log_foundry.flush(60)
+    monkeypatch.undo()
     health = log_foundry.health()
-    assert client.acked == 400
+    assert client.acked == 2_000
     assert health.sink is not None and health.sink.failed == 0
     assert max(sink.durations) < 1.0, sink.durations
+    assert max(sink.durations) > 30 * 0.002, f"the premise: a batch grew: {sink.durations}"

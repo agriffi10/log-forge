@@ -324,8 +324,9 @@ class NATSSink:
     ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and
     ~~a batch's first attempt is always made~~ only the first exit batch's first attempt is always
     made: SPEC-090 FR-003 declines a later exit batch, unattempted, once the longest attempt any
-    exit batch has made predicts it would overrun. Before that it was ``(max_retries + 1) x publish_timeout``, which exceeded the join at
-    the defaults; ``architecture.md`` section 12 records the closure.
+    exit batch has made predicts it would overrun. Before that it was
+    ``(max_retries + 1) x publish_timeout``, which exceeded the join at the defaults;
+    ``architecture.md`` section 12 records the closure.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
     is exactly what made this sink report success for events that had not left the process: with

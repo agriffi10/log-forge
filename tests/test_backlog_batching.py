@@ -270,23 +270,33 @@ def test_a_carry_emit_restarts_the_interval(monkeypatch: pytest.MonkeyPatch) -> 
 # ---------------------------------------------------------------------------- FR-001 rule 4
 
 
-def test_a_per_event_sink_is_never_held_past_one_second() -> None:
-    """FR-001 AC6: a 2 ms-per-event sink sent 200 spans at once gets all 400, each call short.
+def test_a_per_event_sink_is_never_held_past_one_second(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-001 AC6: a 2 ms-per-event sink sent ~~200~~ 1,000 spans at once gets every event.
 
-    The sink idles once per call for 2 ms times the events it was handed, so a batch grown past
-    half an interval's worth would hold it past the interval. Some batch must also grow past ten
-    spans, or this would pass on a tree without the rule.
+    ~~The sink idles once per call for 2 ms times the events it was handed~~ The sink costs 2 ms
+    an event, so a batch grown past half an interval's worth would hold it past the interval. Some batch must also grow
+    past ten spans, or this would pass on a tree without the rule.
+
+    **1,000 spans on a fake clock** (diff review, 2026-11-16). 200 spans are 400 events, 0.8 s
+    of sink time in all, so no batch could hold the sink for a second and a fixed cap with no
+    measured target passed. 1,000 spans are 4 s of sink time, so a batch at the cap would hold
+    it for 2 s, while the rule's half interval holds it for about 0.5 s. The sink advances a
+    fake ``time.monotonic`` by 2 ms an event instead of idling, so the worker measures the cost
+    exactly and the test does not spend those 4 s.
     """
-    sink = _Sink(per_event=0.002)
+    clock = _Clock()
+    monkeypatch.setattr(time, "monotonic", clock)
+    sink = _Sink(per_event=0.002, clock=clock)
     gate = sink.hold(1)
     worker = Worker(sink)
     install_worker(worker)
-    for seq in range(200):
+    for seq in range(1_000):
         worker.submit(_span(seq))
     assert sink.entered(1).wait(10)
     gate.set()
-    _until(lambda: sink.events() == 400, seconds=30.0)
-    assert sink.longest < 1.0, f"an emit held the sink {sink.longest:.3f}s"
+    _until(lambda: sink.events() == 2_000, seconds=30.0)
+    monkeypatch.undo()
+    assert sink.longest < 1.0, f"an emit held the sink {sink.longest:.3f}s: {sink.sizes()}"
     assert max(sink.sizes()) > 20, sink.sizes()
 
 
