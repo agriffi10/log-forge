@@ -1733,24 +1733,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   timeout plus a small epsilon, and a close-once-per-write oracle
   (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
   callback against every public call, with a fork and a signal handler as calls.
-- **`NATSSink` leaves the events past a round's deadline unattempted and counts them in no
-  per-event term** (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
-  wall-clock deadline, and an event it has not reached gets no per-event line and no `failed`
-  count; the batch's loss then shows only in `failed_batches` and the worker's abandon line. The
-  harness sets that deadline to 0.2 s of real time, so on a loaded runner
-  `tests/test_sinks_nats_engine_matrix.py::test_the_engine_matches_1x[every-event-unencodable-js-injected-worker]`
-  reads `failed` 7 where it pins 9. It failed so in CI run 43726021314 on a branch that changes
-  neither `sinks/nats.py` nor the harness, and passes 50 of 50 on a quiet machine on both that
-  branch and `ae0b7674`.
-  `docs/audits/2026-11-14-probes/core-pipeline/p18_nats_deadline_leaves_events_unattempted.py`
-  (the `nats` extra installed) slows the first encode by 0.25 s and prints, at `ae0b7674`,
-  `{'failed': 7, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and
-  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. The test's half is closed:
-  `tests/nats_engine_matrix_harness.py`'s `Clock` now drives the round deadline instead of real
-  time, so the pinned count no longer depends on runner load, and the same 0.25 s stall now reads
-  the pinned 9. **Closed by** SPEC-088's ledger, which places every event of such a run in exactly
-  one term, with this probe as the case its build checks, so whether the per-event count and the
-  abandon line together count each event once is decided by the identity rather than by reading.
+- ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no per-event term**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
 - **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
   breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
   of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
@@ -1839,6 +1822,32 @@ an item leaves this list when a spec closes it, not because the arc names it.
   the driver's own exception too. Decision: `docs/decisions/failure-paths/` (*The dual type reads
   only what the driver stores, and only Python's own subclassing can refuse it*).
 
+- ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no
+  per-event term**~~ (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
+  wall-clock deadline, and an event it has not reached gets no per-event line and no `failed`
+  count; the batch's loss then shows only in `failed_batches` and the worker's abandon line. The
+  harness sets that deadline to 0.2 s of real time, so on a loaded runner
+  `tests/test_sinks_nats_engine_matrix.py::test_the_engine_matches_1x[every-event-unencodable-js-injected-worker]`
+  reads `failed` 7 where it pins 9. It failed so in CI run 43726021314 on a branch that changes
+  neither `sinks/nats.py` nor the harness, and passes 50 of 50 on a quiet machine on both that
+  branch and `ae0b7674`.
+  `docs/audits/2026-11-14-probes/core-pipeline/p18_nats_deadline_leaves_events_unattempted.py`
+  (the `nats` extra installed) slows the first encode by 0.25 s and prints, at `ae0b7674`,
+  `{'failed': 7, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and
+  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. The test's half is closed:
+  `tests/nats_engine_matrix_harness.py`'s `Clock` now drives the round deadline instead of real
+  time, so the pinned count no longer depends on runner load, and the same 0.25 s stall now reads
+  the pinned 9. **Closed by** SPEC-088's ledger, which places every event of such a run in exactly
+  one term, with this probe as the case its build checks, so whether the per-event count and the
+  abandon line together count each event once is decided by the identity rather than by reading.
+  → **closed by SPEC-088's ledger.** At the commit that merged SPEC-088, run with the `nats` extra, `p18` prints the
+  same `{'failed': 9, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and `lost 3 event(s);
+  batch abandoned after 3 emit attempts`, and the worker it drives reads `batch_lost=3` with every
+  other exit term zero: each of the batch's 3 events is in one term, once. The sink's `failed` of 9
+  is its own per-attempt count in `health().sink`, an upper bound the ledger does not add, as
+  `Health.sink`'s docstring and invariant 2 record. The harness hands `Worker._emit` a batch no
+  queue took in, so that worker's `in_flight` reads minus 3; the suite's balance fixture checks
+  only the workers a test still holds at teardown, and the harness drops its own.
 - ~~**`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**~~
   (2026-11-14 audit, finding 18; invariant 2, whose recorded exception at `docs/invariants.md:62`
   stands). `dropped` counts submissions, `failed_batches` counts batches, the sink, orphan and

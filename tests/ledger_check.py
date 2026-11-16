@@ -33,7 +33,15 @@ import functools
 import weakref
 
 _tracked: weakref.WeakSet = weakref.WeakSet()
-"""Every `Worker` built since the current test began."""
+"""Every `Worker` built since the current test began and still alive at its teardown.
+
+Weakly held, so a worker the test dropped before its teardown is not checked: a known limit of
+the check, kept on purpose. Measured in the all-extras environment, holding every worker strongly
+until the next test began failed exactly the 32 worker-path cases of
+`test_sinks_nats_engine_matrix.py::test_the_engine_matches_1x` and 2 of
+`test_a_planted_verdict_is_caught`, whose harness hands `Worker._emit` a batch no queue took in, as
+the exempt `test_the_workers_emit_loop_survives_a_huge_max_retries` does; a function-level marker
+would wrongly fail those tests' balancing `emit`-path cases. Every other test balanced."""
 
 _direct = [0]
 """Events the `lf` fixture emitted directly since the current test began."""
