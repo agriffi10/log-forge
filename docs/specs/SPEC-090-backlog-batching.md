@@ -207,6 +207,12 @@ call, over-reading `health().events.queued` for that long and failing the suite'
 fixture whenever the call outlasts the 2 s it re-reads a drain outside `get`
 (`tests/ledger_check.py`), while a shorter call would be hidden from it.
 
+**A carry emit restarts the interval** (added 2026-11-16): when `_take` emits the batch ahead of
+the submission it took, `_drain` sets `last_flush` to the clock read just before that take, as
+the count trigger's emit sets it to the clock read before its emit. Otherwise a carry emit lasting
+about half an interval left the time trigger to fire on the take after the next one, and a sink
+whose cost is per event was handed single-span batches under a backlog.
+
 #### Acceptance Criteria:
 
 - [ ] `p13_burst.py` on 3.12 and 3.13 sends no batch above 1,000 events and drains its backlog in
@@ -797,6 +803,9 @@ kept, and the build's own run is the one that counts.
 
 ## Revision history
 
+- **2026-11-16, a paragraph added to FR-001**: a carry emit restarts the time trigger's interval.
+  Found by the plan review, which measured `spec090_per_event_sink.py 0.005 1000` on a prototype
+  without it: 7 of 29 batches held a single span, and none with it.
 - **2026-11-16, one sentence added to FR-001**: each take is counted by `_hold` where it is
   taken, before any carry or emit decision. Found by the second diff review of the fix that lets
   SPEC-088's balance fixture wait for a live drain to settle, whose reading holds only if the
