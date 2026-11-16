@@ -34,16 +34,32 @@
   - FR-006's two readings of an open span were both run, and the stricter one was built.
   - The counting `_put` appends to the deque itself instead of calling `super()._put`. With the
     `super()` call it measured 48 to 55 ns, which crosses FR-005's 50 ns bound.
+  - FR-002's second criterion, `p03`'s `submitted_after_shutdown` below `queued` plus `dropped`,
+    is replaced by every late submission in exactly one of the two counts. The comparison is a
+    race: the field counts the late submissions the final drain carries, and under load it failed
+    in 3 of 10 concurrent runs (the first diff review).
+- **What the first diff review changed**, besides that criterion:
+  - A worker's build reads the hand-over count without the registration lock, so that lock is
+    never taken under `Runtime._lock` and the two are never nested.
+  - `shutdown()`'s once-per-count line is decided under the registration lock.
+  - Three write orders a reading relies on are held statically by the write-site gate.
+  - The fixture no longer skips `xfail`-marked tests.
 
 ## Measured on the final branch
 
-Every number below and every probe reading in `architecture.md` §12 was measured on
-`74940965`. Its `src/` is the code as merged, because the later commits on the branch touch only
-docs.
+Every probe reading below and in `architecture.md` §12 was measured on `14bf6588`, whose `src/`
+is the code as merged: the commits after it touch only docs. The cost table was measured before
+the first diff review at a load average near 2; re-measured on `14bf6588` at a load average near
+78, every figure stayed inside its bound: the counting put 27.6 and 24.8 ns, a traced call's writes
+121.4 and 136.5 ns, a snapshot at nine cells 3.82 and 4.33 µs, on 3.13.1 and 3.12.12.
 
-- **The probes.** p02, p03 2000, p04, p08, p11, p14, p15, p16 and p17 were re-run. Each prints the
-  reading quoted in §12. p03 is a race whose counts move between runs, and §12 quotes this
-  head's run.
+- **The probes.** p02, p04, p08, p11, p14, p15, p16 and p17 were re-run, and each prints the
+  reading quoted in §12. p03 is a race whose counts move between runs and is no longer compared:
+  `p03_shutdown_race.py 2000` printed `queued=10000 dropped=1673 submitted_after_shutdown=10000`
+  and, on a second run, `queued=10000 dropped=1139 submitted_after_shutdown=10000`; under load
+  the first diff review saw `queued=6006 dropped=0 submitted_after_shutdown=6561`, which is why
+  the criterion changed. Read with a wrapper once each ends, p03, p14 and p17 leave
+  `unaccounted == 0`.
 - **p18, run with the `nats` extra.** Its batch of 3 lands in `batch_lost` and in no other term.
   The sink's `failed` of 9 is its per-attempt count in `health().sink`, outside the ledger. So the
   `NATSSink` §12 item is struck.
@@ -92,7 +108,7 @@ docs.
 - `test_public_surface.py` counts 36 exports.
 - `test_worker_predicate_roster.py` gains two `EXISTENCE` rows, in `_worker_health` and
   `_check_ledger`. Its `_SITE_FLOOR` for `_lifecycle` is now 96, which is the derived count. It
-  was 92 on `main`, while the branch point `9d05e793` already read 94.
+  was 92 on `main`, and 94 at the commit the branch was first cut from, `9d05e793`.
 
 ## What changed from earlier specs?
 
@@ -123,8 +139,21 @@ docs.
 | The open guard's debit | 11 tests, naming `open_spans` |
 | The orphan guard's `BaseException` debit | `test_a_keyboardinterrupt_from_the_sink_still_propagates`, naming `unaccounted` |
 
-- **Test ids.** The ids that `pytest --collect-only -q` collects were compared against
-  `9d05e793`. One id left, by a rename derived from a line number.
+- **Test ids.** The ids that `pytest --collect-only -q` collects on `14bf6588` were compared with
+  those on the branch's real base, `9d70f782`: 11,416 there and 11,555 here. One id left, by a
+  rename derived from a line number:
+  `test_numeric_door_roster.py::test_removing_a_helper_call_is_reported[worker.py:Worker.max_retries@431]`
+  is now `...@757`, the line of `Worker.__init__`'s `floor_count` call. The rest are additions:
+  the five new test files (48, 18, 14, 18 and 27 ids) and derived ids that now name `_ledger.py`
+  or a new test file (`test_diag.py` 2, `test_fork_lifecycle.py` 8, `test_fork_roster.py` 2,
+  `test_public_surface.py` 2).
+- **The write orders**, each reversed in `src` once and restored: `_hold` writing `_taken` before
+  `_in_flight`, `_settle` lowering `_in_flight` before its exits, and the orphan path crediting
+  before raising its gauge. Each passed the ledger suites and failed the write-site gate's order
+  check, naming its order.
+- **The once-per-count line**, decided outside the lock again: two racing checks wrote two lines.
+- **The all-extras suite on `14bf6588`**, with `LOG_FOUNDRY_EXTRAS=1`: 11,525 passed, the same seven
+  tests exempt, and p18 with the `nats` extra prints what §12 quotes.
 - **Earlier runs, on the pre-rebase tree `5232c410`:**
   - the all-extras suite: 11,070 passed;
   - `tests/integration` against the nine services: 34 passed.
