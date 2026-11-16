@@ -212,7 +212,11 @@ counted, in every cell whose sink calls back from its own code, except the cells
 `flush(timeout)`, `shutdown(timeout)` and `configure(sink=…)` return within their budget, and a
 bound is measured in CPU as well as wall clock, so a busy-spin cannot pass as a wait (SPEC-038).
 Every backoff waits on the worker's stop event, never `time.sleep`, so a shutdown cuts it short
-(SPEC-027). A shutdown shortens a wait; it never skips work (SPEC-038). The delivery engine's waits
+(SPEC-027). A shutdown shortens a wait; it never skips work (SPEC-038): what the exit drain
+declines, a retry or a later exit batch predicted to end past `shutdown()`'s deadline, is not work
+the process gets, and the first attempt of the exit drain's first batch is always made (*The exit
+drain declines a retry, or a later batch, predicted to end past the shutdown deadline*,
+`docs/decisions/sink-lifecycle/`; SPEC-062, refined by SPEC-090). The delivery engine's waits
 between rounds are the same (SPEC-072): each goes through `sinks._retry.wait`, capped at `MAX_WAIT`,
 on the worker's `_stop` or, on the orphan path and in the inline adapter, on the sink's
 `log_foundry_stop_signal`; a server's hint is bounded by the sink's `max_retry_after`; and SPEC-062's

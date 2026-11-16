@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-090
 title: "Under a Backlog the Worker Sends Larger Batches, and the Exit Drain Sends Its Backlog in Batches"
 description: "Lets the worker drain a backlog in batches sized to what its sink delivers in half a flush interval, capped at 1,000 events and with no new setting, and has the exit drain send its backlog by the same rule and stop starting batches it cannot finish, so a burst loses fewer events and an exit counts what it could not send."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-004, SPEC-021, SPEC-039, SPEC-054, SPEC-062, SPEC-068, SPEC-072, SPEC-088]
 arc: audit-2026-11-14
 arc_order: 6
@@ -803,6 +803,24 @@ kept, and the build's own run is the one that counts.
 
 ## Revision history
 
+- **2026-11-16, at completion: the record reached further than FR-005's table.** The build found
+  more sites stating a claim FR-001 or FR-003 made false, and rewrote or marked each: in
+  `worker.py`, the `max_retries` Args text, `_emit`'s "the first attempt of a batch is never
+  declined", `Health.failed_batches`, `EventLedger.batch_lost`, and the `_drain`,
+  `_retry_declined` and `_JOIN_MARGIN` docstrings; `tests/test_sinks_http.py`'s present-tense
+  claim about the exit backlog; the decisions *A shutdown shortens a wait; it must never skip
+  work*, *An expired shutdown is final, and a join the drain thread owes is handed over once* and
+  *A sink's wait is bounded, interruptible, and never taken on a destination's word*, which quote
+  the exit-drain decision's old title or its one-batch exit; invariant 3's "a shutdown shortens a
+  wait; it never skips work"; and in `architecture.md` §12, SPEC-062's closed `NATSSink` item, the
+  after-shutdown line item ("the last read" became the bound), and the sentinel-stranding item,
+  whose closure by re-reading the queue after the stop FR-002's bound rules out, struck, its
+  window recorded as wider by the old pull loop's duration. The README's `failed_batches` and
+  `batch_lost` rows now cover a batch declined unattempted. Two premises had moved: FR-002's
+  expiry-line figure was already SPEC-088's `in_flight`, so it needed a test and no code; and a
+  pending `docs/release-notes/v1.2.1.md` existed, so the release notes went there, as FR-005
+  allows. The `NATSSink` residual, filed in §12, was measured directly at a 0.2 s
+  `publish_timeout`: 193 of 400 events acked, where the tree before this spec acked all 400.
 - **2026-11-16, a paragraph added to FR-001**: a carry emit restarts the time trigger's interval.
   Found by the plan review, which measured `spec090_per_event_sink.py 0.005 1000` on a prototype
   without it: 7 of 29 batches held a single span, and none with it.

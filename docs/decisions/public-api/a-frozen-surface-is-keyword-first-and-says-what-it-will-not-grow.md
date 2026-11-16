@@ -8,6 +8,13 @@ description: "every public dataclass is `kw_only`, `defaults=` takes a `Mapping`
 
 ## History
 
+### 2026-11-16
+
+- **Kept** by Andrew's answer of 2026-11-15 on burst capacity, "Larger batches, no setting":
+  SPEC-090 has the worker send larger batches under a backlog and adds no public name, so the
+  worker's tunables stay unreachable from `configure()`. The rule and its reasons: *A backlog
+  drains in larger batches, and capacity is not a setting* (`docs/decisions/pipeline/`).
+
 ### 2026-09-02
 
 - **Settled.**

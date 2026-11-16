@@ -1304,10 +1304,11 @@ close it.
 - **The after-shutdown submission line announces a loss the final drain can still deliver**
   (SPEC-068; invariant 2). `Worker._count_undeliverable` writes `lost N submission(s)` ("nothing
   will drain these") for a submission made after the retirement count moved, but one made before
-  `_final_drain`'s last read is still taken by that drain and delivered, or announced again by
+  ~~`_final_drain`'s last read~~ the bound `_final_drain` fixes when it starts (the entries queued
+  then, since SPEC-090 FR-002) is still taken by that drain and delivered, or announced again by
   `_emit` if it fails. `Worker.submit`'s docstring already calls the line over-strong.
-  **Closed by** writing that `lost` line only once the final drain's last read of the queue is
-  done or the drain thread is dead.
+  **Closed by** writing that `lost` line only once the final drain has taken the last entry its
+  bound admits, or the drain thread is dead.
 - **`flush()` called on the drain thread waits on itself** (SPEC-068 spec review; invariant 3;
   corrected in place by SPEC-085). A sink's `emit` that calls `flush()` waits on the thread it
   runs on: measured at `a0f44b5f`, `flush(timeout=2.0)` takes 2.00 s, `flush(timeout=None)` does
@@ -1325,8 +1326,13 @@ close it.
   by SPEC-068's second diff review in roughly 1 to 8 of 300 races against the worker as it stood
   before SPEC-068; it predates that spec, which closed the same shape
   for the caller that takes over a drain-thread join (that one no longer queues a second sentinel).
-  **Closed by** putting the sentinel before the stop event can wake the drain, or by
-  `_final_drain` re-reading the queue after the stop until it has taken a sentinel.
+  Since SPEC-090 FR-002 `_final_drain` takes at most the entries the queue held when it began, so
+  the window now closes when the exit drain starts rather than where its one pull loop used to
+  end: it is wider by that loop's duration, sub-millisecond to a few milliseconds, argued from the
+  code and not measured. **Closed by** putting the sentinel before the stop event can wake the
+  drain~~, or by `_final_drain` re-reading the queue after the stop until it has taken a
+  sentinel~~ — struck by SPEC-090, whose FR-002 bounds the exit drain to what was queued when it
+  began, so that a caller logging after `shutdown()` cannot keep it running.
 - **A `shutdown()` called inside an orphan-path sink's `emit` closes that sink from inside its own
   emit** (SPEC-068 diff review; invariant 5). With no span active, `log_foundry.info()` emits on the
   caller's own thread (`api.py`), and `Runtime.held` asks only about the worker's thread, so the
@@ -1561,38 +1567,27 @@ an item leaves this list when a spec closes it, not because the arc names it.
   current. **Closed by** popping the span and
   the scope whatever the guard lets through, in a spec of its own; that this closes it is
   unmeasured.
-- **The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
-  that batch behind a promise of a count that never comes** (2026-11-14 audit, finding 9; invariants
-  2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
-  (`worker.py:1804-1817`), and when `shutdown()` expires the line says the events in flight are
-  "counted when the emit returns" (`:1449-1450`), which at interpreter exit they never are.
-  `docs/audits/2026-11-14-probes/core-pipeline/p04_exit.py 0.02 10000`, in the core frame's run: the
-  exit took 30.3 s, the sink was handed 19,980 events in one call and had taken 11,630 of the 20,000
-  when the process ended, `close()` never ran, and that one stderr line was the only trace of the
-  8,370 lost. **Closed by** draining the backlog at exit in batches of the worker's own size, so
-  that an expiry costs one batch, ~~and by an expiry line that counts the batch in flight or stops
-  promising to~~ — narrowed by SPEC-088 FR-002 item 4 to its capacity half: the batch in flight is
-  in `health().events.in_flight` at the expiry and the line names that gauge in place of the
-  promise (`p04` on the branch: `19980 event(s) in flight (health().events.in_flight)`).
-- **The queue holds 10,000 submissions and a batch is 10 submissions, and neither can be changed**
-  (2026-11-14 audit, finding 10; invariant 2's `dropped` term). `Worker.__init__` sets both defaults
-  (`worker.py:361-363`), `_lifecycle.py:3796` builds the worker with them, and `configure()` exposes
-  neither (`config.py:272-284`). `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`, in the
-  core frame's run: 30,000 spans in 0.42 s against a sink taking 20 ms a call lost 19,820
-  submissions to `dropped`, counted and announced, and the backlog then left in 1,018 calls of
-  exactly 20 events over 23.5 s. **Bounded by a settled decision, which nothing has reopened:** the
-  worker's tunables are unreachable from `configure()` by *A frozen surface is keyword-first, and
-  says what it will not grow* (`docs/decisions/public-api/`; invariant 10). The arc plans capacity
-  beside the exit drain, and Andrew's decisions of 2026-11-14 name neither. **Answered
-  2026-11-15.** Asked "For burst capacity, should the worker send larger batches under backlog, or
-  expose settings?", Andrew answered "Larger batches, no setting". So that decision stands, the
-  worker's tunables stay unreachable from `configure()`, and the remedy for the burst loss is that
-  the worker sends larger batches when a backlog exists. The item stays open because that is not
-  built. ~~**Closed by** a spec that sizes the queue and the batch without a new public argument and
-  leaves that decision standing, or by Andrew rewriting the decision to admit a capacity setting;
-  which of the two is his to say.~~ **Closed by** a later spec of arc `audit-2026-11-14` that has
-  the worker drain a backlog in larger batches without adding a setting, measured against
-  `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`.
+- **A JetStream `NATSSink` whose `publish_timeout` is shorter than half the flush interval loses
+  the tail of a backlog batch** (SPEC-090 FR-004; invariant 2). Since SPEC-090 a batch under a
+  backlog grows to what the sink delivers in half a flush interval, 0.5 s at the default, and
+  `NATSSink` bounds a whole call by one `publish_timeout` with one JetStream ack per event, so a
+  budget shorter than that, or an ack time that grows more than twentyfold between one batch and
+  the next, is handed a batch it cannot finish: the events past the deadline are left unattempted
+  and counted lost and announced, never silent; with a steady ack and the default 10 s budget it
+  did not arise in the runs below. Before SPEC-090 the same loss needed ten spans' acks to outlast
+  the budget, so the window is wider now, not new.
+  `docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 200 0.2` (a 2 ms
+  ack, 200 spans, a 0.2 s budget), at `be686953` on 3.13.1 and 3.12.12: 193 of 400 acked,
+  `health().sink.failed` 208, four `deliver` calls, the largest 210 and 206 events, two of them
+  cut at the 0.2 s budget, and `flush()` returned `reason='sink-flush'`; `failed` also counts one
+  event per cut batch as `unconfirmed`, whose ack may have landed, so the two can add past 400.
+  At `75e7bf1e`, before
+  SPEC-090, the same run acked all 400 in 20 calls of 20 events, the longest 0.049 to 0.076 s.
+  At the default budget, `spec090_nats_ack_backlog.py 0.002 200 10` at `be686953`: all 400 acked,
+  `failed` 0, the longest call 0.505 to 0.510 s. **Closed by** `NATSSink` answering an event its
+  deadline left unattempted as `RETRYABLE`, since it never reached the driver and a resend cannot
+  duplicate it, so the worker resends the tail rather than losing it. That is a change to a sink's
+  verdict, which SPEC-090 left to the sinks track.
 - **A span's events stay on the span until it closes, so a process killed mid-handler loses the
   whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
   document states it). By the core frame's reading, only the close, or a `flush()` called on the
@@ -1909,6 +1904,65 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `docs/process/completion-ritual.md` asks of a volatile number.
 
 ### Resolved
+
+- ~~**The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
+  that batch behind a promise of a count that never comes**~~ (2026-11-14 audit, finding 9; invariants
+  2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
+  (`worker.py:1804-1817`), and when `shutdown()` expires the line says the events in flight are
+  "counted when the emit returns" (`:1449-1450`), which at interpreter exit they never are.
+  `docs/audits/2026-11-14-probes/core-pipeline/p04_exit.py 0.02 10000`, in the core frame's run: the
+  exit took 30.3 s, the sink was handed 19,980 events in one call and had taken 11,630 of the 20,000
+  when the process ended, `close()` never ran, and that one stderr line was the only trace of the
+  8,370 lost. **Closed by** draining the backlog at exit in batches of the worker's own size, so
+  that an expiry costs one batch, ~~and by an expiry line that counts the batch in flight or stops
+  promising to~~ — narrowed by SPEC-088 FR-002 item 4 to its capacity half: the batch in flight is
+  in `health().events.in_flight` at the expiry and the line names that gauge in place of the
+  promise (`p04` on the branch: `19980 event(s) in flight (health().events.in_flight)`).
+  → **capacity half closed by SPEC-090 FR-002 and FR-003.** The exit drain continues the steady
+  drain's batch and sends the backlog by the same rule, taking at most the entries queued when it
+  began, and declines unattempted a later exit batch predicted to end past the deadline, counted
+  in `failed_batches` and `batch_lost` and announced in one line. `p04_exit.py 0.02 10000` at
+  `75e7bf1e`, before: the process took 30.3 s on 3.13.1 and 3.12.12, the sink received 11,220 and
+  11,710 of 20,000 events in 2 calls, the largest 19,980 events, `close()` never ran, and the one
+  line named `19980 event(s) in flight`. At `be686953`, after: the process exited in 29.9 s and
+  29.8 s, the sink received 11,082 and 10,740 events in 60 and 61 calls, the largest 234 and 200
+  events, `close()` ran, and one line counted the rest, `lost 8918 event(s); 49 exit batch(es)
+  declined unattempted` on 3.13.1 and `lost 9260 event(s); 53 exit batch(es) declined
+  unattempted` on 3.12.12, each adding to 20,000 with what the sink received. Decision:
+  `docs/decisions/sink-lifecycle/` (*The exit drain declines a retry, or a later batch, predicted
+  to end past the shutdown deadline*).
+- ~~**The queue holds 10,000 submissions and a batch is 10 submissions, and neither can be changed**~~
+  (2026-11-14 audit, finding 10; invariant 2's `dropped` term). `Worker.__init__` sets both defaults
+  (`worker.py:361-363`), `_lifecycle.py:3796` builds the worker with them, and `configure()` exposes
+  neither (`config.py:272-284`). `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`, in the
+  core frame's run: 30,000 spans in 0.42 s against a sink taking 20 ms a call lost 19,820
+  submissions to `dropped`, counted and announced, and the backlog then left in 1,018 calls of
+  exactly 20 events over 23.5 s. **Bounded by a settled decision, which nothing has reopened:** the
+  worker's tunables are unreachable from `configure()` by *A frozen surface is keyword-first, and
+  says what it will not grow* (`docs/decisions/public-api/`; invariant 10). The arc plans capacity
+  beside the exit drain, and Andrew's decisions of 2026-11-14 name neither. **Answered
+  2026-11-15.** Asked "For burst capacity, should the worker send larger batches under backlog, or
+  expose settings?", Andrew answered "Larger batches, no setting". So that decision stands, the
+  worker's tunables stay unreachable from `configure()`, and the remedy for the burst loss is that
+  the worker sends larger batches when a backlog exists. ~~The item stays open because that is not
+  built.~~ ~~**Closed by** a spec that sizes the queue and the batch without a new public argument and
+  leaves that decision standing, or by Andrew rewriting the decision to admit a capacity setting;
+  which of the two is his to say.~~ **Closed by** a later spec of arc `audit-2026-11-14` that has
+  the worker drain a backlog in larger batches without adding a setting, measured against
+  `docs/audits/2026-11-14-probes/core-pipeline/p13_burst.py`. → **closed by SPEC-090 FR-001**,
+  with no setting added and the queue unchanged: while a backlog waits, a batch grows by whole
+  submissions up to what the sink delivers in half a flush interval, never past 1,000 events unless
+  it holds at most `batch_size` submissions, and with nothing waiting it is the count trigger's
+  batch. `p13_burst.py` at `75e7bf1e`, before: a 0.39 s burst on 3.13.1 dropped 19,850
+  submissions and drained the rest in 1,015 calls of 20 events over 27.1 s, and a 0.94 s burst on
+  3.12.12 dropped 19,620 and took 1,038 calls over 25.8 s. At `be686953`, after: a 0.47 s burst on
+  3.13.1 dropped 10,269 and drained in 41 calls, the largest 1,000 events, in 0.5 s, and a 0.39 s
+  burst on 3.12.12 dropped 13,660 and drained in 35 calls, the largest 1,000, in 0.6 s. The drops
+  move with the burst's speed, so `spec090_burst_gated.py` holds the first emit until the queue is
+  full: it dropped 19,990 on both trees, and the released backlog then took 1,000 calls of 20
+  events over 26.91 s and 26.63 s before, and 22 calls, the largest 1,000, in 0.52 s and 0.69 s
+  after. Decision: `docs/decisions/pipeline/` (*A backlog drains in larger batches, and capacity is
+  not a setting*).
 
 - ~~**A driver exception class can still stop `delivery_error` building the dual type, or raise
   from it.**~~ (invariant 1; no spec — found by the stored-name sweep's third diff review,
@@ -2405,7 +2459,12 @@ an item leaves this list when a spec closes it, not because the arc names it.
   one in flight when the budget runs out, and the first attempt of a tail batch, which is never
   declined (SPEC-062 FR-004's residual). Measured at `71e42dd` with a 0.5 s failing
   sink under `shutdown(timeout=1.2)`: 3 attempts, the join expired and `close()` ran 0 times;
-  after, 2 attempts and one close, pinned by `tests/test_worker_exit_budget.py`.
+  after, 2 attempts and one close, pinned by `tests/test_worker_exit_budget.py`. **Refined by
+  SPEC-090 FR-003:** the exit drain now sends several batches, and only its first batch's first
+  attempt is never declined, so "a tail batch" above is that first batch; a later exit batch is
+  declined unattempted once the longest attempt seen predicts it would overrun, and the two-emit
+  bound stands (*The exit drain declines a retry, or a later batch, predicted to end past the
+  shutdown deadline*).
 
 - ~~**`health().inherited_sink` reads the owed record's last entry**~~ (SPEC-045; invariant 12) →
   **closed by SPEC-054 FR-005**. Arming order does not make a sink the installed one: `_swap_sink`
