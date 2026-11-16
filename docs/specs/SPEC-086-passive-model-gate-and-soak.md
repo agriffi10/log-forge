@@ -187,11 +187,23 @@ close" (SPEC-045). At the sink it is two closes at one count, the same as the do
 fixed. The difference is in who armed the sink between the two takes: there a writer, in #339 a
 sink change deciding late.
 
-**So the soak reads the library's record.** It wraps three private names for the length of the
+**So the soak reads the library's record.** It wraps four private names for the length of the
 run, and a rename of any of them fails the item instead of silencing it, because the wrapper is
-installed by name: `_lifecycle._CloseRegistry.arm`, `_lifecycle._CloseRegistry.take`, and
-`log_foundry.api._note_orphan_emit`, the orphan path's call that arms a sink for a write. An arm
-recorded on a thread that is inside `_note_orphan_emit` is a **writer's arm**. A close's take is
+installed by name:
+- `_lifecycle._CloseRegistry.arm`;
+- `_lifecycle._CloseRegistry.take`;
+- `log_foundry.api._note_orphan_emit`, the orphan path's call that arms a sink for a write;
+- `_lifecycle._get_worker`, whose build arms the configured sink for the worker to write.
+
+A **writer's arm** is either of two arms. One is an arm of the very sink a `_note_orphan_emit`
+on the same thread was called for. The other is any arm recorded on a thread inside
+`_get_worker`. The build's sink is resolved inside it, where a wrapper cannot read it without
+racing a concurrent `configure()`, so that arm is attributed by the thread being inside the
+build. A build arms nothing but the sink it builds on.
+
+Both callers reach these names in a way the patch intercepts, at the head and at `31dda162`:
+`api.py` calls `_note_orphan_emit` as a module global, and `decorator.py` calls
+`_lifecycle._get_worker()` as a module attribute. A close's take is
 the earliest `take` of that sink recorded before the close entered that no earlier close has
 discharged. Not the latest: a sink change can hand its close to a closer thread that has not
 started when a `shutdown()` takes the re-armed sink and closes it inline, so two takes precede two
@@ -222,9 +234,11 @@ rule fails on today's library at a low rate, for the defect FR-005 hands to SPEC
 The unowed-repeat rule did not fail in any run measured at `5447d26a`.
 
 **The soak cannot rot unseen.** One test collected in every run executes the soak's body for
-one seed and asserts its wiring: the three wrappers were installed, arms, takes, writes and
-closes were recorded, and the two rules were evaluated. It does not assert their verdict, so it
-cannot fail at a race's rate.
+one seed, in each passive form, and asserts its wiring: the four wrappers were installed; arms,
+takes, writes and closes were recorded; and the two rules were evaluated. It does not assert
+their verdict, nor which thread wrote, so it cannot fail at a race's rate. Two deterministic
+steps hold the attribution: an orphan log's arm of a fresh sink, and a worker build's arm
+followed by a write on the drain thread.
 
 #### Acceptance Criteria:
 
@@ -239,7 +253,7 @@ cannot fail at a race's rate.
       the same with a `shutdown()` as the first taker, and asserting `CloseBroken:repeat@<count>`
       for two closes with no arm between their takes and for two closes with only a sink
       change's arm between them.
-- [ ] A soak item fails, and does not pass, when any of the three private names cannot be
+- [ ] A soak item fails, and does not pass, when any of the four private names cannot be
       wrapped.
 - [ ] A red soak item's message carries its form, seed, signature, the failing sink's record as
       described, the library's stderr lines, and its re-run command.
@@ -261,7 +275,7 @@ The soak's unowed-repeat rule is not. The demonstration exports the parent's tre
 `tests/` over the export's `tests/`, and runs the soak items of the default seeds from that
 directory. Each failure message carries `log_foundry.__file__`, and a run is void unless that
 path is under the scratch directory: this repo has been caught by an editable install resolving
-a copied tree back to the original. The three names the soak wraps exist at `31dda162`.
+a copied tree back to the original. The four names the soak wraps exist at `31dda162`.
 
 The defect is a race, so both halves of the criterion are counts of runs. If the parent does not
 fail as stated, that is a finding: it is recorded with its measurement, the spec does not move
@@ -344,7 +358,8 @@ def check_late_write(closes: Closes) -> None: ...
 
 @dataclass(frozen=True)
 class Arm:
-    by_writer: bool          # recorded on a thread inside api._note_orphan_emit
+    by_writer: bool          # an arm of the sink an api._note_orphan_emit on this thread was
+                             #   called for, or any arm on a thread inside _lifecycle._get_worker
 
 @dataclass(frozen=True)
 class Take: ...
@@ -424,7 +439,7 @@ and the second adds to the default collection only a test that asserts wiring.
 
 ### Phase 2: The soak, its proof, and the record (FR-003, FR-004, FR-005)
 
-- `check_unowed_repeat` with its corpus; the three wrappers; `LOG_FOUNDRY_MODEL_SOAK`, the soak
+- `check_unowed_repeat` with its corpus; the four wrappers; `LOG_FOUNDRY_MODEL_SOAK`, the soak
   items, their report and the wiring test.
 - The demonstration at `31dda162`; the one soak of seeds 0 to 1999.
 - The three probes re-run and recorded; the body of SPEC-085's orphan-log item extended.
@@ -455,6 +470,13 @@ reviews' independent builds. The library's source is the same at `a0f44b5f` and 
 | The three probes | *Review 3:* `p9` matches row for row; `p10` 100, 98 and 0 of 100; `p8` 2 of 300, nothing on stderr |
 
 ## Revision history
+
+- **2026-11-15, revised after the second diff review.** A worker build's arm is a writer's arm.
+  `_get_worker` arms the configured sink for the worker to write, and a forced worker-path
+  sequence was flagged `repeat@2` on 5 of 5 runs while its orphan twin was silent. So the soak
+  wraps `_lifecycle._get_worker` as a fourth name. An orphan-path arm counts only for the sink
+  its call was made for. The wiring test runs each form and leaves thread-specific checks to
+  deterministic steps.
 
 - **2026-11-15, revised during the build** after the plan review. The soak pairs each close with
   the earliest undischarged take rather than the latest, and reports a close with none as

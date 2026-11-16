@@ -490,7 +490,7 @@ areas:
         status: "stable"
         path: "docs/decisions/working-rules/sessions-keep-docker-images-cached.md"
       - title: "The model gates its close count only where one caller makes it exact, and soaks it under concurrency on request"
-        fence: "the generative model test gates a sink's close count (no close at the previous close's write count, no write after the last close returned) only in its sequential half, where one caller makes the count exact; under four callers the same count is a soak, collected only with `LOG_FOUNDRY_MODEL_SOAK=1` and set by no workflow, that excuses a repeat close only for a writer's arm between the two closes' takes as the library records them; a malformed model switch stops the session, never falls back. (SPEC-086)"
+        fence: "the generative model test gates a sink's close count (no close at the previous close's write count, no write after the last close returned) only in its sequential half, where one caller makes the count exact; under four callers the same count is a soak, collected only with `LOG_FOUNDRY_MODEL_SOAK=1` and set by no workflow, that excuses a repeat close only for a writer's arm between the two closes' takes as the library records them, a writer's arm being one `_note_orphan_emit` makes of its own sink or one inside `_get_worker`'s worker build; a malformed model switch stops the session, never falls back. (SPEC-086)"
         status: "stable"
         path: "docs/decisions/working-rules/the-model-gates-its-close-count-only-where-one-caller-makes-it-exact-and-soaks-it-under-concurrency-on-request.md"
       - title: "The supported-Python versions have one authority — the CI matrix — and restatements are bound to it, not to each other"

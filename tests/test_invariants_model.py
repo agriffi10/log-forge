@@ -82,7 +82,7 @@ sequential seed replays exactly. Every failure ends with the command that re-run
 
 **The soak** (FR-003). ``LOG_FOUNDRY_MODEL_SOAK=1`` adds one item per passive form and seed that
 runs the concurrent test as the gating item does, with the library's own record of what it armed
-and took read through three wrapped private names, and judges every sink by two rules: an
+and took read through four wrapped private names, and judges every sink by two rules: an
 unowed repeat close (two closes at one count with no writer's arm between their takes) and a write
 after the last close returned. A red soak item is a finding, not a regression, and it gates
 nothing: no workflow sets the switch. ``test_the_soak_is_wired`` runs the soak's body for one seed
@@ -185,12 +185,18 @@ class _SoakRecord:
     ``.take``, which the library calls holding ``_state._lock``, and the writes and closes from
     the recorders, under each recorder's own lock; this record's lock is a leaf taken inside
     either and never around anything, so one sink's events land in one list in the order they
-    happened. An arm is a writer's when it is recorded on a thread inside
-    ``api._note_orphan_emit``, which a per-thread depth says.
+    happened. An arm is a **writer's** when it arms the sink a writer is about to write: an arm
+    of the very sink an ``api._note_orphan_emit`` on this thread was called for, or any arm on a
+    thread inside ``_lifecycle._get_worker``, whose build arms the configured sink for the worker
+    to write. The orphan path's sink is known, its argument, so its arm is matched by identity;
+    the build's sink is resolved inside it, where a wrapper cannot see it without racing a
+    concurrent ``configure()``, so a build's arm is attributed by the thread being inside it, and
+    a build arms nothing but the sink it builds on.
 
     Attributes:
       installed: The private names wrapped, in order.
       orphan_entries: How many times ``api._note_orphan_emit`` was entered.
+      builds: How many times ``_lifecycle._get_worker`` was entered.
       judged_repeat: The sinks the unowed-repeat rule was evaluated over.
       judged_late: The sinks the late-write rule was evaluated over.
       report: The failure text of a red run, empty for a clean one.
@@ -210,13 +216,14 @@ class _SoakRecord:
         """
         self.installed: list[str] = []
         self.orphan_entries = 0
+        self.builds = 0
         self.judged_repeat = 0
         self.judged_late = 0
         self.report = ""
         self._events: dict[int, list[SinkEvent]] = {}
         self._sinks: dict[int, object] = {}
         self._lock = threading.Lock()
-        self._depth = threading.local()
+        self._local = threading.local()
 
     def register(self, sink: object) -> None:
         """Starts recording one sink, before the library is handed it.
@@ -281,11 +288,18 @@ class _SoakRecord:
         with self._lock:
             return [event for events in self._events.values() for event in events]
 
-    def entering(self) -> None:
-        """Marks this thread as inside ``api._note_orphan_emit``.
+    def _frames(self) -> list[object]:
+        """Returns this thread's stack of writers in progress: sinks, or :data:`_BUILD`."""
+        frames = getattr(self._local, "frames", None)
+        if frames is None:
+            frames = self._local.frames = []
+        return frames
+
+    def entering(self, writer: object) -> None:
+        """Marks this thread as inside a writer: the orphan path for a sink, or a worker build.
 
         Args:
-          None.
+          writer: The sink ``api._note_orphan_emit`` was called for, or :data:`_BUILD`.
 
         Returns:
           None.
@@ -293,12 +307,15 @@ class _SoakRecord:
         Raises:
           None.
         """
-        self._depth.value = getattr(self._depth, "value", 0) + 1
+        self._frames().append(writer)
         with self._lock:
-            self.orphan_entries += 1
+            if writer is _BUILD:
+                self.builds += 1
+            else:
+                self.orphan_entries += 1
 
     def leaving(self) -> None:
-        """Marks this thread as having left ``api._note_orphan_emit``.
+        """Marks this thread as having left the writer it entered last.
 
         Args:
           None.
@@ -309,21 +326,25 @@ class _SoakRecord:
         Raises:
           None.
         """
-        self._depth.value -= 1
+        self._frames().pop()
 
-    def inside(self) -> bool:
-        """Returns whether this thread is inside ``api._note_orphan_emit``.
+    def by_writer(self, sink: object) -> bool:
+        """Returns whether an arm of *sink* recorded now is a writer's.
 
         Args:
-          None.
+          sink: The sink being armed.
 
         Returns:
-          Whether an arm recorded now is a writer's.
+          Whether this thread is inside the orphan path for this very sink, or inside a build.
 
         Raises:
           None.
         """
-        return getattr(self._depth, "value", 0) > 0
+        return any(frame is sink or frame is _BUILD for frame in self._frames())
+
+
+_BUILD = object()
+"""The writer frame :func:`_install` pushes for ``_lifecycle._get_worker``."""
 
 
 _SOAK: dict[str, _SoakRecord | None] = {"run": None}
@@ -918,21 +939,42 @@ def _bounded(call: Call, where: str) -> float:
     except (BoundExceeded, Stalled) as exc:
         raise AssertionError(
             f"invariant 3 (within its timeout plus {EPSILON:.1f} s): "
-            f"{' '.join(exc.signatures)}, {exc.detail} {where}"
+            f"{' '.join(exc.signatures)}, {exc.detail}; {_machine()} {where}"
         ) from exc
     return (call.ended - call.began) - call.budget
+
+
+def _machine() -> str:
+    """How loaded this machine was when a bound failed, so starvation reads apart from a stall.
+
+    Under 40 busy-loops on a 10-core machine, a load of 81 to 112, 4 of 6 runs of this file
+    failed a zero-budget call at 1.03 to 1.35 s of own time; at a load of 50 to 55 it was green 13
+    of 13. The bound is not skipped or widened under load, since that would let a real stall pass
+    as starvation; the failure says how starved the run was, and a reader decides.
+    """
+    try:
+        one, five, fifteen = os.getloadavg()
+    except OSError:
+        return f"load average unavailable on {os.cpu_count()} CPUs"
+    return f"load average {one:.1f} / {five:.1f} / {fifteen:.1f} on {os.cpu_count()} CPUs"
 
 
 _WRAPPED: tuple[tuple[object, str, str], ...] = (
     (_lifecycle._CloseRegistry, "arm", "_lifecycle._CloseRegistry.arm"),
     (_lifecycle._CloseRegistry, "take", "_lifecycle._CloseRegistry.take"),
     (log_foundry.api, "_note_orphan_emit", "log_foundry.api._note_orphan_emit"),
+    (_lifecycle, "_get_worker", "_lifecycle._get_worker"),
 )
-"""The three private names the soak wraps, by owner, attribute and the name it reports."""
+"""The four private names the soak wraps, by owner, attribute and the name it reports.
+
+``api._note_orphan_emit`` is called as a global of ``api`` and ``_lifecycle._get_worker`` as an
+attribute of ``_lifecycle`` (``decorator.py``), the only callers of either, so a patch of each
+intercepts every call, here and at ``31dda162``.
+"""
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
-    """Wraps the three private names for the length of one test, by name (SPEC-086 FR-003).
+    """Wraps the four private names for the length of one test, by name (SPEC-086 FR-003).
 
     A name that no longer exists fails the item instead of silencing it: a rename would
     otherwise leave the soak reading no arms or takes, and every repeat close would look unowed,
@@ -944,9 +986,10 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
     real_arm = _lifecycle._CloseRegistry.arm
     real_take = _lifecycle._CloseRegistry.take
     real_note = log_foundry.api._note_orphan_emit
+    real_build = _lifecycle._get_worker
 
     def arm(registry: Any, sink: Any) -> None:
-        soak.add(sink, Arm(by_writer=soak.inside()))
+        soak.add(sink, Arm(by_writer=soak.by_writer(sink)))
         real_arm(registry, sink)
 
     def take(registry: Any, sink: Any, rule: Any) -> Any:
@@ -954,9 +997,16 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
         return real_take(registry, sink, rule)
 
     def note(sink: Any) -> None:
-        soak.entering()
+        soak.entering(sink)
         try:
             real_note(sink)
+        finally:
+            soak.leaving()
+
+    def build() -> Any:
+        soak.entering(_BUILD)
+        try:
+            return real_build()
         finally:
             soak.leaving()
 
@@ -964,6 +1014,7 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
     monkeypatch.setattr(_lifecycle._CloseRegistry, "arm", arm)
     monkeypatch.setattr(_lifecycle._CloseRegistry, "take", take)
     monkeypatch.setattr(log_foundry.api, "_note_orphan_emit", note)
+    monkeypatch.setattr(_lifecycle, "_get_worker", build)
     soak.installed = [label for _, _, label in _WRAPPED]
 
 
@@ -1205,13 +1256,18 @@ def test_the_soak_is_wired(
     ``emit``, ``DeliverRecorder.deliver`` and ``HTTPRecorder.deliver``. With only the ``emit``
     form here, deleting the count from either ``deliver`` left every soak item green, since a
     sink with no writes recorded has no write after its last close and no repeat it can blame.
-    The three wrappers are installed; arms, takes, writes and closes are recorded, writes on a
-    drain thread and on an actor's; ``_note_orphan_emit`` was entered; both rules were evaluated
-    once per sink; and every close discharged a take, since a close with no take means the take
-    wrapper missed one. Whether either rule found anything is not asserted, so this cannot fail at
-    a race's rate. The coda holds the writer attribution itself, which the run cannot be relied
-    on to exercise: on a runtime with nothing owed, one orphan log's arm of a fresh sink must be
-    recorded as a writer's.
+    Over the seeded run, only what its draw makes certain whatever the schedule: the four
+    wrappers are installed; arms, takes, writes and closes are recorded; the orphan path's
+    wrapper was entered; both rules were evaluated once per sink; and every close discharged a
+    take, since a close with no take means the take wrapper missed one. Whether either rule found
+    anything is not asserted, and neither is which thread wrote: under 40 busy-loops seed 2's run
+    delivered no batch on the drain thread in 2 of 6 runs. So this cannot fail at a race's rate.
+
+    The coda, on the runtime the final shutdown left with nothing owed, holds the orphan path's
+    attribution, which the run cannot be relied on to exercise: one orphan log's arm of a fresh
+    sink is a writer's, and its write is on this thread. The worker path's attribution and a write
+    on the drain thread are :func:`test_the_soak_records_the_worker_path`'s, on a fresh runtime,
+    because a traced call after the final shutdown meets the retired worker and builds none.
     """
     soak = _SoakRecord()
     ledger, _ = _interleaving(WIRING_SEED, form, monkeypatch, capfd, soak)
@@ -1219,9 +1275,6 @@ def test_the_soak_is_wired(
     events = soak.all_events()
     kinds = collections.Counter(type(event).__name__ for event in events)
     assert {kinds[name] > 0 for name in ("Arm", "Take", "Write", "Close")} == {True}, kinds
-    threads = {event.thread for event in events if isinstance(event, Write)}
-    assert "log-foundry-worker" in threads, threads
-    assert threads - {"log-foundry-worker"}, f"no orphan-path write was recorded: {threads}"
     assert soak.orphan_entries > 0, "the orphan path's wrapper was never entered"
     assert soak.judged_repeat == soak.judged_late == len(ledger.sinks), (
         soak.judged_repeat,
@@ -1239,10 +1292,59 @@ def test_the_soak_is_wired(
     soak.register(fresh)
     log_foundry.configure(service="model", sink=fresh)
     log_foundry.info("coda")
-    assert soak.events_of(fresh)[:2] == [
+    assert soak.events_of(fresh) == [
         Arm(by_writer=True),
         Write(threading.current_thread().name),
     ], soak.events_of(fresh)
+
+
+def test_the_soak_records_the_worker_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-086 FR-003: a worker build's arm is a writer's, and its write is on the drain thread.
+
+    Deterministic, one step at a time, on a fresh runtime with the soak's wrappers installed: a
+    sink is registered and configured, a traced call builds the worker, whose arm of that sink is
+    recorded as a writer's, and a ``flush()`` makes the drain thread write the span. The seeded
+    run's own drain-thread writes are not asserted, because under load a run can deliver none.
+    """
+    soak = _SoakRecord()
+    _install(monkeypatch, soak)
+    sink = Recorder(0.0)
+    soak.register(sink)
+    log_foundry.configure(service="model", sink=sink)
+    _outer(False)
+    assert soak.builds > 0, "the traced call never entered the worker build's wrapper"
+    assert log_foundry.flush(timeout=FLUSH_TIMEOUT), "the flush did not settle"
+    events = soak.events_of(sink)
+    assert events[:1] == [Arm(by_writer=True)], f"the worker build's arm: {events}"
+    assert Write("log-foundry-worker") in events, f"no write on the drain thread: {events}"
+    log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+    assert isinstance(soak.events_of(sink)[-1], Close), soak.events_of(sink)
+
+
+def test_a_bound_failure_names_the_machines_load() -> None:
+    """SPEC-086 FR-001: a call over its bound fails naming the load average and the CPU count."""
+    with pytest.raises(AssertionError) as caught:
+        _bounded(Call("info", 0, 0.0, 0.0, 1.5), "where=here")
+    text = str(caught.value)
+    assert "Stalled:info" in text, text
+    assert re.search(r"load average [0-9.]+ / [0-9.]+ / [0-9.]+ on \d+ CPUs", text), text
+    assert text.endswith("where=here"), text
+    assert _bounded(Call("flush", 0, 2.0, 0.0, 2.5), "") == 0.5
+
+
+def test_a_writers_arm_is_matched_to_its_sink() -> None:
+    """SPEC-086 FR-003: inside the orphan path only that sink's arm is a writer's; in a build, any."""
+    soak, mine, other = _SoakRecord(), object(), object()
+    assert not soak.by_writer(mine)
+    soak.entering(mine)
+    assert soak.by_writer(mine)
+    assert not soak.by_writer(other)
+    soak.entering(_BUILD)
+    assert soak.by_writer(other)
+    soak.leaving()
+    soak.leaving()
+    assert not soak.by_writer(mine)
+    assert (soak.orphan_entries, soak.builds) == (1, 1)
 
 
 class _Node:

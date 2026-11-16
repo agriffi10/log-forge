@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "The model gates its close count only where one caller makes it exact, and soaks it under concurrency on request"
-description: "the generative model test gates a sink's close count (no close at the previous close's write count, no write after the last close returned) only in its sequential half, where one caller makes the count exact; under four callers the same count is a soak, collected only with `LOG_FOUNDRY_MODEL_SOAK=1` and set by no workflow, that excuses a repeat close only for a writer's arm between the two closes' takes as the library records them; a malformed model switch stops the session, never falls back. (SPEC-086)"
+description: "the generative model test gates a sink's close count (no close at the previous close's write count, no write after the last close returned) only in its sequential half, where one caller makes the count exact; under four callers the same count is a soak, collected only with `LOG_FOUNDRY_MODEL_SOAK=1` and set by no workflow, that excuses a repeat close only for a writer's arm between the two closes' takes as the library records them, a writer's arm being one `_note_orphan_emit` makes of its own sink or one inside `_get_worker`'s worker build; a malformed model switch stops the session, never falls back. (SPEC-086)"
 ---
 
 `tests/test_invariants_model.py` holds every call it makes to its own timeout plus `EPSILON` in
@@ -11,7 +11,8 @@ it is asserted after every step, as `check_repeat`, and after every `shutdown` a
 calls. The concurrent gating runs assert neither rule. Under `LOG_FOUNDRY_MODEL_SOAK=1` the same
 count runs over the concurrent half as `test_soak_the_close_count_under_concurrency`, which reads
 the library's own arms and takes through wrappers installed by name and judges by
-`check_unowed_repeat`.
+`check_unowed_repeat`. The four wrapped names are `_CloseRegistry.arm` and `.take`,
+`api._note_orphan_emit` and `_lifecycle._get_worker`.
 
 **Why the sink alone is exact under one caller and not under four.** A second close at one write
 count is owed when a writer armed the sink again after the first close's take and its write entered
@@ -21,6 +22,13 @@ close. With four it happens: seed 1653 does it in about one run in a hundred, an
 looks the same as the double close #339 fixed. Only the library's record of who armed the sink
 between the two takes tells them apart. A gate that reads a race at its rate goes red on honest
 runs, so the concurrent count runs on request and its red items are findings, not a merge verdict.
+
+**What a writer's arm is.** The orphan path arms the sink it is about to write. The worker
+build arms the configured sink for the worker to write. Both are writers in invariant 5's sense.
+The second diff review forced a worker-build arm between two takes. With only the orphan path
+counted, the soak flagged `repeat@2` on 5 of 5 runs, while the orphan twin of that sequence was
+silent. An orphan-path arm counts only for the sink its call was made for. A build's sink is
+resolved inside it, so a build's arm is attributed by the thread being inside it.
 
 **Why a writer's arm, and the earliest take.** A rule that excused any arm between the takes would
 excuse #339 itself, whose second close follows a sink change's arm. At `31dda162` that weaker rule
@@ -49,4 +57,6 @@ falls back on a value it cannot parse.
 
 ### 2026-11-15
 
+- **Refined** after the second diff review: a worker build's arm is a writer's arm, and an
+  orphan-path arm counts only for its own sink.
 - **Settled** by SPEC-086 at its completion.
