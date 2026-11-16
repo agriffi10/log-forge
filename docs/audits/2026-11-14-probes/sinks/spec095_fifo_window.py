@@ -9,10 +9,13 @@ budget `_run` computes, so it measures the tree on the path. Run from the reposi
 For each case it prints the earliest moment each round can start, counted from the start of the
 first, when every round before it ends in an exception: the waits the engine adds, plus each
 earlier round's own duration. A round's duration is the case's assumption, not a measurement:
-`0` is a client that fails at once, and `180` is three botocore attempts each ending at the
-60-second read timeout, botocore's default `read_timeout` (`botocore/endpoint.py`,
-`DEFAULT_TIMEOUT = 60`, at botocore 1.43.127) under the standard retry mode's default of three
-attempts (boto3's retries guide). It marks the first round that starts more than 300 seconds
+`0` is a client that fails at once; `300` is five botocore attempts and `180` three, each ending
+at the 60-second read timeout, botocore's default `read_timeout` (`botocore/endpoint.py`,
+`DEFAULT_TIMEOUT = 60`). At botocore 1.43.127 the default retry mode is `legacy`, five attempts,
+unless `AWS_NEW_RETRIES_2026` selects `standard`, three (`botocore/configprovider.py:23-41`;
+boto3's retries guide gives both counts). Revised on 2026-11-16 after SPEC-095's review, which
+found the first revision had assumed `standard` was the default. It marks the first round that
+starts more than 300 seconds
 after round one, which is where a resend of an entry first sent in round one is outside the
 deduplication interval SQS documents for `MessageDeduplicationId`.
 """
@@ -40,7 +43,8 @@ def starts(sink_retries: int, worker_retries: int, duration: float) -> list[floa
 def main() -> int:
     cases = [
         ("SQSSink defaults, calls fail at once", 3, 3, 0.0),
-        ("SQSSink defaults, each call times out three times", 3, 3, 180.0),
+        ("SQSSink defaults, legacy mode: each call times out five times", 3, 3, 300.0),
+        ("SQSSink defaults, standard mode: each call times out three times", 3, 3, 180.0),
         ("max_retries=20, calls fail at once", 20, 3, 0.0),
     ]
     for label, sink_retries, worker_retries, duration in cases:

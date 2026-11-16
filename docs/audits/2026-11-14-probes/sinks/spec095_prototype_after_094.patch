@@ -286,10 +286,10 @@ index 7a342f9..c487735 100644
      """Reports an outcome the library cannot decide yet, without claiming a loss (SPEC-068 FR-001).
  
 diff --git a/src/log_foundry/sinks/_classify.py b/src/log_foundry/sinks/_classify.py
-index 6bf2576..ddc1463 100644
+index 6bf2576..75bd566 100644
 --- a/src/log_foundry/sinks/_classify.py
 +++ b/src/log_foundry/sinks/_classify.py
-@@ -123,6 +123,42 @@ def is_retryable(predicate: ErrorPredicate, err: Exception) -> bool:
+@@ -123,6 +123,22 @@ def is_retryable(predicate: ErrorPredicate, err: Exception) -> bool:
          return False
  
  
@@ -306,32 +306,22 @@ index 6bf2576..ddc1463 100644
 +        return True
 +    if issubclass(kind, (ConnectionRefusedError, socket.gaierror, urllib.error.URLError)):
 +        return False
-+    if issubclass(
-+        kind,
-+        driver_classes(
-+            "botocore.exceptions",
-+            "EndpointConnectionError",
-+            "ConnectTimeoutError",
-+            "ProxyConnectionError",
-+        ),
-+    ):
-+        return False
-+    if issubclass(kind, driver_classes("azure.eventhub.exceptions", "ConnectError")):
-+        return False
-+    if issubclass(kind, driver_classes("botocore.exceptions", "ClientError")):
-+        response = getattr(err, "response", None)
-+        meta = response.get("ResponseMetadata") if issubclass(type(response), dict) else None
-+        status = meta.get("HTTPStatusCode") if issubclass(type(meta), dict) else None
-+        return type(status) is int and status >= 500
-+    state = getattr(err, "sqlstate", None)
-+    if issubclass(type(state), str) and len(state) == 5 and not state.startswith("08"):
-+        return False
 +    return True
 +
 +
  def aws_retryable(err: Exception) -> bool:
      """The four AWS sinks' predicate: botocore's transient and throttling failures (FR-002).
  
+diff --git a/src/log_foundry/sinks/_deferral.py b/src/log_foundry/sinks/_deferral.py
+index a1306be..61d1789 100644
+--- a/src/log_foundry/sinks/_deferral.py
++++ b/src/log_foundry/sinks/_deferral.py
+@@ -232,4 +232,4 @@ def wrapped_losses(inner: SinkLosses | None, own: int) -> SinkLosses | None:
+         return inner
+     if inner is None:
+         return SinkLosses(dropped=own, failed=0)
+-    return SinkLosses(dropped=inner.dropped + own, failed=inner.failed)
++    return SinkLosses(dropped=inner.dropped + own, failed=inner.failed, resent=inner.resent)
 diff --git a/src/log_foundry/sinks/_engine.py b/src/log_foundry/sinks/_engine.py
 index 3b47746..5cf5906 100644
 --- a/src/log_foundry/sinks/_engine.py
@@ -542,7 +532,7 @@ index 3b47746..5cf5906 100644
                      for counter, amount in counts.items():
                          ledger.count_for(owner, counter, amount)
 diff --git a/src/log_foundry/sinks/_rounds.py b/src/log_foundry/sinks/_rounds.py
-index 9b2f421..fa5cb36 100644
+index 9b2f421..cb6d03f 100644
 --- a/src/log_foundry/sinks/_rounds.py
 +++ b/src/log_foundry/sinks/_rounds.py
 @@ -26,6 +26,7 @@ __all__ = [
@@ -584,7 +574,7 @@ index 9b2f421..fa5cb36 100644
          kind = _diag.type_name(error)
          for position in positions:
              fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
-+        mark_reached(positions, error, retryable)
++        mark_reached(positions, error, retryable, True)
          lost.add(
              carried,
              when=When.LAST if retryable else When.ALWAYS,
@@ -592,10 +582,28 @@ index 9b2f421..fa5cb36 100644
          kind = _diag.type_name(error)
          for position in positions:
              fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
-+        mark_reached(positions, error, retryable)
++        mark_reached(positions, error, retryable, True)
          lost.add(
              carried,
              when=When.LAST if retryable else When.ALWAYS,
+@@ -556,12 +572,17 @@ def settle_positional(
+         return
+     retry = {id(record) for record in verdict.retry}
+     retrying: list[dict[str, object]] = []
++    coded_may_land: list[int] = []
+     for position, event, record in zip(positions, carried, records, strict=True):
+         if id(record) in retry:
+             fates[position] = Outcome.RETRYABLE
+             retrying.append(event)
++            if results_key == "RequestResponses":
++                coded_may_land.append(position)
+         else:
+             fates[position] = Outcome.ACCEPTED
++    if coded_may_land:
++        context.may_have_landed(coded_may_land)
+     lost.add(
+         retrying,
+         when=When.LAST,
 diff --git a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 index ec68617..96a42bc 100644
 --- a/src/log_foundry/sinks/_socket.py
@@ -657,7 +665,7 @@ index 243ba47..50a6a49 100644
  
  @runtime_checkable
 diff --git a/src/log_foundry/sinks/clickhouse.py b/src/log_foundry/sinks/clickhouse.py
-index 8df18a9..48062a7 100644
+index 8df18a9..8c74d37 100644
 --- a/src/log_foundry/sinks/clickhouse.py
 +++ b/src/log_foundry/sinks/clickhouse.py
 @@ -16,7 +16,7 @@ from log_foundry.sinks._extras import import_extra
@@ -673,12 +681,24 @@ index 8df18a9..48062a7 100644
                      outcome = Outcome.ACCEPTED
                  else:
                      outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
-+                    mark_reached([p for p, _ in chunk], called.error, called.retryable)
++                    mark_reached([p for p, _ in chunk], called.error, called.retryable, True)
                      kind = _diag.type_name(called.error)
                      lost.add(
                          carried,
+diff --git a/src/log_foundry/sinks/elasticsearch.py b/src/log_foundry/sinks/elasticsearch.py
+index 693e30c..1d53ea4 100644
+--- a/src/log_foundry/sinks/elasticsearch.py
++++ b/src/log_foundry/sinks/elasticsearch.py
+@@ -229,6 +229,7 @@ class ElasticsearchSink(HTTPSink):
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.item_errors + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+ 
 diff --git a/src/log_foundry/sinks/eventhubs.py b/src/log_foundry/sinks/eventhubs.py
-index e8622c4..cbad86f 100644
+index e8622c4..1f0ffd6 100644
 --- a/src/log_foundry/sinks/eventhubs.py
 +++ b/src/log_foundry/sinks/eventhubs.py
 @@ -15,7 +15,7 @@ from log_foundry.sinks._extras import import_extra
@@ -694,10 +714,22 @@ index e8622c4..cbad86f 100644
              outcome = Outcome.ACCEPTED
          else:
              outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
-+            mark_reached(list(packed), called.error, called.retryable)
++            mark_reached(list(packed), called.error, called.retryable, True)
              kind = _diag.type_name(called.error)
              lost.add(
                  carried,
+diff --git a/src/log_foundry/sinks/honeycomb.py b/src/log_foundry/sinks/honeycomb.py
+index 7e9d73a..2744ab1 100644
+--- a/src/log_foundry/sinks/honeycomb.py
++++ b/src/log_foundry/sinks/honeycomb.py
+@@ -394,6 +394,7 @@ class HoneycombSink(HTTPSink):
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.rejected_events + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+ 
 diff --git a/src/log_foundry/sinks/http.py b/src/log_foundry/sinks/http.py
 index 52e2c8f..c84a66a 100644
 --- a/src/log_foundry/sinks/http.py
@@ -779,7 +811,7 @@ index 52e2c8f..c84a66a 100644
              return _Answer(None, payload=payload)
          return _Answer(
 diff --git a/src/log_foundry/sinks/mongodb.py b/src/log_foundry/sinks/mongodb.py
-index c4d7426..354ac95 100644
+index c4d7426..7140281 100644
 --- a/src/log_foundry/sinks/mongodb.py
 +++ b/src/log_foundry/sinks/mongodb.py
 @@ -19,7 +19,7 @@ from log_foundry.sinks._extras import import_extra
@@ -835,7 +867,7 @@ index c4d7426..354ac95 100644
          """Reads a ``BulkWriteError``'s ``writeErrors`` by ``index`` through the keyed reader.
  
          A list it cannot pair makes every document ``UNKNOWN`` with one line, ``ALWAYS``, or
-@@ -485,8 +504,12 @@ class MongoDBSink:
+@@ -485,14 +504,21 @@ class MongoDBSink:
              return
          landed: list[int] = []
          rejects = 0
@@ -845,13 +877,60 @@ index c4d7426..354ac95 100644
 +            if named is None or (
 +                carried is not None
 +                and _own_id_again(named)
++                and "_id" not in carried[at]
 +                and sends_of(self, carried[at]) > 1
 +            ):
                  fates[position] = Outcome.ACCEPTED
                  landed.append(position)
              else:
+                 fates[position] = Outcome.REJECTED
+                 rejects += 1
+         encoded_landed(self, landed)
++        if not rejects:
++            return
+         total = rejects >= len(positions)
+         context.announce(
+             lambda: _diag.lost(
+diff --git a/src/log_foundry/sinks/multi.py b/src/log_foundry/sinks/multi.py
+index 4170373..d3bcd24 100644
+--- a/src/log_foundry/sinks/multi.py
++++ b/src/log_foundry/sinks/multi.py
+@@ -301,6 +301,7 @@ class MultiSink:
+         return SinkLosses(
+             dropped=sum(child.dropped for child in reported),
+             failed=sum(child.failed for child in reported) + absorbed,
++            resent=sum(child.resent for child in reported),
+         )
+ 
+     def close(self) -> None:
+diff --git a/src/log_foundry/sinks/nats.py b/src/log_foundry/sinks/nats.py
+index 6c497e1..335a35a 100644
+--- a/src/log_foundry/sinks/nats.py
++++ b/src/log_foundry/sinks/nats.py
+@@ -1856,4 +1856,8 @@ def _unlocked(counters: SinkCounters) -> SinkLosses:
+     Raises:
+       None.
+     """
+-    return SinkLosses(dropped=counters.dropped_events, failed=counters.failed_events)
++    return SinkLosses(
++        dropped=counters.dropped_events,
++        failed=counters.failed_events,
++        resent=counters.resent_events,
++    )
+diff --git a/src/log_foundry/sinks/otlp.py b/src/log_foundry/sinks/otlp.py
+index 8ccbc2f..08db904 100644
+--- a/src/log_foundry/sinks/otlp.py
++++ b/src/log_foundry/sinks/otlp.py
+@@ -340,6 +340,7 @@ class OTLPSink(HTTPSink):
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.rejected_records + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+ 
 diff --git a/src/log_foundry/sinks/postgres.py b/src/log_foundry/sinks/postgres.py
-index 43ae1d8..a4a5282 100644
+index 43ae1d8..027c0d9 100644
 --- a/src/log_foundry/sinks/postgres.py
 +++ b/src/log_foundry/sinks/postgres.py
 @@ -23,7 +23,7 @@ from log_foundry.sinks._extras import import_extra
@@ -889,7 +968,7 @@ index 43ae1d8..a4a5282 100644
              self._rollback()
 -            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
 +            state = getattr(err, "sqlstate", None)
-+            reached = committing and (state is None or str(state).startswith("08"))
++            reached = committing and (state is None or str(state)[:2] in ("08", "57", "XX"))
 +            return Called(
 +                None,
 +                error=err,
@@ -958,7 +1037,7 @@ index 034c8e9..24822ae 100644
  
      def _retryable_error(self, err: Exception) -> bool:
 diff --git a/src/log_foundry/sinks/redis.py b/src/log_foundry/sinks/redis.py
-index 98cbbd2..1666469 100644
+index 98cbbd2..787280d 100644
 --- a/src/log_foundry/sinks/redis.py
 +++ b/src/log_foundry/sinks/redis.py
 @@ -15,7 +15,7 @@ from log_foundry.sinks._extras import import_extra
@@ -974,7 +1053,7 @@ index 98cbbd2..1666469 100644
                  )
                  lost.register()
                  outcome = Outcome.RETRYABLE if retryable else Outcome.REJECTED
-+                mark_reached(list(positions), err, retryable)
++                mark_reached(list(positions), err, retryable, True)
              else:
                  outcome = Outcome.ACCEPTED
              for position in positions:
