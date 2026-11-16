@@ -5,7 +5,9 @@ A fake client acknowledges each message a set time after it was handed over, on 
 own, as a broker's round trip would. Each case emits batches of a given size through the sink's
 `emit` and prints the median wall time of one `emit` and the events per second that implies; a
 dead client never acknowledges, and its row shows that one `emit` is bounded by the sink's
-timeout. Run it against two trees and compare:
+timeout. Revised on 2026-11-16: the fake's `poll` blocks until it serves a report or its timeout
+passes, as librdkafka's does, because SPEC-094's round now waits by polling. Run it against two
+trees and compare:
 
     PYTHONPATH=<tree>/src python -B spec094_report_wait_cost.py
 """
@@ -50,7 +52,13 @@ class Producer:
         return len(ready)
 
     def poll(self, timeout: float = 0) -> int:
-        return self._serve()
+        """Blocks until it serves a report or the timeout passes, as librdkafka's poll does."""
+        deadline = time.monotonic() + timeout
+        while True:
+            served = self._serve()
+            if served or time.monotonic() >= deadline:
+                return served
+            time.sleep(0.0002)
 
     def flush(self, timeout: float | None = None) -> int:
         deadline = time.monotonic() + (timeout if timeout is not None else 3600)

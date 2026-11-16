@@ -626,7 +626,7 @@ specs:
     path: "docs/specs/SPEC-093-acknowledgement-fixes.md"
   - id: "SPEC-094"
     title: "Client-Buffered Sinks Wait for the Delivery Report, on the Delivery Engine"
-    description: "Moves KafkaSink and GooglePubSubSink onto the delivery engine, with each round waiting within the sink's own timeout for the client's report on every message it handed over, so that a definitive refusal fails the batch, an indefinite report is counted as one that may have landed, and no count arrives after the batch's verdict."
+    description: "Moves KafkaSink and GooglePubSubSink onto the delivery engine, with each round waiting, within the sink's own timeout and until the stop signal, for the client's report on every message it handed over, so that a rejection no attempt could have written fails the batch, every other report is counted as one that may have landed, and no count arrives after the batch's verdict."
     spec_status: "Draft"
     depends_on: ["SPEC-069", "SPEC-072", "SPEC-074", "SPEC-075", "SPEC-076", "SPEC-092", "SPEC-093"]
     arc: "audit-2026-11-14"

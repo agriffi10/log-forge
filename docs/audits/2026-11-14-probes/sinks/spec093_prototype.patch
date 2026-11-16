@@ -1,6 +1,6 @@
 diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py
---- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 20:35:40
-+++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 20:41:13
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 23:02:15
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:42:00
 @@ -64,6 +64,9 @@
          "StreamLostError": ("AMQPConnectionError",),
          "ConnectionWrongStateError": ("AMQPConnectionError",),
@@ -75,8 +75,8 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
      def channel(self) -> RabbitChannel:
          if self.broken:
 diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_table.py ./docs/audits/2026-11-14-probes/sinks/spec092_table.py
---- a/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-15 20:35:40
-+++ b/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-15 20:41:13
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-15 23:02:15
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-16 08:42:00
 @@ -109,7 +109,7 @@
      return _same(make)
  
@@ -133,8 +133,8 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_table.py ./docs/audits/2
          for fault in faults:
              if fault in skip:
 diff -ruN ./src/log_foundry/sinks/_batch.py ./src/log_foundry/sinks/_batch.py
---- a/src/log_foundry/sinks/_batch.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/_batch.py	2026-11-15 20:40:35
+--- a/src/log_foundry/sinks/_batch.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/_batch.py	2026-11-16 08:42:00
 @@ -142,6 +142,7 @@
      error_key: str = "ErrorCode",
      failed_count: object = _NOT_PASSED,
@@ -153,8 +153,8 @@ diff -ruN ./src/log_foundry/sinks/_batch.py ./src/log_foundry/sinks/_batch.py
          return _adjudicate_counted(records, results, error_key, failed_count)
      if len(results) != len(records):
 diff -ruN ./src/log_foundry/sinks/_rounds.py ./src/log_foundry/sinks/_rounds.py
---- a/src/log_foundry/sinks/_rounds.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/_rounds.py	2026-11-15 20:41:13
+--- a/src/log_foundry/sinks/_rounds.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/_rounds.py	2026-11-16 08:42:00
 @@ -259,16 +259,28 @@
        None. A ``BaseException`` from the predicate or the reply still propagates.
      """
@@ -246,8 +246,8 @@ diff -ruN ./src/log_foundry/sinks/_rounds.py ./src/log_foundry/sinks/_rounds.py
          coded = sum(1 for result in results if result.get("ErrorCode"))
          returned = (
 diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
---- a/src/log_foundry/sinks/_socket.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/_socket.py	2026-11-15 20:41:13
+--- a/src/log_foundry/sinks/_socket.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/_socket.py	2026-11-16 08:42:13
 @@ -4,6 +4,7 @@
  
  import errno
@@ -256,15 +256,16 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
  import socket
  from typing import TYPE_CHECKING
  
-@@ -116,6 +117,37 @@
+@@ -116,6 +117,40 @@
      )
  
  
 +def _peer_state(sock: socket.socket) -> str:
 +    """Reports what a held TCP connection shows of its peer: ``open``, ``fin`` or ``reset``.
 +
-+    A zero-timeout readiness check, then a one-byte peek: readable with nothing to read is a FIN,
-+    and a peek that raises ``OSError`` is a reset. A check that cannot be made reads as open.
++    A pending socket error (``SO_ERROR``) is a reset, then a zero-timeout readiness check and a
++    one-byte peek: readable with nothing to read is a FIN, and a peek that raises ``OSError`` is a
++    reset. A check that cannot be made reads as open.
 +
 +    Args:
 +      sock: The held socket.
@@ -276,6 +277,8 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
 +      None.
 +    """
 +    try:
++        if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
++            return "reset"
 +        try:
 +            readable = bool(select.select([sock], [], [], 0)[0])
 +        except ValueError:
@@ -294,7 +297,7 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
  def _json_frame(event: dict[str, object]) -> bytes:
      """Frames an event as its UTF-8 JSON text, the transport's default when a caller gives none.
  
-@@ -400,12 +432,20 @@
+@@ -400,12 +435,20 @@
              fates = [Outcome.DROPPED] * len(batch)
              pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
              lost = Lost(self)
@@ -315,7 +318,7 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
                  fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
                  kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
                  lost.add(
-@@ -414,8 +454,40 @@
+@@ -414,8 +457,40 @@
                      key=kind,
                      line=raised_line("message", "SocketTransport", kind),
                  )
@@ -357,8 +360,8 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
      def _sendable(
          self, messages: list[tuple[int, bytes]], pending: Deferral | _Drops
 diff -ruN ./src/log_foundry/sinks/elasticsearch.py ./src/log_foundry/sinks/elasticsearch.py
---- a/src/log_foundry/sinks/elasticsearch.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/elasticsearch.py	2026-11-15 20:40:35
+--- a/src/log_foundry/sinks/elasticsearch.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/elasticsearch.py	2026-11-16 08:42:00
 @@ -188,7 +188,7 @@
              data = json.loads(payload)
          except Exception:
@@ -369,8 +372,8 @@ diff -ruN ./src/log_foundry/sinks/elasticsearch.py ./src/log_foundry/sinks/elast
          if not data.get("errors"):
              return (Outcome.ACCEPTED,) * sent
 diff -ruN ./src/log_foundry/sinks/rabbitmq.py ./src/log_foundry/sinks/rabbitmq.py
---- a/src/log_foundry/sinks/rabbitmq.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/rabbitmq.py	2026-11-15 20:41:13
+--- a/src/log_foundry/sinks/rabbitmq.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/rabbitmq.py	2026-11-16 08:42:00
 @@ -80,6 +80,7 @@
          blocked_connection_timeout: float | None = None,
          socket_timeout: float | None = None,
@@ -523,8 +526,8 @@ diff -ruN ./src/log_foundry/sinks/rabbitmq.py ./src/log_foundry/sinks/rabbitmq.p
  
      def _reset(self) -> None:
 diff -ruN ./src/log_foundry/sinks/sentry.py ./src/log_foundry/sinks/sentry.py
---- a/src/log_foundry/sinks/sentry.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/sentry.py	2026-11-15 20:41:13
+--- a/src/log_foundry/sinks/sentry.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/sentry.py	2026-11-16 08:42:00
 @@ -10,6 +10,7 @@
  from urllib.parse import urlsplit
  
@@ -616,8 +619,8 @@ diff -ruN ./src/log_foundry/sinks/sentry.py ./src/log_foundry/sinks/sentry.py
                  self._post_envelope(event)
          except SinkDeliveryError:
 diff -ruN ./src/log_foundry/sinks/sns.py ./src/log_foundry/sinks/sns.py
---- a/src/log_foundry/sinks/sns.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/sns.py	2026-11-15 20:40:35
+--- a/src/log_foundry/sinks/sns.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/sns.py	2026-11-16 08:42:00
 @@ -95,6 +95,7 @@
          self.log_foundry_stop_signal: threading.Event | None = None
          self.log_foundry_counters = SinkCounters()
@@ -627,8 +630,8 @@ diff -ruN ./src/log_foundry/sinks/sns.py ./src/log_foundry/sinks/sns.py
      @property
      def _counter_lock(self) -> threading.Lock:
 diff -ruN ./src/log_foundry/sinks/sqs.py ./src/log_foundry/sinks/sqs.py
---- a/src/log_foundry/sinks/sqs.py	2026-11-15 20:35:40
-+++ b/src/log_foundry/sinks/sqs.py	2026-11-15 20:40:35
+--- a/src/log_foundry/sinks/sqs.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/sqs.py	2026-11-16 08:42:00
 @@ -245,6 +245,7 @@
          self.message_deduplication_id = message_deduplication_id
          self.log_foundry_counters = SinkCounters()

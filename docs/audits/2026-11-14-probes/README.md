@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Forty-one files here are not the audit's.** Each was added after the audit was brought in
+**Forty-four files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -34,10 +34,13 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   ledger costs, by the spec's Evidence method, for the delivery doc.
 - `sinks/spec093_socket_options.py` and `sinks/spec093_rabbitmq_confirm_cost.py`, written while
   authoring SPEC-093 against `33582484`, and `sinks/spec094_report_wait_cost.py`, written while
-  authoring SPEC-094. Each is run with `PYTHONPATH=<tree>/src` as its docstring says, against two
+  authoring SPEC-094. `sinks/spec093_close_corpus.py`, written while revising SPEC-093 against
+  `97a03f45`, imports nothing from the library and is run on macOS and in Docker
+  `python:3.12-slim` as its docstring says. `sinks/spec094_stuck_partition.py` and
+  `sinks/spec094_dead_broker_flush.py` are adapted from SPEC-094's reviewer's probes. Each is run with `PYTHONPATH=<tree>/src` as its docstring says, against two
   trees to compare. `sinks/spec093_prototype.patch` and `sinks/spec094_prototype.patch` are not
   probes: they are the two specs' prototypes, applied in that order with `patch -p1` to
-  `git archive 9d70f782 src tests docs/audits/2026-11-14-probes`, and SPEC-093's and SPEC-094's
+  `git archive 97a03f45 src tests docs/audits/2026-11-14-probes`, and SPEC-093's and SPEC-094's
   *Evidence* sections say what each measured.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they

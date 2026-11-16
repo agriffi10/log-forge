@@ -1,7 +1,7 @@
 diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py
---- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 20:41:13
-+++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 20:42:48
-@@ -69,6 +69,16 @@
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:42:00
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:52:37
+@@ -69,6 +69,18 @@
          "ChannelClosedByBroker": ("AMQPError",),
      },
      "psycopg.errors": {"Error": (), "OperationalError": ("Error",)},
@@ -11,6 +11,8 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
 +        "ClientError": ("GoogleAPICallError",),
 +        "Forbidden": ("ClientError",),
 +        "PermissionDenied": ("Forbidden",),
++        "BadRequest": ("ClientError",),
++        "InvalidArgument": ("BadRequest",),
 +        "ServerError": ("GoogleAPICallError",),
 +        "GatewayTimeout": ("ServerError",),
 +        "DeadlineExceeded": ("GatewayTimeout",),
@@ -18,13 +20,22 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
      "redis.exceptions": {
          "RedisError": (),
          "ConnectionError": ("RedisError",),
-@@ -949,9 +959,13 @@
+@@ -918,7 +930,7 @@
+         for carried, callback in queue:
+             if self.backend.fault == "never-acknowledged":
+                 if callback is not None:
+-                    callback(KafkaError(29), None)
++                    callback(KafkaError(10), None)
+             elif self.backend.fault == "report-indefinite":
+                 self.backend.take(carried)
+                 if callback is not None:
+@@ -949,9 +961,13 @@
              if self.settled or fault == "report-indefinite":
                  self.backend.take(self.carried)
          if fault == "never-acknowledged":
 -            raise PermissionDenied("the topic refused the publish")
 +            raise driver_error(
-+                "google.api_core.exceptions", "PermissionDenied", "the topic refused the publish"
++                "google.api_core.exceptions", "InvalidArgument", "the topic refused the publish"
 +            )
          if fault == "report-indefinite":
 -            raise DeadlineExceeded("the publish deadline passed")
@@ -35,9 +46,13 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
  
      def exception(self, timeout: float | None = None) -> BaseException | None:
 diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
---- a/src/log_foundry/sinks/kafka.py	2026-11-15 20:40:35
-+++ b/src/log_foundry/sinks/kafka.py	2026-11-15 20:42:48
-@@ -7,18 +7,76 @@
+--- a/src/log_foundry/sinks/kafka.py	2026-11-16 08:42:00
++++ b/src/log_foundry/sinks/kafka.py	2026-11-16 08:55:42
+@@ -4,21 +4,82 @@
+ 
+ import json
+ import threading
++import time
  from typing import Any
  
  from log_foundry import _diag
@@ -50,16 +65,20 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  from log_foundry.sinks._extras import import_extra
  from log_foundry.sinks._guard import ClosedGuard, GuardMode
  from log_foundry.sinks._refusal import final_refusal
- from log_foundry.sinks._retry import usable_timeout
+-from log_foundry.sinks._retry import usable_timeout
+-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
++from log_foundry.sinks._retry import usable_timeout, wait
 +from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
- from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
++from log_foundry.sinks.base import SinkLosses
 +from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
  
  __all__ = ["KafkaSink"]
  
-+DEFINITIVE_CODES = frozenset({2, 10, 17, 18, 21, 29, 31, 87})
-+"""Kafka protocol codes a broker returns only for a produce request it did not write (SPEC-094)."""
++DEFINITIVE_CODES = frozenset({10, 18, 21, 87})
  
++_REPORT_SLICE = 0.05
++"""Kafka protocol codes a broker returns only for a produce request it did not write (SPEC-094)."""
++
 +
 +class _Reports:
 +    """One round's delivery reports by position, closed to late reports once the round settles."""
@@ -116,7 +135,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  def _usable_timeout(value: float) -> float:
      """Returns a flush timeout that is actually a bound, or the default.
  
-@@ -171,12 +229,88 @@
+@@ -171,12 +232,88 @@
          self.producer = producer
          self.key_field = key_field
          self.flush_timeout = _usable_timeout(flush_timeout)
@@ -208,7 +227,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
      def _closed(self) -> bool:
          """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
  
-@@ -215,119 +349,142 @@
+@@ -215,119 +352,141 @@
          return self._guard._lock
  
      def losses(self) -> SinkLosses:
@@ -398,10 +417,9 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
 +                )
 +            if not produced:
 +                return Verdict(outcomes=tuple(fates))
-+            remaining = self.producer.flush(self.flush_timeout)
++            drained = self._await_reports(reports, produced)
 +            reports.settled = True
 +            seen = dict(reports.reports)
-+            drained = type(remaining) is int and remaining == 0
 +            definitive: list[str] = []
 +            unknown = 0
 +            for position in produced:
@@ -438,7 +456,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
      def _encode(self, event: dict[str, object]) -> tuple[bytes, bytes | None]:
          """Encodes one event as its message body and partition key.
-@@ -351,24 +508,6 @@
+@@ -351,24 +510,6 @@
          """
          return json.dumps(event).encode("utf-8"), self._key(event)
  
@@ -463,7 +481,58 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
      def close(self) -> None:
          """Flushes the producer so buffered messages are delivered before exit (FR-002).
  
-@@ -467,16 +606,7 @@
+@@ -428,13 +569,44 @@
+         with self._guard.enter() as section:
+             if not section:
+                 raise final_refusal(self, "KafkaSink cannot flush: the sink is closed")
+-            remaining = self.producer.flush(self.flush_timeout)
+-        if type(remaining) is int and remaining > 0:
+-            raise SinkDeliveryError(
+-                f"KafkaSink flushed within {self.flush_timeout}s with {remaining} "
+-                "message(s) still queued"
+-            )
++            self.producer.flush(0)
+ 
++    def _await_reports(self, reports: _Reports, produced: list[int]) -> bool:
++        """Waits until every produced position has a report, the queue drains, or time is up.
++
++        Each pass asks ``flush(0)``, which serves the reports already in and returns at once with
++        the producer's queue length, then polls for one slice. The stop signal ends the wait after
++        the first slice.
++
++        Args:
++          reports: The round's report table.
++          produced: The positions produced this round.
++
++        Returns:
++          Whether the producer's queue read empty, so an unreported message was delivered.
++
++        Raises:
++          None. Whatever the producer raises propagates.
++        """
++        deadline = time.monotonic() + self.flush_timeout
++        stop = self.log_foundry_stop_signal
++        first = True
++        while True:
++            remaining = self.producer.flush(0)
++            if all(position in reports.reports for position in produced):
++                return False
++            if type(remaining) is int and remaining == 0:
++                return True
++            left = deadline - time.monotonic()
++            if left <= 0 or (not first and stop is not None and stop.is_set()):
++                return False
++            began = time.monotonic()
++            slice_ = min(left, _REPORT_SLICE)
++            served = self.producer.poll(slice_)
++            first = False
++            if not (type(served) is int and served > 0):
++                wait(slice_ - (time.monotonic() - began), stop)
++
+     def _flush_bounded(self) -> None:
+         """Flushes the producer within a bound, counting whatever it could not deliver (FR-006).
+ 
+@@ -467,16 +639,7 @@
          Raises:
            Exception: Whatever the producer raises, which ``close``'s caller already handles.
          """
@@ -481,7 +550,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
      def _key(self, event: dict[str, object]) -> bytes | None:
          """Derives one message's partition key from the configured field.
-@@ -496,29 +626,25 @@
+@@ -496,29 +659,25 @@
          value = event.get(self.key_field)
          return str(value).encode("utf-8") if value is not None else None
  
@@ -527,8 +596,8 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
  def _code(err: object) -> str:
 diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
---- a/src/log_foundry/sinks/pubsub.py	2026-11-15 20:40:35
-+++ b/src/log_foundry/sinks/pubsub.py	2026-11-15 20:42:48
+--- a/src/log_foundry/sinks/pubsub.py	2026-11-16 08:42:00
++++ b/src/log_foundry/sinks/pubsub.py	2026-11-16 08:43:25
 @@ -8,12 +8,16 @@
  from typing import Any
  
@@ -780,7 +849,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
  
          Returns:
            None.
-@@ -362,257 +245,208 @@
+@@ -362,257 +245,216 @@
          Raises:
            None.
          """
@@ -1064,7 +1133,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
 -    def _drain_pending(self, pending: list[Any]) -> None:
 -        """Resolves a swapped-out list within the close bound, counting what it abandons.
 +    def _await_round(self, futures: list[tuple[int, Any]]) -> list[tuple[int, str, str]]:
-+        """Waits for one round's futures under one deadline, never cut short by the stop signal.
++        """Waits for one round's futures under one deadline, cut short by the stop signal.
  
 -        The tail every close-race site shares: :meth:`close`, and the two branches where a close
 -        lands while another pass is mid-flight. Each used to resolve its leftovers with
@@ -1072,7 +1141,10 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
 -        a client publish deadline of 600 s. ``_await_overflow``'s copy is the one that mattered
 -        most: it runs on whichever thread called ``emit``, which on the orphan path is an
 -        application thread.
--
++        Every future is asked at least once. The first ask may wait one slice; once the stop
++        signal is set after that, each later ask waits nothing, and a future still unresolved
++        reads as unknown.
+ 
 -        Unboundable futures still get ``timeout=None``, because that is the only wait they accept
 -        and :meth:`_resolve` counts whatever they resolve to.
 -
@@ -1103,20 +1175,24 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
 -            f"{self.overflow_timeout}s close bound expired",
 -        )
 +        deadline = time.monotonic() + self.overflow_timeout
++        stop = self.log_foundry_stop_signal
++        first = True
 +        settled: list[tuple[int, str, str]] = []
 +        for position, future in futures:
 +            outcome: tuple[str, str] | None = None
 +            while outcome is None:
 +                left = deadline - time.monotonic()
-+                if left <= 0:
-+                    outcome = ("unknown", "no result within the bound")
-+                    break
++                stopping = not first and stop is not None and stop.is_set()
++                slice_ = 0.0 if stopping or left <= 0 else min(left, _POLL_INTERVAL)
++                first = False
 +                began = time.monotonic()
-+                slice_ = min(left, _POLL_INTERVAL)
 +                try:
 +                    future.result(timeout=slice_)
 +                except TimeoutError:
-+                    wait(slice_ - (time.monotonic() - began), None)
++                    if stopping or left <= 0:
++                        outcome = ("unknown", "no result within the bound")
++                        break
++                    wait(slice_ - (time.monotonic() - began), stop)
 +                    continue
 +                except TypeError:
 +                    outcome = ("unknown", "a future that takes no timeout")
@@ -1188,7 +1264,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
  
      def flush(self) -> None:
          """Resolves the outstanding publish futures without closing the sink (SPEC-036 FR-002).
-@@ -648,28 +482,7 @@
+@@ -648,28 +490,7 @@
          """
          if self._closed:
              raise final_refusal(self, "GooglePubSubSink cannot flush: the sink is closed")
@@ -1217,7 +1293,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
      def close(self) -> None:
          """Resolves the pending publish futures within a bound, counting the rest (FR-008).
  
-@@ -715,8 +528,32 @@
+@@ -715,8 +536,26 @@
          """
          with self._futures_lock:
              self._closed = True
@@ -1239,13 +1315,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
 +      None.
 +    """
 +    definitive = (
-+        *driver_classes(
-+            "google.api_core.exceptions",
-+            "InvalidArgument",
-+            "Unauthenticated",
-+            "PermissionDenied",
-+            "NotFound",
-+        ),
++        *driver_classes("google.api_core.exceptions", "InvalidArgument"),
 +        *driver_classes("google.cloud.pubsub_v1.publisher.exceptions", "FlowControlLimitError"),
 +    )
 +    return _diag.is_a(err, definitive)

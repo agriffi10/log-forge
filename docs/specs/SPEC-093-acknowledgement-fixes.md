@@ -77,10 +77,10 @@ Every premise below was first read at `33582484`, and the prototype under *Evide
 there. Two branches that touched `src/log_foundry/sinks/` were open while this spec was written,
 `claude/driver-error-rework-c373af` (`sinks/_driver_error.py` and the sinks that call
 `delivery_error`) and `claude/isinstance-guard-9eeb88` (an AST sweep of every type test). Both
-landed, as `8bd0b54a` and `bb6656ff`, and SPEC-086 then landed as `9d70f782`. None of the three
-changes a line this spec cites, and every `file:line` here was re-read at `9d70f782`. The prototype
-was rebuilt on `9d70f782`, and the numbers under *Evidence* are from that tree unless they say
-otherwise. **The build re-verifies every `file:line` against `main` as it stands.** No fix here calls
+landed, as `8bd0b54a` and `bb6656ff`, and SPEC-086 and SPEC-088 then landed, up to `97a03f45`. None
+of them changes a line this spec cites, and every `file:line` here was re-read at `97a03f45`. The
+prototype was rebuilt on `97a03f45`, and the numbers under *Evidence* are from that tree unless they
+say otherwise. **The build re-verifies every `file:line` against `main` as it stands.** No fix here calls
 `delivery_error`, so this spec assumes no definition of it, current or earlier. Every type test the
 fixes add is `_diag.is_a`, as *A type test reads the real type, never the value's __class__*
 (`docs/decisions/failure-paths/`) requires, and `tests/test_class_check_roster.py` holds that.
@@ -101,73 +101,94 @@ his answers that day bind FR-002 and FR-004, and *Revision history* quotes them.
 (`sinks/_socket.py:404-408`, the `sendall` at `:517`). The class documents `failed` as "Messages not
 confirmed" (`:157`), and nothing is ever confirmed. After the peer closes, the kernel takes the next
 frames anyway and they go nowhere. `probe_socket.py` at `33582484` lost 4 of 50 from `SyslogSink` and
-8 of 50 from `LogstashSink`, with `failed=0` and no line. The audit recorded 2 to 25.
+8 of 50 from `LogstashSink`, with `failed=0` and no line. The audit recorded 2 to 25. In Docker
+`python:3.12-slim` at `97a03f45` it lost 1 of 50 from each.
 
-**What the socket can know.** `spec093_socket_options.py` measures six options with a frame loop
-shaped like `_round`, against a loopback listener (*Evidence*). A check between batches finds every
-close the peer made between them. A check before every frame costs about 0.4 µs against a 4 to 10 µs
-`sendall`, and it still let up to 10 of 50 frames vanish when the peer closed mid-batch. Calling the
-frames written since the last check `UNKNOWN` when a later write raises catches a mid-batch close, but
-only when a later write does raise. A check after the round's last frame catches the rest, but a FIN
-alone cannot tell a close from a legal half-close: a peer that shuts down only its write side keeps
-reading every frame. Counting on a FIN at that point reported all 50 frames of a half-closing peer as
-may-have-landed, every one of which arrived. Counting only on a reset there reported none of them, and
-still caught the close that a FIN-counting check caught. So the end-of-round check reads a reset and
-not a FIN.
+**How the close rule was chosen: by a scenario corpus, on both platforms.** Two earlier drafts
+patched the end-of-round rule by reasoning, and each was wrong on a case it had not run. Counting
+on a FIN reported a half-closing peer's delivered frames as may-have-landed. Counting only on a peek
+that raises fell silent on Linux, where a FIN followed by the RST our later write draws still peeks
+as a FIN. So the rule is now the one that a committed scenario corpus,
+`spec093_close_corpus.py`, shows right on every scenario on Linux (Docker `python:3.12-slim`, the
+platform CI and production use) and on macOS. Each scenario's true outcome is what the peer
+received, measured, against the rule's verdict:
+
+| Scenario | True outcome | Expected verdict |
+|---|---|---|
+| clean: the peer reads everything and stays open | all received | silent |
+| half-close: the peer shuts down its write side and reads everything | all received | silent |
+| FIN, then the RST our later frame draws | the frame lost | count |
+| an RST with no FIN (`SO_LINGER` zero), frames unread | frames lost | count |
+| a FIN only, after the peer read everything | all received | silent |
+| a reset that lands after the end check | frames lost | silent: no check can see it |
+
+The rule that reads the socket's pending error, `getsockopt(SOL_SOCKET, SO_ERROR)`, before the peek
+is right on every row on both platforms, in five runs each (*Evidence*). After a FIN and the RST our
+write drew, `SO_ERROR` held `EPIPE` (32) on Linux and `ECONNRESET` (54) on macOS while the peek read
+an empty FIN on both. After a half-close it held 0. The FIN rule failed the two rows where every
+frame arrived, on both platforms. The peek-only rule failed the FIN-then-RST row on Linux in every
+run.
 
 **The rule, for `transport="tcp"` only.**
 
-1. **Before a round's first frame**, a held connection is checked by `_peer_state(sock)`, a
-   module-level seam beside `_make_tcp` that answers `"open"`, `"fin"` or `"reset"`. The check is a
-   zero-timeout readiness test, `select.select([sock], [], [], 0)`, falling back to `select.poll`
-   where `select.select` refuses the descriptor with `ValueError` (one above `FD_SETSIZE`). A fresh
-   `select.poll` object per check costs 21 to 41 µs, against 0.4 to 0.6 µs for `select.select`. When
-   the socket is readable, the check calls `recv(1, socket.MSG_PEEK)`. Readable with nothing to read
-   is `"fin"`, and an `OSError` from either call is `"reset"`. Either one makes the round call
-   `_reset()` before it writes, so its frames go on a new connection and nothing is counted. A
-   half-closed peer therefore costs a new connection per round and loses nothing. The check does not
-   use `MSG_DONTWAIT`, because on a socket with a timeout, which `create_connection(timeout=…)` gives,
-   CPython waits the whole timeout before that call returns. The probe measured 1.00 s of a 1.0 s
-   timeout. A check that raises anything other than `OSError` answers `"open"`, so an object that is
-   not a real socket keeps 1.x's behaviour.
-2. **The frames written on the current connection since its last check that answered open** are
-   unconfirmed. A connection opened inside the round counts as checked when it opened. When a later
-   write on that connection raises, the unconfirmed frames become `UNKNOWN`. The raising frame keeps
-   today's outcome, `RETRYABLE` or `REJECTED` as `_retryable_error` answers, and so it is still sent
-   again on a new connection. That resend is finding 5, which is out of scope.
-3. **After the round's last frame**, the connection is checked again. When the check answers
-   `"reset"`, the round's unconfirmed frames become `UNKNOWN` and the connection is reset. A `"fin"`
-   changes nothing in this round, and the next round's first check replaces the connection.
-4. Each group of `UNKNOWN` frames is announced once, `ALWAYS`, with the line `lost N message(s);
+1. **`_peer_state(sock)`**, a module-level seam beside `_make_tcp`, answers `"open"`, `"fin"` or
+   `"reset"`:
+   - a nonzero `getsockopt(SOL_SOCKET, SO_ERROR)` is `"reset"` (reading it clears it, and the
+     connection is replaced next anyway);
+   - otherwise a zero-timeout readiness test, `select.select([sock], [], [], 0)`, falling back to
+     `select.poll` where `select.select` refuses the descriptor with `ValueError` (one above
+     `FD_SETSIZE`), then, when readable, `recv(1, socket.MSG_PEEK)`: empty is `"fin"`, data is
+     `"open"`;
+   - an `OSError` from any of these is `"reset"`, and any other exception is `"open"`, so an
+     object that is not a real socket keeps 1.x's behaviour.
+
+   It never uses `MSG_DONTWAIT`: on a socket with a timeout, which `create_connection(timeout=…)`
+   gives, CPython waits the whole timeout before that call returns, measured at 1.00 s of a 1.0 s
+   timeout. A fresh `select.poll` object costs 21 to 41 µs, against 0.4 to 0.6 µs for
+   `select.select`.
+2. **Before a round's first frame**, a held connection whose state is not `"open"` is replaced
+   (`_reset()`), so the round's frames go on a new connection and nothing is counted. A
+   half-closing peer therefore costs a new connection per round and loses nothing.
+3. **The frames written on the current connection since its last check that answered `"open"`**
+   are unconfirmed. A connection opened inside the round counts as checked when it opened. When a
+   later write on that connection raises, the unconfirmed frames become `UNKNOWN`. The raising
+   frame keeps today's outcome, `RETRYABLE` or `REJECTED` as `_retryable_error` answers, and so it
+   is still sent again on a new connection. That resend is finding 5, which is out of scope.
+4. **After the round's last frame**, the connection is checked again. `"reset"` makes the round's
+   unconfirmed frames `UNKNOWN` and replaces the connection. `"fin"` changes nothing in this round,
+   and the next round's first check replaces the connection.
+5. Each group of `UNKNOWN` frames is announced once, `ALWAYS`, with the line `lost N message(s);
    SocketTransport, written to a connection its peer closed; may have landed, not retried`. The
    engine counts them in `failed_events`, and they are never sent again.
 
-**What stays unknowable.** Two windows remain. A peer can close with frames the kernel took and it
-never read, and its reset can arrive after the end-of-round check. And a peer can close with frames it
-read, then send only a FIN, so the check cannot tell it from a half-close. In both cases the frames
-were reported landed, and the next round's check replaces the connection. FR-006 records this in §13.
+**What stays unknowable**, from the corpus on both platforms: a reset that lands after the
+end-of-round check. Those frames read as delivered, and the next round's check replaces the
+connection. A FIN alone after the peer read everything is not a loss, and the rule stays silent on
+it. FR-006 records the one window in §13.
 
 #### Acceptance Criteria:
 
 - [ ] `SyslogSink[tcp]-peer-closed` and `LogstashSink[tcp]-peer-closed` of
       `tests/test_conformance.py` read green (invariants 2 and 7).
-- [ ] With `_make_tcp` returning ends of `socket.socketpair()`, a peer closed between two rounds
-      leaves every frame of the second round on the new connection, `failed` unchanged and no
-      `lost` line (invariants 2 and 7).
+- [ ] A new test, `tests/test_socket_close_corpus.py`, runs the six scenarios above against
+      `SocketTransport` over loopback TCP in the ordinary `CI / test` job on Linux, and asserts per
+      scenario the expected verdict of the table: no `UNKNOWN` and no `lost` line for the clean,
+      half-close and FIN-after-reading rows; every frame of the round `UNKNOWN`, counted once in
+      `failed` and named on one line for the FIN-then-RST and RST-without-FIN rows; and silence for
+      the reset after the end check (invariants 2, 7 and 11).
+- [ ] The same test, with `_peer_state`'s `SO_ERROR` read removed, fails on its FIN-then-RST row on
+      Linux, and with the end-of-round check counting `"fin"`, fails on its half-close and
+      FIN-after-reading rows (invariant 2).
+- [ ] A peer closed between two rounds leaves every frame of the second round on the new
+      connection, `failed` unchanged and no `lost` line (invariants 2 and 7).
 - [ ] With the peer closed mid-round and a later write raising `BrokenPipeError`, the frames written
       on that connection after its check are `UNKNOWN`, counted once in `failed`, named on one line,
       and never written again. The raising frame is written again on the next connection
       (invariants 2, 7 and 11).
-- [ ] With the peer's end of a `socketpair` set to `SO_LINGER` zero and closed after the round's
-      writes, so that the end-of-round check sees a reset, every frame of that round written on the
-      connection is `UNKNOWN`, counted and named on one line (invariants 2 and 7).
-- [ ] With a peer that calls `shutdown(SHUT_WR)` and keeps reading, `halfclose.py` (the reviewer's
-      reproduction, re-run as a test) reads every frame received, `failed=0` and no line
-      (invariant 2).
 - [ ] A held socket whose check raises `TypeError` answers `"open"`, and its frames are `ACCEPTED`
       as in 1.x (invariant 1).
 - [ ] `probe_socket.py` against the branch reports `batch2 received=50/50`, `failed=0` and no line
-      for both sinks under FIN and RST, in five runs out of five (invariant 2).
+      for both sinks under FIN and RST, in Docker `python:3.12-slim` and on macOS (invariant 2).
 - [ ] UDP rounds call no check, and `SyslogSink[udp]-peer-closed` and `LogstashSink[udp]-peer-closed`
       keep the `udp-fire-and-forget` departure (invariant 2).
 
@@ -392,7 +413,7 @@ confirms are opt-in.
       `RabbitMQSink[confirmed-borrowed]` on every row but `peer-closed`, which reads
       `ambiguous-when-knowable` under the `confirm-borrowed-unprobed` departure (invariants 2 and 7).
 - [ ] `RabbitMQSink[owned]` and `RabbitMQSink[borrowed]`, the default, read exactly as they read at
-      `9d70f782`, and their `peer-closed` rows sit under the `publish-unconfirmed` departure
+      `97a03f45`, and their `peer-closed` rows sit under the `publish-unconfirmed` departure
       (invariants 2 and 7).
 - [ ] With a stand-in connection and channel that record calls, a `confirm=True` sink calls
       `confirm_delivery()` once per channel it opens, passes `mandatory=True` on every publish, and
@@ -408,7 +429,7 @@ confirms are opt-in.
       events `RETRYABLE` or `REJECTED` as the predicate answers (invariants 2 and 7).
 - [ ] A stand-in channel without `confirm_delivery` publishes and is `ACCEPTED`, as in 1.x (invariant
       10).
-- [ ] `inspect.signature(RabbitMQSink)` equals the `9d70f782` signature plus a keyword-only `confirm`
+- [ ] `inspect.signature(RabbitMQSink)` equals the `97a03f45` signature plus a keyword-only `confirm`
       with default `False`, as the last parameter (invariant 10).
 - [ ] **Owed until a green run:** in `integration.yml`, against its real broker, a `confirm=True`
       sink delivers a batch, and a publish with `mandatory` to a routing key no queue is bound to is
@@ -486,7 +507,7 @@ baseline.
       `ACCEPTED`, in an export of the branch head, `SyslogSink[tcp]-peer-closed` and
       `LogstashSink[tcp]-peer-closed` read `silent-loss` again. The corpus's fake socket cannot be
       polled, so its check answers `"open"` and the corpus reaches only that rule. The two checks are
-      held by FR-001's socketpair and half-close criteria (invariant 2).
+      held by `tests/test_socket_close_corpus.py` (FR-001) (invariant 2).
 - [ ] With the liveness probe removed, `RabbitMQSink[confirmed]-peer-closed` reads
       `ambiguous-when-knowable`. With `confirm_delivery` never called, `RabbitMQSink[confirmed]` reads
       `duplicate` and `RabbitMQSink[confirmed-borrowed]` reads `lost-but-held` on
@@ -516,14 +537,15 @@ that text.
   - The finding-5 item gains one sentence: a `confirm=True` `RabbitMQSink` publish whose confirm was
     lost is `UNKNOWN` and is not resent, and the default keeps the resend.
 - **§13 gains four bullets.**
-  - "**A TCP frame the kernel took is unconfirmed until the transport's next check.**" A peer whose
-    reset arrives after the end-of-round check, or that closes with only a FIN, loses those frames
-    while they read as delivered.
+  - "**A reset that lands after the end-of-round check leaves that round's frames reported
+    delivered.**" It is the one row of `spec093_close_corpus.py` no rule can see, on Linux and on
+    macOS, and the next round's check replaces the connection.
   - "**A FIN alone is not read as a loss, because it is also a legal half-close.**" The bullet
     carries the reproduction (`halfclose.py`, all 60 frames received with `failed=60` under a
-    FIN-counting check) and the reason. A false count is the safe direction for a may-have-landed
-    line, but a half-closing collector would see one on every batch, and a reset is what proves the
-    peer discarded data.
+    FIN-counting check) and the corpus's two rows in which every frame arrived after a FIN. A false
+    count is the safe direction for a may-have-landed line, but a half-closing collector would see
+    one on every batch. A pending socket error, read through `SO_ERROR`, is what shows the peer
+    discarded data.
   - "**A confirmed `RabbitMQSink` publish costs a broker round trip.**" The bullet carries the
     measured figures at 0.2, 1 and 5 ms, and says that at 5 ms one 1,000-event batch outlasts
     `flush()`'s 5 s default.
@@ -565,7 +587,8 @@ that text.
   words it.
   - **The file's title and opening paragraphs are rewritten**, so that no sentence there becomes
     false. Today's title is about the file and stream sinks only, and the opener says "No constructor
-    signature or default changed", which `RabbitMQSink(confirm=)` makes false. The file keeps its
+    signature or default changed", which `RabbitMQSink(confirm=)` makes false. So does the same
+    sentence under *What did not change* (`v1.2.1.md:240` at `97a03f45`), which is rewritten too. The file keeps its
     name. Whether the release is 1.2.1 or 1.3.0 is chosen when it is tagged, since a new keyword
     argument is additive. The opener says so, and no sentence depends on the number.
   - The entry lists:
@@ -676,14 +699,14 @@ docs/                 # FR-006
 ## Evidence
 
 The prototype is `docs/audits/2026-11-14-probes/sinks/spec093_prototype.patch`. It applies with
-`patch -p1` to `git archive 9d70f782 src tests docs/audits/2026-11-14-probes`, and it carries this
+`patch -p1` to `git archive 97a03f45 src tests docs/audits/2026-11-14-probes`, and it carries this
 spec's `src/` change and SPEC-092's prototype corpus edited as FR-005 says. SPEC-092 is not built, so
 its prototype (`spec092_run.py`) stands in for its corpus. The corpus's `ledger` check does not run,
 and the build re-measures against the delivered corpus. Numbers were taken on macOS with Python 3.13.1
-and no extra installed, at `9d70f782` unless they say otherwise. Other sessions shared the machine,
+and no extra installed, at `97a03f45` unless they say otherwise. Other sessions shared the machine,
 and the one-minute load is given where it was read.
 
-**The rows.** Against the prototype corpus at `9d70f782`, `src/` unchanged, 256 rows read 170 green
+**The rows.** Against the prototype corpus at `97a03f45`, `src/` unchanged, 256 rows read 170 green
 and 86 red, which is SPEC-092's record. With this patch alone applied, and no SPEC-094 change, 268 rows
 read 191 green and 77 red. That is the same in three runs on Python 3.13.1 and one on Python 3.12.12,
 each exiting 0, and from the committed patch applied to a fresh export. Exactly these ten rows move,
@@ -695,7 +718,7 @@ each from `silent-loss` to green:
 - `SentrySink[sdk]-never-acknowledged`.
 
 The twelve new rows read green, except `RabbitMQSink[confirmed-borrowed]-peer-closed`, which reads
-`ambiguous-when-knowable`. The default `RabbitMQSink` rows read as at `9d70f782`. During authoring the
+`ambiguous-when-knowable`. The default `RabbitMQSink` rows read as at `97a03f45`. During authoring the
 changes were also measured one at a time, each on top of the ones before it, and each step moved only
 the rows of the sinks it changed. The socket change alone moved exactly the two TCP rows.
 
@@ -703,20 +726,23 @@ the rows of the sinks it changed. The socket change alone moved exactly the two 
 
 - With FR-001's second rule removed, both TCP `peer-closed` rows read `silent-loss`.
 - With the end-of-round check counting a FIN as well as a reset, `halfclose.py` read `failed=60` for
-  60 frames that all arrived. With it counting only a reset, it read `failed=0`. At `9d70f782`,
-  `src/` unchanged, it read `failed=0`.
+  60 frames that all arrived. With the rule as specified, it read `failed=0` in Docker
+  `python:3.12-slim` and on macOS. At `97a03f45`, `src/` unchanged, it read `failed=0`.
+- With `_peer_state` reading no `SO_ERROR`, the reviewer's `fin_then_rst.py` read `fin` after the
+  FIN and the RST on Linux. With it, `reset` on Linux and on macOS.
 - With the liveness probe removed, `RabbitMQSink[confirmed]-peer-closed` read
   `ambiguous-when-knowable`.
 - With `confirm_delivery` never called, `RabbitMQSink[confirmed]-taken-then-raised` read `duplicate`,
   `RabbitMQSink[confirmed-borrowed]-taken-then-raised` read `lost-but-held`, and
   `RabbitMQSink[confirmed-borrowed]-peer-closed` read `silent-loss`.
 
-**The suite.** The full suite was run against the prototype in a scratch export with no `docs/`. 43
-tests fail there with or without the prototype, because they read files the export lacks. The
-prototype fails 25 more. They are the same 25 at `33582484`, at `bb6656ff` and, after this spec's
-revision, at `9d70f782`, so the revision's changes (the opt-in default, the probe, the reset-only end
-check, the mixed Sentry batch and the line's new ending) fail no test the earlier draft did not. Each
-is accounted for:
+**The suite.** The full suite was run against the prototype in a scratch export with no `docs/`.
+Some tests fail there with or without the prototype, because they read files the export lacks: 43
+at `9d70f782` and 50 at `97a03f45`. The prototype fails 25 more. They are the same 25 at
+`33582484`, at `bb6656ff`, at `9d70f782` after the first revision, and at `97a03f45` after the
+second, so neither revision's changes fail a test the first draft did not: not the opt-in default,
+the probe, the `SO_ERROR` close rule, the mixed Sentry batch or the line's new ending. Each is
+accounted for:
 
 - FR-002, 5: `test_sentry_backend.py::test_a_usable_client_is_preferred_over_the_fallback`,
   `::test_the_default_prefers_a_usable_sdk`, `test_sink_losses.py::test_sentry_transport_errors_are_isolated_per_event`
@@ -754,10 +780,30 @@ failed 4 more: the `[errors-false]`, `[errors-null]` and `[errors-zero]` rows of
 `test_sink_concurrency.py::test_elasticsearch_dropped_unadjudicated_is_counted_under_the_lock`. So
 FR-003 takes only the object with neither key.
 
-**The socket options.** `spec093_socket_options.py 5` was run once, at a one-minute load near 100. The
-table gives silent loss out of the second batch, meaning frames reported accepted that the listener
-did not receive, over the five runs. The bracketed figures are frames counted as may-have-landed that
-did arrive.
+**The close corpus.** `spec093_close_corpus.py 5` ran each scenario five times per rule, on macOS
+(Python 3.13.1) and in Docker `python:3.12-slim` (Linux 6.12, Python 3.12.16). Each cell gives the
+verdict that matched the truth in how many of the five runs.
+
+| Scenario | true outcome | FIN rule, macOS / Linux | peek-only rule, macOS / Linux | `SO_ERROR` rule, macOS / Linux |
+|---|---|---|---|---|
+| clean | all received | 5/5, 5/5 | 5/5, 5/5 | 5/5, 5/5 |
+| half-close, reads everything | all received | 0/5, 0/5 (counted) | 5/5, 5/5 | 5/5, 5/5 |
+| FIN, then the RST a later frame draws | the frame lost | 5/5, 5/5 | 5/5, **0/5 (silent)** | 5/5, 5/5 |
+| RST with no FIN, frames unread | all lost | 5/5, 5/5 | 5/5, 5/5 | 5/5, 5/5 |
+| FIN only, after reading everything | all received | 0/5, 0/5 (counted) | 5/5, 5/5 | 5/5, 5/5 |
+| a reset after the end check (unknowable) | all lost | silent, as expected | silent | silent |
+
+The first draft of the corpus raced its own peer on the RST rows (the peer's reader could take the
+frames before the reset); a settle before the writes fixed it, and the table is from the fixed run.
+`so_error_after_fin_rst.py`, the reviewer's probe, read `SO_ERROR` 54 (`ECONNRESET`) on macOS and 32
+(`EPIPE`) on Linux after a FIN and the RST it drew, and 0 after a half-close, with the peek reading
+an empty FIN in each.
+
+**The socket options.** `spec093_socket_options.py 5`, run once at a one-minute load near 100 on
+macOS, gives silent loss out of the second batch, meaning frames reported accepted that the listener
+did not receive, over five runs. The bracketed figure is frames counted as may-have-landed that did
+arrive. Its last column, an end check that reads only a reset, is the peek-only rule that the corpus
+shows wrong on Linux; the specified rule replaces it.
 
 | Scenario | today | check per round | check per frame | unknown on a raise | round + raise | round + raise + end | round + raise + end on reset |
 |---|---|---|---|---|---|---|---|
@@ -767,13 +813,12 @@ did arrive.
 | peer closes after 2 of 3, 1 ms between frames | 1 | 1 | 0 | 1 | 1 | 0 | 0 |
 | peer half-closes and keeps reading | 0 | 0 | 0 | 0 | 0 | 0 (50 counted) | 0 |
 
-Earlier sessions of the probe, at three and five runs and lower loads, read 1 to 49 for *today* and
-0 for *round + raise + end* in every scenario; the half-close row and the last column are new in this
-session. The cost lines, three runs at a load near 21: `select.select` 0.41 to 0.59 µs per check, a
-fresh `select.poll` object 21 to 41 µs, `sendall` of a 156-byte frame 4.1 to 9.8 µs, and
+The cost lines, three runs at a load near 21: `select.select` 0.41 to 0.59 µs per check, a fresh
+`select.poll` object 21 to 41 µs, `sendall` of a 156-byte frame 4.1 to 9.8 µs, and
 `recv(MSG_PEEK | MSG_DONTWAIT)` on an idle socket with a 1.0 s timeout raised `TimeoutError` after
 1.00 s each time. `probe_socket.py` against the prototype read `batch2 received=50/50`, `failed=0` and
-no line for both sinks under FIN and RST, in three runs out of three.
+no line for both sinks under FIN and RST, in Docker `python:3.12-slim` and on macOS. At `97a03f45`
+it read 49 of 50 with `failed=0` in Docker.
 
 **The reply probes.** These were measured against the prototype, and the `33582484` figures are in
 each FR's Description. `probe_sqs.py` read G1 `failed=6`, two lines, `uncounted_missing=0`, and G2
@@ -786,7 +831,7 @@ channel that sleeps one round trip per confirmed publish, at a load near 21:
 
 | Round trip | batch 10 | batch 100 | batch 1,000 |
 |---|---|---|---|
-| none (`9d70f782`) | 0.05 to 0.09 ms | 0.24 to 0.53 ms | 2.3 to 14.3 ms |
+| none (`9d70f782`, before SPEC-088 landed) | 0.05 to 0.09 ms | 0.24 to 0.53 ms | 2.3 to 14.3 ms |
 | 0.2 ms | 2.7 ms | 25.1 ms | 250 ms |
 | 1.0 ms | 11.7 ms | 112 ms | 1,125 ms |
 | 5.0 ms | 52.7 ms | 551 ms | 5,420 ms |
@@ -797,10 +842,8 @@ alone. SPEC-090's batches of up to 1,000 events pay the last column.
 **What the prototype could not settle.** The real broker's confirm and return behaviour, which the
 integration run owes (FR-004). What a real proxy or emulator returns for SQS, SNS, Kinesis or `_bulk`,
 and whether a real SNS reply can omit `Successful`, which the `Failed`-only reading would then read as
-1.x did. Whether the check sees a FIN and a reset the same way on Linux and Windows as on macOS, where
-it was measured: CI runs on Ubuntu only (§12, finding 23), and FR-001's socketpair tests are what it
-runs. And how often a real network delivers a reset after the end-of-round check, which loopback
-cannot show.
+1.x did. Windows, where the corpus was not run. And how often a real network delivers a reset after
+the end-of-round check, which loopback cannot show.
 
 ## Revision history
 
@@ -844,3 +887,17 @@ cannot show.
       misuse.
     - The unread-reply line carries decision A's ending.
     - A `confirm_delivery()` that raises no longer leaks its channel.
+- Revised again on 2026-11-16, after SPEC-094's review found the second close rule wrong on Linux.
+  - **The method changed, not only the rule.** The FIN rule had produced false loss on a
+    half-close, and the peek-only rule produced silent loss on Linux, where a FIN followed by the RST
+    our later frame draws still peeks as a FIN. FR-001's rule now comes from a committed scenario
+    corpus, `spec093_close_corpus.py`, run in Docker `python:3.12-slim` and on macOS over six
+    scenarios, including the ones that must stay silent. Of the three rules it measures, only the one
+    that reads `SO_ERROR` before the peek is right on every row on both platforms, and FR-001's
+    criteria now assert each row's verdict on Linux in CI.
+  - §13 keeps one TCP window, a reset that lands after the end-of-round check, which is the corpus's
+    one unknowable row on both platforms. The earlier bullet's claim that a FIN-only close after
+    reading loses frames is withdrawn, because the corpus shows those frames received.
+  - The base moved to `97a03f45`, where SPEC-088 landed. No line this spec cites moved, the corpus
+    totals did not move, and the release-notes sentence FR-006 must rewrite now also stands under
+    *What did not change*.

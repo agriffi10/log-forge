@@ -92,8 +92,11 @@ and the determinism runs were repeated on Python 3.12.12.
 - **B, finding 12.** Asked whether a client-buffered sink's verdict may come
   before the client's report, he answered **"Wait for the report (Recommended)"**: each batch's
   `emit` waits for the client's delivery reports within the sink's existing timeout, as core NATS
-  confirms, so a truthy `flush()` means the broker acknowledged. SPEC-094 builds it; here the
-  corpus requires it, and the rows flip when it lands.
+  confirms, ~~so a truthy `flush()` means the broker acknowledged~~. *Superseded on 2026-11-16:*
+  Andrew answered "Truthy, counted (Recommended)", so a truthy `flush()` means every event was
+  acknowledged or counted; an indefinite report is counted `UNKNOWN` and leaves it truthy, and a
+  definite rejection makes it falsy (SPEC-094). SPEC-094 builds it; here the corpus requires it,
+  and the rows flip when it lands.
 
 ### FR-001: Every shipped sink declares one acknowledgement class per constructor variant, as data
 
@@ -201,7 +204,7 @@ from a patched `model.new_log_id`, so the backend counts by identity, never by p
 | `reply-lost` | the first call takes everything, then raises a transient error (for `transactional`, the commit is applied and the connection then drops) |
 | `peer-closed` | a clean first batch; the peer then closes, the second batch's first three writes return having reached nobody, the fourth raises, and a new connection takes the rest (`udp`: no listener, nothing taken, nothing raised) |
 | `no-verdict-shape` | the first call takes its first half and replies with no verdict: `{}`, or for `MongoDBSink` a `writeErrors` that is not a list |
-| `never-acknowledged` | the client takes every event and its later report is **definitive** that each was refused: a Kafka delivery error `29` (`TOPIC_AUTHORIZATION_FAILED`), a Pub/Sub `PermissionDenied`, a Sentry `capture_event` that returns `None` |
+| `never-acknowledged` | the client takes every event and its later report is **definitive** that each was refused: a Kafka delivery error `10` (`MESSAGE_TOO_LARGE`; ~~`29`~~, superseded by SPEC-094 because an authorization error can follow an earlier attempt that wrote the message), a Pub/Sub `InvalidArgument` (~~`PermissionDenied`~~, likewise), a Sentry `capture_event` that returns `None` |
 | `report-indefinite` | the client takes every event and its report never says whether the backend kept it: a Kafka `-192` (`_MSG_TIMED_OUT`) or a Pub/Sub `DeadlineExceeded` for an event the backend holds, the Sentry SDK's transport dropping an event after `capture_event` returned its id, or a core NATS PING never answered (core NATS runs this under `never-acknowledged`) |
 | `autocommit` | each statement is durable at once, and the second raises once with a serialization failure (`40001`), which leaves the connection usable |
 | `caller-code-raises` | the wrapper's predicate or function raises for one event |
@@ -474,12 +477,16 @@ joined across its lines, because leads wrap (`architecture.md:1698`, `:1765` and
   `failed` and `dropped_unadjudicated`, announced once as one that may have landed, and never
   resent. **Closed by** SPEC-093 building that reading, which turns the
   `reply-without-verdict` rows of `tests/test_conformance.py` green."
-- §12's finding-12 item's **Closed by** is rewritten in place: the closure through the spec that
-  adds loss counts to `FlushResult` is struck through as superseded by this decision, and the new
-  text reads "**Decided by Andrew on 2026-11-15.** Asked whether the verdict may come before the
-  client's report, he answered 'Wait for the report (Recommended)': each batch's `emit` waits for
-  the client's delivery reports within the sink's existing timeout, as core NATS confirms, so a
-  truthy `flush()` means the broker acknowledged. **Closed by** SPEC-094 building that, which turns the `verdict-before-refusal` and `verdict-before-indefinite-report`
+- §12's finding-12 item's **Closed by** is rewritten in place. *Superseded on 2026-11-16, before
+  this spec was built:* ~~the closure through the spec that adds loss counts to `FlushResult` is
+  struck through as superseded by this decision, and the new text reads that a truthy `flush()`
+  means the broker acknowledged~~. The closure through the spec that adds loss counts to
+  `FlushResult` stays, and the new text reads "**Decided by Andrew on 2026-11-15 and 2026-11-16.**
+  Asked whether the verdict may come before the client's report, he answered 'Wait for the report
+  (Recommended)': each batch's `emit` waits for the client's delivery reports within the sink's
+  existing timeout, as core NATS confirms. Asked what a truthy `flush()` then means, he answered
+  'Truthy, counted (Recommended)': every event was acknowledged or counted. **Closed by** SPEC-094
+  building that, which turns the `verdict-before-refusal` and `verdict-before-indefinite-report`
   rows of `tests/test_conformance.py` green, and by a decision on whether a full client queue is
   retried."
 - §12's finding-22 item is struck through as closed by SPEC-092, with the totals above, and says
@@ -779,3 +786,10 @@ measured.
   acknowledgement-fixes spec" now names the one that does the work, and the example in FR-001 names
   `RabbitMQSink`'s opt-in confirmed variants, since Andrew chose on 2026-11-15 that confirms are off
   by default. No requirement, row or total changed.
+- Edited on 2026-11-16 by SPEC-094's revision, text only. Decision B's gloss, "so a truthy `flush()`
+  means the broker acknowledged", is struck at both sites that state it, with the reading Andrew
+  gave on 2026-11-16 ("Truthy, counted (Recommended)") beside it, and the §12 text FR-004 writes no
+  longer strikes the `FlushResult` closure, which that answer keeps. The `never-acknowledged`
+  fault's Kafka and Pub/Sub examples become `10` and `InvalidArgument`, because SPEC-094 reads a
+  report as definitive only when no attempt could have written the event. No requirement, row or
+  total changed.
