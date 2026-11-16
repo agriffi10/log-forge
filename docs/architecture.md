@@ -1885,8 +1885,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   succeeded, or by the event ledger debiting each event to one term.
   → **closed by SPEC-088 FR-002 item 1.** `Worker.submit` reads the retirement count once, after a
   put that succeeded, so an overflowed submission is in `dropped` alone. At the commit that merged SPEC-088,
-  `p03_shutdown_race.py 2000` printed `submitted_after_shutdown` 10,010 and 10,044 against `queued`
-  plus `dropped` of 11,976 and 11,951.
+  `p03_shutdown_race.py 2000`, a race whose counts move from run to run, printed
+  `submitted_after_shutdown` 10,009 and 10,010 in two runs against `queued` plus `dropped` of
+  11,990 and 11,981.
 - ~~**A drain thread that dies leaves the batch it was holding in no counter**~~ (2026-11-14 audit,
   finding 7; invariant 2). `Worker._terminal_failure` sets `stopped_reason` and announces the held
   work in event-lists, not events, and moves no loss term (`worker.py:1679-1690`).
