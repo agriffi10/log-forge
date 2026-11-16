@@ -22,6 +22,7 @@ test here patches.
 from __future__ import annotations
 
 import ast
+import math
 import pathlib
 import re
 import threading
@@ -34,7 +35,9 @@ from conftest import install_worker, retire_process
 from ledger_sinks import ledger
 from log_foundry import Outcome, SinkCounters, Verdict, emit_via_deliver
 from log_foundry import worker as worker_mod
+from log_foundry.sinks.http import HTTPSink
 from log_foundry.worker import _SHUTDOWN, Worker, _FlushMarker
+from test_sinks_http import FakeResponse
 from test_worker_exit_budget import _SLACK, _lost_lines, _measured
 
 _PAUSE = 0.002
@@ -132,16 +135,20 @@ class _EngineSink:
       calls: ``deliver`` calls made.
       seconds: Seconds every later call idles.
       accepts: Whether every later call accepts its batch rather than answering RETRYABLE.
+      raises: Whether every later call raises ``ConnectionError`` instead of answering.
       accepted: Events accepted by every call.
     """
 
     max_retries = 0
 
-    def __init__(self, *, seconds: float = 0.3, accepts: bool = False) -> None:
+    def __init__(
+        self, *, seconds: float = 0.3, accepts: bool = False, raises: bool = False
+    ) -> None:
         self.log_foundry_counters = SinkCounters()
         self.calls = 0
         self.seconds = seconds
         self.accepts = accepts
+        self.raises = raises
         self.accepted = 0
         self.first_waits_on: threading.Event | None = None
 
@@ -154,6 +161,8 @@ class _EngineSink:
             self.accepted += len(batch)
             return Verdict(outcomes=(Outcome.ACCEPTED,) * len(batch))
         threading.Event().wait(self.seconds)
+        if self.raises:
+            raise ConnectionError("down")
         if self.accepts:
             self.accepted += len(batch)
             return Verdict(outcomes=(Outcome.ACCEPTED,) * len(batch))
@@ -665,6 +674,12 @@ def test_a_dead_sink_at_exit_writes_at_most_three_lines(capsys: pytest.CaptureFi
 
     The pre-stop batch and the first exit batch each write their own abandon line, and every
     later exit batch is one tally, so the lines name every event accepted and no more.
+
+    **The 198 is unchanged by an abandoned exit batch keeping the target** (diff review,
+    2026-11-16): the pre-stop batch failed on the steady drain, which resets the target to zero,
+    so every exit batch is ten spans whether or not the exit resets it again. This is the
+    residual ``architecture.md`` §12 files, a target already zero at the stop; the two tests
+    after this one cover a target at the cap.
     """
     sink = _ExitSink(fails=True)
     sink.first_fails = True
@@ -676,6 +691,79 @@ def test_a_dead_sink_at_exit_writes_at_most_three_lines(capsys: pytest.CaptureFi
     assert len(lines) <= 3, err
     assert sum(n for n, _w, _d in _lost_lines(err)) == 4_000, err
     assert "198 more exit batch(es) abandoned" in err, err
+
+
+_DEAD_BACKLOG = 2_000
+"""Spans queued at exit behind a dead sink: 4,000 events, four exit batches at the cap."""
+
+
+def _dead_exit_bound(events: int) -> int:
+    """The exit batches a dead sink may be handed: the backlog over the cap, and one carry."""
+    return math.ceil(events / worker_mod._BACKLOG_BATCH_CAP) + 1
+
+
+def test_a_dead_engine_sink_at_exit_is_handed_batches_at_the_cap(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-001 rule 4 at exit: an abandoned exit batch leaves the target as it was.
+
+    The pre-stop batch is delivered, so the target is the cap, and then every ``deliver``
+    raises. Each failed run writes the engine's own ``absorbed`` line, which the exit tallies
+    cannot aggregate, so the lines grow with the number of exit batches. Before SPEC-090 the
+    whole backlog was one call and two lines; the bound asserted here is the backlog over the
+    cap, plus one for a carry, in calls, and that plus two lines (the pre-stop path writes none,
+    the first abandoned exit batch writes the worker's line, the tally one more). Had the first
+    abandoned exit batch reset the target, the rest would go ten spans a call: about 150 calls
+    and 150 lines here (diff review, 2026-11-16).
+    """
+    sink = _EngineSink(seconds=0.0, raises=True)
+    worker = _at_exit(sink, _DEAD_BACKLOG)
+    retire_process(worker, 30.0)
+    worker._thread.join(5.0)
+    err = capsys.readouterr().err
+    bound = _dead_exit_bound(2 * _DEAD_BACKLOG)
+    assert sink.calls - 1 <= bound, f"{sink.calls - 1} deliver calls at exit, bound {bound}"
+    assert len(_LOG_LINE.findall(err)) <= bound + 2, err
+    assert worker.failed_batches == sink.calls - 1
+
+
+def test_a_refused_http_sink_at_exit_is_handed_batches_at_the_cap(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """FR-001 rule 4 at exit, through a shipped sink: a refusing ``HTTPSink`` keeps the cap.
+
+    ``HTTPSink`` writes its own line per failed request, which the exit tallies cannot
+    aggregate either. Its opener answers the pre-stop batch once the stop is claimed, so the
+    target is the cap, then refuses every request. With no retries at either level, each exit
+    batch is one request, so the opener calls and the lines are bounded as the engine twin's
+    are, where a reset target made them about 150 each.
+    """
+    calls = [0]
+    stop: list[threading.Event] = []
+
+    def opener(request: Any, timeout: float | None = None) -> FakeResponse:
+        calls[0] += 1
+        if calls[0] == 1:
+            stop[0].wait(30.0)
+            return FakeResponse(200)
+        raise ConnectionRefusedError(61, "refused")
+
+    sink = HTTPSink("http://127.0.0.1:1/x", opener=opener, max_retries=0)
+    worker = Worker(sink, batch_size=10, flush_interval=3_600.0, max_retries=0)
+    stop.append(worker._stop)
+    install_worker(worker)
+    for seq in range(10):
+        worker.submit(_span(seq))
+    _until(lambda: calls[0] == 1)
+    for seq in range(10, 10 + _DEAD_BACKLOG):
+        worker.submit(_span(seq))
+    retire_process(worker, 30.0)
+    worker._thread.join(5.0)
+    err = capsys.readouterr().err
+    bound = _dead_exit_bound(2 * _DEAD_BACKLOG)
+    assert calls[0] - 1 <= bound, f"{calls[0] - 1} requests at exit, bound {bound}"
+    assert len(_LOG_LINE.findall(err)) <= bound + 2, err
+    assert worker.failed_batches == calls[0] - 1
 
 
 def test_an_unbounded_shutdown_declines_nothing(

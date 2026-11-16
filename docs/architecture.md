@@ -1588,6 +1588,26 @@ an item leaves this list when a spec closes it, not because the arc names it.
   deadline left unattempted as `RETRYABLE`, since it never reached the driver and a resend cannot
   duplicate it, so the worker resends the tail rather than losing it. That is a change to a sink's
   verdict, which SPEC-090 left to the sinks track.
+- **A dead sink whose target is already zero at the stop is handed the exit backlog in
+  `batch_size` submissions, and its own per-batch lines are not aggregated** (SPEC-090 FR-001
+  rule 4 and FR-003; invariants 2 and 11). FR-003 aggregates the worker's abandon and decline
+  lines at exit, but not the lines a sink or the delivery engine writes per batch: `HTTPSink`'s
+  `lost 1 request(s)`, the engine's `absorbed a failure while delivering a batch`, and its line
+  for a run that settles with loss. Those follow the number of exit batches. An abandoned exit
+  batch leaves the size target as it was, so with a target at the cap the exit sends the backlog
+  in about one batch per 1,000 events; but when the target is already zero at the stop, because
+  the last steady batch failed or nothing was measured, every exit batch is `batch_size`
+  submissions. `docs/audits/2026-11-14-probes/core-pipeline/spec090_dead_http_exit.py` (a
+  refusing `HTTPSink`, 10,000 spans at exit, `max_retries=3`), on 3.13.1 and 3.12.12 alike: in
+  `zero` mode the build made 16,016 opener calls and wrote 1,004 `log-foundry:` lines with
+  `failed_batches` 1,001, where the tree before SPEC-090 (`75e7bf1e`) made 336 calls and 23 lines
+  with 2; in `cap` mode the build made 321 calls and 22 lines with 20, against 321 and 21. Every
+  event is still counted and announced; what grows is the sink's work and stderr. **Closed by**
+  one of: the exit drain reading a target of zero as the cap, since at exit nothing waits for a
+  failing sink to recover; or, after the first abandoned exit batch, declining every later one
+  unattempted, as FR-003 already does once a retry is declined, which changes what a dead sink
+  at exit is sent; or a channel through which a sink's per-batch loss line is tallied by the
+  worker at exit, which is new sink-contract surface. None is measured yet.
 - **A span's events stay on the span until it closes, so a process killed mid-handler loses the
   whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
   document states it). By the core frame's reading, only the close, or a `flush()` called on the

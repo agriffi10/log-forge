@@ -26,13 +26,19 @@ so the steady drain and the exit drain decide a batch boundary the same way, inv
   flush_interval / 2)`; the cap when `elapsed` is zero or negative (a clock that cannot see the
   emit, or one a test froze); zero, which is the count trigger's batch, after a batch counted in
   `failed_batches`, after one that held no events, after one whose emit straddled a
-  `retarget`, for a new worker and in a forked child. A batch the exit drain declines leaves it as
-  it was.
+  `retarget`, for a new worker and in a forked child. A batch the exit drain declines, or
+  abandons, leaves it as it was: at exit nothing waits for a failing sink to recover, and a reset
+  cut a dead sink's backlog into `batch_size` submissions, each paying the sink's own calls and
+  lines.
 - **The cap is 1,000 events**, the private constant `_BACKLOG_BATCH_CAP`, a ceiling except for a
   batch of at most `batch_size` submissions, which the count trigger sent before this rule too.
 
-**Why half an interval of the sink's own rate.** A per-call sink reaches the cap at once; a
-per-event sink (SQS at ten entries a request, a JetStream `NATSSink` at one ack per event) settles
+**Why half an interval of the sink's own rate.** A per-call sink's target multiplies by half an
+interval over the cost of a call with each batch, so one costing well under that reaches the cap
+at once and one costing a little under it within a few batches, while one costing more than half
+an interval never grows past the count trigger's batch (`spec090_slow_per_call.py`: at 0.3 s a
+call the batches went 20, 24, 38 and so on to 1,000 by the tenth; at 0.6 s every batch was 20);
+a per-event sink (SQS at ten entries a request, a JetStream `NATSSink` at one ack per event) settles
 near half an interval's worth, so an emit stays shorter than the time trigger's interval and a
 later event, a flush marker, a swap's fence or an exit's join waits behind it no longer than the
 interval already allowed. Prototyped at a whole interval, a sink costing 20 ms an event was handed
@@ -67,6 +73,10 @@ later batch, predicted to end past the shutdown deadline* (`docs/decisions/sink-
 
 ### 2026-11-16
 
+- **Refined** by SPEC-090's second diff review: an abandoned exit batch leaves the size target as
+  it was, as a declined one does. A refusing `HTTPSink` with 10,000 spans at exit made 15,217
+  requests and wrote 953 lines with the reset, 321 and 22 without it, against 321 and 21 before
+  SPEC-090. "A per-call sink reaches the cap at once" was narrowed to the cost at which it does.
 - **Built** by SPEC-090: `_take`, `_complete`, `_set_target`, the sink generation `retarget`
   bumps, and the exit drain sending its backlog by the same rule. Measured on the build
   (`be686953`), `p13_burst.py` drained its backlog in 0.5 s on 3.13.1 and 0.6 s on 3.12.12, no

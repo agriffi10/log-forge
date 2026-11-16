@@ -13,7 +13,10 @@
   marker only through `_answer_marker`. `_emit_pending` declines a later exit batch unattempted
   through `_decline_exit_batch`; `_write_exit_tallies` writes the declined and abandoned tallies
   from `_final_drain`'s `finally`, from `stop()`'s expiry branch before its line, and from `_run`'s
-  outer `finally`.
+  outer `finally`. An abandoned exit batch leaves the size target as it was, as a declined one
+  does, which the second diff review found: resetting it had cut a dead sink's exit backlog into
+  ten-span batches, each writing the sink's own line, 15,217 requests and 953 lines for a refusing
+  `HTTPSink` with 10,000 spans at exit, now 321 and 22, against 321 and 21 before SPEC-090.
 - **The sinks** (FR-004): `tests/test_batch_bound_roster.py` derives every public sink from the
   tree against a table of how it takes a batch, hands every `RIGS` sink and the HTTP family 1,000
   events, and runs a JetStream `NATSSink` behind a slow ack. No sink's code changed; `nats.py`'s
@@ -21,7 +24,8 @@
 - **The record** (FR-005): the decision *A backlog drains in larger batches, and capacity is not a
   setting* (`docs/decisions/pipeline/`); the exit-drain decision in `docs/decisions/sink-lifecycle/`
   rewritten in place, its file name kept; §12's findings 9 and 10 struck and the `NATSSink`
-  residual filed; the README; and `docs/release-notes/v1.2.1.md`.
+  residual filed, then a second residual, a dead sink whose target is already zero at the stop
+  (`spec090_dead_http_exit.py zero`: 16,016 requests and 1,004 lines, against 336 and 23); the README; and `docs/release-notes/v1.2.1.md`.
 
 ## Premises that had moved
 
@@ -43,9 +47,9 @@ to 36. Each pair of figures is 3.13.1, then 3.12.12.
 |---|---|---|---|
 | FR-001 AC1 | `p13_burst.py` | `{20: 1015}` and `{20: 1038}`, drained in 27.1 s and 25.8 s, `dropped` 19,850 and 19,620 | largest 1,000, drained in 0.5 s and 0.6 s, `dropped` 10,269 and 13,660 |
 | FR-001 AC2 | `spec090_burst_gated.py` | `dropped=19990`; 1,000 calls of 20, 26.91 s and 26.63 s | `dropped=19990`; 22 calls, largest 1,000, 0.52 s and 0.69 s |
-| FR-002 AC1, FR-003 AC2 | `p04_exit.py 0.02 10000` | 2 calls, largest 19,980; `close()` not run; `19980 event(s) in flight` | 60 and 61 calls, largest 234 and 200; `close()` run; one line declining 8,918 and 9,260 events, which with the 11,082 and 10,740 received make 20,000 |
-| FR-003 AC1 | `spec090_exit_budget.py` | `batched`: 1.20 s, join expired, 3 attempts, `close()` 0 times | `tree`: 1.07 s, join completed, 2 attempts, `close()` once, `failed_batches=3` |
-| FR-003 AC3 | `spec090_dead_sink_exit_lines.py` | 2 lines, 20,002 events, `failed_batches=2` | 3 lines, 20,002 events, `failed_batches=1001`, the last `999 more exit batch(es) abandoned` |
+| FR-002 AC1, FR-003 AC2 | `p04_exit.py 0.02 10000` | 2 calls, largest 19,980; `close()` not run; `19980 event(s) in flight` | ~~60 and 61 calls, largest 234 and 200; `close()` run; one line declining 8,918 and 9,260 events, which with the 11,082 and 10,740 received make 20,000~~ re-run after the second diff review's fix: 61 calls on both, largest 234 and 240; `close()` run; one line declining 6,828 and 7,040 events in 32 batches, which with the 13,172 and 12,960 received make 20,000. The fix touches no batch here, since none fails; the figures move with the machine's load |
+| FR-003 AC1 | `spec090_exit_budget.py` | `batched`: 1.20 s, join expired, 3 attempts, `close()` 0 times | `tree`: ~~1.07 s~~ 1.05 s and 1.06 s on the re-run after the second diff review's fix, join completed, 2 attempts, `close()` once, `failed_batches=3` |
+| FR-003 AC3 | `spec090_dead_sink_exit_lines.py` | 2 lines, 20,002 events, `failed_batches=2` | 3 lines, 20,002 events, `failed_batches=1001`, the last `999 more exit batch(es) abandoned`; unchanged on the re-run after the second diff review's fix, since its pre-stop batch fails and the target is already zero at the stop |
 | FR-004 AC4 | `spec090_nats_ack_backlog.py ~~0.002 200 10~~ 0.002 1000 10` | not run | ~~400 acked, `failed` 0, longest `deliver` 0.510 s and 0.505 s~~ 2,000 acked, `failed` 0, 12 calls, longest `deliver` 0.505 s and 0.513 s, re-run after the first diff review found 200 spans could not fail the criterion (the spec's revision history) |
 
 The first 3.13.1 build run of `p13` met a 2.81 s burst at a load average near 27 and left no

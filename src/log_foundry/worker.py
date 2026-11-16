@@ -1972,9 +1972,12 @@ class Worker:
         inside an emit.
 
         **The outer** ``finally`` **also writes the exit tallies** (SPEC-090 FR-003), after the
-        waiters are released so no ``flush()`` caller waits behind a stderr write. A drain that
-        dies in :meth:`_drain` after its exit batches began never reaches
-        :meth:`_final_drain`'s own ``finally``, so this is the drain thread's own end for that
+        waiters are released. ~~so no ``flush()`` caller waits behind a stderr write~~ That
+        ordering holds only for the path this copy exists for: on every normal exit
+        :meth:`_final_drain`'s own ``finally`` has already written and zeroed the tallies before
+        the waiters here are released, and this call finds nothing (diff review, 2026-11-16). A
+        drain that dies in :meth:`_drain` after its exit batches began never reaches
+        :meth:`_final_drain`'s ``finally``, so this is the drain thread's own end for that
         path; when nothing is tallied it writes nothing.
 
         Args:
@@ -2241,6 +2244,16 @@ class Worker:
         zero, which rule 4 names, before the exit budget below is asked anything: it is no
         attempt, and declining it would count a failed batch of nothing.
 
+        **An abandoned exit batch leaves the target as it was** (SPEC-090 FR-001 rule 4, diff
+        review, 2026-11-16), as a declined one does. On the steady drain a failure resets the
+        target so a failing sink is retried with small batches while it may recover; at exit
+        nothing waits for it to recover, and resetting there cut the rest of a dead sink's
+        backlog into ``batch_size`` submissions each. Every such batch costs the sink's own
+        calls and lines, which the exit tallies cannot aggregate: the engine's per-run line and
+        a sink's own per-batch line, such as ``HTTPSink``'s. Measured with a refusing
+        ``HTTPSink`` and 10,000 spans at exit: 15,217 opener calls and 953 lines with the
+        reset, 321 calls and 22 lines without it, against 321 and 21 before SPEC-090.
+
         **An exit batch is declined unattempted when it is predicted to overrun** (FR-003). An
         exit batch is one whose first attempt begins after :meth:`claim_stop` set ``_stopped``,
         read without the lock as ``_exit_deadline`` is. The first exit batch's first attempt is
@@ -2293,7 +2306,10 @@ class Worker:
         elapsed = time.monotonic() - started
         pending.clear()
         self._pending_events = 0
-        self._set_target(size, elapsed, failed=self.failed_batches != before, generation=generation)
+        failed = self.failed_batches != before
+        if exit_batch and failed:
+            return
+        self._set_target(size, elapsed, failed=failed, generation=generation)
 
     def _size_target(self) -> float:
         """The size target a batch reads now, in events (SPEC-090 FR-001 rule 4).
@@ -2384,8 +2400,10 @@ class Worker:
 
         Zero when the batch was counted in ``failed_batches``, when the sink generation moved
         while it was emitted, or when it held no events: the next batch is then the count
-        trigger's. The cap when ``elapsed`` is zero or negative: an emit the clock cannot see
-        took less than its resolution, which is the limit of an unbounded rate, and the cap is
+        trigger's. An exit batch counted in ``failed_batches`` never reaches here:
+        :meth:`_emit_pending` leaves the target as it was, as for a declined one. The cap when
+        ``elapsed`` is zero or negative: an emit the clock cannot see took less than its
+        resolution, which is the limit of an unbounded rate, and the cap is
         what bounds that limit; keeping the previous target instead would let a frozen clock pin
         whatever it last measured, and dividing by zero on this thread would end it. Otherwise
         ``min(cap, events / elapsed * flush_interval / 2)``: half an interval of the sink's own
@@ -2810,9 +2828,14 @@ class Worker:
         :meth:`_emit_pending` says. The first abandoned exit batch writes the abandon line as
         any batch does; every later one is added to the abandon tally under the lock, beside
         ``failed_batches``, and announced by :meth:`_write_exit_tallies`, so a dead sink at exit
-        writes two lines where a line per batch would write a thousand. On every route that can
-        tally, :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a
-        tally it took has already left ``_in_flight``.
+        writes two of the worker's lines where a line per batch would write a thousand. The
+        tallies do not reach a line the engine or the sink itself writes per batch, the engine's
+        ``absorbed`` line or ``HTTPSink``'s ``lost 1 request(s)``: those follow the number of exit
+        batches, which :meth:`_emit_pending` keeps near one per ``_BACKLOG_BATCH_CAP`` events by
+        leaving the target as it was after an abandoned exit batch, except when the target was
+        already zero at the stop (``architecture.md`` §12). On every route that can tally,
+        :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a tally it
+        took has already left ``_in_flight``.
 
         ~~``_in_flight`` holds the batch size from before the first attempt until this method
         returns by any route~~ — superseded by SPEC-088: ``_in_flight`` already holds the batch,

@@ -114,8 +114,9 @@ and 17,861 to 19,860 of 30,000 submissions dropped, the most when the burst was 
    600-event span, is sent as 998 events and then a batch that begins with the 600.
 4. **The size target** is set after each batch the drain emits, from that batch alone, and read
    by the next:
-   - `0` when that batch was counted in `failed_batches`, when the sink generation (rule 5)
-     changed while it was being emitted, or when it held no events;
+   - `0` when that batch was counted in `failed_batches` and was not an exit batch (FR-003),
+     when the sink generation (rule 5) changed while it was being emitted, or when it held no
+     events;
    - the cap when its elapsed time was zero or negative;
    - otherwise `min(1_000, events / elapsed × flush_interval / 2)`.
 
@@ -123,7 +124,11 @@ and 17,861 to 19,860 of 30,000 submissions dropped, the most when the burst was 
    retries and the engine's waits lower the rate. `T` is `0`, which is today's batch, for a new
    worker, for a forked child (rule 6) and while the sink generation differs from the one `T` was
    measured under. A batch the exit drain declines without an attempt (FR-003) was not emitted
-   and leaves `T` as it was.
+   and leaves `T` as it was, and **an exit batch counted in `failed_batches` leaves `T` as it
+   was too** (added 2026-11-16): on the steady drain a failure resets `T` so a failing sink is
+   retried with small batches while it may recover, but at exit nothing waits for it, and a
+   reset cut a dead sink's backlog into `batch_size` submissions each, every one paying the
+   sink's own calls and lines.
 5. **The sink generation.** `_sink_generation` is an `int` that `retarget` increments where it
    reassigns `self.sink` (`worker.py:1123`), under `Worker._lock`. `_emit` reads `self.sink` for
    the engine (`worker.py:1934`) and again on every 1.x attempt (`worker.py:1960`), so a batch can
@@ -146,7 +151,12 @@ and 17,861 to 19,860 of 30,000 submissions dropped, the most when the burst was 
 time trigger's interval, so the wait a later event, a flush marker, a swap's fence or an exit's
 join sees behind a batch in flight stays within what the time trigger already allows. And it stops
 growth where growth stops paying: a sink whose cost is per call (`p13`'s, or the HTTP family up to
-its request size) reaches the cap at once, while one whose cost is per event (SQS at ten entries a
+its request size) ~~reaches the cap at once~~ multiplies its target by half an interval over the
+cost of a call with each batch, so one costing well under that, as `p13`'s 20 ms does, reaches
+the cap at once, and one costing more than half an interval never grows past the count trigger's
+batch (`spec090_slow_per_call.py`: at 0.3 s a call the batches climbed from 20 to 1,000 events
+over ten batches, at 0.6 s every batch was 20; added 2026-11-16), while one whose cost is per
+event (SQS at ten entries a
 request, `NATSSink` through JetStream at one ack per event) settles near half an interval's worth,
 because a bigger batch only makes its call longer. **Half, not a whole interval**, because the time
 trigger's clock is read before the emit (`worker.py:1740-1743`): with a whole interval an emit
@@ -379,6 +389,16 @@ raises at once costs about 1,000 abandon lines for a full queue, where today it 
 So a dead sink at exit writes two lines where a per-batch drain would write about a thousand, and
 the declined batches of `p04` are one line. A retry declined inside an exit batch still writes
 SPEC-062's line, once, since every batch after it is declined.
+
+**What the tallies do not reach** (added 2026-11-16). They aggregate the worker's own abandon and
+decline lines. A sink's own per-batch line (`HTTPSink`'s `lost 1 request(s)`) and the delivery
+engine's (`absorbed a failure while delivering a batch`, and its line for a run that settles with
+loss) are written once per exit batch, so they are bounded by the number of exit batches, which an
+abandoned exit batch leaving the target as it was (FR-001 rule 4) keeps near one per 1,000
+events: a refusing `HTTPSink` with 10,000 spans at exit made 321 requests and wrote 22 lines,
+against 321 and 21 before this spec. When the target is already `0` at the stop, every exit batch
+is `batch_size` submissions and those lines are one per batch; that residual is filed in
+`docs/architecture.md` §12 with its measurement and its closures.
 
 #### Acceptance Criteria:
 
@@ -803,6 +823,21 @@ kept, and the build's own run is the one that counts.
 
 ## Revision history
 
+- **2026-11-16, after the second diff review: an abandoned exit batch leaves the target as it
+  was.** FR-001 rule 4 reset the target to `0` after any failed batch, the exit drain's included,
+  so after the first abandoned exit batch a dead sink was handed the rest of the backlog in
+  `batch_size` submissions, and every one wrote the sink's or the engine's own line, which FR-003's
+  tallies do not aggregate. The review measured a refusing `HTTPSink` with 10,000 spans at exit:
+  15,217 requests and 953 lines on the build, 321 and 21 before this spec. Rule 4 now leaves the
+  target as it was after an abandoned exit batch, as after a declined one, and the steady drain is
+  unchanged: 321 requests and 22 lines. FR-003 now says its aggregation covers the worker's lines,
+  and that a sink's and the engine's per-batch lines are bounded by the number of exit batches,
+  which the unchanged target keeps near the old tree's. The case where the target is already `0`
+  at the stop is filed in `docs/architecture.md` §12. FR-001's "a sink whose cost is per call
+  reaches the cap at once" is narrowed: the target grows by half an interval over the cost per
+  batch, so a per-call sink costing more than half an interval never grows past the count
+  trigger's batch. Both probes, `spec090_dead_http_exit.py` and `spec090_slow_per_call.py`, are
+  committed beside the others.
 - **2026-11-16, after the first diff review: two criteria's 200 spans could not fail.** FR-001's
   sixth criterion and FR-004's fourth sent 200 spans, 400 events at 2 ms each, which is 0.8 s of
   sink time in all, so no call could last a second, and a fixed cap with no measured target
