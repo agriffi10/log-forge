@@ -1500,14 +1500,17 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 94, "log_foundry.decorator": 4}
+_SITE_FLOOR = {"log_foundry._lifecycle": 96, "log_foundry.decorator": 4}
 """The floor each walked module must still meet, by name.
 
-**Raised from 92 to 94 at SPEC-088, to the count measured.** `_per_module_sites()` read 94 for
-`_lifecycle` on `main` at `9d05e793`, the two sites added by the specs since the last raise having
-left the floor behind, and SPEC-088 adds none: the ledger's reading lives in `worker.py`, which
-the roster does not walk, and `_lifecycle._ledger_reading` hands `_state.worker_exists()` to it
-without asking a question of it. `decorator` stays at 4.
+**Raised from 92 to 96 at SPEC-088, to the count measured on its branch.** `_per_module_sites()`
+read 94 for `_lifecycle` at `9d05e793`, the two sites added by the specs since the last raise
+having left the floor at 92, and SPEC-088 adds two, both `EXISTENCE` rows above: the event
+ledger's reading in `_worker_health` (`_ledger_reading().ledger`) and in `_check_ledger`
+(`_ledger_reading().ledger.unaccounted`). The reading itself lives in `worker.py`, which the roster
+does not walk, and `_lifecycle._ledger_reading` hands `_state.worker_exists()` to it without asking
+a question of it. ~~SPEC-088 adds none~~ — struck: the first version of this note said so, read
+from that last fact while the two callers' sites were already filed. `decorator` stays at 4.
 
 **Raised to the derived counts by the fix after SPEC-079 for a late build's signal, 60 -> 92 and
 2 -> 4.** Measured with this file's `_sites`, diffing the site list of `_lifecycle.py` at

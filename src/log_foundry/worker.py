@@ -209,7 +209,7 @@ class _CountingQueue(queue.Queue[object]):
 
     ``_put`` runs under the mutex ``put`` and ``put_nowait`` already hold, so the count is exact
     and :meth:`Worker.submit` writes no counter of its own on the accept path. Flush markers and
-    the shutdown sentinel are not lists and count nothing.
+    the shutdown sentinel are not submissions and count nothing.
 
     Attributes:
       entered: Events of the submissions this queue has taken in.
@@ -233,11 +233,22 @@ class _CountingQueue(queue.Queue[object]):
     def _put(self, item: object) -> None:
         """Counts a submission's events, then queues it.
 
+        **A submission is classified as the drain classifies it**: anything that is neither the
+        shutdown sentinel, by identity, nor a flush marker, by its exact type, which
+        :meth:`Worker._final_drain` and :meth:`Worker._drain` then take and count through
+        :meth:`Worker._hold`. So the taken-in count and the taking count agree by construction,
+        and the test reads the item's real type, never a class hook the item could answer with.
+        ~~``isinstance(item, list)``~~ — replaced after the rebase onto ``bb6656ff``, whose
+        ``tests/test_class_check_roster.py`` refuses an ``isinstance`` that runs a value's class
+        hook; it also asked a different question from the drain's. ``_FlushMarker`` has no
+        subclass, so the exact type and the drain's ``_diag.is_a`` agree, and no call is added.
+
         It appends to ``self.queue`` itself rather than calling ``super()._put``, which is that one
         append: the zero-argument ``super()`` lookup cost more than the count, and measured, the
-        counting put cost 48 to 55 ns over a plain one with it, against FR-005's bound of 50.
-        The deque is the attribute :meth:`Worker._queued_submissions` already reads
-        (``architecture.md`` §13 records the reliance).
+        counting put cost 48 to 55 ns over a plain one with it, against FR-005's bound of 50, and
+        measures 31.2 ns (3.13.1) and 26.9 ns (3.12.12) with the classification above. The deque
+        is the attribute :meth:`Worker._queued_submissions` already reads (``architecture.md`` §13
+        records the reliance).
 
         Args:
           item: A submission, a flush marker or the shutdown sentinel.
@@ -248,8 +259,8 @@ class _CountingQueue(queue.Queue[object]):
         Raises:
           None.
         """
-        if isinstance(item, list):
-            self.entered += len(item)
+        if item is not _SHUTDOWN and type(item) is not _FlushMarker:
+            self.entered += len(item)  # type: ignore[arg-type]
         self.queue.append(item)
 
 
