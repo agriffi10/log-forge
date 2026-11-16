@@ -93,8 +93,8 @@ SPEC-094 are reviewed but not yet on `main`:
 
 - **`main`**: SPEC-092's corpus as on `main`. 256 rows: 74 pinned under twelve pins, 12 departure
   rows under seven departures, and 170 that must pass.
-- **After SPEC-094**: SPEC-093's and SPEC-094's prototype patches applied, from the branch
-  `docs/spec-093-acknowledgement-fixes`. 268 rows: 58 pinned under five pins, 15 departure rows
+- **After SPEC-094**: SPEC-093's and SPEC-094's prototype patches applied (`sinks/spec093_prototype.patch`
+  and `sinks/spec094_prototype.patch`). 268 rows: 58 pinned under five pins, 15 departure rows
   under nine departures, and 195 that must pass.
 
 The build uses whichever base is on `main` when it starts. *Evidence* shows that this spec moves

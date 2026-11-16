@@ -54,8 +54,8 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   `sinks/spec095_prototype.patch` and `sinks/spec095_prototype_after_094.patch` are not probes:
   they are SPEC-095's prototype, the first applied with `patch -p1` to `git archive 97a03f45 src
   tests docs/audits/2026-11-14-probes`, the second to that tree after SPEC-093's and SPEC-094's
-  prototype patches from the branch `docs/spec-093-acknowledgement-fixes`. SPEC-095's *Evidence*
-  section says what each measured.
+  prototype patches, `sinks/spec093_prototype.patch` and `sinks/spec094_prototype.patch`.
+  SPEC-095's *Evidence* section says what each measured.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded
