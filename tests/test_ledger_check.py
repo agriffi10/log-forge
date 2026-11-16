@@ -7,6 +7,7 @@ after it reads a balanced process.
 """
 
 import ast
+import collections
 import os
 import pathlib
 import subprocess
@@ -304,6 +305,112 @@ def test_a_parked_drain_is_read_once_though_it_would_correct_itself(monkeypatch)
         worker.stop(5)
     assert found == ["a worker's queued+stranded reads 2 with 0 events in its queue"], found
     assert len(readings) == 1, readings
+
+
+def test_the_terms_are_read_under_the_queues_mutex(monkeypatch) -> None:
+    """A drain notified at teardown, as on `main` at `97a03f45`, reads balanced (frame 2's M11).
+
+    The test holds the mutex, queues a submission and notifies the parked drain, which cannot take
+    it until the test lets go. Read under the mutex, the terms wait for it too, and whichever of
+    the reading and the drain takes the mutex first, the reading is consistent or re-read. A
+    reading whose terms were taken before the mutex would see ``taken`` from before the take: the
+    wrapped `_drain_terms` then holds those stale terms until the drain has taken, held, emitted
+    and parked again, so the reading finds a parked drain and judges the stale terms at once. The
+    wrapper waits only when it runs before the test has let go, which a mutex-scoped read never
+    does, so the correct path costs the bounded wait for a read that never comes.
+    """
+    worker = _parked_worker()
+    q = worker._queue
+    real_terms = worker._drain_terms
+    released, read_early = threading.Event(), threading.Event()
+
+    def terms():  # type: ignore[no-untyped-def]
+        got = real_terms()
+        if not released.is_set():
+            read_early.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with q.mutex:
+                    if worker._delivered == 2 and q.not_empty._waiters:
+                        break
+                time.sleep(0.001)
+        return got
+
+    monkeypatch.setattr(worker, "_drain_terms", terms)
+    got: list[list[str]] = []
+    reader = threading.Thread(target=lambda: got.append(ledger_check.worker_problems(worker)))
+    with q.mutex:
+        q._put([{"message": "one"}, {"message": "two"}])
+        q.unfinished_tasks += 1
+        q.not_empty.notify()
+        reader.start()
+        read_early.wait(0.5)
+        released.set()
+    reader.join(10)
+    worker.stop(5)
+    assert not reader.is_alive(), "the reading outlived its bound"
+    assert got == [[]], f"the reading judged terms taken outside the mutex: {got}"
+
+
+class _PausingWaiters(collections.deque):  # type: ignore[type-arg]
+    """A condition's waiter deque whose truth, asked once by one thread off the mutex, pauses."""
+
+    def __init__(self, items, mutex, asked, go) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(items)
+        self.mutex, self.asked, self.go = mutex, asked, go
+        self.reader: threading.Thread | None = None
+
+    def __bool__(self) -> bool:
+        answer = len(self) > 0
+        if threading.current_thread() is self.reader and not self.asked.is_set():
+            self.asked.set()
+            if not self.mutex.locked():
+                self.go.wait(5)
+        return answer
+
+
+def test_parked_is_read_under_the_queues_mutex(monkeypatch) -> None:
+    """A drain woken between ``parked`` and the terms is not judged as parked (frame 2's M9).
+
+    The waiter deque's truth is asked once by the reader. Asked under the mutex, as it must be,
+    it answers at once and the reading is the parked drain at rest, balanced. Asked before the
+    mutex, it pauses after answering "parked" while the test submits: the drain wakes, takes the
+    submission and is held in `_hold`, so the reading would judge the take-to-`_hold` window, the
+    CI shape, as a drain at rest. Nothing here races: the pause is entered only off the mutex,
+    and the test moves on each step's event.
+    """
+    worker = _parked_worker()
+    q = worker._queue
+    asked, go, paused, release = (threading.Event() for _ in range(4))
+    real_hold = worker_mod.Worker._hold
+
+    def hold(self, events) -> None:  # type: ignore[no-untyped-def]
+        paused.set()
+        release.wait(10)
+        real_hold(self, events)
+
+    monkeypatch.setattr(worker_mod.Worker, "_hold", hold)
+    with q.mutex:
+        waiters = _PausingWaiters(q.not_empty._waiters, q.mutex, asked, go)
+        q.not_empty._waiters = waiters
+    got: list[list[str]] = []
+    reader = threading.Thread(target=lambda: got.append(ledger_check.worker_problems(worker)))
+    waiters.reader = reader
+    try:
+        reader.start()
+        assert asked.wait(5)
+        worker.submit([{"message": "one"}, {"message": "two"}])
+        assert paused.wait(5)
+        go.set()
+        reader.join(10)
+    finally:
+        go.set()
+        release.set()
+        worker.stop(5)
+        with q.mutex:
+            q.not_empty._waiters = collections.deque(q.not_empty._waiters)
+    assert not reader.is_alive(), "the reading outlived its bound"
+    assert got == [[]], f"a drain woken before the mutex was judged as parked: {got}"
 
 
 def test_one_settle_bound_is_shared_by_every_worker_a_teardown_reads(monkeypatch) -> None:
