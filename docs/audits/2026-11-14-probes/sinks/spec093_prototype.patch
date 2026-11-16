@@ -1,4 +1,4 @@
-diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py
+diff -ruN a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py
 --- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 23:02:15
 +++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:42:00
 @@ -64,6 +64,9 @@
@@ -74,7 +74,7 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
  
      def channel(self) -> RabbitChannel:
          if self.broken:
-diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_table.py ./docs/audits/2026-11-14-probes/sinks/spec092_table.py
+diff -ruN a/docs/audits/2026-11-14-probes/sinks/spec092_table.py b/docs/audits/2026-11-14-probes/sinks/spec092_table.py
 --- a/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-15 23:02:15
 +++ b/docs/audits/2026-11-14-probes/sinks/spec092_table.py	2026-11-16 08:42:00
 @@ -109,7 +109,7 @@
@@ -132,7 +132,7 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_table.py ./docs/audits/2
          skip = NOT_RUN.get((sink, variant), {})
          for fault in faults:
              if fault in skip:
-diff -ruN ./src/log_foundry/sinks/_batch.py ./src/log_foundry/sinks/_batch.py
+diff -ruN a/src/log_foundry/sinks/_batch.py b/src/log_foundry/sinks/_batch.py
 --- a/src/log_foundry/sinks/_batch.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/_batch.py	2026-11-16 08:42:00
 @@ -142,6 +142,7 @@
@@ -152,7 +152,7 @@ diff -ruN ./src/log_foundry/sinks/_batch.py ./src/log_foundry/sinks/_batch.py
              return Adjudication([], len(records))
          return _adjudicate_counted(records, results, error_key, failed_count)
      if len(results) != len(records):
-diff -ruN ./src/log_foundry/sinks/_rounds.py ./src/log_foundry/sinks/_rounds.py
+diff -ruN a/src/log_foundry/sinks/_rounds.py b/src/log_foundry/sinks/_rounds.py
 --- a/src/log_foundry/sinks/_rounds.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/_rounds.py	2026-11-16 08:42:00
 @@ -259,16 +259,28 @@
@@ -245,18 +245,46 @@ diff -ruN ./src/log_foundry/sinks/_rounds.py ./src/log_foundry/sinks/_rounds.py
      if verdict.unadjudicated:
          coded = sum(1 for result in results if result.get("ErrorCode"))
          returned = (
-diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
+diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 --- a/src/log_foundry/sinks/_socket.py	2026-11-15 23:02:15
-+++ b/src/log_foundry/sinks/_socket.py	2026-11-16 08:42:13
-@@ -4,6 +4,7 @@
++++ b/src/log_foundry/sinks/_socket.py	2026-11-16 09:49:28
+@@ -4,7 +4,11 @@
  
  import errno
  import json
 +import select
  import socket
++import sys
++import threading
++import time
  from typing import TYPE_CHECKING
  
-@@ -116,6 +117,40 @@
+ from log_foundry import _diag
+@@ -21,6 +25,7 @@
+     floor_count,
+     require_positive,
+     require_timeout,
++    wait,
+ )
+ from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+@@ -45,6 +50,15 @@
+ it is configurable. TCP is a stream and has no such limit, so this bounds nothing there.
+ """
+ 
++_RESET_ERRNOS = frozenset({errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED, errno.ETIMEDOUT})
++"""Pending socket errors that mean the peer reset or abandoned the connection (SPEC-093 FR-001)."""
++
++_RESET_WAIT = 0.25
++"""Seconds the end-of-round check waits for the peer's acknowledgement or a reset (SPEC-093)."""
++
++_RESET_STEP = 0.001
++"""Seconds between two reads of the socket while the end-of-round check waits."""
++
+ _PERMANENT_ERRNOS = frozenset({errno.EMSGSIZE})
+ """Socket errnos that describe the message rather than the destination (FR-007 AC-3).
+ 
+@@ -116,6 +130,96 @@
      )
  
  
@@ -277,7 +305,7 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
 +      None.
 +    """
 +    try:
-+        if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR):
++        if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) in _RESET_ERRNOS:
 +            return "reset"
 +        try:
 +            readable = bool(select.select([sock], [], [], 0)[0])
@@ -294,10 +322,66 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
 +        return "open"
 +
 +
++def _unacked(sock: socket.socket) -> int | None:
++    """Bytes the peer's kernel has not yet acknowledged, or ``None`` where the platform cannot say.
++
++    Linux's ``SIOCOUTQ`` (``TIOCOUTQ``) and macOS's ``SO_NWRITE`` count what the send buffer still
++    holds: written and not yet acknowledged, or not yet sent.
++
++    Args:
++      sock: The held socket.
++
++    Returns:
++      The count, or ``None``.
++
++    Raises:
++      None.
++    """
++    try:
++        if sys.platform == "darwin":
++            return int(sock.getsockopt(socket.SOL_SOCKET, 0x1024))
++        import fcntl
++        import struct
++        import termios
++
++        return int(struct.unpack("i", fcntl.ioctl(sock.fileno(), termios.TIOCOUTQ, b"\0" * 4))[0])
++    except Exception:
++        return None
++
++
++def _end_state(sock: socket.socket) -> str:
++    """Checks a held connection after a round, waiting for the peer to answer what it wrote.
++
++    A peer that closed before the round's frames reached it answers them with a reset and never
++    with an acknowledgement, and an open or half-closed peer acknowledges them, so waiting until
++    every byte is acknowledged or a reset arrives decides the round on the peer's answer to its own
++    bytes rather than on whatever has landed by the time the check runs. The wait is bounded by
++    ``_RESET_WAIT``, and where :func:`_unacked` cannot read the send queue it does not wait.
++
++    Args:
++      sock: The held socket.
++
++    Returns:
++      ``reset`` when a reset arrived first, else what :func:`_peer_state` answers last.
++
++    Raises:
++      None.
++    """
++    deadline = time.monotonic() + _RESET_WAIT
++    while True:
++        state = _peer_state(sock)
++        if state == "reset":
++            return state
++        queued = _unacked(sock)
++        if not queued or time.monotonic() >= deadline:
++            return state
++        wait(_RESET_STEP)
++
++
  def _json_frame(event: dict[str, object]) -> bytes:
      """Frames an event as its UTF-8 JSON text, the transport's default when a caller gives none.
  
-@@ -400,12 +435,20 @@
+@@ -400,12 +504,20 @@
              fates = [Outcome.DROPPED] * len(batch)
              pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
              lost = Lost(self)
@@ -318,11 +402,11 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
                  fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
                  kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
                  lost.add(
-@@ -414,8 +457,40 @@
+@@ -414,8 +526,40 @@
                      key=kind,
                      line=raised_line("message", "SocketTransport", kind),
                  )
-+            if unconfirmed and self._sock is not None and _peer_state(self._sock) == "reset":
++            if unconfirmed and self._sock is not None and _end_state(self._sock) == "reset":
 +                self._unconfirm(unconfirmed, fates, context)
 +                self._reset()
              lost.register()
@@ -359,7 +443,7 @@ diff -ruN ./src/log_foundry/sinks/_socket.py ./src/log_foundry/sinks/_socket.py
  
      def _sendable(
          self, messages: list[tuple[int, bytes]], pending: Deferral | _Drops
-diff -ruN ./src/log_foundry/sinks/elasticsearch.py ./src/log_foundry/sinks/elasticsearch.py
+diff -ruN a/src/log_foundry/sinks/elasticsearch.py b/src/log_foundry/sinks/elasticsearch.py
 --- a/src/log_foundry/sinks/elasticsearch.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/elasticsearch.py	2026-11-16 08:42:00
 @@ -188,7 +188,7 @@
@@ -371,7 +455,7 @@ diff -ruN ./src/log_foundry/sinks/elasticsearch.py ./src/log_foundry/sinks/elast
              return self._unadjudicated(items, _detail(sent))
          if not data.get("errors"):
              return (Outcome.ACCEPTED,) * sent
-diff -ruN ./src/log_foundry/sinks/rabbitmq.py ./src/log_foundry/sinks/rabbitmq.py
+diff -ruN a/src/log_foundry/sinks/rabbitmq.py b/src/log_foundry/sinks/rabbitmq.py
 --- a/src/log_foundry/sinks/rabbitmq.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/rabbitmq.py	2026-11-16 08:42:00
 @@ -80,6 +80,7 @@
@@ -525,7 +609,7 @@ diff -ruN ./src/log_foundry/sinks/rabbitmq.py ./src/log_foundry/sinks/rabbitmq.p
          return self._channel
  
      def _reset(self) -> None:
-diff -ruN ./src/log_foundry/sinks/sentry.py ./src/log_foundry/sinks/sentry.py
+diff -ruN a/src/log_foundry/sinks/sentry.py b/src/log_foundry/sinks/sentry.py
 --- a/src/log_foundry/sinks/sentry.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/sentry.py	2026-11-16 08:42:00
 @@ -10,6 +10,7 @@
@@ -618,7 +702,7 @@ diff -ruN ./src/log_foundry/sinks/sentry.py ./src/log_foundry/sinks/sentry.py
              else:
                  self._post_envelope(event)
          except SinkDeliveryError:
-diff -ruN ./src/log_foundry/sinks/sns.py ./src/log_foundry/sinks/sns.py
+diff -ruN a/src/log_foundry/sinks/sns.py b/src/log_foundry/sinks/sns.py
 --- a/src/log_foundry/sinks/sns.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/sns.py	2026-11-16 08:42:00
 @@ -95,6 +95,7 @@
@@ -629,7 +713,7 @@ diff -ruN ./src/log_foundry/sinks/sns.py ./src/log_foundry/sinks/sns.py
  
      @property
      def _counter_lock(self) -> threading.Lock:
-diff -ruN ./src/log_foundry/sinks/sqs.py ./src/log_foundry/sinks/sqs.py
+diff -ruN a/src/log_foundry/sinks/sqs.py b/src/log_foundry/sinks/sqs.py
 --- a/src/log_foundry/sinks/sqs.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/sqs.py	2026-11-16 08:42:00
 @@ -245,6 +245,7 @@

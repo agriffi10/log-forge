@@ -85,9 +85,11 @@ and FR-002 add is `_diag.is_a`, as *A type test reads the real type, never the v
 
 **The rule both sinks share.** A round hands every remaining event to the client, then waits for the
 reports on the messages it handed over. The wait ends when every one of them has a report, when the
-sink's own timeout has passed, or when the sink's `log_foundry_stop_signal` is set after the wait's
-first slice. So every round waits at least one slice, 50 ms at most, for reports already on their
-way, and a shutdown then cuts the rest short. Each message the round handed over has one outcome:
+sink's own timeout has passed, or when the sink's `log_foundry_stop_signal` is set once the wait's
+first slice has passed. The first slice is a deadline, the wait's start plus 50 ms, not a count of
+passes, so a round under a set stop still takes every report that arrives inside those 50 ms, and a
+shutdown then cuts the rest short. A pause between two asks is never cut short by a stop that was
+already set when it began, so a round under a set stop does not ask in a tight loop. Each message the round handed over has one outcome:
 
 | The report | Outcome | Counted | Line, once per round unless it says otherwise |
 |---|---|---|---|
@@ -102,8 +104,10 @@ error never downgrades it to `NOT_PERSISTED` (`rdkafka_msg.c:1011-1018`), but co
 expose that status. google-cloud-pubsub 2.43.0 retries a publish on `DeadlineExceeded` among others
 (`google/pubsub_v1/services/publisher/transports/base.py:179-197`), so a later `NotFound` or
 `PermissionDenied` can follow an attempt the server kept. So `REJECTED` is kept for a refusal that
-every attempt would have met the same way, because it judges the message's own bytes, or for a
-message the client never sent. Everything else is `UNKNOWN`.
+no attempt of the message could have escaped: one that judges something every attempt carries
+unchanged, or one for a message the client never sent. A refusal that judges what an attempt
+carried beside the message, such as the batch the client built around it, does not qualify,
+because the client builds that again for each attempt. Everything else is `UNKNOWN`.
 
 A run with no event `ACCEPTED`, at least one `REJECTED` and none `UNKNOWN` fails, by the engine's rule
 (SPEC-072). The worker then counts one failed batch, and `flush()` reads false. A run with any
@@ -148,33 +152,49 @@ the counters. The class docstring now says the sink exposes `log_foundry_stop_si
   `DROPPED` and counted in `rejected` only when the run settles, with 1.x's line `KafkaSink produce,
   <Type>`. In a round where nothing was produced, every refused message is `RETRYABLE`, and the
   engine resends it after its wait.
-- **The wait, for this round's messages only.** A blocking `rd_kafka_flush` waits on the producer's
-  whole backlog, so one message stuck on a leaderless partition held every later round for the full
-  timeout. The reviewer's probe measured 0.50 s per emit for four emits in a row. So the round never
-  blocks in `flush`. Each pass of its wait does three things:
-  - it calls `producer.flush(0)`, which serves the reports already in, wakes the broker threads
-    while it marks the producer as flushing (`rdkafka.c:6486-6494`), and returns the queue length
-    without blocking (`Producer.c:480-567` takes the non-chunked path under 200 ms);
-  - it polls for one slice, `producer.poll(slice)`, of at most `_REPORT_SLICE` (0.05 s);
-  - when the poll served nothing, it waits the rest of the slice on the stop signal through
-    `_retry.wait`, so a `poll` that returns at once does not spin, and a poll that served a report
-    goes straight to the next pass.
+- **The wait, for this round's messages only, in slices.** A single blocking
+  `flush(flush_timeout)` waits on the producer's whole backlog, so one message stuck on a leaderless
+  partition held every later round for the full timeout: the reviewer's probe measured 0.50 s per
+  emit for four emits in a row. So the round asks in slices of at most `_REPORT_SLICE` (0.05 s) and
+  checks its own reports between them. Each pass does two things:
+  - it calls `producer.flush(slice)`, which serves reports for at most that slice, returns early
+    once the producer's queue is empty, and returns the queue length. While it runs it holds the
+    producer's flushing mark (`rdkafka.c:6486-6494`), under which librdkafka sends what is queued
+    without waiting out `linger.ms` (`:6492-6493`). That is why the pass flushes for the slice
+    rather than calling `flush(0)` and then `poll(slice)`: the mark is held only while `flush`
+    runs, so the earlier design's `flush(0)` dropped it at once, and every round then waited out
+    `linger.ms` in its poll. Against a real broker that cost a round the producer's whole
+    `linger.ms`, 1 s of it at `linger.ms=1000` (*Evidence*);
+  - when the pass served no report, it waits the rest of its slice through `_retry.wait`, so a
+    `flush` that returns at once, as a stand-in's may, does not spin. The pause is cut short by the
+    stop signal, unless the signal was already set when the pause began (`_retry.pause_on`), since
+    a set signal would end every pause at once.
 
   The wait stops when any of these holds:
   - every position produced this round has a report;
-  - `flush(0)` returned the `int` 0, meaning no message waits to be sent or acknowledged and no
+  - `flush(slice)` returned the `int` 0, meaning no message waits to be sent or acknowledged and no
     report waits to be served;
   - `flush_timeout` has passed since the wait began;
-  - the stop signal is set after the first slice.
+  - the stop signal is set and the first slice, the wait's start plus `_REPORT_SLICE`, has passed.
 
-  `kafka` joins `tests/test_sink_retry.py`'s `WAIT_EXCLUSIONS`, as `pubsub` is, with the reason "it
-  waits on its own delivery reports, which is not a retry backoff".
+  A message stuck on one partition costs each later round one slice, because a pass whose own
+  reports are all in still ends only at the check after `flush(slice)` returns, and with the stuck
+  message queued that `flush` returns at the end of its slice. The probe measured 0.05 to 0.06 s
+  per later emit, against 0.50 s for the single blocking flush. A producer whose `linger.ms` is at
+  or above `flush_timeout` costs nothing more, because the flushing mark overrides `linger.ms`
+  while each slice runs: measured against a real broker at `linger.ms=1000` with `flush_timeout=5`
+  and at `linger.ms=3000` with `flush_timeout=1` (*Evidence*).
+
+  `kafka` joins `tests/test_sink_retry.py`'s `WAIT_EXCLUSIONS`, as `pubsub` and, since SPEC-093,
+  `_socket` are, with the reason "it waits on its own delivery reports, which is not a retry
+  backoff". SPEC-093 has `tests/test_engine_sinks_roster.py`'s wait finding skip a module that list
+  names, so both sinks, now engine sinks that wait, pass it for the same reason.
 - **Each produced message.**
   - A report with no error: `ACCEPTED`.
   - A report whose error code is in `DEFINITIVE_CODES`: `REJECTED`, with 1.x's line `KafkaSink
     delivery, <Type> code=N`, one per message.
   - A report with any other error: `UNKNOWN`.
-  - No report: `ACCEPTED` when the wait ended on `flush(0)` returning 0, and `UNKNOWN` otherwise.
+  - No report: `ACCEPTED` when the wait ended on `flush(slice)` returning 0, and `UNKNOWN` otherwise.
 - **`delivery.report.only.error`.** A producer configured that way, built from `producer_config` or
   injected, sends no report for a success. Its round ends when the queue reads empty, and its
   unreported messages are then `ACCEPTED`. When another message is stuck, the queue never reads
@@ -186,12 +206,14 @@ the counters. The class docstring now says the sink exposes `log_foundry_stop_si
   The round's `UNKNOWN` messages share one line: `lost N message(s); KafkaSink, no definitive delivery
   report within <flush_timeout>s; may have landed, not retried`.
 - **Late reports.** The report table is closed when the round reads it, so a report served later, by
-  another round's poll or by `close()`, changes nothing. The table takes no lock, because a write
+  another round's `flush` or `poll`, or by `close()`, changes nothing. The table takes no lock, because a write
   after the round read it lands in a table nothing reads.
 - **The `flush()` hook.** It refuses when the sink is closed, as today. Otherwise it calls
-  `producer.flush(0)`, which serves any pending report and asks the broker threads to send at once,
-  and it returns without raising for a remainder, because every message a remainder holds was already
-  counted by its round. 1.x waited `flush_timeout` and raised for a remainder, which made
+  `producer.flush(0)`, which serves any pending report and returns at once, and it returns without
+  raising for a remainder, because every message a remainder holds was already counted by its round.
+  It does not make librdkafka send sooner, since the flushing mark it sets is dropped as it returns
+  (`rdkafka.c:6492-6493`), and it has no need to: every message a round handed over was waited for
+  by that round. 1.x waited `flush_timeout` and raised for a remainder, which made
   `log_foundry.flush()` falsy (`reason='sink-flush'`) over an indefinite report and, at the defaults,
   overran its 5 s budget. That contradicts Andrew's 2026-11-16 answer, and the hook now matches
   `GooglePubSubSink`'s.
@@ -200,21 +222,25 @@ the counters. The class docstring now says the sink exposes `log_foundry_stop_si
   1.x's "still queued when the close flush expired" count and the `released_during` count both go,
   since each counted a message after its batch's verdict.
 
-**`DEFINITIVE_CODES`** is `frozenset({10, 18, 21, 87})`: `MESSAGE_TOO_LARGE`, `RECORD_LIST_TOO_LARGE`,
-`INVALID_REQUIRED_ACKS` and `INVALID_RECORD`. Each was checked against the principle above.
-- The broker returns 10 and 18 for the request's bytes against its size limits.
-- It returns 87 for a record its validation refuses.
-- It returns 21 for the producer's own `acks` setting.
+**`DEFINITIVE_CODES`** is `frozenset({21, 87})`: `INVALID_REQUIRED_ACKS` and `INVALID_RECORD`. Each
+was checked against the principle above.
+- The broker returns 21 for the producer's `acks` setting, which is the producer's for its life,
+  so every attempt carries the same one.
+- It returns 87 for a record that its per-record validation refuses, and it names the record. The
+  record's key, value and headers are the message's own and go unchanged into every attempt.
 
-So every attempt carrying the same message under the same settings meets the same refusal, and none
-could have written it. The draft's other codes do not qualify:
+So no attempt of a message refused with either could have been written. The broker's own settings
+can still change between attempts, a topic's compaction among them, and that would break the
+reasoning for 87; it is an inference from the Kafka protocol and librdkafka v2.16.0's source, not
+a measurement, and *Evidence* says so. The codes left out:
+- 10, `MESSAGE_TOO_LARGE`, and 18, `RECORD_LIST_TOO_LARGE`, judge the record batch, which librdkafka
+  builds again for each attempt. With the producer's `message.max.bytes` above the topic's
+  `max.message.bytes`, a message whose first, smaller batch timed out `POSSIBLY_PERSISTED` can meet
+  10 in a larger batch on its retry. Measured against a real broker, a 2 MB message read `UNKNOWN`.
 - 29 and 31 are authorization, which can change between attempts.
 - 2, `CORRUPT_MESSAGE`, can be a transient corruption of one attempt.
 - 17, `INVALID_TOPIC_EXCEPTION`, is left out because this spec could not verify that librdkafka
-  never sends it after an earlier attempt.
-
-A broker's size limit changed between two attempts would break the reasoning for 10 and 18. That is
-an inference, not a measurement, and *Evidence* says so. A code is read as `_code` reads it: `code()`
+  never sends it after an earlier attempt. A code is read as `_code` reads it: `code()`
 must return a value `_diag.is_a(value, int)` admits, which includes an `int` subclass (`kafka.py:546`),
 compared as the `int` it holds.
 
@@ -222,12 +248,14 @@ compared as the `int` it holds.
 - a broker round trip on every batch;
 - every batch waiting `flush_timeout`, 10 s by default, against a broker that never answers, with its
   messages counted `UNKNOWN`;
-- with one partition stuck and every other report arriving, batches that return as soon as their own
-  messages are reported;
+- with one partition stuck and every other report arriving, later batches that return one 50 ms
+  slice after their own messages are reported, not after the timeout;
 - an orphan log, one outside any span, holding the caller's thread for the same wait (invariant 4):
   the probe measured 0.50 s for a 0.5 s timeout against a dead broker;
 - `failed` counting each lost message once per run, where 1.x counted at every report;
 - a batch whose every report is in `DEFINITIVE_CODES` reading `flush()` false, where 1.x read it true;
+- a batch whose reports are size refusals (10 or 18), which 1.x counted as failures beside a truthy
+  `flush()`, now counted as `UNKNOWN`, with `flush()` still truthy;
 - a batch whose reports are authorization errors (29), which 1.x counted as failures beside a truthy
   `flush()`, still counted, as `UNKNOWN`, with `flush()` truthy;
 - a `FilteringSink` or `TransformSink` around the sink now offering `deliver` (SPEC-075);
@@ -238,21 +266,32 @@ compared as the `int` it holds.
 
 - [ ] `KafkaSink-never-acknowledged` and `KafkaSink-report-indefinite` of `tests/test_conformance.py`
       read green, and `KafkaSink`'s other rows stay green (invariants 2 and 7).
-- [ ] With every report carrying code 10, a batch through the worker reads `flush()` false and one
-      failed batch, and each message is produced once. With every report carrying code 29, it reads
+- [ ] With every report carrying code 87, a batch through the worker reads `flush()` false and one
+      failed batch, and each message is produced once. With every report carrying code 10, it reads
+      `flush()` true with every message `UNKNOWN`. With every report carrying code 29, it reads
       `flush()` true with every message `UNKNOWN`, counted once in `failed`, and one line (invariants 2
       and 7).
 - [ ] `probe_misc.py` case 3 against the branch reads `flush()=True`, `failed_batches=0`, `failed=25`
       and one line, with no count after `flush()` returned (invariants 2 and 11).
 - [ ] `spec094_stuck_partition.py`, re-run as a test: with one message never reported and every other
       reported at the next poll, `flush_timeout=0.5`, the first emit returns in no less than 0.5 s
-      and within 1.5 s, and each of the next three returns within 0.1 s with no new `failed` count.
+      and within 1.5 s, and each of the next three returns within 0.2 s with no new `failed` count.
       The same test, with the round calling `flush(flush_timeout)` instead, takes 0.5 s for each
       emit, which shows it reads the per-round wait (invariants 2 and 3).
 - [ ] A report served after its round settled, by a later round's poll or by `close()`, moves no
       counter and writes no line (invariant 2).
-- [ ] With no callback served and `flush(0)` returning 0, every message is `ACCEPTED`. With it
+- [ ] With no callback served and `flush` returning 0, every message is `ACCEPTED`. With it
       returning 1, every message is `UNKNOWN` at the deadline (invariants 2 and 7).
+- [ ] Under a stop signal set before the round, with a stand-in whose `flush` serves one partition's
+      reports per call and returns, the four partitions' reports due at 10, 18, 26 and 34 ms, all 40
+      messages are `ACCEPTED`. The same test, with the first slice's end set to the wait's start,
+      reads 30 of the 40 `UNKNOWN`, which shows the first slice is a deadline and not one pass
+      (invariants 2 and 7).
+- [ ] With a stand-in whose `flush` returns 1 at once and never reports, `flush_timeout=0.5`, one
+      `emit` uses less than 0.1 s of CPU time across its 0.5 s wait, with the stop signal unset and
+      with it set before the round. The same test, with the pause between passes removed, uses
+      CPU time within 0.1 s of its wall time, and with `pause_on` returning the set signal, uses
+      that much over the 50 ms first slice (invariant 3).
 - [ ] With no report ever and `flush_timeout=0.5`, one `emit` returns in no less than 0.5 s and within
       1.5 s, its messages counted once in `failed`. With the stop signal set 0.3 s in and
       `flush_timeout=5`, it returns in no less than 0.3 s and within 1.3 s, its messages `UNKNOWN`
@@ -288,9 +327,17 @@ their shared rules* keeps row 3.
   `GooglePubSubSink publish unconfirmed, the sink closed mid-batch`, and it is not waited on. That is
   row 3 of the declared exceptions.
 - **The wait.** The round's futures are waited on under one deadline, `overflow_timeout` (30 s by
-  default), in slices of `_POLL_INTERVAL` through `result(timeout=slice)`, and between slices on the
-  stop signal. Every future is asked at least once. Once the stop signal is set after the first
-  slice, each later ask waits nothing, and a future still unresolved reads as unknown.
+  default), in slices of `_POLL_INTERVAL` (0.05 s) through `result(timeout=slice)`. Every future is
+  asked at least once. The first slice is a deadline, the wait's start plus `_POLL_INTERVAL`: once
+  it has passed and the stop signal is set, each later ask waits nothing, and a future still
+  unresolved reads as unknown. A `result` that raises `TimeoutError` before its slice is over, as a
+  stand-in's may, is followed by a pause for the rest of the slice through `_retry.wait`, cut short
+  by the stop signal unless it was already set when the pause began (`_retry.pause_on`).
+- **A future resolved with a `TimeoutError`.** `result()` raises the builtin `TimeoutError` both for
+  a future still pending and for one whose outcome is a `TimeoutError`. The two are told apart by
+  the future's `done()`: a done future's `TimeoutError` is its outcome, read as any other
+  exception, so `UNKNOWN` at once rather than after the whole deadline. A future with no `done()`,
+  or whose `done()` raises, reads as pending.
 - **Each future.**
   - A result: `ACCEPTED`.
   - An exception in the definitive set: `REJECTED`, with the line `GooglePubSubSink publish refused,
@@ -299,9 +346,16 @@ their shared rules* keeps row 3.
     `timeout` (`TypeError`): `UNKNOWN`. The round's `UNKNOWN` events share one line,
     `GooglePubSubSink publish unconfirmed (<first Type>); may have landed, not retried`.
 - **The definitive set**, resolved through `_classify.driver_classes`, so nothing is imported:
-  - `google.api_core.exceptions.InvalidArgument`. The server returns it for the request's content,
-    so a retry of the same message meets it again. That is an inference from the status code's
-    meaning: `google/api_core/exceptions.py:266-275` only maps status 400 and gRPC `INVALID_ARGUMENT` to the class.
+  - `google.api_core.exceptions.InvalidArgument`. The server returns it for a publish request it
+    refuses whole, and the client sets the request's error on every future in the client's batch
+    (`publisher/_batch/thread.py:344-371`). So it does not judge one message's own bytes: a valid
+    message batched beside an invalid one is refused with it. What holds is that no attempt wrote
+    it, because the server applies a publish request whole or not at all, and the publish retry
+    (`transports/base.py:179-197`) does not retry `InvalidArgument`, so the refusal follows no
+    attempt the server kept. That a refused request is applied to none of its messages is an
+    inference from the API's meaning, not a measurement, and *Evidence* says so:
+    `google/api_core/exceptions.py:266-275` only maps status 400 and gRPC `INVALID_ARGUMENT` to the
+    class.
   - `google.cloud.pubsub_v1.publisher.exceptions.FlowControlLimitError`, which google-cloud-pubsub
     2.43.0 sets on a future it never sent (`publisher/client.py:405-423`).
 
@@ -339,6 +393,17 @@ their shared rules* keeps row 3.
 - [ ] With futures that never resolve and `overflow_timeout=0.5`, one `emit` returns in no less than
       0.5 s and within 1.5 s with its events `UNKNOWN`. With the stop signal set 0.3 s in and
       `overflow_timeout=5`, it returns in no less than 0.3 s and within 1.3 s (invariants 3 and 7).
+- [ ] Under a stop signal set before the round, with 1,000 futures that resolve between 10 and 30 ms
+      after the publish, every event is `ACCEPTED`. The same test, with the first slice's end set
+      to the wait's start, reads events `UNKNOWN`, which shows the first slice is a deadline
+      (invariants 2 and 7).
+- [ ] With futures whose `result` raises `TimeoutError` at once and whose `done()` is false,
+      `overflow_timeout=0.5`, one `emit` uses less than 0.1 s of CPU time across its 0.5 s wait,
+      with the stop signal unset and with it set before the round. The same test, with the pause
+      removed, uses CPU time within 0.1 s of its wall time (invariant 3).
+- [ ] A future that is done and whose `result` raises `TimeoutError` reads `UNKNOWN`, its line
+      naming `TimeoutError`, and the `emit` returns within 0.1 s with `overflow_timeout=5`
+      (invariants 3 and 7).
 - [ ] A close landing mid-round makes the later publishes `UNKNOWN` without raising, and
       `test_a_close_landing_mid_batch_counts_the_rest_unconfirmed_and_does_not_raise` passes
       (invariant 7).
@@ -351,8 +416,8 @@ their shared rules* keeps row 3.
 
 These are changes to SPEC-092's files as its build delivers them, after SPEC-093's.
 
-- **The Kafka double.** It already serves its reports at `flush`, which the round's `flush(0)`
-  reaches. Its definitive report becomes code 10 rather than 29, which SPEC-092's fault table now
+- **The Kafka double.** It already serves its reports at `flush`, which the round's `flush(slice)`
+  reaches. Its definitive report becomes code 87 rather than 29, which SPEC-092's fault table now
   says. 1.x reads every report error alike, so no row moves at `97a03f45`.
 - **The Pub/Sub double** raises `InvalidArgument` and `DeadlineExceeded` as classes of a stub
   `google.api_core.exceptions`, installed through `DRIVERS` with google-api-core's hierarchy for the
@@ -398,9 +463,11 @@ These are the completion ritual's edits, made on the pushed branch.
   - The item "**`GooglePubSubSink.close()`'s bound does not cover an unboundable future**"
     (`architecture.md:1222-1232` at `97a03f45`) is struck as closed by SPEC-094. Such a future is now
     `UNKNOWN` in its round, counted, and never waited on at `close()`.
-- **§13 gains four bullets.**
+- **§13 gains five bullets.**
   - "**A client-buffered sink's batch costs a broker round trip.**" It carries the measured figures
-    at batch 10 and at 1,000.
+    at batch 10 and at 1,000, and the real broker's figures, which do not grow with `linger.ms`.
+  - "**With one Kafka partition stuck, each later `KafkaSink` round pays one 50 ms slice.**" It
+    carries the 0.05 to 0.06 s measured against 0.50 s for a single blocking flush.
   - "**Against a broker that never answers, a `KafkaSink` or `GooglePubSubSink` batch holds the drain
     thread for the sink's timeout, and an orphan log holds the caller's thread for it.**" It carries
     the 0.50 s measured for a 0.5 s timeout.
@@ -452,10 +519,11 @@ These are the completion ritual's edits, made on the pushed branch.
   and opener, as SPEC-093 rewrites them, stay true with these changes in. The entry lists:
   - both sinks on the engine, with `deliver`;
   - the per-round wait, its bound, and the stop signal that cuts it;
-  - the partial-outage cost: with one partition stuck, only that partition's messages wait;
+  - the partial-outage cost: with one partition stuck, only that partition's messages wait the
+    timeout, and each later round pays one 50 ms slice;
   - the dead-broker cost: each batch, and each orphan log, waits the timeout;
-  - definite rejections (the two sets) failing the batch, and every other report, authorization
-    errors among them, counted `UNKNOWN` with `flush()` truthy;
+  - definite rejections (the two sets) failing the batch, and every other report, authorization and
+    size refusals among them, counted `UNKNOWN` with `flush()` truthy;
   - the `flush()` hook no longer waiting or raising;
   - no count after the verdict, and the close counts that go;
   - `max_pending` inert;
@@ -469,7 +537,7 @@ These are the completion ritual's edits, made on the pushed branch.
 #### Acceptance Criteria:
 
 - [ ] §12's finding-12 item and its unboundable-future item are struck as closed by SPEC-094, the
-      full-client-queue item is open with its own lead, and §13 carries the four bullets.
+      full-client-queue item is open with its own lead, and §13 carries the five bullets.
 - [ ] The decision-B file quotes "Wait for the report (Recommended)" dated 2026-11-15 and "Truthy,
       counted (Recommended)" dated 2026-11-16, in that order, and states the reworded meaning. The
       definitive-report decision and the five dated History entries exist.
@@ -488,8 +556,11 @@ These are the completion ritual's edits, made on the pushed branch.
 ## Data Model
 
 ```python
+# src/log_foundry/sinks/_retry.py
+def pause_on(stop: threading.Event | None) -> threading.Event | None: ...   # new: None once set
+
 # src/log_foundry/sinks/kafka.py
-DEFINITIVE_CODES: frozenset[int] = frozenset({10, 18, 21, 87})
+DEFINITIVE_CODES: frozenset[int] = frozenset({21, 87})
 _REPORT_SLICE: float = 0.05
 
 class KafkaSink:
@@ -512,6 +583,7 @@ class GooglePubSubSink:
 
 ```
 src/log_foundry/sinks/
+├── _retry.py     # FR-001, FR-002: pause_on
 ├── kafka.py      # FR-001
 └── pubsub.py     # FR-002
 tests/
@@ -524,8 +596,8 @@ docs/             # FR-004
 
 ### Phase 1: `KafkaSink` on the engine (FR-001)
 
-- The round, the per-round wait, the report table, `DEFINITIVE_CODES`, the counters as properties,
-  the stop signal and the `flush()` hook, with the tests that change.
+- `_retry.pause_on`, then the round, the sliced wait, the report table, `DEFINITIVE_CODES`, the
+  counters as properties, the stop signal and the `flush()` hook, with the tests that change.
 
 ### Phase 2: `GooglePubSubSink` on the engine (FR-002)
 
@@ -545,7 +617,8 @@ Numbers were taken on macOS with Python 3.13.1 and no extra installed, at `97a03
 otherwise.
 
 **The rows.** On top of SPEC-093's prototype, 268 rows read 195 green and 73 red. That is the same in
-three runs on Python 3.13.1 and one on 3.12.12. Exactly these four rows move:
+three runs on Python 3.13.1 and one on 3.12.12, from the committed patches applied to a fresh
+export, and row for row the same as the previous revision's prototype. Exactly these four rows move:
 
 - `KafkaSink-never-acknowledged` and `GooglePubSubSink-never-acknowledged`, from
   `partition`+`silent-loss` to green;
@@ -563,8 +636,9 @@ lost and held. Only a verdict can say `UNKNOWN`, which is why both sinks move on
 
 **The mutant.** With `KafkaSink._round`'s wait removed, `KafkaSink-clean`, `-refused-once` and
 `-never-acknowledged` read `ambiguous-when-knowable`, and `-refused-always` and `-report-indefinite`
-stay green: with no wait, every produced message is `UNKNOWN`. That was measured on the per-round
-wait at `97a03f45`, as it was on the draft's `flush`-based wait at `33582484`.
+stay green: with no wait, every produced message is `UNKNOWN`. That was measured on this revision's
+sliced wait and on the previous revision's polls at `97a03f45`, as it was on the draft's
+`flush`-based wait at `33582484`.
 
 **The Pub/Sub double's classes matter.** With the double raising its local `PermissionDenied`, the
 prototype read `GooglePubSubSink-never-acknowledged` as `ambiguous-when-knowable`. A refusal the sink
@@ -575,9 +649,12 @@ cannot recognise by class reads as indefinite. With the stub module's class, the
 | | emit 0 | emit 1 | emit 2 | emit 3 |
 |---|---|---|---|---|
 | the draft, `flush(flush_timeout)` | 0.50 s | 0.50 s | 0.51 s | 0.50 s |
-| this spec, per-round polls | 0.50 s | 0.00 s | 0.00 s | 0.00 s |
+| the previous revision, `flush(0)` and polls | 0.50 s | 0.00 s | 0.00 s | 0.00 s |
+| this spec, `flush(slice)` | 0.50 s | 0.06 s | 0.05 s | 0.05 s |
 
-Both counted the stuck message once in `failed`. `spec094_dead_broker_flush.py`, with a producer that
+Each counted the stuck message once in `failed`. The slice each later emit pays is the stand-in's
+`flush` holding the slice while the stuck message is queued, which a real `rd_kafka_flush` does
+too, since it returns early only once the queue is empty. `spec094_dead_broker_flush.py`, with a producer that
 never reports and `flush_timeout=0.5`:
 - under the draft, `log_foundry.flush(timeout=5)` returned `FlushResult(ok=False,
   reason='sink-flush')` after 1.01 s;
@@ -587,15 +664,38 @@ In both, an orphan `info()` held the caller's thread for 0.50 s and every event 
 `failed`. With the stop signal set 0.3 s into a wait whose timeout is 5 s, an `emit` returned after
 0.32 to 0.34 s for each sink, its events `UNKNOWN`.
 
+**The first slice, the pause and a resolved `TimeoutError`.** `spec094_first_slice_and_pause.py`
+against this revision's prototype, against the previous revision's (`59c1fbf0`), and against this
+revision with each re-plant:
+
+| Case | this revision | `59c1fbf0` | re-plant |
+|---|---|---|---|
+| Kafka, stop set before the round, 40 reports by 34 ms | 0 of 40 `UNKNOWN`, 34 to 35 ms | 40 of 40 | first slice ends at the start: 30 of 40, 10.8 ms |
+| Pub/Sub, stop set before the round, 1,000 futures by 30 ms | 0 of 1,000 `UNKNOWN` | 349 of 1,000 | first slice ends at the start: 536 of 1,000 |
+| Kafka, `flush` returns 1 at once, 0.5 s timeout, stop unset | CPU 0.001 s of 0.504 s, 11 calls | CPU 0.001 s | no pause: CPU 0.500 s of 0.500 s, 2,044,100 calls |
+| the same, stop set before the round | CPU 0.000 s of 0.054 s, 2 calls | returned at once | `pause_on` returning the set stop: CPU 0.050 s of 0.050 s, 51,294 calls |
+| Pub/Sub, `result` raises `TimeoutError` at once, 0.5 s timeout, stop unset | CPU 0.001 s of 0.503 s, 11 calls | CPU 0.013 s | no pause: CPU 0.500 s of 0.500 s, 2,102,089 calls |
+| the same, stop set before the round | CPU 0.000 s of 0.052 s, 2 calls | returned at once | `pause_on` returning the set stop: CPU 0.050 s of 0.050 s, 68,729 calls |
+| Pub/Sub, a future done with `TimeoutError`, 5 s timeout | `UNKNOWN` in under 1 ms | `UNKNOWN` after 5.003 s | none |
+
+The review's own stand-ins, `kstop.py` and `pstop.py`, read 30 of 40 and 900 of 1,000 `UNKNOWN`
+against `59c1fbf0`. The previous revision's rows under a set stop returned at once because its
+first slice ended at its first pass, which is S3; with the slice made a deadline and no
+`pause_on`, the same stand-ins burned the 50 ms slice in a tight loop, which is the re-plant column.
+
 **The suite.** The full suite was run against the prototype in a scratch export with no `docs/`.
-Against SPEC-093's prototype at `97a03f45`, 54 more tests fail. The draft's `flush`-based prototype
-failed 52 at `33582484` and 53 at `bb6656ff`, which added `tests/test_class_claim.py`. The 54th is
-`test_sink_retry.py::test_only_the_engine_waits_or_backs_off`, which FR-001 changes by adding `kafka`
-to `WAIT_EXCLUSIONS`. A first version of the per-round wait, which polled and read `__len__` without
-`flush(0)`, failed eight more. Each used a stand-in producer that serves reports only at `flush`, so
-it waited the full timeout and read its messages as `UNKNOWN`; the `flush(0)` pass fixed all eight.
-In an earlier run, at a one-minute load near 100, two unrelated `_otel` tests failed once and passed
-when rerun serially. They are not counted. The 54 are in these files:
+Against SPEC-093's prototype at `97a03f45`, 52 more tests fail, 129 in all against 77. The draft's
+`flush`-based prototype failed 52 at `33582484` and 53 at `bb6656ff`, which added
+`tests/test_class_claim.py`, and the previous revision failed 54. Two of those 54,
+`test_sink_retry.py::test_only_the_engine_waits_or_backs_off` and
+`test_engine_sinks_roster.py::test_the_engine_sinks_are_the_sixteen`, now fail on SPEC-093's
+prototype already, because its end-of-round wait trips the same two gates, so they are SPEC-093's
+count and not this spec's. The sliced `flush`, the first-slice deadline and `pause_on` fail no test
+the previous revision did not. A first version of the per-round wait, which polled and read
+`__len__` without `flush`, failed eight more. Each used a stand-in producer that serves reports only
+at `flush`, so it waited the full timeout and read its messages as `UNKNOWN`. In an earlier run, at
+a one-minute load near 100, two unrelated `_otel` tests failed once and passed when rerun serially.
+They are not counted. The 52 are in these files:
 
 | File | Tests |
 |---|---|
@@ -610,16 +710,14 @@ when rerun serially. They are not counted. The 54 are in these files:
 | `test_sink_flush_hook.py` | 2 |
 | `test_final_refusal.py` | 2 |
 | `test_delivery_engine.py` | 2 |
-| `test_sink_retry.py` | 1 |
 | `test_sink_post_close.py` | 1 |
 | `test_fork_roster.py` | 1 |
-| `test_engine_sinks_roster.py` | 1 |
 | `test_class_claim.py` | 1 |
 
 With each sink's change applied alone on top of SPEC-093's, at `33582484` with the draft's wait, 25
 of the 52 failed with `KafkaSink`'s and 33 with `GooglePubSubSink`'s. 7 failed with either, and one
 failed only with both: `test_deferral.py::test_every_run_context_count_of_a_dropped_counter_is_settled`,
-which expects a stored `rejected` counter that neither sink then keeps. Each of the 54 asserts what
+which expects a stored `rejected` counter that neither sink then keeps. Each of the 52 asserts what
 FR-001 or FR-002 changes:
 
 - **The pending list and its reap, overflow and close resolution.** These are the 16 in
@@ -643,11 +741,10 @@ FR-001 or FR-002 changes:
   sink's `emit` calls for a closed sink's refused batch, and now read `emits() == 0`, because the
   worker reaches an engine sink through `deliver`.
 - **A roster derived from the tree that now finds two more engine sinks, or a gate's fixture planted
-  in code that moved.**
-  - `test_engine_sinks_roster.py::test_the_engine_sinks_are_the_sixteen`.
+  in code that moved.** `test_engine_sinks_roster.py::test_the_engine_sinks_are_the_sixteen`, which
+  also finds the two new engine sinks, already fails on SPEC-093's prototype and is counted there.
   - The two in `test_delivery_engine.py`.
   - The five in `test_classify.py`, the retry-loop sweep and the wrapper exclusions.
-  - `test_sink_retry.py::test_only_the_engine_waits_or_backs_off`.
   - `test_sink_post_close.py::test_every_hand_listed_adopter_population_is_the_derived_one`.
   - Two of the three in `test_deferral.py`: `test_every_dropped_counter_is_written_only_by_a_deferral_commit`,
     and `test_every_run_context_count_of_a_dropped_counter_is_settled`, the one that needs both
@@ -662,48 +759,61 @@ FR-001 or FR-002 changes:
   `test_stored_name_sinks.py`.
 
 **The cost.** `spec094_report_wait_cost.py` used a fake client that acknowledges each message a set
-time after it was handed over, and whose `poll` blocks until it serves a report or its timeout
-passes, as librdkafka's does. It gives the median `emit` of seven, at a one-minute load between 9
-and 14:
+time after it was handed over, and whose `flush` serves reports until its queue is empty or its
+timeout passes, as librdkafka's does. It gives the median `emit` of seven, at a one-minute load near
+5, measured on this revision's sliced wait; the rows at `97a03f45` are the previous revision's:
 
 | Sink | ack | batch 10 | batch 100 | batch 1,000 |
 |---|---|---|---|---|
 | `KafkaSink` at `97a03f45` | any | 0.02 ms | 0.13 to 0.14 ms | 1.3 to 1.4 ms |
-| `KafkaSink`, waiting | 1 ms | 1.10 ms | 1.29 ms | 3.74 ms |
-| `KafkaSink`, waiting | 5 ms | 5.17 ms | 5.44 ms | 7.84 ms |
-| `KafkaSink`, waiting | 20 ms | 20.24 ms | 20.70 ms | 24.29 ms |
+| `KafkaSink`, waiting | 1 ms | 1.10 ms | 1.32 ms | 4.07 ms |
+| `KafkaSink`, waiting | 5 ms | 5.17 ms | 5.40 ms | 8.05 ms |
+| `KafkaSink`, waiting | 20 ms | 20.22 ms | 20.57 ms | 23.18 ms |
 | `GooglePubSubSink` at `97a03f45` | any | 0.02 ms | 0.13 to 0.14 ms | 1.2 to 1.4 ms |
-| `GooglePubSubSink`, waiting | 1 ms | 1.54 ms | 2.24 ms | 6.18 ms |
-| `GooglePubSubSink`, waiting | 5 ms | 6.37 ms | 6.70 ms | 9.05 ms |
-| `GooglePubSubSink`, waiting | 20 ms | 24.93 ms | 25.00 ms | 31.97 ms |
+| `GooglePubSubSink`, waiting | 1 ms | 1.32 ms | 1.45 ms | 3.28 ms |
+| `GooglePubSubSink`, waiting | 5 ms | 6.30 ms | 6.47 ms | 8.02 ms |
+| `GooglePubSubSink`, waiting | 20 ms | 23.88 ms | 22.65 ms | 27.62 ms |
 
 So one batch costs about one round trip. At today's batches of 10 events and a 5 ms round trip, the
 drain thread delivers about 1,900 events a second to Kafka and 1,600 to Pub/Sub, where it delivered
-about 600,000 at `97a03f45`. At SPEC-090's cap of 1,000 events a batch it delivers about 128,000 and
-110,000. SPEC-090's size target is `events / elapsed × flush_interval / 2`, which reaches the cap under
+about 600,000 at `97a03f45`. At SPEC-090's cap of 1,000 events a batch it delivers about 124,000 to
+each. SPEC-090's size target is `events / elapsed × flush_interval / 2`, which reaches the cap under
 a backlog once a round trip is the cost, so a backlog lifts the batch size to where the wait matters
-least. With a client that never acknowledges and the timeout at 0.5 s, one `emit` took 500.6 ms for
-`KafkaSink` and 502.8 ms for `GooglePubSubSink`, against 0.02 ms at `97a03f45`. The fake's blocking
-`poll` matters: with a `poll` that returns at once, every Kafka round paid a 50 ms slice (54 to
-65 ms per `emit`), which is why a pass skips the slice's wait after a poll that served a report.
+least. With a client that never acknowledges and the timeout at 0.5 s, one `emit` took 500.3 ms for
+`KafkaSink` and 502.9 ms for `GooglePubSubSink`, against 0.02 ms at `97a03f45`.
+
+**Against a real broker.** `spec094_real_broker_linger.py` ran `KafkaSink.deliver` with a
+confluent-kafka 2.16.1 `Producer`, whose bundled librdkafka reads `2.16.0` from `libversion()`,
+against the Kafka 3.9.1 image `tests/integration/docker-compose.yml` pins, from a container on the
+broker's network, ten messages a `deliver`. Milliseconds per `deliver`, first to last:
+
+| Case | the previous revision, `flush(0)` and `poll(slice)` | this revision, `flush(slice)` |
+|---|---|---|
+| `linger.ms` 5 (the default) | 6.3 to 8.5, all `ACCEPTED` | 0.7 to 4.5, all `ACCEPTED` |
+| `linger.ms` 100 | 104.4 to 108.7, all `ACCEPTED` | 0.5 to 2.8, all `ACCEPTED` |
+| `linger.ms` 1000, `flush_timeout` 5 | 1,006.0 to 1,008.4, all `ACCEPTED` | 0.4 to 2.8, all `ACCEPTED` |
+| `linger.ms` 3000, `flush_timeout` 1 | 1,001.0 to 1,002.1, **all `UNKNOWN`** | 0.5 to 2.2, all `ACCEPTED` |
+| `delivery.report.only.error`, `linger.ms` 200 | 205.0 to 209.3, all `ACCEPTED` | 0.7 to 3.1, all `ACCEPTED` |
+| stop set before the round, `linger.ms` 1000 | 51.3 to 55.9, **all `UNKNOWN`** | 0.5 to 2.7, all `ACCEPTED` |
+| no broker, `flush_timeout` 0.5 | 501.4 to 502.7, all `UNKNOWN` | 501.0 to 501.9, all `UNKNOWN` |
+| no broker, stop set before the round | 2.4 to 52.6, all `UNKNOWN` | 51.2 to 52.2, all `UNKNOWN` |
+| a 2 MB message, producer `message.max.bytes` above the topic's | `REJECTED` (code 10) | `UNKNOWN` |
+
+So under the previous revision each round paid the producer's whole `linger.ms`, and a `linger.ms`
+at or above `flush_timeout`, or a set stop, read every delivered message as `UNKNOWN`. Under
+`flush(slice)` no round paid `linger.ms`, and each delivered message read `ACCEPTED`. The first
+`deliver` of each case pays the connection to the partition leader.
 
 **What the prototype could not settle.**
 
-- Whether a broker thread woken by `flush(0)` sends before `linger.ms` (librdkafka's default 5 ms,
-  `rdkafka_conf.c:1652-1660`) has passed. At worst a round pays that 5 ms.
-- That `flush(0)` returns the queue length that librdkafka's `rd_kafka_outq_len` documents, which
-  counts unserved reports as well as unsent messages. That is read from the documentation and
-  `Producer.c`, not measured against a broker.
-- That librdkafka never sends one of `DEFINITIVE_CODES` after an earlier attempt that wrote the
-  message. The four codes judge the message's bytes or the producer's settings, so every attempt
-  meets them alike, but a broker or topic setting changed between attempts would break that. It is
-  read from the Kafka protocol and librdkafka v2.16.0's source, not measured.
-- Which librdkafka the confluent-kafka 2.16.1 wheels bundle. Its source requires librdkafka 2.16.0 or
-  later (`confluent_kafka.h:147-151`), and the bundled version is unverified.
-- That the server returns `InvalidArgument` only for a request's content, an inference from the
-  status code.
-- How the real clients behave. That is owed to `integration.yml`'s Kafka and Pub/Sub tests on the
-  PR's branch.
+- That librdkafka never sends 21 or 87 after an earlier attempt that wrote the message. Both judge
+  what every attempt carries unchanged, the producer's `acks` and the record's own content, but a
+  broker or topic setting changed between attempts, such as a topic made compacted, would break that
+  for 87. It is read from the Kafka protocol and librdkafka v2.16.0's source, not measured.
+- That Pub/Sub applies a publish request it refuses with `InvalidArgument` to none of its messages,
+  an inference from the API's meaning.
+- How Pub/Sub's real client behaves, and Kafka's beyond the cases measured above. That is owed to
+  `integration.yml`'s Kafka and Pub/Sub tests on the PR's branch.
 
 ## Revision history
 
@@ -744,3 +854,24 @@ least. With a client that never acknowledges and the timeout at 0.5 s, one `emit
       `Producer_flush` spans `Producer.c:480-567`, and `exceptions.py` only maps codes to classes.
     - **11.** The timing criteria have a lower bound and allow one second over, as SPEC-086 does.
     - **12.** The suite attributions are corrected.
+- Revised again on 2026-11-16, after the execution-frame review of both specs.
+  - **S2, the linger cost.** The round's `flush(0)` held librdkafka's flushing mark only while it
+    ran (`rdkafka.c:6492-6493`), so the poll after it waited out `linger.ms`: measured against a real
+    broker, a round cost the producer's whole `linger.ms`. Each pass now calls `flush(slice)`, which
+    holds the mark for the slice, and the same broker measured each round at a few milliseconds
+    whatever `linger.ms` was, including `linger.ms` above `flush_timeout`. The cost this moves is a
+    stuck partition's: each later round pays one slice, 0.05 to 0.06 s, which FR-001 states and its
+    criterion allows. The "at worst a round pays that 5 ms" bullet is withdrawn, and the bundled
+    librdkafka is measured at 2.16.0.
+  - **S3.** The first slice is a deadline from the wait's start, not one pass, so a round under a
+    set stop takes every report inside it; each sink has a criterion with its re-plant.
+  - **S4.** A pause between two asks now waits even when the stop was set before it began
+    (`_retry.pause_on`). The review's stand-ins burned the whole slice in a tight loop under a set
+    stop, and each sink now has a CPU-time criterion with its re-plants. The same pause bounds a
+    stand-in whose `flush` returns at once, which was S7.
+  - **S6.** A Pub/Sub future resolved with a `TimeoutError` is told from a pending one by `done()`.
+  - **S8.** Kafka's set narrowed to `{21, 87}`: 10 and 18 judge the batch librdkafka builds again
+    for each attempt, and a real broker's 2 MB refusal now reads `UNKNOWN`. Pub/Sub's
+    `InvalidArgument` stays definitive on "no attempt wrote it", not on the message's own bytes,
+    since the refusal lands on the whole client batch. The corpus's Kafka double and SPEC-092's
+    example now use 87.

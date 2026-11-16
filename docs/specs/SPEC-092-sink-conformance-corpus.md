@@ -204,7 +204,7 @@ from a patched `model.new_log_id`, so the backend counts by identity, never by p
 | `reply-lost` | the first call takes everything, then raises a transient error (for `transactional`, the commit is applied and the connection then drops) |
 | `peer-closed` | a clean first batch; the peer then closes, the second batch's first three writes return having reached nobody, the fourth raises, and a new connection takes the rest (`udp`: no listener, nothing taken, nothing raised) |
 | `no-verdict-shape` | the first call takes its first half and replies with no verdict: `{}`, or for `MongoDBSink` a `writeErrors` that is not a list |
-| `never-acknowledged` | the client takes every event and its later report is **definitive** that each was refused: a Kafka delivery error `10` (`MESSAGE_TOO_LARGE`; ~~`29`~~, superseded by SPEC-094 because an authorization error can follow an earlier attempt that wrote the message), a Pub/Sub `InvalidArgument` (~~`PermissionDenied`~~, likewise), a Sentry `capture_event` that returns `None` |
+| `never-acknowledged` | the client takes every event and its later report is **definitive** that each was refused: a Kafka delivery error `87` (`INVALID_RECORD`; ~~`29`~~, superseded by SPEC-094 because an authorization error can follow an earlier attempt that wrote the message, as a size refusal can), a Pub/Sub `InvalidArgument` (~~`PermissionDenied`~~, likewise), a Sentry `capture_event` that returns `None` |
 | `report-indefinite` | the client takes every event and its report never says whether the backend kept it: a Kafka `-192` (`_MSG_TIMED_OUT`) or a Pub/Sub `DeadlineExceeded` for an event the backend holds, the Sentry SDK's transport dropping an event after `capture_event` returned its id, or a core NATS PING never answered (core NATS runs this under `never-acknowledged`) |
 | `autocommit` | each statement is durable at once, and the second raises once with a serialization failure (`40001`), which leaves the connection usable |
 | `caller-code-raises` | the wrapper's predicate or function raises for one event |
@@ -793,3 +793,6 @@ measured.
   fault's Kafka and Pub/Sub examples become `10` and `InvalidArgument`, because SPEC-094 reads a
   report as definitive only when no attempt could have written the event. No requirement, row or
   total changed.
+- Edited again on 2026-11-16 by SPEC-094's second revision, text only. The Kafka example becomes
+  `87`, since SPEC-094 no longer reads `10` as definitive: librdkafka builds the batch that `10`
+  judges again for each attempt. No requirement, row or total changed.

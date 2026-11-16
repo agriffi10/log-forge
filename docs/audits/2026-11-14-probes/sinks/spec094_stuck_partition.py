@@ -2,8 +2,10 @@
 
 Adapted on 2026-11-16 from SPEC-094's reviewer's `stuck_one_kafka.py`, against 97a03f45; not one of
 the audit's probes. One partition has no leader, so the producer never reports one message, and
-librdkafka's `flush` waits on the producer's whole backlog. Each later `emit` should return as soon
-as its own messages are reported. Run against a tree: `PYTHONPATH=<tree>/src python -B <this file>`.
+librdkafka's `flush` waits on the producer's whole backlog. Each later `emit` should return within
+one slice of its own messages being reported, since the stand-in's `flush` holds its timeout while
+the stuck message is queued, as librdkafka's does. Run against a tree:
+`PYTHONPATH=<tree>/src python -B <this file>`.
 """
 
 import time

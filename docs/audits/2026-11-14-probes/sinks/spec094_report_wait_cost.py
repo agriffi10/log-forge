@@ -6,8 +6,10 @@ own, as a broker's round trip would. Each case emits batches of a given size thr
 `emit` and prints the median wall time of one `emit` and the events per second that implies; a
 dead client never acknowledges, and its row shows that one `emit` is bounded by the sink's
 timeout. Revised on 2026-11-16: the fake's `poll` blocks until it serves a report or its timeout
-passes, as librdkafka's does, because SPEC-094's round now waits by polling. Run it against two
-trees and compare:
+passes, as librdkafka's does, because SPEC-094's round then waited by polling. Re-run on its second
+revision that day, whose round flushes in slices instead: the fake's `flush` serves until its queue
+is empty or its timeout passes, as librdkafka's does, so the probe needed no change. Run it against
+two trees and compare:
 
     PYTHONPATH=<tree>/src python -B spec094_report_wait_cost.py
 """

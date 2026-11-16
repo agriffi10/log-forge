@@ -1,6 +1,6 @@
-diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py
+diff -ruN a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py
 --- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:42:00
-+++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:52:37
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 09:28:18
 @@ -69,6 +69,18 @@
          "ChannelClosedByBroker": ("AMQPError",),
      },
@@ -25,7 +25,7 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
              if self.backend.fault == "never-acknowledged":
                  if callback is not None:
 -                    callback(KafkaError(29), None)
-+                    callback(KafkaError(10), None)
++                    callback(KafkaError(87), None)
              elif self.backend.fault == "report-indefinite":
                  self.backend.take(carried)
                  if callback is not None:
@@ -45,15 +45,46 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
          return "id"
  
      def exception(self, timeout: float | None = None) -> BaseException | None:
-diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
+diff -ruN a/src/log_foundry/sinks/_retry.py b/src/log_foundry/sinks/_retry.py
+--- a/src/log_foundry/sinks/_retry.py	2026-11-16 08:42:00
++++ b/src/log_foundry/sinks/_retry.py	2026-11-16 09:40:03
+@@ -331,6 +331,25 @@
+     return max(exact_int(value, name, owner), floor)
+ 
+ 
++def pause_on(stop: threading.Event | None) -> threading.Event | None:
++    """The event a pause between two asks for a report may be cut short by (SPEC-094).
++
++    A stop signal already set would end :func:`wait` at once, so a wait that keeps asking for one
++    slice after the stop would ask in a tight loop, measured burning CPU for the whole slice.
++    Such a pause is waited out in full instead; one not yet set still cuts it short.
++
++    Args:
++      stop: The worker's shutdown event, or ``None``.
++
++    Returns:
++      ``stop`` when it is not set, else ``None``.
++
++    Raises:
++      None.
++    """
++    return None if stop is not None and stop.is_set() else stop
++
++
+ def wait_budget(value: float | None, name: str) -> float | None:
+     """Returns the wait a public ``timeout`` asks for, or refuses one with no meaning (SPEC-066).
+ 
+diff -ruN a/src/log_foundry/sinks/kafka.py b/src/log_foundry/sinks/kafka.py
 --- a/src/log_foundry/sinks/kafka.py	2026-11-16 08:42:00
-+++ b/src/log_foundry/sinks/kafka.py	2026-11-16 08:55:42
-@@ -4,21 +4,82 @@
++++ b/src/log_foundry/sinks/kafka.py	2026-11-16 09:55:35
+@@ -3,22 +3,87 @@
+ from __future__ import annotations
  
  import json
- import threading
+-import threading
+-from typing import Any
 +import time
- from typing import Any
++from typing import TYPE_CHECKING, Any
  
  from log_foundry import _diag
 +from log_foundry.sinks import _engine
@@ -67,17 +98,22 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  from log_foundry.sinks._refusal import final_refusal
 -from log_foundry.sinks._retry import usable_timeout
 -from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
-+from log_foundry.sinks._retry import usable_timeout, wait
++from log_foundry.sinks._retry import pause_on, usable_timeout, wait
 +from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
-+from log_foundry.sinks.base import SinkLosses
 +from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
  
++if TYPE_CHECKING:
++    import threading
++
++    from log_foundry.sinks.base import SinkLosses
++
  __all__ = ["KafkaSink"]
  
-+DEFINITIVE_CODES = frozenset({10, 18, 21, 87})
++DEFINITIVE_CODES = frozenset({21, 87})
++"""Kafka protocol codes no attempt of the refused message could have escaped (SPEC-094)."""
  
 +_REPORT_SLICE = 0.05
-+"""Kafka protocol codes a broker returns only for a produce request it did not write (SPEC-094)."""
++"""Seconds one pass of the round's report wait flushes for, and the first slice's length."""
 +
 +
 +class _Reports:
@@ -135,7 +171,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  def _usable_timeout(value: float) -> float:
      """Returns a flush timeout that is actually a bound, or the default.
  
-@@ -171,12 +232,88 @@
+@@ -171,12 +236,88 @@
          self.producer = producer
          self.key_field = key_field
          self.flush_timeout = _usable_timeout(flush_timeout)
@@ -227,7 +263,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
      def _closed(self) -> bool:
          """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
  
-@@ -215,119 +352,141 @@
+@@ -215,119 +356,141 @@
          return self._guard._lock
  
      def losses(self) -> SinkLosses:
@@ -456,7 +492,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
      def _encode(self, event: dict[str, object]) -> tuple[bytes, bytes | None]:
          """Encodes one event as its message body and partition key.
-@@ -351,24 +510,6 @@
+@@ -351,24 +514,6 @@
          """
          return json.dumps(event).encode("utf-8"), self._key(event)
  
@@ -481,7 +517,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
      def close(self) -> None:
          """Flushes the producer so buffered messages are delivered before exit (FR-002).
  
-@@ -428,13 +569,44 @@
+@@ -428,13 +573,47 @@
          with self._guard.enter() as section:
              if not section:
                  raise final_refusal(self, "KafkaSink cannot flush: the sink is closed")
@@ -496,9 +532,11 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
 +    def _await_reports(self, reports: _Reports, produced: list[int]) -> bool:
 +        """Waits until every produced position has a report, the queue drains, or time is up.
 +
-+        Each pass asks ``flush(0)``, which serves the reports already in and returns at once with
-+        the producer's queue length, then polls for one slice. The stop signal ends the wait after
-+        the first slice.
++        Each pass asks ``flush(slice)``: it serves reports for at most one slice and, while it
++        runs, holds the producer's flushing mark, so ``linger.ms`` does not hold back what is
++        queued, and it returns with the producer's queue length. A pass that served nothing waits
++        out the rest of its slice. A set stop signal ends the wait once the first slice, measured
++        from the start, has passed.
 +
 +        Args:
 +          reports: The round's report table.
@@ -510,29 +548,30 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
 +        Raises:
 +          None. Whatever the producer raises propagates.
 +        """
-+        deadline = time.monotonic() + self.flush_timeout
++        began = time.monotonic()
++        deadline = began + self.flush_timeout
++        first_slice_end = began + _REPORT_SLICE
 +        stop = self.log_foundry_stop_signal
-+        first = True
 +        while True:
-+            remaining = self.producer.flush(0)
++            seen = len(reports.reports)
++            now = time.monotonic()
++            slice_start = now
++            slice_ = max(0.0, min(deadline - now, _REPORT_SLICE))
++            remaining = self.producer.flush(slice_)
 +            if all(position in reports.reports for position in produced):
 +                return False
 +            if type(remaining) is int and remaining == 0:
 +                return True
-+            left = deadline - time.monotonic()
-+            if left <= 0 or (not first and stop is not None and stop.is_set()):
++            now = time.monotonic()
++            if now >= deadline or (now >= first_slice_end and stop is not None and stop.is_set()):
 +                return False
-+            began = time.monotonic()
-+            slice_ = min(left, _REPORT_SLICE)
-+            served = self.producer.poll(slice_)
-+            first = False
-+            if not (type(served) is int and served > 0):
-+                wait(slice_ - (time.monotonic() - began), stop)
++            if len(reports.reports) == seen:
++                wait(slice_ - (now - slice_start), pause_on(stop))
 +
      def _flush_bounded(self) -> None:
          """Flushes the producer within a bound, counting whatever it could not deliver (FR-006).
  
-@@ -467,16 +639,7 @@
+@@ -467,16 +646,7 @@
          Raises:
            Exception: Whatever the producer raises, which ``close``'s caller already handles.
          """
@@ -550,7 +589,7 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
      def _key(self, event: dict[str, object]) -> bytes | None:
          """Derives one message's partition key from the configured field.
-@@ -496,29 +659,25 @@
+@@ -496,29 +666,25 @@
          value = event.get(self.key_field)
          return str(value).encode("utf-8") if value is not None else None
  
@@ -595,11 +634,15 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
  
  def _code(err: object) -> str:
-diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
+diff -ruN a/src/log_foundry/sinks/pubsub.py b/src/log_foundry/sinks/pubsub.py
 --- a/src/log_foundry/sinks/pubsub.py	2026-11-16 08:42:00
-+++ b/src/log_foundry/sinks/pubsub.py	2026-11-16 08:43:25
-@@ -8,12 +8,16 @@
- from typing import Any
++++ b/src/log_foundry/sinks/pubsub.py	2026-11-16 09:55:35
+@@ -5,16 +5,22 @@
+ import json
+ import threading
+ import time
+-from typing import Any
++from typing import TYPE_CHECKING, Any
  
  from log_foundry import _diag
 -from log_foundry.sinks._deferral import Deferral
@@ -610,15 +653,19 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
 +from log_foundry.sinks._engine import When, emit_via_deliver, run_context
  from log_foundry.sinks._extras import import_extra
  from log_foundry.sinks._refusal import final_refusal
- from log_foundry.sinks._retry import floor_count, usable_timeout, wait
+-from log_foundry.sinks._retry import floor_count, usable_timeout, wait
 -from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
++from log_foundry.sinks._retry import floor_count, pause_on, usable_timeout, wait
 +from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
-+from log_foundry.sinks.base import SinkLosses
 +from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
  
++if TYPE_CHECKING:
++    from log_foundry.sinks.base import SinkLosses
++
  __all__ = ["GooglePubSubSink"]
  
-@@ -162,199 +166,78 @@
+ 
+@@ -162,199 +168,78 @@
          self.client = client
          self.overflow_timeout = usable_timeout(overflow_timeout, DEFAULT_OVERFLOW_TIMEOUT)
          self.log_foundry_stop_signal: threading.Event | None = None
@@ -849,7 +896,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
  
          Returns:
            None.
-@@ -362,257 +245,216 @@
+@@ -362,257 +247,219 @@
          Raises:
            None.
          """
@@ -1174,25 +1221,28 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
 -            f"GooglePubSubSink, {len(expired)} publish(es) still in flight when the "
 -            f"{self.overflow_timeout}s close bound expired",
 -        )
-+        deadline = time.monotonic() + self.overflow_timeout
++        began = time.monotonic()
++        deadline = began + self.overflow_timeout
++        first_slice_end = began + _POLL_INTERVAL
 +        stop = self.log_foundry_stop_signal
-+        first = True
 +        settled: list[tuple[int, str, str]] = []
 +        for position, future in futures:
 +            outcome: tuple[str, str] | None = None
 +            while outcome is None:
-+                left = deadline - time.monotonic()
-+                stopping = not first and stop is not None and stop.is_set()
++                now = time.monotonic()
++                left = deadline - now
++                stopping = now >= first_slice_end and stop is not None and stop.is_set()
 +                slice_ = 0.0 if stopping or left <= 0 else min(left, _POLL_INTERVAL)
-+                first = False
-+                began = time.monotonic()
 +                try:
 +                    future.result(timeout=slice_)
-+                except TimeoutError:
++                except TimeoutError as err:
++                    if _resolved(future):
++                        outcome = ("unknown", _diag.type_name(err))
++                        break
 +                    if stopping or left <= 0:
 +                        outcome = ("unknown", "no result within the bound")
 +                        break
-+                    wait(slice_ - (time.monotonic() - began), stop)
++                    wait(slice_ - (time.monotonic() - now), pause_on(stop))
 +                    continue
 +                except TypeError:
 +                    outcome = ("unknown", "a future that takes no timeout")
@@ -1264,7 +1314,7 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
  
      def flush(self) -> None:
          """Resolves the outstanding publish futures without closing the sink (SPEC-036 FR-002).
-@@ -648,28 +490,7 @@
+@@ -648,28 +495,7 @@
          """
          if self._closed:
              raise final_refusal(self, "GooglePubSubSink cannot flush: the sink is closed")
@@ -1293,12 +1343,31 @@ diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
      def close(self) -> None:
          """Resolves the pending publish futures within a bound, counting the rest (FR-008).
  
-@@ -715,8 +536,26 @@
+@@ -715,8 +541,45 @@
          """
          with self._futures_lock:
              self._closed = True
 -            pending, self._futures = self._futures, []
 -        self._drain_pending(pending)
++
++
++def _resolved(future: Any) -> bool:
++    """Whether a future has resolved, so a ``TimeoutError`` from it is its own outcome.
++
++    Args:
++      future: The publish future.
++
++    Returns:
++      True when its ``done()`` answers true; False when it has none or the call fails.
++
++    Raises:
++      None.
++    """
++    done = getattr(future, "done", None)
++    try:
++        return callable(done) and bool(done())
++    except Exception:
++        return False
 +
 +
 +def _is_definitive(err: Exception) -> bool:
