@@ -450,8 +450,8 @@ other threads' open spans are swept by no `flush()` is superseded: after this sp
 its sweep. One SPEC-089 criterion asserts the old bound and inverts: "A span left open on another
 thread with 2 buffered events is in no count, and `health().events.open_spans == 2` after the
 call" (`docs/specs/SPEC-089-flush-loss-counts.md:213-215`). Its test, the one SPEC-089's build adds
-with that assertion (`grep -rn 'open_spans == 2' tests/`), is rewritten: the other thread's span
-buffers its `span.start` and 2 logs, the 2 logs are delivered by the call and are in its window,
+with that assertion (`grep -rn 'events.open_spans == 2' tests/`), is rewritten: the other thread's
+span buffers its `span.start` and 2 logs, the 2 logs are delivered by the call and are in its window,
 and `health().events.open_spans == 1` after it, the held `span.start`.
 
 **The harnesses.** Both span identities count submissions: `tests/test_invariants_model.py:567`,

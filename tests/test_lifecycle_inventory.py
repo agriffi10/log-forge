@@ -902,6 +902,9 @@ INVENTORY: dict[Key, Row] = {
     _c("worker.py", "Worker.__init__", "self._drain_settled", "Event"): Row(
         "Worker", _W, "the drain loop's second event, ordered against the first"
     ),
+    _c("worker.py", "Worker.__init__", "self._drain_accounted", "Event"): Row(
+        "Worker", _W, "the drain loop's third event: its last debit is made (SPEC-089)"
+    ),
     _c("worker.py", "Worker.__init__", "self._lock", "Lock"): Row(
         "Worker", _W, "guards the worker's counters, markers and _stopped"
     ),
@@ -1090,6 +1093,7 @@ INVENTORY: dict[Key, Row] = {
     _wk("_epoch"): Row("Worker", _INH, "the retirement count at this worker's build"),
     _wk("_drain_finished"): Row("Worker", ("walk", _REBUILD), "the drain loop's own event"),
     _wk("_drain_settled"): Row("Worker", ("walk", _REBUILD), "the drain loop's own event"),
+    _wk("_drain_accounted"): Row("Worker", ("walk", _REBUILD), "the drain loop's own event"),
     _wk("_stopped"): Row("Worker", (_REBUILD,), "the once-only stop gate of one worker"),
     _wk("_exit_deadline"): Row("Worker", (_REBUILD,), "the drain's deadline (SPEC-062)"),
     _wk("_join_owed"): Row("Worker", (_REBUILD,), "the join a stop on the drain thread owes"),

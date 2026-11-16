@@ -707,7 +707,8 @@ baggage; a task's events carry its own `span_id`.
 
 ## 10. The public surface only grows, and hands out nothing the library reads
 
-Every public dataclass is keyword-only and grows by appending; results grow by new reason values;
+Every public dataclass is keyword-only and grows by appending; results grow by new reason values
+and by appended keyword fields, never by a changed `__bool__` (SPEC-089);
 `Mapping` in, copies out; `Sink`'s members are abstract so a typo cannot instantiate; the worker's
 tunables are unreachable from `configure()` (SPEC-034, SPEC-051).
 

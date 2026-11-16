@@ -159,7 +159,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("Worker.submit", "self._lock"): 1,
             ("Worker._count_undeliverable", "self._lock"): 1,
             ("Worker.health", "self._lock"): 1,
-            ("Worker.flush", "self._lock"): 1,
+            ("Worker._flush_marked", "self._lock"): 1,
             ("Worker.retarget", "self._lock"): 3,
             ("Worker._record_incomplete_swap", "self._lock"): 1,
             ("Worker.claim_stop", "self._lock"): 1,

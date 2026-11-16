@@ -399,9 +399,14 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "None` branch, and the fall-through still builds nothing."
         ),
     ),
-    ("_flush_worker", "worker.flush(timeout)", 0): (
+    ("_flush_worker", "worker._flush_marked(timeout, counted=counted)", 0): (
         LIVENESS,
         (
+            "re-keyed from `worker.flush(timeout)` at SPEC-089 FR-003, the same question, and "
+            "from `counted=True` after its second diff review, when a start that could not be "
+            "read stopped asking the drain for a snapshot: "
+            "`_flush_marked` is `Worker.flush`'s body, now also returning the marker it queued "
+            "so the caller can close the window's counts. "
             "who *performs* the drain, and a retired worker performs nothing — `Worker.flush` "
             "returns a falsy result with reason `retired` as its first statement, before the "
             "liveness check and before any queue work. It is a **binding** because SPEC-036 "
@@ -413,6 +418,71 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "to be discovered at build time against a red test, and settles it as a category that "
             "already exists: an earlier draft claimed none of the four described performing a "
             "drain, which is false against LIVENESS's own definition."
+        ),
+    ),
+    ("_flush_worker", "_open_window()", 0): (
+        EXISTENCE,
+        (
+            "the start of the flush's counted window (SPEC-089 FR-002), read before the sweep. "
+            "It reads the event ledger through `_ledger_reading`, which takes the process worker "
+            "by existence, retired or not, for the reason `_worker_health`'s ledger row gives: a "
+            "retired worker's queue is the ledger's stranded term, and a flush after shutdown "
+            "must see it rise."
+        ),
+    ),
+    ("_flush_worker", "_close_window(worker, marker, deadline, start) if counted else None", 0): (
+        EXISTENCE,
+        (
+            "the end of the flush's counted window (SPEC-089 FR-003), handed the worker the "
+            "existence binding above found, and skipped when the start could not be read (the "
+            "second diff review, MINOR 5). A retired worker is read rather than skipped: the "
+            "buffers a post-shutdown flush sweeps into its queue are what the result counts as "
+            "stranded, which liveness would report as no worker and no loss. It is handed the "
+            "start too, whose pid says which process the wait for a dying drain belongs to (the "
+            "execution-frame review, MINOR 1)."
+        ),
+    ),
+    (
+        "_await_accounting",
+        "worker._drain_accounted.wait(step) or (left is not None and left <= step)",
+        0,
+    ): (
+        LIVENESS,
+        (
+            "has the dying drain made its last debit, so that what it held is in drain_lost and "
+            "its queue stranded (SPEC-089 FR-003) — `_close_window`'s dying test, asked again "
+            "slice by slice. The wait is sliced only so that a thread forked during it stops "
+            "waiting on the child's resumed drain, which sets the event when it ends (the "
+            "execution-frame review, MINOR 1); the second half is the deadline, not a worker "
+            "question."
+        ),
+    ),
+    (
+        "_close_window",
+        "worker is not None and threading.current_thread() is not worker._thread",
+        0,
+    ): (
+        MOMENT,
+        (
+            "is the calling thread the drain thread right now (SPEC-089 FR-003) — the guard "
+            "`Worker.claim_stop` and `Worker.stop` use. A flush made from the dying drain's own "
+            "stderr line runs on that thread, and joining it would wait for itself; `join` "
+            "raises there. The `is not None` half is existence: with no worker there is no "
+            "drain to wait for and the end is read at once."
+        ),
+    ),
+    (
+        "_close_window",
+        "unwinding or (worker._drain_finished.is_set() and worker._thread.is_alive())",
+        0,
+    ): (
+        LIVENESS,
+        (
+            "is the drain dying, so that what it held is not yet in drain_lost and its queue not "
+            "yet stranded (SPEC-089 FR-003). Thread liveness, not `_drain_finished` alone: the "
+            "flag is set before `_terminal_failure` debits and the thread ends after it, so the "
+            "wait is for the thread. An expired shutdown leaves the flag clear on a drain still "
+            "working, which is why its pessimistic answer causes no wait."
         ),
     ),
     ("_flush", "_lifecycle._get_worker()", 0): (
@@ -1500,8 +1570,21 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 96, "log_foundry.decorator": 4}
+_SITE_FLOOR = {"log_foundry._lifecycle": 101, "log_foundry.decorator": 4}
 """The floor each walked module must still meet, by name.
+
+**Raised from 100 to 101 at SPEC-089's execution-frame review, to the count measured on its
+branch.** The wait for a dying drain moved into `_await_accounting`, sliced so that a forked thread
+leaves it, and its slice test is one new site, filed above. The `_close_window` binding was re-keyed
+in place to pass the window's start, adding none.
+
+**Raised from 96 to 100 at SPEC-089, to the count measured on its branch.** SPEC-089 adds four
+sites, all filed above: `_flush_worker`'s two window reads (`_open_window()`,
+`_close_window(worker, marker, deadline)`) and `_close_window`'s two tests (the drain-thread guard
+and the dying-drain test). `worker.flush(timeout)` was re-keyed in place to
+`worker._flush_marked(timeout, counted=True)`, adding none. Its second diff review re-keyed that
+row and the `_close_window` binding again, to `counted=counted` and to the conditional end read,
+adding none: the count measured on the branch after it is still 100. `decorator` stays at 4.
 
 **Raised from 92 to 96 at SPEC-088, to the count measured on its branch.** `_per_module_sites()`
 read 94 for `_lifecycle` at `9d05e793`, the two sites added by the specs since the last raise
