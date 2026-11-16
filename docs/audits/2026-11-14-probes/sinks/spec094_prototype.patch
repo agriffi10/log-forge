@@ -1,0 +1,1393 @@
+diff -ruN a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 08:42:00
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-16 09:28:18
+@@ -69,6 +69,18 @@
+         "ChannelClosedByBroker": ("AMQPError",),
+     },
+     "psycopg.errors": {"Error": (), "OperationalError": ("Error",)},
++    "google.api_core.exceptions": {
++        "GoogleAPIError": (),
++        "GoogleAPICallError": ("GoogleAPIError",),
++        "ClientError": ("GoogleAPICallError",),
++        "Forbidden": ("ClientError",),
++        "PermissionDenied": ("Forbidden",),
++        "BadRequest": ("ClientError",),
++        "InvalidArgument": ("BadRequest",),
++        "ServerError": ("GoogleAPICallError",),
++        "GatewayTimeout": ("ServerError",),
++        "DeadlineExceeded": ("GatewayTimeout",),
++    },
+     "redis.exceptions": {
+         "RedisError": (),
+         "ConnectionError": ("RedisError",),
+@@ -918,7 +930,7 @@
+         for carried, callback in queue:
+             if self.backend.fault == "never-acknowledged":
+                 if callback is not None:
+-                    callback(KafkaError(29), None)
++                    callback(KafkaError(87), None)
+             elif self.backend.fault == "report-indefinite":
+                 self.backend.take(carried)
+                 if callback is not None:
+@@ -949,9 +961,13 @@
+             if self.settled or fault == "report-indefinite":
+                 self.backend.take(self.carried)
+         if fault == "never-acknowledged":
+-            raise PermissionDenied("the topic refused the publish")
++            raise driver_error(
++                "google.api_core.exceptions", "InvalidArgument", "the topic refused the publish"
++            )
+         if fault == "report-indefinite":
+-            raise DeadlineExceeded("the publish deadline passed")
++            raise driver_error(
++                "google.api_core.exceptions", "DeadlineExceeded", "the publish deadline passed"
++            )
+         return "id"
+ 
+     def exception(self, timeout: float | None = None) -> BaseException | None:
+diff -ruN a/src/log_foundry/sinks/_retry.py b/src/log_foundry/sinks/_retry.py
+--- a/src/log_foundry/sinks/_retry.py	2026-11-16 08:42:00
++++ b/src/log_foundry/sinks/_retry.py	2026-11-16 09:40:03
+@@ -331,6 +331,25 @@
+     return max(exact_int(value, name, owner), floor)
+ 
+ 
++def pause_on(stop: threading.Event | None) -> threading.Event | None:
++    """The event a pause between two asks for a report may be cut short by (SPEC-094).
++
++    A stop signal already set would end :func:`wait` at once, so a wait that keeps asking for one
++    slice after the stop would ask in a tight loop, measured burning CPU for the whole slice.
++    Such a pause is waited out in full instead; one not yet set still cuts it short.
++
++    Args:
++      stop: The worker's shutdown event, or ``None``.
++
++    Returns:
++      ``stop`` when it is not set, else ``None``.
++
++    Raises:
++      None.
++    """
++    return None if stop is not None and stop.is_set() else stop
++
++
+ def wait_budget(value: float | None, name: str) -> float | None:
+     """Returns the wait a public ``timeout`` asks for, or refuses one with no meaning (SPEC-066).
+ 
+diff -ruN a/src/log_foundry/sinks/kafka.py b/src/log_foundry/sinks/kafka.py
+--- a/src/log_foundry/sinks/kafka.py	2026-11-16 08:42:00
++++ b/src/log_foundry/sinks/kafka.py	2026-11-16 09:55:35
+@@ -3,22 +3,87 @@
+ from __future__ import annotations
+ 
+ import json
+-import threading
+-from typing import Any
++import time
++from typing import TYPE_CHECKING, Any
+ 
+ from log_foundry import _diag
++from log_foundry.sinks import _engine
+ from log_foundry.sinks._args import refuse_with_injected
+-from log_foundry.sinks._deferral import Deferral
+-from log_foundry.sinks._encode import encode_events
++from log_foundry.sinks._encode import encode_round
++from log_foundry.sinks._engine import When, emit_via_deliver, run_context
+ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+-from log_foundry.sinks._retry import usable_timeout
+-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
++from log_foundry.sinks._retry import pause_on, usable_timeout, wait
++from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
++from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
++if TYPE_CHECKING:
++    import threading
++
++    from log_foundry.sinks.base import SinkLosses
++
+ __all__ = ["KafkaSink"]
+ 
++DEFINITIVE_CODES = frozenset({21, 87})
++"""Kafka protocol codes no attempt of the refused message could have escaped (SPEC-094)."""
+ 
++_REPORT_SLICE = 0.05
++"""Seconds one pass of the round's report wait flushes for, and the first slice's length."""
++
++
++class _Reports:
++    """One round's delivery reports by position, closed to late reports once the round settles."""
++
++    __slots__ = ("reports", "settled")
++
++    def __init__(self) -> None:
++        """Starts with no report.
++
++        Args:
++          None.
++
++        Returns:
++          None.
++
++        Raises:
++          None.
++        """
++        self.reports: dict[int, object] = {}
++        self.settled = False
++
++    def callback(self, position: int) -> Any:
++        """Returns the delivery callback for the message at ``position``.
++
++        Args:
++          position: The message's position in the round's batch.
++
++        Returns:
++          The callback.
++
++        Raises:
++          None.
++        """
++
++        def report(err: object, msg: object) -> None:
++            """Records one report; one arriving after the round settled changes nothing.
++
++            Args:
++              err: The delivery error, or ``None``.
++              msg: The message, unused.
++
++            Returns:
++              None.
++
++            Raises:
++              None.
++            """
++            if not self.settled:
++                self.reports[position] = err
++
++        return report
++
++
+ def _usable_timeout(value: float) -> float:
+     """Returns a flush timeout that is actually a bound, or the default.
+ 
+@@ -171,12 +236,88 @@
+         self.producer = producer
+         self.key_field = key_field
+         self.flush_timeout = _usable_timeout(flush_timeout)
+-        self.failed = 0
+-        self.rejected = 0
+-        self._counter_lock = threading.Lock()
++        self.log_foundry_counters = SinkCounters()
++        self.log_foundry_stop_signal: threading.Event | None = None
+         self._guard = ClosedGuard(GuardMode.CLOSE_ONLY)
+ 
+     @property
++    def _counter_lock(self) -> threading.Lock:
++        """The counters' lock.
++
++        Args:
++          None.
++
++        Returns:
++          The lock.
++
++        Raises:
++          None.
++        """
++        return self.log_foundry_counters._counter_lock
++
++    @property
++    def failed(self) -> int:
++        """Messages refused or unconfirmed, the engine's ``failed_events``.
++
++        Args:
++          None.
++
++        Returns:
++          The count.
++
++        Raises:
++          None.
++        """
++        return self.log_foundry_counters.failed_events
++
++    @failed.setter
++    def failed(self, value: int) -> None:
++        """Sets the count.
++
++        Args:
++          value: The new count.
++
++        Returns:
++          None.
++
++        Raises:
++          None.
++        """
++        with self._counter_lock:
++            self.log_foundry_counters.failed_events = value
++
++    @property
++    def rejected(self) -> int:
++        """Messages that never left the process, the engine's ``dropped_events``.
++
++        Args:
++          None.
++
++        Returns:
++          The count.
++
++        Raises:
++          None.
++        """
++        return self.log_foundry_counters.dropped_events
++
++    @rejected.setter
++    def rejected(self, value: int) -> None:
++        """Sets the count.
++
++        Args:
++          value: The new count.
++
++        Returns:
++          None.
++
++        Raises:
++          None.
++        """
++        with self._counter_lock:
++            self.log_foundry_counters.dropped_events = value
++
++    @property
+     def _closed(self) -> bool:
+         """Whether a close has begun: the 1.x name, read-only, answered by the guard (SPEC-076).
+ 
+@@ -215,119 +356,141 @@
+         return self._guard._lock
+ 
+     def losses(self) -> SinkLosses:
+-        """Reports refused and undelivered messages (SPEC-026 FR-002).
++        """Reports the engine's totals.
+ 
+-        A callback failure never makes :meth:`emit` raise, and the reason is ownership rather
+-        than timing — ``poll(0)`` runs inside ``emit``, so a callback for a message produced
+-        earlier in the same batch can and does fire before it returns. Once the producer has
+-        accepted a message it owns delivery, including its own retries, and re-producing it from
+-        here would duplicate whatever the producer eventually lands.
+-
+         Args:
+           None.
+ 
+         Returns:
+-          The counters. Refusals are reported as ``dropped``, since nothing ever left the
+-          process, while ``failed`` is the delivery callback's verdict on a message the producer
+-          did accept. A refusal is counted and announced only when ``emit`` returns (SPEC-059
+-          FR-003), so ``dropped`` holds the refusals of batches whose other messages were handed
+-          off. A batch refused whole raised instead and is counted where the raise was caught —
+-          the worker's ``failed_batches`` once its retries are spent, ``orphan_lost`` outside a
+-          span, or a ``MultiSink``'s own ``failed`` when a sibling delivered — and a retry that
+-          hands it off counts nothing. An event :meth:`emit` could not encode is counted in the
+-          same ``rejected`` (SPEC-069 FR-001): it never left the process either.
++          The counters.
+ 
+         Raises:
+           None.
+         """
+-        with self._counter_lock:
+-            return SinkLosses(dropped=self.rejected, failed=self.failed)
++        return self.log_foundry_counters.losses()
+ 
+     def emit(self, batch: list[dict[str, object]]) -> None:
+-        """Produces one message per event and serves delivery callbacks without blocking.
++        """Delivers the batch through the engine inline.
+ 
+-        ``produce()`` is a local hand-off, so what it refuses is the only failure this call can
+-        observe (FR-002). A refusal is counted and announced only when ``emit`` returns, through
+-        the deferral helper whose ``with`` encloses the produce loop and the total-failure raise
+-        (SPEC-059 FR-003). A partial refusal returns, so its count lands then, with one line per
+-        refused message naming that message's own exception type, bound as the refusal was
+-        decided; the messages that were accepted are already on their way, so it is not retried.
+-        When every message was refused the call raises and counts nothing — whoever catches the
+-        raise owns the batch, so a batch refused on one attempt and accepted on the next records
+-        no loss that never happened. A raise mid-loop (``poll``) discards the refusals too. A
+-        delivery callback ``poll(0)`` serves counts ``failed`` immediately, which stays an upper
+-        bound this does not defer.
++        Args:
++          batch: The events to produce.
+ 
+-        Every event's body and key are encoded before the first produce (SPEC-069 FR-001). One
+-        that cannot be encoded is dropped into ``rejected``, counted and announced only when this
+-        call returns, with one line per call; before, the messages ahead of it were already
+-        produced when its encode raised, and the worker's retry produced them again. A batch of
+-        nothing encodable produces nothing and returns (FR-002), and the total-refusal raise
+-        counts the encodable messages only.
++        Returns:
++          None.
+ 
+-        A closed or closing sink refuses the batch before touching the producer (SPEC-032
+-        FR-001). Refusing is not a loss this sink absorbed, so it moves no counter here: it
+-        is a failure reported to the worker, which records it in
+-        ``health().failed_batches``. The produce loop is a ``CLOSE_ONLY`` section of the
+-        guard rather than a lock held across it, which would serialize a client
+-        ``confluent-kafka`` documents as thread-safe (SPEC-076 FR-003). A close that lands
+-        while a call is producing waits for it, for at most ``CLOSE_OVERLAP_WAIT``, so the
+-        close's flush walks what it produced. A call the close's release overtook anyway
+-        is told so, and the messages it handed to the producer are counted in ``failed``
+-        at once, beside :meth:`_on_delivery`'s count, with one line naming the count: the
+-        release's flush may have delivered some of them, so it is the upper bound
+-        invariant 2 records for ``failed``, and nothing this call accepted goes uncounted.
+-        That count is made only when this call returns normally; one that raises leaves
+-        its whole batch to its catcher.
++        Raises:
++          SinkDeliveryError: When the run failed.
++        """
++        emit_via_deliver(self, batch)
+ 
++    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
++        """Runs one round and reports each event's fate by index (SPEC-094 FR-001).
++
+         Args:
+-          batch: The events to produce.
++          batch: The events.
+ 
+         Returns:
++          The round's verdict.
++
++        Raises:
+           None.
++        """
++        return _engine.one_round(self._round, batch)
+ 
++    def _round(self, batch: list[dict[str, object]]) -> Verdict:
++        """Produces every remaining message, then waits for the round's delivery reports.
++
++        Args:
++          batch: The events this round is offered.
++
++        Returns:
++          A verdict with one outcome per event of ``batch``.
++
+         Raises:
+-          SinkDeliveryError: When the sink is closed or closing, or when every message was
+-            refused so the batch reached nothing — the total failure the worker's retry exists
+-            for (SPEC-026 FR-001). Either leaves no refusal counted.
++          None.
+         """
+-        if not batch:
+-            return
+-        accepted = 0
+         with self._guard.enter() as section:
+             if not section:
+-                raise final_refusal(
+-                    self,
+-                    f"KafkaSink produced none of {len(batch)} message(s): the sink is closed"
++                run_context().refuse(
++                    final_refusal(
++                        self,
++                        f"KafkaSink produced none of {len(batch)} message(s): the sink is closed",
++                    )
+                 )
+-            with Deferral(self) as pending:
+-                refused: list[str] = []
+-                messages = encode_events(
+-                    batch, self._encode, pending, sink=_diag.type_name(self), counter="rejected"
+-                )
+-                if not messages:
+-                    return
+-                for _, (body, key) in messages:
+-                    try:
+-                        self.producer.produce(
+-                            self.topic, value=body, key=key, callback=self._on_delivery
+-                        )
+-                    except Exception as err:
+-                        refused.append(_diag.type_name(err))
+-                        continue
+-                    accepted += 1
+-                    self.producer.poll(0)
+-                if refused:
+-                    pending.count("rejected", len(refused))
+-                    pending.announce(lambda: self._announce_refused(refused))
+-                if not accepted:
+-                    raise SinkDeliveryError(
+-                        f"KafkaSink produced none of {len(messages)} message(s)"
++                return Verdict.uniform(Outcome.REJECTED, len(batch))
++            context = run_context()
++            fates = [Outcome.DROPPED] * len(batch)
++            name = _diag.type_name(self)
++            reports = _Reports()
++            produced: list[int] = []
++            refused: list[tuple[int, str]] = []
++            for position, (body, key) in encode_round(self, batch, self._encode, sink=name):
++                mark_sent(self, [batch[position]])
++                try:
++                    self.producer.produce(
++                        self.topic, value=body, key=key, callback=reports.callback(position)
+                     )
+-        if section.released_during and accepted:
+-            with self._counter_lock:
+-                self.failed += accepted
+-            _diag.lost("message", accepted, "KafkaSink, produced while the sink was closing")
++                except Exception as err:
++                    refused.append((position, _diag.type_name(err)))
++                    continue
++                produced.append(position)
++                self.producer.poll(0)
++            lost = Lost(self)
++            if refused and not produced:
++                for position, kind in refused:
++                    fates[position] = Outcome.RETRYABLE
++                    lost.add(
++                        [batch[position]],
++                        when=When.LAST,
++                        key=kind,
++                        line=raised_line("message", "KafkaSink produce", kind),
++                    )
++                lost.register()
++                return Verdict(outcomes=tuple(fates))
++            kinds = [kind for _, kind in refused]
++            if kinds:
++                context.announce(
++                    lambda: [_diag.lost("message", 1, f"KafkaSink produce, {k}") for k in kinds],
++                    when=When.SETTLED,
++                )
++            if not produced:
++                return Verdict(outcomes=tuple(fates))
++            drained = self._await_reports(reports, produced)
++            reports.settled = True
++            seen = dict(reports.reports)
++            definitive: list[str] = []
++            unknown = 0
++            for position in produced:
++                if position not in seen:
++                    fates[position] = Outcome.ACCEPTED if drained else Outcome.UNKNOWN
++                    unknown += 0 if drained else 1
++                    continue
++                err = seen[position]
++                if err is None:
++                    fates[position] = Outcome.ACCEPTED
++                elif _is_definitive(err):
++                    fates[position] = Outcome.REJECTED
++                    definitive.append(f"{_diag.type_name(err)}{_code(err)}")
++                else:
++                    fates[position] = Outcome.UNKNOWN
++                    unknown += 1
++            if definitive:
++                context.announce(
++                    lambda: [_diag.lost("message", 1, f"KafkaSink delivery, {k}") for k in definitive],
++                    when=When.ALWAYS,
++                )
++            if unknown:
++                timeout = self.flush_timeout
++                context.announce(
++                    lambda: _diag.lost(
++                        "message",
++                        unknown,
++                        f"KafkaSink, no definitive delivery report within {timeout}s; may have "
++                        "landed, not retried",
++                    ),
++                    when=When.ALWAYS,
++                )
++        return Verdict(outcomes=tuple(fates))
+ 
+     def _encode(self, event: dict[str, object]) -> tuple[bytes, bytes | None]:
+         """Encodes one event as its message body and partition key.
+@@ -351,24 +514,6 @@
+         """
+         return json.dumps(event).encode("utf-8"), self._key(event)
+ 
+-    def _announce_refused(self, kinds: list[str]) -> None:
+-        """Writes one line per message ``produce()`` refused, naming its exception type (FR-002).
+-
+-        Called by the calling ``emit``'s deferral after the count is committed, outside the
+-        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-003).
+-
+-        Args:
+-          kinds: Each refused message's exception type name, in the order they were refused.
+-
+-        Returns:
+-          None.
+-
+-        Raises:
+-          None.
+-        """
+-        for kind in kinds:
+-            _diag.lost("message", 1, f"KafkaSink produce, {kind}")
+-
+     def close(self) -> None:
+         """Flushes the producer so buffered messages are delivered before exit (FR-002).
+ 
+@@ -428,13 +573,47 @@
+         with self._guard.enter() as section:
+             if not section:
+                 raise final_refusal(self, "KafkaSink cannot flush: the sink is closed")
+-            remaining = self.producer.flush(self.flush_timeout)
+-        if type(remaining) is int and remaining > 0:
+-            raise SinkDeliveryError(
+-                f"KafkaSink flushed within {self.flush_timeout}s with {remaining} "
+-                "message(s) still queued"
+-            )
++            self.producer.flush(0)
+ 
++    def _await_reports(self, reports: _Reports, produced: list[int]) -> bool:
++        """Waits until every produced position has a report, the queue drains, or time is up.
++
++        Each pass asks ``flush(slice)``: it serves reports for at most one slice and, while it
++        runs, holds the producer's flushing mark, so ``linger.ms`` does not hold back what is
++        queued, and it returns with the producer's queue length. A pass that served nothing waits
++        out the rest of its slice. A set stop signal ends the wait once the first slice, measured
++        from the start, has passed.
++
++        Args:
++          reports: The round's report table.
++          produced: The positions produced this round.
++
++        Returns:
++          Whether the producer's queue read empty, so an unreported message was delivered.
++
++        Raises:
++          None. Whatever the producer raises propagates.
++        """
++        began = time.monotonic()
++        deadline = began + self.flush_timeout
++        first_slice_end = began + _REPORT_SLICE
++        stop = self.log_foundry_stop_signal
++        while True:
++            seen = len(reports.reports)
++            now = time.monotonic()
++            slice_start = now
++            slice_ = max(0.0, min(deadline - now, _REPORT_SLICE))
++            remaining = self.producer.flush(slice_)
++            if all(position in reports.reports for position in produced):
++                return False
++            if type(remaining) is int and remaining == 0:
++                return True
++            now = time.monotonic()
++            if now >= deadline or (now >= first_slice_end and stop is not None and stop.is_set()):
++                return False
++            if len(reports.reports) == seen:
++                wait(slice_ - (now - slice_start), pause_on(stop))
++
+     def _flush_bounded(self) -> None:
+         """Flushes the producer within a bound, counting whatever it could not deliver (FR-006).
+ 
+@@ -467,16 +646,7 @@
+         Raises:
+           Exception: Whatever the producer raises, which ``close``'s caller already handles.
+         """
+-        remaining = self.producer.flush(self.flush_timeout)
+-        if type(remaining) is not int or remaining <= 0:
+-            return
+-        with self._counter_lock:
+-            self.failed += remaining
+-        _diag.lost(
+-            "message",
+-            remaining,
+-            f"KafkaSink, still queued when the {self.flush_timeout}s close flush expired",
+-        )
++        self.producer.flush(self.flush_timeout)
+ 
+     def _key(self, event: dict[str, object]) -> bytes | None:
+         """Derives one message's partition key from the configured field.
+@@ -496,29 +666,25 @@
+         value = event.get(self.key_field)
+         return str(value).encode("utf-8") if value is not None else None
+ 
+-    def _on_delivery(self, err: object, msg: object) -> None:
+-        """Counts and logs a delivery failure, as ``confluent-kafka``'s callback (FR-002).
+ 
+-        The error is a ``KafkaError`` rather than an exception, so it goes to
+-        :func:`~log_foundry._diag.lost` rather than ``absorbed``. Its ``str`` is a human message
+-        that can quote the record, so only the type and the numeric code are written — the code
+-        is librdkafka's own enumeration and is what makes a delivery failure diagnosable
+-        (SPEC-029 FR-002).
++def _is_definitive(err: object) -> bool:
++    """Reports whether a delivery error says the broker did not write the message.
+ 
+-        Args:
+-          err: The delivery error, or ``None`` on success.
+-          msg: The message the callback describes, unused.
++    Args:
++      err: The delivery error.
+ 
+-        Returns:
+-          None.
++    Returns:
++      True when its code is in :data:`DEFINITIVE_CODES`.
+ 
+-        Raises:
+-          None.
+-        """
+-        if err is not None:
+-            with self._counter_lock:
+-                self.failed += 1
+-            _diag.lost("message", 1, f"KafkaSink delivery, {_diag.type_name(err)}{_code(err)}")
++    Raises:
++      None.
++    """
++    try:
++        code = getattr(err, "code", None)
++        value = code() if callable(code) else None
++        return type(value) is int and value in DEFINITIVE_CODES
++    except Exception:
++        return False
+ 
+ 
+ def _code(err: object) -> str:
+diff -ruN a/src/log_foundry/sinks/pubsub.py b/src/log_foundry/sinks/pubsub.py
+--- a/src/log_foundry/sinks/pubsub.py	2026-11-16 08:42:00
++++ b/src/log_foundry/sinks/pubsub.py	2026-11-16 09:55:35
+@@ -5,16 +5,22 @@
+ import json
+ import threading
+ import time
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ from log_foundry import _diag
+-from log_foundry.sinks._deferral import Deferral
+-from log_foundry.sinks._encode import encode_events
++from log_foundry.sinks import _engine
++from log_foundry.sinks._classify import driver_classes
++from log_foundry.sinks._encode import encode_round
++from log_foundry.sinks._engine import When, emit_via_deliver, run_context
+ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._refusal import final_refusal
+-from log_foundry.sinks._retry import floor_count, usable_timeout, wait
+-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
++from log_foundry.sinks._retry import floor_count, pause_on, usable_timeout, wait
++from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
++from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
++if TYPE_CHECKING:
++    from log_foundry.sinks.base import SinkLosses
++
+ __all__ = ["GooglePubSubSink"]
+ 
+ 
+@@ -162,199 +168,78 @@
+         self.client = client
+         self.overflow_timeout = usable_timeout(overflow_timeout, DEFAULT_OVERFLOW_TIMEOUT)
+         self.log_foundry_stop_signal: threading.Event | None = None
+-        self.failed = 0
+-        self.rejected = 0
+-        self._counter_lock = threading.Lock()
++        self.log_foundry_counters = SinkCounters()
+         self._futures_lock = threading.Lock()
+         self._futures: list[Any] = []
+         self._closed = False
+ 
+-    def losses(self) -> SinkLosses:
+-        """Reports refused publishes and futures that resolved to an error (FR-002).
++    @property
++    def _counter_lock(self) -> threading.Lock:
++        """The counters' lock.
+ 
+         Args:
+           None.
+ 
+         Returns:
+-          The counters. ``failed`` moves as futures settle, which :meth:`emit` reaps on every
+-          call (FR-004), so an outage is visible while it is happening rather than only at
+-          shutdown. It still lags the publish that caused it by however long the client takes to
+-          give up, which is a property of the client's asynchronous publish and not of this
+-          accessor. An event :meth:`emit` could not encode is counted in ``rejected`` beside the
+-          refusals (SPEC-069 FR-001), as it was when the encode sat inside the publish guard.
++          The lock.
+ 
+         Raises:
+           None.
+         """
+-        with self._counter_lock:
+-            return SinkLosses(dropped=self.rejected, failed=self.failed)
++        return self.log_foundry_counters._counter_lock
+ 
+-    def emit(self, batch: list[dict[str, object]]) -> None:
+-        """Publishes one message per event, then reaps the futures that have settled (FR-008).
++    @property
++    def failed(self) -> int:
++        """Publishes refused or unconfirmed, the engine's ``failed_events``.
+ 
+-        ``publish()`` is a local hand-off returning a future, so a refusal is the only failure
+-        this call can observe. It is isolated per event, because letting the first refusal
+-        propagate would hand the worker a batch whose earlier events are already in flight, and
+-        the retry would duplicate them. The stderr line names which counter moved, since
+-        "refused" and "unconfirmed" mean different things.
+-
+-        A closed sink refuses the batch before touching the client (SPEC-032 FR-001), because
+-        nothing will resolve a future appended after :meth:`close` swapped the list out.
+-        Refusing moves no counter here: it is a failure reported to the worker, which records it
+-        in ``health().failed_batches``, not loss this sink absorbed. The flag is read twice on
+-        purpose — once for the batch, and again under ``_futures_lock`` for each append, which
+-        is the lock ``close`` swaps under. Without the second read a close landing mid-loop
+-        would leave exactly the orphaned future this guard exists to prevent, and the read costs
+-        nothing because the append already takes that lock. Only the read happens under it: the
+-        counter bump and the stderr line are taken *after* the lock is released, because
+-        ``close`` waits on the same lock and a blocked stderr would otherwise hold it — an I/O
+-        call inside a transport lock is what SPEC-028's two-lock decision exists to avoid.
+-
+-        A close that lands mid-batch does **not** raise, even when it catches every event. Each
+-        one had ``publish()`` called on it and may well land, so raising would have the worker
+-        re-send them and duplicate whatever did — the SPEC-018 rule that only a *provable*
+-        non-delivery may be retried. They are counted as unconfirmed instead, which is exactly
+-        what they are. That is why the total-failure raise below tests the refusals rather than
+-        the successes: "nothing was published" and "nothing was confirmed" are different claims,
+-        and only the first is safe to retry.
+-
+-        The reap runs *before* the total-failure test, so a batch the client refused outright
+-        still returns the pending list to its bound on the way out.
+-
+-        A refusal is counted and announced only when ``emit`` returns, through the deferral
+-        helper whose ``with`` encloses the publish loop, :meth:`_reap` and the total-failure
+-        raise (SPEC-059 FR-003). When every event was refused the call raises and counts nothing
+-        — whoever catches the raise owns the batch, so a batch refused on one attempt and
+-        accepted on the next records no loss that never happened — and a refusal followed by a
+-        raise from :meth:`_reap` is discarded too. A partial refusal returns, and its count and
+-        one line per refused event, each naming that event's own exception type bound as the
+-        refusal was decided, land then. The lines are written after the reap, so one can trail
+-        its refusal by up to one overflow wait, which ``overflow_timeout`` bounds; writing it
+-        earlier would count before the call is known to return. The orphaned-future count above,
+-        and the reap's, stay immediate: they are ``failed``, an upper bound this does not defer.
+-
+-        Every event is encoded before the first publish (SPEC-069 FR-001), through the encode
+-        helper into ``rejected``: one that cannot be encoded is counted and announced with **one
+-        line per call**, where the encode inside the publish guard wrote one "refused" line per
+-        event. A batch of nothing encodable publishes nothing, skips the reap and returns
+-        (FR-002), and the total-failure raise compares the refusals with the encodable events.
+-
+         Args:
+-          batch: The events to publish.
++          None.
+ 
+         Returns:
+-          None.
++          The count.
+ 
+         Raises:
+-          SinkDeliveryError: When the sink was already closed on entry, or when every event was
+-            refused (SPEC-026 FR-001). Either leaves no refusal counted.
++          None.
+         """
+-        if not batch:
+-            return
+-        if self._closed:
+-            raise final_refusal(
+-                self,
+-                f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed"
+-            )
+-        with Deferral(self) as pending:
+-            refused: list[str] = []
+-            encoded = encode_events(
+-                batch, self._encode, pending, sink=_diag.type_name(self), counter="rejected"
+-            )
+-            if not encoded:
+-                return
+-            for _, data in encoded:
+-                try:
+-                    future = self.client.publish(self.topic, data=data)
+-                except Exception as err:
+-                    refused.append(_diag.type_name(err))
+-                    continue
+-                with self._futures_lock:
+-                    orphaned = self._closed
+-                    if not orphaned:
+-                        self._futures.append(future)
+-                if orphaned:
+-                    with self._counter_lock:
+-                        self.failed += 1
+-                    _diag.lost(
+-                        "event",
+-                        1,
+-                        "GooglePubSubSink publish unconfirmed, the sink closed mid-batch",
+-                    )
+-            if refused:
+-                pending.count("rejected", len(refused))
+-                pending.announce(lambda: self._announce_refused(refused))
+-            self._reap()
+-            if len(refused) == len(encoded):
+-                raise SinkDeliveryError(
+-                    f"GooglePubSubSink published none of {len(encoded)} event(s)"
+-                )
++        return self.log_foundry_counters.failed_events
+ 
+-    def _encode(self, event: dict[str, object]) -> bytes:
+-        """Encodes one event as the UTF-8 JSON data of its message.
++    @failed.setter
++    def failed(self, value: int) -> None:
++        """Sets the count.
+ 
+         Args:
+-          event: The event to encode.
++          value: The new count.
+ 
+         Returns:
+-          The message data.
++          None.
+ 
+         Raises:
+-          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
+-            drop of this one event. Neither source of events produces one: assembly coerces every
+-            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
+-            returns (SPEC-058 FR-001).
++          None.
+         """
+-        return json.dumps(event).encode("utf-8")
++        with self._counter_lock:
++            self.log_foundry_counters.failed_events = value
+ 
+-    def _announce_refused(self, kinds: list[str]) -> None:
+-        """Writes one line per publish the client refused, naming its exception type (FR-008).
++    @property
++    def rejected(self) -> int:
++        """Publishes that never left the process, the engine's ``dropped_events``.
+ 
+-        Called by the calling ``emit``'s deferral after the count is committed, outside the
+-        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-003). The text
+-        says "refused", where an unconfirmed future's says "unconfirmed", because the two lines
+-        name different counters.
+-
+         Args:
+-          kinds: Each refused event's exception type name, in the order they were refused.
++          None.
+ 
+         Returns:
+-          None.
++          The count.
+ 
+         Raises:
+           None.
+         """
+-        for kind in kinds:
+-            _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {kind}")
++        return self.log_foundry_counters.dropped_events
+ 
+-    def _reap(self) -> None:
+-        """Resolves the futures that have settled, and waits on the oldest if over the bound.
++    @rejected.setter
++    def rejected(self, value: int) -> None:
++        """Sets the count.
+ 
+-        This is what makes an outage visible while it is happening (FR-004 AC-1) and what stops
+-        the pending list growing with the total number of events the process has ever logged
+-        (AC-4). Before it, ``result()`` was called only from :meth:`close`, so ``failed`` stayed
+-        at zero and ``health()`` read clean through an entire Pub/Sub outage.
+-
+-        Futures are selected under the futures lock and resolved *outside* it, as :meth:`close`
+-        does: a settled future's ``result()`` is immediate, but an overflow future's is a wait,
+-        and holding the lock across it would block every concurrent publish behind it — the I/O
+-        inside a transport lock that SPEC-028's two-lock arrangement exists to avoid.
+-
+-        The partition is **one pass**, and that is load-bearing rather than tidy. Two
+-        comprehensions query ``done()`` twice per future, and a future that settles between the
+-        two queries — which is what a client's commit thread does — lands in neither list: not
+-        resolved, and dropped by the reassignment below. Measured, five failed publishes vanished
+-        with ``losses()`` reading clean, and under a real thread race 41% of failures went
+-        uncounted. That is the silent loss this method exists to end, so the scan may not ask the
+-        same future twice.
+-
+-        Overflow is taken from the front, so the oldest publish is the one waited on. Waiting
+-        rather than discarding is deliberate (AC-2): the event has already been handed to the
+-        client and may yet be delivered, so dropping it here would invent a loss that the
+-        destination has not committed.
+-
+         Args:
+-          None.
++          value: The new count.
+ 
+         Returns:
+           None.
+@@ -362,257 +247,219 @@
+         Raises:
+           None.
+         """
+-        with self._futures_lock:
+-            settled: list[Any] = []
+-            outstanding: list[Any] = []
+-            for future in self._futures:
+-                (settled if _has_settled(future) else outstanding).append(future)
+-            excess = max(len(outstanding) - self.max_pending, 0)
+-            overflow, self._futures = outstanding[:excess], outstanding[excess:]
+-        for future in settled:
+-            self._resolve(future)
+-        self._await_overflow(overflow)
++        with self._counter_lock:
++            self.log_foundry_counters.dropped_events = value
+ 
+-    def _await_overflow(self, overflow: list[Any]) -> None:
+-        """Waits on the oldest futures once the pending list is over its bound (FR-004 AC-2).
++    def losses(self) -> SinkLosses:
++        """Reports the engine's totals.
+ 
+-        The wait is **bounded and interruptible**, per SPEC-027. This runs inside ``emit`` on the
+-        worker's single drain thread, so an unbounded ``result()`` here is a pause on all log
+-        delivery that ``shutdown()`` cannot cut short. Before FR-004 the only blocking
+-        ``result()`` was in ``close``, where such a wait belongs.
+-
+-        **One deadline covers the whole list, and the stop signal is re-read each time round.**
+-        A per-*future* timeout is not a bound: with the shipped 30 s and ten futures over the
+-        limit, one ``emit`` blocked for five minutes, and a shutdown landing mid-loop was not
+-        noticed until every future had been waited on — measured at 5.04 s for a signal set after
+-        0.3 s. Both were regressions against a version of this sink that never blocked at all.
+-
+-        A future the wait does not outlast is **put back**, not counted: it may still land, and
+-        ``close`` resolves whatever remains. That has a consequence worth stating rather than
+-        hiding, because it is a real limit: against a client that resolves *nothing*, the pending
+-        list grows by a batch per emit (measured 10 → 60 over six emits) and the ``max_pending``
+-        bound stops holding. Nothing better is available — the three properties "never invent
+-        loss", "never block delivery indefinitely" and "bound memory" cannot all hold when the
+-        destination has stopped answering, and the first two are the ones this library is for.
+-        The growth is a symptom of the outage, every event in it is still accounted for, and
+-        ``losses()`` reports what resolves.
+-
+         Args:
+-          overflow: The oldest outstanding futures, already removed from the pending list.
++          None.
+ 
+         Returns:
+-          None.
++          The counters.
+ 
+         Raises:
+           None.
+         """
+-        if not overflow:
+-            return
+-        expired, unboundable = self._resolve_within(
+-            overflow, time.monotonic() + self.overflow_timeout, heed_stop=True
+-        )
+-        unresolved = expired + unboundable
+-        if not unresolved:
+-            return
+-        with self._futures_lock:
+-            if not self._closed:
+-                self._futures[:0] = unresolved
+-                return
+-        self._drain_pending(unresolved)
++        return self.log_foundry_counters.losses()
+ 
+-    def _resolve_within(
+-        self, pending: list[Any], deadline: float, *, heed_stop: bool
+-    ) -> tuple[list[Any], list[Any]]:
+-        """Waits on each future until the deadline, splitting what did not settle in two.
++    def emit(self, batch: list[dict[str, object]]) -> None:
++        """Delivers the batch through the engine inline.
+ 
+-        One deadline covers the whole list rather than a timeout per future: at the shipped
+-        ``max_pending`` a per-future wait is not a bound at all (SPEC-038's rule that a bound
+-        applied per item is ``n x timeout``). ``_futures_lock`` is never held across a
+-        ``result()``, because ``emit`` takes it per event and an application thread on the orphan
+-        path would block behind it.
+-
+         Args:
+-          pending: The futures to resolve, already removed from the pending list.
+-          deadline: A ``time.monotonic()`` reading the pass must not run past.
+-          heed_stop: Whether a set stop signal also ends the pass. **True only on the flush
+-            path.** ``Worker.shutdown`` sets that event *before* closing the sink inline, so a
+-            close that heeded it would abandon everything on every ordinary shutdown -- SPEC-038's
+-            rule that a shutdown shortens a *wait* and must never skip *work*, and the exit drain
+-            is the one path a serverless process has.
++          batch: The events to publish.
+ 
+         Returns:
+-          The futures whose wait expired, and separately the ones that cannot be waited on within
+-          a timeout at all. They are split because they mean opposite things: an expired future is
+-          unconfirmed, while an *unboundable* one is a healthy publish this pass simply cannot
+-          poll, and counting the second as loss invents it (SPEC-036 measured three of four
+-          healthy publishes reported ``failed`` that way).
++          None.
+ 
+         Raises:
+-          None.
++          SinkDeliveryError: When the run failed.
+         """
+-        expired: list[Any] = []
+-        unboundable: list[Any] = []
+-        for index, future in enumerate(pending):
+-            settled = False
+-            unpollable = False
+-            while not self._past(deadline, heed_stop=heed_stop):
+-                began = time.monotonic()
+-                slice_ = min(deadline - began, _POLL_INTERVAL)
+-                try:
+-                    settled = self._resolve(future, slice_)
+-                except _Unboundable:
+-                    unpollable = True
+-                    break
+-                if settled:
+-                    break
+-                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
+-            else:
+-                self._classify_remainder(pending[index:], expired, unboundable)
+-                break
+-            if unpollable:
+-                unboundable.append(future)
+-        return expired, unboundable
++        emit_via_deliver(self, batch)
+ 
+-    def _classify_remainder(
+-        self, remaining: list[Any], expired: list[Any], unboundable: list[Any]
+-    ) -> None:
+-        """Sorts the futures a deadline never reached into expired and unboundable.
++    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
++        """Runs one round and reports each event's fate by index (SPEC-094 FR-002).
+ 
+-        The pass gives up on the whole remainder when its one deadline expires, and the two
+-        outcomes must still be told apart: an expired future is unconfirmed and is counted, while
+-        an **unboundable** one is a healthy publish that simply cannot be polled within a timeout,
+-        and counting it invents loss. A blanket ``expired.extend(...)`` here charged three healthy
+-        publishes as lost behind one stalled future, which is SPEC-036's measured defect
+-        reintroduced by the fix that cites it.
+-
+-        The probe is a zero-second wait, so it costs nothing against a deadline that has already
+-        gone: a future whose ``result()`` takes no ``timeout`` raises ``_Unboundable`` on the way
+-        in, and everything else either settles immediately or reports itself still in flight.
+-
+         Args:
+-          remaining: The futures the pass did not reach, the current one first.
+-          expired: The unconfirmed list, appended to in place.
+-          unboundable: The cannot-be-polled list, appended to in place.
++          batch: The events.
+ 
+         Returns:
+-          None.
++          The round's verdict.
+ 
+         Raises:
+           None.
+         """
+-        for future in remaining:
+-            try:
+-                if not self._resolve(future, 0):
+-                    expired.append(future)
+-            except _Unboundable:
+-                unboundable.append(future)
++        return _engine.one_round(self._round, batch)
+ 
+-    def _past(self, deadline: float, *, heed_stop: bool) -> bool:
+-        """Reports whether a resolution pass must stop.
++    def _round(self, batch: list[dict[str, object]]) -> Verdict:
++        """Publishes every remaining event, then waits for the round's futures.
+ 
+         Args:
+-          deadline: A ``time.monotonic()`` reading.
+-          heed_stop: Whether a set stop signal also ends the pass.
++          batch: The events this round is offered.
+ 
+         Returns:
+-          True on the deadline, or on the stop signal when this caller heeds it.
++          A verdict with one outcome per event of ``batch``.
+ 
+         Raises:
+           None.
+         """
+-        if time.monotonic() >= deadline:
+-            return True
+-        if not heed_stop:
+-            return False
+-        stop = self.log_foundry_stop_signal
+-        return stop is not None and stop.is_set()
++        context = run_context()
++        if self._closed:
++            context.refuse(
++                final_refusal(
++                    self,
++                    f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed",
++                )
++            )
++            return Verdict.uniform(Outcome.REJECTED, len(batch))
++        fates = [Outcome.DROPPED] * len(batch)
++        name = _diag.type_name(self)
++        futures: list[tuple[int, Any]] = []
++        refused: list[tuple[int, str]] = []
++        orphaned = 0
++        for position, data in encode_round(self, batch, self._encode, sink=name):
++            mark_sent(self, [batch[position]])
++            try:
++                future = self.client.publish(self.topic, data=data)
++            except Exception as err:
++                refused.append((position, _diag.type_name(err)))
++                continue
++            with self._futures_lock:
++                closed = self._closed
++            if closed:
++                fates[position] = Outcome.UNKNOWN
++                orphaned += 1
++                continue
++            futures.append((position, future))
++        if orphaned:
++            context.announce(
++                lambda: _diag.lost(
++                    "event",
++                    orphaned,
++                    "GooglePubSubSink publish unconfirmed, the sink closed mid-batch",
++                ),
++                when=When.ALWAYS,
++            )
++        lost = Lost(self)
++        if refused and not futures and not orphaned:
++            for position, kind in refused:
++                fates[position] = Outcome.RETRYABLE
++                lost.add(
++                    [batch[position]],
++                    when=When.LAST,
++                    key=kind,
++                    line=raised_line("event", "GooglePubSubSink publish", kind),
++                )
++            lost.register()
++            return Verdict(outcomes=tuple(fates))
++        kinds = [kind for _, kind in refused]
++        if kinds:
++            context.announce(
++                lambda: [
++                    _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {k}")
++                    for k in kinds
++                ],
++                when=When.SETTLED,
++            )
++        definitive: list[str] = []
++        unknown: list[str] = []
++        for position, state, kind in self._await_round(futures):
++            if state == "ok":
++                fates[position] = Outcome.ACCEPTED
++            elif state == "definitive":
++                fates[position] = Outcome.REJECTED
++                definitive.append(kind)
++            else:
++                fates[position] = Outcome.UNKNOWN
++                unknown.append(kind)
++        if definitive:
++            context.announce(
++                lambda: [
++                    _diag.lost("event", 1, f"GooglePubSubSink publish refused, {k}")
++                    for k in definitive
++                ],
++                when=When.ALWAYS,
++            )
++        if unknown:
++            count = len(unknown)
++            first = unknown[0]
++            context.announce(
++                lambda: _diag.lost(
++                    "event",
++                    count,
++                    f"GooglePubSubSink publish unconfirmed ({first}); may have landed, not "
++                    "retried",
++                ),
++                when=When.ALWAYS,
++            )
++        return Verdict(outcomes=tuple(fates))
+ 
+-    def _drain_pending(self, pending: list[Any]) -> None:
+-        """Resolves a swapped-out list within the close bound, counting what it abandons.
++    def _await_round(self, futures: list[tuple[int, Any]]) -> list[tuple[int, str, str]]:
++        """Waits for one round's futures under one deadline, cut short by the stop signal.
+ 
+-        The tail every close-race site shares: :meth:`close`, and the two branches where a close
+-        lands while another pass is mid-flight. Each used to resolve its leftovers with
+-        ``timeout=None``, which is the unbounded wait ``Worker.shutdown`` performs inline against
+-        a client publish deadline of 600 s. ``_await_overflow``'s copy is the one that mattered
+-        most: it runs on whichever thread called ``emit``, which on the orphan path is an
+-        application thread.
++        Every future is asked at least once. The first ask may wait one slice; once the stop
++        signal is set after that, each later ask waits nothing, and a future still unresolved
++        reads as unknown.
+ 
+-        Unboundable futures still get ``timeout=None``, because that is the only wait they accept
+-        and :meth:`_resolve` counts whatever they resolve to.
+-
+         Args:
+-          pending: The futures this caller owns and nothing else will resolve.
++          futures: Each published event's position and future.
+ 
+         Returns:
+-          None.
++          Per future: its position, ``ok``, ``definitive`` or ``unknown``, and a type name.
+ 
+         Raises:
+           None.
+         """
+-        expired, unboundable = self._resolve_within(
+-            pending, time.monotonic() + self.overflow_timeout, heed_stop=False
+-        )
+-        for future in unboundable:
+-            self._resolve(future)
+-        if not expired:
+-            return
+-        with self._counter_lock:
+-            self.failed += len(expired)
+-        _diag.lost(
+-            "event",
+-            len(expired),
+-            f"GooglePubSubSink, {len(expired)} publish(es) still in flight when the "
+-            f"{self.overflow_timeout}s close bound expired",
+-        )
++        began = time.monotonic()
++        deadline = began + self.overflow_timeout
++        first_slice_end = began + _POLL_INTERVAL
++        stop = self.log_foundry_stop_signal
++        settled: list[tuple[int, str, str]] = []
++        for position, future in futures:
++            outcome: tuple[str, str] | None = None
++            while outcome is None:
++                now = time.monotonic()
++                left = deadline - now
++                stopping = now >= first_slice_end and stop is not None and stop.is_set()
++                slice_ = 0.0 if stopping or left <= 0 else min(left, _POLL_INTERVAL)
++                try:
++                    future.result(timeout=slice_)
++                except TimeoutError as err:
++                    if _resolved(future):
++                        outcome = ("unknown", _diag.type_name(err))
++                        break
++                    if stopping or left <= 0:
++                        outcome = ("unknown", "no result within the bound")
++                        break
++                    wait(slice_ - (time.monotonic() - now), pause_on(stop))
++                    continue
++                except TypeError:
++                    outcome = ("unknown", "a future that takes no timeout")
++                except Exception as err:
++                    kind = _diag.type_name(err)
++                    outcome = ("definitive", kind) if _is_definitive(err) else ("unknown", kind)
++                else:
++                    outcome = ("ok", "")
++            settled.append((position, *outcome))
++        return settled
+ 
+-    def _resolve(self, future: Any, timeout: float | None = None) -> bool:
+-        """Waits for one publish to settle, counting and announcing a failure.
++    def _encode(self, event: dict[str, object]) -> bytes:
++        """Encodes one event as the UTF-8 JSON data of its message.
+ 
+         Args:
+-          future: The publish future to resolve.
+-          timeout: Seconds to wait, or ``None`` to wait indefinitely. Since SPEC-048 FR-004 that
+-            is what an *unboundable* future gets, not what ``close`` does: ``close`` bounds itself
+-            on ``overflow_timeout`` through :meth:`_drain_pending`, because it runs inline inside
+-            ``Worker.shutdown`` against a client publish deadline of 600 s.
++          event: The event to encode.
+ 
+         Returns:
+-          True when the future settled, False when a *bounded* wait expired with it still in
+-          flight. An expired wait is not a failure and moves no counter: the publish is
+-          unfinished, not unconfirmed.
++          The message data.
+ 
+-          A ``TypeError`` from a *bounded* call is read the same way, because a future whose
+-          ``result()`` takes no ``timeout`` cannot be waited on within one: counting it would
+-          invent loss on a publish that was going to succeed, which an injected ``client=`` makes
+-          reachable (measured: three of four healthy publishes reported ``failed`` with a
+-          ``TypeError`` line). It is put back and resolved unbounded at ``close`` instead. A
+-          genuine ``TypeError`` from the publish itself takes the same route and is counted
+-          there, so nothing is lost either way.
+-
+-          A ``TimeoutError`` is only read that way when this call set a timeout. With none set —
+-          which is every call from ``close`` — it is the client reporting that the publish itself
+-          timed out, and is counted like any other failure. Conflating the two made a genuinely
+-          unconfirmed publish silently uncounted, which an existing ``losses()`` test caught. A
+-          server-side timeout arriving *during* a bounded wait is read as "still in flight" and
+-          the future is put back, so it is counted at ``close`` rather than here — later, never
+-          lost.
+-
+         Raises:
+-          _Unboundable: When a bounded call cannot be made at all, which only
+-            :meth:`_await_overflow` catches. An unresolved future must never crash the worker
+-            (FR-011), and this is called from ``close`` as well as from the emitting thread, so
+-            nothing else escapes.
++          TypeError: If the event is not JSON-serializable, which ``encode_events`` turns into a
++            drop of this one event. Neither source of events produces one: assembly coerces every
++            value (``sanitize``), and a ``TransformSink`` checks and coerces what its function
++            returns (SPEC-058 FR-001).
+         """
+-        try:
+-            future.result() if timeout is None else future.result(timeout=timeout)
+-        except Exception as err:
+-            if timeout is not None and _diag.is_a(err, TypeError):
+-                raise _Unboundable from None
+-            if timeout is not None and _diag.is_a(err, TimeoutError):
+-                return False
+-            with self._counter_lock:
+-                self.failed += 1
+-            _diag.lost("event", 1, f"GooglePubSubSink publish unconfirmed, {_diag.type_name(err)}")
+-        return True
++        return json.dumps(event).encode("utf-8")
+ 
+     def flush(self) -> None:
+         """Resolves the outstanding publish futures without closing the sink (SPEC-036 FR-002).
+@@ -648,28 +495,7 @@
+         """
+         if self._closed:
+             raise final_refusal(self, "GooglePubSubSink cannot flush: the sink is closed")
+-        with self._futures_lock:
+-            pending, self._futures = self._futures, []
+-        if not pending:
+-            return
+ 
+-        expired, unboundable = self._resolve_within(
+-            pending, time.monotonic() + self.overflow_timeout, heed_stop=True
+-        )
+-        unresolved = expired + unboundable
+-
+-        if not unresolved:
+-            return
+-        with self._futures_lock:
+-            closed = self._closed
+-            if not closed:
+-                self._futures[:0] = unresolved
+-        if closed:
+-            self._drain_pending(unresolved)
+-        raise SinkDeliveryError(
+-            f"GooglePubSubSink flushed with {len(unresolved)} publish(es) still in flight"
+-        )
+-
+     def close(self) -> None:
+         """Resolves the pending publish futures within a bound, counting the rest (FR-008).
+ 
+@@ -715,8 +541,45 @@
+         """
+         with self._futures_lock:
+             self._closed = True
+-            pending, self._futures = self._futures, []
+-        self._drain_pending(pending)
++
++
++def _resolved(future: Any) -> bool:
++    """Whether a future has resolved, so a ``TimeoutError`` from it is its own outcome.
++
++    Args:
++      future: The publish future.
++
++    Returns:
++      True when its ``done()`` answers true; False when it has none or the call fails.
++
++    Raises:
++      None.
++    """
++    done = getattr(future, "done", None)
++    try:
++        return callable(done) and bool(done())
++    except Exception:
++        return False
++
++
++def _is_definitive(err: Exception) -> bool:
++    """Reports whether a publish future's exception says the server stored nothing.
++
++    Args:
++      err: The exception ``result()`` raised.
++
++    Returns:
++      True for ``InvalidArgument``, ``Unauthenticated``, ``PermissionDenied``, ``NotFound`` and
++      the publisher's ``FlowControlLimitError``.
++
++    Raises:
++      None.
++    """
++    definitive = (
++        *driver_classes("google.api_core.exceptions", "InvalidArgument"),
++        *driver_classes("google.cloud.pubsub_v1.publisher.exceptions", "FlowControlLimitError"),
++    )
++    return _diag.is_a(err, definitive)
+ 
+ 
+ def _has_settled(future: Any) -> bool:

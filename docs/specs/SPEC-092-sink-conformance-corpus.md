@@ -49,8 +49,9 @@ the sinks and flip the pins.
 
 - **Fixing any sink.** Every red row is pinned, never fixed. The writes nothing acknowledges
   (findings 1, 11, 12 and RabbitMQ's confirms) and the reading of a reply that names no failure
-  (finding 14) are the next sink spec of this arc, the acknowledgement-fixes spec, which uses these
-  classes and flips these pins as Andrew decided (FR-004).
+  (finding 14) are the arc's next two sink specs, SPEC-093 (findings 1, 11 and 14 and RabbitMQ's
+  confirms) and SPEC-094 (finding 12), which use these classes and flip these pins as Andrew decided
+  (FR-004).
 - **Idempotency keys and a count of the sends that may have duplicated** (finding 5). A later spec
   of this arc. This spec adds no counter: the corpus reads "ambiguous" test-side (FR-003).
 - **Any change under `src/`**, any public attribute, and any change to a stderr line.
@@ -86,13 +87,16 @@ and the determinism runs were repeated on Python 3.12.12.
   list with no `Failed`, or a Kinesis or Firehose reply with neither a count nor records) should
   read as delivered, he answered **"Unadjudicated (Recommended)"**: every event the reply does not
   name is `UNKNOWN`, counted in `failed` and `dropped_unadjudicated`, announced once as one that may
-  have landed, and never resent. The acknowledgement-fixes spec builds it; here the rows stay pinned
+  have landed, and never resent. SPEC-093 builds it; here the rows stay pinned
   until it does, and the reading the corpus expects is that one.
 - **B, finding 12.** Asked whether a client-buffered sink's verdict may come
   before the client's report, he answered **"Wait for the report (Recommended)"**: each batch's
   `emit` waits for the client's delivery reports within the sink's existing timeout, as core NATS
-  confirms, so a truthy `flush()` means the broker acknowledged. The acknowledgement-fixes spec
-  builds it; here the corpus requires it, and the rows flip when it lands.
+  confirms, ~~so a truthy `flush()` means the broker acknowledged~~. *Superseded on 2026-11-16:*
+  Andrew answered "Truthy, counted (Recommended)", so a truthy `flush()` means every event was
+  acknowledged or counted; an indefinite report is counted `UNKNOWN` and leaves it truthy, and a
+  definite rejection makes it falsy (SPEC-094). SPEC-094 builds it; here the corpus requires it,
+  and the rows flip when it lands.
 
 ### FR-001: Every shipped sink declares one acknowledgement class per constructor variant, as data
 
@@ -143,8 +147,8 @@ in `ABSTRACT` with that reason. `base.Sink` is the Protocol.
 to the surface of 39 classes for good (invariant 10 lets it grow, never shrink); it could not say
 that one `LogstashSink` is a `socket-stream` and another a `request-reply` without becoming an
 instance property; and the corpus is its only reader, since a third-party sink is not in it. The
-next sink spec edits rows here when it changes what a sink can know (`RabbitMQSink` to
-`per-event-ack` with confirms, for one).
+next sink spec edits rows here when it changes what a sink can know (`RabbitMQSink`'s opt-in
+confirmed variants in `per-event-ack`, for one).
 
 **A new sink cannot ship without a class, and a new constructor argument cannot ship without a
 verdict on whether it makes a variant.** The roster is the one `tests/test_public_surface.py`
@@ -200,7 +204,7 @@ from a patched `model.new_log_id`, so the backend counts by identity, never by p
 | `reply-lost` | the first call takes everything, then raises a transient error (for `transactional`, the commit is applied and the connection then drops) |
 | `peer-closed` | a clean first batch; the peer then closes, the second batch's first three writes return having reached nobody, the fourth raises, and a new connection takes the rest (`udp`: no listener, nothing taken, nothing raised) |
 | `no-verdict-shape` | the first call takes its first half and replies with no verdict: `{}`, or for `MongoDBSink` a `writeErrors` that is not a list |
-| `never-acknowledged` | the client takes every event and its later report is **definitive** that each was refused: a Kafka delivery error `29` (`TOPIC_AUTHORIZATION_FAILED`), a Pub/Sub `PermissionDenied`, a Sentry `capture_event` that returns `None` |
+| `never-acknowledged` | the client takes every event and its later report is **definitive** that each was refused: a Kafka delivery error `87` (`INVALID_RECORD`; ~~`29`~~, superseded by SPEC-094 because an authorization error can follow an earlier attempt that wrote the message, as a size refusal can), a Pub/Sub `InvalidArgument` (~~`PermissionDenied`~~, likewise), a Sentry `capture_event` that returns `None` |
 | `report-indefinite` | the client takes every event and its report never says whether the backend kept it: a Kafka `-192` (`_MSG_TIMED_OUT`) or a Pub/Sub `DeadlineExceeded` for an event the backend holds, the Sentry SDK's transport dropping an event after `capture_event` returned its id, or a core NATS PING never answered (core NATS runs this under `never-acknowledged`) |
 | `autocommit` | each statement is durable at once, and the second raises once with a serialization failure (`40001`), which leaves the connection usable |
 | `caller-code-raises` | the wrapper's predicate or function raises for one event |
@@ -359,7 +363,7 @@ eight events, and a sum would call that row red for its unit. `ambiguous-when-kn
 keeps "ambiguous" from being a way out: a sink that called every raise ambiguous would pass
 `taken-then-raised` and `reply-lost`, and this check fails it on `refused-once`.
 
-**Decisions A and B in the assertion.** Once the acknowledgement-fixes spec lands, a
+**Decisions A and B in the assertion.** Once SPEC-093 and SPEC-094 land, a
 `no-verdict-shape` row's unnamed events are ambiguous, which passes every check (they were carried
 by an unknowable call, and a line names them), and a client-buffered row whose sink waits for the
 report has no late count. Both are what the checks already ask; neither needs a change to `judge`.
@@ -428,8 +432,8 @@ while a wrapper row that repeats its inner sink's pin is what holds the wrapper 
 | `autocommit-sqlite` | `SQLiteSink[autocommit]-autocommit` (1) | `duplicate`, `lost-but-held` | the same item |
 
 That is 74 pinned rows. `GooglePubSubSink`'s half of finding 12, which the audit read and did not
-run, is now run. The five `reply-without-verdict` rows turn green when the acknowledgement-fixes
-spec builds decision A, and the four finding-12 rows when it builds decision B.
+run, is now run. The five `reply-without-verdict` rows turn green when SPEC-093 builds decision A,
+and the four finding-12 rows when SPEC-094 builds decision B.
 
 **A departure** is a red row the library permits: the row passes only at the departure's exact
 verdict, and the departure's **record** is a file and a phrase quoted from it verbatim, which the
@@ -471,14 +475,17 @@ joined across its lines, because leads wrap (`architecture.md:1698`, `:1765` and
   2026-11-15.** Asked whether a reply that names no failure should read as delivered, he answered
   'Unadjudicated (Recommended)': every event the reply does not name is `UNKNOWN`, counted in
   `failed` and `dropped_unadjudicated`, announced once as one that may have landed, and never
-  resent. **Closed by** the acknowledgement-fixes spec building that reading, which turns the
+  resent. **Closed by** SPEC-093 building that reading, which turns the
   `reply-without-verdict` rows of `tests/test_conformance.py` green."
-- §12's finding-12 item's **Closed by** is rewritten in place: the closure through the spec that
-  adds loss counts to `FlushResult` is struck through as superseded by this decision, and the new
-  text reads "**Decided by Andrew on 2026-11-15.** Asked whether the verdict may come before the
-  client's report, he answered 'Wait for the report (Recommended)': each batch's `emit` waits for
-  the client's delivery reports within the sink's existing timeout, as core NATS confirms, so a
-  truthy `flush()` means the broker acknowledged. **Closed by** the acknowledgement-fixes spec
+- §12's finding-12 item's **Closed by** is rewritten in place. *Superseded on 2026-11-16, before
+  this spec was built:* ~~the closure through the spec that adds loss counts to `FlushResult` is
+  struck through as superseded by this decision, and the new text reads that a truthy `flush()`
+  means the broker acknowledged~~. The closure through the spec that adds loss counts to
+  `FlushResult` stays, and the new text reads "**Decided by Andrew on 2026-11-15 and 2026-11-16.**
+  Asked whether the verdict may come before the client's report, he answered 'Wait for the report
+  (Recommended)': each batch's `emit` waits for the client's delivery reports within the sink's
+  existing timeout, as core NATS confirms. Asked what a truthy `flush()` then means, he answered
+  'Truthy, counted (Recommended)': every event was acknowledged or counted. **Closed by** SPEC-094
   building that, which turns the `verdict-before-refusal` and `verdict-before-indefinite-report`
   rows of `tests/test_conformance.py` green, and by a decision on whether a full client queue is
   retried."
@@ -773,3 +780,19 @@ measured.
   fixtures; departure records became quoted phrases (`NullSink`'s had cited SPEC-026 FR-002, which
   does not mention it); and FR-005 compares with the verdicts at `6bd0b66e`. Rows went from 243 to
   256, red from 80 to 86, pins from 69 rows to 74 and departures from 11 rows to 12.
+- Edited on 2026-11-15 by SPEC-093's revision, text only. The acknowledgement-fixes spec this spec
+  named became two: SPEC-093 builds decision A and fixes findings 1, 11 and 14 and adds RabbitMQ's
+  confirms, and SPEC-094 builds decision B (finding 12). So every sentence that named "the
+  acknowledgement-fixes spec" now names the one that does the work, and the example in FR-001 names
+  `RabbitMQSink`'s opt-in confirmed variants, since Andrew chose on 2026-11-15 that confirms are off
+  by default. No requirement, row or total changed.
+- Edited on 2026-11-16 by SPEC-094's revision, text only. Decision B's gloss, "so a truthy `flush()`
+  means the broker acknowledged", is struck at both sites that state it, with the reading Andrew
+  gave on 2026-11-16 ("Truthy, counted (Recommended)") beside it, and the §12 text FR-004 writes no
+  longer strikes the `FlushResult` closure, which that answer keeps. The `never-acknowledged`
+  fault's Kafka and Pub/Sub examples become `10` and `InvalidArgument`, because SPEC-094 reads a
+  report as definitive only when no attempt could have written the event. No requirement, row or
+  total changed.
+- Edited again on 2026-11-16 by SPEC-094's second revision, text only. The Kafka example becomes
+  `87`, since SPEC-094 no longer reads `10` as definitive: librdkafka builds the batch that `10`
+  judges again for each attempt. No requirement, row or total changed.
