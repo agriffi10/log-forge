@@ -1517,7 +1517,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   rate is an upper bound for a real program, and the mechanism does not depend on the rate. The
   frame found the handler blocked on `Runtime._lock`, the close registry's lock, `Worker._lock` and,
   by inference, the queue's mutex. SPEC-088 adds the event ledger's registration lock, taken by a
-  thread's first credit and by every `health()` and `shutdown()` reading, and makes it an `RLock`,
+  thread's first credit, once per pass of every `health()` and `shutdown()` reading, and around
+  `shutdown()`'s once-per-count check, and never with a lifecycle lock held: a worker's build,
+  which runs under `Runtime._lock`, reads the hand-over count without it (`_ledger.handed_unlocked`,
+  SPEC-088's diff review), so the two are never nested in either order. It is an `RLock`,
   so a handler or a `__del__` that logs or reads on the thread already inside it re-enters rather
   than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`). A
   handler on a thread inside any of the other locks still waits. **The documents promise this caller, and the code breaks the
@@ -1884,10 +1887,14 @@ an item leaves this list when a spec closes it, not because the arc names it.
   of the same probe at 400. **Closed by** counting a retired submission only once its put has
   succeeded, or by the event ledger debiting each event to one term.
   → **closed by SPEC-088 FR-002 item 1.** `Worker.submit` reads the retirement count once, after a
-  put that succeeded, so an overflowed submission is in `dropped` alone. At the commit that merged SPEC-088,
-  `p03_shutdown_race.py 2000`, a race whose counts move from run to run, printed
-  `submitted_after_shutdown` 10,009 and 10,010 in two runs against `queued` plus `dropped` of
-  11,990 and 11,981.
+  put that succeeded, so an overflowed submission is in `dropped` alone, and every late submission
+  is in exactly one of the two: after the drain has ended, eight threads' 2,400 traced calls into a
+  queue of 500 read `submitted_after_shutdown=500 dropped=1900`
+  (`tests/test_event_ledger_defects.py`). ~~`p03_shutdown_race.py 2000` printed
+  `submitted_after_shutdown` below `queued` plus `dropped`~~ — struck by SPEC-088's diff review:
+  that comparison is a race, since `submitted_after_shutdown` also counts the late submissions the
+  final drain carries, and under load it read `queued=6006 dropped=0
+  submitted_after_shutdown=6561`; the probe's readings are recorded in SPEC-088's delivery doc.
 - ~~**A drain thread that dies leaves the batch it was holding in no counter**~~ (2026-11-14 audit,
   finding 7; invariant 2). `Worker._terminal_failure` sets `stopped_reason` and announces the held
   work in event-lists, not events, and moves no loss term (`worker.py:1679-1690`).

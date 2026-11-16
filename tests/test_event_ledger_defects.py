@@ -1,8 +1,10 @@
 """SPEC-088 FR-002: the six accounting defects, one scenario per reproduction.
 
-Each test ends by asserting the ledger places every event (FR-003 AC-10). Where a criterion names
-one of the audit's probes, the probe is run in a fresh interpreter against this tree and its
-printed numbers are read, so the test checks the reproduction itself and not a paraphrase of it.
+Each test ends by asserting the ledger places every event (FR-003 AC-10). The probes p03, p11,
+p14, p16 and p17 are run unedited in a fresh interpreter against this tree and their printed
+numbers read, p03, p14 and p17 with ``health().events`` read once the probe ends; ~~where a
+criterion names one of the audit's probes, the probe is run~~ — p01, p05 and p08 are reproduced
+in process instead, at their numbers, and p02 is both (diff review frame 1).
 """
 
 import asyncio
@@ -12,9 +14,10 @@ import threading
 import pytest
 
 import log_foundry as lf
+from conftest import run_concurrently
 from ledger_sinks import GatedSink, ledger, reading
 from log_foundry import _lifecycle, api, context, decorator
-from test_event_ledger import _fast_worker, _ledger_on, _probe
+from test_event_ledger import _fast_worker, _ledger_on, _probe, _probe_ledger
 
 
 def _placed(asked: int | None = None) -> None:
@@ -54,13 +57,33 @@ def test_overflow_after_shutdown_is_counted_once(capsys) -> None:
     _placed(10)
 
 
-def test_p03_counts_late_submissions_below_queued_plus_dropped() -> None:
-    """FR-002 AC-2: ``p03_shutdown_race.py 2000``; today it printed one above."""
-    out = _probe("p03_shutdown_race.py", "2000")
-    after = next(line for line in out.splitlines() if line.startswith("after:"))
-    fields = dict(part.split("=", 1) for part in after.removeprefix("after: ").split() if "=" in part)
-    queued, dropped = int(fields["queued"]), int(fields["dropped"])
-    assert int(fields["submitted_after_shutdown"]) < queued + dropped, after
+def test_every_late_submission_is_in_one_of_two_counts(capsys) -> None:
+    """FR-002 AC-2 as revised: no late submission is in both ``submitted_after_shutdown`` and ``dropped``.
+
+    ~~``p03`` prints ``submitted_after_shutdown`` below ``queued`` plus ``dropped``~~ — struck by
+    diff review frame 1: under load the final drain carries more late submissions than overflow,
+    and the field counts those by design, so the comparison failed in 3 of 10 concurrent runs.
+    Here every submission is made after the drain has ended, so each is late, and each lands in
+    exactly one of the two counts whatever the load.
+    """
+    worker = _fast_worker(GatedSink(), max_queue=500)
+    _lifecycle._shutdown_worker(2)
+    assert not worker._thread.is_alive()
+    errors = run_concurrently(lambda index, iteration: _plain(), 8, per_thread=300)
+    assert not errors, errors
+    capsys.readouterr()
+    health = lf.health()
+    e = health.events
+    assert health.submitted_after_shutdown + health.dropped == 2_400, health
+    assert (health.submitted_after_shutdown, health.dropped) == (500, 1_900), health
+    assert (e.stranded, e.overflow_lost) == (1_000, 3_800), e
+    _placed(4_800)
+
+
+def test_p03_ends_with_every_event_placed() -> None:
+    """FR-003 AC-10 for ``p03_shutdown_race.py 2000``, whose racing counts are only recorded."""
+    _out, events = _probe_ledger("p03_shutdown_race.py", "2000")
+    assert events["unaccounted"] == 0, events
 
 
 # ── item 2, finding 17 ───────────────────────────────────────────────────────────────────
@@ -202,8 +225,10 @@ def test_an_expired_shutdown_leaves_the_batch_in_flight(capsys) -> None:
 
 def test_p14_delivers_span_end_on_both_rows() -> None:
     """FR-002 AC-9: the close builds ``span.end`` before it reads the buffer."""
-    rows = [line for line in _probe("p14_end_races_sweep.py").splitlines() if line.startswith("[")]
+    out, events = _probe_ledger("p14_end_races_sweep.py")
+    rows = [line for line in out.splitlines() if line.startswith("[")]
     assert len(rows) == 2, rows
+    assert events["unaccounted"] == 0, events
     for row in rows:
         received = row.split("sink got ", 1)[1].split("]", 1)[0]
         assert "'span.end'" in received, row
@@ -276,9 +301,10 @@ def test_p17_logs_after_an_interrupted_close_keep_the_span_ids() -> None:
     """FR-002 AC-12: the handler row and the task row on the span's ids, the control row fresh."""
     import ast
 
-    rows = [line for line in _probe("p17_log_after_an_interrupted_close.py").splitlines()
-            if line.startswith("row ")]
+    out, events = _probe_ledger("p17_log_after_an_interrupted_close.py")
+    rows = [line for line in out.splitlines() if line.startswith("row ")]
     assert len(rows) == 3, rows
+    assert events["unaccounted"] == 0, events
     for row in rows[:2]:
         span_ids = ast.literal_eval(row.split("span ", 1)[1].split(" |", 1)[0])
         got = ast.literal_eval(row.split("sink ", 1)[1])

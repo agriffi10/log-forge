@@ -288,6 +288,30 @@ def _sum(name: str, field: str) -> int:
     return total
 
 
+def handed_unlocked() -> int:
+    """Returns the hand-overs credited so far, read without the lock, for a worker's build.
+
+    ``Worker.__init__`` runs under ``Runtime._lock``, and taking the registration lock there
+    nested it inside that lock, while a ``__del__`` collected under the registration lock that
+    calls a lifecycle API takes the two in the opposite order (diff review frame 1). Nothing here
+    needs the lock: the pair is published by one rebinding and never mutated, so one load of it
+    is a consistent snapshot, and a fold keeps every total, so summing the dead cells it still
+    holds gives the same count a folded pair would. The count is exact as of that load, which is
+    all the build's record needs: every later reading's hand-overs are at least it.
+
+    Args:
+      None.
+
+    Returns:
+      The events handed to ``Worker.submit``, over every cell, dead or not.
+
+    Raises:
+      None.
+    """
+    base, cells = _registry.pair
+    return base.handed + sum(one.handed for one in cells)
+
+
 def handed() -> int:
     """Returns the hand-overs credited so far, every thread's (pass 1 of a reading).
 

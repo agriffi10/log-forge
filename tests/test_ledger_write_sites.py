@@ -397,3 +397,118 @@ def test_a_same_named_attribute_is_refused_until_it_is_exempted() -> None:
 def test_these_shapes_are_silent(case: str) -> None:
     """The admitted shapes pass, so a refusal above is the shape's and not the harness's."""
     assert check(SILENT[case], {}) == [], case
+
+
+# ── the write orders the read order relies on (diff review frame 1) ──────────────────────
+#
+# A reading is sound because each counter is read in the reverse of the order its writer writes
+# it (`worker._read_ledger`). Three of those orders live in code no run can catch reversed on
+# CPython 3.13, where a thread switch cannot fall between two adjacent `+=`: the drain raising
+# its gauge before its taking count, settling its exits before lowering the gauge, and the
+# orphan path raising its gauge before its credit. So the order is held statically.
+
+ORDER = "a ledger write order the read order relies on is reversed"
+MISSING = "an ordered ledger write is missing"
+
+_SETTLE_EXITS = tuple(
+    f"self.{name} +=" for name in ("_delivered", "_skipped", "_sink_lost", "_batch_lost", "_drain_lost")
+)
+
+ORDERS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...], str], ...] = (
+    ("worker.py", "Worker._hold", ("self._in_flight +=",), ("self._taken +=",),
+     "the drain's gauge rises before its taking count"),
+    ("worker.py", "Worker._settle", _SETTLE_EXITS, ("self._in_flight -=",),
+     "the drain's exits are written before its gauge falls"),
+    ("api.py", "_log", ("cell.orphan_open +=",), ("cell.orphan +=",),
+     "the orphan path's gauge rises before its credit"),
+)
+"""Each entry: every write in the first group comes, in source order, before every write in the
+second, inside the named function."""
+
+
+def _aug_writes(tree: ast.Module, qual: str) -> list[tuple[int, str]]:
+    """Every augmented assignment inside the function ``qual``, as (line, "target op")."""
+    scope: ast.AST | None = tree
+    for part in qual.split("."):
+        scope = next(
+            (
+                node for node in ast.iter_child_nodes(scope)  # type: ignore[arg-type]
+                if isinstance(node, ast.ClassDef | ast.FunctionDef) and node.name == part
+            ),
+            None,
+        )
+        if scope is None:
+            return []
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(scope):
+        if isinstance(node, ast.AugAssign):
+            op = "+=" if isinstance(node.op, ast.Add) else "-=" if isinstance(node.op, ast.Sub) else "?="
+            found.append((node.lineno, f"{ast.unparse(node.target)} {op}"))
+    return found
+
+
+def check_orders(sources: dict[str, str], orders=ORDERS) -> list[Finding]:  # type: ignore[no-untyped-def]
+    """Returns a finding for every reversed or missing write of ``orders`` in ``sources``."""
+    findings: list[Finding] = []
+    for file, qual, before, after, reason in orders:
+        if file not in sources:
+            continue
+        writes = _aug_writes(ast.parse(sources[file]), qual)
+        lines = {text: [line for line, seen in writes if seen == text] for text in (*before, *after)}
+        absent = [text for text, at in lines.items() if not at]
+        if absent:
+            findings.append(Finding(MISSING, (file, qual, ", ".join(absent))))
+            continue
+        last_before = max(line for text in before for line in lines[text])
+        first_after = min(line for text in after for line in lines[text])
+        if last_before >= first_after:
+            findings.append(Finding(ORDER, (file, qual, reason)))
+    return findings
+
+
+def test_the_ledger_writes_keep_the_orders_the_read_relies_on() -> None:
+    """Each of the three orders holds in the tree as it is."""
+    findings = check_orders(_live())
+    assert not findings, "\n".join(f"{f.reason}: {f.site}" for f in findings)
+
+
+_HOLD = "class Worker:\n    def _hold(self, n):\n        {a}\n        {b}\n"
+_SETTLE = (
+    "class Worker:\n    def _settle(self, size, d=0, s=0, k=0, b=0, x=0):\n"
+    "        self._delivered += d\n        self._skipped += s\n        self._sink_lost += k\n"
+    "        {mid}\n        self._drain_lost += x\n        {last}\n"
+)
+_LOG = "def _log():\n    cell = _ledger.cell()\n    {a}\n    {b}\n    cell.orphan_open -= 1\n"
+
+ORDER_CORPUS = {
+    "hold, gauge after the taking count": (
+        {"worker.py": _HOLD.format(a="self._taken += n", b="self._in_flight += n")}, [ORDER]),
+    "hold, in order": (
+        {"worker.py": _HOLD.format(a="self._in_flight += n", b="self._taken += n")}, []),
+    "settle, gauge before an exit": (
+        {"worker.py": _SETTLE.format(mid="self._in_flight -= size", last="self._batch_lost += b")},
+        [ORDER]),
+    "settle, in order": (
+        {"worker.py": _SETTLE.format(mid="self._batch_lost += b", last="self._in_flight -= size")},
+        []),
+    "orphan, credit before the gauge": (
+        {"api.py": _LOG.format(a="cell.orphan += 1", b="cell.orphan_open += 1")}, [ORDER]),
+    "orphan, in order": (
+        {"api.py": _LOG.format(a="cell.orphan_open += 1", b="cell.orphan += 1")}, []),
+    "a renamed write": (
+        {"worker.py": _HOLD.format(a="self._held += n", b="self._taken += n")}, [MISSING]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(ORDER_CORPUS))
+def test_each_order_refuses_its_reversal_and_passes_its_order(case: str) -> None:
+    """A reversal is refused for its reason, the order as written is silent, a rename is not."""
+    sources, expected = ORDER_CORPUS[case]
+    quals = {"worker.py": "Worker._settle" if "settle" in case else "Worker._hold", "api.py": "_log"}
+    orders = [order for order in ORDERS if order[1] == quals[next(iter(sources))]]
+    assert [finding.reason for finding in check_orders(sources, orders)] == expected, case
+
+
+def test_a_function_that_is_gone_is_reported_missing() -> None:
+    """A renamed or deleted function cannot leave its order checked against nothing."""
+    assert [f.reason for f in check_orders({"api.py": "def _emit():\n    pass\n"})] == [MISSING]

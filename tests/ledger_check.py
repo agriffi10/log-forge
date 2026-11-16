@@ -153,6 +153,4 @@ def judge(found: list[str], marked: bool) -> str | None:
 
 def verdict(node) -> str | None:  # type: ignore[no-untyped-def]
     """Judges the test ``node`` at its teardown; ``None`` when it passes the check."""
-    if node.get_closest_marker("xfail") is not None:
-        return None
     return judge(problems(), node.get_closest_marker(MARKER) is not None)

@@ -778,7 +778,7 @@ class Worker:
         self._batch_lost = 0
         self._drain_lost = 0
         self._overflow_lost = 0
-        self._handed_at_build = _ledger.handed()
+        self._handed_at_build = _ledger.handed_unlocked()
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()

@@ -5725,6 +5725,15 @@ def _check_ledger() -> None:
     It asserts nothing about ``open_spans``: a ``shutdown()`` from inside a traced function, or a
     daemon thread inside one at interpreter exit, leaves events legitimately buffered.
 
+    **The once-per-count decision is made under the ledger's registration lock** (diff review
+    frame 1), the reading and the check-and-set of ``_ledger_announced`` together, so two
+    ``shutdown()`` calls racing over one imbalance write one line between them; read and written
+    without a lock, both could pass the check before either recorded the count. That lock is the
+    leaf every reading already takes once per pass, and re-entrant, so the reading inside it
+    takes it again; it is not on the accept path's fast case, which a thread holds only for its
+    first credit. The line itself is written after the lock is released, so a wedged stderr holds
+    no lock.
+
     Args:
       None.
 
@@ -5734,11 +5743,14 @@ def _check_ledger() -> None:
     Raises:
       None.
     """
+    from log_foundry import _ledger
+
     try:
-        unaccounted = _ledger_reading().ledger.unaccounted
-        if unaccounted <= 0 or unaccounted == _state._ledger_announced:
-            return
-        _state._ledger_announced = unaccounted
+        with _ledger._registry.lock:
+            unaccounted = _ledger_reading().ledger.unaccounted
+            if unaccounted <= 0 or unaccounted == _state._ledger_announced:
+                return
+            _state._ledger_announced = unaccounted
         _diag.lost(
             "event",
             unaccounted,

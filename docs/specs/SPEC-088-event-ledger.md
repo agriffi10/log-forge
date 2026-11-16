@@ -385,9 +385,18 @@ again it was lost with every counter at zero (Evidence).
       leaves `dropped == N - C`, `submitted_after_shutdown == C`, `overflow_lost` twice the
       first and `stranded` twice the second; today the same scenario reads
       `submitted_after_shutdown == N` (invariant 2).
-- [ ] `p03_shutdown_race.py 2000` prints a `submitted_after_shutdown` below `queued` plus
+- [ ] ~~`p03_shutdown_race.py 2000` prints a `submitted_after_shutdown` below `queued` plus
       `dropped`; today it prints one above (11,979 and 11,992 in two of this spec's runs, against
-      10,013 to 10,094 on the prototype) (invariants 2 and 11).
+      10,013 to 10,094 on the prototype)~~ — struck by diff review frame 1: that comparison holds
+      only while overflow outnumbers the late submissions the final drain carries, which
+      `submitted_after_shutdown` counts by design (`Health.submitted_after_shutdown` starts its
+      count when `shutdown()` begins), so under load it failed: 3 of 10 concurrent pytest runs,
+      one reading `queued=6006 dropped=0 submitted_after_shutdown=6561`, and 10 of 20 probe runs.
+      In its place, a criterion that holds by construction: eight threads making 2,400 traced
+      calls into a queue of 500 after `shutdown()`'s drain has ended leave every late submission
+      in exactly one of `submitted_after_shutdown` and `dropped`, the two summing to 2,400, with
+      `overflow_lost` twice the second and `stranded` twice the first; `p03`'s own readings are
+      recorded in the delivery doc and not compared (invariants 2 and 11).
 - [ ] `p11_assembly.py` prints `in_span_lost=2` for (a), where today it prints 0; "moved by 3"
       for (b), where today it prints 2; and `unaccounted=0` for (c), where today it prints 6
       (invariant 2).
@@ -459,13 +468,17 @@ When the check finds `unaccounted` above zero it writes one line through `_diag`
 only, and it writes again only when the number differs from the last one it announced, since a
 warm container may call `shutdown()` on every invocation.
 
-**A `shutdown()` from a signal handler.** The check reads the caller-side cells under the ledger's
+**A `shutdown()` from a signal handler.** ~~The check reads the caller-side cells under the ledger's
 registration lock, a plain `threading.Lock`. A handler that runs `shutdown()` on a thread already
 inside that lock, which a `health()` call holds for its read, waits on its own thread: forced by
-raising the signal inside the read, it hung. This is one more instance of the open §12 item for
-finding 3, which already records the same wait on `Runtime._lock`, the close registry's lock,
-`Worker._lock` and the queue's mutex, and is closed by the lifecycle track's one command path.
-This spec makes no new promise about a handler and adds that lock to the item's list.
+raising the signal inside the read, it hung.~~ — struck during the build: the registration lock
+is an `RLock`, taken once per pass of a reading, to fold the dead cells and take one snapshot of
+the pair, and released before the pass sums it (FR-004). A handler that runs `shutdown()` or
+`health()` on a thread already inside it re-enters it rather than waiting on its own thread, as
+the next paragraph says. This is still one more lock on the list of the open §12 item for finding
+3, which records the same wait on `Runtime._lock`, the close registry's lock, `Worker._lock` and
+the queue's mutex and is closed by the lifecycle track's one command path: a handler on a thread
+inside any of those still waits, and this spec makes no new promise about a handler.
 
 **Re-entry on the registration lock** (added during the build, from the plan review). The hazard
 above was worse for this lock than the paragraph says: a handler or a `__del__` that *logs* on a
@@ -1027,6 +1040,13 @@ end-to-end figure says nothing about a change of this size.
 ---
 
 ## Revision history
+
+- **2026-11-15, revised in place after the first diff review**, each change struck in its section:
+  FR-002's second criterion, `p03`'s `submitted_after_shutdown` below `queued` plus `dropped`,
+  is replaced by one that holds by construction, every late submission in exactly one of the two
+  counts, after that comparison failed under load in 3 of 10 concurrent runs; and FR-003's
+  signal-handler paragraph is restated for the `RLock` held once per pass, where it still
+  described a plain `Lock` held for the whole read.
 
 - **2026-11-15, revised in place during the build** on `spec-088/impl`, each change struck in its
   section: the snapshot's read order is SPEC-091's two passes with the worker's terms first

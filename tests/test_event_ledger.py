@@ -663,6 +663,39 @@ def _probe(name: str, *args: str) -> str:
     return done.stdout
 
 
+def _probe_ledger(name: str, *args: str) -> tuple[str, dict[str, int]]:
+    """Runs a probe unedited, then reads ``health().events`` in the same process once it ends.
+
+    The probes are kept byte for byte as they were run (their README), so the ledger is read by a
+    wrapper that runs the script with ``runpy`` and prints one ``LEDGER`` line after it, rather
+    than by editing the script to print it.
+    """
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    here = root / "docs/audits/2026-11-14-probes/core-pipeline"
+    probe = here / name
+    wrapper = (
+        "import runpy, sys\n"
+        f"sys.argv = [{str(probe)!r}, *{list(args)!r}]\n"
+        f"sys.path.insert(0, {str(here)!r})\n"
+        f"runpy.run_path({str(probe)!r}, run_name='__main__')\n"
+        "import log_foundry\n"
+        "print('LEDGER', log_foundry.health().events, flush=True)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(root / "src")}
+    done = subprocess.run(  # noqa: S603
+        [sys.executable, "-B", "-c", wrapper], capture_output=True, text=True, timeout=120,
+        env=env, check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    last = next(line for line in done.stdout.splitlines() if line.startswith("LEDGER "))
+    return done.stdout, _ledger_on(last)
+
+
 def _ledger_on(line: str) -> dict[str, int]:
     """The ``EventLedger(...)`` a probe printed on ``line``, as a dict."""
     import re
@@ -731,3 +764,46 @@ def test_a_retired_parents_child_strands_its_submissions() -> None:
 
     child = run_in_child(in_child, timeout=10)
     assert child.output == "2 0 0", child.output
+
+
+def test_two_checks_racing_write_one_line_for_one_imbalance(monkeypatch, capsys) -> None:
+    """FR-003 AC-5 under a race (diff review frame 1): the check and its record are one decision.
+
+    The check `shutdown()` ends with is run on two threads at once, as two `shutdown()` calls that
+    reach their ends together run it; two whole calls mostly serialize on the worker's stop, so the
+    race is driven at the check itself. The read of the last count announced is slowed, so both
+    are inside the window between reading it and recording the new one; decided apart, both wrote
+    the line.
+    """
+    import time
+
+    _fast_worker(GatedSink())
+    _lose_inside_submit(monkeypatch)
+    _five_logs()
+    held = {"count": 0}
+
+    def read_slowly(self) -> int:  # type: ignore[no-untyped-def]
+        count = held["count"]
+        time.sleep(0.05)
+        return count
+
+    def record(self, count: int) -> None:  # type: ignore[no-untyped-def]
+        held["count"] = count
+
+    monkeypatch.setattr(
+        type(_lifecycle._state), "_ledger_announced", property(read_slowly, record), raising=False
+    )
+    barrier = threading.Barrier(2)
+
+    def stop() -> None:
+        barrier.wait()
+        _lifecycle._check_ledger()
+
+    threads = [threading.Thread(target=stop) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    lines = _lines(capsys.readouterr().err)
+    assert len(lines) == 1 and "lost 7 event(s)" in lines[0], lines
+    ledger_check.begin()
