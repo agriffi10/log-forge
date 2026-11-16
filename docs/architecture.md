@@ -1352,7 +1352,94 @@ close it.
   Measured at `a0f44b5f`, 2 cells red: the installed sink has one write and closes entered at
   counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
   by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
-  the swap began.
+  the config named it (the item below says why the config write, not the swap's entry, and which
+  takes count). Its two pinned cells retarget a worker that then declines, which SPEC-054 records
+  as an accepted trade; the item below says what closing it reverses.
+- **A sink a swap installs is closed twice with nothing written between when a concurrent
+  `shutdown()` took it before the swap decided** (SPEC-086's soak; invariant 5). This is the item
+  above with the `shutdown()` on another thread instead of inside a sink's code.
+  `configure(sink=S)` writes S to the config before its swap decides (`config._change_sink` calls
+  `_rebind`, then `_swap_live_sink`). In that window an orphan log arms S and writes to it, and a
+  `shutdown()` takes S and closes it. The swap then arms S as the sink it installs, and a later
+  take closes S again at the same write count.
+
+  On the no-worker branch, the swap's config write precedes the shutdown's take of S, and its
+  swap's critical section follows the drain's last take (before it, the swap declines at entry). None of invariant 5's recorded exceptions
+  covers that window. `docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`
+  forces it:
+  - At `9d70f782`, 7 of 7 forced runs closed S at counts 1 and 1. Both controls closed S once in 7
+    of 7: one drops the first `shutdown()`, and the other drops the stale log that keeps the
+    swap from returning early.
+  - It closed S twice on 5 of 5 runs at each of `31dda162`, `624d817f` (#339), `a0f44b5f`
+    (v1.2.0), `5447d26a` and `6bd0b66e`. It is present at every tree measured, so it shipped in
+    1.2.0 and is not a regression. #339's serialized `configure()` does not reach it, because the
+    `shutdown()` does not take that lock.
+  - Unforced, it is the soak's `repeat@<n>` with nothing written between the first close's take
+    and the second close's take. The soak was run over its even seeds alternately at `5447d26a`
+    and `9d70f782`, at loads of 28 to 82. It found 1 such report in 9,000 runs at `5447d26a` and 3
+    in 9,000 at `9d70f782`. In each, the only arm between the two takes was the swap's arm of the
+    sink it installs, traced by caller. At `9d70f782` all 3 arms were on the no-worker branch. At
+    `5447d26a` the one arm, `emit-seed1238`, was after `Worker.retarget`. Of 14 more found at
+    higher load at `9d70f782`, 9 were on the no-worker branch and 5 were after `Worker.retarget`.
+    In every one, the first take was a `shutdown()`'s.
+  - The one other `repeat@<n>` at each commit is not counted here: `emit-seed1582` and
+    `deliver-seed600` each had a write after the first take. At `emit-seed1582` that write made no
+    arm because the swap's arm had already made the sink owed, so the soak's rule, which looks for
+    a writer's arm, reads a close the write owes as unowed. At `deliver-seed600` the writer armed
+    before the take, which is the race of the orphan-log item below. Whether its second close is
+    owed depends on how that item closes. The higher-load set had 4 more like `emit-seed1582`.
+  - SPEC-086's `deliver-seed962` has the same record. It is not #339's double close, as SPEC-086
+    and `check_unowed_repeat`'s docstring call such an arm, because the take ahead of the swap's
+    arm is a `shutdown()`'s, which #339's lock does not cover. The take after it is often a
+    later `configure()`'s stale take, as at `deliver-seed1366` and `http-seed1106`.
+
+  After `Worker.retarget` the same arm is reached only through two windows invariant 5 already
+  records: a `shutdown()` that gave up waiting for the swap's decision, and a swap that retargets a
+  worker built during the shutdown. There the recorded consequence is a sink left open; this is a
+  second consequence, a sink closed twice. It is unforced. Where the retarget declined, it is the
+  redundant close SPEC-054 accepted as a trade. That trade is recorded in
+  `docs/decisions/pipeline/one-lifecycle-owner-the-bookkeeping-around-the-two-emit-paths-exists-once.md`,
+  in SPEC-054 and its delivery doc, in `_swap_sink`'s docstring, and in
+  `tests/test_shutdown_lifecycle.py::test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade`.
+  Its text names a declined swap only, so the no-worker half of this item reverses no recorded
+  decision.
+
+  Three docstrings state as correct or complete what this item disproves:
+  - `_shutdown_worker`'s "the one not covered";
+  - `_swaps_to_await`'s claim that its snapshot holds every swap whose decision may still be ahead;
+  - `_swap_sink`'s no-worker paragraph, which arms the new sink after the drain's last take.
+
+  **Closed by** one of two routes:
+  - **The one lifecycle command path.**
+  - **The swap withholding its arm of the sink it installs** where a `shutdown()` or the exit drain
+    (a `_close_owed` take) has taken that sink since the config named it. This applies on the
+    no-worker branch, and on the branch after `Worker.retarget` only for a `declined` verdict.
+
+  The withhold has three bounds:
+  - **The take must be a `_close_owed` take, not any take.** Through an unserialized pair of
+    `configure()` calls, a second swap's stale loop can take S before the first swap's retarget
+    adopts it, and the worker then writes S. At `027b39a5`, S's closes were `[1, 2]`, which is
+    correct. A withhold keyed on any take left `[1]` with two writes: written after its last close
+    and owed by nobody. A third diff reviewer measured this, 3 of 3.
+  - **On `fenced` and `unfenced`, the swap's arm stays.** It is the only arm the worker's new sink
+    gets.
+  - **The mark is per sink change.** It is published lock-free before `_rebind`, as
+    `_swaps_running` is, because taking `_state._lock` there would add an acquisition to counts
+    that tests pin. One global slot is overwritten by an unserialized or re-entrant `configure()`.
+    It is cleared in `_change_sink`'s `finally`, or it holds a superseded sink strongly, which four
+    SPEC-081 tests in `tests/test_ownership_record.py` refuse. It needs a home in the lifecycle
+    inventory and the fork roster.
+
+  A withhold keyed on the config write was measured on both branches at `4cda14ba` and
+  `027b39a5`, and then removed:
+  - p11 closed S once in 3 of 3 runs.
+  - The whole suite failed only the trade test and the two `installed-closed-twice` pins of the
+    item above, which are `declined`, plus tests that inventory or bound the mutant's own scratch
+    globals. The SPEC-035 FR-003 tests stayed green, because the next orphan log re-arms S.
+  - A mark taken at the swap's entry instead left p11 at 3 of 3 double closes.
+
+  The no-worker half can land alone. The `declined` half reverses SPEC-054's recorded trade: it is
+  a rewrite of that decision file in place, and Andrew's call.
 - **An orphan log that passed its owed check before a `shutdown()` took its sink writes after the
   close, and the sink is owed nothing** (SPEC-085; invariant 5). Measured at `a0f44b5f` by the
   reproduction in `tests/test_model_cells.py`: `writes=2`, one close entered and returned at count
