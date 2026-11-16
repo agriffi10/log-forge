@@ -215,7 +215,8 @@ def test_an_expired_join_counts_the_events_inside_deliver(
     finally:
         release.set()
         worker._thread.join(5.0)
-    assert "4 event(s) in flight, counted when the emit returns" in err, err
+    # ~~counted when the emit returns~~ — struck by SPEC-088 FR-002 item 4: the clause names the ledger gauge the events are in.
+    assert "4 event(s) in flight (health().events.in_flight)" in err, err
     assert worker._in_flight == 0
 
 
@@ -354,6 +355,7 @@ class _AlwaysFails:
         pass
 
 
+@pytest.mark.ledger_exempt("calls Worker._emit with a batch no queue took in")
 def test_the_workers_emit_loop_survives_a_huge_max_retries(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

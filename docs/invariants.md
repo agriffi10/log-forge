@@ -58,9 +58,18 @@ can repeat, invariant 11), or it is still queued where a `shutdown()` left it â€
 `retired` is set and `submitted_after_shutdown` counts it (SPEC-030). Nothing is lost silently
 and nothing is counted twice.
 
-*Observable:* the ledger balances. For spans, `span.end` delivered + `queued` + `dropped` equals
-spans started; for orphan logs, delivered + `orphan_lost` equals calls made; an event that could
-not be *built* is in `in_span_lost` or `orphan_lost`; loss a sink absorbed is in `health().sink`.
+*Observable:* the ledger balances, in events (SPEC-088 FR-001). Every event is credited to
+`health().events.accepted` at the call that asks for it, and at rest, with no library call in
+progress, `accepted == open_spans + queued + in_flight + delivered + skipped + in_span_lost +
+orphan_lost + overflow_lost + batch_lost + sink_lost + drain_lost + stranded`, with
+`health().events.unaccounted == 0`, the events the terms cannot place; at rest after a `flush()`
+with every span closed, the three gauges are zero. An event that could not be *built* is in
+`in_span_lost` or `orphan_lost`; loss a sink absorbed inside an `emit` that returned is in
+`health().sink`, where the ledger ends. `shutdown()` reports a non-zero `unaccounted` on stderr
+and raises nothing, and the suite's autouse fixture fails a test whose process does not balance.
+~~For spans, `span.end` delivered + `queued` + `dropped` equals spans started; for orphan logs,
+delivered + `orphan_lost` equals calls made~~ â€” superseded by SPEC-088: those two identities
+counted in submissions and calls and could only be closed by adding up stderr lines.
 *Recorded exceptions:* `dropped` counts submissions, not events, and a sink's `failed` is an upper
 bound (`health()` docstring); `queued` also counts a `flush()` marker stranded by a racing
 `shutdown()`, for the life of the process (`Health.queued` docstring, SPEC-050 FR-001); ~~three

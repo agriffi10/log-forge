@@ -16,6 +16,7 @@ from log_foundry import (
     DEFAULT_SWAP_TIMEOUT,
     Config,
     ContinueResult,
+    EventLedger,
     FlushResult,
     Health,
     Outcome,
@@ -70,6 +71,9 @@ from log_foundry.sinks.sqs import DedupIdSource, GroupIdSource, SQSSink
 
 # FR-001: every public dataclass, by keyword. A positional form is planted in `rejects.py`.
 _HEALTH = Health(queued=0, dropped=0, failed_batches=0, in_span_lost=0)
+# SPEC-088 FR-004: the ledger is read through health() and built by keyword.
+_LEDGER = EventLedger(accepted=2, delivered=2)
+_LOST: int = health().events.lost + _LEDGER.pending
 _LOSSES = SinkLosses(dropped=0, failed=0)
 _FLUSH = FlushResult(ok=True)
 _CONTINUE = ContinueResult(ok=False, reason="nothing-supplied")
@@ -323,6 +327,6 @@ _NAMES: tuple[object, ...] = (
     _FACTORY_CONFIG, _FACTORY, _configure_a_factory,
     __version__, health, get_config, get_baggage, current_baggage_header, current_trace_context,
     read_losses, flush_sink, SinkDeliveryError, merge_headers, _BACKEND, _GROUP, _DEDUP,
-    _MyEngineSink, read_deliver, Outcome, Verdict, SinkCounters,
+    _MyEngineSink, read_deliver, Outcome, Verdict, SinkCounters, _LEDGER, _LOST,
 )
 _READERS: tuple[Callable[..., Any], ...] = (read_losses, flush_sink)

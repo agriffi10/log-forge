@@ -29,7 +29,7 @@ from log_foundry.sinks.verdict import (
     emit_via_deliver,
     read_deliver,
 )
-from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, Health
+from log_foundry.worker import DEFAULT_SHUTDOWN_TIMEOUT, DEFAULT_SWAP_TIMEOUT, EventLedger, Health
 
 try:
     __version__ = _dist_version("log-foundry")
@@ -120,8 +120,8 @@ def health() -> Health:
     Returns:
       The snapshot: ``queued``, ``dropped``, ``failed_batches``, ``stopped_reason``, ``sink``,
       ``retired``, ``submitted_after_shutdown``, ``incomplete_swaps``, ``closing_sinks``,
-      ``inherited_sink``, ``orphan_lost`` and ``in_span_lost`` — every field, since a counter
-      documented nowhere is a loss nobody looks for. ``retired`` says
+      ``inherited_sink``, ``orphan_lost``, ``in_span_lost`` and ``events`` — every field, since a
+      counter documented nowhere is a loss nobody looks for. ``retired`` says
       :func:`shutdown` was called, and ``submitted_after_shutdown`` counts events accepted
       afterwards, which are queued where nothing will drain them — non-zero together, that is
       the ``shutdown()``-per-invocation mistake, and the remedy is :func:`flush`.
@@ -147,6 +147,12 @@ def health() -> Health:
       snapshot is simply zeroed, except for ``retired``, which stays truthful even for a
       process that only ever logged outside a span and so built no worker at all (SPEC-031
       FR-006). Valid after :func:`shutdown`.
+      ``events`` is the :class:`EventLedger` (SPEC-088): every accepted event in the one term it
+      is in now, counted in events — ``accepted``; the gauges ``open_spans``, ``queued`` and
+      ``in_flight``; the exits ``delivered`` and ``skipped``; and the losses ``in_span_lost``,
+      ``orphan_lost``, ``overflow_lost``, ``batch_lost``, ``sink_lost``, ``drain_lost`` and
+      ``stranded`` — with ``unaccounted``, the events the terms cannot place, which is zero in a
+      correct library. A process with no worker reports one too.
 
     Raises:
       None.
@@ -235,6 +241,7 @@ __all__ = [
     "DEFAULT_SWAP_TIMEOUT",
     "Config",
     "ContinueResult",
+    "EventLedger",
     "FlushResult",
     "Health",
     "Outcome",

@@ -37,8 +37,9 @@ plus whatever is queued and not yet delivered.
   own that makes the time trigger due, so an event leaves within about one interval (FR-002).
 - `flush()`, `shutdown()`, the exit drain, events recorded after the worker has stopped, sink
   swaps and a forked child, each stated against the sweep (FR-003).
-- The sweep in SPEC-088's event ledger, with SPEC-088 FR-001's snapshot read order refined, and in
-  SPEC-089's flush window, with the SPEC-089 criterion it inverts rewritten; the model harnesses'
+- The sweep in SPEC-088's event ledger, ~~with SPEC-088 FR-001's snapshot read order refined~~
+  crediting each sweep's hand-over in the sweeping thread's cell, which the two-pass read order
+  SPEC-088 built already reads soundly (revised 2026-11-15), and in SPEC-089's flush window, with the SPEC-089 criterion it inverts rewritten; the model harnesses'
   span identity restated in `span.end` events; and the SPEC-085 pin the move resolves (FR-004).
 - The traced call's added cost, measured, and the locks the open and per-event paths may take
   (FR-005).
@@ -349,7 +350,14 @@ thread and never calls sink code while it holds `_sweep_lock`.
 - **A fork.** The child forgets every registered span before its drain thread resumes. The step
   is a handler, `_lifecycle._forget_open_spans_after_fork`, that imports `decorator` lazily and
   clears `_open_spans`, registered with `_fork.register_child_handler` in `_lifecycle.py` between
-  `:5911` (`_adopt_factory_after_fork`) and `:5912` (`_rebuild_worker_after_fork`). Not from
+  ~~`:5911` (`_adopt_factory_after_fork`) and `:5912` (`_rebuild_worker_after_fork`)~~
+  `_adopt_factory_after_fork` and `_rebuild_worker_after_fork` (revised 2026-11-15: SPEC-088
+  registers `_restart_ledger_after_fork` between those two, so the order on its tree is
+  `_reclaim_after_fork`, `_clear_after_fork`, `_adopt_factory_after_fork`,
+  `_restart_ledger_after_fork`, `_rebuild_worker_after_fork`, `_lifecycle.py:6514-6518` at
+  SPEC-088's `d0361104`). The step goes immediately before `_rebuild_worker_after_fork`, after the
+  ledger's restart; either side of the restart would do, because the restart reads the ledger's
+  cells and never the registry this step clears. Not from
   `decorator.py`: `decorator` imports `_lifecycle`, so a registration there runs after the rebuild,
   when the child's drain thread is already running; and not ahead of `_reclaim_after_fork`, which
   `tests/test_fork_lifecycle.py:2133-2137` requires to run first. Never `os.register_at_fork`
@@ -399,7 +407,7 @@ forgotten spans stay in its `open_spans`, as SPEC-088 FR-005 records for spans o
 and `open_spans` stays a remainder: the registry is not exact for it (held events, a child's
 forgotten spans, the append window).
 
-**SPEC-088's snapshot read order is refined.** SPEC-088 FR-001 reads, cell by cell, each cell's
+~~**SPEC-088's snapshot read order is refined.** SPEC-088 FR-001 reads, cell by cell, each cell's
 hand-over and then its span credits, and argues that a remainder gauge cannot read below zero
 because, within one cell, the hand-over is written after the credit it debits. A sweep breaks the
 premise: it credits its hand-over in the drain thread's or the flusher's cell, while the span
@@ -415,7 +423,24 @@ second pass, which runs later, reads it. A debit to `in_span_lost` is likewise w
 credit and read before every credit. `open_spans` therefore reads zero or more while sweeps run.
 The orphan cells and the worker's terms keep SPEC-088's order after the two passes. This is a
 refinement of SPEC-088 FR-001's read order, made here because this spec is the one that adds a
-hand-over in a cell other than the owner's.
+hand-over in a cell other than the owner's.~~
+
+**SPEC-088's snapshot read order already reads a sweep soundly** (revised 2026-11-15, after
+SPEC-088 was built). The refinement above was built in SPEC-088 itself, because a copied context
+such as `asyncio.to_thread` already hands over in a cell other than the owner's: an in-span log on
+the executor thread is credited in that thread's cell while the close's hand-over is credited in
+the owner's. As built, `log_foundry.worker._read_ledger` reads the process worker; then its
+drain's liveness, taking count, held events and exits; then `in_span_lost`; then **every cell's
+hand-over in one pass**; then the queue's entered count and `overflow_lost`; then **every cell's
+span credits in a second pass**, from a fresh snapshot of the cells; then the orphan cells, cell by
+cell; then `orphan_lost`. It differs from the sentence struck above in one place: the worker's
+terms are read **before** the two passes, not after them, so that every snapshot has an `accepted`
+no less than the worker path's exits and losses. The argument for a sweep is the one struck above,
+unchanged: a sweep's hand-over is written after its take, the take after the append, the append
+after the owner's credit, so the second pass reads every credit a first-pass hand-over debits.
+What this spec still has to do is credit each sweep's hand-over in the sweeping thread's cell after
+its `hand_in` returns, at the two new sites (FR-004's first paragraph); the read order needs no
+change.
 
 **SPEC-089's window** starts before `_sweep_open_spans()`, so the registry sweep that `flush()` now
 makes runs inside it, and an overflow it causes is counted in that call's counts. A worker sweep's
@@ -455,8 +480,12 @@ empty. The pin is removed and its §12 item moved to Resolved.
       threads have joined and a `flush()` has returned, `pending == 0` (invariant 2).
 - [ ] A snapshot held by an injected hook after it has read the owner's cell and before it reads
       the sweeper's, while a sweep takes 3 events from the owner's span and credits them, reads
-      `unaccounted == 0` and `open_spans >= 0`; with the cell-by-cell order of SPEC-088 as written
-      it reads `unaccounted == 2` (invariant 2).
+      `unaccounted == 0` and `open_spans >= 0`; ~~with the cell-by-cell order of SPEC-088 as written
+      it reads `unaccounted == 2`~~ with SPEC-088's two passes swapped, so the span credits are read
+      before the hand-overs, and the snapshot held through `_ledger._between` in the span pass after
+      the owner's cell (the owner holding `span.start` and 3 logs, of which the reader has seen 1),
+      it reads `unaccounted == 2` (revised 2026-11-15: SPEC-088 built the two-pass order, so the
+      cell-by-cell order exists only as this mutant) (invariant 2).
 - [ ] A sweep of two open spans into a full queue moves `overflow_lost` by the events of both
       takes, `dropped` by 2 and `open_spans` down by the same events (invariant 2).
 - [ ] With `_hand_in` made to raise for a span's take, `in_span_lost` moves by that take's events,
@@ -656,7 +685,8 @@ class Worker:
 
 # _lifecycle.py
 worker = Worker(sink, offer_signal=False, sweep=_sweep_registered)   # the one caller of sweep=
-def _forget_open_spans_after_fork() -> None: ...     # lazy import; registered between :5911, :5912
+def _forget_open_spans_after_fork() -> None: ...     # lazy import; registered just before
+                                                     # _rebuild_worker_after_fork (FR-003)
 ```
 
 ## File & Folder Structure
@@ -699,7 +729,8 @@ docs/                 # FR-006's record
 
 ### Phase 3: The ledger and the harnesses (FR-004, FR-005)
 
-- The hand-over credit at the two new sites, the two-pass snapshot read order, the restated span
+- The hand-over credit at the two new sites, ~~the two-pass snapshot read order~~ (built by
+  SPEC-088), the restated span
   identities, SPEC-089's inverted test, the pin removed and `_flush`'s empty guard, the cost tests
   and measurements.
 
@@ -770,7 +801,7 @@ it shows: `spec091_exactly_once.py`, `spec091_latency.py`, `spec091_fork.py`, `s
 | the sweep on the time trigger's clock (`latency`) | every sample at the 5 s cap, `busy` and idle |
 | the sweep not making the time trigger due (`latency`) | max 2.006 s |
 | no fork step (`fork`) | the child writes all 8 of the parent's pre-fork events again |
-| (second cut) the fork handler's order | `_reclaim_after_fork`, `_clear_after_fork`, `_adopt_factory_after_fork`, `_forget_open_spans_after_fork`, `_rebuild_worker_after_fork` |
+| (second cut) the fork handler's order | `_reclaim_after_fork`, `_clear_after_fork`, `_adopt_factory_after_fork`, `_forget_open_spans_after_fork`, `_rebuild_worker_after_fork`, on a tree without SPEC-088, whose `_restart_ledger_after_fork` now sits between `_adopt_factory_after_fork` and the forgetting step (FR-003) |
 | no lock around `continue_trace`'s check and re-parent | `split_spans=19 refused=1` |
 
 **The SPEC-085 cells** (`tests/test_model_cells.py`). `a2cd4b36`: 451 passed, 21 expected
@@ -828,6 +859,14 @@ millisecond once an interval; FR-001 takes it for the cap.
 the prototype.
 
 ## Revision history
+
+- **2026-11-15, revised in place after SPEC-088 was built**, each change struck in its section.
+  SPEC-088 already reads its snapshot in two passes, with the worker's terms read before them
+  rather than after, so FR-004's refinement is restated as built and this spec's remaining work
+  is the sweep's hand-over credit (the scope bullet and Phase 3 follow it). The fork order now
+  names SPEC-088's `_restart_ledger_after_fork`, and the stale `:5911`/`:5912` citations are
+  replaced by function names. FR-004's `unaccounted == 2` criterion is kept as a mutant that
+  swaps the two passes.
 
 - **2026-11-15, after the spec review.** Thirteen findings, all taken. The mechanism changed in
   four places, each prototyped and measured as the second cut (Evidence): no stderr write under

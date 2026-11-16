@@ -1435,88 +1435,13 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (`test_a_capped_stream_never_writes_an_event_twice` in
   `tests/test_stream_sink_partial_write.py`), which is what closure (b) keeps, so the answer
   leaves that assertion as written.
-- **`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**
-  (2026-11-14 audit, finding 18; invariant 2, whose recorded exception at `docs/invariants.md:62`
-  stands). `dropped` counts submissions, `failed_batches` counts batches, the sink, orphan and
-  in-span terms count events, and nothing counts what was accepted.
-  `docs/audits/2026-11-14-probes/core-pipeline/p01_overflow.py`: 36,000 events accepted and 30,030
-  delivered, with `dropped=1990` standing for 5,970 missing events.
-  `core-pipeline/p05_raise_nth.py`: 300 events lost to ten abandoned batches read as
-  `failed_batches=10` in `health()` and as an event count only on stderr. **Closed by** one
-  event-unit ledger on the runtime, which Andrew took on 2026-11-14: every accept site credits an
-  accepted count and every exit debits delivered, exactly one named loss term or a pending gauge,
-  with the balance asserted at `shutdown()` and by a test fixture. The ledger appends event-unit
-  terms to `Health` (invariant 10). The existing counters keep their units and the recorded
-  exception stands; nothing is reopened. Nor is this the in-library metrics that `CLAUDE.md` rules
-  out, ~~which are measurements of the application, to be derived downstream from its logs~~
-  (corrected 2026-11-15 while SPEC-088 was authored: the non-goal's words are "derive them
-  downstream" and name no subject, so the argument rests on that test). A count of events that
-  never reached the sink cannot be derived downstream of the sink, the terms are returned by
-  `health()` and shipped nowhere, and they extend the library's account of its own delivery, which
-  `Health` already carries.
-- **A submission that overflows the queue after `shutdown()` is counted in two loss terms**
-  (2026-11-14 audit, finding 16; invariant 2). `Worker.submit` counts `submitted_after_shutdown`
-  before the put (`worker.py:669-671`) and `dropped` again when the put raises `queue.Full`
-  (`:674-680`), although its own docstring says counting a dropped submission in both fields "would
-  double-report one loss" (`:657-658`).
-  `docs/audits/2026-11-14-probes/core-pipeline/p03_shutdown_race.py 2000`, in the core frame's run:
-  `dropped=1994` sat inside `submitted_after_shutdown=11994`, and each of the 1,994 was announced on
-  both lines. This is not the item *The after-shutdown submission line announces a loss the final
-  drain can still deliver*, which is the 11 submissions the final drain delivered in the frame's run
-  of the same probe at 400. **Closed by** counting a retired submission only once its put has
-  succeeded, or by the event ledger debiting each event to one term.
-- **A drain thread that dies leaves the batch it was holding in no counter** (2026-11-14 audit,
-  finding 7; invariant 2). `Worker._terminal_failure` sets `stopped_reason` and announces the held
-  work in event-lists, not events, and moves no loss term (`worker.py:1679-1690`).
-  `docs/audits/2026-11-14-probes/core-pipeline/p08_worker_death.py`: of 50 spans accepted, 10 were
-  delivered, 10 were held by the dead thread and are in no counter, and 30 stayed queued. **Bounded
-  by a settled decision:** a dead worker is reported, not restarted
-  (`docs/decisions/failure-paths/a-dead-worker-is-reported-not-restarted--and-as-a-reason-not-a-liveness-flag.md`),
-  so the 30 later spans that are never delivered are that decision working and are not open here.
-  **Closed by** counting the held events in a loss term at the moment the thread dies.
-- **A span that fails to open loses its two boundary events uncounted, and a failed close
-  undercounts by one** (2026-11-14 audit, finding 17; invariant 2, whose observable puts an event
-  that could not be built in `in_span_lost`). The open guard in `decorator._begin` announces and
-  counts nothing (`decorator.py:630-635`); the close guard counts `len(span.events)` (`:687`), which
-  omits the `span.end` that `:721` failed to build.
-  `docs/audits/2026-11-14-probes/core-pipeline/p11_assembly.py`: an injected fault at the open left
-  `in_span_lost` at 0 with neither boundary event built, the in-span log being delivered as an
-  orphan on a fresh trace; an injected fault at the close lost 3 events and moved `in_span_lost` by
-  2; and a traced recursion into `RecursionError`, with nothing injected, left 6 of 398 events
-  unaccounted, a split the core frame did not determine. **Closed by** a count at the open guard for
-  the two events that call will never build, and one more at the close guard.
-- **A `span.end` built while another thread sweeps the span lands on a buffer already handed over,
-  and is lost uncounted once the drain has taken it** (found while authoring SPEC-088, 2026-11-15;
-  invariant 2). `decorator._close_span` runs `span.events.append(end_event(span, status, exc))`
-  (`decorator.py:721`), which reads `span.events` before it calls `end_event`, so a `flush()` on a
-  thread or task sharing the span can detach the buffer during that call (`:459-462`) and the
-  append then lands on a list already submitted. This is not the append window §13 records, which
-  is `api._log`'s and stays open: that one builds first and appends after, so its event lands on the
-  new buffer. `docs/audits/2026-11-14-probes/core-pipeline/p14_end_races_sweep.py`, at `ae0b7674`,
-  forcing the interleaving from inside `end_event`: with a sweep only, the sink still received
-  `span.end`, because the list was still queued; with a `flush()`, it received `span.start` and the
-  in-span log and never `span.end`, with `flush()` truthy, every counter zero and nothing on stderr.
-  Unforced, at a switch interval of 1e-6, the ledger prototype saw the late append in 18 of 30
-  trials of `tests/test_span_sweep.py`'s sweep-against-close race, which asserts only that nothing
-  is delivered twice. **Closed by** SPEC-088 FR-002: the close builds the event before it reads the
-  buffer.
-- **A forked child's `health()` reports the parent's `orphan_lost` and `in_span_lost` as its own**
-  (found while authoring SPEC-088, 2026-11-15; invariants 2 and 12). `Worker._reinit_after_fork`
-  zeroes the worker's counters in the child (`worker.py:584-592`), and nothing resets the two
-  counters `decorator.py` holds (`:51-52`).
-  `docs/audits/2026-11-14-probes/core-pipeline/p15_fork_child_counters.py`, at `ae0b7674`: a parent
-  that had lost one orphan log forked a child that read `orphan_lost=1` at the fork and after its
-  own work, having lost nothing. **Closed by** SPEC-088 FR-005: the child's ledger starts as what
-  its open spans hold, with every loss term zero.
-- **The events of a call a `BaseException` cuts short are in no counter** (found while authoring
-  SPEC-088, 2026-11-15; invariant 2, whose promise is made for a call that returned). The guards
-  catch `Exception` and let a `KeyboardInterrupt` through, by invariant 1, and count nothing on the
-  way. `docs/audits/2026-11-14-probes/core-pipeline/p16_interrupt_through_a_guard.py`, at
-  `ae0b7674`: an interrupt raised by the sink during an orphan log, and one raised while a span
-  opened, each reached the caller with the event gone and `orphan_lost` and `in_span_lost` at 0.
-  An in-span log whose build is interrupted is the same case at the fourth guard (`api.py:138`),
-  found by SPEC-088's spec review. **Closed by** SPEC-088 FR-002: each guard counts what its call
-  can no longer deliver and re-raises the exception unchanged.
+- ~~**`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**A submission that overflows the queue after `shutdown()` is counted in two loss terms**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**A drain thread that dies leaves the batch it was holding in no counter**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**A span that fails to open loses its two boundary events uncounted, and a failed close undercounts by one**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**A `span.end` built while another thread sweeps the span lands on a buffer already handed over, and is lost uncounted once the drain has taken it**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**A forked child's `health()` reports the parent's `orphan_lost` and `in_span_lost` as its own**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**The events of a call a `BaseException` cuts short are in no counter**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
 - **A `BaseException` raised while a span closes leaves that span current in the caller's
   context** (found while authoring SPEC-088, 2026-11-15; invariant 9; no spec yet). `_end` pops
   the span and the baggage scope after a guard that catches `Exception` only
@@ -1542,8 +1467,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   exit took 30.3 s, the sink was handed 19,980 events in one call and had taken 11,630 of the 20,000
   when the process ended, `close()` never ran, and that one stderr line was the only trace of the
   8,370 lost. **Closed by** draining the backlog at exit in batches of the worker's own size, so
-  that an expiry costs one batch, and by an expiry line that counts the batch in flight or stops
-  promising to.
+  that an expiry costs one batch, ~~and by an expiry line that counts the batch in flight or stops
+  promising to~~ — narrowed by SPEC-088 FR-002 item 4 to its capacity half: the batch in flight is
+  in `health().events.in_flight` at the expiry and the line names that gauge in place of the
+  promise (`p04` on the branch: `19980 event(s) in flight (health().events.in_flight)`).
 - **The queue holds 10,000 submissions and a batch is 10 submissions, and neither can be changed**
   (2026-11-14 audit, finding 10; invariant 2's `dropped` term). `Worker.__init__` sets both defaults
   (`worker.py:361-363`), `_lifecycle.py:3796` builds the worker with them, and `configure()` exposes
@@ -1589,7 +1516,18 @@ an item leaves this list when a spec closes it, not because the arc names it.
   in the lifecycle frame's run; those loops spend nearly all their time inside lock sections, so the
   rate is an upper bound for a real program, and the mechanism does not depend on the rate. The
   frame found the handler blocked on `Runtime._lock`, the close registry's lock, `Worker._lock` and,
-  by inference, the queue's mutex. **The documents promise this caller, and the code breaks the
+  by inference, the queue's mutex. SPEC-088 adds the event ledger's registration lock, taken by a
+  thread's first credit, once per pass of every `health()` and `shutdown()` reading, and around
+  `shutdown()`'s once-per-count check, and never with a lifecycle lock held: a worker's build,
+  which runs under `Runtime._lock`, reads the hand-over count without it (`_ledger.handed_unlocked`,
+  SPEC-088's diff review), so the two are never nested in either order. It is an `RLock`,
+  so a handler or a `__del__` that logs or reads on the thread already inside it re-enters rather
+  than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`). A
+  handler on a thread inside any of the other locks still waits. One nesting remains, and it is
+  the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
+  `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
+  `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
+  while the registration lock is held (SPEC-088's second diff review). **The documents promise this caller, and the code breaks the
   promise.** `docs/invariants.md`, in invariant 5's recorded exceptions, describes what a re-entrant
   `shutdown()` made from "a signal handler" leaves behind, and
   `docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md`
@@ -1802,24 +1740,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   timeout plus a small epsilon, and a close-once-per-write oracle
   (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
   callback against every public call, with a fork and a signal handler as calls.
-- **`NATSSink` leaves the events past a round's deadline unattempted and counts them in no
-  per-event term** (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
-  wall-clock deadline, and an event it has not reached gets no per-event line and no `failed`
-  count; the batch's loss then shows only in `failed_batches` and the worker's abandon line. The
-  harness sets that deadline to 0.2 s of real time, so on a loaded runner
-  `tests/test_sinks_nats_engine_matrix.py::test_the_engine_matches_1x[every-event-unencodable-js-injected-worker]`
-  reads `failed` 7 where it pins 9. It failed so in CI run 43726021314 on a branch that changes
-  neither `sinks/nats.py` nor the harness, and passes 50 of 50 on a quiet machine on both that
-  branch and `ae0b7674`.
-  `docs/audits/2026-11-14-probes/core-pipeline/p18_nats_deadline_leaves_events_unattempted.py`
-  (the `nats` extra installed) slows the first encode by 0.25 s and prints, at `ae0b7674`,
-  `{'failed': 7, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and
-  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. The test's half is closed:
-  `tests/nats_engine_matrix_harness.py`'s `Clock` now drives the round deadline instead of real
-  time, so the pinned count no longer depends on runner load, and the same 0.25 s stall now reads
-  the pinned 9. **Closed by** SPEC-088's ledger, which places every event of such a run in exactly
-  one term, with this probe as the case its build checks, so whether the per-event count and the
-  abandon line together count each event once is decided by the identity rather than by reading.
+- ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no per-event term**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
 - **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
   breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
   of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
@@ -1908,6 +1829,143 @@ an item leaves this list when a spec closes it, not because the arc names it.
   the driver's own exception too. Decision: `docs/decisions/failure-paths/` (*The dual type reads
   only what the driver stores, and only Python's own subclassing can refuse it*).
 
+- ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no
+  per-event term**~~ (found on SPEC-082's PR, 2026-11-15; invariant 2). `NATSSink._publish_all` stops at the round's
+  wall-clock deadline, and an event it has not reached gets no per-event line and no `failed`
+  count; the batch's loss then shows only in `failed_batches` and the worker's abandon line. The
+  harness sets that deadline to 0.2 s of real time, so on a loaded runner
+  `tests/test_sinks_nats_engine_matrix.py::test_the_engine_matches_1x[every-event-unencodable-js-injected-worker]`
+  reads `failed` 7 where it pins 9. It failed so in CI run 43726021314 on a branch that changes
+  neither `sinks/nats.py` nor the harness, and passes 50 of 50 on a quiet machine on both that
+  branch and `ae0b7674`.
+  `docs/audits/2026-11-14-probes/core-pipeline/p18_nats_deadline_leaves_events_unattempted.py`
+  (the `nats` extra installed) slows the first encode by 0.25 s and prints, at `ae0b7674`,
+  `{'failed': 7, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and
+  `log-foundry: lost 3 event(s); batch abandoned after 3 emit attempts`. The test's half is closed:
+  `tests/nats_engine_matrix_harness.py`'s `Clock` now drives the round deadline instead of real
+  time, so the pinned count no longer depends on runner load, and the same 0.25 s stall now reads
+  the pinned 9. **Closed by** SPEC-088's ledger, which places every event of such a run in exactly
+  one term, with this probe as the case its build checks, so whether the per-event count and the
+  abandon line together count each event once is decided by the identity rather than by reading.
+  → **closed by SPEC-088's ledger.** At the commit that merged SPEC-088, run with the `nats` extra, `p18` prints the
+  same `{'failed': 9, 'failed_batches': 1, 'calls': 3, 'publishes': 0}` and `lost 3 event(s);
+  batch abandoned after 3 emit attempts`, and the worker it drives reads `batch_lost=3` with every
+  other exit term zero: each of the batch's 3 events is in one term, once. The sink's `failed` of 9
+  is its own per-attempt count in `health().sink`, an upper bound the ledger does not add, as
+  `Health.sink`'s docstring and invariant 2 record. The harness hands `Worker._emit` a batch no
+  queue took in, so that worker's `in_flight` reads minus 3; the suite's balance fixture checks
+  only the workers a test still holds at teardown, and the harness drops its own.
+- ~~**`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**~~
+  (2026-11-14 audit, finding 18; invariant 2, whose recorded exception at `docs/invariants.md:62`
+  stands). `dropped` counts submissions, `failed_batches` counts batches, the sink, orphan and
+  in-span terms count events, and nothing counts what was accepted.
+  `docs/audits/2026-11-14-probes/core-pipeline/p01_overflow.py`: 36,000 events accepted and 30,030
+  delivered, with `dropped=1990` standing for 5,970 missing events.
+  `core-pipeline/p05_raise_nth.py`: 300 events lost to ten abandoned batches read as
+  `failed_batches=10` in `health()` and as an event count only on stderr. **Closed by** one
+  event-unit ledger on the runtime, which Andrew took on 2026-11-14: every accept site credits an
+  accepted count and every exit debits delivered, exactly one named loss term or a pending gauge,
+  with the balance asserted at `shutdown()` and by a test fixture. The ledger appends event-unit
+  terms to `Health` (invariant 10). The existing counters keep their units and the recorded
+  exception stands; nothing is reopened. Nor is this the in-library metrics that `CLAUDE.md` rules
+  out, ~~which are measurements of the application, to be derived downstream from its logs~~
+  (corrected 2026-11-15 while SPEC-088 was authored: the non-goal's words are "derive them
+  downstream" and name no subject, so the argument rests on that test). A count of events that
+  never reached the sink cannot be derived downstream of the sink, the terms are returned by
+  `health()` and shipped nowhere, and they extend the library's account of its own delivery, which
+  `Health` already carries.
+  → **closed by SPEC-088 FR-001 and FR-004.** `health().events` is an `EventLedger` in events: every
+  accept site credits `accepted` before the build and every event leaves through one term, and
+  `shutdown()` and the suite's autouse fixture check the balance. At the commit that merged SPEC-088, `p01`'s scenario
+  reads `accepted=36000 delivered=30030 overflow_lost=5970` and `p05`'s `delivered=600
+  batch_lost=300` (`tests/test_event_ledger.py`).
+- ~~**A submission that overflows the queue after `shutdown()` is counted in two loss terms**~~
+  (2026-11-14 audit, finding 16; invariant 2). `Worker.submit` counts `submitted_after_shutdown`
+  before the put (`worker.py:669-671`) and `dropped` again when the put raises `queue.Full`
+  (`:674-680`), although its own docstring says counting a dropped submission in both fields "would
+  double-report one loss" (`:657-658`).
+  `docs/audits/2026-11-14-probes/core-pipeline/p03_shutdown_race.py 2000`, in the core frame's run:
+  `dropped=1994` sat inside `submitted_after_shutdown=11994`, and each of the 1,994 was announced on
+  both lines. This is not the item *The after-shutdown submission line announces a loss the final
+  drain can still deliver*, which is the 11 submissions the final drain delivered in the frame's run
+  of the same probe at 400. **Closed by** counting a retired submission only once its put has
+  succeeded, or by the event ledger debiting each event to one term.
+  → **closed by SPEC-088 FR-002 item 1.** `Worker.submit` reads the retirement count once, after a
+  put that succeeded, so an overflowed submission is in `dropped` alone, and every late submission
+  is in exactly one of the two: after the drain has ended, eight threads' 2,400 traced calls into a
+  queue of 500 read `submitted_after_shutdown=500 dropped=1900`
+  (`tests/test_event_ledger_defects.py`). ~~`p03_shutdown_race.py 2000` printed
+  `submitted_after_shutdown` below `queued` plus `dropped`~~ — struck by SPEC-088's diff review:
+  that comparison is a race, since `submitted_after_shutdown` also counts the late submissions the
+  final drain carries, and under load it read `queued=6006 dropped=0
+  submitted_after_shutdown=6561`; the probe's readings are recorded in SPEC-088's delivery doc.
+- ~~**A drain thread that dies leaves the batch it was holding in no counter**~~ (2026-11-14 audit,
+  finding 7; invariant 2). `Worker._terminal_failure` sets `stopped_reason` and announces the held
+  work in event-lists, not events, and moves no loss term (`worker.py:1679-1690`).
+  `docs/audits/2026-11-14-probes/core-pipeline/p08_worker_death.py`: of 50 spans accepted, 10 were
+  delivered, 10 were held by the dead thread and are in no counter, and 30 stayed queued. **Bounded
+  by a settled decision:** a dead worker is reported, not restarted
+  (`docs/decisions/failure-paths/a-dead-worker-is-reported-not-restarted--and-as-a-reason-not-a-liveness-flag.md`),
+  so the 30 later spans that are never delivered are that decision working and are not open here.
+  **Closed by** counting the held events in a loss term at the moment the thread dies.
+  → **closed by SPEC-088 FR-002 item 3.** `_terminal_failure` debits what the thread held to
+  `drain_lost` and its line names that count. At the commit that merged SPEC-088, `p08`'s scenario reads `accepted=100
+  delivered=20 drain_lost=20 stranded=60`, and its line says `lost 20 event(s) in 10 undrained
+  event-list(s) it held`.
+- ~~**A span that fails to open loses its two boundary events uncounted, and a failed close
+  undercounts by one**~~ (2026-11-14 audit, finding 17; invariant 2, whose observable puts an event
+  that could not be built in `in_span_lost`). The open guard in `decorator._begin` announces and
+  counts nothing (`decorator.py:630-635`); the close guard counts `len(span.events)` (`:687`), which
+  omits the `span.end` that `:721` failed to build.
+  `docs/audits/2026-11-14-probes/core-pipeline/p11_assembly.py`: an injected fault at the open left
+  `in_span_lost` at 0 with neither boundary event built, the in-span log being delivered as an
+  orphan on a fresh trace; an injected fault at the close lost 3 events and moved `in_span_lost` by
+  2; and a traced recursion into `RecursionError`, with nothing injected, left 6 of 398 events
+  unaccounted, a split the core frame did not determine. **Closed by** a count at the open guard for
+  the two events that call will never build, and one more at the close guard.
+  → **closed by SPEC-088 FR-002 item 2.** The open guard counts both boundary events when no span
+  was built, and the close guard takes the buffer under `_sweep_lock`, marks the span closed and
+  abandoned, and counts what it took plus `span.end` when `Span.ended` is false. At the commit that merged SPEC-088,
+  `p11` prints `in_span_lost=2` for (a), moved by 3 for (b), and `unaccounted=0` for (c).
+- ~~**A `span.end` built while another thread sweeps the span lands on a buffer already handed over,
+  and is lost uncounted once the drain has taken it**~~ (found while authoring SPEC-088, 2026-11-15;
+  invariant 2). `decorator._close_span` runs `span.events.append(end_event(span, status, exc))`
+  (`decorator.py:721`), which reads `span.events` before it calls `end_event`, so a `flush()` on a
+  thread or task sharing the span can detach the buffer during that call (`:459-462`) and the
+  append then lands on a list already submitted. This is not the append window §13 records, which
+  is `api._log`'s and stays open: that one builds first and appends after, so its event lands on the
+  new buffer. `docs/audits/2026-11-14-probes/core-pipeline/p14_end_races_sweep.py`, at `ae0b7674`,
+  forcing the interleaving from inside `end_event`: with a sweep only, the sink still received
+  `span.end`, because the list was still queued; with a `flush()`, it received `span.start` and the
+  in-span log and never `span.end`, with `flush()` truthy, every counter zero and nothing on stderr.
+  Unforced, at a switch interval of 1e-6, the ledger prototype saw the late append in 18 of 30
+  trials of `tests/test_span_sweep.py`'s sweep-against-close race, which asserts only that nothing
+  is delivered twice. **Closed by** SPEC-088 FR-002: the close builds the event before it reads the
+  buffer.
+  → **closed by SPEC-088 FR-002 item 5.** At the commit that merged SPEC-088, `p14` delivers `span.end` on both rows.
+- ~~**A forked child's `health()` reports the parent's `orphan_lost` and `in_span_lost` as its own**~~
+  (found while authoring SPEC-088, 2026-11-15; invariants 2 and 12). `Worker._reinit_after_fork`
+  zeroes the worker's counters in the child (`worker.py:584-592`), and nothing resets the two
+  counters `decorator.py` holds (`:51-52`).
+  `docs/audits/2026-11-14-probes/core-pipeline/p15_fork_child_counters.py`, at `ae0b7674`: a parent
+  that had lost one orphan log forked a child that read `orphan_lost=1` at the fork and after its
+  own work, having lost nothing. **Closed by** SPEC-088 FR-005: the child's ledger starts as what
+  its open spans hold, with every loss term zero.
+  → **closed by SPEC-088 FR-005.** At the commit that merged SPEC-088, `p15`'s child reads `accepted=2 open_spans=2
+  orphan_lost=0` at the fork and `accepted=3 delivered=3` after its span closes, and the parent
+  keeps `orphan_lost=1`.
+- ~~**The events of a call a `BaseException` cuts short are in no counter**~~ (found while authoring
+  SPEC-088, 2026-11-15; invariant 2, whose promise is made for a call that returned). The guards
+  catch `Exception` and let a `KeyboardInterrupt` through, by invariant 1, and count nothing on the
+  way. `docs/audits/2026-11-14-probes/core-pipeline/p16_interrupt_through_a_guard.py`, at
+  `ae0b7674`: an interrupt raised by the sink during an orphan log, and one raised while a span
+  opened, each reached the caller with the event gone and `orphan_lost` and `in_span_lost` at 0.
+  An in-span log whose build is interrupted is the same case at the fourth guard (`api.py:138`),
+  found by SPEC-088's spec review. **Closed by** SPEC-088 FR-002: each guard counts what its call
+  can no longer deliver and re-raises the exception unchanged.
+  → **closed by SPEC-088 FR-002 item 6.** At the commit that merged SPEC-088, `p16` ends with `accepted=5 orphan_lost=1
+  in_span_lost=4 delivered=0` and nothing on stderr, and `p17` ships a log made after an interrupted
+  close on the span's own trace and span ids.
 - ~~**A sink can be released while it is still live inside the graph that replaced it.**~~
   (2026-11-14 audit, finding 4; invariants 5 and 2) → **closed by SPEC-087.** `configure(A)` then
   `configure(MultiSink(A, B))`, or the reverse, closed A at the swap while A was a member of the
@@ -2418,6 +2476,20 @@ and a third copy is a fork with no merge.
   The *append* race above — `api._log` reading the flag, building, then appending — is the one that
   stays open: closing it needs a **per-span** lock on the hottest path in the library, which is a
   different instrument and a real cost, and it is declined here rather than in passing.
+
+  **What the event ledger makes of these windows** (SPEC-088). An event the append window strands
+  is credited when it is asked for and never handed over, so it stays in
+  `health().events.open_spans`: visible for the first time, and not announced, since the shutdown
+  check cannot tell it from an event on a span that is still open. Under the GIL the stranded
+  append lands on the span's new list, because loading `span.events` and calling its `append` have
+  no switch point between them; the close's own `span.end` is built before the buffer is read
+  for the same reason (SPEC-088 FR-002 item 5). On a free-threaded build, which the library does
+  not support, the counters stay exact, since none of them depends on the GIL, but both of those
+  orderings do: a late append onto a list already handed over would reach `delivered` without the
+  queue's count, and the ledger would report it in `unaccounted` where the library was silent.
+  **A forked child over-reads `open_spans`**: its ledger starts with the events buffered on every
+  span the parent had open, and those on other threads of the parent are in the child's memory
+  with nothing in the child to close them, so they stay in its `open_spans` for life.
 
   `Span.swept` is not a synchronization primitive either, and the guarantee it carries is
   single-threaded. `continue_trace` reads it and then re-parents across an ordinary function call,

@@ -223,6 +223,9 @@ asyncio_mode = "auto"            # async test functions run without an explicit 
 # distributed session, so deleting `-n 0` from the workflow fails loudly instead of producing the
 # intermittent cross-talk it used to.
 addopts = "--strict-markers -n 12 --dist worksteal"
+# SPEC-088 FR-006: a test that works below the event ledger's accept sites, and so cannot
+# balance, says why; `tests/ledger_check.py` fails a marked test that balances.
+markers = ["ledger_exempt(reason): this test cannot balance the event ledger, and why"]
 # THE HANG GUARD. This library runs a worker thread, fork repair and exit-time drains, so a
 # regression can show up as a test that never returns rather than one that fails, and before this
 # a hung test sat until GitHub's six-hour job limit with nothing in the log. Both settings ship

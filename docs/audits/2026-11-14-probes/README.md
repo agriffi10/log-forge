@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Thirty-four files here are not the audit's.** Each was added after the audit was brought in
+**Thirty-five files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -25,6 +25,8 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
 - `core-pipeline/spec091_*.py`, seven, written while authoring SPEC-091.
 - `sinks/spec092_*.py`, five, SPEC-092's prototype conformance corpus. Unlike the probes they
   import one another, so `sinks/` and `tests/` go on `PYTHONPATH` as their docstrings say.
+- `core-pipeline/spec088_cost.py`, written while building SPEC-088: it measures what the event
+  ledger costs, by the spec's Evidence method, for the delivery doc.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded

@@ -175,6 +175,7 @@ def test_the_detach_duplicates_nothing() -> None:
         assert messages.count(f"event-{i}") == 1, f"event-{i} appears {messages.count(f'event-{i}')} times"
 
 
+@pytest.mark.ledger_exempt("calls _flush on a hand-built span")
 def test_the_span_is_left_a_fresh_list_rather_than_a_cleared_one() -> None:
     """AC-4, at the mechanism. The swap is what makes the detach free and correct.
 

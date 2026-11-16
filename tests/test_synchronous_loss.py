@@ -11,6 +11,8 @@ from __future__ import annotations
 import threading
 from typing import TYPE_CHECKING
 
+import pytest
+
 import log_foundry
 from conftest import run_concurrently
 from log_foundry import _lifecycle, decorator
@@ -170,6 +172,7 @@ def test_the_counter_lock_is_dedicated_and_not_the_worker_lock() -> None:
     assert isinstance(decorator._loss_lock, type(threading.Lock()))
 
 
+@pytest.mark.ledger_exempt("calls _note_orphan_loss directly")
 def test_the_increment_happens_under_the_lock() -> None:
     """AC-5, the property that survives free-threading.
 
@@ -219,6 +222,7 @@ def test_concurrent_orphan_losses_are_all_counted() -> None:
     assert log_foundry.health().orphan_lost == 64
 
 
+@pytest.mark.ledger_exempt("calls _note_orphan_loss directly")
 def test_the_lock_is_a_module_global_the_fork_walk_can_reach() -> None:
     """AC-5a. SPEC-039's derived fork roster picks a lock up only where the walk can write it.
 

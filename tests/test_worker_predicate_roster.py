@@ -358,6 +358,24 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "leaves SPEC-030's retired-plus-submitted pair with a term that can never fire."
         ),
     ),
+    ("_worker_health", "_ledger_reading().ledger", 0): (
+        EXISTENCE,
+        (
+            "the event ledger read for health().events (SPEC-088 FR-004), whose worker terms come "
+            "from the process worker whether or not it has retired: a retired worker's queue is "
+            "what the ledger reports as stranded, so the existence question is the one asked, as "
+            "it is for the counters beside it."
+        ),
+    ),
+    ("_check_ledger", "_ledger_reading().ledger.unaccounted", 0): (
+        EXISTENCE,
+        (
+            "the shutdown check's reading (SPEC-088 FR-003), which runs once the call has retired "
+            "the worker it stopped, so it must read that worker's terms by existence: asked by "
+            "liveness, a drain that ended holding events would read as no worker at all and the "
+            "events it held would never be reported."
+        ),
+    ),
     ("_worker_health", "None if worker is None else worker.health()", 0): (
         LIVENESS,
         (
@@ -1482,8 +1500,17 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 92, "log_foundry.decorator": 4}
+_SITE_FLOOR = {"log_foundry._lifecycle": 96, "log_foundry.decorator": 4}
 """The floor each walked module must still meet, by name.
+
+**Raised from 92 to 96 at SPEC-088, to the count measured on its branch.** `_per_module_sites()`
+read 94 for `_lifecycle` at `9d05e793`, the two sites added by the specs since the last raise
+having left the floor at 92, and SPEC-088 adds two, both `EXISTENCE` rows above: the event
+ledger's reading in `_worker_health` (`_ledger_reading().ledger`) and in `_check_ledger`
+(`_ledger_reading().ledger.unaccounted`). The reading itself lives in `worker.py`, which the roster
+does not walk, and `_lifecycle._ledger_reading` hands `_state.worker_exists()` to it without asking
+a question of it. ~~SPEC-088 adds none~~ — struck: the first version of this note said so, read
+from that last fact while the two callers' sites were already filed. `decorator` stays at 4.
 
 **Raised to the derived counts by the fix after SPEC-079 for a late build's signal, 60 -> 92 and
 2 -> 4.** Measured with this file's `_sites`, diffing the site list of `_lifecycle.py` at

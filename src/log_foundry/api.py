@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from log_foundry import _diag, context
+from log_foundry import _diag, _ledger, context
 from log_foundry._lifecycle import _note_orphan_emit
 from log_foundry.config import _ensure_sink
 from log_foundry.console import ConsoleWriter
@@ -115,6 +115,29 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     ``status=error`` for an exception the caller never raised. Now the event is delivered, nothing
     is echoed, and the fault is announced "echoing to the console" by type.
 
+    **Both branches credit the event ledger before the build** (SPEC-088 FR-001). The in-span
+    branch credits a span credit. The orphan branch raises its cell's gauge, credits, writes
+    exactly one exit — ``delivered`` when ``emit`` returned, the settled run's ``delivered``,
+    ``skipped`` and ``sink_lost``, or ``orphan_lost`` — and lowers the gauge in a ``finally``, so a
+    call that is credited, not in progress and in no exit is a missing debit the check sees,
+    where a remainder would have read it as an orphan log forever in flight.
+
+    **A** ``BaseException`` **through either guard is counted, then re-raised unchanged**
+    (SPEC-088 FR-002 item 6). The guards catch ``Exception`` and let a ``KeyboardInterrupt`` or
+    ``SystemExit`` through (invariant 1), which left what the call had credited in no term. Each
+    now counts exactly what it counts on an ``Exception`` and writes nothing to stderr: the
+    exception reaching the caller is the announcement. The in-span guard counts only when the
+    event was not appended, so an event is never both buffered and lost; an interrupt landing
+    between the append and the flag that records it is the one window this leaves, an
+    asynchronous exception between two bytecodes, excluded rather than closed as
+    ``_lifecycle._shutdown_worker``'s docstring excludes its own.
+
+    **A log after an interrupted close keeps the span's ids** (SPEC-088 FR-002). The close guard
+    marks the span abandoned and leaves it current, so a level call from the caller's ``except``
+    handler, or from a task created inside the span, finds it closed and takes the orphan path;
+    for an abandoned span the orphan reuses the span's trace id, span id, parent id, name and
+    defaults, and is counted once, on the orphan path. A span that closed normally is untouched.
+
     Args:
       level: The severity label to stamp on the event.
       message: The caller-supplied message text.
@@ -132,20 +155,41 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     span = context.current_span()
     event: dict[str, object] | None = None
     if span is not None and not span.closed:
+        _ledger.cell().span += 1
+        appended = False
         try:
             event = build_event(span, level, message, fields=fields, baggage=baggage)
             span.events.append(event)
+            appended = True
         except Exception as exc:
             _note_in_span_loss()
             _diag.absorbed("building an in-span log", exc, "the event was lost")
+        except BaseException:
+            if not appended:
+                _note_in_span_loss()
+            raise
     else:
+        cell = _ledger.cell()
+        cell.orphan_open += 1
+        cell.orphan += 1
         try:
-            orphan = Span(
-                trace_id=new_trace_id(),
-                span_id=new_span_id(),
-                parent_span_id=None,
-                name=message,
-                start_ts=0.0,
+            orphan = (
+                Span(
+                    trace_id=span.trace_id,
+                    span_id=span.span_id,
+                    parent_span_id=span.parent_span_id,
+                    name=span.name,
+                    start_ts=0.0,
+                    defaults=span.defaults,
+                )
+                if span is not None and span.abandoned
+                else Span(
+                    trace_id=new_trace_id(),
+                    span_id=new_span_id(),
+                    parent_span_id=None,
+                    name=message,
+                    start_ts=0.0,
+                )
             )
             event = build_event(orphan, level, message, fields=fields, baggage=baggage)
             sink = _ensure_sink()
@@ -155,6 +199,7 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
             )
             if delivery is None:
                 sink.emit([event])
+                cell.delivered += 1
             elif delivery.failed:
                 _note_orphan_loss()
                 _diag.lost(
@@ -162,9 +207,18 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
                     1,
                     f"orphan log not delivered after {delivery.attempts} delivery round(s)",
                 )
+            else:
+                cell.delivered += delivery.accepted
+                cell.skipped += delivery.skipped
+                cell.sink_lost += 1 - delivery.accepted - delivery.skipped
         except Exception as exc:
             _note_orphan_loss()
             _diag.absorbed("emitting an orphan log", exc, "the event was lost")
+        except BaseException:
+            _note_orphan_loss()
+            raise
+        finally:
+            cell.orphan_open -= 1
     try:
         if echo and event is not None:
             _console.write(event)

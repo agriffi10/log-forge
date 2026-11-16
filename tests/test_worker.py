@@ -798,7 +798,9 @@ def test_system_exit_from_sink_is_recorded_and_announced(capsys) -> None:
         "log-foundry: absorbed a failure while draining the log queue (SystemExit)"
     )
     assert "worker thread stopped" in err
-    assert "1 undrained event-list(s) held and 0 queued item(s) undelivered" in err
+    # ~~"1 undrained event-list(s) held and 0 queued item(s)"~~ — reworded by SPEC-088 FR-002
+    # item 3: the line now names the held events it counts in drain_lost.
+    assert "lost 1 event(s) in 1 undrained event-list(s) it held and 0 queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err
 
 
@@ -1292,7 +1294,8 @@ def test_the_line_reports_both_what_was_held_and_what_was_queued(capsys) -> None
     assert err.count("\n") == 1, "still exactly one line"
     assert "(SystemExit)" in err, "type name only"
     assert "SystemExit(" not in err, "the type, not the repr"
-    assert "1 undrained event-list(s) held and 3 queued item(s) undelivered" in err
+    # ~~"1 undrained event-list(s) held and 3 queued item(s)"~~ — reworded by SPEC-088 FR-002 item 3.
+    assert "lost 1 event(s) in 1 undrained event-list(s) it held and 3 queued item(s) undelivered" in err
     assert "tok3n" not in err, "still never the exception's message"
 
 
@@ -1310,7 +1313,8 @@ def test_the_line_is_written_even_when_the_queue_size_is_unavailable(capsys) -> 
     assert w.stopped_reason == "SystemExit", "the record is still set, and set first"
     err = capsys.readouterr().err
     assert err.count("\n") == 1
-    assert "1 undrained event-list(s) held and ? queued item(s) undelivered" in err
+    # ~~"1 undrained event-list(s) held and ? queued item(s)"~~ — reworded by SPEC-088 FR-002 item 3.
+    assert "lost 1 event(s) in 1 undrained event-list(s) it held and ? queued item(s) undelivered" in err
     assert "nothing further will be delivered" in err
 
 

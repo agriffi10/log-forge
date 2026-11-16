@@ -989,9 +989,10 @@ def test_the_expiry_line_counts_the_batch_in_flight(capsys) -> None:
     sink, worker, err = _expire_on_a_wedged_batch(capsys)
 
     assert _lost_lines(err) == [], "the expiry line announces no loss"
+    # ~~counted when the emit returns~~ — struck by SPEC-088 FR-002 item 4: the clause names the ledger gauge the events are in.
     assert err == (
         "log-foundry: shutdown timed out after 0.5s; the sink is left open because the worker "
-        "thread is still using it; 3 event(s) in flight, counted when the emit returns\n"
+        "thread is still using it; 3 event(s) in flight (health().events.in_flight)\n"
     ), err
 
     sink.fail = True
@@ -1031,27 +1032,34 @@ def test_the_expiry_line_is_unchanged_when_nothing_is_in_flight(capsys) -> None:
     line is now a `_diag.pending` one, which claims no loss, and its queued clause counts
     submissions only, so the sentinel is not in it and the line ends after its first part.
     This supersedes SPEC-062 FR-005 AC-4's byte-for-byte promise against `71e42dd`.
+
+    ~~park the drain thread **before** `_emit` writes the count~~ — superseded by SPEC-088: the
+    drain counts a submission in flight the moment it takes it (`Worker._hold`), so a thread
+    parked before `_emit` holds that event and the line rightly names it. The thread is parked
+    instead where it holds nothing, on a flush marker it has just taken from an empty queue.
     """
     sink = _SlowFailSink(0.0, fail_times=0)
     worker = Worker(sink, batch_size=1, flush_interval=60.0)
     parked = threading.Event()
     release = threading.Event()
-    real_emit = worker._emit
+    real_take = worker._take_marker
 
-    def gated_emit(event_lists: list[list[dict[str, object]]]) -> None:
+    def gated_take(marker: object) -> None:
         parked.set()
         release.wait(30.0)
-        real_emit(event_lists)
+        real_take(marker)  # type: ignore[arg-type]
 
-    worker._emit = gated_emit  # type: ignore[method-assign]
-    worker.submit([{"a": 1}])
-    assert parked.wait(5.0), "the drain thread is parked before _emit runs"
+    worker._take_marker = gated_take  # type: ignore[method-assign]
+    flusher = threading.Thread(target=worker.flush, args=(30.0,))
+    flusher.start()
+    assert parked.wait(5.0), "the drain thread is parked on a marker, holding nothing"
     assert worker._in_flight == 0, "the premise: nothing is in flight"
 
     worker.stop(0.2)
     err = capsys.readouterr().err
     release.set()
     worker._thread.join(5.0)
+    flusher.join(5.0)
 
     assert err == (
         "log-foundry: shutdown timed out after 0.2s; the sink is left open because the worker "

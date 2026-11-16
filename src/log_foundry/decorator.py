@@ -10,7 +10,7 @@ from collections.abc import Callable
 from time import monotonic
 from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
-from log_foundry import _diag, _lifecycle, context
+from log_foundry import _diag, _ledger, _lifecycle, context
 from log_foundry.ids import (
     is_valid_span_id,
     is_valid_trace_id,
@@ -435,6 +435,11 @@ def _sweep_open_spans() -> None:
     stops before detaching anything, releases the lock, resolves the worker and sweeps again; a
     flush that finds nothing buffered still builds nothing.
 
+    **Each take is a hand-over in the event ledger** (SPEC-088 FR-001), credited in the calling
+    thread's cell after ``submit`` returns, so every event the credit counts is already in the
+    queue's taken-in count or in ``overflow_lost``. The length is read under the lock, at the
+    swap, so a racing append cannot change what is counted.
+
     Args:
       None.
 
@@ -459,7 +464,9 @@ def _sweep_open_spans() -> None:
                 backfill_baggage(span, context._live_baggage())
                 span.swept = True
                 buffered, span.events = span.events, []
+                count = len(buffered)
                 worker.submit(buffered)
+                _ledger.cell().handed += count
             if not needs_worker:
                 return
         worker = _lifecycle._get_worker()
@@ -569,6 +576,11 @@ def _flush(span: Span) -> None:
     SPEC-036 FR-004 window rather than widening it — the gap between detaching and submitting
     falls from the whole of ``_get_worker()`` to a lock release.
 
+    **The hand-over is credited after** ``submit`` **returns** (SPEC-088 FR-001), in the calling
+    thread's cell, by the length read at the detach. Credited before, a submission ``submit`` lost
+    without a count would read as balanced; after, it leaves the meeting of the caller's
+    hand-overs with the queue's taken-in count positive, which the shutdown check reports.
+
     Args:
       span: The finished span whose buffered events are submitted.
 
@@ -581,7 +593,9 @@ def _flush(span: Span) -> None:
     worker = _lifecycle._get_worker()
     with _sweep_lock:
         events, span.events = span.events, []
+        count = len(events)
     worker.submit(events)
+    _ledger.cell().handed += count
 
 
 type _SpanScope = tuple[
@@ -608,6 +622,10 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
     :func:`~log_foundry.context.current_span` before :func:`_open_span`, which is what makes
     the new span current.
 
+    **The call's** ``span.start`` **is credited first, before the** ``try`` (SPEC-088 FR-001):
+    accepted means asked for, so a guard that forgets its debit leaves a remainder a check can
+    see, where a credit after the build would hide exactly the events a failed open lost.
+
     Args:
       name: The span name, normally the decorated function's qualified name.
       defaults: Per-decorator default fields, or ``None``.
@@ -622,17 +640,24 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
     span: Span | None = None
     token: contextvars.Token[tuple[Span, ...]] | None = None
     scope: contextvars.Token[dict[str, object]] | None = None
+    _ledger.cell().span += 1
     try:
         if context.current_span() is None:
             scope = context.push_baggage_scope()
         span = _open_span(name, defaults)
         token = context.push_span(span)
     except Exception as exc:
+        if span is None:
+            _ledger.cell().span += 1
+            _note_in_span_loss(2)
         _diag.absorbed(
             "opening a span",
             exc,
             "this call runs untraced" if span is None else "this call is traced incompletely",
         )
+    except BaseException:
+        _note_in_span_loss(1 if span is None else _abandon(span))
+        raise
     return span, token, scope
 
 
@@ -665,6 +690,9 @@ def _end(
     and it is recorded **before** the announcement for the reason every other site here is:
     stderr may be wedged, and the counter must not be lost to it.
 
+    **A span's** ``span.end`` **is credited before the close is tried** (SPEC-088 FR-001), for the
+    reason :func:`_begin` credits ``span.start`` before its ``try``.
+
     Args:
       span: The span to close, or ``None`` if none was opened.
       token: The span-stack token to release, or ``None``.
@@ -681,11 +709,15 @@ def _end(
         runtime's intent and must still reach the caller.
     """
     if span is not None:
+        _ledger.cell().span += 1
         try:
             _close_span(span, status, error)
         except Exception as exc:
-            _note_in_span_loss(len(span.events))
+            _note_in_span_loss(_abandon(span) + (0 if span.ended else 1))
             _diag.absorbed("closing a span", exc, "the span's events were lost")
+        except BaseException:
+            _note_in_span_loss(_abandon(span) + (0 if span.ended else 1))
+            raise
     if token is not None:
         context.pop_span(token)
     if scope is not None:
@@ -718,10 +750,39 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
       Exception: Whatever building the end event or flushing raises; :func:`_end` is the
         guard.
     """
-    span.events.append(end_event(span, status, exc))
+    event = end_event(span, status, exc)
+    span.events.append(event)
+    span.ended = True
     backfill_baggage(span, context._live_baggage())
     span.closed = True
     _flush(span)
+
+
+def _abandon(span: Span) -> int:
+    """Takes a span's buffer and closes it, for a guard that gave up on it (SPEC-088 FR-002).
+
+    The guard counts what it took as lost, so the take is what keeps those events from a second
+    term: left on the span, a context still holding it could ``flush()`` them after they were
+    counted, and in the review's unforced race 3 events were both counted and delivered. The take
+    is the detach :func:`_flush` and the sweep make, under the same lock. The span is marked
+    closed, so a later append takes the orphan route, and abandoned, so that orphan keeps this
+    span's ids (:func:`log_foundry.api._log`). Popping the span from its context is out of scope
+    (``architecture.md`` §12), so it stays current there.
+
+    Args:
+      span: The span the guard gave up on.
+
+    Returns:
+      How many events it took.
+
+    Raises:
+      None.
+    """
+    with _sweep_lock:
+        taken, span.events = span.events, []
+    span.closed = True
+    span.abandoned = True
+    return len(taken)
 
 
 def _refuse_unusable(fn: object) -> None:

@@ -1306,8 +1306,41 @@ They tell you different things, and they want different responses:
 | `incomplete_swaps` | A late `configure(sink=...)` could not confirm the previous sink was drained. The swap took effect; that sink was left open and some queued events may have gone to the new one. | Investigate the previous sink — it was hung or failing. Configure the sink before the first log where you can. |
 | `inherited_sink` | This process is delivering to a sink it **inherited across a `fork`** and may not release, so it will not be closed here. Not a loss and not an alert term. | Nothing, usually. It explains a handle still open after `shutdown()`, and tells you a deployment shares one sink across a fork at all. `True` for a shared `StdoutSink` too, whose `close()` only flushes — so a `True` is not by itself evidence that anything is held. If you want the child to own its transport, build the sink in the worker process (see Forking). |
 | `orphan_lost` | An event logged **with no open span** never reached the sink. That call emits on your own thread with no worker behind it, so no other field here can carry it — it is not a batch, there was no retry, and there may be no worker at all. Covers a sink that failed to *construct* as well as one that raised. | Fix the destination, or the data. The stderr line names the exception type. If a process logs this way at all, this is the field to alert on: nothing else describes that path. |
-| `in_span_lost` | An event logged **inside a span** was lost before delivery, for one of two reasons the count tells apart: **the data** — a value that could not be turned into an event, one per call — or **no drain thread at all** — the process could not start the worker, and the span's whole buffer is counted at once (SPEC-050). Never a destination that failed at delivery; that is `failed_batches`. | One event at a time: fix the call site — a non-string message (an exception object, say) is the common cause. A whole buffer at once: the process cannot start a thread; the stderr line names it. |
+| `in_span_lost` | An event logged **inside a span** was lost before delivery: **the data** — a value that could not be turned into an event, or a span that could not be opened or closed, which counts its boundary events too — or **no drain thread at all** — the process could not start the worker, and the span's whole buffer is counted at once (SPEC-050). A `KeyboardInterrupt` or `SystemExit` raised inside the library's own build, open or close of an in-span event is counted here as well (SPEC-088); one your own code raises inside a traced function closes the span normally, and its events are delivered. Never a destination that failed at delivery; that is `failed_batches`. | Read the stderr line: it names the site. A failed build: fix the call site — a non-string message (an exception object, say) is the common cause. A whole buffer at once: the process cannot start a thread. |
 | `closing_sinks` | Swapped-out sinks inside `close()` **right now** — a live gauge, not a counter. It and `queued` are the two fields here that fall as well as rise; the other integer counters only climb. Non-zero on a single read is normal during a swap. | Nothing, unless it stays non-zero. That means a destination is stuck in `close()` and will not release its resources. |
+
+#### The event ledger: `health().events`
+
+The fields above count in three units — submissions, batches and events — so they cannot be added
+up to say where every event went. `health().events` is an `EventLedger` that can: every event is
+counted once when it is asked for, in `accepted`, and is then in exactly one other term.
+
+| Term | An event is in it when |
+|---|---|
+| `open_spans` | it is buffered on a span and not yet handed to the worker (a gauge) |
+| `queued` | it is in the worker's queue and the worker's thread is running (a gauge; events, where `h.queued` counts submissions) |
+| `in_flight` | the worker's thread has taken it and not finished with it, or its orphan log call is still running (a gauge) |
+| `delivered` | an `emit` returned for its batch, or `deliver` answered `ACCEPTED` |
+| `skipped` | `deliver` answered `SKIPPED` |
+| `in_span_lost`, `orphan_lost` | the two fields above, the same values |
+| `overflow_lost` | its submission met a full queue (the events of what `dropped` counts) |
+| `batch_lost` | its batch was abandoned after its retries, or its retry was declined |
+| `sink_lost` | a `deliver` run settled and it ended neither `ACCEPTED` nor `SKIPPED` |
+| `drain_lost` | the worker's thread died holding it |
+| `stranded` | it is in the queue of a worker whose thread has ended |
+
+With no library call in progress, `accepted == pending + delivered + skipped + lost`, where
+`pending` and `lost` are properties summing the gauges and the seven loss terms. `unaccounted` is
+not a term: it is the events the ledger cannot place, and it is zero in a correct library. If it is
+ever above zero when `shutdown()` ends, one stderr line says so; nothing is raised. The ledger ends
+where a sink's `emit` returns, so a loss a sink takes inside an `emit` that returned is in
+`h.sink`, not here. After a `flush()` returns, `open_spans` is the events still buffered on spans
+that have not closed, which a `flush()` made inside them hands over.
+
+```python
+e = log_foundry.health().events
+print(e.accepted, e.delivered, e.pending, e.lost, e.unaccounted)
+```
 
 `orphan_lost` and `in_span_lost` are deliberately two fields and their sum is deliberately not
 reported. They aggregate different failure populations — one can mean the destination *or* the
@@ -1362,10 +1395,10 @@ logging is doing the right thing; it is the *pair* — retired, and still being 
 means every log line since the shutdown has gone nowhere. That state used to read as perfectly
 healthy: `stopped_reason` is `None` after a clean shutdown, and the queue simply grows.
 
-**Six of the twelve fields report for a process that has no worker at all** — `sink`, `retired`,
-`closing_sinks`, `inherited_sink`, `orphan_lost` and `in_span_lost`. That set is not a list to
-maintain by hand: it is exactly the fields in `_lifecycle`'s `Health(...)` assembly that are *not*
-guarded by `counters is None`, and re-reading that call is how to check it. A program that only
+**Seven of the thirteen fields report for a process that has no worker at all** — `sink`,
+`retired`, `closing_sinks`, `inherited_sink`, `orphan_lost`, `in_span_lost` and `events`. That set
+is not a list to maintain by hand: it is exactly the fields in `_lifecycle`'s `Health(...)` assembly
+that are *not* guarded by `counters is None`, and re-reading that call is how to check it. A program that only
 ever calls `info()`/`error()` outside a span emits synchronously and builds no background worker,
 so the other six describe something that does not exist and read their empty value — zero for the
 five counters, `None` for `stopped_reason` — which is why that path needs counters of its own. Until it had them, such a process
