@@ -199,6 +199,14 @@ up to 1,000 at once, where today it moves by ten spans' events; the next batch i
 size, by rule 4. `in_flight` holds the batch being emitted, the batch being built and at most one
 carried submission.
 
+**Each take is counted where it is taken** (added 2026-11-16): `_take` calls `_hold` straight
+after `get` returns, before the join-or-carry decision and before any emit, so a carried
+submission is in `in_flight` from its take, as the sentence above has it, because one counted only
+after the previous batch emitted would leave the window from take to `_hold` open across a sink
+call, over-reading `health().events.queued` for that long and failing the suite's balance
+fixture whenever the call outlasts the 2 s it re-reads a drain outside `get`
+(`tests/ledger_check.py`), while a shorter call would be hidden from it.
+
 #### Acceptance Criteria:
 
 - [ ] `p13_burst.py` on 3.12 and 3.13 sends no batch above 1,000 events and drains its backlog in
@@ -789,6 +797,10 @@ kept, and the build's own run is the one that counts.
 
 ## Revision history
 
+- **2026-11-16, one sentence added to FR-001**: each take is counted by `_hold` where it is
+  taken, before any carry or emit decision. Found by the second diff review of the fix that lets
+  SPEC-088's balance fixture wait for a live drain to settle, whose reading holds only if the
+  window from take to `_hold` never spans a sink call.
 - **2026-11-15, revised after the spec review**, which found twelve defects, all fixed here.
   ~~The first attempt of every exit batch is made~~: with a slow-failing sink it turned a
   completed join into an expired one with the sink left open, so FR-003 declines a later exit

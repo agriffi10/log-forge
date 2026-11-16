@@ -7,12 +7,14 @@ after it reads a balanced process.
 """
 
 import ast
+import collections
 import os
 import pathlib
 import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 
@@ -105,11 +107,12 @@ def test_a_stalled_sink_and_a_killed_drain_are_silent() -> None:
 
 
 def test_an_uncounted_queue_entry_fires() -> None:
+    """A live drain's entry no count admits is still reported once the settle bound is spent."""
     sink, worker = _stalled_worker()
     try:
         with worker._queue.mutex:
             worker._queue.queue.append([{"message": "slipped in"}])
-        found = ledger_check.worker_problems(worker)
+        found = ledger_check.worker_problems(worker, settle=0.1)
         assert found == ["a worker's queued+stranded reads 0 with 1 events in its queue"], found
         with worker._queue.mutex:
             worker._queue.queue.pop()
@@ -156,6 +159,315 @@ def test_a_negative_in_flight_fires() -> None:
         assert "a worker's in_flight reads -1" in ledger_check.worker_problems(worker)
     finally:
         worker._in_flight = 0
+
+
+_PAUSES = {
+    "between get and _hold": "a worker's queued+stranded reads 2 with 0 events in its queue",
+    "inside _settle": "a worker's drain residual is -2",
+}
+"""Each point a live, balancing drain can be paused at, and what one reading there reports."""
+
+
+def _paused_drain(monkeypatch, where: str) -> tuple[worker_mod.Worker, threading.Event]:
+    """A live worker whose drain is held at ``where`` with a two-event submission, and its release.
+
+    ``between get and _hold`` is the window `main` went red in at `97a03f45`: the queue is empty
+    and the take not yet counted. ``inside _settle`` runs the real `_settle` twice, the exits with
+    no gauge change and then the gauge with no exits, and pauses between: the exits are written
+    and ``in_flight`` not yet lowered.
+    """
+    paused, release = threading.Event(), threading.Event()
+    if where == "between get and _hold":
+        real_hold = worker_mod.Worker._hold
+
+        def hold(self, events) -> None:  # type: ignore[no-untyped-def]
+            paused.set()
+            release.wait(10)
+            real_hold(self, events)
+
+        monkeypatch.setattr(worker_mod.Worker, "_hold", hold)
+    else:
+        real_settle = worker_mod.Worker._settle
+
+        def settle(self, size, **exits) -> None:  # type: ignore[no-untyped-def]
+            real_settle(self, 0, **exits)
+            paused.set()
+            release.wait(10)
+            real_settle(self, size)
+
+        monkeypatch.setattr(worker_mod.Worker, "_settle", settle)
+    worker = worker_mod.Worker(GatedSink(), batch_size=1, flush_interval=60.0)
+    worker.submit([{"message": "one"}, {"message": "two"}])
+    assert paused.wait(5)
+    return worker, release
+
+
+def _counting_readings(monkeypatch) -> tuple[list[list[str]], threading.Event]:
+    """Records every reading `worker_problems` makes, and an event set once the first is made."""
+    readings: list[list[str]] = []
+    first = threading.Event()
+    real_read = ledger_check._read_worker
+
+    def read(worker):  # type: ignore[no-untyped-def]
+        got = real_read(worker)
+        readings.append(got[-1])
+        first.set()
+        return got
+
+    monkeypatch.setattr(ledger_check, "_read_worker", read)
+    return readings, first
+
+
+@pytest.mark.parametrize("where", sorted(_PAUSES))
+def test_one_reading_of_a_paused_live_drain_misreads_it(monkeypatch, where: str) -> None:
+    """The flake, reproduced: a single reading, as the fixture made before the settle, fails."""
+    worker, release = _paused_drain(monkeypatch, where)
+    try:
+        assert ledger_check.worker_problems(worker, settle=0) == [_PAUSES[where]]
+    finally:
+        release.set()
+        worker.stop(5)
+
+
+@pytest.mark.parametrize("where", sorted(_PAUSES))
+def test_a_paused_live_drain_released_within_the_bound_reads_balanced(
+    monkeypatch, where: str
+) -> None:
+    """The fix: the drain's first reading fails, it is read again, and once released it passes."""
+    worker, release = _paused_drain(monkeypatch, where)
+    readings, first = _counting_readings(monkeypatch)
+    got: list[list[str]] = []
+    reader = threading.Thread(target=lambda: got.append(ledger_check.worker_problems(worker)))
+    reader.start()
+    try:
+        assert first.wait(5)
+    finally:
+        release.set()
+        reader.join(5)
+    assert not reader.is_alive(), "the settle outlived its bound"
+    assert readings[0] == [_PAUSES[where]], readings
+    assert got == [[]], got
+    worker.stop(5)
+
+
+@pytest.mark.parametrize("where", sorted(_PAUSES))
+def test_a_drain_paused_past_the_bound_is_reported_with_its_reason(monkeypatch, where: str) -> None:
+    worker, release = _paused_drain(monkeypatch, where)
+    readings, _ = _counting_readings(monkeypatch)
+    try:
+        assert ledger_check.worker_problems(worker, settle=0.1) == [_PAUSES[where]]
+        assert len(readings) > 1, "a live drain that failed was read once"
+    finally:
+        release.set()
+        worker.stop(5)
+
+
+def _parked_worker() -> worker_mod.Worker:
+    """An idle live worker whose drain has been seen waiting in ``queue.get``."""
+    worker = worker_mod.Worker(GatedSink(), batch_size=1, flush_interval=60.0)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with worker._queue.mutex:
+            if worker._queue.not_empty._waiters:
+                return worker
+        time.sleep(0.001)
+    raise AssertionError("the drain never parked in get")
+
+
+def test_a_parked_drain_is_read_once_though_it_would_correct_itself(monkeypatch) -> None:
+    """A drain at rest in ``get`` is judged on one reading: the lazy-hold class stays caught.
+
+    The diff review's mutant moved `_hold` from the take to the top of `_emit_pending`, so events
+    sat in the drain's ``pending`` counted ``queued`` while it waited in ``get``, and the drain
+    corrected the count itself when its flush interval emitted them. A settle that re-read a
+    parked drain hid it. Here the count is planted on a parked drain and corrected after the first
+    reading, as that drain would; a check that read it again would report it balanced.
+    """
+    worker = _parked_worker()
+    readings, _ = _counting_readings(monkeypatch)
+    real_read = ledger_check._read_worker
+    planted = [True]
+
+    def read_then_correct(w):  # type: ignore[no-untyped-def]
+        got = real_read(w)
+        if planted[0]:
+            w._queue.entered -= 2
+            planted[0] = False
+        return got
+
+    monkeypatch.setattr(ledger_check, "_read_worker", read_then_correct)
+    worker._queue.entered += 2
+    try:
+        found = ledger_check.worker_problems(worker)
+    finally:
+        if planted[0]:
+            worker._queue.entered -= 2
+        worker.stop(5)
+    assert found == ["a worker's queued+stranded reads 2 with 0 events in its queue"], found
+    assert len(readings) == 1, readings
+
+
+def test_the_terms_are_read_under_the_queues_mutex(monkeypatch) -> None:
+    """A drain notified at teardown, as on `main` at `97a03f45`, reads balanced (frame 2's M11).
+
+    The test holds the mutex, queues a submission and notifies the parked drain, which cannot take
+    it until the test lets go. Read under the mutex, the terms wait for it too, and whichever of
+    the reading and the drain takes the mutex first, the reading is consistent or re-read. A
+    reading whose terms were taken before the mutex would see ``taken`` from before the take: the
+    wrapped `_drain_terms` then holds those stale terms until the drain has taken, held, emitted
+    and parked again, so the reading finds a parked drain and judges the stale terms at once. The
+    wrapper waits only when it runs before the test has let go, which a mutex-scoped read never
+    does, so the correct path costs the bounded wait for a read that never comes.
+    """
+    worker = _parked_worker()
+    q = worker._queue
+    real_terms = worker._drain_terms
+    released, read_early = threading.Event(), threading.Event()
+
+    def terms():  # type: ignore[no-untyped-def]
+        got = real_terms()
+        if not released.is_set():
+            read_early.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with q.mutex:
+                    if worker._delivered == 2 and q.not_empty._waiters:
+                        break
+                time.sleep(0.001)
+        return got
+
+    monkeypatch.setattr(worker, "_drain_terms", terms)
+    got: list[list[str]] = []
+    reader = threading.Thread(target=lambda: got.append(ledger_check.worker_problems(worker)))
+    with q.mutex:
+        q._put([{"message": "one"}, {"message": "two"}])
+        q.unfinished_tasks += 1
+        q.not_empty.notify()
+        reader.start()
+        read_early.wait(0.5)
+        released.set()
+    reader.join(10)
+    worker.stop(5)
+    assert not reader.is_alive(), "the reading outlived its bound"
+    assert got == [[]], f"the reading judged terms taken outside the mutex: {got}"
+
+
+class _PausingWaiters(collections.deque):  # type: ignore[type-arg]
+    """A condition's waiter deque whose truth, asked once by one thread off the mutex, pauses."""
+
+    def __init__(self, items, mutex, asked, go) -> None:  # type: ignore[no-untyped-def]
+        super().__init__(items)
+        self.mutex, self.asked, self.go = mutex, asked, go
+        self.reader: threading.Thread | None = None
+
+    def __bool__(self) -> bool:
+        answer = len(self) > 0
+        if threading.current_thread() is self.reader and not self.asked.is_set():
+            self.asked.set()
+            if not self.mutex.locked():
+                self.go.wait(5)
+        return answer
+
+
+def test_parked_is_read_under_the_queues_mutex(monkeypatch) -> None:
+    """A drain woken between ``parked`` and the terms is not judged as parked (frame 2's M9).
+
+    The waiter deque's truth is asked once by the reader. Asked under the mutex, as it must be,
+    it answers at once and the reading is the parked drain at rest, balanced. Asked before the
+    mutex, it pauses after answering "parked" while the test submits: the drain wakes, takes the
+    submission and is held in `_hold`, so the reading would judge the take-to-`_hold` window, the
+    CI shape, as a drain at rest. Nothing here races: the pause is entered only off the mutex,
+    and the test moves on each step's event.
+    """
+    worker = _parked_worker()
+    q = worker._queue
+    asked, go, paused, release = (threading.Event() for _ in range(4))
+    real_hold = worker_mod.Worker._hold
+
+    def hold(self, events) -> None:  # type: ignore[no-untyped-def]
+        paused.set()
+        release.wait(10)
+        real_hold(self, events)
+
+    monkeypatch.setattr(worker_mod.Worker, "_hold", hold)
+    with q.mutex:
+        waiters = _PausingWaiters(q.not_empty._waiters, q.mutex, asked, go)
+        q.not_empty._waiters = waiters
+    got: list[list[str]] = []
+    reader = threading.Thread(target=lambda: got.append(ledger_check.worker_problems(worker)))
+    waiters.reader = reader
+    try:
+        reader.start()
+        assert asked.wait(5)
+        worker.submit([{"message": "one"}, {"message": "two"}])
+        assert paused.wait(5)
+        go.set()
+        reader.join(10)
+    finally:
+        go.set()
+        release.set()
+        worker.stop(5)
+        with q.mutex:
+            q.not_empty._waiters = collections.deque(q.not_empty._waiters)
+    assert not reader.is_alive(), "the reading outlived its bound"
+    assert got == [[]], f"a drain woken before the mutex was judged as parked: {got}"
+
+
+def test_one_settle_bound_is_shared_by_every_worker_a_teardown_reads(monkeypatch) -> None:
+    """Three drains held out of ``get`` and out of balance spend one bound between them, not three.
+
+    The bound is driven by a fake clock that only the settle's pause advances, so what is asserted
+    is the time the settle asked for, with no wall clock in it.
+    """
+    now = [0.0]
+    monkeypatch.setattr(ledger_check, "_clock", lambda: now[0])
+    monkeypatch.setattr(ledger_check, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
+    lock, entered, all_paused, release = threading.Lock(), [0], threading.Event(), threading.Event()
+    real_hold = worker_mod.Worker._hold
+
+    def hold(self, events) -> None:  # type: ignore[no-untyped-def]
+        with lock:
+            entered[0] += 1
+            if entered[0] == 3:
+                all_paused.set()
+        release.wait(10)
+        real_hold(self, events)
+
+    monkeypatch.setattr(worker_mod.Worker, "_hold", hold)
+    workers = [worker_mod.Worker(GatedSink(), batch_size=1, flush_interval=60.0) for _ in range(3)]
+    for worker in workers:
+        worker.submit([{"message": "one"}, {"message": "two"}])
+    try:
+        assert all_paused.wait(5)
+        found = ledger_check.problems()
+    finally:
+        release.set()
+        for worker in workers:
+            worker.stop(5)
+    assert found == [_PAUSES["between get and _hold"]] * 3, found
+    assert now[0] == pytest.approx(ledger_check.SETTLE, abs=2 * ledger_check._PAUSE), now[0]
+
+
+def test_a_dead_drain_and_a_first_passing_reading_are_read_once(monkeypatch) -> None:
+    """Neither waits: an ended drain will not move again, and a stalled sink balances at once."""
+    readings, _ = _counting_readings(monkeypatch)
+    worker = _ended_worker()
+    worker._in_flight = 2
+    try:
+        assert ledger_check.worker_problems(worker) == [
+            "a worker's ended drain holds 2 events in flight",
+            "a worker's drain residual is -2",
+        ]
+    finally:
+        worker._in_flight = 0
+    assert len(readings) == 1, readings
+    sink, stalled = _stalled_worker()
+    try:
+        assert ledger_check.worker_problems(stalled) == []
+        assert len(readings) == 2, readings
+    finally:
+        sink.gate.set()
+        stalled.stop(5)
 
 
 def test_an_lf_run_is_silent_and_a_meeting_residual_past_it_fires(lf) -> None:
@@ -295,12 +607,15 @@ def test_no_test_using_lf_carries_the_marker() -> None:
     }, marked
 
 
-def test_the_fixture_adds_no_wait_over_a_stalled_sink() -> None:
+def test_the_fixture_adds_no_wait_over_a_stalled_sink(monkeypatch) -> None:
     """FR-006 AC-7: the check reads and returns while a sink is stalled, and reads it balanced.
 
     Timed by the thread that runs it never having to be waited for: it runs on its own thread,
-    which is joined with a generous bound, rather than against a clock with a tight one.
+    which is joined with a generous bound, rather than against a clock with a tight one. The join
+    is longer than `ledger_check.SETTLE`, so it alone would pass a check that spent the settle on
+    the stall; the stalled worker being read exactly once is what says the check did not.
     """
+    readings, _ = _counting_readings(monkeypatch)
     sink = GatedSink()
     lf.configure(sink=sink)
     sink.gate.clear()
@@ -316,4 +631,5 @@ def test_the_fixture_adds_no_wait_over_a_stalled_sink() -> None:
     reader.join(5)
     assert returned, "the check waited on the stalled sink"
     assert got == [[]], got
+    assert readings == [[]], "the stalled worker was read more than once"
     assert lf.flush(5)

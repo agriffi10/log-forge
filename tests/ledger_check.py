@@ -2,9 +2,26 @@
 
 `tests/conftest.py`'s autouse `_ledger_balance` fixture calls :func:`begin` at each test's setup
 and :func:`verdict` at its teardown, after the test's body and before the suite's own reset, and
-fails the test with the reasons :func:`verdict` returns. It stops nothing and waits for nothing:
-every check is a read. The logic lives here rather than in `conftest.py` so the fixture stays a
-thin caller.
+fails the test with the reasons :func:`verdict` returns. It stops nothing: every check is a read.
+The logic lives here rather than in `conftest.py` so the fixture stays a thin caller.
+
+**It reads at rest for the caller's side, and lets a live drain settle for the worker's side.**
+The test's own calls have returned by its teardown, so the process terms are read once. A
+worker's drain thread may still be running, though, and between `queue.get` returning and
+`Worker._hold` counting the take, or inside `Worker._settle` between the exits and the gauge, its
+own terms read out of balance for a few bytecodes: `main` went red once that way, at `97a03f45`,
+on `test_the_snapshot_returns_while_each_lock_is_held[queue]`, whose drain took its submission
+only when the test let go of the queue's mutex. So a worker whose drain is alive, not parked in
+``queue.get``, and whose reading fails is read again, every :data:`_PAUSE`, until a reading
+passes or :data:`SETTLE` has elapsed, and the last reading's reasons are the ones reported. A
+reading that passes the first time is not repeated, and neither is one of an ended drain, which
+nothing will move again, nor one of a drain parked in ``get``, which is at rest: a defect that
+leaves a parked drain mis-termed fails at once, even one the drain would correct later (the
+corpus's lazy-hold case). A stalled sink balances through ``in_flight`` and ``queued`` on its
+first reading, so it still adds no wait (FR-006 AC-7). The order in `src/` is not the thing to
+change: `_hold` raises the gauge before the taking count, outside the queue's mutex, so that
+``health()`` and the ``shutdown()`` check never read a false ``unaccounted``, and
+`tests/test_ledger_write_sites.py` holds it there.
 
 **What fails a test.**
 
@@ -38,6 +55,7 @@ cannot stay.
 from __future__ import annotations
 
 import functools
+import time
 import weakref
 
 _tracked: weakref.WeakSet = weakref.WeakSet()
@@ -55,6 +73,24 @@ _direct = [0]
 """Events the `lf` fixture emitted directly since the current test began."""
 
 MARKER = "ledger_exempt"
+
+SETTLE = 2.0
+"""Seconds one teardown lets live drains settle, shared by every worker it reads.
+
+The windows it covers are a few bytecodes long, and a drain parked in ``queue.get`` is read once,
+so the bound is spent only by a failing drain that stays out of ``get``: one stalled in a sink,
+or one whose defect keeps it from parking. What it can still hide is a mis-terming that is
+corrected within the bound by a drain that never parks in between. It is shared rather than per
+worker so a defect that every worker shows costs one bound, not one per worker."""
+
+_PAUSE = 0.005
+"""Seconds between two readings of a live drain that has not settled."""
+
+_clock = time.monotonic
+"""The settle's clock, a module attribute so the corpus can drive the bound with a fake one."""
+
+_sleep = time.sleep
+"""The settle's pause, a module attribute for the same reason as :data:`_clock`."""
 
 
 def _track_workers() -> None:
@@ -97,17 +133,43 @@ def emitted_directly(count: int) -> None:
     _direct[0] += count
 
 
-def _queued_events(worker) -> int:  # type: ignore[no-untyped-def]
-    with worker._queue.mutex:
-        return sum(len(item) for item in worker._queue.queue if isinstance(item, list))
+def worker_problems(worker, settle: float = SETTLE) -> list[str]:  # type: ignore[no-untyped-def]
+    """What one worker's own terms place that the ledger cannot, once a live drain has settled.
+
+    A failing reading is repeated only while the drain is alive and was not parked in
+    ``queue.get``, until one passes or ``settle`` seconds have passed. A passing reading, a
+    reading of an ended drain and a reading of a parked drain are final at once.
+    """
+    deadline = _clock() + settle
+    alive, parked, found = _read_worker(worker)
+    while found and alive and not parked and _clock() < deadline:
+        _sleep(_PAUSE)
+        alive, parked, found = _read_worker(worker)
+    return found
 
 
-def worker_problems(worker) -> list[str]:  # type: ignore[no-untyped-def]
-    """What one worker's own terms place that the ledger cannot."""
-    alive, taken, held, *exits = worker._drain_terms()
-    in_queue = worker._queue.entered - taken
+def _read_worker(worker) -> tuple[bool, bool, list[str]]:  # type: ignore[no-untyped-def]
+    """One reading of a worker's own terms, taken under its queue's mutex.
+
+    Returns whether the drain was alive, whether it was parked in ``queue.get`` for the whole
+    reading, and what the terms misplace. Parked means a waiter on the queue's ``not_empty``
+    condition while this holds the mutex: `Condition.wait` adds its waiter under the mutex, and
+    removes it under the mutex too, whether `notify` does it or a timed-out wait does it after
+    taking the mutex back, so a waiter seen here cannot leave `get` until this lets go. Such a
+    drain has finished every `_hold` and `_settle` it began, so its reading is the drain at rest.
+    A drain blocked on the mutex at the top of `get`, not yet a waiter, is at rest as well, but
+    reads as not parked, the same as one woken by `notify` and about to take an item. The two
+    cannot be told apart from here, so both are read again: the cost is a wait, never a false
+    verdict. The one other caller of ``not_empty.wait`` would be another thread blocking in the
+    worker's `get`, which nothing in the suite does.
+    """
+    q = worker._queue
+    with q.mutex:
+        parked = bool(q.not_empty._waiters)
+        alive, taken, held, *exits = worker._drain_terms()
+        in_queue = q.entered - taken
+        events = sum(len(item) for item in q.queue if isinstance(item, list))
     found: list[str] = []
-    events = _queued_events(worker)
     if in_queue != events:
         found.append(f"a worker's queued+stranded reads {in_queue} with {events} events in its queue")
     if not alive and held > 0:
@@ -117,7 +179,7 @@ def worker_problems(worker) -> list[str]:  # type: ignore[no-untyped-def]
         found.append(f"a worker's drain residual is {residual}")
     if held < 0:
         found.append(f"a worker's in_flight reads {held}")
-    return found
+    return alive, parked, found
 
 
 def problems() -> list[str]:
@@ -143,8 +205,9 @@ def problems() -> list[str]:
         found.append(f"open_spans={e.open_spans} with {own} buffered on this context's open spans")
     if left_open:
         found.append(f"open_spans: the test left {len(left_open)} span(s) open on its own context")
+    deadline = _clock() + SETTLE
     for worker in list(_tracked):
-        found.extend(worker_problems(worker))
+        found.extend(worker_problems(worker, max(0.0, deadline - _clock())))
     return found
 
 
