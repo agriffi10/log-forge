@@ -155,9 +155,12 @@ verdict on whether it makes a variant.** The roster is the one `tests/test_publi
 derives from the source, every class under `sinks/` that defines or inherits `emit`, read without
 importing so an absent extra cannot hide one. `PARAMETERS` records every rostered class's
 `__init__` parameter names, read by AST and inherited where a class defines none: 168 names over 39
-classes at `6bd0b66e`. Each parameter is either one a variant's `picks` sets (`transport`,
+classes at `6bd0b66e`, and 170 once SPEC-096 gives `SQSSink` and `SNSSink` `max_message_bytes`, on
+top of what SPEC-093 adds. Each parameter is either one a variant's `picks` sets (`transport`,
 `backend`, `jetstream`, `client` beside `servers`, `connection` beside `dsn` or `url`) or listed in
-`NEUTRAL` for its class as one that does not change what the sink can know.
+`NEUTRAL` for its class as one that does not change what the sink can know. `max_message_bytes` is
+one of those: a size limit changes which events are sent, never what the sink can know about one
+it sent.
 
 #### Acceptance Criteria:
 
@@ -173,7 +176,8 @@ classes at `6bd0b66e`. Each parameter is either one a variant's `picks` sets (`t
 - [ ] A test asserts that the AST-derived parameters equal `PARAMETERS`, failing with the class and
       the parameter gained or lost, and that for each class `PARAMETERS` equals the union of its
       variants' `picks` keys and its `NEUTRAL` entry; a fixture class with one extra parameter
-      yields a line naming both (invariants 2 and 7).
+      yields a line naming both. Wherever the tree's `SQSSink` and `SNSSink` take
+      `max_message_bytes` (SPEC-096), it is in each class's `NEUTRAL` entry (invariants 2 and 7).
 - [ ] Every variant's builder returns an instance whose class has the name its entry gives
       (invariants 2 and 7).
 - [ ] A test asserts that every `ABSTRACT` entry is a class no `VARIANTS` entry builds and that at
@@ -796,3 +800,9 @@ measured.
 - Edited again on 2026-11-16 by SPEC-094's second revision, text only. The Kafka example becomes
   `87`, since SPEC-094 no longer reads `10` as definitive: librdkafka builds the batch that `10`
   judges again for each attempt. No requirement, row or total changed.
+- Edited on 2026-11-16 by SPEC-096's revision. `PARAMETERS`'s paragraph names the 170 names the
+  tree holds once SPEC-096 adds `max_message_bytes` to `SQSSink` and `SNSSink`, and FR-001's
+  parameter criterion requires it in each class's `NEUTRAL`. The 168 at `6bd0b66e` stays as
+  measured, since this spec builds before SPEC-096 in the arc and reads the tree it is built on.
+  `spec096_corpus_rows.py` ran every row with both classes' limit at 1,048,576 and at 1,024, and
+  no row moved, so no row or total changed.

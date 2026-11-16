@@ -41,8 +41,10 @@ request is ever sized past the service's 1 MiB.
 ### Out of Scope
 
 - **Changing the default.** The limit stays 262,144 bytes unless a caller passes
-  `max_message_bytes`. *Evidence* gives the case for 1,048,576, the service's default for a new
-  queue, and the measured cost of that default against a queue still at 262,144.
+  `max_message_bytes`. Andrew chose this on 2026-11-16, asked whether `SQSSink`'s default should
+  stay 256 KiB or become 1 MiB: "Keep 256 KiB (Recommended)". *Evidence* gives the case for
+  1,048,576, the service's default for a new queue, and the measured cost of that default against a
+  queue still at 262,144.
 - **Reading the destination's limit from AWS.** Asking `GetQueueAttributes` or
   `GetTopicAttributes` for `MaximumMessageSize` needs a permission a send-only role does not have,
   adds a network call to construction, and reads a value that "You can increase or decrease ... at
@@ -52,13 +54,18 @@ request is ever sized past the service's 1 MiB.
   question. `docs/architecture.md` §12 carries it as an open item, filed with this spec.
   `FirehoseSink`'s limits were read too and still match the service, which says they "cannot be
   changed".
-- **Validating `MAX_BYTES`.** It is read per round when `max_message_bytes` is `None`, as in 1.x,
-  and an assignment made after construction can be judged only on the drain thread, which
-  invariant 13 forbids. Only its upper side is held, by the 1,048,576 cap (FR-002, FR-003).
+- **Validating `MAX_BYTES`, or `max_message_bytes` assigned after construction.** `MAX_BYTES` is
+  read per round when `max_message_bytes` is `None`, as in 1.x, and `sink.max_message_bytes` is a
+  public attribute a caller can reassign, as `sink.max_retries` is. An assignment made after
+  construction can be judged only on the drain thread, which invariant 13 forbids. Only the upper
+  side of either is held, by the 1,048,576 cap (FR-002, FR-003).
 - **Not counting the FIFO ids.** `SQSSink` costs a FIFO entry as its body plus its
   `MessageGroupId` and `MessageDeduplicationId` (SPEC-016 FR-005). The AWS pages say message
   attributes count toward the limit and do not say whether these two parameters do, so the sink
-  keeps over-counting, by at most 256 bytes, which drops rather than sends a message at the edge.
+  keeps over-counting, by at most 256 bytes for ids AWS accepts (each is at most 128 characters of
+  ASCII alphanumerics and punctuation), which drops rather than sends a message at the edge.
+  `_bounded` truncates a derived id to 128 *characters*, so an id AWS would refuse anyway can cost
+  more.
 - **A separate request limit.** A request's sum is held to the same limit as a message, as today.
   SQS's batch total is 1 MiB whatever the queue's limit; holding it to the message limit costs
   extra requests below 1 MiB and keeps the default's requests byte for byte what 1.x sends.
@@ -67,9 +74,11 @@ request is ever sized past the service's 1 MiB.
   entry costs itself, counted in `failed` (SPEC-016, SPEC-070). That is the reason to pass the
   destination's limit.
 - **Any change to the stderr line formats**, the counters, `MAX_BATCH`, the verdicts or the
-  retry classification. SPEC-093's `dropped_unadjudicated` and SPEC-095's resend count touch
-  these two sinks' constructors and rounds, and this spec does not depend on either. Whichever
-  lands second rebases over the other's lines.
+  retry classification. SPEC-093 (its FR-003 gives both sinks `dropped_unadjudicated`, a sub-count
+  of `failed`) and SPEC-095 (a count of resends), both Draft on `main`, touch these two sinks'
+  constructor bodies, rounds and public-attribute rosters. This spec reads no counter either adds
+  and adds none, so it does not depend on either, and no requirement here contradicts theirs.
+  Whichever is built second rebases over the other's lines.
 
 ---
 
@@ -105,6 +114,14 @@ exact error, and before `boto3` is imported or any client is built:
   `ValueError` naming the class, `max_message_bytes`, the value and both bounds.
 - Anything else is stored as the exact `int`.
 
+**The message renders the value through `sanitize._int_text`** (SPEC-066 FR-003), on the exact
+`int`, never `f"got {max_message_bytes}"`: CPython refuses to turn an integer of more than 4,300
+digits into text, so that f-string raised "Exceeds the limit (4300 digits) for integer string
+conversion" out of the refusal itself for `max_message_bytes=10**5000`, naming neither the class
+nor the argument. `_int_text` names such a value as `<int: ~5001 digits>`, the form every other
+door's refusal uses. And it renders the *exact* value, so a subclass whose `__repr__` or
+`__format__` lies cannot choose the text.
+
 The range is the one AWS gives `MaximumMessageSize` for a queue ("An integer from 1,024 bytes (1
 KiB) to 1,048,576 bytes (1 MiB)", `CreateQueue`) and for a topic ("Valid values are 1024 to
 1048576", `SetTopicAttributes`). So every limit a destination can have is accepted, and nothing
@@ -124,13 +141,25 @@ call level within a module only.
       (invariant 10).
 - [ ] For each class, `max_message_bytes=1024`, `=1048576`, `=262144` and `=None` construct, and
       `sink.max_message_bytes` reads `1024`, `1048576`, `262144` and `None`. An `int` subclass
-      holding `2048` whose `__lt__`, `__gt__` and `__le__` lie is stored as the exact `int` 2048
-      (invariant 13).
+      holding `2048` whose `__lt__`, `__gt__`, `__le__` and `__ge__` lie is stored as the exact
+      `int` 2048, `type(...) is int` (invariant 13).
+- [ ] For each class, `int` subclasses holding `512` and `1048577`, whose `__lt__`, `__gt__`,
+      `__le__` and `__ge__` all answer that the value is in range and whose `__repr__` and
+      `__format__` return `"262144"`, are refused with `ValueError` whose text names `512` and
+      `1048577` respectively. A build that range-checks the caller's object and stores the
+      `exact_int` copy constructs here, and fails this criterion (invariant 13).
 - [ ] For each class, `1023`, `1048577`, `0`, `-1` and `True` raise `ValueError` whose text names
       the class, `max_message_bytes`, the value, `1024` and `1048576`. `1.5e6`, `262144.0`,
       `"262144"` and `Decimal(262144)` raise `TypeError` naming `max_message_bytes` and the type.
-      Each is raised with no `boto3` import attempted, proven with `client=None` and no `aws`
-      extra (invariant 13).
+      Each is raised before the client is built: with `client=None` and the counted `boto3`
+      stand-in of `tests/test_numeric_doors.py` (`_boto3`, the `SQSSink` and `SNSSink` rows of
+      `_BUILDS`), the stand-in records one build for a good value and none for each refused one
+      (invariant 13).
+- [ ] For each class, `max_message_bytes=10**5000` and `=-10**5000` raise exactly `ValueError`
+      whose text starts with `<Class> max_message_bytes must be from 1024 to 1048576 bytes, got
+      <int: ~5001 digits>`, as two rows each of `_HUGE_DOORS` in `tests/test_numeric_doors.py`.
+      Re-planting `f"got {max_message_bytes}"` in either constructor fails its rows with CPython's
+      digit-limit error (invariant 13).
 - [ ] `SQSSink(url, max_retries=2.5, max_message_bytes=1.5)` raises the `max_retries` error
       unchanged, and `SNSSink` the same. `SQSSink(url, message_group_id=5, max_message_bytes=1.5)`
       raises the `message_group_id` error unchanged (invariant 13).
@@ -179,8 +208,8 @@ the service requires, which costs requests and never a refusal.
 
 - [ ] With `max_message_bytes=None` and `MAX_BYTES` untouched, the requests a recording client
       receives for each batch of `spec096_limits_today.py` cases A, B, C and E equal, entry for
-      entry and byte for byte apart from each entry's `Id`, those recorded at `10ba21ee`, and the
-      counters and stderr lines are the same (invariants 2 and 7).
+      entry and byte for byte apart from each entry's `Id`, those recorded at `10ba21ee`, and
+      `dropped_oversized`, `failed` and the stderr lines are the same (invariants 2 and 7).
 - [ ] With `max_message_bytes=1048576` on a standard queue, an event whose body is 1,048,576 bytes
       is sent alone and lands, and one of 1,048,577 bytes is dropped, `dropped_oversized == 1`,
       with one line reading `SQSSink, 1048577 bytes exceeds the 1048576-byte message limit`
@@ -212,12 +241,25 @@ FR-002's rule on SNS's twin path (invariant 6). Each round reads one effective l
 counted in `dropped_oversized` with today's line, `SNSSink, exceeds the <limit>-byte message
 limit`. `chunk_items` (`:239-241`) is given the effective limit as `max_bytes`.
 
+**A request is costed in bytes.** Today `chunk_items` measures each SNS body with
+`size_of=lambda p: len(p[1])`, which counts characters, while `_bodies` checks each message in
+UTF-8 bytes. The two agree only because `json.dumps` escapes every non-ASCII character by default,
+so a body is ASCII. A subclass whose `_encode` writes UTF-8 (`ensure_ascii=False`) gets requests
+up to four times the limit in bytes. `size_of` becomes the body's UTF-8 length, the unit
+`_bodies` and the service use. For an ASCII body the two are equal, so no default request changes.
+
 On SNS the request's sum is the topic's own rule, not a choice: "The combined size of all
 messages in the batch, including each message's body and attributes, must not exceed the topic's
 MaximumMessageSize" (`PublishBatch`). So a caller who raises the limit for a topic at 1 MiB gets
 requests that fill it. A caller who raises it above the topic's own limit gets requests the topic
-refuses whole. With the sink at 1 MiB and the topic at 262,144, two 200 KiB messages were both
-lost in one refused call (`spec096_destination_below_limit.py`, T1), where today's sink sends
+refuses whole: the docs settle that this is a refusal of the call, `BatchRequestTooLong`, "The
+length of all the batch messages put together is more than the limit. HTTP Status Code: 400"
+(`PublishBatch`). And a topic cannot always be raised: "To set MaximumMessageSize above 256 KiB,
+the topic must have 100 or fewer total subscriptions, all of which must be supported endpoint
+types (Amazon Data Firehose, Amazon SQS, or AWS Lambda)" (*Publishing large messages*). So a topic
+that fans out to HTTP, email or SMS subscribers stays at 256 KiB or below whatever the caller
+passes here. With the sink at 1 MiB and the topic at 262,144, two 200 KiB messages were both lost
+in one refused call (`spec096_destination_below_limit.py`, T1), where today's sink sends
 them in two calls and both land (T2). That is why the default stays at SNS's own default, and why
 the README tells the caller to pass the topic's value and nothing larger.
 
@@ -225,8 +267,13 @@ the README tells the caller to pass the topic's value and nothing larger.
 
 - [ ] With `max_message_bytes=None` and `MAX_BYTES` untouched, the requests a recording client
       receives for `spec096_limits_today.py` cases F1 and F2 equal, entry for entry and byte for
-      byte apart from each `Id`, those recorded at `10ba21ee`, with the same counters and lines
-      (invariants 2 and 6).
+      byte apart from each `Id`, those recorded at `10ba21ee`, with the same `dropped_oversized`,
+      `failed` and lines (invariants 2 and 6).
+- [ ] With `max_message_bytes=1024`, on a subclass whose `_encode` is
+      `json.dumps(event, ensure_ascii=False)`, an event whose body holds 600 `é` (over 1,024 bytes,
+      under 1,024 characters) is dropped and counted. Two events whose bodies are each 700 to
+      1,000 bytes and under 512 characters go out in two requests, where counting characters
+      would put both in one request of more than 1,024 bytes (invariants 2 and 6).
 - [ ] With `max_message_bytes=1048576`, a 600 KiB message is published and lands, where at the
       default it is dropped (`spec096_destination_below_limit.py` T3 and T4). A message of
       1,048,577 bytes is dropped, counted, and announced naming `1048576` (invariants 2 and 6).
@@ -265,8 +312,8 @@ three ways above would stop working without a word. `PostgresSink.connect_timeou
 - [ ] The three tests above pass unedited (invariant 10).
 - [ ] With `max_message_bytes=None`, `sink.MAX_BYTES = 2048` on the instance, and a subclass
       setting `MAX_BYTES = 2048`, each drops a 3 KiB event and keeps a small one, naming `2048` on
-      both classes, as `spec096_limits_today.py` cases D1, D2 and F3 measured at `10ba21ee`
-      (invariant 10).
+      both classes, as `spec096_limits_today.py` cases D1 and D2 (SQS) and F3 and F4 (SNS)
+      measured (invariant 10).
 - [ ] With `max_message_bytes=65536` and `sink.MAX_BYTES = 2048` on the instance, a 3 KiB event
       lands and the effective limit named for a 100 KiB event is `65536` (invariant 10).
 
@@ -287,47 +334,69 @@ What a caller and the next session read:
   for `MAX_BYTES` and `max_message_bytes`, and `_prepare`/`_bodies`/`_chunks`/`_round`, where
   they name the limit. `sanitize.py`'s `_MAX_RENDERED_BYTES` docstring says "``SQSSink`` sends at
   most 256 KiB", which becomes "256 KiB by default".
-- **`docs/release-notes/v1.2.1.md`**, the pending notes on `main`. An *Added* section, "`SQSSink`
-  and `SNSSink` take `max_message_bytes` (SPEC-096)", gives the argument, its range, its default
-  and the cap. A *Changed* bullet covers a `MAX_BYTES` set above 1,048,576 on an instance or a
-  subclass: a message over 1 MiB is now counted in `dropped_oversized` with the oversize line,
-  where it was sent and counted in `failed` when the service refused it, and requests are split
-  under 1 MiB. That is also a seventh exception in the "`>=1,<2` pin" list. Both sentences that
-  read "No constructor signature or default changed" are rewritten to say that no default
-  changed and that the two sinks each gain one keyword-only argument, appended. The sentence that
-  says *Added* lists one new public name counts the new ones. The opening list of carried specs
-  names SPEC-096.
+- **`docs/release-notes/v1.2.1.md`**, the pending notes on `main`, as SPEC-093 and SPEC-095 also
+  edit them. An *Added* section, "`SQSSink` and `SNSSink` take `max_message_bytes` (SPEC-096)",
+  gives the argument, its range, its default and the cap. A *Changed* bullet covers a `MAX_BYTES`
+  set above 1,048,576 on an instance or a subclass: a message over 1 MiB is now counted in
+  `dropped_oversized` with the oversize line, where it was sent and counted in `failed` when the
+  service refused it, and requests are split under 1 MiB. The "`>=1,<2` pin" list gains that case
+  as an entry named by its content, "code that sets `SQSSink.MAX_BYTES` or `SNSSink.MAX_BYTES`
+  above 1,048,576", and its lead-in's count ("with six exceptions" at `ead40798`) is recounted
+  against the list as it stands when this spec completes, since SPEC-093 and SPEC-095 each add
+  entries. Every sentence saying no constructor signature changed is rewritten to say that the two
+  sinks each gain one keyword-only argument, appended, and that no default changed. The sentence
+  that says *Added* lists one new public name counts the new ones. The opening list of carried
+  specs names SPEC-096.
 - **`docs/architecture.md`.** §8's "≤ 256 KB apiece" becomes the sink's message limit, 256 KiB by
-  default and at most 1 MiB. §12's item for `SQSSink.MAX_BYTES` moves to *Resolved*, closed by
-  this spec. Its Kinesis item stays open.
+  default and at most 1 MiB. §13's "past SQS's 256 KB" (the payload-ceilings bullet) becomes "past
+  `SQSSink`'s default 256 KiB, and SQS's own 1 MiB". §12's item for `SQSSink.MAX_BYTES` moves to
+  *Resolved*, closed by this spec. Its Kinesis item stays open.
+- **`docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte-budget.md`**
+  says "(SQS takes 256 KB)"; it becomes "(`SQSSink` sends 256 KiB by default, and SQS takes
+  1 MiB)", with a dated History line saying the fact changed and the decision did not.
+  `docs/implementation-guide.md` and the delivery docs keep their 256 KB: they are history.
 - **A decision file** in `docs/decisions/sink-delivery/`: *A destination limit the caller can
   configure is a constructor argument, defaulting to the 1.x value, under the service's ceiling*.
   It records the `None` default and FR-004's reason, the cap, the rejected `GetQueueAttributes`
   read, and the evidence on the default.
-- **SPEC-092's roster**, if `tests/conformance_classes.py` exists on the branch. The two new
-  parameters are listed in `NEUTRAL` for their classes, since a limit does not change what a sink
-  can know about whether its backend took an event. `PARAMETERS` gains them, 170 names where
-  `spec096_corpus_rows.py` reads 168 at `10ba21ee`. If the file does not exist, nothing is owed
-  here: SPEC-092's build reads the parameters from the tree.
+- **The public-attribute roster.** `tests/test_sinks_encode.py::test_the_public_surface_grows_only_by_five_losses`
+  compares each sink's public names with the frozen `BASE_PUBLIC` literal plus the names later
+  specs added. A new map beside `ENGINE_GAINED`, `LIMIT_GAINED = {"SQSSink":
+  frozenset({"max_message_bytes"}), "SNSSink": frozenset({"max_message_bytes"})}`, joins that
+  union. `BASE_PUBLIC` is not edited, since it records the surface as one spec found it.
+- **SPEC-092's roster.** SPEC-092's text is amended alongside this spec, before either is built: its
+  `PARAMETERS` paragraph names the two parameters and the count they make, and its criterion
+  requires `max_message_bytes` in each class's `NEUTRAL` wherever the tree has it, since a limit
+  does not change what a sink can know about whether its backend took an event. If
+  `tests/conformance_classes.py` exists when this spec is built, the build adds the two names to
+  `PARAMETERS` and `NEUTRAL`. If it does not, SPEC-092's build reads them from the tree.
 
 #### Acceptance Criteria:
 
 - [ ] `README.md`'s rows for `SQSSink` and `SNSSink` contain `max_message_bytes=None`, and the
       AWS section contains `MaximumMessageSize`, `1048576` and the words "256 KiB" (serves no
       invariant: documentation, judged by `docs/process/completion-ritual.md`).
-- [ ] `docs/release-notes/v1.2.1.md` contains `max_message_bytes`, `1,024`, `1,048,576` and
-      `SPEC-096`, and no longer contains the sentence "No constructor signature or default
-      changed" (serves no invariant: the release notes, which no gate holds to the code).
+- [ ] `docs/release-notes/v1.2.1.md` contains `max_message_bytes`, `1,024`, `1,048,576`,
+      `SPEC-096` and the pin entry naming `MAX_BYTES` above 1,048,576. Read with every run of
+      whitespace collapsed to one space, so a sentence wrapped across lines is still found, it
+      contains neither "No constructor signature or default changed" nor any other sentence
+      saying a constructor signature is unchanged, and the lead-in's count equals the number of
+      entries in its list (serves no invariant: the release notes, which no gate holds to the
+      code).
 - [ ] `docs/architecture.md` §12 *Open* has no item headed by `SQSSink.MAX_BYTES`, *Resolved*
-      has one naming SPEC-096, and the `KinesisSink` item is still under *Open* (serves no
-      invariant: the open-items register).
+      has one naming SPEC-096, and the `KinesisSink` item is still under *Open*. Neither §13 nor
+      the coercion-budget decision file states SQS's limit as 256 KB (serves no invariant: the
+      open-items register and the record).
+- [ ] `test_the_public_surface_grows_only_by_five_losses` passes with `LIMIT_GAINED` in its
+      union, and this spec's diff does not touch the `BASE_PUBLIC` literal (serves no invariant:
+      the roster's own hygiene; FR-001's signature and typed-consumer criteria hold the surface).
 - [ ] The decision file exists under `docs/decisions/sink-delivery/`, `sh scripts/gen-index.sh`
       lists it, and `sh scripts/docs-lint.sh` exits 0 (serves no invariant: the register's
       shape).
 - [ ] If `tests/conformance_classes.py` exists, its parameter test passes with `max_message_bytes`
-      in `NEUTRAL` for both classes, and `spec096_corpus_rows.py`, re-run on the branch, still
-      reports 0 rows moved at 1,048,576 and at 1,024 (serves no invariant: SPEC-092's roster
-      hygiene; no row's verdict depends on the limit).
+      in `PARAMETERS` and `NEUTRAL` for both classes. Either way, `spec096_corpus_rows.py`, re-run
+      on the branch, still reports 0 rows moved at 1,048,576 and at 1,024 (serves no invariant:
+      SPEC-092's roster hygiene; no row's verdict depends on the limit).
 
 ---
 
@@ -343,7 +412,8 @@ class SQSSink:
     MAX_BYTES = 256 * 1024              # unchanged; the limit when max_message_bytes is None
     max_message_bytes: int | None       # new public attribute, the judged argument
 
-    def _limit(self) -> int: ...        # min(max_message_bytes or MAX_BYTES, _SERVICE_MAX_BYTES)
+    def _limit(self) -> int: ...        # min(MAX_BYTES if max_message_bytes is None
+                                        #     else max_message_bytes, _SERVICE_MAX_BYTES)
 
 # src/log_foundry/sinks/sns.py
 _SERVICE_MAX_BYTES: Final = 1_048_576   # PublishBatch: the most any topic's MaximumMessageSize is
@@ -387,6 +457,7 @@ SNSSink(
 # Refusals, raised before any client is built:
 #   TypeError:  "SQSSink max_message_bytes must be an integer, not float"   (exact_int's text)
 #   ValueError: "SQSSink max_message_bytes must be from 1024 to 1048576 bytes, got 512"
+#               the value rendered by sanitize._int_text(exact), never f"got {max_message_bytes}"
 
 # A queue created at the service default:
 SQSSink(queue_url=URL, max_message_bytes=1_048_576)
@@ -404,12 +475,14 @@ src/log_foundry/sinks/sns.py        # FR-001, FR-003, FR-004
 src/log_foundry/sanitize.py         # FR-005: one docstring phrase
 tests/test_sinks_message_limit.py   # new: FR-001 to FR-004 for both sinks
 tests/typed_consumer/accepts.py     # FR-001
-tests/test_sinks_encode.py          # the public-attribute roster gains max_message_bytes
+tests/test_sinks_encode.py          # FR-005: LIMIT_GAINED joins the public-surface union
+tests/test_numeric_doors.py         # FR-001: _BUILDS refusals and four _HUGE_DOORS rows
 tests/conformance_classes.py        # FR-005, only if SPEC-092 is built
 README.md
 docs/release-notes/v1.2.1.md
-docs/architecture.md                # §8, §12
+docs/architecture.md                # §8, §12, §13
 docs/decisions/sink-delivery/a-destination-limit-the-caller-can-configure-is-a-constructor-argument-defaulting-to-the-1x-value-under-the-services-ceiling.md
+docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte-budget.md
 ```
 
 ## Implementation Phases
@@ -419,27 +492,30 @@ docs/decisions/sink-delivery/a-destination-limit-the-caller-can-configure-is-a-c
 - Add `max_message_bytes` to both constructors, judged after every existing refusal and before
   any client is built; store the exact `int` or `None`.
 - Add `_limit` and the two constants to each module; keep `MAX_BYTES` and its value.
-- Tests for every value FR-001 names on both classes, the precedence of existing refusals, the
-  two rosters, the typed consumer, and FR-004's `MAX_BYTES` reach.
+- Tests for every value FR-001 names on both classes, the lying subclasses, the `_BUILDS` and
+  `_HUGE_DOORS` rows, the precedence of existing refusals, the two rosters, the typed consumer,
+  and FR-004's `MAX_BYTES` reach.
 
 ### Phase 2: Applying it (FR-002, FR-003)
 
 - Record, at `10ba21ee`, the requests a recording client receives for `spec096_limits_today.py`
   cases A, B, C, E, F1 and F2, as the fixture FR-002's and FR-003's first criteria compare with.
 - Route the effective limit through `_chunks`/`_prepare`/`_announce_oversized` on SQS and
-  `_round`/`_bodies` on SNS, read once per round.
+  `_round`/`_bodies` on SNS, read once per round, and cost an SNS request in UTF-8 bytes.
 - Tests for each criterion of FR-002 and FR-003, the twin-path table included.
 
 ### Phase 3: The record (FR-005)
 
-- README, docstrings, release notes, §8 and §12, the decision file, SPEC-092's roster if built.
+- README, docstrings, release notes, §8, §12 and §13, the two decision files, `LIMIT_GAINED`, and
+  SPEC-092's roster if built.
 
 ---
 
 ## Evidence
 
 Read and measured on 2026-11-16 at `10ba21ee`, on macOS with CPython 3.13.1, with no `aws` extra
-installed. Every AWS page was fetched live that day; the SQS notes the orchestrating session took
+installed, and every probe re-run at `ead40798` after the rebase with identical output: nothing
+under `src/` or `tests/` differs between the two. Case F4 was added and first run at `ead40798`. Every AWS page was fetched live that day; the SQS notes the orchestrating session took
 on 2026-11-15 agree with each. The three probes are committed under
 `docs/audits/2026-11-14-probes/sinks/` and run against the tree with `PYTHONPATH=src` (the third
 also needs `tests` and the probes directory on the path, as its header says).
@@ -504,6 +580,7 @@ than the commercial Regions and GovCloud. None of these was measured against AWS
 | F1, SNS, ten 100 KiB events | 5 of 2 | 204,972 each | 10 | 0 |
 | F2, SNS, one 300 KiB event beside two small | 1 of 2 | 192 | 2 | 1 |
 | F3, SNS, instance `MAX_BYTES = 2048` | 1 of 1 | 96 | 1 | 1, naming `2048` |
+| F4, SNS, subclass `MAX_BYTES = 2048` | 1 of 1 | 96 | 1 | 1, naming `2048` |
 
 **A destination below the sink, `spec096_destination_below_limit.py`.** The fake enforces a
 destination limit and the 1 MiB batch total, refusing an over-limit entry either by failing the
@@ -528,7 +605,8 @@ the argument does. The batch is nine ~100-byte events and one 400 KiB event.
 chunk is `REJECTED` at its first attempt and every event in it is lost. The line names
 `ClientError` and not the code.
 
-**The default.** The spec keeps 262,144, for these reasons:
+**The default.** Andrew chose on 2026-11-16: "Keep 256 KiB (Recommended)". The evidence he
+was given follows. For keeping 262,144:
 
 - 1.x callers see nothing change, which is the `1.x` rule.
 - A caller whose queue is still at 262,144 keeps S1's outcome, one event dropped and counted with
@@ -541,7 +619,7 @@ chunk is `REJECTED` at its first attempt and every event in it is lost. The line
   `max_value_bytes`, 8,192 by default, and `docs/architecture.md` §13 measured 256 keys × 8,192
   bytes as roughly 2 MB, so such an event is possible but takes many large fields.
 
-The case for 1,048,576:
+For 1,048,576:
 
 - It is the service's own default for a queue created today.
 - A caller who never reads the README gets S3 rather than S1: the tenth event lands instead of
@@ -563,3 +641,31 @@ today, and this spec adds two.
 - **2026-11-16, written.** The §12 item said "Nothing here has been measured or read". The AWS
   pages were read, the limits quoted above, and the item rewritten to name this spec. The Kinesis
   item was filed beside it the same day.
+- **2026-11-16, revised after the spec review**, rebased onto `ead40798`, where SPEC-093,
+  SPEC-094 and SPEC-095 landed as Draft specs. Andrew answered the default ("Keep 256 KiB
+  (Recommended)"), recorded under *Out of Scope* and *Evidence*. Every finding was fixed:
+  - FR-001's refusal renders the value through `sanitize._int_text`, with `±10**5000` rows in
+    `_HUGE_DOORS`. ~~`f"got {max_message_bytes}"`~~ raised CPython's digit-limit error out of
+    the refusal itself.
+  - FR-001 gains lying subclasses holding 512 and 1,048,577 that say "in range". The 2,048
+    subclass alone passed a build that range-checked the raw value and stored the `exact_int`
+    copy.
+  - The no-build criterion uses the counted `_boto3` stand-in. ~~"no `aws` extra"~~ cannot hold
+    in `integration.yml`, which installs every extra.
+  - FR-005 names §13's and the coercion-budget decision's "256 KB". It also names
+    `LIMIT_GAINED`, and does not edit `BASE_PUBLIC`.
+  - SPEC-092's `PARAMETERS` paragraph and its `NEUTRAL` criterion are amended in this commit.
+    They do not say a bare "170": SPEC-092 builds before this spec in the arc, so its count is
+    168 at `6bd0b66e` plus two once this spec lands, plus whatever SPEC-093's `ack_wait=` and
+    `confirm=` add.
+  - FR-003 costs an SNS request in UTF-8 bytes. ~~Characters~~ agreed only because `json.dumps`
+    escapes non-ASCII.
+  - The FIFO over-count is "at most 256 bytes for ids AWS accepts".
+  - Assigning `max_message_bytes` after construction is named in *Out of Scope*.
+  - The Data Model no longer uses `or`. FR-004 cites the measured SNS subclass case F4.
+  - The release-notes exception is named by its content, and the lead-in count is recounted at
+    completion.
+  - The release-notes criterion reads across line wraps.
+  - SPEC-093's FR-003 and SPEC-095 are cited as Draft on `main`. Neither contradicts a
+    requirement here.
+  - SNS's whole-call `BatchRequestTooLong` and the 100-subscription precondition are quoted.

@@ -13,7 +13,7 @@ Cases:
   C  one event over 256 KiB beside two small ones: dropped, counted, and the line.
   D  an instance assignment `sink.MAX_BYTES = 2048` and a subclass override: honoured?
   E  a FIFO entry whose body alone fits but body plus ids does not.
-  F  the same as A and C for SNSSink.
+  F  the same as A, C and D for SNSSink (F4, the subclass, added on 2026-11-16 at ead40798).
 """
 
 from __future__ import annotations
@@ -149,6 +149,15 @@ def main() -> None:
     run(
         "F3 SNS instance MAX_BYTES=2048, a 3 KiB event beside a small one",
         sns,
+        [event(0, 10), event(1, 3 * KIB)],
+    )
+
+    class SmallTopic(SNSSink):
+        MAX_BYTES = 2048
+
+    run(
+        "F4 SNS subclass MAX_BYTES=2048, a 3 KiB event beside a small one",
+        SmallTopic("arn:t", client=Recorder()),
         [event(0, 10), event(1, 3 * KIB)],
     )
 

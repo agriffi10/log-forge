@@ -62,6 +62,7 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   `SNSSink` apply their byte limit today, what each counts when the destination's limit is below
   the sink's, and whether any SPEC-092 row depends on the limit. The third imports SPEC-092's
   prototype, so it needs `sinks/` and `tests/` on `PYTHONPATH` as its docstring says.
+
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded
 in the frame report under `../2026-11-14-frames/`. They are exempt from the linters for that

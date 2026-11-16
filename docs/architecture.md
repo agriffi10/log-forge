@@ -1888,8 +1888,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   invariant 2's `dropped_oversized`). The class holds 256 KiB (`sinks/sqs.py:186`), and an event
   whose message exceeds it is dropped and counted (`:690`). AWS raised the limit on 2025-08-04
   ("Amazon Simple Queue Service (Amazon SQS) has increased the maximum message payload size from
-  256 KiB to 1 MiB", *What's New*, posted Aug 4, 2025), and a queue's `MaximumMessageSize` is now "An integer from 1,024 bytes (1
-  KiB) to 1,048,576 bytes (1 MiB). Default: 1,048,576 bytes (1 MiB)" (`CreateQueue`). So the sink
+  256 KiB to 1 MiB", *What's New*, posted Aug 4, 2025), and a queue's `MaximumMessageSize` is now
+  "An integer from 1,024 bytes (1 KiB) to 1,048,576 bytes (1 MiB). Default: 1,048,576 bytes (1
+  MiB)" (`CreateQueue`). So the sink
   drops an event between 256 KiB and 1 MiB that a queue at the service default would take, and
   sends one that a queue configured below 256 KiB refuses; when that refusal is the whole call, the
   call's other events are lost with it, counted in `failed`
