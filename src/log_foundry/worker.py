@@ -233,6 +233,12 @@ class _CountingQueue(queue.Queue[object]):
     def _put(self, item: object) -> None:
         """Counts a submission's events, then queues it.
 
+        It appends to ``self.queue`` itself rather than calling ``super()._put``, which is that one
+        append: the zero-argument ``super()`` lookup cost more than the count, and measured, the
+        counting put cost 48 to 55 ns over a plain one with it, against FR-005's bound of 50.
+        The deque is the attribute :meth:`Worker._queued_submissions` already reads
+        (``architecture.md`` §13 records the reliance).
+
         Args:
           item: A submission, a flush marker or the shutdown sentinel.
 
@@ -244,7 +250,7 @@ class _CountingQueue(queue.Queue[object]):
         """
         if isinstance(item, list):
             self.entered += len(item)
-        super()._put(item)
+        self.queue.append(item)
 
 
 @dataclass(frozen=True, kw_only=True)
