@@ -38,7 +38,7 @@ because the hook never asks the trunk for a lock, so a lock stamped with it woul
 Monitor tool's until-loop on `queue.sh turn SPEC-XXX`, every couple of minutes. Each call is also
 your heartbeat: a waiter that stops polling for 30 minutes loses its place, which is what stops a
 dead session from blocking the line forever. Do not poll `acquire` — poll `turn`, then `acquire` once
-it exits 0. And **`cd` into the worktree you built the spec in and `acquire` from there in the
+it exits 0. And **`cd` into the worktree that holds the branch and `acquire` from there in the
 SAME command** — the agent's Bash tool resets the working directory between calls, so a `cd` in
 one call and an `acquire` in the next acquires from the wrong tree.
 
@@ -94,7 +94,9 @@ never looks like a bug in the queue.
 The **whole** PR lifecycle, not just the push: `git fetch origin` and rebase onto the ref you just
 fetched — `main` moves under you while you wait for the lock and while you hold it, and an
 unfetched `origin/main` cannot show you that — re-run your gates, push, open the PR, watch it to green
-**keyed on the head sha**, merge, then confirm `main` itself went green. Then release.
+**keyed on the head sha**, merge, then confirm `main` itself went green. Then release. The watch is
+your own wait, never a notifier that reports only failures: one that stays silent on green leaves
+your PR open and green, holding the lock, after your turn has ended.
 
 If your spec needs more than one PR, take a ticket per PR and release between them, so the others
 interleave rather than waiting out your whole spec.

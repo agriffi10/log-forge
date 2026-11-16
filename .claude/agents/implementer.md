@@ -15,9 +15,9 @@ For a plan: turn the spec's Implementation Phases into a concrete plan; validate
 the plan rests on that nobody has checked.
 
 For a build: first switch to the branch your brief names, in your own worktree (`git switch
-<name>`). When the brief instead names another worktree's path, because that worktree holds the
-branch, work there with `cd <path> && …` in every call. Either way, confirm with
-`git log --oneline -1` that the head is the SHA the brief gives: your worktree starts elsewhere,
+<name>`), then confirm with `git log --oneline -1` that the head is the SHA the brief gives. Never
+write in another worktree, even one that holds the branch; if `git switch` refuses because it is
+checked out elsewhere, return and say so. Your worktree starts elsewhere,
 and `docs/process/agent-roles.md` → *The implementer's branch* says why. Then work the reviewed
 plan's phases in order, straight through. Triage emergent issues by kind — reversible or
 technical, decide and note it; product-changing or ambiguous, STOP and return with options and a
