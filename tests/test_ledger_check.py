@@ -105,11 +105,12 @@ def test_a_stalled_sink_and_a_killed_drain_are_silent() -> None:
 
 
 def test_an_uncounted_queue_entry_fires() -> None:
+    """A live drain's entry no count admits is still reported once the settle bound is spent."""
     sink, worker = _stalled_worker()
     try:
         with worker._queue.mutex:
             worker._queue.queue.append([{"message": "slipped in"}])
-        found = ledger_check.worker_problems(worker)
+        found = ledger_check.worker_problems(worker, settle=0.1)
         assert found == ["a worker's queued+stranded reads 0 with 1 events in its queue"], found
         with worker._queue.mutex:
             worker._queue.queue.pop()
@@ -156,6 +157,129 @@ def test_a_negative_in_flight_fires() -> None:
         assert "a worker's in_flight reads -1" in ledger_check.worker_problems(worker)
     finally:
         worker._in_flight = 0
+
+
+_PAUSES = {
+    "between get and _hold": "a worker's queued+stranded reads 2 with 0 events in its queue",
+    "inside _settle": "a worker's drain residual is -2",
+}
+"""Each point a live, balancing drain can be paused at, and what one reading there reports."""
+
+
+def _paused_drain(monkeypatch, where: str) -> tuple[worker_mod.Worker, threading.Event]:
+    """A live worker whose drain is held at ``where`` with a two-event submission, and its release.
+
+    ``between get and _hold`` is the window `main` went red in at `97a03f45`: the queue is empty
+    and the take not yet counted. ``inside _settle`` runs the real `_settle` twice, the exits with
+    no gauge change and then the gauge with no exits, and pauses between: the exits are written
+    and ``in_flight`` not yet lowered.
+    """
+    paused, release = threading.Event(), threading.Event()
+    if where == "between get and _hold":
+        real_hold = worker_mod.Worker._hold
+
+        def hold(self, events) -> None:  # type: ignore[no-untyped-def]
+            paused.set()
+            release.wait(10)
+            real_hold(self, events)
+
+        monkeypatch.setattr(worker_mod.Worker, "_hold", hold)
+    else:
+        real_settle = worker_mod.Worker._settle
+
+        def settle(self, size, **exits) -> None:  # type: ignore[no-untyped-def]
+            real_settle(self, 0, **exits)
+            paused.set()
+            release.wait(10)
+            real_settle(self, size)
+
+        monkeypatch.setattr(worker_mod.Worker, "_settle", settle)
+    worker = worker_mod.Worker(GatedSink(), batch_size=1, flush_interval=60.0)
+    worker.submit([{"message": "one"}, {"message": "two"}])
+    assert paused.wait(5)
+    return worker, release
+
+
+def _counting_readings(monkeypatch) -> tuple[list[list[str]], threading.Event]:
+    """Records every reading `worker_problems` makes, and an event set once the first is made."""
+    readings: list[list[str]] = []
+    first = threading.Event()
+    real_read = ledger_check._read_worker
+
+    def read(worker):  # type: ignore[no-untyped-def]
+        got = real_read(worker)
+        readings.append(got[1])
+        first.set()
+        return got
+
+    monkeypatch.setattr(ledger_check, "_read_worker", read)
+    return readings, first
+
+
+@pytest.mark.parametrize("where", sorted(_PAUSES))
+def test_one_reading_of_a_paused_live_drain_misreads_it(monkeypatch, where: str) -> None:
+    """The flake, reproduced: a single reading, as the fixture made before the settle, fails."""
+    worker, release = _paused_drain(monkeypatch, where)
+    try:
+        assert ledger_check.worker_problems(worker, settle=0) == [_PAUSES[where]]
+    finally:
+        release.set()
+        worker.stop(5)
+
+
+@pytest.mark.parametrize("where", sorted(_PAUSES))
+def test_a_paused_live_drain_released_within_the_bound_reads_balanced(
+    monkeypatch, where: str
+) -> None:
+    """The fix: the drain's first reading fails, it is read again, and once released it passes."""
+    worker, release = _paused_drain(monkeypatch, where)
+    readings, first = _counting_readings(monkeypatch)
+    got: list[list[str]] = []
+    reader = threading.Thread(target=lambda: got.append(ledger_check.worker_problems(worker)))
+    reader.start()
+    try:
+        assert first.wait(5)
+    finally:
+        release.set()
+        reader.join(5)
+    assert not reader.is_alive(), "the settle outlived its bound"
+    assert readings[0] == [_PAUSES[where]], readings
+    assert got == [[]], got
+    worker.stop(5)
+
+
+@pytest.mark.parametrize("where", sorted(_PAUSES))
+def test_a_drain_paused_past_the_bound_is_reported_with_its_reason(monkeypatch, where: str) -> None:
+    worker, release = _paused_drain(monkeypatch, where)
+    readings, _ = _counting_readings(monkeypatch)
+    try:
+        assert ledger_check.worker_problems(worker, settle=0.1) == [_PAUSES[where]]
+        assert len(readings) > 1, "a live drain that failed was read once"
+    finally:
+        release.set()
+        worker.stop(5)
+
+
+def test_a_dead_drain_and_a_first_passing_reading_are_read_once(monkeypatch) -> None:
+    """Neither waits: an ended drain will not move again, and a stalled sink balances at once."""
+    readings, _ = _counting_readings(monkeypatch)
+    worker = _ended_worker()
+    worker._in_flight = 2
+    try:
+        assert ledger_check.worker_problems(worker) == [
+            "a worker's ended drain holds 2 events in flight",
+            "a worker's drain residual is -2",
+        ]
+    finally:
+        worker._in_flight = 0
+    assert len(readings) == 1, readings
+    sink, stalled = _stalled_worker()
+    try:
+        assert ledger_check.worker_problems(stalled) == []
+        assert len(readings) == 2, readings
+    finally:
+        sink.gate.set()
+        stalled.stop(5)
 
 
 def test_an_lf_run_is_silent_and_a_meeting_residual_past_it_fires(lf) -> None:
@@ -295,12 +419,15 @@ def test_no_test_using_lf_carries_the_marker() -> None:
     }, marked
 
 
-def test_the_fixture_adds_no_wait_over_a_stalled_sink() -> None:
+def test_the_fixture_adds_no_wait_over_a_stalled_sink(monkeypatch) -> None:
     """FR-006 AC-7: the check reads and returns while a sink is stalled, and reads it balanced.
 
     Timed by the thread that runs it never having to be waited for: it runs on its own thread,
-    which is joined with a generous bound, rather than against a clock with a tight one.
+    which is joined with a generous bound, rather than against a clock with a tight one. The join
+    is longer than `ledger_check.SETTLE`, so it alone would pass a check that spent the settle on
+    the stall; the stalled worker being read exactly once is what says the check did not.
     """
+    readings, _ = _counting_readings(monkeypatch)
     sink = GatedSink()
     lf.configure(sink=sink)
     sink.gate.clear()
@@ -316,4 +443,5 @@ def test_the_fixture_adds_no_wait_over_a_stalled_sink() -> None:
     reader.join(5)
     assert returned, "the check waited on the stalled sink"
     assert got == [[]], got
+    assert readings == [[]], "the stalled worker was read more than once"
     assert lf.flush(5)

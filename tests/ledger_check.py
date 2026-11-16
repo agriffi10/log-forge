@@ -2,9 +2,23 @@
 
 `tests/conftest.py`'s autouse `_ledger_balance` fixture calls :func:`begin` at each test's setup
 and :func:`verdict` at its teardown, after the test's body and before the suite's own reset, and
-fails the test with the reasons :func:`verdict` returns. It stops nothing and waits for nothing:
-every check is a read. The logic lives here rather than in `conftest.py` so the fixture stays a
-thin caller.
+fails the test with the reasons :func:`verdict` returns. It stops nothing: every check is a read.
+The logic lives here rather than in `conftest.py` so the fixture stays a thin caller.
+
+**It reads at rest for the caller's side, and lets a live drain settle for the worker's side.**
+The test's own calls have returned by its teardown, so the process terms are read once. A
+worker's drain thread may still be running, though, and between `queue.get` returning and
+`Worker._hold` counting the take, or inside `Worker._settle` between the exits and the gauge, its
+own terms read out of balance for a few bytecodes: `main` went red once that way, at `97a03f45`,
+on `test_the_snapshot_returns_while_each_lock_is_held[queue]`, whose drain took its submission
+only when the test let go of the queue's mutex. So a worker whose drain is alive and whose
+reading fails is read again, every :data:`_PAUSE`, until a reading passes or :data:`SETTLE` has
+elapsed, and the last reading's reasons are the ones reported. A reading that passes the first
+time is not repeated, and neither is one of an ended drain, which nothing will move again: a
+stalled sink balances through ``in_flight`` and ``queued`` on its first reading, so it still adds
+no wait (FR-006 AC-7). The order in `src/` is not the thing to change: `_hold` raises the gauge
+before the taking count, outside the queue's mutex, so that ``health()`` and the ``shutdown()``
+check never read a false ``unaccounted``, and `tests/test_ledger_write_sites.py` holds it there.
 
 **What fails a test.**
 
@@ -38,6 +52,7 @@ cannot stay.
 from __future__ import annotations
 
 import functools
+import time
 import weakref
 
 _tracked: weakref.WeakSet = weakref.WeakSet()
@@ -55,6 +70,16 @@ _direct = [0]
 """Events the `lf` fixture emitted directly since the current test began."""
 
 MARKER = "ledger_exempt"
+
+SETTLE = 2.0
+"""Seconds one teardown lets live drains settle, shared by every worker it reads.
+
+The window it covers is a few bytecodes long, so the bound is spent only by a drain that is truly
+out of balance, which then fails its test this much later. It is shared rather than per worker
+so a defect that every worker shows costs one bound, not one per worker."""
+
+_PAUSE = 0.005
+"""Seconds between two readings of a live drain that has not settled."""
 
 
 def _track_workers() -> None:
@@ -102,8 +127,22 @@ def _queued_events(worker) -> int:  # type: ignore[no-untyped-def]
         return sum(len(item) for item in worker._queue.queue if isinstance(item, list))
 
 
-def worker_problems(worker) -> list[str]:  # type: ignore[no-untyped-def]
-    """What one worker's own terms place that the ledger cannot."""
+def worker_problems(worker, settle: float = SETTLE) -> list[str]:  # type: ignore[no-untyped-def]
+    """What one worker's own terms place that the ledger cannot, once a live drain has settled.
+
+    A failing reading of a live drain is repeated until one passes or ``settle`` seconds have
+    passed; a passing reading, or any reading of an ended drain, is final at once.
+    """
+    deadline = time.monotonic() + settle
+    alive, found = _read_worker(worker)
+    while found and alive and time.monotonic() < deadline:
+        time.sleep(_PAUSE)
+        alive, found = _read_worker(worker)
+    return found
+
+
+def _read_worker(worker) -> tuple[bool, list[str]]:  # type: ignore[no-untyped-def]
+    """One reading of a worker's own terms: whether its drain was alive, and what they misplace."""
     alive, taken, held, *exits = worker._drain_terms()
     in_queue = worker._queue.entered - taken
     found: list[str] = []
@@ -117,7 +156,7 @@ def worker_problems(worker) -> list[str]:  # type: ignore[no-untyped-def]
         found.append(f"a worker's drain residual is {residual}")
     if held < 0:
         found.append(f"a worker's in_flight reads {held}")
-    return found
+    return alive, found
 
 
 def problems() -> list[str]:
@@ -143,8 +182,9 @@ def problems() -> list[str]:
         found.append(f"open_spans={e.open_spans} with {own} buffered on this context's open spans")
     if left_open:
         found.append(f"open_spans: the test left {len(left_open)} span(s) open on its own context")
+    deadline = time.monotonic() + SETTLE
     for worker in list(_tracked):
-        found.extend(worker_problems(worker))
+        found.extend(worker_problems(worker, max(0.0, deadline - time.monotonic())))
     return found
 
 
