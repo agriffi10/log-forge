@@ -1109,6 +1109,34 @@ INVENTORY: dict[Key, Row] = {
     ),
     _wk("_taken_markers"): Row("Worker", (_REBUILD,), "flush() callers owed; in _FORK_SKIP"),
     _wk("_held"): Row("Worker", (_REBUILD,), "sinks the drain thread may be inside"),
+    _wk("_pending_events"): Row(
+        "Worker",
+        (_REBUILD,),
+        "events in the batch being built; the child's starts empty (SPEC-090)",
+    ),
+    _wk("_target"): Row(
+        "Worker", (_REBUILD,), "the size target; zero in a child, so its first batch is today's"
+    ),
+    _wk("_target_generation"): Row(
+        "Worker", (_REBUILD,), "the sink generation the target was measured under (SPEC-090)"
+    ),
+    _wk("_sink_generation"): Row(
+        "Worker", _INH, "sink swaps retarget made; inherited harmlessly, as sink is (SPEC-090)"
+    ),
+    _wk("_exit_batches"): Row("Worker", (_REBUILD,), "exit batches attempted (SPEC-090 FR-003)"),
+    _wk("_exit_longest"): Row("Worker", (_REBUILD,), "longest exit attempt (SPEC-090 FR-003)"),
+    _wk("_exit_declining"): Row(
+        "Worker", (_REBUILD,), "every later exit batch is declined (SPEC-090 FR-003)"
+    ),
+    _wk("_exit_abandoned_seen"): Row(
+        "Worker", (_REBUILD,), "the first abandoned exit batch wrote its line (SPEC-090 FR-003)"
+    ),
+    _wk("_abandoned_tally"): Row(
+        "Worker", (_REBUILD,), "abandoned exit batches not yet announced, under _lock (SPEC-090)"
+    ),
+    _wk("_declined_tally"): Row(
+        "Worker", (_REBUILD,), "declined exit batches not yet announced, under _lock (SPEC-090)"
+    ),
     _wk("_lock"): Row("Worker", _W, "guards the worker's counters"),
     _wk("_thread"): Row("Worker", (_REBUILD,), "the drain thread"),
     ("module", "_lifecycle.py", "_state"): Row(

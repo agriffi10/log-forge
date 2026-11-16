@@ -605,14 +605,20 @@ def _begin(sinks: Sequence[object]) -> ChildRun:
 
 
 def _prepare(run: ChildRun) -> None:
-    """Prepares the child for the ledger: watches ``Worker._emit`` for abandoned batches.
+    """Prepares the child for the ledger: watches ``Worker._emit_pending`` for lost batches.
 
     A batch refused while a factory is inside its own ``flush()`` or ``shutdown()`` is a counted
     failure, not a defect, so its ``span.end`` events are the ledger's abandoned term. They are
-    observed by wrapping ``Worker._emit``, **in the child only**: when ``failed_batches`` rose
-    across a call, the ``span.end`` events in the event lists that call was handed are abandoned.
-    ``failed_batches`` alone will not do, since one batch can hold several traced calls. A child
-    of a child inherits the wrapper, which reads the run at the time of the call.
+    observed by wrapping ``Worker._emit_pending``, **in the child only**: when ``failed_batches``
+    rose across a call, the ``span.end`` events in the event lists that call was handed are
+    abandoned. ``failed_batches`` alone will not do, since one batch can hold several traced
+    calls. A child of a child inherits the wrapper, which reads the run at the time of the call.
+
+    ~~It wrapped ``Worker._emit``~~ — moved by SPEC-090 (plan review, 2026-11-16): an exit batch
+    the exit budget declines unattempted moves ``failed_batches`` without reaching ``_emit``, so
+    the wrapper sits one level up, where every batch an emit or a decline settles passes. The
+    event lists are copied before the call, because ``_emit_pending`` clears the list it is
+    handed.
 
     Args:
       run: The child's run.
@@ -624,15 +630,16 @@ def _prepare(run: ChildRun) -> None:
       None.
     """
     del run
-    real = Worker._emit
+    real = Worker._emit_pending
     if getattr(real, "_model_watched", False):
         return
 
-    def watched(self: Worker, event_lists: list[list[dict[str, object]]]) -> None:
+    def watched(self: Worker, pending: list[list[dict[str, object]]]) -> None:
         """Emits as the worker does, and counts the ``span.end`` events of a refused batch."""
+        event_lists = list(pending)
         before = self.failed_batches
         try:
-            real(self, event_lists)
+            real(self, pending)
         finally:
             if self.failed_batches > before:
                 ends = sum(
@@ -644,7 +651,7 @@ def _prepare(run: ChildRun) -> None:
                 current().abandon(ends)
 
     watched._model_watched = True  # type: ignore[attr-defined]
-    Worker._emit = watched  # type: ignore[method-assign]
+    Worker._emit_pending = watched  # type: ignore[method-assign]
 
 
 def _finish(run: ChildRun) -> dict[str, object]:

@@ -172,6 +172,8 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("Worker._terminal_failure", "self._lock"): 1,
             ("Worker._nothing_lost_since", "self._lock"): 1,
             ("Worker._emit", "self._lock"): 3,
+            ("Worker._decline_exit_batch", "self._lock"): 1,
+            ("Worker._write_exit_tallies", "self._lock"): 1,
         }
     ),
 }
@@ -181,7 +183,15 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
 lock they are written under everywhere else, in a forked child's handler, after the fork roster
 has replaced that lock; it takes nothing else, so the lock order does not move. ``_check_ledger``
 decides its once-per-count line under the ledger's registration lock, a leaf no lifecycle lock is
-held around (diff review frame 1)."""
+held around (diff review frame 1).
+
+**Re-recorded at SPEC-090 (2026-11-16).** Exactly two ``worker.py`` sites enter, none leave:
+``_decline_exit_batch`` counts a declined exit batch in ``failed_batches`` and its tally under the
+worker's lock, and ``_write_exit_tallies`` takes and zeroes both exit tallies under it. Each takes
+that lock alone, as a leaf, so the order does not move. ``retarget`` stays at three, because its
+generation bump is inside the reassign's existing section, ``_emit`` at three, because the
+abandon tally is added inside the sections that already count ``failed_batches``, and ``stop`` at
+one."""
 
 
 def _tree(name: str) -> ast.Module:

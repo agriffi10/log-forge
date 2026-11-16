@@ -176,13 +176,25 @@ def test_case_a_expiry_line_reports_in_flight_and_queued_submissions(capsys) -> 
 
 
 def test_case_a_released_to_fail_announces_each_event_lost_once(capsys) -> None:
-    """FR-001 AC-3. Four events submitted, four announced lost — `fda134a` announced seven."""
+    """FR-001 AC-3. Four events submitted, four announced lost — `fda134a` announced seven.
+
+    ~~The two queued spans are announced in one line of three events, the exit drain's one
+    batch~~ — SPEC-090 FR-002 and FR-003: the exit drain sends them as two batches of
+    ``batch_size`` one. The first, past the deadline, makes its first attempt and has its retry
+    declined; the second is then declined unattempted and counted in the declined line. So the
+    lines name 1, 2 and 1 events, and each of the four events is still announced exactly once.
+    """
     sink, worker, err, _ = _case_a(capsys)
     sink.fail = True
     _release(sink, worker)
     later = capsys.readouterr().err
 
-    assert [(n, what) for n, what, _ in _lost_lines(later)] == [(1, "event"), (3, "event")], later
+    assert [(n, what) for n, what, _ in _lost_lines(later)] == [
+        (1, "event"),
+        (2, "event"),
+        (1, "event"),
+    ], later
+    assert "1 exit batch(es) declined unattempted" in later, later
     assert sum(n for n, _, _ in _lost_lines(err + later)) == 4, err + later
     assert "item(s)" not in err + later
 

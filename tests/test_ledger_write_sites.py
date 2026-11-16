@@ -50,8 +50,13 @@ QUEUE_COUNTERS = frozenset({"entered"})
 GLOBAL_COUNTERS = frozenset({"_orphan_lost", "_in_span_lost"})
 DRAIN_ONLY = frozenset(
     {"_run", "_drain", "_final_drain", "_emit_pending", "_emit", "_terminal_failure", "_hold",
-     "_settle"}
+     "_settle", "_take", "_complete", "_size_target", "_set_target", "_answer_marker",
+     "_decline_exit_batch", "_tally_exit_abandon"}
 )
+"""SPEC-090 added ``_take``, ``_complete``, ``_size_target``, ``_set_target``, ``_answer_marker``,
+``_decline_exit_batch`` and ``_tally_exit_abandon``: the batching rule and the exit budget run on
+the drain thread only, and the leak check below then proves it statically. ``_write_exit_tallies``
+is not here, because ``stop()`` calls it when its join expires."""
 LOCKS = frozenset({"_lock", "_loss_lock", "lock", "mutex"})
 CONSTRUCTION = frozenset({"__init__", "_reinit_after_fork"})
 
@@ -64,8 +69,7 @@ ledger's."""
 
 NOT_LEDGER = {
     ("worker.py", "_FlushMarker.__init__", "self.delivered"): "a flush marker's verdict",
-    ("worker.py", "Worker._drain", "item.delivered"): "a flush marker's verdict",
-    ("worker.py", "Worker._final_drain", "marker.delivered"): "a flush marker's verdict",
+    ("worker.py", "Worker._answer_marker", "marker.delivered"): "a flush marker's verdict",
     ("_lifecycle.py", "_CloseRegistry.__init__", "self._in_flight"): "the closes in flight",
 }
 
@@ -531,3 +535,86 @@ def test_each_order_refuses_its_reversal_and_passes_its_order(case: str) -> None
 def test_a_function_that_is_gone_is_reported_missing() -> None:
     """A renamed or deleted function cannot leave its order checked against nothing."""
     assert [f.reason for f in check_orders({"api.py": "def _emit():\n    pass\n"})] == [MISSING]
+
+
+# ── a take is counted before anything is decided about it (SPEC-090 FR-001) ──────────────
+#
+# `Worker._take` holds the submission it was handed before it decides to join or carry it and
+# before any emit, so a carried submission is in `in_flight` from its take. A `_hold` moved
+# below the carry's emit would leave the window from take to count open across a sink call,
+# which no run reliably reaches, so the order is held statically.
+
+HOLD_LATE = "Worker._take decides or emits before it holds the submission"
+HOLD_MISSING = "Worker._take does not hold the submission"
+
+
+def take_holds_first(source: str) -> list[str]:
+    """The reasons ``Worker._take`` in ``source`` does not hold its submission first."""
+    tree = ast.parse(source)
+    cls = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Worker"), None)
+    take = next(
+        (
+            n
+            for n in (cls.body if cls else [])
+            if isinstance(n, ast.FunctionDef) and n.name == "_take"
+        ),
+        None,
+    )
+    if take is None:
+        return [HOLD_MISSING]
+    body = take.body
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    holds = [
+        node
+        for node in ast.walk(take)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_hold"
+        and ast.unparse(node.func.value) == "self"
+    ]
+    if not holds:
+        return [HOLD_MISSING]
+    first = body[0] if body else None
+    if not (isinstance(first, ast.Expr) and first.value in holds):
+        return [HOLD_LATE]
+    return []
+
+
+def test_take_holds_before_it_decides() -> None:
+    """FR-001's last paragraph, in the tree as it is: ``_take``'s first statement is the hold."""
+    assert take_holds_first((_SRC / "worker.py").read_text(encoding="utf-8")) == []
+
+
+_TAKE = '''
+class Worker:
+    def _take(self, pending, item):
+        """Takes one."""
+        {body}
+'''
+
+TAKE_CORPUS = {
+    "hold after the carry": (
+        (
+            "if len(pending) >= 10:\n            self._emit_pending(pending)\n"
+            "        self._hold(item)\n        pending.append(item)"
+        ),
+        [HOLD_LATE],
+    ),
+    "hold after the append": ("pending.append(item)\n        self._hold(item)", [HOLD_LATE]),
+    "no hold": ("pending.append(item)", [HOLD_MISSING]),
+    "hold first": (
+        (
+            "self._hold(item)\n        if len(pending) >= 10:\n"
+            "            self._emit_pending(pending)\n        pending.append(item)"
+        ),
+        [],
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(TAKE_CORPUS))
+def test_the_hold_first_check_refuses_a_late_hold(case: str) -> None:
+    """A late or missing hold is refused for its reason; a hold first is silent."""
+    body, expected = TAKE_CORPUS[case]
+    assert take_holds_first(_TAKE.format(body=body)) == expected, case
