@@ -62,13 +62,13 @@ itself changed no file under `src/` or `.github/`. Its tests changed in four pla
 
 `git diff --stat origin/main -- .github/ src/` is empty for the rebased branch (FR-003).
 
-**FR-001, the owed CI margin.** This is owed to the pull request's green run of the `CI` workflow.
-Each leg must be at most 0.5 s.
+**FR-001, the CI margin.** Settled on the pull request's green run of the `CI` workflow: each leg
+must be at most 0.5 s, and both are. Both legs printed 11357 passed, 38 skipped and 21 xfailed.
 
 | Leg | Run | Commit | Worst margin and test id |
 |---|---|---|---|
-| Python 3.12 | **OWED: fill in after CI** | **OWED** | **OWED** |
-| Python 3.13 | **OWED: fill in after CI** | **OWED** | **OWED** |
+| Python 3.12 | `CI` run 43780951657, job `test (py3.12)` | `26f47e3b` | **0.016 s** at `[http-seed7]` |
+| Python 3.13 | `CI` run 43780951657, job `test (py3.13)` | `26f47e3b` | **0.014 s** at `[deliver-seed0]` |
 
 These are the local readings. The whole suite at `9af4dd60` gave **11356 passed, 39 skipped and 21
 xfailed**, exit 0. Its gate line read 0.022 s at `[deliver-seed10]`, at a load near 150 from
