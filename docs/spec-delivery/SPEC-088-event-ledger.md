@@ -106,9 +106,11 @@ the first diff review at a load average near 2; re-measured on `14bf6588` at a l
 - **The fixture lets a live drain settle before it judges a worker** (a fix after the merge):
   `main`'s Release run at `97a03f45` went red once at teardown of
   `test_the_snapshot_returns_while_each_lock_is_held[queue]`, read between the drain's `queue.get`
-  and `Worker._hold`, so a live drain whose reading fails is now read again until it passes or
-  `ledger_check.SETTLE` (2 s) elapses, while an ended drain and a first reading that passes are
-  read once, which keeps FR-006 AC-7's no-wait criterion.
+  and `Worker._hold`, so a live drain that is not parked in `queue.get` and whose reading fails is
+  now read again until it passes or `ledger_check.SETTLE` (2 s) elapses, while an ended drain, a
+  parked one (at rest, so a defect that leaves it mis-termed fails at once even if it would
+  correct itself later) and a first reading that passes are read once, which keeps FR-006 AC-7's
+  no-wait criterion.
 - **The fixture cannot see a negative meeting residual**, hand-overs below what the queue took
   in and what overflowed, such as `overflow_lost` counted twice. Every test that hands a worker
   events directly reads that way, because no hand-over credits them, and flagging it errored 334

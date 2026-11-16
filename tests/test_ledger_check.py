@@ -13,6 +13,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+import time
 
 import pytest
 
@@ -208,7 +209,7 @@ def _counting_readings(monkeypatch) -> tuple[list[list[str]], threading.Event]:
 
     def read(worker):  # type: ignore[no-untyped-def]
         got = real_read(worker)
-        readings.append(got[1])
+        readings.append(got[-1])
         first.set()
         return got
 
@@ -258,6 +259,86 @@ def test_a_drain_paused_past_the_bound_is_reported_with_its_reason(monkeypatch, 
     finally:
         release.set()
         worker.stop(5)
+
+
+def _parked_worker() -> worker_mod.Worker:
+    """An idle live worker whose drain has been seen waiting in ``queue.get``."""
+    worker = worker_mod.Worker(GatedSink(), batch_size=1, flush_interval=60.0)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with worker._queue.mutex:
+            if worker._queue.not_empty._waiters:
+                return worker
+        time.sleep(0.001)
+    raise AssertionError("the drain never parked in get")
+
+
+def test_a_parked_drain_is_read_once_though_it_would_correct_itself(monkeypatch) -> None:
+    """A drain at rest in ``get`` is judged on one reading: the lazy-hold class stays caught.
+
+    The diff review's mutant moved `_hold` from the take to the top of `_emit_pending`, so events
+    sat in the drain's ``pending`` counted ``queued`` while it waited in ``get``, and the drain
+    corrected the count itself when its flush interval emitted them. A settle that re-read a
+    parked drain hid it. Here the count is planted on a parked drain and corrected after the first
+    reading, as that drain would; a check that read it again would report it balanced.
+    """
+    worker = _parked_worker()
+    readings, _ = _counting_readings(monkeypatch)
+    real_read = ledger_check._read_worker
+    planted = [True]
+
+    def read_then_correct(w):  # type: ignore[no-untyped-def]
+        got = real_read(w)
+        if planted[0]:
+            w._queue.entered -= 2
+            planted[0] = False
+        return got
+
+    monkeypatch.setattr(ledger_check, "_read_worker", read_then_correct)
+    worker._queue.entered += 2
+    try:
+        found = ledger_check.worker_problems(worker)
+    finally:
+        if planted[0]:
+            worker._queue.entered -= 2
+        worker.stop(5)
+    assert found == ["a worker's queued+stranded reads 2 with 0 events in its queue"], found
+    assert len(readings) == 1, readings
+
+
+def test_one_settle_bound_is_shared_by_every_worker_a_teardown_reads(monkeypatch) -> None:
+    """Three drains held out of ``get`` and out of balance spend one bound between them, not three.
+
+    The bound is driven by a fake clock that only the settle's pause advances, so what is asserted
+    is the time the settle asked for, with no wall clock in it.
+    """
+    now = [0.0]
+    monkeypatch.setattr(ledger_check, "_clock", lambda: now[0])
+    monkeypatch.setattr(ledger_check, "_sleep", lambda s: now.__setitem__(0, now[0] + s))
+    lock, entered, all_paused, release = threading.Lock(), [0], threading.Event(), threading.Event()
+    real_hold = worker_mod.Worker._hold
+
+    def hold(self, events) -> None:  # type: ignore[no-untyped-def]
+        with lock:
+            entered[0] += 1
+            if entered[0] == 3:
+                all_paused.set()
+        release.wait(10)
+        real_hold(self, events)
+
+    monkeypatch.setattr(worker_mod.Worker, "_hold", hold)
+    workers = [worker_mod.Worker(GatedSink(), batch_size=1, flush_interval=60.0) for _ in range(3)]
+    for worker in workers:
+        worker.submit([{"message": "one"}, {"message": "two"}])
+    try:
+        assert all_paused.wait(5)
+        found = ledger_check.problems()
+    finally:
+        release.set()
+        for worker in workers:
+            worker.stop(5)
+    assert found == [_PAUSES["between get and _hold"]] * 3, found
+    assert now[0] == pytest.approx(ledger_check.SETTLE, abs=2 * ledger_check._PAUSE), now[0]
 
 
 def test_a_dead_drain_and_a_first_passing_reading_are_read_once(monkeypatch) -> None:

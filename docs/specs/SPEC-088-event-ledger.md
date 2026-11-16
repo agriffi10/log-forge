@@ -694,7 +694,8 @@ forking thread's open spans is a second acceptance of the same events, which is 
 
 The fixture is what turns the next accounting defect into a failed test. It runs after each
 test's body and before the suite's own reset, and it stops nothing ~~and waits for nothing~~ —
-superseded after the merge: it waits only on a live drain whose reading fails, for up to 2 s,
+superseded after the merge: it waits only on a live drain out of `queue.get` whose reading
+fails, for up to 2 s,
 as the delivery doc's FR-006 section says. It fails the test when any of these holds:
 
 - `unaccounted` is not zero.
