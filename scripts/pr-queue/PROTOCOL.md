@@ -94,7 +94,9 @@ never looks like a bug in the queue.
 The **whole** PR lifecycle, not just the push: `git fetch origin` and rebase onto the ref you just
 fetched — `main` moves under you while you wait for the lock and while you hold it, and an
 unfetched `origin/main` cannot show you that — re-run your gates, push, open the PR, watch it to green
-**keyed on the head sha**, merge, then confirm `main` itself went green. Then release.
+**keyed on the head sha**, merge, then confirm `main` itself went green. Then release. The watch is
+your own wait, never a notifier that reports only failures: one that stays silent on green leaves
+your PR open and green, holding the lock, after your turn has ended.
 
 If your spec needs more than one PR, take a ticket per PR and release between them, so the others
 interleave rather than waiting out your whole spec.

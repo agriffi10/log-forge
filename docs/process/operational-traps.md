@@ -63,5 +63,15 @@ list project-specific; seed it the first time a trap bites and never again.
   sets `required_review_thread_resolution` and `require_extra_approval_for_unattributed_changes`, so
   treat the approval requirement as the reason rather than any one parameter. The bypass replaces
   the branch protection, never the review gate (`session-rhythm.md` → *Landing the spec*).
+- **The desktop app's "Auto-fix pull requests" never reports a green PR.** Switched on, it wakes
+  the session with a `<ci-monitor-event>` for a CI failure, a merge conflict or a review comment, and
+  sends nothing when the checks pass. A session that ends its turn after opening its PR, expecting to
+  be woken, leaves a green PR open and holding the PR-queue lock, with every waiter behind it. It bit
+  twice around SPEC-088: #381 sat green for 63 minutes, and #383 for hours with SPEC-093 blocked
+  behind it, and each merged only when a peer session asked for the merge. The watch is the
+  session's own, and no failure-only notifier replaces it: after the push, start one background wait
+  keyed on the head sha, bounded by a timeout, that exits once every check against that sha has
+  completed, and merge when it reports green (`session-rhythm.md` → *Landing the spec*). Bit in
+  SPEC-088.
 - _(add your own as they bite — one line each, with the fix.)_
 

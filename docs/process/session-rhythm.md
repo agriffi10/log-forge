@@ -110,7 +110,10 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   after a push anyway — a late finding, a rotated frame, a reviewer that ran long — its fixes are
   committed and reviewed locally before the next push, rather than each one going up as it lands.
 - **Every PR is watched to completion and merged as soon as CI is green** — never open a PR and walk
-  away. A spec's PR merges only on green.
+  away. A spec's PR merges only on green. **The watch is the session's own:** after the push, start
+  one bounded background wait keyed on the head sha that exits once every check against it has
+  completed, and merge when it reports green. Never end the turn on a notifier that reports only
+  failures, such as the desktop app's Auto-fix (`operational-traps.md`).
 - **The merge takes the owner bypass, and that is the normal path here, not an escape hatch:**
   `gh pr merge <n> --squash --admin --delete-branch`. A plain `--squash` refuses with "the base
   branch policy prohibits the merge", because the `main` ruleset asks for an approval that the

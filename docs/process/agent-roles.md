@@ -32,7 +32,7 @@ another by its brief, its tools and its isolation, never by its model.
 The `implementer` and `reviewer` roles run in a worktree of their own, and that worktree is cut from
 the shared checkout's HEAD (observed: `main`), not from the caller's branch. Git also refuses to
 check out a branch another worktree holds. So the delegated implementer owns the branch the spec
-is pushed from:
+is pushed from while it builds, and hands it back for everything else:
 
 - The orchestrator cuts the implementer's branch, under a name for the implementer and never its own
   session branch, from a freshly fetched `origin/main` in its own worktree
@@ -46,21 +46,33 @@ is pushed from:
 - The orchestrator briefs the implementer with the branch name and that commit's SHA. The
   implementer runs `git switch <name>` in its own worktree, confirms `git log --oneline -1` shows
   that SHA, builds there, and names the SHA in its report.
-- A later implementer round on the same branch (fixes for a review finding, or a later PR's phases)
-  cannot switch to it, because the first implementer's worktree still holds it. Resume the same
-  implementer with `SendMessage`, or brief a new one with the first worktree's absolute path, where
-  it works by `cd <path> && …` in every call instead of switching.
-- The completion ritual (`completion-ritual.md`) is committed on the implementer's branch, in the
-  implementer's worktree, before the diff reviews, because that is the branch that is pushed. The
-  `spec-author` has no worktree of its own, so the orchestrator briefs it with that worktree's
-  absolute path and the branch name, and the `spec-author` commits the ritual there. The reviewers
-  then review the head that includes the ritual.
+- **One worktree holds the branch at a time, and whoever writes on it switches to it in its own
+  worktree.** A PreToolUse hook refuses every Write and Edit by a session, or by its non-isolated
+  subagents, on a file outside that session's worktree ("Do not write to other worktrees' files from
+  this session"), so the branch moves to the writer rather than the writer to the branch. Freeing it
+  is `git switch --detach` in the holder's worktree — a git operation, not a file write, so the
+  orchestrator may run it there with `cd <path> && …`.
+- The completion ritual (`completion-ritual.md`) is committed on the implementer's branch before the
+  diff reviews, because that is the branch that is pushed. The `spec-author` is a non-isolated
+  subagent and writes only in the orchestrator's worktree, so the orchestrator detaches the
+  implementer's worktree, runs `git switch <name>` in its own, and briefs the `spec-author` with its
+  own worktree's path and the branch name; the `spec-author` runs the ritual and commits there. Never
+  route around the hook through Bash. The reviewers then review the head that includes the ritual.
+- A later code round on the same branch (a fix for a diff-review finding, or a later PR's phases)
+  reverses that hand-off: the orchestrator detaches its own worktree, and the implementer — resumed
+  with `SendMessage`, or a new one — runs `git switch <name>` in its own worktree again and confirms
+  `git log --oneline -1` shows the SHA the brief gives.
 - The orchestrator runs both diff reviews against that branch's head SHA. Each reviewer is briefed
   with the exact SHA, checks it out detached in its own worktree and confirms its tree with
   `git log --oneline -1` before reviewing.
-- The orchestrator runs `acquire`, the push (`git push -u origin <name>`) and the PR from the
-  implementer's worktree path, because the queue lock records the branch it was acquired on
-  (`scripts/pr-queue/PROTOCOL.md`).
+- **The landing runs from the orchestrator's own worktree.** It takes the branch back there
+  (detaching the implementer's worktree first, if a code round left the branch with it), and runs the
+  fetch and any rebase onto a moved `main`, `acquire`, the push (`git push -u origin <name>`) and the
+  PR from that path: a rebase can stop on a conflict that only an Edit resolves, and `acquire`
+  records the branch checked out where it runs (`scripts/pr-queue/PROTOCOL.md`), so it must run in
+  the worktree that holds it. After the merge it runs `git switch --detach origin/main` there,
+  freshly fetched, and deletes the local branch, so that worktree holds no commit `done_check.py`
+  reads as unmerged.
 
 ## Fences
 
