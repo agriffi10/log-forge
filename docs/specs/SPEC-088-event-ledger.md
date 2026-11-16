@@ -648,6 +648,13 @@ prototype's.
 (`p15_fork_child_counters.py`: the child reads `orphan_lost=1` for a loss the parent took). The
 child's ledger starts as what it holds: `accepted` and `open_spans` both equal the parent's
 `open_spans` at the fork, and every other term is zero, the two existing loss counters included.
+~~every other term is zero~~ — revised after the second diff review: the forking thread can be
+inside an orphan call when it forks (a sink's `emit` that forks, or a stop-signal setter on the
+orphan path), and the child's copy of that call goes on to write its one exit. So the child also
+keeps the forking thread's cell, reset to its orphan calls in progress, each credited to
+`accepted` and in `in_flight` until its exit; restarted without it, a child whose copy of the call
+raised debited `orphan_lost` with no credit and read an orphan residual of -1. A span call in
+progress at the fork needs nothing: its credit is already among the parent's `open_spans`.
 The parent's ledger is untouched. Events buffered on spans that were open on other threads of
 the parent are in the child's memory and nothing in the child will close them, so they stay in
 its `open_spans`; that over-read is recorded in `architecture.md` §13. The child's copy of the
@@ -1040,6 +1047,11 @@ end-to-end figure says nothing about a change of this size.
 ---
 
 ## Revision history
+
+- **2026-11-15, revised in place after the second diff review**: FR-005's forked-child paragraph,
+  since a child now keeps the forking thread's cell seeded with its orphan calls in progress, after
+  a fork inside an orphan call left the child's copy of that call debiting `orphan_lost` with no
+  credit.
 
 - **2026-11-15, revised in place after the first diff review**, each change struck in its section:
   FR-002's second criterion, `p03`'s `submitted_after_shutdown` below `queued` plus `dropped`,

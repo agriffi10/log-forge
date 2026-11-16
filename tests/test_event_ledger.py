@@ -807,3 +807,98 @@ def test_two_checks_racing_write_one_line_for_one_imbalance(monkeypatch, capsys)
     lines = _lines(capsys.readouterr().err)
     assert len(lines) == 1 and "lost 7 event(s)" in lines[0], lines
     ledger_check.begin()
+
+
+_FORK_INSIDE_AN_ORPHAN_CALL = '''
+import os
+import log_foundry as lf
+from log_foundry import _lifecycle
+
+
+class ForkingSink:
+    forked = False
+    child = False
+
+    def emit(self, batch):
+        if not self.forked:
+            self.forked = True
+            self.pid = os.fork()
+            if self.pid == 0:
+                self.child = True
+                raise RuntimeError("the child's copy of the emit fails")
+
+    def close(self):
+        pass
+
+
+sink = ForkingSink()
+lf.configure(sink=sink)
+lf.info("orphan")
+who = "child" if sink.child else "parent"
+if who == "parent":
+    os.waitpid(sink.pid, 0)
+seen = _lifecycle._ledger_reading()
+e = seen.ledger
+print(who, e.accepted, e.pending + e.delivered + e.skipped + e.lost, e.orphan_lost,
+      e.delivered, e.unaccounted, seen.orphan_residual, flush=True)
+if who == "child":
+    os._exit(0)
+'''
+
+
+def test_a_child_forked_inside_an_orphan_call_balances_that_call() -> None:
+    """Diff review frame 2: the forking thread's cell goes on into the child with its call.
+
+    A sink's ``emit`` forks, as a stop-signal setter on the orphan path can, and the child's copy of
+    the call raises, so the child debits ``orphan_lost``. With the child's ledger restarted from
+    its open spans alone, that debit had no credit and the child read ``orphan_residual -1``. Run in
+    a fresh interpreter, so the fork is not the suite's (``pyproject.toml``'s fork hazard).
+    """
+    import os
+    import pathlib
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    done = subprocess.run(  # noqa: S603
+        [sys.executable, "-B", "-c", _FORK_INSIDE_AN_ORPHAN_CALL],
+        capture_output=True, text=True, timeout=60, check=False,
+        env={**os.environ, "PYTHONPATH": str(root / "src")},
+    )
+    rows = {line.split()[0]: line.split()[1:] for line in done.stdout.splitlines()}
+    assert done.returncode == 0 and set(rows) == {"child", "parent"}, done.stdout + done.stderr
+    accepted, placed, orphan_lost, delivered, unaccounted, residual = map(int, rows["child"])
+    assert (accepted, placed, orphan_lost, delivered) == (1, 1, 1, 0), rows["child"]
+    assert (unaccounted, residual) == (0, 0), rows["child"]
+    assert list(map(int, rows["parent"])) == [1, 1, 0, 1, 0, 0], rows["parent"]
+
+
+def test_a_worker_builds_while_another_thread_holds_the_registration_lock() -> None:
+    """Diff review frame 2: a worker's build takes no registration lock under ``Runtime._lock``.
+
+    It reads the hand-over count from the published pair instead (``_ledger.handed_unlocked``), so
+    the two locks are never nested; through ``_ledger.handed()`` this build waited.
+    """
+    from log_foundry import _ledger
+
+    lf.configure(sink=GatedSink())
+    lf.info("registers this thread's cell")
+    assert _lifecycle._state.worker_exists() is None
+    taken, release = threading.Event(), threading.Event()
+
+    def holder() -> None:
+        with _ledger._registry.lock:
+            taken.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=holder)
+    thread.start()
+    assert taken.wait(5)
+    built = threading.Event()
+    builder = threading.Thread(target=lambda: (_lifecycle._get_worker(), built.set()))
+    builder.start()
+    returned = built.wait(5)
+    release.set()
+    thread.join(5)
+    builder.join(5)
+    assert returned, "the worker's build waited on the registration lock"

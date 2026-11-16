@@ -19,7 +19,10 @@
 - **The surface** (FR-004):
   - `Health.events` and `EventLedger`, which is exported.
   - The private `_lifecycle._ledger_snapshot()`, for SPEC-089.
-  - A forked child's ledger restarts in `_restart_ledger_after_fork` (FR-005).
+  - A forked child's ledger restarts in `_restart_ledger_after_fork` (FR-005), keeping the
+    forking thread's cell seeded with its orphan calls in progress (`_ledger.restart_in_child`),
+    so a call the thread forked inside balances whichever exit the child's copy takes (the
+    second diff review: without it, a child whose copy raised read an orphan residual of -1).
 - **The fixture** (FR-006):
   - The autouse `_ledger_balance` fixture in `tests/conftest.py` calls `tests/ledger_check.py`.
     The `ledger_exempt` marker is strict.
@@ -96,6 +99,15 @@ the first diff review at a load average near 2; re-measured on `14bf6588` at a l
   `emit`-path cases, which balance. So the weak tracking stays. Either of two changes would close
   the gap: strong tracking with a marker per case, or a harness that sends its batch through the
   queue.
+- **The fixture checks the drain residual with either sign** (the second diff review). With only
+  the positive side checked, `_settle` doubling `delivered` passed `test_worker.py`,
+  `test_shutdown_lifecycle.py` and `test_api.py` with the fixture silent; with both, that mutant
+  errors tests at teardown and the unmutated suite is green.
+- **The fixture cannot see a negative meeting residual**, hand-overs below what the queue took
+  in and what overflowed, such as `overflow_lost` counted twice. Every test that hands a worker
+  events directly reads that way, because no hand-over credits them, and flagging it errored 334
+  tests. The positive side is in `unaccounted`, which the fixture and the shutdown check both
+  read.
 
 ## Rosters
 
@@ -129,6 +141,11 @@ the first diff review at a load average near 2; re-measured on `14bf6588` at a l
     losses.
   - A plain `Lock` as the registration lock makes a log inside it wait on its own thread.
   - With no restart in a forked child, the three fork tests fail.
+  - With the child's restart dropping the forking thread's cell, the child of a fork inside an
+    orphan call reads `orphan_residual -1`; with a worker's build reading the hand-over count
+    through the lock, the build waits while another thread holds it; and with `_settle` doubling
+    `delivered`, the fixture's either-sign drain residual errors 41 tests at teardown in
+    `test_worker.py`, `test_shutdown_lifecycle.py` and `test_api.py` (the second diff review).
   - Breaking any one of the write-site gate's eleven checks fails at least one case.
   - Breaking any one of the fixture's twelve checks fails at least one case.
 - **FR-006's third criterion**, each mutant run against the whole suite:

@@ -8,7 +8,9 @@ the next counter added to a shared path has to take a lock or a cell, or argue i
 **The admitted shapes.**
 
 - *owner cell*: a write through ``_ledger.cell()``, or through a local bound from it in the same
-  function, which only the calling thread's cell can be.
+  function, which only the calling thread's cell can be; and, in ``_ledger.py``, through a local
+  bound from ``_here.cell``, the same cell read where ``cell()`` itself reads it, which a forked
+  child's restart writes on the forking thread (diff review frame 2).
 - *drain only*: a write on ``self`` inside one of :data:`DRAIN_ONLY`, ``Worker`` methods that run
   only on the drain thread; the gate also proves every call of one of them in ``src/`` comes from
   another of them, so a public method cannot reach one.
@@ -90,6 +92,16 @@ def _is_cell_call(node: ast.AST) -> bool:
     return isinstance(func, ast.Name) and func.id == "cell"
 
 
+def _is_own_cell(node: ast.AST) -> bool:
+    """Whether ``node`` is ``_here.cell``, the calling thread's own cell, read in ``_ledger``."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "cell"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "_here"
+    )
+
+
 def _is_fresh_cell(node: ast.AST) -> bool:
     """Whether ``node`` is ``_Cell()``, a cell nothing has published yet."""
     return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_Cell"
@@ -145,7 +157,7 @@ class _Walker(ast.NodeVisitor):
 
     def _bind(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
-            if _is_cell_call(value):
+            if _is_cell_call(value) or (_is_own_cell(value) and self.file == "_ledger.py"):
                 self.bound[-1][target.id] = "cell"
             elif _is_fresh_cell(value):
                 self.bound[-1][target.id] = "fresh"
@@ -339,6 +351,10 @@ REFUSED = {
         {"worker.py": "class _CountingQueue:\n    def get(self):\n        self.entered -= 1\n"},
         UNADMITTED,
     ),
+    "the thread-local's cell written outside _ledger": (
+        {"api.py": "def log():\n    own = _here.cell\n    own.orphan = 0\n"},
+        UNADMITTED,
+    ),
     "a setattr on a published cell": (
         {"_ledger.py": "def fold(cells):\n    for one in cells:\n        setattr(one, 'span', 0)\n"},
         UNADMITTED,
@@ -359,6 +375,9 @@ SILENT = {
     },
     "a queue count in _put": {
         "worker.py": "class _CountingQueue:\n    def _put(self, item):\n        self.entered += 1\n"
+    },
+    "the thread's own cell read in _ledger": {
+        "_ledger.py": "def restart_in_child():\n    own = _here.cell\n    own.orphan = 0\n"
     },
     "a fresh cell built in _ledger": {
         "_ledger.py": "def fold():\n    merged = _Cell()\n    setattr(merged, 'span', 1)\n    merged.handed = 2\n"

@@ -5790,7 +5790,7 @@ def _restart_ledger_after_fork() -> None:
     from log_foundry import _ledger, decorator
 
     held = _ledger.open_spans_unlocked() - decorator._in_span_lost
-    _ledger.restart(max(0, held))
+    _ledger.restart_in_child(max(0, held))
     with decorator._loss_lock:
         decorator._orphan_lost = 0
         decorator._in_span_lost = 0

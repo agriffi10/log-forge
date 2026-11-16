@@ -128,6 +128,16 @@ def test_events_held_by_an_ended_drain_fire() -> None:
         worker._in_flight = 0
 
 
+def test_a_negative_drain_residual_fires() -> None:
+    """An exit counted twice at rest reads the drain residual below zero (diff review frame 2)."""
+    worker = _ended_worker()
+    worker._delivered += 1
+    try:
+        assert ledger_check.worker_problems(worker) == ["a worker's drain residual is -1"]
+    finally:
+        worker._delivered -= 1
+
+
 def test_a_positive_drain_residual_fires() -> None:
     worker = _ended_worker()
     worker._taken += 1

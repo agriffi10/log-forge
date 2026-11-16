@@ -1523,7 +1523,11 @@ an item leaves this list when a spec closes it, not because the arc names it.
   SPEC-088's diff review), so the two are never nested in either order. It is an `RLock`,
   so a handler or a `__del__` that logs or reads on the thread already inside it re-enters rather
   than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`). A
-  handler on a thread inside any of the other locks still waits. **The documents promise this caller, and the code breaks the
+  handler on a thread inside any of the other locks still waits. One nesting remains, and it is
+  the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
+  `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
+  `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
+  while the registration lock is held (SPEC-088's second diff review). **The documents promise this caller, and the code breaks the
   promise.** `docs/invariants.md`, in invariant 5's recorded exceptions, describes what a re-entrant
   `shutdown()` made from "a signal handler" leaves behind, and
   `docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md`

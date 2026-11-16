@@ -393,6 +393,60 @@ def open_spans_unlocked() -> int:
     return sum(one.span - one.handed for one in (base, *cells))
 
 
+def restart_in_child(span_base: int) -> None:
+    """Restarts a forked child's registry, keeping the forking thread's own cell (diff review 2).
+
+    A child runs its fork handlers on the thread that forked, and that thread can be inside an
+    orphan call when it does: a sink's ``emit`` that forks, or a stop-signal setter on the orphan
+    path. The call goes on in the child with its local reference to this cell, and writes its one
+    exit and lowers its gauge there. Dropped with the rest of the parent's cells, that cell took
+    the exit with it, and an exit to the global ``orphan_lost`` landed with no credit: measured,
+    a child whose copy of the forking ``emit`` raised read ``orphan_residual -1``. So the cell is
+    kept, as the child's first cell, and reset to what the child holds of it: its orphan calls in
+    progress, each credited and in the gauge, so whichever exit each takes balances it. Its other
+    counts are zeroed; the span credits it held are in ``span_base`` already, as
+    :func:`open_spans_unlocked` read them before this. The thread-local is kept too, so the cell
+    stays this thread's. The writes are the owner's, since this runs on that thread.
+
+    A span call in progress at the fork needs nothing here: its credit was written before the
+    fork, so it is in ``span_base`` as an open-span event, and whether the child's copy of the call
+    then appends it or debits it to ``in_span_lost``, the remainder moves with it.
+
+    The one order this does not balance is a fork between an orphan call's gauge and its credit,
+    which only a signal handler that forks could make; the child's copy then credits once more.
+
+    Args:
+      span_base: The span credits the registry starts holding: the open-span events the child
+        inherited.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    base = _Cell()
+    base.span = span_base
+    try:
+        own: _Cell | None = _here.cell
+    except AttributeError:
+        own = None
+    cells: tuple[_Cell, ...] = ()
+    if own is not None:
+        in_progress = own.orphan_open
+        own.span = 0
+        own.handed = 0
+        own.delivered = 0
+        own.skipped = 0
+        own.sink_lost = 0
+        own.orphan = in_progress
+        own.orphan_open = in_progress
+        cells = (own,)
+    registry = _registry
+    with registry.lock:
+        registry.pair = (base, cells)
+
+
 def restart(span_base: int = 0) -> None:
     """Empties the registry and rebinds the thread-local, so every thread re-registers.
 

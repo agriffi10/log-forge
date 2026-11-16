@@ -16,7 +16,15 @@ thin caller.
   is zero for a test that closed what it opened.
 - For any `Worker` the test built, ``queued + stranded`` differs from the events in its queue,
   counted under its mutex, or its own terms place events the ledger cannot: events in flight on an
-  ended drain, a positive drain residual, or a gauge below zero.
+  ended drain, a drain residual of either sign, or a gauge below zero. ~~a positive drain
+  residual~~ — widened by diff review frame 2: at rest a negative one is an exit counted twice,
+  the orphan residual's reason, and with only the positive side checked a `_settle` that doubled
+  `delivered` passed `test_worker.py`, `test_shutdown_lifecycle.py` and `test_api.py` silent.
+
+**What it cannot see.** A negative meeting residual is not flagged: hand-overs below what the
+queue took in and what overflowed. `overflow_lost` counted twice reads that way, and so does
+every test that hands a worker events directly, which no hand-over credits; flagging it errored
+334 tests (diff review frame 2). The positive side is in ``unaccounted`` and is checked.
 
 A test using the `lf` fixture emits each span directly from `decorator._flush`; that fixture
 credits the hand-over as `_flush` does and records the events here, which no queue takes in, so
@@ -105,7 +113,7 @@ def worker_problems(worker) -> list[str]:  # type: ignore[no-untyped-def]
     if not alive and held > 0:
         found.append(f"a worker's ended drain holds {held} events in flight")
     residual = taken - held - sum(exits)
-    if residual > 0:
+    if residual != 0:
         found.append(f"a worker's drain residual is {residual}")
     if held < 0:
         found.append(f"a worker's in_flight reads {held}")
