@@ -325,6 +325,7 @@ def test_an_orphan_log_survives_a_broken_sink(level, capsys) -> None:
     assert "sink is down" not in err, "the message is never written (arch §6)"
 
 
+@pytest.mark.ledger_exempt("logs into a hand-built span pushed in a context it discards")
 def test_an_in_span_log_is_unaffected_by_a_broken_sink() -> None:
     """FR-003 requires no behaviour change in-span: it buffers and never touches the sink."""
     import log_foundry as lf

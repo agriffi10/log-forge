@@ -463,6 +463,7 @@ def test_a_sink_that_fails_to_construct_does_not_fail_the_caller(monkeypatch, ca
     assert "absorbed a failure while closing a span (RuntimeError)" in capsys.readouterr().err
 
 
+@pytest.mark.ledger_exempt("replaces decorator._flush with a no-op")
 def test_a_raising_traced_call_leaves_no_reference_cycle(monkeypatch) -> None:
     """The outcome is held in a local past the `except`, which `except ... as` would have freed.
 

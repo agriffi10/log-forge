@@ -18,6 +18,8 @@ import contextvars
 import sys
 import threading
 
+import pytest
+
 import log_foundry
 from conftest import run_concurrently
 from log_foundry import _lifecycle, context, decorator
@@ -224,6 +226,7 @@ def test_a_sweep_that_finds_events_creates_the_worker() -> None:
     assert "cold start" in seen["delivered"]  # type: ignore[operator]
 
 
+@pytest.mark.ledger_exempt("sweeps a hand-built span's events, which nothing credited")
 def test_two_threads_sweeping_one_shared_span_deliver_each_event_once() -> None:
     """AC-10. Forced, not raced.
 

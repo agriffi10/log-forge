@@ -355,6 +355,7 @@ class _AlwaysFails:
         pass
 
 
+@pytest.mark.ledger_exempt("calls Worker._emit with a batch no queue took in")
 def test_the_workers_emit_loop_survives_a_huge_max_retries(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

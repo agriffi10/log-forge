@@ -13,13 +13,6 @@ from log_foundry import worker as worker_mod
 from log_foundry.sinks.multi import MultiSink
 
 
-@pytest.fixture(autouse=True)
-def _fresh_ledger(_reset_config):
-    """Starts each test on an empty ledger, after the suite's reset has run."""
-    ledger_check.begin()
-    yield
-
-
 def _balanced(asked: int) -> None:
     """Asserts the ledger at rest: everything placed, nothing pending, ``asked`` accepted."""
     seen = reading()
@@ -443,6 +436,7 @@ def test_a_submission_lost_inside_submit_is_unaccounted(monkeypatch, capsys) -> 
     lf.shutdown(1)
     lines = _lines(capsys.readouterr().err)
     assert len(lines) == 1 and "lost 7 event(s)" in lines[0], lines
+    ledger_check.begin()
 
 
 def test_the_shutdown_line_is_written_once_per_distinct_imbalance(monkeypatch, capsys) -> None:
@@ -457,6 +451,7 @@ def test_the_shutdown_line_is_written_once_per_distinct_imbalance(monkeypatch, c
     lf.shutdown(1)
     lines = _lines(capsys.readouterr().err)
     assert len(lines) == 1 and "lost 9 event(s)" in lines[0], lines
+    ledger_check.begin()
 
 
 def test_a_negative_remainder_is_published_as_zero_and_counted() -> None:

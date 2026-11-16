@@ -7,7 +7,6 @@ import time
 
 import pytest
 
-import ledger_check
 import log_foundry as lf
 from conftest import install_worker, run_concurrently
 from ledger_sinks import GatedSink, PlanSink, every, ledger, reading
@@ -16,9 +15,8 @@ from log_foundry import worker as worker_mod
 
 
 @pytest.fixture(autouse=True)
-def _fresh_ledger(_reset_config):
-    """Starts each test on an empty ledger, after the suite's reset has run."""
-    ledger_check.begin()
+def _no_seam_left_set():
+    """Clears the ledger's test seam after each test, so a failed test cannot leave it set."""
     yield
     _ledger._between = None
 

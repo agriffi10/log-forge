@@ -682,6 +682,17 @@ fails the test when any of these holds:
   test's body, so a negative one there is a debit made twice.
 - `open_spans` differs from the events buffered on the spans still open in the fixture's own
   context, which is zero for a test that closed what it opened.
+- The test left a span open on its own context (added during the build, adjudicated below).
+
+**Two readings, adjudicated during the build.** The bullet above and this FR's fourth criterion,
+"a test that leaves a traced call's span open on its own context fails in the fixture", cannot
+both hold: under pytest a sync test's body and its fixtures' teardown share one context, so the
+events on a span the test left open are exactly the events the comparison expects, and the test
+passes. Both were run against the whole suite with the seven tests below marked. Comparison
+only: the suite green and the fourth criterion unmet. Comparison plus the bullet above: the suite
+green with no further failure, and the fourth criterion met. Built: the second. A span left open
+stays current for every later test in the same context, which is a leak worth failing on in its
+own right.
 - For any `Worker` the test built, `queued + stranded` differs from the events in its queue, or
   its own terms place events the ledger cannot: events in flight on an ended drain, or a gauge
   below zero.
@@ -692,7 +703,10 @@ ended. Those are states the identity admits, so such tests need nothing. The `lf
 fixture replaces `decorator._flush` with a direct `emit`. It credits the hand-over as `_flush`
 does and keeps its own count of the events it emitted directly, which no queue takes in, and the
 fixture expects the meeting residual to be at most that count. Both are a few lines in
-`tests/conftest.py`.
+`tests/conftest.py`, and the checks live in `tests/ledger_check.py`, which the fixture calls. The
+fixture requests the suite's `_reset_config` by name, because same-scope autouse fixtures run in
+name order and not definition order (pytest 9.1.1), so it reads after the body and before the
+reset (added during the build).
 
 **Measured against the suite** at `ae0b7674`, over 9,896 test teardowns, with this fixture as
 written (Evidence). With every fix of FR-002 and FR-005 and the `lf` hand-over, 7 tests fail the
@@ -1022,7 +1036,7 @@ end-to-end figure says nothing about a change of this size.
   deadlocked a plain one; FR-002 item 6's open-guard sentence is corrected and covers a built span
   whose push is interrupted; the expiry clause is shortened to fit `_diag`'s detail bound; the
   `NATSSink` §12 item is named in FR-004; the `drain_lost` debit and the child's restart move to
-  earlier phases.
+  earlier phases; and FR-006's two readings of an open span are adjudicated by running both.
 
 - **2026-11-15, revised after the second review**, which built the first revision and found three
   blocking defects, all fixed here. ~~"This sum holds by construction"~~: it held only where the

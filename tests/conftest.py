@@ -458,16 +458,20 @@ def _reset_config():
 
 
 @pytest.fixture(autouse=True)
-def _ledger_balance(_reset_config):
-    """Starts each test on an empty event ledger (SPEC-088 FR-006); the helper is `ledger_check`.
+def _ledger_balance(request, _reset_config):
+    """Fails the test whose process does not balance (SPEC-088 FR-006); the logic is `ledger_check`.
 
     It requests `_reset_config` by name because same-scope autouse fixtures run in name order,
-    not definition order: requested, the reset runs first at setup and last at teardown.
+    not definition order: requested, the reset runs first at setup and last at teardown, so this
+    reads after the test's body and before the suite's own reset.
     """
     import ledger_check
 
     ledger_check.begin()
     yield
+    message = ledger_check.verdict(request.node)
+    if message is not None:
+        pytest.fail(message, pytrace=False)
 
 
 def _reset_worker() -> None:
@@ -634,17 +638,22 @@ def lf(fake_sink: FakeSink, monkeypatch):
     These tests care about span/event/context semantics, not delivery timing, so we keep
     flushing inline here (the synchronous-flush test mode this fixture always anticipated);
     the worker's own batching/retry/backpressure/shutdown behavior is covered directly in
-    `test_worker.py`.
+    `test_worker.py`. The inline flush credits the event ledger's hand-over as `_flush` does and
+    records the events it emitted directly, which no queue takes in (SPEC-088 FR-006).
     """
     import log_foundry
 
     log_foundry.configure(service="test", version="0.0.0", env="test", sink=fake_sink)
 
-    from log_foundry import decorator
+    import ledger_check
+    from log_foundry import _ledger, decorator
     from log_foundry.config import _ensure_sink
 
     def _sync_flush(span) -> None:
+        count = len(span.events)
         _ensure_sink().emit(span.events)
+        _ledger.cell().handed += count
+        ledger_check.emitted_directly(count)
 
     monkeypatch.setattr(decorator, "_flush", _sync_flush)
     return log_foundry
