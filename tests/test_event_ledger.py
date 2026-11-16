@@ -106,8 +106,18 @@ def test_the_overflow_scenario_balances_in_events() -> None:
     _balanced(36_000)
 
 
-def test_abandoned_batches_and_a_failed_orphan_land_in_their_terms(capsys) -> None:
-    """FR-001 AC-3: ``p05_raise_nth.py``'s two scenarios."""
+def test_abandoned_batches_and_a_failed_orphan_land_in_their_terms(capsys, monkeypatch) -> None:
+    """FR-001 AC-3: ``p05_raise_nth.py``'s two scenarios.
+
+    ~~Every batch is ten spans, so every third of the thirty batches fails and 300 events are
+    lost~~ — under SPEC-090 FR-001 a batch grows past ten spans while a backlog waits, so with a
+    60 s interval the batches merged and the failed thirds held other counts (612 delivered and
+    288 lost in one run). The cap is patched to 30 events, ten of these three-event spans, which
+    makes every batch exactly ten spans again whatever the measured target, so p05's numbers
+    stand and the claim the test exists for, that abandoned batches land in ``batch_lost``, is
+    asserted unchanged.
+    """
+    monkeypatch.setattr(worker_mod, "_BACKLOG_BATCH_CAP", 30)
     sink = GatedSink()
     seen: dict[str, object] = {"batch": None, "number": 0}
 

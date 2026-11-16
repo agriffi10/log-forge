@@ -4,6 +4,9 @@ queued, and shutdown(timeout=1.2) runs through the public API, so close() is cou
 "batched" replaces Worker._final_drain with a per-batch exit drain that makes every batch's first attempt, the shape SPEC-090
 first specified: the join expires and close() does not run. SPEC-062's case is today's 2 attempts and one close.
 Usage: python spec090_exit_budget.py tree|batched
+2026-11-16, SPEC-090's build: "batched" now counts each take through Worker._hold, as the tree's own drains do since SPEC-088,
+so its stderr no longer reads a negative in-flight figure or an "unaccounted" line; the attempts, the join and close() it
+measures are unchanged.
 """
 
 import queue, sys, threading, time
@@ -41,6 +44,7 @@ def batched_final_drain(self, pending):
             break
         if isinstance(item, _FlushMarker) or item is None or item is _SHUTDOWN:
             continue
+        self._hold(cast("list[dict[str, object]]", item))
         pending.append(cast("list[dict[str, object]]", item))
         if len(pending) >= self.batch_size:
             self._emit_pending(pending)

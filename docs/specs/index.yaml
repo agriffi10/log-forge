@@ -599,7 +599,7 @@ specs:
   - id: "SPEC-090"
     title: "Under a Backlog the Worker Sends Larger Batches, and the Exit Drain Sends Its Backlog in Batches"
     description: "Lets the worker drain a backlog in batches sized to what its sink delivers in half a flush interval, capped at 1,000 events and with no new setting, and has the exit drain send its backlog by the same rule and stop starting batches it cannot finish, so a burst loses fewer events and an exit counts what it could not send."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-004", "SPEC-021", "SPEC-039", "SPEC-054", "SPEC-062", "SPEC-068", "SPEC-072", "SPEC-088"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-090-backlog-batching.md"

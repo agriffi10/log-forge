@@ -58,6 +58,14 @@ line, which still announces a loss the final drain can deliver (§12).
 
 ## History
 
+### 2026-11-16
+
+- **Pointer updated**: the exit-drain decision this one refines was retitled in place by SPEC-090,
+  to *The exit drain declines a retry, or a later batch, predicted to end past the shutdown
+  deadline* (`docs/decisions/sink-lifecycle/`), since the exit drain now sends several batches and
+  declines a later one predicted to overrun. The handover and the deadline it records are
+  unchanged; the entry below keeps the title it was settled against.
+
 ### 2026-11-04
 
 - **Settled** by SPEC-068. Refines *The exit drain declines only a retry predicted to end past the

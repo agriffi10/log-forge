@@ -199,7 +199,17 @@ def test_a_dying_drain_debits_what_it_held(capsys) -> None:
 
 
 def test_an_expired_shutdown_leaves_the_batch_in_flight(capsys) -> None:
-    """FR-002 AC-7 and AC-8: ``p02_shutdown_stalled.py``'s numbers, and the line that names them."""
+    """FR-002 AC-7 and AC-8: ``p02_shutdown_stalled.py``'s numbers, and the line that names them.
+
+    ~~Once the gate opens, the drain thread delivers all 1,000 events late~~ — SPEC-090 FR-003,
+    its intended change: once the wedged batch returns, the exit drain makes the first exit
+    batch's first attempt, ten spans since the wedged batch's measurement keeps the target at or
+    below 20 events, and declines every later batch unattempted because the deadline has passed.
+    That first exit batch is delivered at once, so its measurement sets the target to the cap and
+    the rest goes as one declined batch of 960. So 40 events are delivered, the other 960 are
+    counted in ``batch_lost`` and named in one declined line, and nothing is left queued or in
+    flight.
+    """
     sink = GatedSink()
     lf.configure(sink=sink)
     sink.gate.clear()
@@ -216,7 +226,10 @@ def test_an_expired_shutdown_leaves_the_batch_in_flight(capsys) -> None:
     assert at_expiry.unaccounted == 0, at_expiry
     assert "20 event(s) in flight (health().events.in_flight)" in err, err
     assert "counted when the emit returns" not in err
-    assert after.delivered == 1000 and after.queued == 0 and after.in_flight == 0, after
+    assert after.delivered == 40 and after.batch_lost == 960, after
+    assert after.queued == 0 and after.in_flight == 0, after
+    late = capsys.readouterr().err
+    assert "lost 960 event(s); 1 exit batch(es) declined unattempted" in late, late
     _placed(1000)
 
 

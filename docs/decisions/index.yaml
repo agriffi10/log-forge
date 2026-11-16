@@ -71,6 +71,10 @@ areas:
     path: "docs/decisions/pipeline/pipeline.md"
     governs: ["src/log_foundry/worker.py", "src/log_foundry/_lifecycle.py", "src/log_foundry/_fork.py"]
     decisions:
+      - title: "A backlog drains in larger batches, and capacity is not a setting"
+        fence: "with an item waiting when the count trigger fires, a batch grows by whole submissions up to half a flush interval of the sink's measured rate, never past 1,000 events unless it holds at most `batch_size` submissions; with nothing waiting it is the count trigger's batch, and no argument, setting or environment variable sizes the batch, the cap, the queue or the interval. (SPEC-090)"
+        status: "stable"
+        path: "docs/decisions/pipeline/a-backlog-drains-in-larger-batches-and-capacity-is-not-a-setting.md"
       - title: "A shutdown waits for a swap in flight to decide, and a swap releases only what the record owes"
         fence: "a `shutdown()` or the exit drain waits on each swap in flight's `_Operation.decided`, snapshotted in its entry section, within its one closer grace and never on its own thread or a `log-foundry-` thread, before it drains; and a swap's fenced branch releases the displaced sink only while `_CloseRegistry.owes` it, and cedes it instead, closing nothing, when the graph the swap installs still holds it. Never hold or wait on `config._sink_lock` for this. (fix after SPEC-079; SPEC-087)"
         status: "stable"
@@ -415,8 +419,8 @@ areas:
         fence: "rotation deadlines are `time.monotonic()`, since a wall-clock deadline is defeated by any step larger than the interval. The *label* stays wall-clock wherever one exists. (SPEC-031)"
         status: "stable"
         path: "docs/decisions/sink-lifecycle/a-value-on-the-wire-is-measured-on-the-clock-that-cannot-move.md"
-      - title: "The exit drain declines only a retry predicted to end past the shutdown deadline"
-        fence: "the exit drain makes every batch's first attempt and declines a retry only when the batch's longest attempt plus a 0.1 s join margin is predicted to end past the `shutdown()` deadline; the budget is the caller's `timeout`, so there is no knob. (SPEC-062)"
+      - title: "The exit drain declines a retry, or a later batch, predicted to end past the shutdown deadline"
+        fence: "the first attempt of the exit drain's first batch is always made; a retry is declined when the batch's longest attempt plus a 0.1 s join margin is predicted to end past the `shutdown()` deadline, and a later exit batch is declined unattempted once an exit batch has declined a retry or the longest attempt any exit batch has made predicts it would overrun; each declined batch is counted, and the budget is the caller's `timeout`, so there is no knob. (SPEC-062, SPEC-090)"
         status: "stable"
         path: "docs/decisions/sink-lifecycle/the-exit-drain-declines-only-a-retry-predicted-to-end-past-the-shutdown-deadline.md"
   - name: "Trace model and context"

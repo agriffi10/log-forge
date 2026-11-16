@@ -450,9 +450,12 @@ def test_max_batch_count_is_floored_so_a_zero_cannot_discard_the_batch() -> None
 def test_six_thousand_events_in_one_emit_become_many_bounded_real_requests() -> None:
     """AC-2, the reproduction, against a real `http.server` rather than an injected opener.
 
-    This is the measured defect: `Worker._final_drain` hands the sink its whole exit backlog --
-    5,980 events in one `emit` when the queue has backed up -- and before FR-001 that went out as
-    a single request the destination rejected whole, taking the backlog with it. Nothing here is
+    This is the measured defect: `Worker._final_drain` handed the sink its whole exit backlog --
+    5,980 events in one `emit` when the queue had backed up -- and before FR-001 that went out as
+    a single request the destination rejected whole, taking the backlog with it. Since SPEC-090
+    FR-002 the exit drain sends its backlog in batches of at most 1,000 events unless a batch
+    holds at most `batch_size` submissions, and one `emit` of thousands is still what a sink can
+    be handed directly, which is what this test hands it. Nothing here is
     faked: real sockets, real `urllib`, real request framing, so the chunking is exercised
     end to end rather than against a double that could agree with the code.
     """

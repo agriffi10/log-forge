@@ -222,9 +222,15 @@ The worker is one background thread with a bounded queue in front of it. `submit
 finished span's events into the queue and returns; the worker drains the queue into a small
 pending pile and flushes that pile to the sink on whichever of two triggers fires first:
 
-- **By count** — once ~10 span bundles have accumulated (note: that's 10 *spans*, and each span
-  carries at least its start/end pair, so a flush is usually well over 10 records). All pending
-  bundles are flattened into a single `sink.emit` call.
+- **By count** — once ~10 span bundles have accumulated and nothing more is waiting in the queue
+  (note: that's 10 *spans*, and each span carries at least its start/end pair, so a flush is
+  usually well over 10 records). All pending bundles are flattened into a single `sink.emit` call.
+  **When a backlog is waiting**, the batch keeps growing by whole spans, up to what the sink
+  delivered in half a flush interval on its last batch and never past 1,000 events, so a burst
+  drains in a few large calls instead of hundreds of small ones. A span's events are never split
+  across batches, so a batch of ten spans can still be larger than 1,000 events, as it always
+  could. After a batch fails, after a sink change, and in a forked child, the next batch is ten
+  spans again until the sink has been measured. None of these sizes is a setting.
 - **By time** — once ~1 second has passed since the last flush, so an idle app never holds logs
   indefinitely. (The loop advances its flush timestamp even when idle, so an empty queue sleeps
   quietly instead of busy-spinning.)
@@ -233,7 +239,12 @@ A failing `sink.emit` is retried a few times with growing backoff; past that the
 abandoned with a counted warning and draining continues — a broken sink degrades logging but
 never crashes the worker or the app. If the bounded queue fills completely, new submissions are
 dropped (newest-first) and counted rather than blocking your code. On `shutdown()` the worker
-stops, sweeps anything still queued into one final batch, emits it, and closes the sink.
+stops, sends whatever was queued at that moment in batches by the same rule, answering any
+`flush()` marker it meets in queue order, and closes the sink. If a batch is predicted to end
+after the `shutdown()` deadline — judged from the longest call the exit has made so far — that
+batch and every later one are not attempted: they are counted in `failed_batches` and in
+`health().events.batch_lost`, and one stderr line names them, so the exit still finishes inside
+its budget and the sink is still closed. The first batch of the exit is always attempted.
 
 Both triggers can be pre-empted: `flush()` puts a marker in the queue and the worker emits the
 pending pile the moment it reaches it, ignoring the count and time triggers. Because the queue
@@ -744,8 +755,8 @@ chunk of a round, and the batch keeps `max_retries + 1` attempts per worker atte
 to `HTTPSink` (`headers=`, `auth=`, `gzip=`, `timeout=`, `max_retries=`, `max_retry_after=`,
 `max_batch_count=`, `max_batch_bytes=`, `opener=`).
 
-Each sink **re-chunks** a batch to its destination's limits, so one large `emit` — the whole
-pending backlog at process exit, for instance — becomes several requests the destination will
+Each sink **re-chunks** a batch to its destination's limits, so one large `emit` — a backlog
+batch of up to 1,000 events, for instance — becomes several requests the destination will
 accept rather than one it rejects whole. Every subclass sets its own defaults from its vendor's
 documentation where there is one; override with `max_batch_count=` / `max_batch_bytes=`. An event
 too large to be sent on its own is dropped and counted in `health().sink.dropped`.
@@ -969,6 +980,9 @@ minutes by default (measured: the delivery callback fires at 300.18 s), reachabl
 > were sequential and nothing bounded how many there were, so a stalled server cost `n × 5 s` on
 > the single drain thread (measured: 25.01 s for five events), and `_final_drain` hands the exit
 > backlog over as one batch.
+>
+> The exit drain no longer hands its backlog over as one batch: it sends it in batches of at most
+> 1,000 events (see *When the worker flushes*), each still bounded by one `publish_timeout`.
 
 `NATSSink` now bounds a whole `emit` with one `publish_timeout` (10 s by default), giving each
 JetStream publish the lesser of the driver's ack timeout and the budget remaining; ~~a core publish
@@ -1298,7 +1312,7 @@ They tell you different things, and they want different responses:
 | Field | Means | What to do |
 |---|---|---|
 | `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per open span a `flush()` sweeps — so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
-| `failed_batches` | A sink stayed broken through the whole retry budget, or the exit drain declined its retry because the retry was predicted to end after `shutdown()`'s deadline. Delivery continues while the process runs; after a decline on the exit drain the process is shutting down and nothing follows. | Fix the destination. |
+| `failed_batches` | A sink stayed broken through the whole retry budget, or the exit drain declined a batch's retry, or a whole later batch unattempted, because it was predicted to end after `shutdown()`'s deadline. Delivery continues while the process runs; after a decline on the exit drain the process is shutting down and nothing follows. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused while the rest of its batch was handed off. A batch the client refused **whole** is not counted here: the sink raises, and it is counted where the raise is caught — in `failed_batches` by the worker once its retries are spent, in `orphan_lost` outside a span, or in the fan-out's `sink.failed` when a `MultiSink` sibling delivered. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
 | `sink.failed` | The sink attempted delivery and could not confirm it — abandoned requests, partially-failed batches, responses it could not adjudicate. | Fix the destination. |
@@ -1324,7 +1338,7 @@ counted once when it is asked for, in `accepted`, and is then in exactly one oth
 | `skipped` | `deliver` answered `SKIPPED` |
 | `in_span_lost`, `orphan_lost` | the two fields above, the same values |
 | `overflow_lost` | its submission met a full queue (the events of what `dropped` counts) |
-| `batch_lost` | its batch was abandoned after its retries, or its retry was declined |
+| `batch_lost` | its batch was abandoned after its retries, or its retry was declined, or the exit drain declined the batch unattempted |
 | `sink_lost` | a `deliver` run settled and it ended neither `ACCEPTED` nor `SKIPPED` |
 | `drain_lost` | the worker's thread died holding it |
 | `stranded` | it is in the queue of a worker whose thread has ended |

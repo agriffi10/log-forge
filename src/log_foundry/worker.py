@@ -77,12 +77,28 @@ _JOIN_MARGIN: float = 0.1
 After ``sink.emit`` returns from the last attempt the drain thread still counts the batch,
 writes the ``_diag`` line, answers the flush markers and leaves :meth:`Worker._run`, and
 ``Thread.join`` must observe that end inside the caller's timeout. :meth:`Worker._emit` adds
-this to its prediction of when a retry would end, so a retry permitted by the rule leaves the
-join time to return. It is that window and nothing more: it reserves no time for ``close()``,
+this to its prediction of when a retry would end, and :meth:`Worker._emit_pending` to its
+prediction of when a later exit batch's first attempt would end (SPEC-090 FR-003), both through
+:meth:`Worker._retry_declined`, so an attempt permitted by the rule leaves the join time to
+return. It is that window and nothing more: it reserves no time for ``close()``,
 which the lifecycle owner runs inline after the join whatever the budget, and it is a module
 constant rather than a parameter because a knob would let a caller recreate the overrun the
-budget exists to remove. ``_emit`` reads it at each decision rather than binding it at
-definition, so a test can patch it to prove it is added.
+budget exists to remove. ``_retry_declined`` reads it at each decision rather than binding it
+at definition, so a test can patch it to prove it is added.
+"""
+
+_BACKLOG_BATCH_CAP: int = 1_000
+"""The most events a batch grows to while a backlog is waiting (SPEC-090 FR-001).
+
+In events, not submissions. A batch holds more than ``batch_size`` submissions only while its
+events stay within the size target, and the target never exceeds this, so no batch exceeds it
+unless it holds at most ``batch_size`` submissions, which is a batch the count trigger alone
+would also send. 1,000 is the largest default per-request count of any shipped sink: the HTTP
+family's ``DEFAULT_MAX_BATCH_COUNT`` and the ``chunk_size`` of ``ClickHouseSink`` and
+``PostgresSink``. Past it a chunking sink makes more requests per call and saves no call, and a
+sink that fails after running fast abandons its batch whole, so the cap bounds that loss. It is
+a module constant, not a ``Worker`` argument, because capacity is not a setting (Andrew,
+2026-11-15), and it is read at each use, as ``_JOIN_MARGIN`` is, so a test can patch it.
 """
 
 
@@ -143,7 +159,9 @@ class EventLedger:
         value as ``Health.orphan_lost``.
       overflow_lost: Events whose submission met a full queue. ``Health.dropped`` counts the
         same submissions.
-      batch_lost: Events of a batch abandoned after its retries, or whose retry was declined.
+      batch_lost: Events of a batch abandoned after its retries, or whose retry was declined,
+        or an exit batch declined unattempted because it was predicted to end after the
+        ``shutdown()`` deadline (SPEC-090 FR-003).
       sink_lost: Events of a settled run that ended neither ``ACCEPTED`` nor ``SKIPPED``.
       drain_lost: Events the drain thread held when it died.
       stranded: Events in the queue of a worker whose drain thread has ended.
@@ -236,8 +254,9 @@ class _CountingQueue(queue.Queue[object]):
         **A submission is classified as the drain classifies it**: anything that is neither the
         shutdown sentinel, by identity, nor a flush marker, by its exact type, which
         :meth:`Worker._final_drain` and :meth:`Worker._drain` then take and count through
-        :meth:`Worker._hold`. So the taken-in count and the taking count agree by construction,
-        and the test reads the item's real type, never a class hook the item could answer with.
+        :meth:`Worker._take`, whose first call is :meth:`Worker._hold`. So the taken-in count and
+        the taking count agree by construction, and the test reads the item's real type, never a
+        class hook the item could answer with.
         ~~``isinstance(item, list)``~~ — replaced after the rebase onto ``bb6656ff``, whose
         ``tests/test_class_check_roster.py`` refuses an ``isinstance`` that runs a value's class
         hook; it also asked a different question from the drain's. ``_FlushMarker`` has no
@@ -282,12 +301,13 @@ class Health:
         submissions — normally only in passing, but a ``flush()`` marker stranded by racing
         ``shutdown()`` is answered and then counted for the life of the process, since
         ``Queue`` offers no way to remove one specific item. A ``_SHUTDOWN`` sentinel put after
-        the final drain's last read is counted the same way, a recorded exception
-        (``architecture.md`` §12).
+        the final drain fixed the bound on what it takes, when it began (SPEC-090 FR-002), is
+        counted the same way, a recorded exception (``architecture.md`` §12).
       dropped: Submissions discarded because the queue was full (backpressure).
       failed_batches: Batches abandoned after the retry budget was spent, or whose retry the
         exit drain declined because it was predicted to end after the ``shutdown()``
-        deadline (SPEC-062).
+        deadline (SPEC-062), or that the exit drain declined unattempted for the same
+        prediction once an earlier exit batch had made its first attempt (SPEC-090 FR-003).
       stopped_reason: The exception type name that terminated the drain thread, or ``None`` if
         it never died — which is also what a live worker and a process that never logged
         report. Non-``None`` is categorically worse than the two counters above: they measure
@@ -717,6 +737,21 @@ class Worker:
         this worker was built, so the meeting of the caller's hand-overs with this queue counts
         only the hand-overs it could have received.
 
+        **The backlog batching state** (SPEC-090 FR-001). ``_pending_events`` is the events in
+        the batch being built, ``_target`` the size target in events that the last emitted batch
+        set (``0`` means the count trigger's batch), and ``_target_generation`` the sink
+        generation that target was measured under; all three are written by the drain thread
+        only. ``_sink_generation`` counts the sink swaps :meth:`retarget` made, under ``_lock``,
+        so a measurement that straddled a swap is discarded without holding a reference to the
+        sink it replaced, which keeps ``_FORK_SKIP`` unchanged. **The exit budget's state**
+        (FR-003): ``_exit_batches`` counts the exit batches whose first attempt was made,
+        ``_exit_longest`` is the longest attempt any of them made, ``_exit_declining`` records
+        that an exit batch declined a retry or that one was declined, and
+        ``_exit_abandoned_seen`` that the first abandoned exit batch has written its own line,
+        all drain thread only; ``_abandoned_tally`` and ``_declined_tally`` are the
+        ``(events, batches)`` not yet announced, written under ``_lock`` because :meth:`stop`
+        takes them too.
+
         ``sink_released=`` used to sit here and is retired (SPEC-054 FR-002). It made a worker
         built during a ``shutdown()`` inherit a discharged close for a sink that shutdown's orphan
         branch had just closed. Under one owed-close record the flag has no work to do: this
@@ -730,7 +765,10 @@ class Worker:
 
         Args:
           sink: The destination every batch is emitted to.
-          batch_size: How many submissions accumulate before an emit is triggered.
+          batch_size: How many submissions accumulate before an emit is triggered while
+            nothing more is waiting, and the fewest a batch holds under a backlog, where it
+            grows by whole submissions toward the size target, up to ``_BACKLOG_BATCH_CAP``
+            events (SPEC-090 FR-001).
           flush_interval: Seconds before a partial batch is emitted anyway.
           max_queue: Ceiling on buffered submissions, past which the newest is dropped.
           max_retries: Retries after a failing emit, an ``int`` floored at zero here (SPEC-066
@@ -738,7 +776,10 @@ class Worker:
             subclass is stored as the exact ``int`` it holds. On the exit drain a retry is
             declined when it is predicted to end after the ``shutdown()`` deadline (SPEC-062),
             so the retries a failing batch sees there are bounded by the
-            caller's budget as well as by this count; the first attempt is always made.
+            caller's budget as well as by this count. ~~the first attempt is always made~~ —
+            refined by SPEC-090 FR-003: the first attempt of the first exit batch is always
+            made, and a later exit batch is declined unattempted once one is predicted to end
+            after the deadline.
           offer_signal: ``False`` when the owner hands the sink this worker's ``_stop`` itself,
             after releasing its lock. The library's own build does: the offer runs the sink's
             setter, and a setter that logs or calls ``configure()`` waited on the lock the build
@@ -782,6 +823,16 @@ class Worker:
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
         self._lock = threading.Lock()
+        self._pending_events = 0
+        self._target = 0.0
+        self._target_generation = 0
+        self._sink_generation = 0
+        self._exit_batches = 0
+        self._exit_longest = 0.0
+        self._exit_declining = False
+        self._exit_abandoned_seen = False
+        self._abandoned_tally = (0, 0)
+        self._declined_tally = (0, 0)
         if offer_signal:
             _lifecycle.offer_stop_signal(sink, self._stop)
         self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
@@ -823,6 +874,19 @@ class Worker:
         resumes it, and without the reset every retry in that child would be declined against
         a deadline the parent's caller set, forever. A retired parent forks a retired child, and
         that child's record is left as it stands.
+
+        **The backlog batching and exit budget fields are reset on both branches** (SPEC-090
+        FR-001 rule 6), beside ``_in_flight`` and for its reason: they describe a drain thread
+        that does not exist in the child. ``_pending_events`` goes to zero because the child's
+        drain thread starts with an empty batch, and ``_target`` to zero so the child's first
+        batch under a backlog is the count trigger's, measured afresh against the child's sink.
+        The exit fields and both tallies go to their unstarted values, so a child neither
+        declines against nor announces an exit the parent was making. ``_sink_generation`` is
+        **not** reset: the child inherits it harmlessly, as it inherits ``sink``, and
+        ``_target_generation`` is set to it, so the zeroed target is the current one.
+        ``_lifecycle._adopt_factory_after_fork`` then reassigns ``sink`` without a bump, which
+        is harmless for the same reason: the target is already zero, and the child's drain
+        cannot emit before the fork handlers return.
 
         **The resume branch also resets the stop gate and replaces a set stop event**
         (SPEC-068 FR-005). Such a worker's child inherits ``_stopped`` true, which would make its
@@ -934,6 +998,15 @@ class Worker:
         self._handed_at_build = 0
         self._taken_markers = []
         self._held = [self.sink]
+        self._pending_events = 0
+        self._target = 0.0
+        self._target_generation = self._sink_generation
+        self._exit_batches = 0
+        self._exit_longest = 0.0
+        self._exit_declining = False
+        self._exit_abandoned_seen = False
+        self._abandoned_tally = (0, 0)
+        self._declined_tally = (0, 0)
         if not resume:
             self._drain_finished.set()
             self._drain_settled.set()
@@ -1450,6 +1523,14 @@ class Worker:
         ``configure()`` re-entered from a sink's own code does. ``config._change_sink`` writes a
         line of its own when it gave up waiting for that lock and when it is re-entered.
 
+        **The reassign bumps** ``_sink_generation`` **in the same locked section** (SPEC-090
+        FR-001 rule 5). :meth:`_emit` reads ``self.sink`` for the engine and again on every 1.x
+        attempt, so a batch can straddle the swap; :meth:`_emit_pending` reads the generation
+        before and after its emit and discards a measurement taken across a bump, and
+        :meth:`_size_target` reads a target measured under an older generation as zero, so the
+        first batch a new sink is handed under a backlog is the count trigger's. An ``int``
+        rather than the sink, so nothing pins a sink this swap replaced.
+
         Args:
           new_sink: The sink to deliver to from now on.
           deadline: The ``time.monotonic()`` instant the caller's budget expires, or ``None``.
@@ -1477,6 +1558,7 @@ class Worker:
             if old is new_sink:
                 return SwapOutcome(verdict="fenced", previous=new_sink)
             self.sink = new_sink
+            self._sink_generation += 1
             self._held = [held for held in self._held if held is not new_sink] + [new_sink]
         _lifecycle._hand_retargeted(new_sink, self._stop)
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -1633,10 +1715,11 @@ class Worker:
         the takeover sets ``_join_taken_over`` in the same critical section, and :meth:`stop`
         reads it to skip the sentinel, which the drain-thread winner already queued. A second one
         is not harmless. Taken over while :meth:`_final_drain`'s emit is running, it lands after
-        that drain's last read, is never consumed, and ``health().queued`` reads 1 for the life
-        of the process with ``submitted_after_shutdown`` at 0 — measured in 33 of 300 unforced
-        runs. The drain needs no wake-up from it either: the drain-thread winner has set the stop
-        event, and the drain loop tests that as soon as the emit it is inside returns.
+        the bound that drain fixed when it began (SPEC-090 FR-002), is never consumed, and
+        ``health().queued`` reads 1 for the life of the process with ``submitted_after_shutdown``
+        at 0 — measured in 33 of 300 unforced runs. The drain needs no wake-up from it either:
+        the drain-thread winner has set the stop event, and the drain loop tests that as soon as
+        the emit it is inside returns.
 
         Whether this caller is the drain thread is read **before** the lock, so the lock is still
         held across no call. In a forked child, ``self._thread`` names the inherited dead thread
@@ -1753,10 +1836,23 @@ class Worker:
         which the line names (SPEC-088 FR-002 item 4, where it promised a count "when the emit
         returns" that never comes if the process exits first); the queued submissions are counted by whichever ``_emit`` line
         settles them, one per batch, so each event is announced lost at most once. The queued
-        clause promises no later count on purpose: when the wedged emit is :meth:`_final_drain`'s
-        own, what is queued arrived after that drain's last read and will never be taken. It
-        counts submissions only, never the sentinel just queued or a flush marker
-        (:meth:`_queued_submissions`).
+        clause promises no later count on purpose: ~~when the wedged emit is
+        :meth:`_final_drain`'s own, what is queued arrived after that drain's last read and will
+        never be taken~~ — refined by SPEC-090 FR-002: when the wedged emit is one of
+        :meth:`_final_drain`'s batches, what is queued is either inside the bound that drain
+        fixed when it began, and taken only if the emit returns, or arrived after it and is
+        never taken. It counts submissions only, never the sentinel just queued or a flush
+        marker (:meth:`_queued_submissions`).
+
+        **The in-flight figure is every event the drain thread holds** (SPEC-090 FR-002): the
+        batch inside the emit, the batch being built and at most one carried submission, which
+        is ``health().events.in_flight``, one read of a counter only the drain thread writes.
+        **The exit tallies are written first** (FR-003): :meth:`_write_exit_tallies` takes and
+        zeroes them under the lock, and a batch is added to one only after :meth:`_settle` has
+        debited it from ``_in_flight``, so taking them before reading the figure leaves no batch
+        named both in a tally line and in this line's in-flight figure, and the tally lines
+        precede the expiry line. What the drain thread adds after this take it writes at its
+        own end.
 
         Args:
           timeout: The caller's budget in seconds, or ``None`` to wait indefinitely. It bounds the
@@ -1794,6 +1890,7 @@ class Worker:
             return
         self._thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         if self._thread.is_alive():
+            self._write_exit_tallies()
             queued = self._queued_submissions()
             in_flight = self._in_flight
             with self._lock:
@@ -1874,6 +1971,15 @@ class Worker:
         terminal failure, and a bounded shutdown that expired while this thread was still
         inside an emit.
 
+        **The outer** ``finally`` **also writes the exit tallies** (SPEC-090 FR-003), after the
+        waiters are released. ~~so no ``flush()`` caller waits behind a stderr write~~ That
+        ordering holds only for the path this copy exists for: on every normal exit
+        :meth:`_final_drain`'s own ``finally`` has already written and zeroed the tallies before
+        the waiters here are released, and this call finds nothing (diff review, 2026-11-16). A
+        drain that dies in :meth:`_drain` after its exit batches began never reaches
+        :meth:`_final_drain`'s ``finally``, so this is the drain thread's own end for that
+        path; when nothing is tallied it writes nothing.
+
         Args:
           None.
 
@@ -1894,6 +2000,7 @@ class Worker:
             self._terminal_failure(exc, len(pending))
         finally:
             self._release_waiters()
+            self._write_exit_tallies()
 
     def _take_marker(self, marker: _FlushMarker) -> None:
         """Records a marker the drain thread has taken out of the queue (SPEC-050 FR-001).
@@ -1929,8 +2036,8 @@ class Worker:
         queue nor the record, so an async ``BaseException`` landing there — the one ``_run``
         catches, on this thread — strands a ``flush(timeout=None)`` that ``_run``'s own closing
         sweep can no longer reach. Answering first inverts the failure into a leaked list entry on
-        a worker that is already dead. This is the reasoning :meth:`_final_drain` already applies
-        to its own ``finally``.
+        a worker that is already dead. This is the reasoning :meth:`_answer_marker`, which both
+        drains answer a marker through (SPEC-090 FR-002), applies to its own ``finally``.
 
         Args:
           marker: The marker this thread has finished with.
@@ -2056,21 +2163,37 @@ class Worker:
         )
 
     def _drain(self, pending: list[list[dict[str, object]]]) -> None:
-        """Accumulates event-lists and emits a batch on the count or time trigger.
+        """Accumulates event-lists and emits a batch on the count, size or time trigger.
 
-        A flush marker emits immediately, ignoring both triggers, because a caller who asked
+        A flush marker emits immediately, ignoring every trigger, because a caller who asked
         for a flush is not interested in the batching policy — and that branch returns to the
-        top of the loop, since a marker falling through to the append below would be treated as
-        a list of events and handed to ``sink.emit``, killing this thread. The window is
-        advanced even when idle: otherwise the timeout collapses to zero and ``get`` busy-spins
-        a core.
+        top of the loop, since a marker falling through to the take below would be treated as
+        a list of events and handed to ``sink.emit``, killing this thread. The marker is
+        answered through :meth:`_answer_marker`, the one answerer :meth:`_final_drain` calls
+        too (SPEC-090 FR-002), so a marker's verdict cannot be decided one way on one drain and
+        another way on the other. The window is advanced even when idle: otherwise the timeout
+        collapses to zero and ``get`` busy-spins a core.
+
+        **A submission goes through** :meth:`_take` **and the batch is judged by**
+        :meth:`_complete` (SPEC-090 FR-001), the two methods both drains call. With nothing
+        waiting, a batch of ``batch_size`` submissions is emitted, as before the rule; while an
+        item is waiting at the count trigger it grows toward the size target. ``waiting`` is
+        read only once the batch holds ``batch_size`` submissions, so the queue's mutex is not
+        taken again on every take. The time trigger and ``last_flush`` stay here, local to this
+        loop, the one interval a later sweep of open spans can follow. **A carry emit restarts
+        the interval** (plan review, 2026-11-16): when :meth:`_take` emitted the batch ahead
+        of the submission it took, ``last_flush`` becomes the clock read just before that take,
+        as the count trigger's emit sets it to the clock read before its emit. Without it a
+        carry emit as long as the interval left the time trigger to fire on the very next take,
+        and a per-event sink under a backlog was handed single-span batches.
 
         The shutdown sentinel **breaks** rather than falling through to the loop condition.
         :meth:`shutdown` queues it before setting ``_stop``, so a thread that takes it may find
         ``_stop`` still clear; continuing would re-enter ``get`` and block for another
         ``flush_interval``, which is a slow shutdown rather than a prompt one. Leaving
         immediately is safe because the only thing after the loop is :meth:`_final_drain`, which
-        collects whatever is still queued — the sentinel is a wake-up, never a fence.
+        continues the batch this loop was building and takes what was queued when it began —
+        the sentinel is a wake-up, never a fence.
 
         Args:
           pending: The accumulator owned by :meth:`_run`, which reports its size on a terminal
@@ -2090,31 +2213,61 @@ class Worker:
             except queue.Empty:
                 item = None
             if _diag.is_a(item, _FlushMarker):
-                self._take_marker(item)
                 try:
-                    self._emit_pending(pending)
-                    item.delivered = self._nothing_lost_since(item)
+                    self._answer_marker(pending, item)
                 finally:
                     last_flush = time.monotonic()
-                    item.event.set()
-                    self._release_marker(item)
                 continue
             if item is _SHUTDOWN:
                 break
             if item is not None:
-                events = cast("list[dict[str, object]]", item)
-                self._hold(events)
-                pending.append(events)
+                taken_at = time.monotonic()
+                if self._take(pending, cast("list[dict[str, object]]", item)):
+                    last_flush = taken_at
+            waiting = len(pending) >= self.batch_size and not self._queue.empty()
             now = time.monotonic()
-            if len(pending) >= self.batch_size or now - last_flush >= self.flush_interval:
+            if self._complete(pending, waiting=waiting) or now - last_flush >= self.flush_interval:
                 self._emit_pending(pending)
                 last_flush = now
         self._final_drain(pending)
 
     def _emit_pending(self, pending: list[list[dict[str, object]]]) -> None:
-        """Emits the pending event-lists if there are any, then clears them.
+        """Emits the pending event-lists if there are any, measures the emit, then clears them.
 
-        The two always go together.
+        **The size target is set here, from this batch alone** (SPEC-090 FR-001 rule 4).
+        ``elapsed`` is ``time.monotonic()`` read around :meth:`_emit`, so its retries and the
+        engine's waits lower the measured rate, and :meth:`_set_target` turns the batch's
+        events and that time into the target the next batch reads. The sink generation is read
+        before the emit and compared after it, and ``failed_batches`` likewise, so a batch that
+        straddled a swap, or was abandoned on the steady drain, sets the target to zero. A batch
+        that holds no events is not handed to the sink, as :meth:`_emit` never handed it one,
+        and sets the target to zero, which rule 4 names, before the exit budget below is asked
+        anything: it is no attempt, and declining it would count a failed batch of nothing.
+
+        **An abandoned exit batch leaves the target as it was** (SPEC-090 FR-001 rule 4, diff
+        review, 2026-11-16), as a declined one does. On the steady drain a failure resets the
+        target so a failing sink is retried with small batches while it may recover; at exit
+        nothing waits for it to recover, and resetting there cut the rest of a dead sink's
+        backlog into ``batch_size`` submissions each. Every such batch costs the sink's own
+        calls and lines, which the exit tallies cannot aggregate: the engine's per-run line and
+        a sink's own per-batch line, such as ``HTTPSink``'s. Measured with a refusing
+        ``HTTPSink`` and 10,000 spans at exit: 15,217 opener calls and 953 lines with the
+        reset, 321 calls and 22 lines without it, against 321 and 21 before SPEC-090.
+
+        **An exit batch is declined unattempted when it is predicted to overrun** (FR-003). An
+        exit batch is one whose first attempt begins after :meth:`claim_stop` set ``_stopped``,
+        read without the lock as ``_exit_deadline`` is. The first exit batch's first attempt is
+        always made. A later one is declined, through :meth:`_decline_exit_batch`, when an
+        exit batch has declined a retry or a batch was declined (``_exit_declining``), or when
+        :meth:`_retry_declined` predicts from the longest attempt any exit batch has made that
+        this one would end past the deadline. A deadline of ``None`` declines nothing, latch or
+        not: it is read first, because a caller off the drain thread that takes over an owed
+        join records its own deadline (:meth:`claim_stop`), which can be ``None`` after a batch
+        was declined, and the decline line would then claim a deadline there is not (diff
+        review, 2026-11-16). A declined batch was not emitted and leaves the target as it was,
+        so the batches the rest of the backlog is cut into are the rule's. The size is summed
+        from the list rather than read from ``_pending_events``, so the measurement holds on any
+        path that appends without :meth:`_take`.
 
         Args:
           pending: The accumulated event-lists, cleared in place.
@@ -2125,9 +2278,248 @@ class Worker:
         Raises:
           Exception: Whatever :meth:`_emit` does not absorb.
         """
-        if pending:
-            self._emit(pending)
+        if not pending:
+            return
+        size = sum(len(events) for events in pending)
+        if size == 0:
             pending.clear()
+            self._pending_events = 0
+            self._set_target(0, 0.0, failed=False, generation=self._sink_generation)
+            return
+        exit_batch = self._stopped
+        if (
+            exit_batch
+            and self._exit_batches
+            and self._exit_deadline is not None
+            and (self._exit_declining or self._retry_declined(self._exit_longest))
+        ):
+            self._decline_exit_batch(size)
+            pending.clear()
+            self._pending_events = 0
+            return
+        if exit_batch:
+            self._exit_batches += 1
+        generation = self._sink_generation
+        before = self.failed_batches
+        started = time.monotonic()
+        self._emit(pending, exit_batch=exit_batch)
+        elapsed = time.monotonic() - started
+        pending.clear()
+        self._pending_events = 0
+        failed = self.failed_batches != before
+        if exit_batch and failed:
+            return
+        self._set_target(size, elapsed, failed=failed, generation=generation)
+
+    def _size_target(self) -> float:
+        """The size target a batch reads now, in events (SPEC-090 FR-001 rule 4).
+
+        A target measured under an older sink generation reads as zero, so after a swap the
+        first batch under a backlog is the count trigger's until the new sink is measured.
+
+        Args:
+          None.
+
+        Returns:
+          ``_target`` when it was measured under the current sink generation, otherwise zero.
+
+        Raises:
+          None.
+        """
+        return self._target if self._target_generation == self._sink_generation else 0.0
+
+    def _take(self, pending: list[list[dict[str, object]]], item: list[dict[str, object]]) -> bool:
+        """Takes one submission into the batch, emitting the batch first when it would overshoot.
+
+        **The take is counted first** (SPEC-090 FR-001, added 2026-11-16): :meth:`_hold` is the
+        first call, before the join-or-carry decision and before any emit, so a carried
+        submission is in ``in_flight`` from its take. One counted only after the previous batch
+        emitted would leave the window from take to :meth:`_hold` open across a sink call, and
+        ``health().events.queued`` would over-read for that long.
+
+        **The carry** (FR-001 rule 2): when the batch already holds ``batch_size`` submissions
+        and this submission's events would take it past the size target, the batch is emitted
+        without it and it begins the next batch. Otherwise it joins. So a batch holds more than
+        ``batch_size`` submissions only while its events stay within the target, and the target
+        never exceeds ``_BACKLOG_BATCH_CAP``, which is what makes the cap a ceiling. The append
+        is in a ``finally`` so that a ``BaseException`` escaping the carry's emit still leaves
+        the submission in ``pending``, where :meth:`_terminal_failure` counts the event-lists
+        the thread held.
+
+        Args:
+          pending: The batch being built, mutated in place.
+          item: The submission just taken from the queue.
+
+        Returns:
+          Whether a carry emitted the batch ahead of ``item``, so :meth:`_drain` can restart its
+          interval.
+
+        Raises:
+          BaseException: Whatever the carry's :meth:`_emit_pending` raises; :meth:`_run` is the
+            guard.
+        """
+        self._hold(item)
+        carried = False
+        try:
+            if (
+                len(pending) >= self.batch_size
+                and self._pending_events + len(item) > self._size_target()
+            ):
+                carried = True
+                self._emit_pending(pending)
+        finally:
+            pending.append(item)
+            self._pending_events += len(item)
+        return carried
+
+    def _complete(self, pending: list[list[dict[str, object]]], *, waiting: bool) -> bool:
+        """Whether the batch being built is ready to emit (SPEC-090 FR-001 rule 2).
+
+        A batch is complete once it holds ``batch_size`` submissions and either nothing more is
+        waiting, which is the count trigger exactly as it was before the rule, or its events
+        have reached the size target. With a target of zero the second clause always holds, so
+        a new worker, a forked child and a batch after a failure or a swap send the count
+        trigger's batch whether anything is waiting or not.
+
+        Args:
+          pending: The batch being built.
+          waiting: Whether an item is waiting in the queue; :meth:`_final_drain` passes ``True``.
+
+        Returns:
+          True when the batch should be emitted now.
+
+        Raises:
+          None.
+        """
+        if len(pending) < self.batch_size:
+            return False
+        return not waiting or self._pending_events >= self._size_target()
+
+    def _set_target(self, events: int, elapsed: float, *, failed: bool, generation: int) -> None:
+        """Sets the size target from the batch just emitted (SPEC-090 FR-001 rule 4).
+
+        Zero when the batch was counted in ``failed_batches``, when the sink generation moved
+        while it was emitted, or when it held no events: the next batch is then the count
+        trigger's. An exit batch counted in ``failed_batches`` never reaches here:
+        :meth:`_emit_pending` leaves the target as it was, as for a declined one. The cap when
+        ``elapsed`` is zero or negative: an emit the clock cannot see took less than its
+        resolution, which is the limit of an unbounded rate, and the cap is
+        what bounds that limit; keeping the previous target instead would let a frozen clock pin
+        whatever it last measured, and dividing by zero on this thread would end it. Otherwise
+        ``min(cap, events / elapsed * flush_interval / 2)``: half an interval of the sink's own
+        rate, so an emit stays shorter than the time trigger's interval and a per-event sink
+        settles near half an interval's worth rather than growing its calls.
+
+        Args:
+          events: The events the batch held.
+          elapsed: The seconds its emit took, retries and the engine's waits included.
+          failed: Whether the batch was counted in ``failed_batches``.
+          generation: The sink generation read before the emit.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        cap = float(_BACKLOG_BATCH_CAP)
+        if failed or events == 0 or generation != self._sink_generation:
+            self._target = 0.0
+        elif elapsed <= 0:
+            self._target = cap
+        else:
+            self._target = min(cap, events / elapsed * self.flush_interval / 2)
+        self._target_generation = generation
+
+    def _answer_marker(self, pending: list[list[dict[str, object]]], marker: _FlushMarker) -> None:
+        """Emits the batch ahead of a flush marker, then answers it (SPEC-090 FR-002).
+
+        The one answerer: :meth:`_drain` and :meth:`_final_drain` both call it, so each takes
+        the marker, computes ``delivered`` and sets its event in one place. The marker is
+        registered through :meth:`_take_marker` before the emit, so a wedged emit leaves it
+        within :meth:`_release_waiters`' reach, and it is answered in a ``finally``, then
+        deregistered, so a ``BaseException`` from the emit cannot strand its waiter; the order
+        of those two is :meth:`_release_marker`'s. It is shaped as :meth:`_drain`'s marker
+        branch was, line for line, so SPEC-089's change to that branch moves into it as it
+        stands.
+
+        Args:
+          pending: The batch being built, emitted and cleared in place.
+          marker: The flush marker just taken from the queue.
+
+        Returns:
+          None.
+
+        Raises:
+          BaseException: Whatever :meth:`_emit_pending` raises; :meth:`_run` is the guard.
+        """
+        self._take_marker(marker)
+        try:
+            self._emit_pending(pending)
+            marker.delivered = self._nothing_lost_since(marker)
+        finally:
+            marker.event.set()
+            self._release_marker(marker)
+
+    def _decline_exit_batch(self, size: int) -> None:
+        """Counts an exit batch declined unattempted, and marks every later one declined.
+
+        SPEC-090 FR-003. The batch moves ``failed_batches`` by one and its events go to
+        ``batch_lost``, as a declined retry's do, and it is added to the declined tally, which
+        :meth:`_write_exit_tallies` announces in one line. :meth:`_settle` runs **before** the
+        locked count and tally, so a batch :meth:`stop` finds in a tally it took has already
+        left ``_in_flight``, which it reads after the take. No line is written here. The mark
+        declines a later batch only while a deadline stands: :meth:`_emit_pending` reads a
+        deadline of ``None`` first, and declines nothing under it.
+
+        Args:
+          size: The events the batch held.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._exit_declining = True
+        self._settle(size, batch_lost=size)
+        with self._lock:
+            self.failed_batches += 1
+            events, batches = self._declined_tally
+            self._declined_tally = (events + size, batches + 1)
+
+    def _write_exit_tallies(self) -> None:
+        """Takes both exit tallies and writes at most one line for each (SPEC-090 FR-003).
+
+        Taking zeroes them in the same locked section, so no batch is announced twice whoever
+        takes them: :meth:`_final_drain` and :meth:`_run` at the drain thread's end, or
+        :meth:`stop` when its join expires, before its expiry line. A drain thread that goes on
+        after that take writes what it adds afterwards at its own end. Every counter the lines
+        name has already moved, by ``_diag``'s record-first rule. Not drain-thread only, because
+        :meth:`stop` calls it.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            abandoned, declined = self._abandoned_tally, self._declined_tally
+            self._abandoned_tally = (0, 0)
+            self._declined_tally = (0, 0)
+        if abandoned[1]:
+            _diag.lost("event", abandoned[0], f"{abandoned[1]} more exit batch(es) abandoned")
+        if declined[1]:
+            _diag.lost(
+                "event",
+                declined[0],
+                f"{declined[1]} exit batch(es) declined unattempted; each was predicted to end "
+                f"after the shutdown() deadline",
+            )
 
     def _hold(self, events: list[dict[str, object]]) -> None:
         """Counts a submission the drain thread has just taken from the queue (SPEC-088 FR-001).
@@ -2248,57 +2640,76 @@ class Worker:
             return self.failed_batches == marker.seen_failures
 
     def _final_drain(self, pending: list[list[dict[str, object]]]) -> None:
-        """Pulls anything still queued on stop and emits the tail as one final batch.
+        """Continues the batch on stop and sends what was queued when it began, by the rule.
 
-        The marker guard is a second copy of :meth:`_drain`'s and needs the same exclusion.
-        Markers are answered after the final emit, so a ``flush()`` that raced ``shutdown()``
-        is answered by the drain that carried its events, with that drain's outcome. They are
-        set in a ``finally`` so a ``BaseException`` from the final emit cannot strand a waiter
-        for its whole timeout.
+        ~~Pulls anything still queued on stop and emits the tail as one final batch~~ —
+        superseded by SPEC-090 FR-002. It continues the batch :meth:`_drain` handed it, with its
+        ``_pending_events``, takes items without waiting and passes each submission through
+        :meth:`_take`, emitting whenever :meth:`_complete` reports the batch complete with the
+        queue counted as waiting, so a batch boundary is decided here exactly as the steady
+        drain decides it; the remainder goes when the loop ends. Handing the sink the whole
+        backlog in one call left a ``shutdown()`` that ran out of time with nearly 20,000 events
+        inside one call whose outcome nobody would learn.
+
+        **It takes at most the entries the queue held when it began**, read in its first
+        statement, so a caller that keeps logging after ``shutdown()`` cannot keep it running:
+        what arrives later stays queued, in ``stranded`` and ``submitted_after_shutdown``. A
+        sentinel put after that read is never taken, so the window a late sentinel strands in
+        now opens when this drain begins rather than where its one pull loop used to end, which
+        widens it by that loop's duration, sub-millisecond to a few milliseconds
+        (``architecture.md`` §12).
+
+        **A marker is answered where it is met**, through :meth:`_answer_marker`, after the
+        batch ahead of it is emitted, so a ``flush()`` that raced ``shutdown()`` is answered by
+        the batches carrying its events and never waits for the batches behind it. A
+        ``BaseException`` from a batch leaves the markers already answered as they were, the
+        one being answered set by that method's ``finally``, and every later one in the queue
+        for :meth:`_run`'s :meth:`_release_waiters`. The exit budget lives in
+        :meth:`_emit_pending`, which every batch here goes through, and the tallies it keeps are
+        written in this method's ``finally`` (FR-003).
 
         Args:
-          pending: The accumulated event-lists, extended with whatever the queue still holds.
+          pending: The batch :meth:`_drain` was building, continued and emitted in place.
 
         Returns:
           None.
 
         Raises:
-          BaseException: Whatever the final emit raises; :meth:`_run` is the guard.
+          BaseException: Whatever an exit batch raises; :meth:`_run` is the guard.
         """
-        markers: list[_FlushMarker] = []
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if _diag.is_a(item, _FlushMarker):
-                markers.append(item)
-                self._take_marker(item)
-                continue
-            if item is not None and item is not _SHUTDOWN:
-                events = cast("list[dict[str, object]]", item)
-                self._hold(events)
-                pending.append(events)
+        budget = self._queue.qsize()
         try:
+            while budget > 0:
+                budget -= 1
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if _diag.is_a(item, _FlushMarker):
+                    self._answer_marker(pending, item)
+                    continue
+                if item is not None and item is not _SHUTDOWN:
+                    self._take(pending, cast("list[dict[str, object]]", item))
+                    if self._complete(pending, waiting=True):
+                        self._emit_pending(pending)
             self._emit_pending(pending)
-            for marker in markers:
-                marker.delivered = self._nothing_lost_since(marker)
         finally:
-            for marker in markers:
-                marker.event.set()
-                self._release_marker(marker)
+            self._write_exit_tallies()
 
     def _retry_declined(self, longest: float) -> bool:
         """Whether another attempt is predicted to end past the ``shutdown()`` deadline (SPEC-062).
 
         The rule is ``now + longest + _JOIN_MARGIN > _exit_deadline``, written here once so the
         1.x ``emit`` loop and the delivery engine (SPEC-072) ask the same question: the engine
-        is handed this bound method as its decline predicate. A deadline of ``None`` declines
-        nothing. ``_JOIN_MARGIN`` is read at each call, so a test can patch it to prove it is
-        added; the deadline is read without the lock, as :meth:`_emit` documents.
+        is handed this bound method as its decline predicate. :meth:`_emit_pending` asks it too,
+        before a later exit batch's first attempt, with the longest attempt any exit batch has
+        made (SPEC-090 FR-003). A deadline of ``None`` declines nothing. ``_JOIN_MARGIN`` is
+        read at each call, so a test can patch it to prove it is added; the deadline is read
+        without the lock, as :meth:`_emit` documents.
 
         Args:
-          longest: The longest attempt of the current batch so far, in seconds.
+          longest: The longest attempt of the current batch so far, in seconds, or, before a
+            later exit batch, the longest attempt any exit batch has made.
 
         Returns:
           True when the next attempt should not be made.
@@ -2309,7 +2720,37 @@ class Worker:
         deadline = self._exit_deadline
         return deadline is not None and time.monotonic() + longest + _JOIN_MARGIN > deadline
 
-    def _emit(self, event_lists: list[list[dict[str, object]]]) -> None:
+    def _tally_exit_abandon(self, size: int, *, exit_batch: bool) -> bool:
+        """Adds an abandoned exit batch to the abandon tally unless it is the first (SPEC-090).
+
+        FR-003: the first abandoned exit batch writes the abandon line itself, and records that
+        it has; every later one is added to ``_abandoned_tally`` instead, which
+        :meth:`_write_exit_tallies` announces in one line. The caller holds ``_lock``, the lock
+        the tally is written under, in the section that moves ``failed_batches``, and calls
+        this after :meth:`_settle`. A batch that is not an exit batch is never tallied.
+
+        Args:
+          size: The events of the abandoned batch.
+          exit_batch: Whether it is an exit batch whose abandonment may be tallied.
+
+        Returns:
+          True when the batch was tallied and the caller writes no line for it.
+
+        Raises:
+          None.
+        """
+        if not exit_batch:
+            return False
+        if not self._exit_abandoned_seen:
+            self._exit_abandoned_seen = True
+            return False
+        events, batches = self._abandoned_tally
+        self._abandoned_tally = (events + size, batches + 1)
+        return True
+
+    def _emit(
+        self, event_lists: list[list[dict[str, object]]], *, exit_batch: bool = False
+    ) -> None:
         """Flattens queued per-span event-lists into one batch and emits it, retrying.
 
         **A sink that offers ``deliver`` is run through the delivery engine first** (SPEC-072
@@ -2355,7 +2796,11 @@ class Worker:
         Each attempt is timed, ``time.monotonic()`` around ``sink.emit`` only and never the
         backoff, and immediately before each retry, after its backoff wait has returned, the
         retry is declined when ``now + longest attempt of this batch + _JOIN_MARGIN`` is past
-        ``_exit_deadline``. The first attempt of a batch is never declined, a deadline of
+        ``_exit_deadline``. ~~The first attempt of a batch is never declined~~ — refined by
+        SPEC-090 FR-003: the first attempt of the first exit batch is never declined, and a
+        later exit batch's is declined by :meth:`_emit_pending` before this method is called,
+        once an exit batch has declined a retry or the longest attempt any exit batch has made
+        predicts it would overrun. A deadline of
         ``None`` declines nothing, and "longest" is per batch. The estimator is the longest
         attempt rather than the last or the mean because a sink whose attempts vary — 0.1 s,
         0.8 s, 0.3 s — can run the next for as long as it ever has, and a prediction from a
@@ -2371,6 +2816,28 @@ class Worker:
         distinct from the exhausted wording so a reader can tell "the sink stayed broken" from
         "the shutdown ran out of time" (FR-002). The abandon line is not written as well.
 
+        **An exit batch feeds the exit budget and has its abandon line aggregated** (SPEC-090
+        FR-003). ``exit_batch`` is :meth:`_emit_pending`'s verdict that this batch's first
+        attempt begins after the stop was claimed. Every 1.x attempt of such a batch is timed,
+        on success as on failure, and an engine run is timed whole and counted as one attempt,
+        which overstates it and so declines no later than the true attempts would; the longest
+        is kept in ``_exit_longest`` for the decision before the next exit batch. A declined
+        retry of an exit batch, through the 1.x loop or an engine run that reports
+        ``declined``, sets ``_exit_declining``, so every later exit batch is declined
+        unattempted while a deadline stands; a deadline of ``None`` declines nothing, as
+        :meth:`_emit_pending` says. The first abandoned exit batch writes the abandon line as
+        any batch does; every later one is added to the abandon tally under the lock, beside
+        ``failed_batches``, and announced by :meth:`_write_exit_tallies`, so a dead sink at exit
+        writes two of the worker's lines where a line per batch would write a thousand. The
+        tallies do not reach a line the engine or the sink itself writes per batch, the engine's
+        ``absorbed`` line or ``HTTPSink``'s ``lost 1 request(s)``: those follow the number of exit
+        batches, which :meth:`_emit_pending` keeps near one per target's worth of events, which
+        is ``_BACKLOG_BATCH_CAP`` when it was measured there, by leaving the target as it was
+        after an abandoned exit batch, except when the target was already zero at the stop
+        (``architecture.md`` §12). On every route that can tally,
+        :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a tally it
+        took has already left ``_in_flight``.
+
         ~~``_in_flight`` holds the batch size from before the first attempt until this method
         returns by any route~~ — superseded by SPEC-088: ``_in_flight`` already holds the batch,
         because :meth:`_hold` counted each submission as the drain took it, and every route out
@@ -2382,6 +2849,9 @@ class Worker:
 
         Args:
           event_lists: The accumulated per-span event-lists to flatten and emit.
+          exit_batch: Whether this batch's first attempt begins after the stop was claimed
+            (SPEC-090 FR-003); ``False``, the default, for every other batch and for a caller
+            that hands this a batch directly.
 
         Returns:
           None. The outcome is not returned because ``failed_batches`` already moves exactly
@@ -2398,6 +2868,7 @@ class Worker:
         retries = max(self.max_retries, 0)
         longest = 0.0
         size = len(batch)
+        run_started = time.monotonic()
         delivery = _engine.run_delivery(
             self.sink,
             batch,
@@ -2406,10 +2877,19 @@ class Worker:
             decline=self._retry_declined,
         )
         if delivery is not None:
+            if exit_batch:
+                self._exit_longest = max(self._exit_longest, time.monotonic() - run_started)
+                if delivery.declined:
+                    self._exit_declining = True
             if delivery.failed:
+                self._settle(size, batch_lost=size)
                 with self._lock:
                     self.failed_batches += 1
-                self._settle(size, batch_lost=size)
+                    tallied = self._tally_exit_abandon(
+                        size, exit_batch=exit_batch and not delivery.declined
+                    )
+                if tallied:
+                    return
                 if delivery.declined:
                     _diag.lost(
                         "event",
@@ -2438,10 +2918,15 @@ class Worker:
                 sink.emit(batch)
             except Exception as err:
                 longest = max(longest, time.monotonic() - started)
+                if exit_batch:
+                    self._exit_longest = max(self._exit_longest, longest)
                 if attempt >= retries or is_final_refusal(err, sink):
+                    self._settle(size, batch_lost=size)
                     with self._lock:
                         self.failed_batches += 1
-                    self._settle(size, batch_lost=size)
+                        tallied = self._tally_exit_abandon(size, exit_batch=exit_batch)
+                    if tallied:
+                        return
                     _diag.lost(
                         "event",
                         size,
@@ -2449,10 +2934,14 @@ class Worker:
                     )
                     return
             else:
+                if exit_batch:
+                    self._exit_longest = max(self._exit_longest, time.monotonic() - started)
                 self._settle(size, delivered=size)
                 return
             self._stop.wait(_engine.cycle_backoff(attempt))
             if self._retry_declined(longest):
+                if exit_batch:
+                    self._exit_declining = True
                 with self._lock:
                     self.failed_batches += 1
                 self._settle(size, batch_lost=size)

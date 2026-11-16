@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-090
 title: "Under a Backlog the Worker Sends Larger Batches, and the Exit Drain Sends Its Backlog in Batches"
 description: "Lets the worker drain a backlog in batches sized to what its sink delivers in half a flush interval, capped at 1,000 events and with no new setting, and has the exit drain send its backlog by the same rule and stop starting batches it cannot finish, so a burst loses fewer events and an exit counts what it could not send."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-004, SPEC-021, SPEC-039, SPEC-054, SPEC-062, SPEC-068, SPEC-072, SPEC-088]
 arc: audit-2026-11-14
 arc_order: 6
@@ -114,8 +114,9 @@ and 17,861 to 19,860 of 30,000 submissions dropped, the most when the burst was 
    600-event span, is sent as 998 events and then a batch that begins with the 600.
 4. **The size target** is set after each batch the drain emits, from that batch alone, and read
    by the next:
-   - `0` when that batch was counted in `failed_batches`, when the sink generation (rule 5)
-     changed while it was being emitted, or when it held no events;
+   - `0` when that batch was counted in `failed_batches` and was not an exit batch (FR-003),
+     when the sink generation (rule 5) changed while it was being emitted, or when it held no
+     events;
    - the cap when its elapsed time was zero or negative;
    - otherwise `min(1_000, events / elapsed × flush_interval / 2)`.
 
@@ -123,7 +124,11 @@ and 17,861 to 19,860 of 30,000 submissions dropped, the most when the burst was 
    retries and the engine's waits lower the rate. `T` is `0`, which is today's batch, for a new
    worker, for a forked child (rule 6) and while the sink generation differs from the one `T` was
    measured under. A batch the exit drain declines without an attempt (FR-003) was not emitted
-   and leaves `T` as it was.
+   and leaves `T` as it was, and **an exit batch counted in `failed_batches` leaves `T` as it
+   was too** (added 2026-11-16): on the steady drain a failure resets `T` so a failing sink is
+   retried with small batches while it may recover, but at exit nothing waits for it, and a
+   reset cut a dead sink's backlog into `batch_size` submissions each, every one paying the
+   sink's own calls and lines.
 5. **The sink generation.** `_sink_generation` is an `int` that `retarget` increments where it
    reassigns `self.sink` (`worker.py:1123`), under `Worker._lock`. `_emit` reads `self.sink` for
    the engine (`worker.py:1934`) and again on every 1.x attempt (`worker.py:1960`), so a batch can
@@ -146,8 +151,12 @@ and 17,861 to 19,860 of 30,000 submissions dropped, the most when the burst was 
 time trigger's interval, so the wait a later event, a flush marker, a swap's fence or an exit's
 join sees behind a batch in flight stays within what the time trigger already allows. And it stops
 growth where growth stops paying: a sink whose cost is per call (`p13`'s, or the HTTP family up to
-its request size) reaches the cap at once, while one whose cost is per event (SQS at ten entries a
-request, `NATSSink` through JetStream at one ack per event) settles near half an interval's worth,
+its request size) ~~reaches the cap at once~~ multiplies its target by half an interval over the
+cost of a call with each batch, so one costing well under that, as `p13`'s 20 ms does, reaches
+the cap at once, and one costing more than half an interval never grows past the count trigger's
+batch (`spec090_slow_per_call.py`: at 0.3 s a call the batches climbed from 20 to 1,000 events
+over about ten batches, at 0.6 s every batch was 20; added 2026-11-16), while one whose cost is
+per event (SQS at ten entries a request, `NATSSink` through JetStream at one ack per event) settles near half an interval's worth,
 because a bigger batch only makes its call longer. **Half, not a whole interval**, because the time
 trigger's clock is read before the emit (`worker.py:1740-1743`): with a whole interval an emit
 lasted as long as the interval, the trigger fired on the first submission after it, and against a
@@ -207,6 +216,12 @@ call, over-reading `health().events.queued` for that long and failing the suite'
 fixture whenever the call outlasts the 2 s it re-reads a drain outside `get`
 (`tests/ledger_check.py`), while a shorter call would be hidden from it.
 
+**A carry emit restarts the interval** (added 2026-11-16): when `_take` emits the batch ahead of
+the submission it took, `_drain` sets `last_flush` to the clock read just before that take, as
+the count trigger's emit sets it to the clock read before its emit. Otherwise a carry emit lasting
+about half an interval left the time trigger to fire on the take after the next one, and a sink
+whose cost is per event was handed single-span batches under a backlog.
+
 #### Acceptance Criteria:
 
 - [ ] `p13_burst.py` on 3.12 and 3.13 sends no batch above 1,000 events and drains its backlog in
@@ -221,8 +236,8 @@ fixture whenever the call outlasts the 2 s it re-reads a drain outside `get`
       the size target (invariant 2).
 - [ ] With the target set to the cap, 499 two-event spans then a 600-event span then 10 more
       two-event spans, all queued at once, are sent as batches of 998 and 620 events (invariant 2).
-- [ ] A sink costing 2 ms per event, sent 200 spans at once, receives all 400 events and is never
-      held in one emit for longer than 1 s (invariant 3).
+- [ ] A sink costing 2 ms per event, sent 1,000 spans at once, receives all 2,000 events and is
+      never held in one emit for longer than 1 s (invariant 3).
 - [ ] With `time.monotonic` patched to a constant, a backlog of 2,000 spans is delivered whole, no
       batch exceeds 1,000 events, and `health().stopped_reason` stays `None` (invariants 1 and 2).
 - [ ] After a batch that is abandoned, after `configure(sink=...)` installs a sink, after a batch
@@ -374,6 +389,16 @@ So a dead sink at exit writes two lines where a per-batch drain would write abou
 the declined batches of `p04` are one line. A retry declined inside an exit batch still writes
 SPEC-062's line, once, since every batch after it is declined.
 
+**What the tallies do not reach** (added 2026-11-16). They aggregate the worker's own abandon and
+decline lines. A sink's own per-batch line (`HTTPSink`'s `lost 1 request(s)`) and the delivery
+engine's (`absorbed a failure while delivering a batch`, and its line for a run that settles with
+loss) are written once per exit batch, so they are bounded by the number of exit batches, which an
+abandoned exit batch leaving the target as it was (FR-001 rule 4) keeps near one per 1,000
+events: a refusing `HTTPSink` with 10,000 spans at exit made 321 requests and wrote 22 lines,
+against 321 and 21 before this spec. When the target is already `0` at the stop, every exit batch
+is `batch_size` submissions and those lines are one per batch; that residual is filed in
+`docs/architecture.md` §12 with its measurement and its closures.
+
 #### Acceptance Criteria:
 
 - [ ] `spec090_exit_budget.py tree` against the build on 3.12 and 3.13, with three exit batches,
@@ -450,10 +475,10 @@ to a sink's verdict, which this spec's Out of Scope leaves to the sinks track.
 - [ ] A test derives every public sink class under `src/log_foundry/sinks/` from the tree and fails
       on one missing from a table that names how it takes a batch, as the table above does
       (invariant 2).
-- [ ] `spec090_nats_ack_backlog.py 0.002 200 10`, a JetStream `NATSSink` behind a 2 ms ack with the
-      default `publish_timeout` sent 200 spans through the worker, acks all 400 events with
-      `health().sink.failed == 0`, and no `deliver` call lasts longer than 1 s (invariants 2
-      and 3).
+- [ ] `spec090_nats_ack_backlog.py 0.002 1000 10`, a JetStream `NATSSink` behind a 2 ms ack with
+      the default `publish_timeout` sent 1,000 spans through the worker, acks all 2,000 events
+      with `health().sink.failed == 0`, and no `deliver` call lasts longer than 1 s
+      (invariants 2 and 3).
 - [ ] `docs/architecture.md` §12 carries the `NATSSink` residual with its probe, its measured
       numbers and its closure, and names this spec (invariant 2).
 
@@ -797,6 +822,52 @@ kept, and the build's own run is the one that counts.
 
 ## Revision history
 
+- **2026-11-16, after the second diff review: an abandoned exit batch leaves the target as it
+  was.** FR-001 rule 4 reset the target to `0` after any failed batch, the exit drain's included,
+  so after the first abandoned exit batch a dead sink was handed the rest of the backlog in
+  `batch_size` submissions, and every one wrote the sink's or the engine's own line, which FR-003's
+  tallies do not aggregate. The review measured a refusing `HTTPSink` with 10,000 spans at exit:
+  15,217 requests and 953 lines on the build, 321 and 21 before this spec. Rule 4 now leaves the
+  target as it was after an abandoned exit batch, as after a declined one, and the steady drain is
+  unchanged: 321 requests and 22 lines. FR-003 now says its aggregation covers the worker's lines,
+  and that a sink's and the engine's per-batch lines are bounded by the number of exit batches,
+  which the unchanged target keeps near the old tree's. The case where the target is already `0`
+  at the stop is filed in `docs/architecture.md` §12. FR-001's "a sink whose cost is per call
+  reaches the cap at once" is narrowed: the target grows by half an interval over the cost per
+  batch, so a per-call sink costing more than half an interval never grows past the count
+  trigger's batch. Both probes, `spec090_dead_http_exit.py` and `spec090_slow_per_call.py`, are
+  committed beside the others.
+- **2026-11-16, after the first diff review: two criteria's 200 spans could not fail.** FR-001's
+  sixth criterion and FR-004's fourth sent 200 spans, 400 events at 2 ms each, which is 0.8 s of
+  sink time in all, so no call could last a second, and a fixed cap with no measured target
+  passed both. They now send 1,000 spans, 2,000 events: a batch at the cap would hold the sink
+  for 2 s, and the rule's half interval about 0.5 s. The suite runs each on a clock that only the
+  sink advances, so the worker measures the cost exactly and the test does not spend the 4 s.
+  Measured against the build on 3.12.12 and 3.13.1: `spec090_nats_ack_backlog.py 0.002 1000 10`
+  acked 2,000 with `sink.failed=0` in 12 `deliver` calls, largest 188 to 192 events, longest
+  0.505 to 0.513 s; `spec090_per_event_sink.py 0.002 1000` received 2,000 in 10 emits, largest
+  248, longest 0.50 to 0.51 s.
+- **2026-11-16, at completion: the record reached further than FR-005's table.** The build found
+  more sites stating a claim FR-001 or FR-003 made false, and rewrote or marked each: in
+  `worker.py`, the `max_retries` Args text, `_emit`'s "the first attempt of a batch is never
+  declined", `Health.failed_batches`, `EventLedger.batch_lost`, and the `_drain`,
+  `_retry_declined` and `_JOIN_MARGIN` docstrings; `tests/test_sinks_http.py`'s present-tense
+  claim about the exit backlog; the decisions *A shutdown shortens a wait; it must never skip
+  work*, *An expired shutdown is final, and a join the drain thread owes is handed over once* and
+  *A sink's wait is bounded, interruptible, and never taken on a destination's word*, which quote
+  the exit-drain decision's old title or its one-batch exit; invariant 3's "a shutdown shortens a
+  wait; it never skips work"; and in `architecture.md` §12, SPEC-062's closed `NATSSink` item, the
+  after-shutdown line item ("the last read" became the bound), and the sentinel-stranding item,
+  whose closure by re-reading the queue after the stop FR-002's bound rules out, struck, its
+  window recorded as wider by the old pull loop's duration. The README's `failed_batches` and
+  `batch_lost` rows now cover a batch declined unattempted. Two premises had moved: FR-002's
+  expiry-line figure was already SPEC-088's `in_flight`, so it needed a test and no code; and a
+  pending `docs/release-notes/v1.2.1.md` existed, so the release notes went there, as FR-005
+  allows. The `NATSSink` residual, filed in §12, was measured directly at a 0.2 s
+  `publish_timeout`: 193 of 400 events acked, where the tree before this spec acked all 400.
+- **2026-11-16, a paragraph added to FR-001**: a carry emit restarts the time trigger's interval.
+  Found by the plan review, which measured `spec090_per_event_sink.py 0.005 1000` on a prototype
+  without it: 7 of 29 batches held a single span, and none with it.
 - **2026-11-16, one sentence added to FR-001**: each take is counted by `_hold` where it is
   taken, before any carry or emit decision. Found by the second diff review of the fix that lets
   SPEC-088's balance fixture wait for a live drain to settle, whose reading holds only if the

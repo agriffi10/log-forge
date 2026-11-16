@@ -33,13 +33,16 @@ DEFAULT_PUBLISH_TIMEOUT = 10.0
 
 A budget for the **batch**, not for an event. Under JetStream each publish awaits an ack bounded by
 the driver's own timeout, and applying that per item is ``n x timeout``, which is not a bound --
-measured, five events against a stalled server cost 25.01 s, and ``Worker._final_drain`` hands the
-process's exit backlog over as a single batch (SPEC-038 measured 5,980 events).
+measured, five events against a stalled server cost 25.01 s, and ~~``Worker._final_drain`` hands
+the process's exit backlog over as a single batch (SPEC-038 measured 5,980 events)~~ — since
+SPEC-090 FR-002 ``Worker._final_drain`` sends the exit backlog in batches by the steady drain's
+rule, none above 1,000 events unless it holds at most ``batch_size`` submissions, and a batch of
+up to 1,000 events is still a batch whose acks a per-item bound would multiply.
 
 It is spent inside ``_lifecycle.DEFAULT_SHUTDOWN_TIMEOUT`` (30.0): ``Worker.shutdown`` joins the
-drain thread against that deadline and ``_final_drain``'s single emit runs on that thread, and an
-expired join leaves the sink **open** by SPEC-027 FR-004, so ``close()`` never drains the client's
-outbound buffer.
+drain thread against that deadline and ~~``_final_drain``'s single emit runs~~ ``_final_drain``'s
+exit batches run on that thread, and an expired join leaves the sink **open** by SPEC-027 FR-004,
+so ``close()`` never drains the client's outbound buffer.
 
 **The exit drain fits the join, and the arithmetic is stated rather than assumed.**
 ``Worker._emit`` retries a failing batch up to ``max_retries + 1`` times -- four at the default --
@@ -49,8 +52,12 @@ wait and never skips work), so on its own the sequence would cost ``(max_retries
 publish_timeout``, 40 s against a 30 s join. Since SPEC-062 the worker declines a retry predicted to
 end after the ``shutdown()`` deadline, so the exit drain's worst case is bounded by the
 ``shutdown()`` budget plus up to two ``publish_timeout``s -- the emit in flight when the budget
-runs out, and the first attempt of a tail batch, which is never declined -- and at these defaults
-the third attempt is declined at 20 s and ``close()`` runs. That rests on one emit costing at most
+runs out, and the first attempt of ~~a tail batch~~ the exit drain's first batch, which is never
+declined -- and at these defaults the third attempt is declined at 20 s and ``close()`` runs. Since
+SPEC-090 FR-003 the exit drain sends several batches, and only its first batch's first attempt is
+never declined: a later batch's first attempt is made only when the longest attempt any exit batch
+has made predicts it fits, and one that outlasts that prediction is itself the emit in flight when
+the budget runs out, so the bound stands. That rests on one emit costing at most
 ``publish_timeout``, which SPEC-061 keeps: its liveness and confirmation round trips and each
 publish are waited under the emit's one deadline. The only overrun is :data:`CALL_SLACK`, the
 backstop for a loop a driver has wedged, and it fires once: the sink then closes itself, so every
@@ -307,13 +314,19 @@ class NATSSink:
     > server, and ``Worker._final_drain`` hands the exit backlog over as one batch. One
     > :data:`DEFAULT_PUBLISH_TIMEOUT` now bounds the whole :meth:`emit`.
 
+    **Superseded in part by SPEC-090 FR-002**: ``Worker._final_drain`` no longer hands the exit
+    backlog over as one batch; it sends it in batches by the steady drain's rule.
+
     The worst case is therefore ``publish_timeout`` per emit — SPEC-061's two round trips and every
     publish, a JetStream ack wait included, spend that one deadline — and across the exit drain
     the ``shutdown()`` budget plus up to two ``publish_timeout``s — the emit in flight when the
-    budget runs out and the first attempt of a tail batch — since ``Worker._emit`` declines a
-    retry predicted to end after that deadline (SPEC-062) and a batch's first attempt is always
-    made. Before that it was ``(max_retries + 1) x publish_timeout``, which exceeded the join at
-    the defaults; ``architecture.md`` section 12 records the closure.
+    budget runs out and the first attempt of the exit drain's first batch — since
+    ``Worker._emit`` declines a retry predicted to end after that deadline (SPEC-062) and
+    ~~a batch's first attempt is always made~~ only the first exit batch's first attempt is always
+    made: SPEC-090 FR-003 declines a later exit batch, unattempted, once the longest attempt any
+    exit batch has made predicts it would overrun. Before that it was
+    ``(max_retries + 1) x publish_timeout``, which exceeded the join at the defaults;
+    ``architecture.md`` section 12 records the closure.
 
     **A disconnected client is reported, not absorbed** (FR-004 AC-5). That non-blocking publish
     is exactly what made this sink report success for events that had not left the process: with
@@ -1598,7 +1611,9 @@ class NATSSink:
         Per-event isolation stays because a partial batch must not be retried wholesale: the
         events that published would be delivered twice. What changes is that the *batch* is
         bounded rather than each event in it — applying the driver's ack timeout per item is
-        ``n x timeout``, and ``Worker._final_drain`` hands the exit backlog over as one batch.
+        ``n x timeout``, and ~~``Worker._final_drain`` hands the exit backlog over as one
+        batch~~ a batch holds up to 1,000 events under a backlog, at exit as in the steady drain,
+        since SPEC-090 FR-002 sends the exit backlog by the steady drain's rule.
 
         The two paths take the bound differently because the driver offers different handles. A
         JetStream publish accepts a ``timeout`` and is given ~~``min(DEFAULT_ACK_TIMEOUT,
