@@ -39,9 +39,9 @@ built spec by spec against the design in `architecture.md`.
   which PyPI rejects as too similar to the unrelated pre-existing `logforge`).
   Target module map (see implementation-guide.md): `config`, `ids`, `model`, `context`, `console`,
   `api`, `decorator`, `worker`, `sinks/{base,stdout,sqs}` — shipped across SPEC-001–005 (`docs/spec-delivery/`
-  says which; `sinks/sqs` is the optional `aws` extra). Plus four leaf helpers the map did not
-  anticipate, importing nothing from the package at runtime — `sanitize`, `_diag`, `results` and
-  `_otel` — and two non-leaves that do: `_lifecycle` and `_fork` (see `docs/component-inventory.md`).
+  says which; `sinks/sqs` is the optional `aws` extra). Plus five leaf helpers the map did not
+  anticipate, importing nothing from the package at runtime — `sanitize`, `_diag`, `results`,
+  `_otel` and `_ledger` — and two non-leaves that do: `_lifecycle` and `_fork` (see `docs/component-inventory.md`).
 - `tests/` — pytest suite (`conftest.py`, `test_*.py`).
 - `docs/` — decisions register, architecture, implementation guide, specs, spec-delivery, templates.
 
