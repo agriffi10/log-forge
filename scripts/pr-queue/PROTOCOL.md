@@ -38,7 +38,7 @@ because the hook never asks the trunk for a lock, so a lock stamped with it woul
 Monitor tool's until-loop on `queue.sh turn SPEC-XXX`, every couple of minutes. Each call is also
 your heartbeat: a waiter that stops polling for 30 minutes loses its place, which is what stops a
 dead session from blocking the line forever. Do not poll `acquire` — poll `turn`, then `acquire` once
-it exits 0. And **`cd` into the worktree you built the spec in and `acquire` from there in the
+it exits 0. And **`cd` into the worktree that holds the branch and `acquire` from there in the
 SAME command** — the agent's Bash tool resets the working directory between calls, so a `cd` in
 one call and an `acquire` in the next acquires from the wrong tree.
 

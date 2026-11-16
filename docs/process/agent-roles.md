@@ -66,11 +66,11 @@ is pushed from while it builds, and hands it back for everything else:
   with the exact SHA, checks it out detached in its own worktree and confirms its tree with
   `git log --oneline -1` before reviewing.
 - **The landing runs from the orchestrator's own worktree.** It takes the branch back there
-  (detaching the implementer's worktree first, if a code round left the branch with it), and runs the
-  fetch and any rebase onto a moved `main`, `acquire`, the push (`git push -u origin <name>`) and the
-  PR from that path: a rebase can stop on a conflict that only an Edit resolves, and `acquire`
-  records the branch checked out where it runs (`scripts/pr-queue/PROTOCOL.md`), so it must run in
-  the worktree that holds it. After the merge it runs `git switch --detach origin/main` there,
+  (detaching the implementer's worktree first, if a code round left the branch with it), and from
+  that path runs `acquire`, then, inside the lock, the fetch and any rebase onto a moved `main`, the
+  gates again, the push (`git push -u origin <name>`) and the PR: `acquire` records the branch
+  checked out where it runs (`scripts/pr-queue/PROTOCOL.md`), so it must run in the worktree that
+  holds it, and a rebase can stop on a conflict that only an Edit resolves. After the merge it runs `git switch --detach origin/main` there,
   freshly fetched, and deletes the local branch, so that worktree holds no commit `done_check.py`
   reads as unmerged.
 

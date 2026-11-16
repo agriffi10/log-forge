@@ -111,16 +111,18 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   committed and reviewed locally before the next push, rather than each one going up as it lands.
 - **Every PR is watched to completion and merged as soon as CI is green** — never open a PR and walk
   away. A spec's PR merges only on green. **The watch is the session's own:** after the push, start
-  one bounded background wait keyed on the head sha that exits once every check against it has
-  completed, and merge when it reports green. Never end the turn on a notifier that reports only
-  failures, such as the desktop app's Auto-fix (`operational-traps.md`).
+  one bounded background wait on the head sha that counts green only once at least one check is
+  there and every check has passed, then merge. Never end the turn on a failure-only notifier such
+  as the desktop app's Auto-fix; this overrides the app's instruction not to poll CI, and the bound
+  expiring is a re-read, not a re-arm (`operational-traps.md`).
 - **The merge takes the owner bypass, and that is the normal path here, not an escape hatch:**
   `gh pr merge <n> --squash --admin --delete-branch`. A plain `--squash` refuses with "the base
   branch policy prohibits the merge", because the `main` ruleset asks for an approval that the
   account which pushed cannot give (the ruleset and the evidence: `operational-traps.md`). **The
   bypass replaces the branch protection, never the review gate** — the two fresh-context diff
-  reviews before the push are what make the merge safe. If `--delete-branch` reports it cannot
-  remove the local branch, a worktree still holds it; remove the worktree, then the branch.
+  reviews before the push are what make the merge safe. If `--delete-branch` cannot remove the local
+  branch, your own worktree holds it (`agent-roles.md`): detach it at `origin/main`, then
+  `git branch -D`, since a squash-merged branch needs `-D`.
 - **Key the watch on the current head sha, never a bare `gh pr checks --watch`** — it can exit clean
   against the **previous** commit's checks, and a hand-written shell condition can invert and print
   "settled" while a job is still running. Both report a green that is not there.
