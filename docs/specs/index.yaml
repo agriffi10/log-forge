@@ -631,13 +631,20 @@ specs:
     depends_on: ["SPEC-069", "SPEC-072", "SPEC-074", "SPEC-075", "SPEC-076", "SPEC-092", "SPEC-093"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-094-client-buffered-sinks-wait-for-the-report.md"
+  - id: "SPEC-095"
+    title: "A Resend After a Lost Reply Is Counted, and Its Key Is the Event's Own `log_id`"
+    description: "Counts and announces every event the delivery engine sends again after a send that may have landed it, has each shipped sink mark such sends, counting every raise from a client that retries internally, reads a MongoDB duplicate driver-stamped _id on such a resend as delivery, and settles that the event's log_id, already in every body, is the idempotency key and what a sink must prove before it declares itself idempotent, so SPEC-092's 50 reply-resent rows and two MongoDB rows turn green and 19 rows move to new departures."
+    spec_status: "Draft"
+    depends_on: ["SPEC-072", "SPEC-073", "SPEC-074", "SPEC-075", "SPEC-088", "SPEC-092"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-095-resends-after-a-lost-reply.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"

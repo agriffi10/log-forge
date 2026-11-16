@@ -1,0 +1,1097 @@
+diff --git a/docs/audits/2026-11-14-probes/sinks/spec092_corpus.py b/docs/audits/2026-11-14-probes/sinks/spec092_corpus.py
+index 699e5ef..eb0385a 100644
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_corpus.py
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_corpus.py
+@@ -249,6 +249,12 @@ class Report:
+     `Worker._emit`."""
+     late_lines: int = 0
+     """Loss lines written after the last batch's `_emit` returned: at `close()`."""
++    resent: dict[str, int] = dataclasses.field(default_factory=dict)
++    """Per `log_id`, the resends the library counted as possible duplicates (SPEC-095)."""
++    batch_resends: tuple[tuple[int, int], ...] = ()
++    """Per batch, the resends counted and the resend lines written inside its `Worker._emit`."""
++    resent_counted: int = 0
++    """For an `emit`-only sink, the resends its `losses().resent` moved over the row."""
+ 
+ 
+ CHECKS = (
+@@ -258,6 +264,7 @@ CHECKS = (
+     "lost-but-held",
+     "unannounced",
+     "ambiguous-when-knowable",
++    "resent-when-knowable",
+ )
+ """The assertion's checks, in the order a verdict lists them."""
+ 
+@@ -289,7 +296,7 @@ def judge(
+             failed.append("partition")
+         if any(fates.get(t) == "landed" and held[t] == 0 for t in batch_tokens):
+             failed.append("silent-loss")
+-        if many:
++        if any(held[t] > 1 + report.resent.get(t, 0) for t in batch_tokens):
+             failed.append("duplicate")
+         if any(fates.get(t) in ("lost", "skipped") and held[t] > 0 for t in batch_tokens):
+             failed.append("lost-but-held")
+@@ -298,6 +305,8 @@ def judge(
+         unknowable = backend.unknowable()
+         if any(fates.get(t) == "ambiguous" and t not in unknowable for t in batch_tokens):
+             failed.append("ambiguous-when-knowable")
++        if any(report.resent.get(t, 0) and t not in unknowable for t in batch_tokens):
++            failed.append("resent-when-knowable")
+     else:
+         if report.claimed_landed + report.counted_lost + report.counted_late != total or (
+             report.counted_late
+@@ -305,12 +314,15 @@ def judge(
+             failed.append("partition")
+         if report.claimed_landed > once + many:
+             failed.append("silent-loss")
+-        if many:
++        extra = sum(held[t] - 1 for t in batch_tokens if held[t] > 1)
++        if extra > report.resent_counted:
+             failed.append("duplicate")
+         if report.counted_lost + report.counted_late > none:
+             failed.append("lost-but-held")
+         if _unannounced(report):
+             failed.append("unannounced")
++        if report.resent_counted and not backend.unknowable():
++            failed.append("resent-when-knowable")
+     return tuple(c for c in CHECKS if c in failed and c not in disabled)
+ 
+ 
+@@ -319,6 +331,8 @@ def _unannounced(report: Report) -> bool:
+     a late count has no loss line after the last batch."""
+     if any(lost and not lines for lost, lines in report.batch_losses):
+         return True
++    if any(resent and not lines for resent, lines in report.batch_resends):
++        return True
+     return bool(report.counted_late) and not report.late_lines
+ 
+ 
+@@ -370,6 +384,11 @@ def runs() -> Iterator[
+             except BaseException as err:
+                 rounds.append((sink, carried, err, run_id))
+                 raise
++            marks = getattr(_engine.run_context()._marks(), "reached", ())
++            reached = frozenset(
++                carried[i] for i in marks if type(i) is int and 0 <= i < len(carried)
++            )
++            REACHED[(id(sink), run_id, len(rounds))] = reached
+             rounds.append((sink, carried, result, run_id))
+             return result
+ 
+@@ -384,6 +403,31 @@ def runs() -> Iterator[
+         _engine._run = original  # type: ignore[assignment]
+ 
+ 
++REACHED: dict[tuple[int, int, int], frozenset[str]] = {}
++"""Per recorded round, the `log_id`s its sink marked as possibly landed (SPEC-095)."""
++
++
++def resends_from(
++    records: list[tuple[object, list[str], object, int]], owner: object, run_id: int
++) -> dict[str, int]:
++    """Per `log_id`, how often one run offered it again after a round that marked it."""
++    from log_foundry.sinks.verdict import Verdict
++
++    marked: dict[str, bool] = {}
++    resent: dict[str, int] = {}
++    for at, (self, carried, result, rid) in enumerate(records):
++        if self is not owner or rid != run_id:
++            continue
++        for token in carried:
++            if marked.get(token):
++                resent[token] = resent.get(token, 0) + 1
++        readable = isinstance(result, Verdict) and len(result.outcomes) == len(carried)
++        reached = REACHED.get((id(self), rid, at), frozenset()) if readable else frozenset()
++        for token in carried:
++            marked[token] = token in reached
++    return resent
++
++
+ def fate_of(outcome: object) -> str:
+     """The one reading of a round's outcome as a fate."""
+     from log_foundry.sinks.verdict import Outcome
+@@ -438,6 +482,13 @@ def agrees(fates: dict[str, str], delivery: object) -> str | None:
+     return None if got == want else f"reconstructed {got} against Delivery {want}"
+ 
+ 
++def agrees_resent(resent: dict[str, int], delivery: object) -> str | None:
++    """The differential oracle for the resend count: the reconstruction against `Delivery`."""
++    want = getattr(delivery, "resent", 0)
++    got = sum(resent.values())
++    return None if got == want else f"reconstructed {got} resend(s) against Delivery {want}"
++
++
+ def losses_total(sink: object) -> tuple[int, int]:
+     """`(dropped, failed)` from the sink's `losses()`, or zeros when it reports none."""
+     reader = getattr(sink, "losses", None)
+@@ -447,7 +498,20 @@ def losses_total(sink: object) -> tuple[int, int]:
+     return (value.dropped, value.failed)
+ 
+ 
++def resent_total(sink: object) -> int:
++    """`resent` from the sink's `losses()`, or zero (SPEC-095)."""
++    reader = getattr(sink, "losses", None)
++    value = reader() if callable(reader) else None
++    return getattr(value, "resent", 0) if value is not None else 0
++
++
+ LOST = re.compile(r"^log-foundry: lost \d+ ")
++RESENT = re.compile(r"^log-foundry: resent \d+ ")
++
++
++def resent_lines_of(text: str) -> int:
++    """How many resend lines the row wrote (SPEC-095)."""
++    return sum(1 for line in text.splitlines() if RESENT.match(line))
+ 
+ 
+ def lines_of(text: str) -> int:
+@@ -503,6 +567,8 @@ class Batch:
+     losses_after: tuple[int, int]
+     lines: int
+     text_end: int
++    resent_lines: int = 0
++    resent_counted: int = 0
+ 
+ 
+ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ...], dict[str, Any]]:
+@@ -557,6 +623,7 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
+                 mark = len(seen)
+                 failed = self.failed_batches
+                 start = losses_total(sink)
++                resent_at = resent_total(sink)
+                 text_at = len(stderr.getvalue())
+                 try:
+                     original_emit(self, event_lists)
+@@ -572,6 +639,8 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
+                                 after,
+                                 lines_of(stderr.getvalue()[text_at:]),
+                                 len(stderr.getvalue()),
++                                resent_lines_of(stderr.getvalue()[text_at:]),
++                                resent_total(sink) - resent_at,
+                             )
+                         )
+ 
+@@ -607,12 +676,21 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
+     claimed = counted = 0
+     disagreement = None
+     batch_losses: list[tuple[int, int]] = []
++    batch_resends: list[tuple[int, int]] = []
++    resent_all: dict[str, int] = {}
++    resent_flat = 0
+     for batch in handled:
+         judged = [(d, rid) for s_, d, rid in seen[batch.runs[0] : batch.runs[1]] if s_ is target]
+         mine = set(batch.tokens)
+         if judged and per_event is not None:
+             fates: dict[str, str] = {}
++            resent_here = 0
+             for delivery, rid in judged:
++                again = {t: n for t, n in resends_from(records, target, rid).items() if t in mine}
++                for t, n in again.items():
++                    resent_all[t] = resent_all.get(t, 0) + n
++                resent_here += sum(again.values())
++                disagreement = disagreement or agrees_resent(again, delivery)
+                 found = {t: f for t, f in fates_from(records, target, rid).items() if t in mine}
+                 if delivery.failed:
+                     found = dict.fromkeys(mine, "lost")
+@@ -621,8 +699,11 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
+                 fates.update(found)
+             per_event.update(fates)
+             lost = sum(1 for f in fates.values() if f in ("lost", "ambiguous"))
++            batch_resends.append((resent_here, batch.resent_lines))
+         else:
+             per_event = None
++            batch_resends.append((batch.resent_counted, batch.resent_lines))
++            resent_flat += batch.resent_counted
+             if batch.failed_batches:
+                 lost = len(batch.tokens)
+                 counted += lost
+@@ -649,6 +730,9 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
+         disagreement=disagreement,
+         batch_losses=tuple(batch_losses),
+         late_lines=lines_of(text[handled[-1].text_end :]) if handled else 0,
++        resent=resent_all,
++        batch_resends=tuple(batch_resends),
++        resent_counted=resent_flat,
+     )
+     expected = row.batches * N
+     verdict = judge(batch_tokens, backend, report, disabled)
+@@ -666,6 +750,7 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
+         "batch_losses": report.batch_losses,
+         "late_lines": report.late_lines,
+         "disagreement": disagreement,
++        "resent": sum(resent_all.values()),
+         "first_line": next((ln for ln in text.splitlines() if ln.startswith("log-foundry")), ""),
+     }
+     return verdict, detail
+diff --git a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py
+index b0e169c..1d2cdee 100644
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py
+@@ -266,7 +266,7 @@ class MongoClient:
+                 errors.append({"index": index, "code": 121, "errmsg": "validation"})
+                 continue
+             if document["_id"] in self.ids:
+-                errors.append({"index": index, "code": 11000, "errmsg": "duplicate key"})
++                errors.append({"index": index, "code": 11000, "errmsg": f"E11000 duplicate key error collection: db.c index: _id_ dup key: {{ _id: \"{document["_id"]}\" }}", "keyPattern": {"_id": 1}, "keyValue": {"_id": document["_id"]}})
+                 continue
+             self.ids.add(document["_id"])
+             self.backend.take([token])
+@@ -552,6 +552,8 @@ class PGCursor:
+             self.conn.backend.take(carried)
+             return
+         self.conn.statements += 1
++        if not self.conn.txn:
++            self.conn.txn_from = len(self.conn.backend.calls) - 1
+         if action == "refuse":
+             raise _pg_error("could not serialize access", "40001")
+         if action == "taken-raise":
+@@ -578,6 +580,7 @@ class PGConnection:
+         self.broken = False
+         self.statements = 0
+         self.lose_commit_reply = False
++        self.txn_from = 0
+ 
+     def check(self) -> None:
+         if self.closed:
+@@ -597,6 +600,8 @@ class PGConnection:
+         self.txn = []
+         if self.lose_commit_reply:
+             self.lose_commit_reply = False
++            for call in self.backend.calls[self.txn_from :]:
++                call.knowable = False
+             self.drop()
+             raise _pg_error("server closed the connection unexpectedly", "08006")
+ 
+diff --git a/src/log_foundry/_diag.py b/src/log_foundry/_diag.py
+index 7a342f9..c487735 100644
+--- a/src/log_foundry/_diag.py
++++ b/src/log_foundry/_diag.py
+@@ -216,6 +216,17 @@ def lost(what: str, count: int, detail: str = "") -> None:
+         pass
+ 
+ 
++def resent(count: int, detail: str = "") -> None:
++    """Reports events sent again after a send that may have landed them (prototype)."""
++    try:
++        sys.stderr.write(
++            f"log-foundry: resent {count} event(s) a lost reply may have landed; "
++            f"they may be duplicated{_suffix(detail)}\n"
++        )
++    except Exception:
++        pass
++
++
+ def pending(detail: str) -> None:
+     """Reports an outcome the library cannot decide yet, without claiming a loss (SPEC-068 FR-001).
+ 
+diff --git a/src/log_foundry/sinks/_classify.py b/src/log_foundry/sinks/_classify.py
+index 6bf2576..75bd566 100644
+--- a/src/log_foundry/sinks/_classify.py
++++ b/src/log_foundry/sinks/_classify.py
+@@ -123,6 +123,22 @@ def is_retryable(predicate: ErrorPredicate, err: Exception) -> bool:
+         return False
+ 
+ 
++def may_have_landed(err: Exception) -> bool:
++    """Whether a call that raised ``err`` may have reached its destination (prototype).
++
++    False only for an exception that proves the request never left, or a reply refusing it.
++    """
++    import socket
++    import urllib.error
++
++    kind = type(err)
++    if issubclass(kind, urllib.error.HTTPError):
++        return True
++    if issubclass(kind, (ConnectionRefusedError, socket.gaierror, urllib.error.URLError)):
++        return False
++    return True
++
++
+ def aws_retryable(err: Exception) -> bool:
+     """The four AWS sinks' predicate: botocore's transient and throttling failures (FR-002).
+ 
+diff --git a/src/log_foundry/sinks/_deferral.py b/src/log_foundry/sinks/_deferral.py
+index a1306be..61d1789 100644
+--- a/src/log_foundry/sinks/_deferral.py
++++ b/src/log_foundry/sinks/_deferral.py
+@@ -232,4 +232,4 @@ def wrapped_losses(inner: SinkLosses | None, own: int) -> SinkLosses | None:
+         return inner
+     if inner is None:
+         return SinkLosses(dropped=own, failed=0)
+-    return SinkLosses(dropped=inner.dropped + own, failed=inner.failed)
++    return SinkLosses(dropped=inner.dropped + own, failed=inner.failed, resent=inner.resent)
+diff --git a/src/log_foundry/sinks/_engine.py b/src/log_foundry/sinks/_engine.py
+index 3b47746..5cf5906 100644
+--- a/src/log_foundry/sinks/_engine.py
++++ b/src/log_foundry/sinks/_engine.py
+@@ -7,6 +7,7 @@ import math
+ import threading
+ import time
+ from contextvars import ContextVar
++import dataclasses
+ from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Final, NamedTuple, cast
+ 
+@@ -118,6 +119,7 @@ class Delivery:
+     failed: bool
+     refused: Exception | None = None
+     raise_on_failure: Exception | None = None
++    resent: int = 0
+ 
+ 
+ _SETTLED_EMPTY: Final = Delivery(
+@@ -447,6 +449,7 @@ class _Marks(NamedTuple):
+     final: tuple[object, ...]
+     refused: Exception | None
+     counted: tuple[object, ...]
++    reached: tuple[object, ...] = ()
+ 
+ 
+ def _moved(index: object, positions: Sequence[int]) -> object:
+@@ -501,6 +504,7 @@ class RunContext:
+         "_lines",
+         "_notes",
+         "_raise_on_failure",
++        "_reached",
+         "_refused",
+         "_resends_unknown",
+         "_round",
+@@ -527,6 +531,7 @@ class RunContext:
+         self._resends_unknown: bool | None = None
+         self._final: list[object] = []
+         self._counted: list[object] = []
++        self._reached: list[object] = []
+         self._refused: Exception | None = None
+         self._raise_on_failure: Exception | None = None
+ 
+@@ -800,6 +805,11 @@ class RunContext:
+         if not self._immediate:
+             self._counted.extend(indices)
+ 
++    def may_have_landed(self, indices: Iterable[int]) -> None:
++        """Marks RETRYABLE indices whose call may have reached the destination (prototype)."""
++        if not self._immediate:
++            self._reached.extend(indices)
++
+     def delegate(
+         self,
+         deliver: Callable[[list[dict[str, object]]], object],
+@@ -852,9 +862,10 @@ class RunContext:
+             if self._in_run():
+                 self._rewind(mark)
+             return verdict, None
+-        final, counted = mark[2], mark[3]
++        final, counted, reached = mark[2], mark[3], mark[6]
+         self._final[final:] = [_moved(index, positions) for index in self._final[final:]]
+         self._counted[counted:] = [_moved(index, positions) for index in self._counted[counted:]]
++        self._reached[reached:] = [_moved(index, positions) for index in self._reached[reached:]]
+         return verdict, found
+ 
+     def _in_run(self) -> bool:
+@@ -887,7 +898,7 @@ class RunContext:
+         Raises:
+           None.
+         """
+-        return _Marks(tuple(self._final), self._refused, tuple(self._counted))
++        return _Marks(tuple(self._final), self._refused, tuple(self._counted), tuple(self._reached))
+ 
+     def drops(self, owner: _Counted) -> _Drops:
+         """Returns a ``Deferral``-shaped view that registers every count and line ``SETTLED``.
+@@ -903,7 +914,7 @@ class RunContext:
+         """
+         return _Drops(self, owner)
+ 
+-    def _mark(self) -> tuple[int, int, int, int, Exception | None, Exception | None]:
++    def _mark(self) -> tuple[int, int, int, int, Exception | None, Exception | None, int]:
+         """Returns a point :meth:`_rewind` can return the context to.
+ 
+         Its first two members are what a caller compares: the counts and the lines registered
+@@ -929,9 +940,10 @@ class RunContext:
+             len(self._counted),
+             self._refused,
+             self._raise_on_failure,
++            len(self._reached),
+         )
+ 
+-    def _rewind(self, mark: tuple[int, int, int, int, Exception | None, Exception | None]) -> None:
++    def _rewind(self, mark: tuple[int, int, int, int, Exception | None, Exception | None, int]) -> None:
+         """Discards every count, line and mark registered since ``mark``.
+ 
+         A caller guarding a hook that may register a count and then raise uses it to replace
+@@ -959,6 +971,7 @@ class RunContext:
+         del self._counted[mark[3] :]
+         self._refused = mark[4]
+         self._raise_on_failure = mark[5]
++        del self._reached[mark[6] :]
+ 
+     def _begin(self, number: int, *, last: bool = False) -> None:
+         """Records the round about to run.
+@@ -977,6 +990,7 @@ class RunContext:
+         self._last = last
+         self._final = []
+         self._counted = []
++        self._reached = []
+         self._refused = None
+ 
+     def _kept(
+@@ -1321,7 +1335,7 @@ def _verdict_failed(verdict: object, n: int, marks: _Marks | None = None) -> boo
+ 
+ def _read_marks(
+     marks: _Marks, outcomes: tuple[Outcome, ...]
+-) -> tuple[frozenset[int], frozenset[int]] | None:
++) -> tuple[frozenset[int], frozenset[int], frozenset[int]] | None:
+     """Validates a round's marks against its verdict: ``(final, counted)``, or ``None``.
+ 
+     A final rejection must name an exact ``int`` index in range whose outcome is ``REJECTED``,
+@@ -1340,7 +1354,11 @@ def _read_marks(
+       None.
+     """
+     found: list[frozenset[int]] = []
+-    for given, wanted in ((marks.final, Outcome.REJECTED), (marks.counted, Outcome.RETRYABLE)):
++    for given, wanted in (
++        (marks.final, Outcome.REJECTED),
++        (marks.counted, Outcome.RETRYABLE),
++        (marks.reached, Outcome.RETRYABLE),
++    ):
+         indices: set[int] = set()
+         for index in given:
+             if type(index) is not int:
+@@ -1349,7 +1367,7 @@ def _read_marks(
+                 return None
+             indices.add(index)
+         found.append(frozenset(indices))
+-    return found[0], found[1]
++    return found[0], found[1], found[2]
+ 
+ 
+ def detached[T](call: Callable[[], T], failed: Callable[[T], bool]) -> T:
+@@ -1659,6 +1677,9 @@ def _run(
+         fate: list[object] = [Outcome.RETRYABLE] * total_events
+         final_of = [False] * total_events
+         counted_of = [False] * total_events
++        reached_of = [False] * total_events
++        resent = 0
++        resent_kinds: list[str] = []
+         refused_in = [0] * total_events
+         decided_in = [0] * total_events
+         refusals: dict[int, Exception] = {}
+@@ -1690,7 +1711,7 @@ def _run(
+             resend = predicate is not None and is_retryable(predicate, exc)
+             for index in pending:
+                 fate[index] = _RAISED
+-                final_of[index] = counted_of[index] = False
++                final_of[index] = counted_of[index] = reached_of[index] = False
+                 refused_in[index] = 0
+             return pending if resend else []
+ 
+@@ -1705,6 +1726,8 @@ def _run(
+                     declined = True
+                     break
+             offered = batch if not attempts else [events[index] for index in pending]
++            if attempts:
++                resent += sum(1 for index in pending if reached_of[index])
+             n = len(pending)
+             attempts += 1
+             for index in pending:
+@@ -1729,7 +1752,7 @@ def _run(
+                     overridden.add(attempts)
+                     for index in pending:
+                         fate[index] = _UNREAD
+-                        final_of[index] = counted_of[index] = False
++                        final_of[index] = counted_of[index] = reached_of[index] = False
+                         refused_in[index] = 0
+                     if not idempotent:
+                         pending = []
+@@ -1750,6 +1773,7 @@ def _run(
+                         fate[index] = outcome
+                         final_of[index] = at in read[0]
+                         counted_of[index] = at in read[1]
++                        reached_of[index] = at in read[2]
+                         refused_in[index] = attempts if marks.refused is not None else 0
+                         if outcome is Outcome.RETRYABLE or (
+                             idempotent and outcome is Outcome.UNKNOWN
+@@ -1767,6 +1791,8 @@ def _run(
+             refused=refusals.get(attempts),
+             raise_on_failure=context._raise_on_failure,
+         )
++        if resent:
++            delivery = dataclasses.replace(delivery, resent=resent)
+         lost_fates = (Outcome.REJECTED, Outcome.RETRYABLE, Outcome.UNKNOWN, _RAISED, _UNREAD)
+         excluded = sum(
+             1
+@@ -1812,6 +1838,9 @@ def _run(
+             with Deferral(counters) as ledger:
+                 ledger.count("failed_events", unconfirmed)
+                 ledger.count("dropped_events", dropped)
++                ledger.count("resent_events", resent)
++                if resent:
++                    ledger.announce(lambda: _diag.resent(resent, name))
+                 for owner, counts in shared:
+                     for counter, amount in counts.items():
+                         ledger.count_for(owner, counter, amount)
+diff --git a/src/log_foundry/sinks/_rounds.py b/src/log_foundry/sinks/_rounds.py
+index 9b2f421..cb6d03f 100644
+--- a/src/log_foundry/sinks/_rounds.py
++++ b/src/log_foundry/sinks/_rounds.py
+@@ -26,6 +26,7 @@ __all__ = [
+     "KeyedReply",
+     "Lost",
+     "entry_ids",
++    "mark_reached",
+     "mark_sent",
+     "raised_line",
+     "read_keyed",
+@@ -35,6 +36,18 @@ __all__ = [
+ ]
+ 
+ 
++def mark_reached(
++    positions: list[int], error: Exception | None, retryable: bool, reached: bool | None = None
++) -> None:
++    """Marks a raised call's RETRYABLE positions that may have landed (prototype)."""
++    from log_foundry.sinks._classify import may_have_landed
++
++    if reached is None:
++        reached = error is not None and may_have_landed(error)
++    if error is not None and retryable and reached:
++        run_context().may_have_landed(positions)
++
++
+ def _sends(owner: object) -> dict[int, list[object]]:
+     """Returns the run's send counts for ``owner``, keyed by event identity.
+ 
+@@ -220,6 +233,7 @@ class Called[T](NamedTuple):
+     result: T | None
+     error: Exception | None = None
+     retryable: bool = False
++    reached: bool | None = None
+ 
+ 
+ class KeyedReply(NamedTuple):
+@@ -392,6 +406,7 @@ def settle_keyed(
+         kind = _diag.type_name(error)
+         for position in positions:
+             fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
++        mark_reached(positions, error, retryable, True)
+         lost.add(
+             carried,
+             when=When.LAST if retryable else When.ALWAYS,
+@@ -514,6 +529,7 @@ def settle_positional(
+         kind = _diag.type_name(error)
+         for position in positions:
+             fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
++        mark_reached(positions, error, retryable, True)
+         lost.add(
+             carried,
+             when=When.LAST if retryable else When.ALWAYS,
+@@ -556,12 +572,17 @@ def settle_positional(
+         return
+     retry = {id(record) for record in verdict.retry}
+     retrying: list[dict[str, object]] = []
++    coded_may_land: list[int] = []
+     for position, event, record in zip(positions, carried, records, strict=True):
+         if id(record) in retry:
+             fates[position] = Outcome.RETRYABLE
+             retrying.append(event)
++            if results_key == "RequestResponses":
++                coded_may_land.append(position)
+         else:
+             fates[position] = Outcome.ACCEPTED
++    if coded_may_land:
++        context.may_have_landed(coded_may_land)
+     lost.add(
+         retrying,
+         when=When.LAST,
+diff --git a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
+index ec68617..96a42bc 100644
+--- a/src/log_foundry/sinks/_socket.py
++++ b/src/log_foundry/sinks/_socket.py
+@@ -27,7 +27,7 @@ from log_foundry.sinks._retry import (
+     require_timeout,
+     wait,
+ )
+-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line, mark_reached
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+ if TYPE_CHECKING:
+@@ -567,6 +567,7 @@ class SocketTransport:
+                 self._unconfirm(unconfirmed, fates, context)
+                 unconfirmed = []
+                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
++                mark_reached([position], called.error, called.retryable, called.reached)
+                 kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
+                 lost.add(
+                     [batch[position]],
+@@ -702,14 +703,24 @@ class SocketTransport:
+         Raises:
+           None.
+         """
++        sending = False
+         try:
+             if self._transport == "udp":
+                 self._socket().sendto(message, (self._host, self._port))
+             else:
+-                self._socket().sendall(message)
++                sock = self._socket()
++                sending = True
++                sock.sendall(message)
+         except Exception as err:
+             self._reset()
+-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
++            from log_foundry.sinks._classify import may_have_landed
++
++            return Called(
++                None,
++                error=err,
++                retryable=is_retryable(self._retryable_error, err),
++                reached=sending and may_have_landed(err),
++            )
+         return Called(None)
+ 
+     def _retryable_error(self, err: Exception) -> bool:
+diff --git a/src/log_foundry/sinks/base.py b/src/log_foundry/sinks/base.py
+index 243ba47..50a6a49 100644
+--- a/src/log_foundry/sinks/base.py
++++ b/src/log_foundry/sinks/base.py
+@@ -65,6 +65,7 @@ class SinkLosses:
+ 
+     dropped: int
+     failed: int
++    resent: int = 0
+ 
+ 
+ @runtime_checkable
+diff --git a/src/log_foundry/sinks/clickhouse.py b/src/log_foundry/sinks/clickhouse.py
+index 8df18a9..8c74d37 100644
+--- a/src/log_foundry/sinks/clickhouse.py
++++ b/src/log_foundry/sinks/clickhouse.py
+@@ -16,7 +16,7 @@ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+ from log_foundry.sinks._retry import floor_count, require_positive, require_timeout
+-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line, mark_reached
+ from log_foundry.sinks.base import SinkDeliveryError
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+@@ -350,6 +350,7 @@ class ClickHouseSink:
+                     outcome = Outcome.ACCEPTED
+                 else:
+                     outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
++                    mark_reached([p for p, _ in chunk], called.error, called.retryable, True)
+                     kind = _diag.type_name(called.error)
+                     lost.add(
+                         carried,
+diff --git a/src/log_foundry/sinks/elasticsearch.py b/src/log_foundry/sinks/elasticsearch.py
+index 693e30c..1d53ea4 100644
+--- a/src/log_foundry/sinks/elasticsearch.py
++++ b/src/log_foundry/sinks/elasticsearch.py
+@@ -229,6 +229,7 @@ class ElasticsearchSink(HTTPSink):
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.item_errors + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+ 
+diff --git a/src/log_foundry/sinks/eventhubs.py b/src/log_foundry/sinks/eventhubs.py
+index e8622c4..1f0ffd6 100644
+--- a/src/log_foundry/sinks/eventhubs.py
++++ b/src/log_foundry/sinks/eventhubs.py
+@@ -15,7 +15,7 @@ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+ from log_foundry.sinks._retry import floor_count
+-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line, mark_reached
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+ if TYPE_CHECKING:
+@@ -396,6 +396,7 @@ class AzureEventHubsSink:
+             outcome = Outcome.ACCEPTED
+         else:
+             outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
++            mark_reached(list(packed), called.error, called.retryable, True)
+             kind = _diag.type_name(called.error)
+             lost.add(
+                 carried,
+diff --git a/src/log_foundry/sinks/honeycomb.py b/src/log_foundry/sinks/honeycomb.py
+index 7e9d73a..2744ab1 100644
+--- a/src/log_foundry/sinks/honeycomb.py
++++ b/src/log_foundry/sinks/honeycomb.py
+@@ -394,6 +394,7 @@ class HoneycombSink(HTTPSink):
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.rejected_events + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+ 
+diff --git a/src/log_foundry/sinks/http.py b/src/log_foundry/sinks/http.py
+index 52e2c8f..c84a66a 100644
+--- a/src/log_foundry/sinks/http.py
++++ b/src/log_foundry/sinks/http.py
+@@ -235,6 +235,7 @@ class _Answer:
+     retry_after: float | None = None
+     detail: str = ""
+     error: Exception | None = None
++    reached: bool = False
+ 
+ 
+ @dataclass
+@@ -2522,6 +2523,8 @@ class HTTPSink:
+                         outcomes = self._read(answer.payload, chunk)
+                     else:
+                         outcomes = (answer.outcome,) * len(chunk)
++                        if answer.outcome is Outcome.RETRYABLE and answer.reached:
++                            context.may_have_landed(where)
+                         hint = answer.retry_after
+                         if (
+                             answer.outcome is Outcome.RETRYABLE
+@@ -3121,6 +3124,7 @@ class HTTPSink:
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+     def close(self) -> None:
+@@ -3234,9 +3238,11 @@ class HTTPSink:
+                 return Verdict(outcomes=(Outcome.REJECTED,))
+             sent.answer = answer
+             outcome = Outcome.REJECTED if answer.outcome is None else answer.outcome
++            if outcome is Outcome.RETRYABLE and answer.reached:
++                _engine.run_context().may_have_landed([0])
+             return Verdict(outcomes=(outcome,), retry_after=answer.retry_after)
+ 
+-        _engine._run(
++        delivery = _engine._run(
+             self,
+             one,
+             SinkCounters(),
+@@ -3246,6 +3252,11 @@ class HTTPSink:
+             stop=_engine.stop_signal_of(self),
+             decline=None,
+         )
++        if delivery.resent:
++            counters = self.log_foundry_counters
++            with counters._counter_lock:
++                counters.resent_events += delivery.resent
++            _diag.resent(delivery.resent, f"{_diag.type_name(self)}, request(s)")
+         if sent.raised is not None:
+             raise sent.raised
+         answer = sent.answer
+@@ -3301,7 +3312,13 @@ class HTTPSink:
+         except Exception as err:
+             reason = f"connection error, {_diag.type_name(err)} {_diag.errno_of(err)}".rstrip()
+             if is_retryable(self._retryable_error, err):
+-                return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
++                from log_foundry.sinks._classify import may_have_landed
++
++                return _Answer(
++                    Outcome.RETRYABLE,
++                    detail=self._give_up(context, reason, When.LAST),
++                    reached=may_have_landed(err),
++                )
+             if not count_unexpected and not _diag.is_a(err, SinkDeliveryError):
+                 return _Answer(Outcome.REJECTED, error=err)
+             return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
+@@ -3313,7 +3330,9 @@ class HTTPSink:
+             return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
+         if self._retryable_status(status):
+             detail = self._give_up(context, f"HTTP {status}", When.LAST)
+-            return _Answer(Outcome.RETRYABLE, retry_after=retry_after, detail=detail)
++            return _Answer(
++                Outcome.RETRYABLE, retry_after=retry_after, detail=detail, reached=status >= 500
++            )
+         if status == 413 and splittable:
+             return _Answer(None, payload=payload)
+         return _Answer(
+diff --git a/src/log_foundry/sinks/mongodb.py b/src/log_foundry/sinks/mongodb.py
+index c4d7426..7140281 100644
+--- a/src/log_foundry/sinks/mongodb.py
++++ b/src/log_foundry/sinks/mongodb.py
+@@ -19,7 +19,7 @@ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+ from log_foundry.sinks._retry import floor_count, require_timeout
+-from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Lost, mark_sent, raised_line, sends_of
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+ if TYPE_CHECKING:
+@@ -43,6 +43,19 @@ only when neither the caller nor the URI's query names one.
+ """
+ 
+ 
++def _own_id_again(entry: object) -> bool:
++    """Whether a writeErrors entry is a duplicate key on ``_id`` (prototype)."""
++    if not issubclass(type(entry), dict):
++        return False
++    if entry.get("code") != 11000:
++        return False
++    pattern = entry.get("keyPattern")
++    if issubclass(type(pattern), dict):
++        return pattern == {"_id": 1}
++    message = entry.get("errmsg")
++    return issubclass(type(message), str) and " index: _id_ " in message
++
++
+ def _uri_option_names(uri: str | None) -> set[str]:
+     """Returns the option names a MongoDB URI's query carries, lower-cased.
+ 
+@@ -429,7 +442,7 @@ class MongoDBSink:
+             except Exception as err:
+                 details = getattr(err, "details", None)
+                 if _diag.is_a(details, dict) and "writeErrors" in details:
+-                    self._settle_bulk(details["writeErrors"], positions, fates)
++                    self._settle_bulk(details["writeErrors"], positions, fates, carried)
+                 else:
+                     retryable = is_retryable(self._retryable_error, err)
+                     for position in positions:
+@@ -449,7 +462,13 @@ class MongoDBSink:
+                 encoded_landed(self, positions)
+             return Verdict(outcomes=tuple(fates))
+ 
+-    def _settle_bulk(self, errors: object, positions: list[int], fates: list[Outcome]) -> None:
++    def _settle_bulk(
++        self,
++        errors: object,
++        positions: list[int],
++        fates: list[Outcome],
++        carried: list[dict[str, object]] | None = None,
++    ) -> None:
+         """Reads a ``BulkWriteError``'s ``writeErrors`` by ``index`` through the keyed reader.
+ 
+         A list it cannot pair makes every document ``UNKNOWN`` with one line, ``ALWAYS``, or
+@@ -485,14 +504,21 @@ class MongoDBSink:
+             return
+         landed: list[int] = []
+         rejects = 0
+-        for position, named in zip(positions, read.failed, strict=True):
+-            if named is None:
++        for at, (position, named) in enumerate(zip(positions, read.failed, strict=True)):
++            if named is None or (
++                carried is not None
++                and _own_id_again(named)
++                and "_id" not in carried[at]
++                and sends_of(self, carried[at]) > 1
++            ):
+                 fates[position] = Outcome.ACCEPTED
+                 landed.append(position)
+             else:
+                 fates[position] = Outcome.REJECTED
+                 rejects += 1
+         encoded_landed(self, landed)
++        if not rejects:
++            return
+         total = rejects >= len(positions)
+         context.announce(
+             lambda: _diag.lost(
+diff --git a/src/log_foundry/sinks/multi.py b/src/log_foundry/sinks/multi.py
+index 4170373..d3bcd24 100644
+--- a/src/log_foundry/sinks/multi.py
++++ b/src/log_foundry/sinks/multi.py
+@@ -301,6 +301,7 @@ class MultiSink:
+         return SinkLosses(
+             dropped=sum(child.dropped for child in reported),
+             failed=sum(child.failed for child in reported) + absorbed,
++            resent=sum(child.resent for child in reported),
+         )
+ 
+     def close(self) -> None:
+diff --git a/src/log_foundry/sinks/nats.py b/src/log_foundry/sinks/nats.py
+index 6c497e1..335a35a 100644
+--- a/src/log_foundry/sinks/nats.py
++++ b/src/log_foundry/sinks/nats.py
+@@ -1856,4 +1856,8 @@ def _unlocked(counters: SinkCounters) -> SinkLosses:
+     Raises:
+       None.
+     """
+-    return SinkLosses(dropped=counters.dropped_events, failed=counters.failed_events)
++    return SinkLosses(
++        dropped=counters.dropped_events,
++        failed=counters.failed_events,
++        resent=counters.resent_events,
++    )
+diff --git a/src/log_foundry/sinks/otlp.py b/src/log_foundry/sinks/otlp.py
+index 8ccbc2f..08db904 100644
+--- a/src/log_foundry/sinks/otlp.py
++++ b/src/log_foundry/sinks/otlp.py
+@@ -340,6 +340,7 @@ class OTLPSink(HTTPSink):
+             return SinkLosses(
+                 dropped=self.dropped_oversized + self._unrenderable,
+                 failed=self.failed + self.rejected_records + self.dropped_unadjudicated,
++                resent=self.log_foundry_counters.resent_events,
+             )
+ 
+ 
+diff --git a/src/log_foundry/sinks/postgres.py b/src/log_foundry/sinks/postgres.py
+index 43ae1d8..027c0d9 100644
+--- a/src/log_foundry/sinks/postgres.py
++++ b/src/log_foundry/sinks/postgres.py
+@@ -23,7 +23,7 @@ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+ from log_foundry.sinks._retry import floor_count, require_positive
+-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line, mark_reached
+ from log_foundry.sinks.base import SinkDeliveryError
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+@@ -421,6 +421,7 @@ class PostgresSink:
+                 outcome = Outcome.ACCEPTED
+             else:
+                 outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
++                mark_reached(positions, called.error, called.retryable, called.reached)
+                 suffix = (
+                     ", borrowed connection is broken and this sink may not reopen it"
+                     if not self._owns_connection and self._is_broken()
+@@ -454,6 +455,7 @@ class PostgresSink:
+         Raises:
+           None. This is an isolation boundary: a driver fault must never crash the worker.
+         """
++        committing = False
+         try:
+             self._reconnect_if_broken()
+             chunks = 0
+@@ -462,10 +464,18 @@ class PostgresSink:
+                     chunks += 1
+                     cur.executemany(self._insert_sql, chunk)
+             if chunks:
++                committing = True
+                 self._conn.commit()
+         except Exception as err:
+             self._rollback()
+-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
++            state = getattr(err, "sqlstate", None)
++            reached = committing and (state is None or str(state)[:2] in ("08", "57", "XX"))
++            return Called(
++                None,
++                error=err,
++                retryable=is_retryable(self._retryable_error, err),
++                reached=reached,
++            )
+         return Called(chunks)
+ 
+     def _retryable_error(self, err: Exception) -> bool:
+diff --git a/src/log_foundry/sinks/rabbitmq.py b/src/log_foundry/sinks/rabbitmq.py
+index 034c8e9..24822ae 100644
+--- a/src/log_foundry/sinks/rabbitmq.py
++++ b/src/log_foundry/sinks/rabbitmq.py
+@@ -15,7 +15,7 @@ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+ from log_foundry.sinks._retry import floor_count, require_timeout
+-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line, mark_reached
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+ if TYPE_CHECKING:
+@@ -357,6 +357,7 @@ class RabbitMQSink:
+                     unknown.append(kind)
+                     continue
+                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
++                mark_reached([position], called.error, called.retryable, called.reached)
+                 lost.add(
+                     [batch[position]],
+                     when=When.LAST if called.retryable else When.ALWAYS,
+@@ -452,7 +453,9 @@ class RabbitMQSink:
+             channel = self._active_channel()
+         except Exception as err:
+             self._reset()
+-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
++            return Called(
++                None, error=err, retryable=is_retryable(self._retryable_error, err), reached=False
++            )
+         try:
+             channel.basic_publish(
+                 exchange=self._exchange,
+@@ -475,7 +478,24 @@ class RabbitMQSink:
+             )
+             if self._confirming and _diag.is_a(err, unconfirmed):
+                 return Called("unknown", error=err)
+-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
++            from log_foundry.sinks._classify import may_have_landed
++
++            if _diag.is_a(err, driver_classes("pika.exceptions", "AMQPError")):
++                reached = _diag.is_a(
++                    err,
++                    driver_classes(
++                        "pika.exceptions",
++                        "StreamLostError",
++                        "ConnectionClosedByBroker",
++                        "AMQPHeartbeatTimeout",
++                        "ConnectionBlockedTimeout",
++                    ),
++                )
++            else:
++                reached = may_have_landed(err)
++            return Called(
++                None, error=err, retryable=is_retryable(self._retryable_error, err), reached=reached
++            )
+         return Called(None)
+ 
+     def _retryable_error(self, err: Exception) -> bool:
+diff --git a/src/log_foundry/sinks/redis.py b/src/log_foundry/sinks/redis.py
+index 98cbbd2..787280d 100644
+--- a/src/log_foundry/sinks/redis.py
++++ b/src/log_foundry/sinks/redis.py
+@@ -15,7 +15,7 @@ from log_foundry.sinks._extras import import_extra
+ from log_foundry.sinks._guard import ClosedGuard, GuardMode
+ from log_foundry.sinks._refusal import final_refusal
+ from log_foundry.sinks._retry import floor_count, require_positive
+-from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
++from log_foundry.sinks._rounds import Lost, mark_sent, raised_line, mark_reached
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ 
+ if TYPE_CHECKING:
+@@ -300,6 +300,7 @@ class _RedisSink:
+                 )
+                 lost.register()
+                 outcome = Outcome.RETRYABLE if retryable else Outcome.REJECTED
++                mark_reached(list(positions), err, retryable, True)
+             else:
+                 outcome = Outcome.ACCEPTED
+             for position in positions:
+diff --git a/src/log_foundry/sinks/sentry.py b/src/log_foundry/sinks/sentry.py
+index 58c068c..433e7b1 100644
+--- a/src/log_foundry/sinks/sentry.py
++++ b/src/log_foundry/sinks/sentry.py
+@@ -415,9 +415,10 @@ class SentrySink:
+         Raises:
+           None.
+         """
++        resent = self._http.log_foundry_counters.resent_events if self._http is not None else 0
+         with self._counter_lock:
+             return SinkLosses(
+-                dropped=self.discarded, failed=self.failed + self.transport_errors
++                dropped=self.discarded, failed=self.failed + self.transport_errors, resent=resent
+             )
+ 
+     def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool | None:
+diff --git a/src/log_foundry/sinks/verdict.py b/src/log_foundry/sinks/verdict.py
+index 7caf49d..d1f0cab 100644
+--- a/src/log_foundry/sinks/verdict.py
++++ b/src/log_foundry/sinks/verdict.py
+@@ -203,6 +203,7 @@ class SinkCounters:
+         """
+         self.dropped_events = 0
+         self.failed_events = 0
++        self.resent_events = 0
+         self._counter_lock = threading.Lock()
+         _LIVE_COUNTERS.add(self)
+ 
+@@ -221,7 +222,8 @@ class SinkCounters:
+         with self._counter_lock:
+             dropped = self.dropped_events
+             failed = self.failed_events
+-        return SinkLosses(dropped=dropped, failed=failed)
++            resent = self.resent_events
++        return SinkLosses(dropped=dropped, failed=failed, resent=resent)
+ 
+ 
+ def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> object | None:
