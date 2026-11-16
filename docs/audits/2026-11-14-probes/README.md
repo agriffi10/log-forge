@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Fifty-four files here are not the audit's.** Each was added after the audit was brought in
+**Fifty-seven files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -57,6 +57,11 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   prototype patches, `sinks/spec093_prototype.patch` and `sinks/spec094_prototype.patch`.
   SPEC-095's *Evidence* section says what each measured.
 
+- `sinks/spec096_limits_today.py`, `spec096_destination_below_limit.py` and
+  `spec096_corpus_rows.py`, written while authoring SPEC-096 against `10ba21ee`: how `SQSSink` and
+  `SNSSink` apply their byte limit today, what each counts when the destination's limit is below
+  the sink's, and whether any SPEC-092 row depends on the limit. The third imports SPEC-092's
+  prototype, so it needs `sinks/` and `tests/` on `PYTHONPATH` as its docstring says.
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded
 in the frame report under `../2026-11-14-frames/`. They are exempt from the linters for that

@@ -1456,6 +1456,22 @@ close it.
   path's delivery call that a closer waits for or that re-arms the sink once the call returns, or
   by one lifecycle command path.
 
+- **`KinesisSink`'s limits predate Kinesis's 10 MiB records** (found while authoring SPEC-096,
+  2026-11-16, from the live AWS pages and not measured against a stream; invariant 2's
+  `dropped_oversized`). The class caps a record at 1 MiB and a `PutRecords` request at 5 MiB
+  (`sinks/kinesis.py:65-66`). `PutRecords` now reads "Each record in the request can be as large as
+  10 MiB, up to a limit of 10 MiB for the entire request, including partition keys", and a stream's
+  record limit is its own setting, `MaxRecordSizeInKiB`, "between 1024 and 10240 KiB"
+  (`UpdateMaxRecordSize`), with "The default maximum record size for existing, and newly created
+  streams is set to 1 MiB" (*Handle large records*). So the 1 MiB record cap is still right for a
+  stream left at its default, but every record above it is dropped and counted for a stream raised
+  past it, and the 5 MiB request cap costs extra calls and loses nothing. `FirehoseSink`'s 1,000 KiB
+  and 4 MiB caps (`sinks/firehose.py:65-66`) were read the same day and still match its
+  `PutRecordBatch` page, which says "These limits cannot be changed". **Closed by** a spec that gives
+  `KinesisSink` a record limit argument as SPEC-096 gives the SQS and SNS sinks a message limit,
+  defaulting to 1 MiB, with the request cap raised to 10 MiB or kept with its reason, and the record
+  limit held at or below the request cap so that no record that passes the one can fail the other.
+
 **Filed from the 2026-11-14 audit.** Every item from here to *Resolved* was filed from
 `docs/audits/2026-11-14-post-1.2.0-audit.md`, whose findings table gives each its number: the
 pipeline's accounting first, then the lifecycle, the sinks, and the verification that should have
@@ -1866,13 +1882,21 @@ an item leaves this list when a spec closes it, not because the arc names it.
   it is has not been established. **Closed by** reading the CI and Integration runs of the pull
   request that landed each spec (#294, #307, #308 and #299 in that order), and for each line
   striking it with the run that settled it, or filing here what did not settle.
-- **`SQSSink.MAX_BYTES` may be below what the service now accepts** (2026-11-14 audit, raised by the
-  sinks frame from memory and unverified; invariant 2's `dropped_oversized`). The class holds 256
-  KiB (`sinks/sqs.py:186`) and an event whose message exceeds it is dropped, counted (`:690`). The
-  frame believes AWS raised the SQS message limit to 1 MiB during 2025 and did not check; if that is
-  right, the sink drops events the queue would take. Nothing here has been measured or read.
-  **Closed by** reading the live AWS documentation for the limit, not memory, and then either
-  raising the constant or striking this item with the page that confirms 256 KiB.
+- **`SQSSink.MAX_BYTES` is below what the service now accepts, and neither SQS nor SNS sink lets a
+  caller match a destination's own limit** (2026-11-14 audit, raised by the sinks frame from memory;
+  read against the live AWS pages on 2026-11-15 and 2026-11-16 while SPEC-096 was authored;
+  invariant 2's `dropped_oversized`). The class holds 256 KiB (`sinks/sqs.py:186`), and an event
+  whose message exceeds it is dropped and counted (`:690`). AWS raised the limit on 2025-08-04
+  ("Amazon Simple Queue Service (Amazon SQS) has increased the maximum message payload size from
+  256 KiB to 1 MiB", *What's New*, posted Aug 4, 2025), and a queue's `MaximumMessageSize` is now "An integer from 1,024 bytes (1
+  KiB) to 1,048,576 bytes (1 MiB). Default: 1,048,576 bytes (1 MiB)" (`CreateQueue`). So the sink
+  drops an event between 256 KiB and 1 MiB that a queue at the service default would take, and
+  sends one that a queue configured below 256 KiB refuses; when that refusal is the whole call, the
+  call's other events are lost with it, counted in `failed`
+  (`docs/audits/2026-11-14-probes/sinks/spec096_destination_below_limit.py`, case S4). `SNSSink`
+  has the second half: a topic's `MaximumMessageSize` defaults to 262,144 bytes and may be raised to
+  1,048,576, and `SNSSink.MAX_BYTES` (`sinks/sns.py:70`) cannot follow it. **Closed by** SPEC-096,
+  which gives both sinks a `max_message_bytes=` argument.
 - **Three comments give a suite time that CI may no longer show** (2026-11-14 audit, raised by the
   verification frame and unverified here; no invariant). `.github/workflows/ci.yml:131` says the
   pytest step fell to about 49 s, `:108` reasons from that figure, and `pyproject.toml`'s comments
