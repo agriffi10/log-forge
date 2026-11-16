@@ -1,6 +1,6 @@
 diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py
---- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 18:37:45
-+++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 18:37:46
+--- a/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 20:41:13
++++ b/docs/audits/2026-11-14-probes/sinks/spec092_shims.py	2026-11-15 20:42:48
 @@ -69,6 +69,16 @@
          "ChannelClosedByBroker": ("AMQPError",),
      },
@@ -18,7 +18,7 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
      "redis.exceptions": {
          "RedisError": (),
          "ConnectionError": ("RedisError",),
-@@ -941,9 +951,13 @@
+@@ -949,9 +959,13 @@
              if self.settled or fault == "report-indefinite":
                  self.backend.take(self.carried)
          if fault == "never-acknowledged":
@@ -35,8 +35,8 @@ diff -ruN ./docs/audits/2026-11-14-probes/sinks/spec092_shims.py ./docs/audits/2
  
      def exception(self, timeout: float | None = None) -> BaseException | None:
 diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
---- a/src/log_foundry/sinks/kafka.py	2026-11-15 18:37:45
-+++ b/src/log_foundry/sinks/kafka.py	2026-11-15 18:37:46
+--- a/src/log_foundry/sinks/kafka.py	2026-11-15 20:40:35
++++ b/src/log_foundry/sinks/kafka.py	2026-11-15 20:42:48
 @@ -7,18 +7,76 @@
  from typing import Any
  
@@ -527,8 +527,8 @@ diff -ruN ./src/log_foundry/sinks/kafka.py ./src/log_foundry/sinks/kafka.py
  
  def _code(err: object) -> str:
 diff -ruN ./src/log_foundry/sinks/pubsub.py ./src/log_foundry/sinks/pubsub.py
---- a/src/log_foundry/sinks/pubsub.py	2026-11-15 18:37:45
-+++ b/src/log_foundry/sinks/pubsub.py	2026-11-15 18:38:07
+--- a/src/log_foundry/sinks/pubsub.py	2026-11-15 20:40:35
++++ b/src/log_foundry/sinks/pubsub.py	2026-11-15 20:42:48
 @@ -8,12 +8,16 @@
  from typing import Any
  

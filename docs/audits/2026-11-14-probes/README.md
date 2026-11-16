@@ -37,7 +37,7 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   authoring SPEC-094. Each is run with `PYTHONPATH=<tree>/src` as its docstring says, against two
   trees to compare. `sinks/spec093_prototype.patch` and `sinks/spec094_prototype.patch` are not
   probes: they are the two specs' prototypes, applied in that order with `patch -p1` to
-  `git archive bb6656ff src tests docs/audits/2026-11-14-probes`, and SPEC-093's and SPEC-094's
+  `git archive 9d70f782 src tests docs/audits/2026-11-14-probes`, and SPEC-093's and SPEC-094's
   *Evidence* sections say what each measured.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they

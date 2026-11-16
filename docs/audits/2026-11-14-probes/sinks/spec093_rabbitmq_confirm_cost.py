@@ -5,13 +5,16 @@ pika's `BlockingChannel.basic_publish` in confirm mode waits for each message's 
 before it returns (`pika/adapters/blocking_connection.py`, `basic_publish`), so the fake channel
 here sleeps a set round trip inside each publish once `confirm_delivery()` was called, and
 returns at once otherwise. It prints the median wall time of one `emit` per batch size and round
-trip. Run it against two trees and compare:
+trip. Revised the same day for SPEC-093's review: confirms are opt-in (`confirm=True`), which the
+probe passes where the tree accepts it, and a 5 ms round trip is measured. Run it against two trees
+and compare:
 
     PYTHONPATH=<tree>/src python -B spec093_rabbitmq_confirm_cost.py
 """
 
 from __future__ import annotations
 
+import inspect
 import statistics
 import sys
 import time
@@ -52,11 +55,12 @@ class Connection:
 
 def main() -> int:
     print("log_foundry", log_foundry.__file__, "python", sys.version.split()[0])
-    for rtt in (0.0002, 0.001):
+    extra = {"confirm": True} if "confirm" in inspect.signature(RabbitMQSink).parameters else {}
+    for rtt in (0.0002, 0.001, 0.005):
         for size in (10, 100, 1000):
-            sink = RabbitMQSink(exchange="x", routing_key="k", connection=Connection(rtt))
+            sink = RabbitMQSink(exchange="x", routing_key="k", connection=Connection(rtt), **extra)
             times = []
-            for _ in range(5):
+            for _ in range(3 if rtt >= 0.005 else 5):
                 events = [{"message": "m", "i": i} for i in range(size)]
                 started = time.perf_counter()
                 sink.emit(events)

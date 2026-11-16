@@ -1,4 +1,4 @@
-"""SPEC-093 probe: what a TCP writer can know when its peer closes, under five detection options.
+"""SPEC-093 probe: what a TCP writer can know when its peer closes, under six detection options.
 
 Written on 2026-11-15 while authoring SPEC-093, against 33582484; not one of the audit's probes.
 It drives a frame loop shaped like `SocketTransport._round` (one `sendall` per frame, reconnect
@@ -7,7 +7,13 @@ scenario sends a first batch, has the listener close the connection the writer h
 a second batch of 50. Per option it prints what the listener received of the second batch and
 how the writer would report each frame: `accepted`, `unknown` (written since the last check on
 a connection then found closed) or `retried` (a raise, resent on a new connection). `silent` is
-frames reported accepted that never arrived. Run from anywhere: `python -B <this file> [runs]`.
+frames reported accepted that never arrived, and `unknown_received` frames counted as may-have-
+landed that did arrive. The `half-close` scenario has the listener shut down its write side on
+every connection and keep reading, which is legal TCP. Revised the same day for SPEC-093's review:
+the half-close scenario, the `round+raise+end-on-reset` option, and the cost lines printed last
+(a `select.select` check, a fresh `select.poll` object per check, `sendall` of one frame, and how
+long `recv(MSG_PEEK | MSG_DONTWAIT)` waits on a socket that has a timeout). Run from anywhere:
+`python -B <this file> [runs]`.
 """
 
 from __future__ import annotations
@@ -28,18 +34,26 @@ OPTIONS = (
     "unknown-on-raise",
     "round+raise",
     "round+raise+end",
+    "round+raise+end-on-reset",
 )
+CHECKED = ("check-per-round", "round+raise", "round+raise+end", "round+raise+end-on-reset")
+ON_RAISE = ("unknown-on-raise", "round+raise", "round+raise+end", "round+raise+end-on-reset")
+
+
+def closed_how(sock: socket.socket) -> str:
+    """`open`, `fin` (readable with nothing to read) or `reset` (a peek that raises)."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if not readable:
+            return "open"
+        return "fin" if sock.recv(1, socket.MSG_PEEK) == b"" else "open"
+    except OSError:
+        return "reset"
 
 
 def closed_by_peer(sock: socket.socket) -> bool:
     """A zero-timeout readiness check, then a peek: readable with nothing to read is a close."""
-    try:
-        readable, _, _ = select.select([sock], [], [], 0)
-        if not readable:
-            return False
-        return sock.recv(1, socket.MSG_PEEK) == b""
-    except OSError:
-        return True
+    return closed_how(sock) != "open"
 
 
 class Listener:
@@ -71,6 +85,8 @@ class Listener:
             threading.Thread(target=target, args=(conn,), daemon=True).start()
 
     def read_first(self, conn: socket.socket) -> None:
+        if self.mode == "half":
+            conn.shutdown(socket.SHUT_WR)
         self.first = conn
         self.ready.set()
         conn.settimeout(0.2)
@@ -91,6 +107,8 @@ class Listener:
             pass
 
     def read_all(self, conn: socket.socket) -> None:
+        if self.mode == "half":
+            conn.shutdown(socket.SHUT_WR)
         try:
             while data := conn.recv(65536):
                 with self.lock:
@@ -123,13 +141,15 @@ def run(option: str, mode: str, after: int | None, n: int = N, gap: float = 0.0)
     for frame in frames("1", 10):
         sock.sendall(frame)
     lst.ready.wait(2)
-    if after is None:
+    if after is None and mode != "half":
         time.sleep(0.3)
         lst.close_first()
         time.sleep(0.2)
+    elif mode == "half":
+        time.sleep(0.2)
     report: dict[int, str] = {}
     since_check: list[int] = []
-    if option in ("check-per-round", "round+raise", "round+raise+end") and closed_by_peer(sock):
+    if option in CHECKED and closed_by_peer(sock):
         sock.close()
         sock = socket.create_connection(("127.0.0.1", lst.port), timeout=5.0)
     pending = list(enumerate(frames("2", n)))
@@ -142,7 +162,7 @@ def run(option: str, mode: str, after: int | None, n: int = N, gap: float = 0.0)
             try:
                 sock.sendall(frame)
             except OSError:
-                if option in ("unknown-on-raise", "round+raise", "round+raise+end"):
+                if option in ON_RAISE:
                     for earlier in since_check:
                         report[earlier] = "unknown"
                 since_check = []
@@ -154,7 +174,14 @@ def run(option: str, mode: str, after: int | None, n: int = N, gap: float = 0.0)
             since_check.append(index)
             if gap:
                 time.sleep(gap)
-        if option == "round+raise+end" and since_check and closed_by_peer(sock):
+        how = closed_how(sock) if since_check else "open"
+        if option == "round+raise+end" and how != "open":
+            for earlier in since_check:
+                report[earlier] = "unknown"
+            since_check = []
+            sock.close()
+            sock = socket.create_connection(("127.0.0.1", lst.port), timeout=5.0)
+        if option == "round+raise+end-on-reset" and how == "reset":
             for earlier in since_check:
                 report[earlier] = "unknown"
             since_check = []
@@ -176,8 +203,60 @@ def run(option: str, mode: str, after: int | None, n: int = N, gap: float = 0.0)
         "unknown_not_received": sum(
             1 for k, v in report.items() if v == "unknown" and k not in received
         ),
+        "unknown_received": sum(1 for k, v in report.items() if v == "unknown" and k in received),
         "silent": sum(1 for k, v in report.items() if v == "accepted" and k not in received),
     }
+
+
+def costs() -> None:
+    """Prints the check's cost beside a frame's, and what `MSG_DONTWAIT` does under a timeout."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    sock = socket.create_connection(srv.getsockname(), timeout=5.0)
+    peer, _ = srv.accept()
+
+    def drain() -> None:
+        try:
+            while peer.recv(1 << 20):
+                pass
+        except OSError:
+            pass
+
+    threading.Thread(target=drain, daemon=True).start()
+    n = 100_000
+    started = time.perf_counter()
+    for _ in range(n):
+        select.select([sock], [], [], 0)
+    per_select = (time.perf_counter() - started) / n * 1e6
+    started = time.perf_counter()
+    for _ in range(n):
+        poller = select.poll()
+        poller.register(sock, select.POLLIN)
+        poller.poll(0)
+    per_poll = (time.perf_counter() - started) / n * 1e6
+    frame = frames("3", 1)[0] * 6
+    started = time.perf_counter()
+    for _ in range(n):
+        sock.sendall(frame)
+    per_send = (time.perf_counter() - started) / n * 1e6
+    print(
+        f"select.select(0) {per_select:.2f} us; fresh select.poll + poll(0) {per_poll:.2f} us; "
+        f"sendall of a {len(frame)}-byte frame {per_send:.2f} us"
+    )
+    idle = socket.create_connection(srv.getsockname(), timeout=1.0)
+    started = time.perf_counter()
+    try:
+        idle.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        outcome = "returned"
+    except OSError as err:
+        outcome = type(err).__name__
+    print(
+        f"recv(MSG_PEEK | MSG_DONTWAIT) on an idle socket with a 1.0 s timeout: {outcome} after "
+        f"{time.perf_counter() - started:.2f} s"
+    )
+    for s in (idle, sock, peer, srv):
+        s.close()
 
 
 def main() -> int:
@@ -188,13 +267,15 @@ def main() -> int:
         ("between batches, RST", "rst", None, N, 0.0),
         ("mid-batch after 10 of 50, FIN", "fin", 10, N, 0.0),
         ("mid-batch after 2 of 3, 1 ms gap", "fin", 2, 3, 0.001),
+        ("half-close, peer keeps reading", "half", None, N, 0.0),
     ]
     for label, mode, after, n, gap in scenarios:
         for option in OPTIONS:
             results = [run(option, mode, after, n, gap) for _ in range(runs)]
-            cols = ("received", "copies", "accepted", "unknown", "unknown_not_received", "silent")
+            cols = ("received", "copies", "accepted", "unknown", "unknown_received", "silent")
             text = "  ".join(f"{c}=" + "/".join(str(r[c]) for r in results) for c in cols)
-            print(f"{label:<33} {option:<16} {text}")
+            print(f"{label:<33} {option:<24} {text}")
+    costs()
     return 0
 
 

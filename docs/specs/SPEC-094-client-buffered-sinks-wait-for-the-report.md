@@ -4,7 +4,7 @@ id: SPEC-094
 title: "Client-Buffered Sinks Wait for the Delivery Report, on the Delivery Engine"
 description: "Moves KafkaSink and GooglePubSubSink onto the delivery engine, with each round waiting within the sink's own timeout for the client's report on every message it handed over, so that a definitive refusal fails the batch, an indefinite report is counted as one that may have landed, and no count arrives after the batch's verdict."
 spec_status: Draft
-depends_on: [SPEC-069, SPEC-072, SPEC-074, SPEC-075, SPEC-076, SPEC-092]
+depends_on: [SPEC-069, SPEC-072, SPEC-074, SPEC-075, SPEC-076, SPEC-092, SPEC-093]
 arc: audit-2026-11-14
 arc_order: 10
 ---
@@ -41,7 +41,8 @@ sent again. Nothing about the batch is counted after its verdict.
 - **`NATSSink`**, which already confirms core batches (SPEC-061), and its round deadline.
 - **`SentrySink`'s transport-side drop**, which stays SPEC-092's `sdk-transport-drop` departure.
 - **The socket, Sentry discard, AWS, `_bulk` and RabbitMQ fixes.** They are SPEC-093, the arc's
-  previous spec, which this one follows in `arc_order` and does not depend on in code.
+  previous spec. This spec depends on it: both land in one PR, and FR-003 edits the corpus and the
+  pending release notes as SPEC-093 leaves them.
 - **Idempotency keys** (finding 5). An `UNKNOWN` message is never sent again here, because no
   shipped sink declares itself idempotent.
 - **A new constructor argument, setting or default.** The wait is bounded by the timeout each sink
@@ -52,23 +53,28 @@ sent again. Nothing about the batch is counted after its verdict.
 
 ## Functional Requirements
 
-Every premise below was read at `33582484`, and every measurement was taken there by the prototype
-under *Evidence*. Two branches that touched `src/log_foundry/sinks/` were open while this spec was
-written, `claude/driver-error-rework-c373af` and `claude/isinstance-guard-9eeb88`. Both landed before
-it was committed, as `8bd0b54a` and `bb6656ff`. They change no line this spec cites, and every
-`file:line` here was re-read at `bb6656ff`. **The build re-verifies every `file:line` against `main`
-as it stands.** Neither sink calls `delivery_error`, so this spec assumes no definition of it. Every
-type test FR-001 and FR-002 add is `_diag.is_a`, as *A type test reads the real type, never the
-value's __class__* (`docs/decisions/failure-paths/`) requires.
+Every premise below was first read at `33582484`, and the prototype under *Evidence* was measured
+there. Two branches that touched `src/log_foundry/sinks/` were open while this spec was written,
+`claude/driver-error-rework-c373af` and `claude/isinstance-guard-9eeb88`. Both landed, as `8bd0b54a`
+and `bb6656ff`, and SPEC-086 then landed as `9d70f782`. None of the three changes a line this spec
+cites, and every `file:line` here was re-read at `9d70f782`. The prototype was rebuilt on
+`9d70f782`. **The build re-verifies every `file:line` against `main` as it stands.** Neither sink
+calls `delivery_error`, so this spec assumes no definition of it. Every type test FR-001 and FR-002
+add is `_diag.is_a`, as *A type test reads the real type, never the value's __class__*
+(`docs/decisions/failure-paths/`) requires.
 
 **Andrew's decision B, made on 2026-11-15**, binds every FR here. He was asked whether a
 client-buffered sink's verdict may come before the client's report, and he answered **"Wait for the
 report (Recommended)"**. Each batch's `emit` waits for the client's delivery reports within the sink's
-existing timeout, as core NATS confirms, so a truthy `flush()` means the broker acknowledged. Core NATS
-counts a batch whose confirmation never came, announces it, and leaves `flush()` truthy, because the
-bytes may still land (invariant 7's recorded exception). An indefinite report here does the same. So
-a truthy `flush()` means that no batch was refused outright. A caller sees the reports that could not
-say in `health().sink`, and in `FlushResult`'s loss counts once SPEC-089 is built.
+existing timeout, as core NATS confirms. The question's gloss went on to say that a truthy `flush()`
+then means the broker acknowledged. That gloss is reconciled here with SPEC-089's settled decision,
+made by Andrew later the same day: `flush()` stays truthy over a counted loss ("Keep truthy, add
+counts"). So under this spec **a truthy `flush()` means every event was either acknowledged or
+counted**, not that the broker acknowledged every one. A definitive refusal of a whole batch fails it
+and `flush()` reads false. An indefinite report is counted as one that may have landed, announced, and
+leaves `flush()` truthy, as core NATS does for a batch whose confirmation never came (invariant 7's
+recorded exception). A caller sees those counts in `health().sink`, and in `FlushResult`'s loss counts
+once SPEC-089 is built.
 
 **The rule both sinks share.** A round hands every remaining event to the client, then waits for the
 reports on the messages it handed over. The wait is bounded by one deadline, the sink's own timeout,
@@ -260,11 +266,12 @@ These are changes to SPEC-092's files as its build delivers them, after SPEC-093
 - **The Kafka double** is unchanged. It already serves reports at `flush`.
 - **Pins.** `verdict-before-refusal` and `verdict-before-indefinite-report` are removed, because their
   four rows read green.
-- **Totals**, after SPEC-093's: 263 rows, 57 pinned, 13 departure rows and 193 that must pass.
+- **Totals**, after SPEC-093's: 268 rows, 58 pinned under five pins, 15 departure rows and 195 that
+  must pass.
 
 #### Acceptance Criteria:
 
-- [ ] The corpus's literals read 263 rows, 57 pinned, 13 departure rows and 193 that must pass
+- [ ] The corpus's literals read 268 rows, 58 pinned, 15 departure rows and 195 that must pass
       (invariants 2 and 7).
 - [ ] Against SPEC-093's verdicts, only the four rows of FR-001 and FR-002 change (invariants 2
       and 7).
@@ -291,8 +298,9 @@ These are the completion ritual's edits, made on the pushed branch.
   - "**Against a broker that never answers, a `KafkaSink` or `GooglePubSubSink` batch holds the drain
     thread for the sink's timeout.**"
 - **Decisions in `docs/decisions/sink-delivery/`.**
-  - A new decision for decision B, which quotes Andrew's question and answer with the date, and the
-    shared rule's table.
+  - A new decision for decision B. It quotes Andrew's question and answer with the date, records
+    the reconciliation with SPEC-089's "Keep truthy, add counts" (a truthy `flush()` means every
+    event was acknowledged or counted), and carries the shared rule's table.
   - A new decision for the two definitive sets and the no-report reading.
 - **Settled decisions refined in place, each with a dated History entry naming SPEC-094.**
   - *A sink may report per event* (`docs/decisions/sink-delivery/`): the engine sinks now include
@@ -318,7 +326,8 @@ These are the completion ritual's edits, made on the pushed branch.
     `max_pending` has no effect.
 - **Rosters and prose gates that name these sinks**, updated to the tree. The engine sinks become 18,
   and the adopter, deferral, retry-loop, fork and retry-safe-prose rosters change as *Evidence* lists.
-- **The release notes**, where SPEC-093's went, and worded as SPEC-090 words it. The entry lists:
+- **The release notes**, where SPEC-093's went, and worded as SPEC-090 words it. The file's title
+  and opener, as SPEC-093 rewrites them, stay true with these changes in. The entry lists:
   - both sinks on the engine, with `deliver`;
   - the per-batch wait and its bound;
   - definitive refusals failing the batch;
@@ -336,8 +345,9 @@ These are the completion ritual's edits, made on the pushed branch.
 
 - [ ] §12's finding-12 item is struck as closed by SPEC-094, and the full-client-queue item is open
       with its own lead, and §13 carries the two bullets (invariant 2).
-- [ ] The decision-B file quotes "Wait for the report (Recommended)" with the date 2026-11-15, and
-      the two new decision files and the four dated History entries exist (invariant 7).
+- [ ] The decision-B file quotes "Wait for the report (Recommended)" with the date 2026-11-15 and
+      states the reconciliation with "Keep truthy, add counts", and the two new decision files and
+      the four dated History entries exist (invariant 7).
 - [ ] Invariants 4 and 7 name the new recorded exceptions (invariants 4 and 7).
 - [ ] The README sites state the wait, and no README sentence says either sink hands off and returns
       without waiting (invariant 2).
@@ -399,11 +409,11 @@ docs/             # FR-004
 
 Every number was taken at `33582484` on macOS with Python 3.13.1 and no extra installed, unless it
 says otherwise. The prototype is `docs/audits/2026-11-14-probes/sinks/spec094_prototype.patch`. It
-applies with `patch -p1` after `spec093_prototype.patch` to `git archive bb6656ff src tests
+applies with `patch -p1` after `spec093_prototype.patch` to `git archive 9d70f782 src tests
 docs/audits/2026-11-14-probes`. SPEC-092's prototype stands in for its corpus, as in SPEC-093.
 
-**The rows.** On top of SPEC-093's prototype, 263 rows read 193 green and 70 red. That is the same in
-three runs on Python 3.13.1 and one on 3.12.12. Exactly these four rows move:
+**The rows.** On top of SPEC-093's prototype, rebuilt on `9d70f782`, 268 rows read 195 green and 73
+red. That is the same in three runs on Python 3.13.1 and one on 3.12.12. Exactly these four rows move:
 
 - `KafkaSink-never-acknowledged` and `GooglePubSubSink-never-acknowledged`, from
   `partition`+`silent-loss` to green;
@@ -426,7 +436,11 @@ prototype read `GooglePubSubSink-never-acknowledged` as `ambiguous-when-knowable
 cannot recognise by class reads as indefinite. With the stub module's class, the row read green.
 
 **The suite.** Against SPEC-093's prototype, 52 more tests fail at `33582484`. Rebased, 53 fail at
-`bb6656ff`, which added `tests/test_class_claim.py`. They are in these files:
+`bb6656ff`, which added `tests/test_class_claim.py`, and the same 53 at `9d70f782`. In that last run,
+at a one-minute load near 100, two unrelated tests also failed once,
+`test_otel_envelope.py::test_every_record_the_mapping_criteria_build_round_trips` and
+`test_otel_mapping.py::test_a_shared_subtree_spends_the_node_budget_exactly_once`, and both passed when
+rerun serially. They are not counted. The 53 are in these files:
 
 | File | Tests |
 |---|---|
@@ -444,7 +458,7 @@ cannot recognise by class reads as indefinite. With the stub module's class, the
 | `test_sink_post_close.py` | 1 |
 | `test_fork_roster.py` | 1 |
 | `test_engine_sinks_roster.py` | 1 |
-| `test_class_claim.py`, at `bb6656ff` only | 1 |
+| `test_class_claim.py`, from `bb6656ff` on | 1 |
 
 With each sink's change applied alone on top of SPEC-093's at `33582484`, 25 of the 52 fail with
 `KafkaSink`'s and 33 with `GooglePubSubSink`'s. 7 fail with either: the roster tests in `test_classify.py`,
@@ -513,7 +527,11 @@ least. With a client that never acknowledges and the timeout at 0.5 s, one `emit
 ## Revision history
 
 - Drafted on 2026-11-15, split from SPEC-093 at the delivery engine. This spec moves two sinks onto
-  it, and SPEC-093 changes no sink's path through it. Decision B's phrase "a truthy `flush()` means the
-  broker acknowledged" is narrower than its own precedent, core NATS, which leaves `flush()` truthy
-  over an unconfirmed batch. This spec follows the precedent and invariant 7 for an indefinite report,
-  and says so above. That reading is Andrew's to overturn.
+  it, and SPEC-093 changes no sink's path through it.
+- Revised the same day, after the fresh-context review of both specs. Decision B's gloss, that a
+  truthy `flush()` means the broker acknowledged, is reconciled with the later SPEC-089 decision
+  ("Keep truthy, add counts", Andrew, 2026-11-15): a truthy `flush()` means every event was
+  acknowledged or counted. That is recorded as the earlier decision read in the light of the later
+  one, and the decision-B file says so (FR-004). SPEC-093 is now in `depends_on`, since both land in
+  one PR, and the Out of Scope sentence says why. The totals follow SPEC-093's revised corpus, in
+  which `RabbitMQSink`'s confirms are opt-in.
