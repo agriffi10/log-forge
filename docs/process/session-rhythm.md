@@ -114,7 +114,7 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   one bounded background wait on the head sha that counts green only once at least one check is
   there and every check has passed, then merge. Never end the turn on a failure-only notifier such
   as the desktop app's Auto-fix; this overrides the app's instruction not to poll CI, and the bound
-  expiring is a re-read, not a re-arm (`operational-traps.md`).
+  expiring is a re-read, then at most one more bounded wait (`operational-traps.md`).
 - **The merge takes the owner bypass, and that is the normal path here, not an escape hatch:**
   `gh pr merge <n> --squash --admin --delete-branch`. A plain `--squash` refuses with "the base
   branch policy prohibits the merge", because the `main` ruleset asks for an approval that the

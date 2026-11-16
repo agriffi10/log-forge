@@ -77,12 +77,14 @@ list project-specific; seed it the first time a trap bites and never again.
   it is green. **The watch:** after the push, start one background wait keyed on the head sha and
   bounded by a timeout. **Green needs at least one check against that sha, and every check
   completed and passing** — over an empty `statusCheckRollup` "every check passed" is vacuously
-  true, which is the state before the first check registers and the state of a PR whose runs never
-  fired (#71) or sat `queued` with no jobs (#339), and `--admin` merges past missing checks. When
-  the bound expires, re-read the checks rather than re-arm blindly: no checks, or runs `queued` with
+  true, which is the state before the first check registers and the state of a PR whose runs sat
+  `queued` with no jobs (#339), and `--admin` merges past missing checks. When the
+  bound expires, re-read the checks rather than re-arm blindly: no checks, or runs `queued` with
   no jobs, after about 15 minutes is a close-and-reopen of the PR, which re-fires them; a CodeQL row
   left `in_progress` with every step succeeded (#263) cannot be re-run, so judge it by its steps and
-  leave it out of the wait by job id; anything else still running gets one more bounded wait. Then
-  merge on green (`session-rhythm.md` → *Landing the spec*). Bit in SPEC-088.
+  leave it out of the wait by job id; anything else still running gets one more bounded wait. If
+  that second wait expires too, stop: report which checks are still pending and ask with the
+  question tool, rather than keep waiting. Otherwise merge on green (`session-rhythm.md` →
+  *Landing the spec*). Bit in SPEC-088.
 - _(add your own as they bite — one line each, with the fix.)_
 

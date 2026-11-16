@@ -58,10 +58,12 @@ is pushed from while it builds, and hands it back for everything else:
   implementer's worktree, runs `git switch <name>` in its own, and briefs the `spec-author` with its
   own worktree's path and the branch name; the `spec-author` runs the ritual and commits there. Never
   route around the hook through Bash. The reviewers then review the head that includes the ritual.
-- A later code round on the same branch (a fix for a diff-review finding, or a later PR's phases)
-  reverses that hand-off: the orchestrator detaches its own worktree, and the implementer — resumed
-  with `SendMessage`, or a new one — runs `git switch <name>` in its own worktree again and confirms
-  `git log --oneline -1` shows the SHA the brief gives.
+- A fix for a diff-review finding is a later code round on the same branch, and reverses that
+  hand-off: the orchestrator detaches its own worktree, and the implementer — resumed with
+  `SendMessage`, or a new one — runs `git switch <name>` in its own worktree again and confirms
+  `git log --oneline -1` shows the SHA the brief gives. A later PR's phases go on a new branch,
+  because the merge below deletes the first: the orchestrator cuts it from a freshly fetched
+  `origin/main` as the first bullet cuts the first, and hands it off the same way.
 - The orchestrator runs both diff reviews against that branch's head SHA. Each reviewer is briefed
   with the exact SHA, checks it out detached in its own worktree and confirms its tree with
   `git log --oneline -1` before reviewing.
@@ -70,9 +72,9 @@ is pushed from while it builds, and hands it back for everything else:
   that path runs `acquire`, then, inside the lock, the fetch and any rebase onto a moved `main`, the
   gates again, the push (`git push -u origin <name>`) and the PR: `acquire` records the branch
   checked out where it runs (`scripts/pr-queue/PROTOCOL.md`), so it must run in the worktree that
-  holds it, and a rebase can stop on a conflict that only an Edit resolves. After the merge it runs `git switch --detach origin/main` there,
-  freshly fetched, and deletes the local branch, so that worktree holds no commit `done_check.py`
-  reads as unmerged.
+  holds it, and a rebase can stop on a conflict that only an Edit resolves. After the merge it runs
+  `git switch --detach origin/main` there, freshly fetched, and deletes the local branch, so that
+  worktree holds no commit `done_check.py` reads as unmerged.
 
 ## Fences
 
