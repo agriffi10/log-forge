@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Fifty-seven files here are not the audit's.** Each was added after the audit was brought in
+**Sixty-six files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -26,7 +26,7 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
 - `core-pipeline/p14_end_races_sweep.py` to `p17_log_after_an_interrupted_close.py`, written
   while authoring and revising SPEC-088, and `p18_nats_deadline_leaves_events_unattempted.py`,
   filed from SPEC-082's build session.
-- `core-pipeline/spec090_*.py`, twelve, written while authoring SPEC-090.
+- `core-pipeline/spec090_*.py`, fourteen: twelve written while authoring SPEC-090 and two while building it.
 - `core-pipeline/spec091_*.py`, seven, written while authoring SPEC-091.
 - `sinks/spec092_*.py`, five, SPEC-092's prototype conformance corpus. Unlike the probes they
   import one another, so `sinks/` and `tests/` go on `PYTHONPATH` as their docstrings say.
@@ -56,6 +56,24 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   tests docs/audits/2026-11-14-probes`, the second to that tree after SPEC-093's and SPEC-094's
   prototype patches, `sinks/spec093_prototype.patch` and `sinks/spec094_prototype.patch`.
   SPEC-095's *Evidence* section says what each measured.
+- `core-pipeline/spec097_signal_in_section.py`, `spec097_stable_signal.py` and `spec097_cost.py`,
+  written while authoring SPEC-097 and SPEC-098 against `ead40798`. The first raises SIGTERM while
+  the main thread holds a library lock, as `lifecycle/p1a_signal_shutdown_injected.py` does, and
+  reads the lock's owner where the lock has one, so it runs against a tree whose lifecycle locks are
+  `RLock`s, which `p1a` cannot; the second reads which stop signal a sink holds and how often its
+  setter runs, in a parent and a forked child; the third measures what the prototype costs. Each is
+  run with `PYTHONPATH=<tree>/src` against two trees to compare. `core-pipeline/spec097_held_sweep.py`
+  and `spec097_reentry_sweep.py` were added after SPEC-097's spec review and read
+  `_lifecycle.in_section()`, so they run against a tree carrying the prototype only: the first raises
+  SIGTERM inside every public call of `log_foundry.__all__` and reads whether the handler's held
+  `shutdown()` ran, and the second interrupts every library lock section a workload reaches with a
+  handler that logs and makes a traced call. `core-pipeline/spec097_pubsub_after_shutdown.py` was
+  added after SPEC-098's spec review: a `GooglePubSubSink` configured again after `shutdown()`, with
+  a fake publisher whose futures confirm after a given delay, which measured the losses behind
+  Andrew's option 2; SPEC-098's *Evidence* gives its readings. `core-pipeline/spec097_prototype.patch`
+  is not a probe: it is the two specs' prototype, applied with `patch -p1` to `git archive ead40798
+  src tests docs/audits/2026-11-14-probes`, and their *Evidence* sections say what it measured, each
+  part alone and both together.
 
 - `sinks/spec096_limits_today.py`, `spec096_destination_below_limit.py` and
   `spec096_corpus_rows.py`, written while authoring SPEC-096 against `10ba21ee`: how `SQSSink` and
@@ -139,7 +157,9 @@ written on 2026-11-15 against `3e27a0a6`, each says so in its first line, and ea
 they measure batch sizes under a backlog and at exit, the exit drain's budget and lines, a frozen
 clock, a per-event sink, a JetStream `NATSSink` behind a slow ack, the caller's burst, a full
 queue's memory and the delay with no backlog. `spec090_exit_budget.py` adapts SPEC-090's spec
-review's probe. `spec090_prototype.py` is not a probe: it rewrites a scratch copy of `worker.py`
+review's probe. Two more, `spec090_dead_http_exit.py` and `spec090_slow_per_call.py`, were added by
+SPEC-090's build (`14711e7e`) from its diff reviews' probes, and each says so in its first line.
+`spec090_prototype.py` is not a probe: it rewrites a scratch copy of `worker.py`
 into the prototype the spec's "rule" numbers come from, and must never be run on a checkout's own
 `src/`. SPEC-090's Evidence section records their output.
 

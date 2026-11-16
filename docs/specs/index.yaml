@@ -645,13 +645,27 @@ specs:
     depends_on: ["SPEC-005", "SPEC-010", "SPEC-016", "SPEC-049", "SPEC-051", "SPEC-066", "SPEC-071", "SPEC-074"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-096-sqs-and-sns-message-limit.md"
+  - id: "SPEC-097"
+    title: "Lifecycle Commands Take Their Turn, and a Call Made From Inside One Never Waits on It"
+    description: "Makes a sink change a command from before its config write, so a shutdown meets it and never has its close undone by it; has a shutdown made from inside a running command merge into it or run when it ends, within the change's budget; refuses a flush made on the drain thread; and has a lifecycle call made on a thread that holds a library lock, a signal handler's, run once that thread lets go, so 94 adversarial cells turn green, no other cell moves, and the signal-handler deadlock is gone."
+    spec_status: "Draft"
+    depends_on: ["SPEC-054", "SPEC-068", "SPEC-077", "SPEC-078", "SPEC-083", "SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-091"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-097-lifecycle-command-path.md"
+  - id: "SPEC-098"
+    title: "One Stable Stop Signal per Sink, Handed Once per Installation"
+    description: "Gives every sink the library delivers to one threading.Event of its own, assigned through log_foundry_stop_signal at its first delivery and again only when a configure() installs it anew, set by every stop, cleared by such a configure() when no stop is running, and kept in a forked child by re-initialising it in place, so no fork repair runs sink code and the machinery that chose which event a sink holds is deleted, while a 1.x sink written to the README's protocol keeps working unchanged."
+    spec_status: "Draft"
+    depends_on: ["SPEC-027", "SPEC-033", "SPEC-042", "SPEC-054", "SPEC-079", "SPEC-081", "SPEC-083", "SPEC-085", "SPEC-086", "SPEC-097"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-098-one-stable-stop-signal-per-sink.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"

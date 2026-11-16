@@ -1136,8 +1136,9 @@ close it.
   owed when a forward is skipped on a holder's account, and closed after that holder's own close
   has returned, so that a wrapper which closes its member gives a second close in sequence, which
   a sink tolerates, and never two at once. That restructures `_close_owed`'s take and its fan-out,
-  so it belongs in this arc's lifecycle command-path spec (*lifecycle commands serialized through
-  one owner*, the signal-handler item below) and not in a further patch to the closer.
+  so it is not a further patch to the closer. It was first assigned to this arc's lifecycle
+  command-path spec; on 2026-11-16 Andrew placed it in a spec of its own, written later in this
+  arc, which SPEC-097, the command-path spec, records as Out of Scope.
 - **A kept sink a straddling orphan log put back in the record can be handed a stop signal on its
   own** (SPEC-087 FR-004's fifth shape; read from the code and not reproduced). A log with no span
   reads the configured sink and arms it a moment later (`api.py`, `_ensure_sink()` then
@@ -1151,6 +1152,9 @@ close it.
   then a `shutdown()`, then a further log with no span while a worker built since is draining.
   **Closed by** one stable stop signal per sink (the item *One stable stop signal per sink changes
   a documented public protocol*, below), which retires the refreshed hands this shape rides on.
+  That closure is by construction: the shape was never reproduced and names no observable, so no
+  measurement shows it closed (SPEC-098; the spec reviewer's `straddle.py` read
+  `shutdown_took=0.00s` both at `ead40798` and on SPEC-098's prototype).
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
   of it is the seam lint guarding the prose in its own data table rather than the rule. The case
@@ -1640,7 +1644,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (2026-11-14 audit, the lifecycle frame's structural changes 1 and 2; invariant 10). Andrew took
   both directions on 2026-11-14, and the protocol change was stated to him when he did. Today the
   library assigns `log_foundry_stop_signal` onto a sink, and `README.md` documents that to a sink's
-  author: the 1.0.0 upgrade note at `:80`, and the protocol at `:1111-1151`, which says the
+  author: the 1.0.0 upgrade note at `:80`, and the protocol at `:1116-1156`, which says the
   attribute "may be assigned more than once, from more than one thread at the same moment" and gives
   a wrapper the forwarding property that relies on it. Invariant 10 promises that a consumer written
   against the frozen surface runs against every later release of the same major, and a signal handed
