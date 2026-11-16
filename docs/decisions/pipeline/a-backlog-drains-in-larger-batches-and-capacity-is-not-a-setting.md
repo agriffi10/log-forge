@@ -29,15 +29,21 @@ so the steady drain and the exit drain decide a batch boundary the same way, inv
   `retarget`, for a new worker and in a forked child. A batch the exit drain declines, or
   abandons, leaves it as it was: at exit nothing waits for a failing sink to recover, and a reset
   cut a dead sink's backlog into `batch_size` submissions, each paying the sink's own calls and
-  lines.
+  lines. The trade is a sink that fails because a batch is too large: at exit it is now handed
+  the target every time rather than ten spans after its first failure. It is no regression
+  against the release, which handed it the whole backlog in one call: with a sink refusing
+  batches over 500 events, the build delivered 20 of 4,020 events at exit, the build that reset
+  the target 80, and the tree before SPEC-090 none (the second diff review's probe).
 - **The cap is 1,000 events**, the private constant `_BACKLOG_BATCH_CAP`, a ceiling except for a
   batch of at most `batch_size` submissions, which the count trigger sent before this rule too.
 
-**Why half an interval of the sink's own rate.** A per-call sink's target multiplies by half an
-interval over the cost of a call with each batch, so one costing well under that reaches the cap
-at once and one costing a little under it within a few batches, while one costing more than half
-an interval never grows past the count trigger's batch (`spec090_slow_per_call.py`: at 0.3 s a
-call the batches went 20, 24, 38 and so on to 1,000 by the tenth; at 0.6 s every batch was 20);
+**Why half an interval of the sink's own rate.** Each batch to a per-call sink multiplies its
+target by `flush_interval / (2 × cost per call)`, so one costing well under half an interval
+reaches the cap at once, one costing near half an interval takes hundreds of batches, and one
+costing more than half an interval never grows past the count trigger's batch
+(`spec090_slow_per_call.py`: at 0.3 s a call the batches went 20, 24, 38 and so on to 1,000 in
+about ten batches; at 0.4 s they reached 204 events after 14; at 0.45 s, 44 after 14; at 0.6 s
+every batch was 20);
 a per-event sink (SQS at ten entries a request, a JetStream `NATSSink` at one ack per event) settles
 near half an interval's worth, so an emit stays shorter than the time trigger's interval and a
 later event, a flush marker, a swap's fence or an exit's join waits behind it no longer than the

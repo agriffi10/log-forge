@@ -155,9 +155,8 @@ its request size) ~~reaches the cap at once~~ multiplies its target by half an i
 cost of a call with each batch, so one costing well under that, as `p13`'s 20 ms does, reaches
 the cap at once, and one costing more than half an interval never grows past the count trigger's
 batch (`spec090_slow_per_call.py`: at 0.3 s a call the batches climbed from 20 to 1,000 events
-over ten batches, at 0.6 s every batch was 20; added 2026-11-16), while one whose cost is per
-event (SQS at ten entries a
-request, `NATSSink` through JetStream at one ack per event) settles near half an interval's worth,
+over about ten batches, at 0.6 s every batch was 20; added 2026-11-16), while one whose cost is
+per event (SQS at ten entries a request, `NATSSink` through JetStream at one ack per event) settles near half an interval's worth,
 because a bigger batch only makes its call longer. **Half, not a whole interval**, because the time
 trigger's clock is read before the emit (`worker.py:1740-1743`): with a whole interval an emit
 lasted as long as the interval, the trigger fired on the first submission after it, and against a

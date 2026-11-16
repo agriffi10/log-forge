@@ -1607,7 +1607,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   failing sink to recover; or, after the first abandoned exit batch, declining every later one
   unattempted, as FR-003 already does once a retry is declined, which changes what a dead sink
   at exit is sent; or a channel through which a sink's per-batch loss line is tallied by the
-  worker at exit, which is new sink-contract surface. None is measured yet.
+  worker at exit, which is new sink-contract surface. None is measured yet. The zero-target case
+  is the shape of a sink that died during the run rather than at `shutdown()`, since its last
+  steady batch failed before the stop, so it is probably the commoner way a sink is dead at
+  exit.
 - **A span's events stay on the span until it closes, so a process killed mid-handler loses the
   whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
   document states it). By the core frame's reading, only the close, or a `flush()` called on the

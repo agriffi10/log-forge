@@ -2239,10 +2239,10 @@ class Worker:
         engine's waits lower the measured rate, and :meth:`_set_target` turns the batch's
         events and that time into the target the next batch reads. The sink generation is read
         before the emit and compared after it, and ``failed_batches`` likewise, so a batch that
-        straddled a swap or was abandoned sets the target to zero. A batch that holds no events
-        is not handed to the sink, as :meth:`_emit` never handed it one, and sets the target to
-        zero, which rule 4 names, before the exit budget below is asked anything: it is no
-        attempt, and declining it would count a failed batch of nothing.
+        straddled a swap, or was abandoned on the steady drain, sets the target to zero. A batch
+        that holds no events is not handed to the sink, as :meth:`_emit` never handed it one,
+        and sets the target to zero, which rule 4 names, before the exit budget below is asked
+        anything: it is no attempt, and declining it would count a failed batch of nothing.
 
         **An abandoned exit batch leaves the target as it was** (SPEC-090 FR-001 rule 4, diff
         review, 2026-11-16), as a declined one does. On the steady drain a failure resets the
@@ -2831,9 +2831,10 @@ class Worker:
         writes two of the worker's lines where a line per batch would write a thousand. The
         tallies do not reach a line the engine or the sink itself writes per batch, the engine's
         ``absorbed`` line or ``HTTPSink``'s ``lost 1 request(s)``: those follow the number of exit
-        batches, which :meth:`_emit_pending` keeps near one per ``_BACKLOG_BATCH_CAP`` events by
-        leaving the target as it was after an abandoned exit batch, except when the target was
-        already zero at the stop (``architecture.md`` §12). On every route that can tally,
+        batches, which :meth:`_emit_pending` keeps near one per target's worth of events, which
+        is ``_BACKLOG_BATCH_CAP`` when it was measured there, by leaving the target as it was
+        after an abandoned exit batch, except when the target was already zero at the stop
+        (``architecture.md`` §12). On every route that can tally,
         :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a tally it
         took has already left ``_in_flight``.
 
