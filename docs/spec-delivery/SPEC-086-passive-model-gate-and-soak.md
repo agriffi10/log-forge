@@ -201,6 +201,11 @@ same count. That is the shape of #339's "sink change deciding late", and it is t
 candidate for the tracing session above. That session now covers four items: the three above,
 and `deliver-seed962`.
 
+> **Traced after the merge (2026-11-15).** `deliver-seed962` has the record of the defect probe
+> `p11` forces, which `docs/architecture.md` §12 now holds: a sink change arms the sink a concurrent
+> `shutdown()` took and closed. It is present at every tree measured, `31dda162` to `9d70f782`.
+> The other three records cannot name their arm.
+
 **The bound under overload.** The second review ran the model file beside 40 busy-loops on this
 10-core Mac, at loads of 81 to 112. **4 of 6 runs failed**, at `Stalled:info` or `Stalled:span`,
 with own times of 1.03 to 1.35 s on a zero-budget call. The passing runs' worst margins were 0.82 to

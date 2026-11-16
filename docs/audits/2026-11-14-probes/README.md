@@ -15,6 +15,11 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   not find. `p8` is behind no open item: it traces a sink closed twice with nothing written between
   the closes to a re-arm between two takes, which invariant 5 records as correct, and is kept so
   the next reader of that symptom finds the trace.
+- `lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`, written while tracing SPEC-086's soak
+  findings against `9d70f782`: the probe behind §12's item for a sink a swap installs that a
+  concurrent `shutdown()` took before the swap decided. Its park point exists in every tree from
+  `31dda162`, the parent of #339, to `9d70f782`, so it runs against older trees as this file says
+  below.
 - `lifecycle/released_sink_handed_back.py`, written while authoring SPEC-087, and
   `lifecycle/leaves_remaining_holder.py`, written while building it: the probe behind §12's item
   for a wrapper that leaves its member alone, which is then closed by nobody.

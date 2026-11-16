@@ -1353,6 +1353,43 @@ close it.
   counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
   by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
   the swap began.
+- **A sink a swap installs is closed twice with nothing written between when a concurrent
+  `shutdown()` took it before the swap decided** (SPEC-086's soak; invariant 5). This is the item
+  above with the `shutdown()` on another thread instead of inside a sink's code.
+  `configure(sink=S)` writes S to the config before its swap decides (`config._change_sink` calls
+  `_rebind`, then `_swap_live_sink`). In that window an orphan log arms S and writes to it, and a
+  `shutdown()` takes S and closes it. The swap then arms S as the sink it installs, on its
+  no-worker branch or after `Worker.retarget`, and a later take closes S again at the same write
+  count. `docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`
+  forces it:
+  - At `9d70f782`, 7 of 7 forced runs closed S at counts 1 and 1. Both controls closed S once in 7
+    of 7: one drops the first `shutdown()`, and the other drops the stale log that keeps the
+    swap from returning early.
+  - It closed S twice on 5 of 5 runs at each of `31dda162`, `624d817f` (#339), `a0f44b5f`
+    (v1.2.0), `5447d26a` and `6bd0b66e`. It is present at every tree measured, so it shipped in
+    1.2.0 and is not a regression. #339's serialized `configure()` does not reach it, because the
+    `shutdown()` does not take that lock.
+  - Unforced, it is the soak's `repeat@<n>` with nothing written between the first close's take
+    and the second close's take. The soak was run over its even seeds alternately at `5447d26a`
+    and `9d70f782`, at loads of 28 to 82. It found 1 such report in 9,000 runs at `5447d26a` and 3
+    in 9,000 at `9d70f782`. In each, the only arm between the two takes was the swap's arm of the
+    sink it installs, traced by caller.
+  - The one other `repeat@<n>` at each commit is not counted here: `emit-seed1582` and
+    `deliver-seed600` each had a write after the first take. At `emit-seed1582` that write made no
+    arm because the swap's arm had already made the sink owed, so the soak's rule, which looks for
+    a writer's arm, reads a close the write owes as unowed. At `deliver-seed600` the writer armed
+    before the take, which is the race of the orphan-log item below. Whether its second close is
+    owed depends on how that item closes.
+  - SPEC-086's `deliver-seed962` has the same record. Its take can land before the swap reaches
+    its critical section, so "since the swap began" in the item above has to mean since the
+    config write.
+
+  **Closed by** the swap arming the sink it installs only if no take has closed that sink since
+  the config named it, or by the one lifecycle command path. On the no-worker branch, an orphan
+  log written after that close arms the sink itself. On the branch after `Worker.retarget`, what
+  withholding the arm needs is not settled: a worker retargeted onto S may still write to it after
+  the take, which would trade the double close for a write after the last close. It was not
+  measured.
 - **An orphan log that passed its owed check before a `shutdown()` took its sink writes after the
   close, and the sink is owed nothing** (SPEC-085; invariant 5). Measured at `a0f44b5f` by the
   reproduction in `tests/test_model_cells.py`: `writes=2`, one close entered and returned at count
