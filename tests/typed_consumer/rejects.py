@@ -69,3 +69,8 @@ configure(sink_factory=_needs_an_argument)  # want: Argument "sink_factory" to "
 
 # 1.2.0: emit_via_deliver is public and keyword-first, so `deliver` is never positional.
 emit_via_deliver(object(), [], None)  # want: Too many positional arguments for "emit_via_deliver"
+
+# SPEC-089 FR-001: `lost` is a read-only total, and the counts are `FlushResult`'s alone.
+_FLUSHED = FlushResult(ok=True)
+_FLUSHED.lost = 3                          # want: Property "lost" defined in "FlushResult" is read-only
+_m = ContinueResult(ok=True, sink_lost=1)  # want: Unexpected keyword argument "sink_lost" for "ContinueResult"

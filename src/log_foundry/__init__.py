@@ -61,8 +61,18 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
         number subclass is read as the exact ``int`` or ``float`` it holds.
 
     Returns:
-      A :class:`FlushResult`. Truthy when the events submitted before this call reached the
-      sink — so a truthy result means they were delivered, not merely that a drain took place.
+      A :class:`FlushResult`. Truthy when the drain that carried the events submitted before
+      this call finished and abandoned no batch while the call was outstanding, not merely that a
+      drain took place. A truthy result can still carry loss: a sink that settles a run having
+      dropped events does not make it falsy, and the result's ``lost`` and its five counts say
+      what the process lost while the call ran (SPEC-089). The counts are process-wide and so
+      over-count, and a zero count covers only the terms the event ledger counts; a loss a sink
+      takes inside an ``emit`` that returned stays in :func:`health`'s ``sink``. A call whose
+      drain dies under it waits, within its ``timeout``, until that drain has debited what it
+      held, which is before the drain writes its stderr line, so the wait never includes that
+      write. The counts are read as :func:`health` reads the ledger, under the ledger's
+      registration lock, so a call made while another thread holds it for a first credit or a
+      fold waits for that brief section first.
       Falsy carries a ``reason`` naming which outcome occurred: ``"timed-out"``, ``"retired"``,
       ``"thread-died"``, ``"queue-full"``, ``"abandoned"`` or ``"sink-flush"`` — the last meaning
       the queue drained but the sink could not empty its own client buffer (SPEC-036 FR-002). It is falsy rather than ``False``:

@@ -1332,7 +1332,7 @@ counted once when it is asked for, in `accepted`, and is then in exactly one oth
 | Term | An event is in it when |
 |---|---|
 | `open_spans` | it is buffered on a span and not yet handed to the worker (a gauge) |
-| `queued` | it is in the worker's queue and the worker's thread is running (a gauge; events, where `h.queued` counts submissions) |
+| `queued` | it is in the worker's queue and the worker's thread is still draining (a gauge; events, where `h.queued` counts submissions) |
 | `in_flight` | the worker's thread has taken it and not finished with it, or its orphan log call is still running (a gauge) |
 | `delivered` | an `emit` returned for its batch, or `deliver` answered `ACCEPTED` |
 | `skipped` | `deliver` answered `SKIPPED` |
@@ -1341,7 +1341,7 @@ counted once when it is asked for, in `accepted`, and is then in exactly one oth
 | `batch_lost` | its batch was abandoned after its retries, or its retry was declined, or the exit drain declined the batch unattempted |
 | `sink_lost` | a `deliver` run settled and it ended neither `ACCEPTED` nor `SKIPPED` |
 | `drain_lost` | the worker's thread died holding it |
-| `stranded` | it is in the queue of a worker whose thread has ended |
+| `stranded` | it is in the queue of a worker whose thread has stopped draining for good: from the end of the thread's run, a moment before the thread itself ends, or as soon as a dying thread has counted what it held |
 
 With no library call in progress, `accepted == pending + delivered + skipped + lost`, where
 `pending` and `lost` are properties summing the gauges and the seven loss terms. `unaccounted` is
@@ -1444,7 +1444,10 @@ which one you want depends on whether the process is about to end:
 ```python
 import log_foundry as lf
 
-lf.flush()      # drain to the sink and keep going; truthy when everything landed
+lf.flush()      # drain to the sink and keep going; truthy when the drain finished. What the
+                # process lost during the call (its window) is counted in .lost, the sum of the
+                # five fields under FlushResult below; process-wide, so it can over-count, and
+                # a zero covers only the terms the ledger counts
 lf.shutdown()   # drain, close the sink, and stop for good; blocks until drained (30s cap on
                 # the drain — the sink's own close() is not bounded by it, see below)
 ```
@@ -1484,10 +1487,27 @@ docstring states its own worst case.
 explicitly when you need to be certain the tail reached the sink before a fast exit, e.g. at the
 end of a short script. It is idempotent.
 
-`flush(timeout=5.0)` returns a **`FlushResult`**, truthy when **nothing was lost while the call
-was outstanding** — the drain it forces reached the sink, and so did anything else the worker
-emitted while it waited its turn. A truthy result is evidence of delivery, not merely that a drain
-took place.
+`flush(timeout=5.0)` returns a **`FlushResult`**, truthy when **the drain that carried your
+events finished and abandoned no batch while the call was outstanding** — the drain it forces
+ran, and so did anything else the worker emitted while it waited its turn. A truthy result is not
+a promise that the sink took every event: a sink that settles a batch having dropped events, or
+having answered them unknown, leaves the result truthy. **The result counts that loss instead.**
+`result.lost` is the total of five counts, each named for the [event ledger](#the-event-ledger-healthevents)
+term it reads: `overflow_lost`, `batch_lost`, `sink_lost`, `drain_lost` and `stranded`. Each is
+the change in that term over the call's **window**, from just before the call sweeps your open
+spans to the moment the drain answers it (or, where no drain answers, to when the call stops
+waiting).
+
+The counts are process-wide, so they **over-count**: they include other threads' events that
+were queued ahead of yours, other threads' submissions that overflowed while you waited, and any
+log made outside a span whose event the sink dropped in the window. A non-zero `lost` says the
+process lost events while the call ran, not that yours were among them. A **zero** count covers
+only the terms the ledger counts: a loss a sink takes inside an `emit` that returned — a failed
+Kafka delivery report, a `MultiSink` child that raised beside one that accepted, an `emit`-only
+sink's own internal loss — is in none of them and shows in `health().sink`, and events still
+buffered on another thread's open span are in `health().events.open_spans`. `repr()` and `==`
+include the counts, so a result whose window lost something is not equal to
+`FlushResult(ok=True)`.
 
 Falsy carries a `reason` saying which of these happened, because they need different fixes:
 
@@ -1498,7 +1518,7 @@ Falsy carries a `reason` saying which of these happened, because they need diffe
 | `"thread-died"` | The drain thread is gone; see `health().stopped_reason`. |
 | `"queue-full"` | Backpressure — the queue could not even accept the marker. |
 | `"abandoned"` | The drain that would have carried those events did not confirm delivery of them. A broken destination is one cause, but not the only one — an expiring bounded `shutdown()` answers waiting calls pessimistically, and the drain may still deliver afterwards. So this is not by itself evidence that anything was lost: `health()` is what says whether it was. |
-| `"sink-flush"` | Everything queued reached the sink, but the sink's own `flush()` raised — a client-side buffer that did not go out. Distinct from `"abandoned"`: the library delivered, the sink did not. |
+| `"sink-flush"` | The drain finished, but the sink's own `flush()` raised — a client-side buffer that did not go out. Distinct from `"abandoned"`: the drain ran to its end, and what it lost is in the result's counts, which cover only the terms the ledger counts; the client buffer is past them. |
 
 ```python
 result = lf.flush(5.0)
@@ -1513,8 +1533,11 @@ as "some other failure" rather than matching exhaustively.
 The window starts when you call it. A batch abandoned *before* that is deliberately not its
 business: the loss is already counted in `health().failed_batches` and reported on stderr, and
 folding it in would make every later `flush()` in the process report a failure it did not incur.
-So `flush()` answers "did the logs I am waiting on get out", and `health()` answers "has anything
-been lost at all" — **check both**, as the handler below does.
+So `flush()` answers "did the drain carrying my logs finish, and what did the process lose while
+I waited", and `health()` answers "has anything been lost at all" — **check both**, as the handler
+below does. A `flush()` whose drain thread dies under it waits, within its timeout, until that
+thread has counted the events it held, so they are in `drain_lost`; that comes before the thread
+writes its stderr line, so the wait never includes the write.
 
 It never raises once it has accepted its `timeout` — a logging call must not be the reason
 your function fails. The one refusal is of the argument itself, at entry and before anything is
@@ -1571,10 +1594,16 @@ def handler(event, context):
         # would log nothing.
         drained = lf.flush()
         h = lf.health()
-        if (not drained or h.failed_batches or h.dropped or h.stopped_reason or h.retired
+        if (not drained or drained.lost or h.failed_batches or h.dropped or h.stopped_reason
+                or h.retired or (h.sink and (h.sink.dropped or h.sink.failed))
                 or h.orphan_lost or h.in_span_lost):
-            # `drained` covers this invocation's tail; the counters cover anything the worker
-            # lost earlier — a batch its own interval trigger already gave up on, for instance.
+            # `drained` is falsy when the drain carrying this invocation's tail did not finish.
+            # `drained.lost` counts what the process lost while the call ran, and a truthy
+            # `drained` can still carry a non-zero `lost`: a sink that settles a batch having
+            # dropped events does not make the flush fail. Its counts cover only the terms the
+            # ledger counts; a loss a sink takes inside an `emit` that returned is in `h.sink`.
+            # The counters cover anything the worker lost earlier — a batch its own interval
+            # trigger already gave up on, for instance.
             # `orphan_lost`/`in_span_lost` cover the two paths no worker field can describe: a
             # log made outside any span, and an event that could not be built.
             # `h.retired` catches the mistake above: inside a handler it can only mean something

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -164,7 +165,8 @@ class EventLedger:
         ``shutdown()`` deadline (SPEC-090 FR-003).
       sink_lost: Events of a settled run that ended neither ``ACCEPTED`` nor ``SKIPPED``.
       drain_lost: Events the drain thread held when it died.
-      stranded: Events in the queue of a worker whose drain thread has ended.
+      stranded: Events in the queue of a worker whose drain has ended: its thread has ended, or
+        it has debited the last of what it held and will take nothing more (SPEC-089).
       unaccounted: Events the terms cannot place; zero when they balance.
     """
 
@@ -486,16 +488,35 @@ class _FlushMarker:
     flush outstanding when a batch is abandoned reports it. A batch abandoned before the call
     is deliberately not in scope: that loss is already in ``failed_batches`` and on stderr, and
     folding it in would make every later empty flush report a failure it did not incur.
+
+    **The three SPEC-089 fields carry the end of a counted flush's window back the same way.**
+    ``counted`` asks the answering drain for a ledger snapshot; only ``log_foundry.flush()``
+    asks, so :meth:`Worker.retarget`'s internal flushes pay nothing. ``ledger`` is that
+    snapshot, written before ``event.set()`` like ``delivered``, and ``ledger_pid`` the pid the
+    drain read it in, stamped beside it so a fork between the read and the caller's wake cannot
+    misdate it. ``unwinding`` says the marker was answered while its drain was unwinding an
+    exception, so the snapshot would have been taken before ``_terminal_failure`` debited
+    ``drain_lost`` and before the queue counted as ``stranded``; the caller waits on
+    ``Worker._drain_accounted`` and reads for itself instead.
     """
 
-    __slots__ = ("delivered", "event", "seen_failures")
+    __slots__ = (
+        "counted",
+        "delivered",
+        "event",
+        "ledger",
+        "ledger_pid",
+        "seen_failures",
+        "unwinding",
+    )
 
-    def __init__(self, seen_failures: int) -> None:
+    def __init__(self, seen_failures: int, *, counted: bool = False) -> None:
         """Stamps a marker with the failure count it will be judged against.
 
         Args:
           seen_failures: ``Worker.failed_batches`` as read on the caller's thread, before the
             marker joins the queue.
+          counted: Whether the drain answering it should snapshot the event ledger (SPEC-089).
 
         Returns:
           None.
@@ -506,6 +527,10 @@ class _FlushMarker:
         self.event = threading.Event()
         self.delivered = False
         self.seen_failures = seen_failures
+        self.counted = counted
+        self.ledger: EventLedger | None = None
+        self.ledger_pid: int | None = None
+        self.unwinding = False
 
 
 class _Reading:
@@ -558,11 +583,12 @@ def _read_ledger(worker: Worker | None) -> _Reading:
 
     A reading is several loads, not one, and calls run while it is taken, so the order is what
     stops a call that is balancing correctly from reading as an imbalance. **The order**, built as
-    the plan review checked it (M2): the process worker (read by the caller), then its drain's
-    liveness, taking count, held events and exits; ``in_span_lost``; every cell's hand-overs (pass 1); the queue's
-    taken-in count and ``_overflow_lost``; every cell's span credits (pass 2); the orphan pass,
-    cell by cell; ``orphan_lost``. Each property rests on one rule, that a count is read before
-    any count written earlier in the life of the same events:
+    the plan review checked it (M2): the process worker (read by the caller), then whether its
+    drain is still running (``Worker._drain_terms``), its taking count, held events and exits;
+    ``in_span_lost``; every cell's hand-overs (pass 1); the queue's taken-in count and
+    ``_overflow_lost``; every cell's span credits (pass 2); the orphan pass, cell by cell;
+    ``orphan_lost``. Each property rests on one rule, that a count is read before any count
+    written earlier in the life of the same events:
 
     - ``accepted`` is never below the worker path's exits and losses: every one of them was
       written after its events' credits, and is read before them.
@@ -577,6 +603,11 @@ def _read_ledger(worker: Worker | None) -> _Reading:
       overflowed, and both are read after pass 1.
     - The drain and orphan residuals never read above zero: each is read in the reverse of the
       order its writer writes it, the gauge raised before the credit and lowered after the exit.
+    - ``queued`` and ``stranded`` split the queue on whether the drain is still running, read
+      first: it reads ended once ``Worker._drain_accounted`` is set, which follows the drain's
+      last take and last debit (SPEC-089 FR-003), or once the thread has ended. A reading that
+      sees it ended therefore sees every debit, so ``held`` is then settled and nothing it holds
+      is counted twice or missed.
 
     It takes the registration lock once per pass and no other lock: not ``Runtime._lock``,
     ``Worker._lock``, the queue's mutex or ``decorator._loss_lock``, whose counters are each read
@@ -596,12 +627,12 @@ def _read_ledger(worker: Worker | None) -> _Reading:
 
     if worker is None:
         at_build = 0
-        alive, taken, held = False, 0, 0
+        running, taken, held = False, 0, 0
         w_delivered = w_skipped = w_sink_lost = batch_lost = drain_lost = 0
     else:
         at_build = worker._handed_at_build
         (
-            alive,
+            running,
             taken,
             held,
             w_delivered,
@@ -619,11 +650,13 @@ def _read_ledger(worker: Worker | None) -> _Reading:
     orphan_lost = decorator._orphan_lost
     in_queue = entered - taken
     open_spans = span - in_span_lost - handed
-    drain_residual = taken - held - (w_delivered + w_skipped + w_sink_lost + batch_lost + drain_lost)
+    drain_residual = (
+        taken - held - (w_delivered + w_skipped + w_sink_lost + batch_lost + drain_lost)
+    )
     orphan_residual = orphan - orphan_open - (o_delivered + o_skipped + o_sink_lost) - orphan_lost
     meeting = None if worker is None else handed - at_build - entered - overflow_lost
     unaccounted = (
-        (0 if alive else max(0, held))
+        (0 if running else max(0, held))
         + max(0, orphan_residual)
         + max(0, meeting or 0)
         + max(0, drain_residual)
@@ -635,7 +668,7 @@ def _read_ledger(worker: Worker | None) -> _Reading:
     ledger = EventLedger(
         accepted=span + orphan,
         open_spans=max(0, open_spans),
-        queued=max(0, in_queue) if alive else 0,
+        queued=max(0, in_queue) if running else 0,
         in_flight=max(0, held) + max(0, orphan_open),
         delivered=w_delivered + o_delivered,
         skipped=w_skipped + o_skipped,
@@ -645,7 +678,7 @@ def _read_ledger(worker: Worker | None) -> _Reading:
         batch_lost=batch_lost,
         sink_lost=w_sink_lost + o_sink_lost,
         drain_lost=drain_lost,
-        stranded=0 if alive else max(0, in_queue),
+        stranded=0 if running else max(0, in_queue),
         unaccounted=unaccounted,
     )
     return _Reading(ledger, orphan_residual, meeting, drain_residual)
@@ -752,6 +785,15 @@ class Worker:
         ``(events, batches)`` not yet announced, written under ``_lock`` because :meth:`stop`
         takes them too.
 
+        **``_drain_accounted`` is the third drain event** (SPEC-089 FR-003). It is set once the
+        drain has debited everything it will ever debit: by :meth:`_terminal_failure` right after
+        it debits what a dying thread held, before the line it writes, and by :meth:`_run`'s
+        outermost ``finally`` on every exit. From then on nothing takes a queued event or debits
+        a held one, so the ledger counts the queue as ``stranded`` as it does once the thread has
+        ended, and a ``flush()`` waiting out a dying drain waits on this rather than on the
+        thread: a ``join`` also waited out that line, which can block on a stderr the waiter
+        itself holds.
+
         ``sink_released=`` used to sit here and is retired (SPEC-054 FR-002). It made a worker
         built during a ``shutdown()`` inherit a discharged close for a sink that shutdown's orphan
         branch had just closed. Under one owed-close record the flag has no work to do: this
@@ -807,6 +849,7 @@ class Worker:
         self._epoch = _lifecycle._state.retirements
         self._drain_finished = threading.Event()
         self._drain_settled = threading.Event()
+        self._drain_accounted = threading.Event()
         self._stopped = False
         self._exit_deadline: float | None = None
         self._join_owed = False
@@ -923,7 +966,7 @@ class Worker:
         background ``shutdown()`` claims a close, ``atexit`` reads "already finished" and returns,
         and the process exits through a running close.
 
-        The two drain events are **set or cleared to match what this child will actually do**,
+        The drain events are **set or cleared to match what this child will actually do**,
         never simply inherited. Resuming clears them, so ``draining`` and ``flush``'s gate
         describe the thread starting here rather than the one that did not survive the fork;
         retiring **sets** them, because no thread will ever set them and a child forked while a
@@ -935,7 +978,10 @@ class Worker:
         that is already refusing (SPEC-033 FR-004). ``_drain_finished`` has no reader on a
         retired worker and is set for the invariant rather than for an observable: settled with
         finished clear is what :attr:`draining` defines as an *abandoned* drain, and a child
-        reporting no ``stopped_reason`` must not read that way. The stop signal is re-offered for
+        reporting no ``stopped_reason`` must not read that way. ``_drain_accounted`` (SPEC-089)
+        follows the other two: cleared for the thread starting here, so a ``flush()`` waiting out
+        a dying drain waits on that thread, and set where no thread will run, since nothing is
+        left to debit. The stop signal is re-offered for
         the sink the fork walk cannot reach: a **third-party** sink is outside its ownership
         boundary, so it would keep pointing at the pre-fork event while this worker sets a new
         one — SPEC-027's guarantee broken by the repair meant to preserve it. **Except a sink the
@@ -954,7 +1000,7 @@ class Worker:
         The inherited thread object is kept instead, which is safe because CPython repairs it
         across the fork — measured, it reports dead and both a bounded and an unbounded ``join``
         return in 0.0000 s — and the failure is recorded as a ``stopped_reason``, which is
-        exactly SPEC-019's vocabulary for "nothing is delivering". Setting both drain events is
+        exactly SPEC-019's vocabulary for "nothing is delivering". Setting the drain events is
         what keeps :meth:`shutdown` from queueing a sentinel into a queue no thread will read.
 
         The success path assigns ``self._thread`` *after* the start, so for an instant a live
@@ -1010,6 +1056,7 @@ class Worker:
         if not resume:
             self._drain_finished.set()
             self._drain_settled.set()
+            self._drain_accounted.set()
             return
         self._exit_deadline = None
         self._stopped = False
@@ -1018,6 +1065,7 @@ class Worker:
         self._stop = _lifecycle._state.refresh_stop_signal()
         self._drain_finished.clear()
         self._drain_settled.clear()
+        self._drain_accounted.clear()
         if not _lifecycle.handing_here(self.sink):
             _lifecycle.offer_stop_signal(self.sink, self._stop)
         thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
@@ -1027,6 +1075,7 @@ class Worker:
             self.stopped_reason = _diag.type_name(exc)
             self._drain_finished.set()
             self._drain_settled.set()
+            self._drain_accounted.set()
             _diag.absorbed("starting this child's drain thread", exc, "it will deliver nothing")
             return
         self._thread = thread
@@ -1248,6 +1297,27 @@ class Worker:
     def flush(self, timeout: float | None = 5.0) -> FlushResult:
         """Drains everything submitted before this call through the sink, without stopping.
 
+        The verdict alone, from a marker that asks the drain for no ledger snapshot (SPEC-089
+        FR-003). :meth:`retarget` calls this, so a swap neither snapshots nor waits on a dying
+        drain; ``log_foundry.flush()`` calls :meth:`_flush_marked` directly for its counts.
+        :meth:`_flush_marked` carries the mechanism and its reasoning.
+
+        Args:
+          timeout: Seconds bounding the whole call. ``None`` waits indefinitely.
+
+        Returns:
+          The :class:`FlushResult` :meth:`_flush_marked` reaches, which carries no counts.
+
+        Raises:
+          None.
+        """
+        return self._flush_marked(timeout, counted=False)[0]
+
+    def _flush_marked(
+        self, timeout: float | None, *, counted: bool
+    ) -> tuple[FlushResult, _FlushMarker | None]:
+        """Drains everything submitted before this call, returning the verdict and its marker.
+
         The precise claim is that nothing was abandoned while this call was outstanding: the
         batch this flush forces, and any batch another flush or a batching trigger emitted
         while its marker waited its turn. A batch abandoned before the call is not in scope —
@@ -1302,14 +1372,24 @@ class Worker:
         one ``retarget`` reads as an unconfirmed drain, counting ``incomplete_swaps``, leaving
         the previous sink open and writing a loss line for a swap that in fact completed.
 
+        **The marker is returned beside the verdict** (SPEC-089 FR-003), so the caller of a
+        counted flush can take the end of its window from it: the ledger the drain wrote when it
+        answered, or, when it carries none or was answered while unwinding, a read of its own.
+        The eleven verdict constructions below carry no counts; ``_lifecycle._with_counts``
+        attaches them, on the calling thread, so this method never waits on a dying drain and a
+        swap's timing is unchanged.
+
         Args:
           timeout: Seconds bounding the whole call — one deadline shared by the put and the
             wait, so the two cannot add up to twice the timeout. ``None`` waits indefinitely.
+          counted: Whether the marker asks its answering drain for a ledger snapshot.
 
         Returns:
-          A :class:`FlushResult`, truthy once the worker has delivered them and otherwise
-          falsy with a ``reason``: ``"timed-out"``, ``"retired"``, ``"thread-died"``,
-          ``"queue-full"``, or ``"abandoned"``. That last one has **four** producers, not one:
+          The verdict and the marker this call queued, or ``None`` in place of the marker when it
+          returned before queueing one. The verdict is a :class:`FlushResult`, truthy once the
+          drain that carried the events finished and abandoned no batch while the call was
+          outstanding, and otherwise falsy with a ``reason``: ``"timed-out"``, ``"retired"``,
+          ``"thread-died"``, ``"queue-full"``, or ``"abandoned"``. That last one has **four** producers, not one:
           the drain carrying those events gave up after exhausting retries (SPEC-021 FR-001,
           the original — and it used to return True, a false success exactly where ``flush()``
           matters most); an expiring ``shutdown()`` answered the marker pessimistically rather
@@ -1317,9 +1397,10 @@ class Worker:
           arrived after that had already happened; or it never reached the queue, because that
           was full and the drain had already been given up on. Only the first says the drain
           adjudicated the batch, so ``"abandoned"`` means "not confirmed delivered", never
-          "confirmed lost". ``ok=True`` is unaffected and still means the sink took them:
-          ``delivered`` starts ``False`` and is written only by the drain, only after its emit
-          returned. **The inner call carries the
+          "confirmed lost". ``ok=True`` means the drain answered and no batch was abandoned in
+          the window: ``delivered`` starts ``False`` and is written only by the drain, only after
+          its emit returned. A settled run's lost events do not make it falsy (SPEC-089); they
+          are counted on the result ``log_foundry.flush()`` returns. **The inner call carries the
           type too, not only the public ``log_foundry.flush``** (SPEC-034 FR-007 AC-1b): the
           five outcomes are distinguishable only here, so a public wrapper over a bare ``bool``
           could name none of them without guessing.
@@ -1328,32 +1409,32 @@ class Worker:
           None.
         """
         if _lifecycle_state.retirements > self._epoch:
-            return FlushResult(ok=False, reason="retired")
+            return FlushResult(ok=False, reason="retired"), None
         if not self._thread.is_alive():
-            return FlushResult(ok=False, reason="thread-died")
+            return FlushResult(ok=False, reason="thread-died"), None
         with self._lock:
-            marker = _FlushMarker(self.failed_batches)
+            marker = _FlushMarker(self.failed_batches, counted=counted)
         deadline = None if timeout is None else time.monotonic() + timeout
         if not self._put_marker(marker, deadline):
             if self._given_up():
-                return FlushResult(ok=False, reason="abandoned")
+                return FlushResult(ok=False, reason="abandoned"), None
             if not self._thread.is_alive() or self._drain_finished.is_set():
-                return FlushResult(ok=False, reason="thread-died")
-            return FlushResult(ok=False, reason="queue-full")
+                return FlushResult(ok=False, reason="thread-died"), None
+            return FlushResult(ok=False, reason="queue-full"), None
         given_up = self._given_up()
         if self._settled():
             answered = marker.event.is_set()
             if answered and marker.delivered:
-                return FlushResult(ok=True)
+                return FlushResult(ok=True), marker
             if answered or given_up:
-                return FlushResult(ok=False, reason="abandoned")
-            return FlushResult(ok=False, reason="thread-died")
+                return FlushResult(ok=False, reason="abandoned"), marker
+            return FlushResult(ok=False, reason="thread-died"), marker
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not marker.event.wait(remaining):
-            return FlushResult(ok=False, reason="timed-out")
+            return FlushResult(ok=False, reason="timed-out"), marker
         if not marker.delivered:
-            return FlushResult(ok=False, reason="abandoned")
-        return FlushResult(ok=True)
+            return FlushResult(ok=False, reason="abandoned"), marker
+        return FlushResult(ok=True), marker
 
     def _given_up(self) -> bool:
         """Whether a bounded ``shutdown()`` expired on a drain that is still running.
@@ -1980,6 +2061,11 @@ class Worker:
         :meth:`_final_drain`'s ``finally``, so this is the drain thread's own end for that
         path; when nothing is tallied it writes nothing.
 
+        ``_drain_accounted`` is set right after the sweep, in a ``finally`` of its own, so it is
+        set on every exit even when the sweep raises, and before the exit tallies' line, so no
+        ``flush()`` waiting on it waits behind a stderr write (SPEC-089 FR-003): on a clean exit
+        nothing set it earlier, and a terminal one has already set it in :meth:`_terminal_failure`.
+
         Args:
           None.
 
@@ -1999,7 +2085,10 @@ class Worker:
         except BaseException as exc:
             self._terminal_failure(exc, len(pending))
         finally:
-            self._release_waiters()
+            try:
+                self._release_waiters()
+            finally:
+                self._drain_accounted.set()
             self._write_exit_tallies()
 
     def _take_marker(self, marker: _FlushMarker) -> None:
@@ -2050,6 +2139,61 @@ class Worker:
         """
         with self._lock:
             self._taken_markers = [m for m in self._taken_markers if m is not marker]
+
+    def _seal_marker(self, marker: _FlushMarker, *, unwinding: bool) -> None:
+        """Closes a counted marker's window on the drain thread, just before it is answered.
+
+        :meth:`_answer_marker` calls it, the one answerer :meth:`_drain` and :meth:`_final_drain`
+        share (SPEC-090), in the ``finally`` that sets the marker's event and immediately before
+        that ``set()``, so the
+        snapshot is taken after every event ahead of the marker has settled and the waiter reads
+        it after ``event.wait()`` returns, the same ordering ``delivered`` relies on (SPEC-089
+        FR-002).
+
+        **A marker answered while unwinding gets no snapshot, only the mark.** The drain is dying
+        then, and ``_terminal_failure`` has not yet debited what it held to ``drain_lost`` nor
+        set ``_drain_accounted``, so the queue does not yet read as ``stranded``; a snapshot
+        taken here would miss both. The caller sees ``unwinding`` and waits on
+        ``_drain_accounted`` before reading for itself (FR-003).
+
+        **The snapshot never waits on the ledger's registration lock**
+        (:func:`_lifecycle._ledger_snapshot_if_free`). Code running inside that lock's section,
+        a ``__del__`` or a signal handler, may be the very ``flush()`` or ``shutdown()`` waiting
+        on this marker, so when another thread holds the lock the marker is answered with no
+        snapshot and the caller reads the end itself.
+
+        **A fault in the snapshot is absorbed by type, and the marker is answered without one.**
+        This runs on the only thread that delivers, and an exception escaping a ``finally`` here
+        would end it; the caller then reads the end itself. Only ``Exception`` is caught, since a
+        ``BaseException`` is ``_run``'s to record. It writes no ledger counter.
+
+        Args:
+          marker: The marker about to be answered.
+          unwinding: Whether the answerer is unwinding an exception rather than settled.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if unwinding:
+            marker.unwinding = True
+            return
+        if not marker.counted:
+            return
+        try:
+            ledger = _lifecycle._ledger_snapshot_if_free()
+            if ledger is None:
+                return
+            marker.ledger_pid = os.getpid()
+            marker.ledger = ledger
+        except Exception as exc:
+            _diag.absorbed(
+                "reading the event ledger for a flush",
+                exc,
+                "the flush reads its counts on the calling thread instead",
+            )
 
     def _release_waiters(self) -> None:
         """Answers the ``flush()`` markers outstanding at the moment it runs.
@@ -2134,8 +2278,11 @@ class Worker:
         **The events the thread held are debited to** ``drain_lost`` (SPEC-088 FR-002 item 3),
         before the line, for the record-first reason above. They were in no counter at all: the
         thread had taken them from the queue, so ``queued`` no longer held them, and nothing
-        would ever emit them. What is queued behind the thread is the ledger's ``stranded`` once
-        the thread has ended, read rather than counted.
+        would ever emit them. What is queued behind the thread is the ledger's ``stranded``, read
+        rather than counted, from the moment ``_drain_accounted`` is set here, right after that
+        debit and **before the line** (SPEC-089 FR-003): the drain takes nothing after it, and a
+        ``flush()`` waiting out this death must not also wait out a write that can block on a
+        stderr the waiting thread itself holds, which a ``join`` on the thread did.
 
         Args:
           exc: The exception that ended the drain thread.
@@ -2151,6 +2298,7 @@ class Worker:
             self.stopped_reason = _diag.type_name(exc)
         held = self._in_flight
         self._settle(held, drain_lost=held)
+        self._drain_accounted.set()
         try:
             queued: object = self._queue.qsize()
         except Exception:
@@ -2439,9 +2587,10 @@ class Worker:
         registered through :meth:`_take_marker` before the emit, so a wedged emit leaves it
         within :meth:`_release_waiters`' reach, and it is answered in a ``finally``, then
         deregistered, so a ``BaseException`` from the emit cannot strand its waiter; the order
-        of those two is :meth:`_release_marker`'s. It is shaped as :meth:`_drain`'s marker
-        branch was, line for line, so SPEC-089's change to that branch moves into it as it
-        stands.
+        of those two is :meth:`_release_marker`'s. Before the event is set the marker is
+        sealed through :meth:`_seal_marker` (SPEC-089): a counted marker answered once its
+        batch settled carries this drain's ledger, and one answered while the emit unwinds is
+        marked so its caller waits for the drain to account before reading.
 
         Args:
           pending: The batch being built, emitted and cleared in place.
@@ -2454,10 +2603,13 @@ class Worker:
           BaseException: Whatever :meth:`_emit_pending` raises; :meth:`_run` is the guard.
         """
         self._take_marker(marker)
+        settled = False
         try:
             self._emit_pending(pending)
             marker.delivered = self._nothing_lost_since(marker)
+            settled = True
         finally:
+            self._seal_marker(marker, unwinding=not settled)
             marker.event.set()
             self._release_marker(marker)
 
@@ -2584,10 +2736,14 @@ class Worker:
     def _drain_terms(self) -> tuple[bool, int, int, int, int, int, int, int]:
         """Reads this worker's drain-side terms, without a lock, in the order a reading needs.
 
-        The thread's liveness is read first: once it reads ended, nothing will take a queued event
-        or debit a held one, and reading it after the counts lets a debit land between the two
-        (SPEC-088 FR-001). ``_drain_finished`` is not the test, because :meth:`_run` sets it
-        before :meth:`_terminal_failure` debits what the thread held. The taking count is read
+        Whether the drain is still running is read first: once it reads ended, nothing will take
+        a queued event or debit a held one, and reading it after the counts lets a debit land
+        between the two (SPEC-088 FR-001). It reads ended once ``_drain_accounted`` is set or the
+        thread has ended, whichever is seen first (SPEC-089 FR-003): the event is set only after
+        the drain's last debit, so a dying drain's queue reads as ``stranded`` before its stderr
+        line is written rather than only once the thread is gone. ``_drain_finished`` is not the
+        test, because :meth:`_run` sets it before :meth:`_terminal_failure` debits what the
+        thread held. The taking count is read
         before the gauge and the gauge before the exits, the reverse of the order the drain
         writes them in. The queue's taken-in count and ``_overflow_lost`` are left to the caller,
         which reads them after the caller-side hand-overs. Each read is one attribute load, so
@@ -2597,17 +2753,17 @@ class Worker:
           None.
 
         Returns:
-          Whether the drain thread is alive, then the taken, held, delivered, skipped, sink-lost,
-          batch-lost and drain-lost counts.
+          Whether the drain is still running, then the taken, held, delivered, skipped,
+          sink-lost, batch-lost and drain-lost counts.
 
         Raises:
           None.
         """
-        alive = self._thread.is_alive()
+        running = not self._drain_accounted.is_set() and self._thread.is_alive()
         taken = self._taken
         held = self._in_flight
         return (
-            alive,
+            running,
             taken,
             held,
             self._delivered,
@@ -2666,7 +2822,9 @@ class Worker:
         one being answered set by that method's ``finally``, and every later one in the queue
         for :meth:`_run`'s :meth:`_release_waiters`. The exit budget lives in
         :meth:`_emit_pending`, which every batch here goes through, and the tallies it keeps are
-        written in this method's ``finally`` (FR-003).
+        written in this method's ``finally`` (FR-003). Sealing a counted marker with this drain's
+        ledger, or marking it answered while unwinding, happens inside :meth:`_answer_marker`
+        through :meth:`_seal_marker`, as it does for :meth:`_drain` (SPEC-089, invariant 6).
 
         Args:
           pending: The batch :meth:`_drain` was building, continued and emitted in place.

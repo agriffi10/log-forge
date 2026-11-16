@@ -1318,6 +1318,23 @@ close it.
   this shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain
   thread, which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034)~~, and a
   swap that does not wait on the thread it runs on~~.
+- **A `flush()` made inside the event ledger's registration lock waits on a drain that waits on
+  that lock, when the sink logs through the library** (SPEC-089's execution-frame review;
+  invariant 3). A thread's first credit registers its ledger cell under the registration lock
+  (`_ledger._register`), and the drain thread's first credit comes from inside `sink.emit` when
+  the sink logs through the library. A `flush()` made while the calling thread holds that lock, as
+  a collector callback or a `__del__` run by the section's own allocations does, waits on the
+  drain to answer its marker while the drain waits on the lock. SPEC-089 made the drain's reading
+  when it answers a counted marker only *try* the lock, which closed the shape where that reading
+  was the waiter, but not this one, where the drain is still inside `emit`. The repro: a sink
+  whose `emit` calls a traced function, and a thread that takes `_ledger._registry.lock`, logs one
+  span and calls `flush()`. Measured at `96cd0480` and at `251a9321` (SPEC-089's In Progress
+  commit, before any of its code): `flush(2)` returns `timed-out` after 2.00 s, and `flush(None)`
+  does not return, with the drain thread's stack in `_ledger._register` under `Worker._emit`. It
+  predates SPEC-089. **Closed by** the drain's first credit not waiting on the lock, either by
+  taking it without blocking, with what a credit does when the lock is held decided by the spec
+  that closes this, or by a cell registered for the drain thread when its drain starts, before it
+  can reach a sink.
 - **A shutdown sentinel can still strand behind the final drain on the ordinary path** (SPEC-068
   diff review; invariant 2). The first caller queues `_SHUTDOWN` and then sets the stop event, but
   a drain thread that wakes on the stop event first — at the end of an emit, or from a backoff —
@@ -1487,63 +1504,7 @@ are things a frame raised and nobody verified, and each says what verifying it t
 `audit-2026-11-14` (`docs/specs/ARCS.md`) says how the remediation is cut and what Andrew decided;
 an item leaves this list when a spec closes it, not because the arc names it.
 
-- **`flush()` is truthy when the sink lost some or all of the events it flushed, and the settled
-  record is divided on whether it should be** (2026-11-14 audit, finding 2; invariants 2 and 7).
-  *Measured.* An engine run settles unless nothing was accepted and nothing ended unknown
-  (`sinks/_engine.py:1873`), and `flush()` is judged on `failed_batches` alone (`worker.py:910`,
-  `:1784`). So a verdict sink that takes 1 of 30 events, drops all 30 or answers `UNKNOWN` for all
-  30 leaves `flush()` at `ok=True`, with the loss in `health().sink` and one stderr line
-  (`docs/audits/2026-11-14-probes/core-pipeline/p09_flush_barrier.py`, four of its five cases).
-  *What a truthy result over a counted loss rests on.* §13's first constraint, *`flush()` reports
-  success over events `NATSSink`'s publish deadline absorbed*, calls it "SPEC-026's routing working
-  as designed" and says `flush()`'s verdict "is built on `failed_batches`". *An event a sink cannot
-  encode costs only itself, and a batch of nothing encodable settles, counted*
-  (`docs/decisions/sink-delivery/`) is Andrew's decision of 2026-11-04, recorded under *1.2.0
-  stability redesign* in `docs/specs/ARCS.md` and shipped in `docs/release-notes/v1.2.0.md`
-  ("`flush()` is truthy and `failed_batches` stays 0 for it", `:126`, and again at `:982`).
-  Invariant 7's recorded exceptions restate both, and carry the all-dropped and all-unknown cases.
-  *A sink that delivered nothing raises; one that delivered something reports*
-  (`docs/decisions/sink-delivery/`) is the routing §13 cites and supports the partial cases only:
-  its own fence counts a `flush()` that "returns `True` while everything is lost" as the defect it
-  exists to prevent. *What it contradicts.* *`flush()` reports delivery, and answers from the drain
-  that carried the events* (`docs/decisions/pipeline/`) says in its entry that "`True` means the
-  sink took them" and that "no added path can produce `ok=True` over lost events". `results.py:61`
-  says the same ("the sink took them"), and so do `README.md:1374` and `:1414-1417` ("evidence of
-  delivery"), while `README.md:767-769` says what the code does. The Lambda handler idiom at
-  `README.md:1501-1502` omits the `h.sink` term the general idiom carries at `:1258`, so a handler
-  written from it sees none of these losses. *Two closures were weighed, neither the
-  default, and the choice was Andrew's.* On 2026-11-14 he accepted the recommendation that `flush()`
-  be judged on the ledger's loss total; by the orchestrating session's account he was not told that
-  the settled record is divided, ~~so it is not yet a decision, and it was unanswered when this was
-  written~~ (answered on 2026-11-15, below). Under (a),
-  `flush()`'s truthiness reflects any loss in its window. That fulfils the `flush()` decision, the
-  docstring and the README's wording, and it reverses §13's constraint, the shipped consequence of
-  the 2026-11-04 decision and invariant 7's recorded exceptions. It costs a behaviour change inside
-  1.x for every caller that branches on `flush()`, and a falsy result for losses no retry cures, an
-  oversized or unencodable event among them. Under (b), truthiness stays and `FlushResult` gains
-  event counts of what was lost in its window, which is additive under invariant 10. That keeps
-  §13's constraint, the 2026-11-04 decision and the release notes, and it reverses the `flush()`
-  decision's "`True` means the sink took them", `results.py:61` and the README's "evidence of
-  delivery". It costs a truthy `flush()` that goes on covering lost events, and every caller having
-  to read the new fields to see a loss, the README's handler idioms first. **Answered 2026-11-15.**
-  Asked "Should flush() stay truthy over a counted loss and gain loss counts, or turn falsy?",
-  Andrew answered "Keep truthy, add counts", which is closure (b). So `flush()`'s truthiness does
-  not change, and `FlushResult` gains event counts of what was lost; that they are counts of what
-  was lost in the call's window is closure (b)'s wording, the record's reading of "add counts",
-  not his. The item stays
-  open because none of that is built: SPEC-088 specifies the event ledger those counts are read
-  from and leaves `FlushResult` alone. ~~**Closed by** his choice, and then by the side it reverses
-  being rewritten in place, dated, with the release notes carrying whatever a caller can see.~~
-  **Closed by** the spec of arc `audit-2026-11-14` that adds those counts to `FlushResult` and
-  rewrites, in place and dated, the statements closure (b) reverses: "`True` means the sink took
-  them" and "no added path can produce `ok=True` over lost events" in the `flush()` decision
-  (`docs/decisions/pipeline/`), `results.py:61`, and the README's "evidence of delivery"
-  (`README.md:1374`, `:1414-1417`), with the Lambda handler idiom at `README.md:1501-1502` reading
-  the loss and the release notes carrying what a caller can see. A staleness risk, not a change:
-  SPEC-084 holds a settled run that lost events to `failed_batches == 0`
-  (`test_a_capped_stream_never_writes_an_event_twice` in
-  `tests/test_stream_sink_partial_write.py`), which is what closure (b) keeps, so the answer
-  leaves that assertion as written.
+- ~~**`flush()` is truthy when the sink lost some or all of the events it flushed, and the settled record is divided on whether it should be**~~ → **closed by SPEC-089**; struck and moved under *Resolved*.
 - ~~**`health()` has no event unit, so invariant 2's ledger closes only by adding up stderr lines**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
 - ~~**A submission that overflows the queue after `shutdown()` is counted in two loss terms**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
 - ~~**A drain thread that dies leaves the batch it was holding in no counter**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
@@ -1643,8 +1604,13 @@ an item leaves this list when a spec closes it, not because the arc names it.
   which runs under `Runtime._lock`, reads the hand-over count without it (`_ledger.handed_unlocked`,
   SPEC-088's diff review), so the two are never nested in either order. It is an `RLock`,
   so a handler or a `__del__` that logs or reads on the thread already inside it re-enters rather
-  than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`). A
-  handler on a thread inside any of the other locks still waits. One nesting remains, and it is
+  than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`).
+  SPEC-089 adds `flush()`'s two window reads, taken on the caller's thread as `health()`'s is, so
+  a `flush()` started while another thread is inside the lock's section waits for it, and the
+  drain's reading when it answers a counted marker, which **only tries** the lock: a `flush()` or
+  `shutdown()` made inside the section waits on the drain, so a drain waiting on the lock waited
+  on its own waiter, and `flush(None)` from a collector callback never returned (SPEC-089's second
+  diff review). A handler on a thread inside any of the other locks still waits. One nesting remains, and it is
   the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
   `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
   `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
@@ -1824,9 +1790,14 @@ an item leaves this list when a spec closes it, not because the arc names it.
   counts", closure (b) of the `flush()` item above, so `flush()` stays truthy here as well.
   ~~**Closed by** the choice the `flush()` item above puts to Andrew, which covers this case with
   the engine's and names what each option reverses, and by a decision on whether a full client
-  queue is retried.~~ **Closed by** the spec that adds the loss counts to `FlushResult`, once it
+  queue is retried.~~ ~~**Closed by** the spec that adds the loss counts to `FlushResult`, once it
   states whether a loss a sink counts after `emit` has returned, as a failed delivery report is
-  here, is among those counts, and by a decision on whether a full client queue is retried.
+  here, is among those counts, and by a decision on whether a full client queue is retried.~~
+  SPEC-089 added those counts (2026-11-16) and states that such a loss is **in none of them**:
+  the event ledger ends where `emit` returns, so a failed delivery report counted afterwards
+  shows in `health().sink` and nowhere on a `flush()` result, whose counts read zero over it.
+  **Closed by** the acknowledgement fix for these two sinks (SPEC-094), which has a round wait
+  for the client's report, and by a decision on whether a full client queue is retried.
 - **An injected autocommit connection breaks the database sinks' all-or-nothing write** (2026-11-14
   audit, finding 15; invariants 2 and 7). `PostgresSink` commits once after every chunk of a batch
   (`sinks/postgres.py:457-468`) and `SQLiteSink` relies on `with self._conn`
@@ -2155,6 +2126,76 @@ an item leaves this list when a spec closes it, not because the arc names it.
   → **closed by SPEC-088 FR-002 item 6.** At the commit that merged SPEC-088, `p16` ends with `accepted=5 orphan_lost=1
   in_span_lost=4 delivered=0` and nothing on stderr, and `p17` ships a log made after an interrupted
   close on the span's own trace and span ids.
+- ~~**`flush()` is truthy when the sink lost some or all of the events it flushed, and the settled
+  record is divided on whether it should be**~~ (2026-11-14 audit, finding 2; invariants 2 and 7).
+  *Measured.* An engine run settles unless nothing was accepted and nothing ended unknown
+  (`sinks/_engine.py:1873`), and `flush()` is judged on `failed_batches` alone (`worker.py:910`,
+  `:1784`). So a verdict sink that takes 1 of 30 events, drops all 30 or answers `UNKNOWN` for all
+  30 leaves `flush()` at `ok=True`, with the loss in `health().sink` and one stderr line
+  (`docs/audits/2026-11-14-probes/core-pipeline/p09_flush_barrier.py`, four of its five cases).
+  *What a truthy result over a counted loss rests on.* §13's first constraint, *`flush()` reports
+  success over events `NATSSink`'s publish deadline absorbed*, calls it "SPEC-026's routing working
+  as designed" and says `flush()`'s verdict "is built on `failed_batches`". *An event a sink cannot
+  encode costs only itself, and a batch of nothing encodable settles, counted*
+  (`docs/decisions/sink-delivery/`) is Andrew's decision of 2026-11-04, recorded under *1.2.0
+  stability redesign* in `docs/specs/ARCS.md` and shipped in `docs/release-notes/v1.2.0.md`
+  ("`flush()` is truthy and `failed_batches` stays 0 for it", `:126`, and again at `:982`).
+  Invariant 7's recorded exceptions restate both, and carry the all-dropped and all-unknown cases.
+  *A sink that delivered nothing raises; one that delivered something reports*
+  (`docs/decisions/sink-delivery/`) is the routing §13 cites and supports the partial cases only:
+  its own fence counts a `flush()` that "returns `True` while everything is lost" as the defect it
+  exists to prevent. *What it contradicts.* *`flush()` reports delivery, and answers from the drain
+  that carried the events* (`docs/decisions/pipeline/`) says in its entry that "`True` means the
+  sink took them" and that "no added path can produce `ok=True` over lost events". `results.py:61`
+  says the same ("the sink took them"), and so do `README.md:1374` and `:1414-1417` ("evidence of
+  delivery"), while `README.md:767-769` says what the code does. The Lambda handler idiom at
+  `README.md:1501-1502` omits the `h.sink` term the general idiom carries at `:1258`, so a handler
+  written from it sees none of these losses. *Two closures were weighed, neither the
+  default, and the choice was Andrew's.* On 2026-11-14 he accepted the recommendation that `flush()`
+  be judged on the ledger's loss total; by the orchestrating session's account he was not told that
+  the settled record is divided, ~~so it is not yet a decision, and it was unanswered when this was
+  written~~ (answered on 2026-11-15, below). Under (a),
+  `flush()`'s truthiness reflects any loss in its window. That fulfils the `flush()` decision, the
+  docstring and the README's wording, and it reverses §13's constraint, the shipped consequence of
+  the 2026-11-04 decision and invariant 7's recorded exceptions. It costs a behaviour change inside
+  1.x for every caller that branches on `flush()`, and a falsy result for losses no retry cures, an
+  oversized or unencodable event among them. Under (b), truthiness stays and `FlushResult` gains
+  event counts of what was lost in its window, which is additive under invariant 10. That keeps
+  §13's constraint, the 2026-11-04 decision and the release notes, and it reverses the `flush()`
+  decision's "`True` means the sink took them", `results.py:61` and the README's "evidence of
+  delivery". It costs a truthy `flush()` that goes on covering lost events, and every caller having
+  to read the new fields to see a loss, the README's handler idioms first. **Answered 2026-11-15.**
+  Asked "Should flush() stay truthy over a counted loss and gain loss counts, or turn falsy?",
+  Andrew answered "Keep truthy, add counts", which is closure (b). So `flush()`'s truthiness does
+  not change, and `FlushResult` gains event counts of what was lost; that they are counts of what
+  was lost in the call's window is closure (b)'s wording, the record's reading of "add counts",
+  not his. The item stays
+  open because none of that is built: SPEC-088 specifies the event ledger those counts are read
+  from and leaves `FlushResult` alone. ~~**Closed by** his choice, and then by the side it reverses
+  being rewritten in place, dated, with the release notes carrying whatever a caller can see.~~
+  **Closed by** the spec of arc `audit-2026-11-14` that adds those counts to `FlushResult` and
+  rewrites, in place and dated, the statements closure (b) reverses: "`True` means the sink took
+  them" and "no added path can produce `ok=True` over lost events" in the `flush()` decision
+  (`docs/decisions/pipeline/`), `results.py:61`, and the README's "evidence of delivery"
+  (`README.md:1374`, `:1414-1417`), with the Lambda handler idiom at `README.md:1501-1502` reading
+  the loss and the release notes carrying what a caller can see. A staleness risk, not a change:
+  SPEC-084 holds a settled run that lost events to `failed_batches == 0`
+  (`test_a_capped_stream_never_writes_an_event_twice` in
+  `tests/test_stream_sink_partial_write.py`), which is what closure (b) keeps, so the answer
+  leaves that assertion as written.
+  → **closed by SPEC-089** (closure (b)). `FlushResult` gains `overflow_lost`, `batch_lost`,
+  `sink_lost`, `drain_lost` and `stranded`, with `lost` their total, each the change in its
+  `health().events` term over the call's window, from before the sweep to the drain's answer;
+  `bool()` still reads `ok` alone. A drain dying under the call is waited for until it has debited
+  what it held (`Worker._drain_accounted`), which is before its stderr line, so the queue behind it
+  reads as `stranded` from then rather than only once its thread has ended. On a worker whose triggers no submission of the case reaches,
+  p09's four lossy plans now return a truthy result whose `sink_lost` is 29, 29, 30 and 30, and "all 30 REJECTED" returns `abandoned` with
+  `batch_lost == 30` (`tests/test_flush_loss_counts.py`). The `flush()` decision was rewritten in
+  place and dated, reversed in part, the result-type decision and invariant 10 refined, the
+  docstrings and the README's wording rewritten, the Lambda handler idiom reads `drained.lost` and
+  the `h.sink` term, and `docs/release-notes/v1.0.0.md` carries a superseded marker. The counts are
+  process-wide and over-count, and a loss a sink counts after its `emit` returned is in none of
+  them: the `KafkaSink` and `GooglePubSubSink` item stays open for that.
 - ~~**A sink can be released while it is still live inside the graph that replaced it.**~~
   (2026-11-14 audit, finding 4; invariants 5 and 2) → **closed by SPEC-087.** `configure(A)` then
   `configure(MultiSink(A, B))`, or the reverse, closed A at the swap while A was a member of the

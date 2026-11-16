@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import collections
 import contextlib
+import dataclasses
 import enum
 import gc
 import os
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
 
     from log_foundry.results import FlushResult
     from log_foundry.sinks.base import Sink
-    from log_foundry.worker import EventLedger, Health, Worker, _Reading
+    from log_foundry.worker import EventLedger, Health, Worker, _FlushMarker, _Reading
 
 DEFAULT_SHUTDOWN_TIMEOUT = 30.0
 """Seconds :meth:`Worker.stop` will wait for the drain thread (SPEC-027 FR-004).
@@ -6297,18 +6298,34 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     first, does build one when it finds buffered events on an open span, because submitting them
     into a worker that does not exist delivers nothing and still reports success.
 
+    **The window's counts are read here, on the calling thread** (SPEC-089 FR-002, FR-003). The
+    start is read before the sweep, because the sweep's own hand-over can overflow a full queue
+    into ``overflow_lost`` before any marker exists. The end is the ledger the drain wrote when it
+    answered this call's marker, or, where it wrote none, a read here once
+    :meth:`Worker._flush_marked` returns and before the sink's own buffer is flushed; a drain that
+    is dying is waited for first (:func:`_close_window`). Every ``return`` below passes through
+    :func:`_with_counts`, and a test derives those returns from the tree. ``timeout`` reaches the
+    worker unchanged, so the verdict's timing does not move; the deadline computed here only
+    bounds the wait for a dying drain.
+
+    **A start that could not be read makes the call uncounted** (SPEC-089 FR-003). Its counts
+    are zero whatever the end reads, so the marker asks the drain for no snapshot and the end is
+    not read: a persistent fault in the ledger then writes one line per call rather than one
+    per read, and the call does not wait on a dying drain for counts it will not report.
+
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
     Returns:
-      A :class:`FlushResult`, truthy when everything outstanding was delivered and when no
-      worker exists — a process that never logged has nothing to drain, so it has lost nothing.
-      A sweep that could not hand its buffers over reports ``"abandoned"``, the existing token
-      for "this call did not deliver them" (SPEC-036 FR-001): the events are still on their open
-      spans and their close may yet carry them, but the caller asked *now*, and on the
-      cold-start path this exists for there may be no close — reporting success there is the
-      exact shape the spec was written to remove. The drain still runs, so whatever was
-      submitted before the failure is not held back by it.
+      A :class:`FlushResult`, truthy when the drain that carried everything outstanding finished
+      and abandoned no batch while the call was outstanding, and when no worker exists — a
+      process that never logged has nothing to drain. Events a settled run lost are counted on
+      the result rather than folded into its truth. A sweep that could not hand its buffers over
+      reports ``"abandoned"``, the existing token for "this call did not deliver them" (SPEC-036
+      FR-001): the events are still on their open spans and their close may yet carry them, but
+      the caller asked *now*, and on the cold-start path this exists for there may be no close —
+      reporting success there is the exact shape the spec was written to remove. The drain still
+      runs, so whatever was submitted before the failure is not held back by it.
 
     The sink's own buffer is drained **whichever way the earlier steps went**, and the failure
     reasons are decided afterwards. A draft returned early on a failed sweep or a dead drain
@@ -6324,6 +6341,9 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     from log_foundry.decorator import _sweep_open_spans
     from log_foundry.results import FlushResult
 
+    deadline = None if timeout is None else monotonic() + timeout
+    start = _open_window()
+    counted = start is not None
     swept = True
     try:
         _sweep_open_spans()
@@ -6332,20 +6352,221 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         swept = False
     worker = _state.worker_exists()
     drained: FlushResult = FlushResult(ok=True)
+    marker: _FlushMarker | None = None
     thread_died = False
     if worker is not None:
         try:
-            drained = worker.flush(timeout)
+            drained, marker = worker._flush_marked(timeout, counted=counted)
         except Exception:
             thread_died = True
+    end = _close_window(worker, marker, deadline, start) if counted else None
     sink_drained = _flush_live_sink()
     if not swept:
-        return FlushResult(ok=False, reason="abandoned")
+        return _with_counts(FlushResult(ok=False, reason="abandoned"), start, end)
     if thread_died:
-        return FlushResult(ok=False, reason="thread-died")
+        return _with_counts(FlushResult(ok=False, reason="thread-died"), start, end)
     if not sink_drained:
-        return FlushResult(ok=False, reason="sink-flush")
-    return drained
+        return _with_counts(FlushResult(ok=False, reason="sink-flush"), start, end)
+    return _with_counts(drained, start, end)
+
+
+def _open_window() -> tuple[int, EventLedger] | None:
+    """Reads the start of a ``flush()`` call's window, stamped with this process's pid.
+
+    The pid is what lets :func:`_with_counts` tell a window a fork crossed from one that stayed
+    in one process (SPEC-089 FR-003): a forked child's ledger restarts at zero, so a difference
+    across the fork would read the parent's losses as negative.
+
+    Args:
+      None.
+
+    Returns:
+      The pid and the ledger as it reads now, or ``None`` when the read failed.
+
+    Raises:
+      None. A fault is announced by type and the call's counts stay zero, its verdict unchanged,
+        because a flush is the call most likely to be made in a ``finally`` (SPEC-089 FR-003).
+    """
+    try:
+        return os.getpid(), _ledger_snapshot()
+    except Exception as exc:
+        _diag.absorbed("reading the event ledger for a flush", exc, "the flush reports no counts")
+        return None
+
+
+_ACCOUNTING_SLICE = 0.05
+"""Seconds one slice of the wait for a dying drain's last debit lasts (SPEC-089 FR-003).
+
+The wait is sliced only so that a thread which forked during it notices that it is now in another
+process (:func:`_await_accounting`). A slice is an idle ``Event.wait``, so the cost is twenty
+wake-ups a second for as long as a drain takes to die, and a forked child leaves within one
+slice. Shorter buys a faster exit for a case no ordinary process meets; longer delays it.
+"""
+
+
+def _await_accounting(worker: Worker, deadline: float | None, opened_in: int) -> None:
+    """Waits idly for a dying drain's last debit, for as long as this thread stays in its process.
+
+    The wait ends when ``Worker._drain_accounted`` is set, when the call's deadline passes, or
+    when this thread is found in a process other than ``opened_in``, the one the flush's window
+    opened in (SPEC-089 FR-003). A fork from a signal handler on this thread, before the wait or
+    during it, leaves the child waiting on its own resumed drain's event, which that drain sets
+    only when it ends, so the child stops waiting at the next slice and reads its own end. Each
+    slice is at most :data:`_ACCOUNTING_SLICE` and at most what is left of the deadline, so the
+    slices together never exceed the deadline and the wait never spins.
+
+    Args:
+      worker: The process worker whose drain is dying.
+      deadline: The call's ``monotonic()`` deadline, or ``None`` for an unbounded call.
+      opened_in: The pid the flush's window opened in.
+
+    Returns:
+      None.
+
+    Raises:
+      None of its own. A fault in the event's ``wait`` propagates to :func:`_close_window`,
+        which absorbs and announces it.
+    """
+    while os.getpid() == opened_in:
+        left = _remaining(deadline)
+        step = _ACCOUNTING_SLICE if left is None else min(_ACCOUNTING_SLICE, left)
+        if worker._drain_accounted.wait(step) or (left is not None and left <= step):
+            return
+
+
+def _close_window(
+    worker: Worker | None,
+    marker: _FlushMarker | None,
+    deadline: float | None,
+    start: tuple[int, EventLedger] | None,
+) -> tuple[int, EventLedger] | None:
+    """Reads the end of a ``flush()`` call's window, waiting first for a dying drain.
+
+    **The drain's own snapshot is the end when it took one** (SPEC-089 FR-002): it was read when
+    the drain answered the marker, after every event ahead of it had settled, which is the same
+    moment the verdict is judged at. A batch the drain loses after answering is then outside the
+    window, however long this thread takes to wake.
+
+    **Otherwise the end is read here, after waiting for a drain that is dying** (FR-003). A drain
+    dying on a ``BaseException`` answers its markers in a ``finally`` before
+    ``_terminal_failure`` debits ``drain_lost``, and the queue behind it counts as ``stranded``
+    only once that debit is made, so a read taken at once can miss both. The drain is dying
+    when the answerer marked the marker ``unwinding``, or when ``_drain_finished`` is set while
+    the thread is still alive, which covers a verdict reached before the drain debited, such as
+    a marker put after the loop stopped. The wait is on ``Worker._drain_accounted``, which
+    ``_terminal_failure`` sets right after that debit and **before** its stderr line, and
+    ``_run`` sets on every exit. It is not a ``join`` on the thread: a ``join`` also waited
+    out that line, and a ``flush()`` made while its own thread held a lock the line needs, a
+    replaced ``sys.stderr`` that serialises writes, waited on a write that waited on it,
+    forever under ``timeout=None``. The wait is idle, bounded by what is left of the call's
+    deadline and unbounded when that is ``None``, as the rest of the call is, and taken in
+    slices of :data:`_ACCOUNTING_SLICE` so that it can notice a fork. An expired
+    ``shutdown()`` leaves ``_drain_finished`` clear on a drain still working, so its pessimistic
+    answer causes no wait. The wait is skipped on the drain thread itself, the guard
+    :meth:`Worker.claim_stop` and :meth:`Worker.stop` use. Since the event is set before the
+    line, a ``flush()`` made from the dying thread's own stderr line finds it set and would not
+    wait even without the guard, so the guard is defence in depth: it keeps the drain thread
+    from ever waiting on an event only it can set.
+
+    **The wait belongs to the process the window opened in** (:func:`_await_accounting`). The
+    event is the worker's, and a forked child resumes that same worker with a new drain that
+    clears it and sets it only when it ends, so a child forked from a signal handler on this
+    thread, before the wait or during it, would otherwise sit on a live drain's event: forever
+    under ``timeout=None``, its whole budget otherwise. The wait is skipped when the window's
+    start was read in another process, and ends at its next slice once this thread finds itself
+    in one, and the child reads its own end. A child forked between the start and the dying test,
+    whose own drain is dying, does not wait for it either: it is the window's start, not the
+    dying test, that a pid can be compared with, and a fork crossing the window already makes its
+    counts the child's since the fork.
+
+    **The pid paired with the drain's snapshot is the one the drain stamped when it took it**
+    (:meth:`Worker._seal_marker`), so the fork rule in :func:`_with_counts` compares the processes
+    the two readings were actually taken in, not the one this thread is in when it wakes. **A
+    snapshot stamped by another process is not the end of this one's window**: a fork on this
+    thread after the drain answered, a signal handler's, leaves the child holding the parent's
+    snapshot, and the child reads its own end instead.
+
+    **The wait and the read each absorb their own fault, each announced by what it was doing.**
+    A wait that fails is announced as one and the end is read without it, so the counts may miss
+    what the dying drain had yet to debit; a read that fails leaves the counts at zero.
+
+    Args:
+      worker: The process worker the call flushed, or ``None`` when there was none.
+      marker: The marker :meth:`Worker._flush_marked` queued, or ``None`` when it queued none.
+      deadline: The call's ``monotonic()`` deadline, or ``None`` for an unbounded call.
+      start: The window's start reading and its pid, from :func:`_open_window`. The caller
+        passes ``None`` never, since an uncounted call reads no end; ``None`` would take this
+        process as the one the window opened in.
+
+    Returns:
+      The pid and the ledger that close the window, or ``None`` when the read failed.
+
+    Raises:
+      None. A fault in the wait or the read is announced by type, and the verdict is unchanged.
+    """
+    if marker is not None and not marker.unwinding:
+        ledger, pid = marker.ledger, marker.ledger_pid
+        if ledger is not None and pid == os.getpid():
+            return pid, ledger
+    try:
+        if worker is not None and threading.current_thread() is not worker._thread:
+            unwinding = marker is not None and marker.unwinding
+            if unwinding or (worker._drain_finished.is_set() and worker._thread.is_alive()):
+                _await_accounting(worker, deadline, os.getpid() if start is None else start[0])
+    except Exception as exc:
+        _diag.absorbed(
+            "waiting for a dying drain's last debit before reading a flush's counts",
+            exc,
+            "the flush reads its counts without waiting",
+        )
+    try:
+        return os.getpid(), _ledger_snapshot()
+    except Exception as exc:
+        _diag.absorbed("reading the event ledger for a flush", exc, "the flush reports no counts")
+        return None
+
+
+def _with_counts(
+    verdict: FlushResult,
+    start: tuple[int, EventLedger] | None,
+    end: tuple[int, EventLedger] | None,
+) -> FlushResult:
+    """Attaches a window's loss counts to a verdict, the one place a result gains them.
+
+    The counts are the fieldwise difference of the two readings over the five loss terms an
+    event handed to the worker can leave by (SPEC-089 FR-002). ``in_span_lost`` and
+    ``orphan_lost`` are left out: they are debited on a caller's own path before anything is
+    handed over, so a flush carries no event that can leave through them. When the two readings
+    were taken in different processes, a fork crossed the window and the child's ledger restarted
+    at zero, so the end reading's own terms are the child's losses since the fork, all inside
+    the window (FR-003). Each count is published as zero rather than negative, since a count can
+    fall in one process only when a test replaces the process worker by hand.
+
+    Args:
+      verdict: The verdict the call reached, with zero counts.
+      start: The window's start reading and its pid, or ``None`` when that read failed.
+      end: The window's end reading and its pid, or ``None`` when that read failed.
+
+    Returns:
+      The verdict with its counts, or the verdict unchanged when either reading is missing.
+
+    Raises:
+      None.
+    """
+    if start is None or end is None:
+        return verdict
+    start_pid, first = start
+    end_pid, last = end
+    if start_pid != end_pid:
+        first = type(last)()
+    return dataclasses.replace(
+        verdict,
+        overflow_lost=max(0, last.overflow_lost - first.overflow_lost),
+        batch_lost=max(0, last.batch_lost - first.batch_lost),
+        sink_lost=max(0, last.sink_lost - first.sink_lost),
+        drain_lost=max(0, last.drain_lost - first.drain_lost),
+        stranded=max(0, last.stranded - first.stranded),
+    )
 
 
 def _delivering_to_an_inherited_sink() -> bool:
@@ -6519,6 +6740,41 @@ def _ledger_snapshot() -> EventLedger:
       None.
     """
     return _ledger_reading().ledger
+
+
+def _ledger_snapshot_if_free() -> EventLedger | None:
+    """Returns one reading of the event ledger, or ``None`` when the registration lock is taken.
+
+    The drain thread's variant of :func:`_ledger_snapshot`, and only :meth:`Worker._seal_marker`
+    calls it (SPEC-089 FR-002). The registration lock is re-entrant so that a ``__del__``, a
+    collector callback or a signal handler running inside its section re-enters rather than
+    waits (``_ledger._Registry``), and such code may call ``flush()`` or ``shutdown()``, which
+    wait on the drain. A drain that then waited on the lock in turn would wait on its own waiter:
+    measured, a ``flush(None)`` from a collector callback inside the lock never returned, and a
+    ``shutdown()`` from inside it expired and left the sink open. So the lock is tried, never
+    waited for, and held across the reading, whose own passes re-enter it. When another thread
+    holds it, the drain answers its marker with no reading and the caller reads the end of its
+    window itself, which the holder can do since the lock is re-entrant; that end is read later
+    than the drain's would have been, so the window may also hold a loss from after the answer.
+
+    Args:
+      None.
+
+    Returns:
+      The ledger as it reads now, or ``None`` when another thread held the registration lock.
+
+    Raises:
+      None.
+    """
+    from log_foundry import _ledger
+
+    lock = _ledger._registry.lock
+    if not lock.acquire(blocking=False):
+        return None
+    try:
+        return _ledger_snapshot()
+    finally:
+        lock.release()
 
 
 _fork.register_pin(_pin_inherited)

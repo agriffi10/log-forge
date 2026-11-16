@@ -592,7 +592,7 @@ specs:
   - id: "SPEC-089"
     title: "flush() Counts What Its Window Lost, and Stays Truthy Over It"
     description: "Gives FlushResult event counts of what the process lost while a flush() call was outstanding, read from the event ledger, without changing what bool(flush()) reports, so a handler can see a loss a truthy flush covers; and rewrites in place every statement that said a truthy flush meant delivery."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-021", "SPEC-034", "SPEC-036", "SPEC-050", "SPEC-051", "SPEC-072", "SPEC-088"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-089-flush-loss-counts.md"

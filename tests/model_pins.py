@@ -192,7 +192,7 @@ PINS: tuple[Pin, ...] = (
             _cell("reentrant", "swap-emit", "worker", "flush-none"),
             _cell("factory", "factory", "worker", "flush-none"),
         ),
-        frozenset({"HangFound:flush-none@worker.flush"}),
+        frozenset({"HangFound:flush-none@worker._flush_marked"}),
         "`flush()` called on the drain thread waits on itself",
         sibling="flush",
     ),

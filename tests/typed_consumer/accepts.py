@@ -76,6 +76,9 @@ _LEDGER = EventLedger(accepted=2, delivered=2)
 _LOST: int = health().events.lost + _LEDGER.pending
 _LOSSES = SinkLosses(dropped=0, failed=0)
 _FLUSH = FlushResult(ok=True)
+# SPEC-089 FR-001: the counts read as `int`, and build by keyword.
+_FLUSH_LOST: int = flush().lost + flush().sink_lost
+_FLUSH_STRANDED = FlushResult(ok=True, stranded=2)
 _CONTINUE = ContinueResult(ok=False, reason="nothing-supplied")
 _CONFIG = Config(service="svc", version="1.0.0", env="prod")
 
@@ -323,7 +326,8 @@ _DEDUP: DedupIdSource = None
 # Every remaining exported name, referenced so nothing is imported and unused. `__all__` is the
 # claim; touching each name here is what makes the claim checkable.
 _NAMES: tuple[object, ...] = (
-    _HEALTH, _LOSSES, _FLUSH, _CONTINUE, _CONFIG, _LABELS, _wire, _work, _sinks,
+    _HEALTH, _LOSSES, _FLUSH, _FLUSH_LOST, _FLUSH_STRANDED, _CONTINUE, _CONFIG, _LABELS, _wire,
+    _work, _sinks,
     _FACTORY_CONFIG, _FACTORY, _configure_a_factory,
     __version__, health, get_config, get_baggage, current_baggage_header, current_trace_context,
     read_losses, flush_sink, SinkDeliveryError, merge_headers, _BACKEND, _GROUP, _DEDUP,

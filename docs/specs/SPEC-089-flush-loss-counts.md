@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-089
 title: "flush() Counts What Its Window Lost, and Stays Truthy Over It"
 description: "Gives FlushResult event counts of what the process lost while a flush() call was outstanding, read from the event ledger, without changing what bool(flush()) reports, so a handler can see a loss a truthy flush covers; and rewrites in place every statement that said a truthy flush meant delivery."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-021, SPEC-034, SPEC-036, SPEC-050, SPEC-051, SPEC-072, SPEC-088]
 arc: audit-2026-11-14
 arc_order: 5
@@ -239,8 +239,9 @@ are, without counts. Every result `log_foundry.flush()` returns passes through o
 **A window the drain did not close is closed on the calling thread.** Sometimes no drain answers
 the marker with a snapshot. The worker may not exist, the call may return before it queues a
 marker (`"retired"`, `"thread-died"`, `"queue-full"`, or an `"abandoned"` given up before the
-put), the wait may time out, or the marker may be answered pessimistically by an expired
-`shutdown()` or the terminal sweep. In each case `_flush_worker` reads the end when
+put), the wait may time out, the marker may be answered pessimistically by an expired
+`shutdown()` or the terminal sweep, or the drain may have found the ledger's registration lock
+held by another thread. In each case `_flush_worker` reads the end when
 `_flush_marked` returns, and before `_flush_live_sink()` runs. Every `FlushResult` `flush()`
 returns carries its window's counts, whatever its reason. That includes `"abandoned"` from a
 failed sweep, `"thread-died"` from `_flush_worker`, and `"sink-flush"`, whose counts are the
@@ -249,6 +250,17 @@ worker takes the difference like any other. `overflow_lost`, `batch_lost`, `drai
 `stranded` read zero there. `sink_lost` does not always: SPEC-088 keeps the orphan path's exits
 in the caller-side cells, so another thread's orphan log that a sink drops in the window is
 counted, which is the third over-count FR-002 names.
+
+**The drain's snapshot never waits on the registration lock.** The lock is re-entrant so that a
+`__del__`, a collector callback or a signal handler running inside its section re-enters it
+rather than waits, and such code may call `flush()` or `shutdown()`, which wait on the drain. A
+drain that waited on the lock would wait on its own waiter: at `bd51dfe5` a `flush(None)` from a
+collector callback inside the lock never returned, a `flush(2.0)` made inside it timed out, and a
+`shutdown(1)` made inside it expired and left the sink open (the second diff review). So the
+drain only tries the lock, holding it across its reading, and when another thread holds it the
+marker is answered with no snapshot and the caller reads the end itself; the holder can, since
+the lock is re-entrant. The caller's own two reads take the lock as `health()` does, so a call
+started while another thread is inside the section waits for that section to end.
 
 **A dying drain is waited for before the read.** A drain thread dying on a `BaseException` from
 the sink answers the markers it holds in a `finally`, before `_terminal_failure` debits
@@ -261,22 +273,37 @@ Measured at `9b54b370`, with a switch interval of 1e-6, the caller's read came b
 the default interval it came after both in 200 of 200 (Evidence).
 
 So each answerer marks a marker it answers while unwinding an exception (`_FlushMarker.unwinding`).
-`_flush_worker` waits for the drain thread to end, then reads, when the marker is so marked or
-when it finds `_drain_finished` set while the thread is still alive. The wait is idle and lasts
-at most what is left of the call's timeout. With `timeout=None` it is unbounded, as the rest of
-the call is. That is a change a caller can see: today a `flush(timeout=None)` whose drain dies
-under it returns `"abandoned"` at once, and it will wait until `_terminal_failure` has written
-its line, which takes as long as `sys.stderr` takes to accept it. The release notes say so
-(FR-004). A call whose budget runs out first reads what has been debited by then. An expired
-`shutdown()` leaves `_drain_finished` clear on a drain that is still working, so its pessimistic
-answer causes no wait.
+`_flush_worker` waits until the dying drain has debited what it held, then reads, when the
+marker is so marked or when it finds `_drain_finished` set while the thread is still alive. The
+wait is on a third drain event, `Worker._drain_accounted`, which `_terminal_failure` sets right
+after its debit and before its stderr line, and `_run`'s outermost `finally` sets on every exit;
+from then on the drain takes nothing from the queue, so the ledger counts the queue as
+`stranded` once that event is set or the thread has ended. ~~`_flush_worker` waits for the drain
+thread to end~~: a `join` also waited out the stderr line, and at `bd51dfe5` a `flush(None)` made
+while its own thread held a lock that a replaced `sys.stderr` serialises writes under waited on a
+line that waited on it, forever (the second diff review). The wait is idle and lasts at most
+what is left of the call's timeout. With `timeout=None` it is unbounded, as the rest of the call
+is. It is taken in slices of 50 ms, and it belongs to the process the window opened in: it is
+skipped when the start was read in another process, and it ends at the next slice once the
+caller's thread finds itself in one. A forked child resumes the same worker with a live drain,
+which clears the event and sets it only when it ends, so a child forked from a signal handler on
+the caller's thread, before the wait or during it, would otherwise wait on that live drain:
+forever under `timeout=None`, its whole budget otherwise (the execution-frame review). That is a change a caller can see: today a `flush(timeout=None)` whose drain dies under it
+returns `"abandoned"` at once, and it will wait until `_terminal_failure` has debited what the
+drain held, which never includes a write to `sys.stderr`. The release notes say so (FR-004). A
+call whose budget runs out first reads what has been debited by then. An expired `shutdown()`
+leaves `_drain_finished` clear on a drain that is still working, so its pessimistic answer
+causes no wait.
 
 **The wait is skipped on the drain thread itself.** `_terminal_failure` writes through `_diag`
 to `sys.stderr`, which a caller may have replaced, and a `flush()` made from that write runs on
-the dying drain thread. Waiting there would wait for its own thread: `Thread.join` raises
-`RuntimeError`, and an unbounded wait would never end. So `_flush_worker` skips the wait when
+the dying drain thread. ~~Waiting there would wait for its own thread: `Thread.join` raises
+`RuntimeError`, and an unbounded wait would never end.~~ The line is written after
+`_drain_accounted` is set, so a wait there would return at once; the drain thread must still
+never wait on an event only it can set. So `_flush_worker` skips the wait when
 `threading.current_thread() is worker._thread`, the guard `Worker.claim_stop` and `Worker.stop`
-already use (`worker.py:1307`, `:1417`), and reads at once.
+already use (`worker.py:1307`, `:1417`), and reads at once. It is defence in depth now, and the
+criterion below holds the outcome.
 
 **A window a fork crosses is the child's.** SPEC-088 FR-005 restarts a forked child's ledger
 with every loss term at zero, and the child's worker starts a fresh drain on a fresh queue
@@ -286,13 +313,19 @@ child's losses since the fork, all inside the window. Each count is also publish
 rather than negative. In one process a count can fall only when a test replaces the process
 worker by hand. A fork after the marker has been queued leaves the marker in the parent's queue,
 which the child replaces, so that child's flush times out. This FR makes no promise about such a
-call beyond its counts being its own and never negative.
+call beyond its counts being its own and never negative. A fork after the drain sealed the marker,
+on the caller's thread before it closes the window, leaves the child holding the parent's
+snapshot, stamped with the parent's pid; the child ignores a snapshot stamped in another process
+and reads its own end.
 
 **A fault in a read is absorbed.** The drain thread's snapshot runs inside its marker branch,
 and an exception escaping there would end the only thread that delivers. A fault in it is
 announced by type and the marker is answered without a snapshot, so the caller reads instead. A
 fault in the caller's own read is announced by type and leaves the counts at zero with the
-verdict unchanged, because a flush is the call most likely to be made in a `finally`.
+verdict unchanged, because a flush is the call most likely to be made in a `finally`. A start
+that could not be read leaves the call's counts zero whatever the end reads, so the call asks the
+drain for no snapshot and does not read the end: a fault that never clears is announced once per
+call rather than once per read, three lines at `bd51dfe5`.
 
 #### Acceptance Criteria:
 
@@ -309,11 +342,16 @@ verdict unchanged, because a flush is the call most likely to be made in a `fina
 - [ ] A flush whose marker `shutdown()`'s exit drain answers, with a sink that raises
       `SystemExit` on that drain's batch, returns `drain_lost` equal to the events ahead of its
       marker, in 200 of 200 runs under a switch interval of 1e-6 (invariants 2 and 6).
-- [ ] With the dying drain held by an injected hook inside `_terminal_failure`, `flush(0.5)`
-      returns within 0.5 s plus 50 ms of wall time and with near-zero CPU, while the thread is
-      still held (invariant 3).
-- [ ] A `flush()` made on the dying drain thread, from a replaced `sys.stderr` that
-      `_terminal_failure` writes to, returns within 50 ms and raises nothing (invariants 1 and 3).
+- [ ] The sink holds the flush's batch for 1.0 s, then raises `SystemExit`, and an injected hook
+      holds the dying drain on its way into `_terminal_failure`, before its debit. `flush(2.0)`
+      waits only what is left of its deadline: the timeouts its slices of the wait on
+      `Worker._drain_accounted` are passed sum to at most 1.0 s, none is unbounded, and there
+      are at most one per 50 ms of that and one more, and the call returns in under 2.5 s of
+      wall time, half the extra second a wait that restarted the deadline would add, with
+      near-zero CPU, while the thread is still held (invariant 3).
+- [ ] A `flush(5)` made on the dying drain thread, from a replaced `sys.stderr` that
+      `_terminal_failure` writes to, returns in under 2.5 s, half the wait it would make for its
+      own thread, raises nothing, and leaves that stderr exactly one line (invariants 1 and 3).
 - [ ] `Worker.retarget`'s markers carry no ledger, and with the drain held by a hook inside
       `_terminal_failure`, a `configure(sink=...)` returns without waiting for that thread to end
       (invariant 3).
@@ -334,6 +372,25 @@ verdict unchanged, because a flush is the call most likely to be made in a `fina
       (invariants 1 and 11).
 - [ ] A fault injected into the caller's snapshot is announced by type once, and `flush()`
       returns its uninjected verdict with every count 0 (invariants 1 and 11).
+- [ ] Made on a thread holding the ledger's registration lock, `flush(2.0)` returns truthy in
+      under 1.0 s with its counts, and `flush(None)` returns; with another thread's flush
+      outstanding on the drain, `shutdown(1)` made there returns in under 0.9 s and closes the
+      sink (invariants 3 and 5).
+- [ ] A flush made from inside a write to a replaced `sys.stderr` that serialises writes under a
+      lock, while the drain dies under it, returns in under 1.0 s with `drain_lost` counted
+      under `flush(2.0)`, and returns under `flush(None)` (invariants 1 and 3).
+- [ ] A flush the closing sweep answers returns while the drain thread is still held inside that
+      sweep, with `drain_lost == 3` and `stranded == 3`; a flush made while the dying drain is
+      held before its debit waits for it and returns the same counts (invariants 2 and 6).
+- [ ] A child forked on the caller's thread after the drain sealed the marker returns counts of
+      its own, here all 0, and the parent's flush returns `sink_lost == 3` (invariant 12).
+- [ ] With the parent's drain dying under the flush and held before its debit, a child forked on
+      the caller's thread inside the wait for that drain, and a child forked there after the
+      marker's unwinding answer and before the wait, each return from `flush(None)` in under
+      2.5 s with every count 0, and the parent's flush returns `drain_lost == 3`
+      (invariants 3 and 12).
+- [ ] With every ledger read faulting, each of three flushes is announced once and returns its
+      uninjected verdict (invariants 1 and 11).
 
 ### FR-004: The record says what a truthy `flush()` means, rewritten in place and dated
 
@@ -414,9 +471,9 @@ so the entry goes in the pending notes for the next tag, whichever spec of the a
 - [ ] The pending release notes carry one entry. It names the five fields and `lost`, says that
       truthiness is unchanged, describes the window, the over-count and what a zero count does
       not cover, and says that `repr()` and `==` now include the counts (invariant 10).
-- [ ] The same entry says that a `flush(timeout=None)` whose drain dies under it now waits for the
-      drain thread to end, including its stderr line, where it returned `"abandoned"` at once
-      (invariants 3 and 10).
+- [ ] The same entry says that a `flush(timeout=None)` whose drain dies under it now waits until
+      that drain has counted what it held, which is before its stderr line, where it returned
+      `"abandoned"` at once (invariants 3 and 10).
 - [ ] The `docs/architecture.md` §12 item for finding 2 is struck as closed by this spec. The
       item for finding 12 records that a loss a sink counts after its `emit` returned is in none
       of the counts, and stays open for its acknowledgement fix (invariant 2).
@@ -612,6 +669,45 @@ so the four were not reproduced and are not explained.
 ---
 
 ## Revision history
+
+- **2026-11-16, revised after the execution-frame review**, which ran the build and found one
+  minor defect in FR-003, fixed in code here, and one older defect, filed rather than fixed.
+  - MINOR: a child forked during the wait for a dying drain, or just before it, waited on its
+    own live drain's `_drain_accounted`, so its `flush(None)` never returned. The wait is now
+    sliced and belongs to the process the window opened in. AC-6's spy follows it; criterion
+    added.
+  - Filed in `architecture.md` §12, not fixed: a `flush()` made inside the ledger's registration
+    lock waits on a drain whose first credit, from a sink that logs through the library, waits
+    on that lock. It reproduces at `251a9321`, before any of this spec's code.
+  - The ledger table's `stranded` row in `README.md` now says the queue reads stranded from the
+    end of the drain's run, a moment before its thread ends.
+
+- **2026-11-16, revised after the second diff review**, the system frame, which found one
+  blocking defect, two major and two minor, all in FR-003 and fixed in code here.
+  - BLOCKER: the drain's snapshot waited on the ledger's registration lock, which a `flush()` or
+    `shutdown()` made inside that lock's section waits behind; the drain now only tries it.
+    Criterion added.
+  - ~~`_flush_worker` waits for the drain thread to end~~: the wait is on
+    `Worker._drain_accounted`, set after the dying drain's debit and before its stderr line,
+    because a `join` deadlocked a `flush(None)` whose thread held a lock the line needs. The
+    ledger counts the queue as `stranded` from that moment. AC-6's hook and spy, FR-004's
+    release-notes criterion and the drain-thread guard's paragraph follow it; two criteria added.
+  - The caller's reads take the registration lock as `health()`'s does, now stated.
+  - A snapshot stamped in another process is ignored, so a fork after the seal reads the child's
+    own end. Criterion added.
+  - A start that could not be read makes the call uncounted, so a persistent fault writes one
+    line per call. Criterion added.
+
+- **2026-11-16, revised after the first diff review**, which found FR-003 AC-6's and AC-7's
+  bounds unsound.
+  - ~~`flush(0.5)` returns within 0.5 s plus 50 ms~~: a 50 ms margin sits under the repo's
+    stall allowance (`tests/test_timing_floors.py`, `STALL_ALLOWANCE`, from a measured 123 ms
+    CI stall), and the scenario spent none of the budget before the drain died, so a wait that
+    restarted the deadline returned at the same moment and passed. The sink now spends 1.0 s of
+    a `flush(2.0)` first, the join's argument is pinned at most 1.0 s, and the ceiling is 2.5 s.
+  - ~~returns within 50 ms~~: a ceiling under the same allowance, which no mutant needed, since
+    the one-line assertion is what catches a missing guard. The ceiling is now 2.5 s, half the
+    `flush(5)` a wait for its own thread would take, and the one-line assertion is stated.
 
 - **2026-11-15, revised after the spec review**, which found three blocking defects and ten
   smaller ones, all fixed here.

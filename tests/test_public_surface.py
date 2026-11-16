@@ -1249,6 +1249,70 @@ def test_a_new_reason_is_additive() -> None:
     assert bool(log_foundry.FlushResult(ok=True)) is True
 
 
+# ── SPEC-089 FR-001: FlushResult gains five counts and their total ─────────────────────────
+
+_FLUSH_COUNTS = ("overflow_lost", "batch_lost", "sink_lost", "drain_lost", "stranded")
+
+
+def test_flush_result_counts_default_to_zero() -> None:
+    """SPEC-089 FR-001 AC-1. Both constructions that existed before the counts still work."""
+    for result in (
+        log_foundry.FlushResult(ok=True),
+        log_foundry.FlushResult(ok=False, reason="timed-out"),
+    ):
+        assert [getattr(result, name) for name in _FLUSH_COUNTS] == [0] * 5
+        assert result.lost == 0
+
+
+def test_flush_result_truthiness_is_ok_alone() -> None:
+    """SPEC-089 FR-001 AC-2. A count never changes what `bool()` reports, in either direction."""
+    assert bool(log_foundry.FlushResult(ok=True, sink_lost=3)) is True
+    assert bool(log_foundry.FlushResult(ok=False, reason="abandoned", batch_lost=3)) is False
+
+
+def test_flush_result_counts_are_frozen_int_fields_and_lost_is_their_sum() -> None:
+    """SPEC-089 FR-001 AC-3. Powers of two, so a `lost` that drops any one term reads wrong."""
+    import typing
+
+    cls = log_foundry.FlushResult
+    fields = {f.name: f for f in dataclasses.fields(cls)}
+    assert [name for name in fields if name not in ("ok", "reason")] == list(_FLUSH_COUNTS)
+    hints = typing.get_type_hints(cls)
+    for name in _FLUSH_COUNTS:
+        assert hints[name] is int, name
+        assert fields[name].default == 0, name
+    assert "lost" not in fields
+    assert isinstance(inspect.getattr_static(cls, "lost"), property)
+    result = cls(ok=True, overflow_lost=1, batch_lost=2, sink_lost=4, drain_lost=8, stranded=16)
+    assert result.lost == 31
+    with pytest.raises(AttributeError):
+        result.lost = 0  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.sink_lost = 0  # type: ignore[misc]
+    assert dataclasses.replace(result, stranded=0).lost == 15
+    assert dataclasses.asdict(result) == {
+        "ok": True, "reason": None, "overflow_lost": 1, "batch_lost": 2, "sink_lost": 4,
+        "drain_lost": 8, "stranded": 16,
+    }
+    assert result != cls(ok=True)
+    assert "sink_lost=4" in repr(result)
+
+
+def test_flush_result_stays_keyword_only() -> None:
+    """SPEC-089 FR-001 AC-4: regression guards, both passing before the counts were added."""
+    assert log_foundry.FlushResult.__match_args__ == ()
+    with pytest.raises(TypeError) as raised:
+        log_foundry.FlushResult(True)  # type: ignore[misc]
+    assert str(raised.value) == "FlushResult.__init__() takes 1 positional argument but 2 were given"
+
+
+def test_continue_result_gains_no_counts() -> None:
+    """SPEC-089 FR-001 AC-5. The counts are `FlushResult`'s, not the shared base's."""
+    assert [f.name for f in dataclasses.fields(log_foundry.ContinueResult)] == ["ok", "reason"]
+    with pytest.raises(TypeError, match="unexpected keyword argument 'sink_lost'"):
+        log_foundry.ContinueResult(ok=True, sink_lost=1)  # type: ignore[call-arg]
+
+
 # ── SPEC-051 FR-001: the public dataclasses are constructed by keyword ──────────────────
 #
 # Field order stopped being part of the frozen contract at SPEC-051. `Health` reached twelve
