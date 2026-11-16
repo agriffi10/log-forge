@@ -889,10 +889,36 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
     a worker's module state never reaches the controller under ``-n 12`` and a recorded property
     does. The logic lives in ``model_oracles.margin_line`` so this hook stays a thin caller: a run
     at an older commit copies the model files without this ``conftest.py``, and needs nothing here.
+    SPEC-086 adds the gating model's line, from ``model_oracles.gate_margin_line``, the same way.
     """
     del exitstatus, config
-    from model_oracles import margin_line
+    from model_oracles import gate_margin_line, margin_line
 
     line = margin_line(terminalreporter.stats.get("passed", ()))
     if line is not None:
         terminalreporter.write_line(line)
+    gate = gate_margin_line(terminalreporter.stats.get("passed", ()))
+    if gate is not None:
+        terminalreporter.write_line(gate)
+
+
+def pytest_configure(config) -> None:
+    """Refuses a malformed model switch before any file is collected (SPEC-086 FR-002, FR-003).
+
+    ``tests/test_invariants_model.py`` reads ``LOG_FOUNDRY_MODEL_SEEDS`` and
+    ``LOG_FOUNDRY_MODEL_SOAK`` at import, and an import error there is only that file's
+    collection error: under the default ``-n 12`` every other file still runs and the session
+    reads as a handful of errors among passes, which is the mistyped soak reporting green that
+    the strict parse exists to prevent. A usage error here stops the session before any test,
+    under ``-n 0`` and ``-n 12`` alike. The parsers are ``model_oracles``', so the rule has one home.
+    """
+    del config
+    import os
+
+    from model_oracles import seeds_from, soak_from
+
+    try:
+        seeds_from(os.environ, ())
+        soak_from(os.environ)
+    except ValueError as exc:
+        raise pytest.UsageError(str(exc)) from exc

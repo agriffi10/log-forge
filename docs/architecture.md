@@ -1359,7 +1359,13 @@ close it.
   1, nothing owed, `orphan_lost=0`, on 7 of 7 runs and on 3 of 3 by an independent reviewer; the
   unparked control closes at count 2. Unforced: 3 of 900 runs of the concurrent model with
   `shutdown()` in its mix. The measurement used a recorder that keeps accepting after `close()`; a
-  shipped sink behind the closed guard was not measured. **Closed by** a mark around the orphan
+  shipped sink behind the closed guard was not measured. A sink change takes the sink the same way
+  (SPEC-086): with the log parked after its owed check, a displacing `configure(sink=…)` made and
+  returned, and the log then released, the first sink has `writes=2` and one close entered and
+  returned at count 1, and nothing is owed after a later `shutdown()` and the exit drain, on 7 of 7
+  forced runs at `acf5196e`, the unparked control closing at count 2 on 7 of 7. Unforced, it is
+  SPEC-086's soak failing the late-write rule at `519-http`, `1335-http` and `1695-http`, measured
+  at `5447d26a` while that spec was authored. **Closed by** a mark around the orphan
   path's delivery call that a closer waits for or that re-arms the sink once the call returns, or
   by one lifecycle command path.
 
@@ -1781,11 +1787,15 @@ an item leaves this list when a spec closes it, not because the arc names it.
   decision on whether they are the default.
 - **The one generative test cannot find the lifecycle defects it is cited as guarding** (2026-11-14
   audit, finding 21; it breaks no invariant, and invariants 1, 2, 5, 6 and 12 name it under
-  *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` (`:109`) holds its
-  stop signal as a plain class attribute (`:132`) and never waits on it, calls back or forks. Its
-  concurrent half is scheduled by the operating system, its time bound carries `BOUND_SLACK = 10.0`
+  *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` holds its
+  stop signal as a plain class attribute and never waits on it, calls back or forks. Its
+  concurrent half is scheduled by the operating system, ~~its time bound carries `BOUND_SLACK = 10.0`
   (`:103`), and its close oracle sees a sink never closed and two closes that overlap (`:579-580`)
-  but not two closes with no write between them. By the verification frame's calibration, none of
+  but not two closes with no write between them~~ — SPEC-086 holds every call in both halves to its
+  own timeout plus one second, and its sequential half to no close at the write count of the close
+  before it and no write after a sink's last close returned; under four callers that count is a
+  soak run on request that reads the library's arms and takes, and gates nothing. The sink is still
+  passive, which is what this item is about. By the verification frame's calibration, none of
   the twelve lifecycle and sink fixes from `95945c0f` to `717d0c68` was found by it, eight of the
   twelve needed a sink that waits on its signal or calls back, and those fixes added no line to it.
   **Closed by** sink personalities that wait on the stop signal, call back and fork, a bound of the

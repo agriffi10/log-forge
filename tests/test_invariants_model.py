@@ -38,12 +38,26 @@ already reports ``RUNNING`` from the config.
 
 **What the driver checks, by invariant**: 1 (no step raises, ``BaseException`` included); 2
 (orphans balance after every step, spans after every truthy ``flush()`` and every shutdown); 3,
-the wall-clock half (each step inside its budget plus the slack); 4 (every ``span.end`` arrives on
-a drain thread and every orphan on the caller's); 5 (after each shutdown every recorder written
-to is closed, nothing is owed, no two closes overlapped, and no child closed an inherited sink);
-6 by construction, since one sequence drives both delivery paths and both drains; and 12, the
-child's half (its state, its three calls, its event in a child recorder) and the parent's ledger
-unchanged by the fork.
+the wall-clock half (every step, the fork included, and each of a forked child's three calls,
+returns within its own timeout plus ``model_oracles.EPSILON``, one second, with a budget of zero
+for an ``info()`` and a traced call); 4 (every ``span.end`` arrives on a drain thread and every
+orphan on the caller's); 5 (after each shutdown every recorder written to is closed, nothing is
+owed, no two closes overlapped, and no child closed an inherited sink; after **every** step no
+close of a sink enters at the write count of the close before it, and after every shutdown and
+exit drain no sink was written after its last close returned); 6 by construction, since one
+sequence drives both delivery paths and both drains; and 12, the child's half (its state, its
+three calls, its event in a child recorder) and the parent's ledger unchanged by the fork.
+
+**The close count** (SPEC-086 FR-001). Every recorder counts the delivery calls that enter it at
+the first statement of the method the library calls (``emit``, or ``deliver`` for the ``deliver``
+and ``http`` forms), and records that count at each ``close``'s entry and return. Counted any
+later, a delivery already inside the sink when a close begins would read as a write after it. With
+one caller nothing can arm a sink between the take of a close and the close, so a second close at
+one count is a double close and a write after the last close returned is a write nobody owes:
+the sink's own record is exact. Under four callers neither holds, because a writer can arm the
+sink again between two takes (invariant 5: "a sink written to after its close is owed a second
+close"), so the concurrent test keeps its two checks, never closed and overlapping, and the count
+runs there only as the soak below.
 
 **What it does not check, and why**: the **CPU half of 3** — a CPU measure over a hundred steps
 under ``-n 12`` is the flake ``tests/test_worker_exit_budget.py`` measures one case at a time;
@@ -53,17 +67,40 @@ under ``-n 12`` is the flake ``tests/test_worker_exit_budget.py`` measures one c
 one; **10** is the public surface and ``Runtime`` is private; **11** needs a value that could leak
 into stderr and none is supplied; **13** needs a bad argument and every step is valid.
 
-What neither is: a bound test. The timeouts here are generous on purpose, because a tight budget
-fails on its setup under a loaded ``-n 12`` run (``tests/test_worker.py`` measures the bounds
-against a wedged sink, one at a time).
+**The bound is one second past each call's own timeout, in both halves** (SPEC-086 FR-001), not
+ten: the passive sink waits on nothing, so a call that spends more than its timeout plus
+``EPSILON`` overran it. The session prints the worst ``elapsed - budget`` over the passing runs
+(``model_oracles.gate_margin_line``), so a margin creeping toward the second is seen before it
+fails. ``tests/test_worker.py`` still owns the bounds against a sink that wedges.
 
-To soak locally, widen ``SEEDS`` or ``SEQ_SEEDS`` and run this file alone with ``-n 12``; a
-failing seed prints its whole history so it replays from the seed alone.
+**Which runs exist is a setting** (FR-002). ``LOG_FOUNDRY_MODEL_SEEDS`` holds a comma-separated
+list of integers and inclusive ``a-b`` ranges, such as ``0-999``; set, both halves run exactly those
+seeds, and unset they run 0 to 15 and 0 to 23. Only the default range gates. A value that does not
+parse is refused by ``tests/conftest.py`` before any test runs. A concurrent seed replays its draw,
+the operations each thread makes, and not its schedule, which is the operating system's; a
+sequential seed replays exactly. Every failure ends with the command that re-runs its item alone.
+
+**The soak** (FR-003). ``LOG_FOUNDRY_MODEL_SOAK=1`` adds one item per passive form and seed that
+runs the concurrent test as the gating item does, with the library's own record of what it armed
+and took read through four wrapped private names, and judges every sink by two rules: an
+unowed repeat close (two closes at one count with no writer's arm between their takes) and a write
+after the last close returned. A red soak item is a finding, not a regression, and it gates
+nothing: no workflow sets the switch. ``test_the_soak_is_wired`` runs the soak's body for one seed
+in every session and asserts its wiring, never its verdict.
+
+```
+LOG_FOUNDRY_MODEL_SEEDS=0-999 poetry run pytest tests/test_invariants_model.py
+LOG_FOUNDRY_MODEL_SOAK=1 LOG_FOUNDRY_MODEL_SEEDS=0-1999 poetry run pytest tests/test_invariants_model.py
+```
 """
 
 from __future__ import annotations
 
+import collections
+import contextlib
+import functools
 import json
+import os
 import pathlib
 import random
 import re
@@ -71,7 +108,7 @@ import threading
 import time
 import weakref
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -83,10 +120,44 @@ from log_foundry.sinks import _engine
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+from model_oracles import (
+    EPSILON,
+    GATE_MARGIN,
+    Arm,
+    BoundExceeded,
+    Call,
+    Close,
+    CloseBroken,
+    Closes,
+    SinkEvent,
+    Stalled,
+    Take,
+    Write,
+    check_call,
+    check_late_write,
+    check_repeat,
+    check_unowed_repeat,
+    rerun_command,
+    seeds_from,
+    soak_from,
+    take_of_each_close,
+)
 from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
 
-SEEDS = range(16)
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+FORMS = ("emit", "deliver", "http")
+DEFAULT_SEEDS = range(16)
+"""The concurrent half's gating seeds; only this range gates (SPEC-086 FR-002)."""
+
+SEEDS = seeds_from(os.environ, DEFAULT_SEEDS)
+"""The concurrent seeds this session runs: ``LOG_FOUNDRY_MODEL_SEEDS``, else the default."""
+
+SOAK = soak_from(os.environ)
+"""Whether ``LOG_FOUNDRY_MODEL_SOAK=1`` asked for the soak items (SPEC-086 FR-003)."""
+
 THREADS = 4
 OPS_PER_THREAD = 60
 CLOSE_SECONDS = 0.002
@@ -100,10 +171,281 @@ nothing. Measured at this value, the defect the counter exists for failed 180 of
 FLUSH_TIMEOUT = 2.0
 SHUTDOWN_TIMEOUT = 3.0
 FINAL_SHUTDOWN_TIMEOUT = 5.0
-BOUND_SLACK = 10.0
+SAMPLER_JOIN = 10.0
+"""How long the state sampler's thread is joined for: a test's own bookkeeping, not a library bound."""
 
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 _PAGE = _REPO / "docs" / "invariants.md"
+
+
+class _SoakRecord:
+    """One soak run's record of every arm, take, write and close of the sinks it handed over.
+
+    SPEC-086 FR-003. The arms and takes come from wrappers on ``_CloseRegistry.arm`` and
+    ``.take``, which the library calls holding ``_state._lock``, and the writes and closes from
+    the recorders, under each recorder's own lock; this record's lock is a leaf taken inside
+    either and never around anything, so one sink's events land in one list in the order they
+    happened. An arm is a **writer's** when it arms the sink a writer is about to write: an arm
+    of the very sink an ``api._note_orphan_emit`` on this thread was called for, or any arm on a
+    thread inside ``_lifecycle._get_worker``, whose build arms the configured sink for the worker
+    to write. The orphan path's sink is known, its argument, so its arm is matched by identity;
+    the build's sink is resolved inside it, where a wrapper cannot see it without racing a
+    concurrent ``configure()``, so a build's arm is attributed by the thread being inside it, and
+    a build arms nothing but the sink it builds on.
+
+    Attributes:
+      installed: The private names wrapped, in order.
+      orphan_entries: How many times ``api._note_orphan_emit`` was entered.
+      builds: How many times ``_lifecycle._get_worker`` was entered.
+      judged_repeat: The sinks the unowed-repeat rule was evaluated over.
+      judged_late: The sinks the late-write rule was evaluated over.
+      report: The failure text of a red run, empty for a clean one.
+    """
+
+    def __init__(self) -> None:
+        """Starts an empty record.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.installed: list[str] = []
+        self.orphan_entries = 0
+        self.builds = 0
+        self.judged_repeat = 0
+        self.judged_late = 0
+        self.report = ""
+        self._events: dict[int, list[SinkEvent]] = {}
+        self._sinks: dict[int, object] = {}
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    def register(self, sink: object) -> None:
+        """Starts recording one sink, before the library is handed it.
+
+        Args:
+          sink: The sink.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._sinks[id(sink)] = sink
+            self._events[id(sink)] = []
+
+    def add(self, sink: object, event: SinkEvent) -> None:
+        """Appends one event for a registered sink; an unregistered one is not this run's.
+
+        Args:
+          sink: The sink the event happened to.
+          event: The event.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            if self._sinks.get(id(sink)) is sink:
+                self._events[id(sink)].append(event)
+
+    def events_of(self, sink: object) -> list[SinkEvent]:
+        """Returns a copy of one sink's events, in the order recorded.
+
+        Args:
+          sink: The sink.
+
+        Returns:
+          Its events.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return list(self._events.get(id(sink), ()))
+
+    def all_events(self) -> list[SinkEvent]:
+        """Returns every registered sink's events, one sink after another.
+
+        Args:
+          None.
+
+        Returns:
+          The events.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return [event for events in self._events.values() for event in events]
+
+    def _frames(self) -> list[object]:
+        """Returns this thread's stack of writers in progress: sinks, or :data:`_BUILD`."""
+        frames = getattr(self._local, "frames", None)
+        if frames is None:
+            frames = self._local.frames = []
+        return frames
+
+    def entering(self, writer: object) -> None:
+        """Marks this thread as inside a writer: the orphan path for a sink, or a worker build.
+
+        Args:
+          writer: The sink ``api._note_orphan_emit`` was called for, or :data:`_BUILD`.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._frames().append(writer)
+        with self._lock:
+            if writer is _BUILD:
+                self.builds += 1
+            else:
+                self.orphan_entries += 1
+
+    def leaving(self) -> None:
+        """Marks this thread as having left the writer it entered last.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._frames().pop()
+
+    def by_writer(self, sink: object) -> bool:
+        """Returns whether an arm of *sink* recorded now is a writer's.
+
+        Args:
+          sink: The sink being armed.
+
+        Returns:
+          Whether this thread is inside the orphan path for this very sink, or inside a build.
+
+        Raises:
+          None.
+        """
+        return any(frame is sink or frame is _BUILD for frame in self._frames())
+
+
+_BUILD = object()
+"""The writer frame :func:`_install` pushes for ``_lifecycle._get_worker``."""
+
+
+_SOAK: dict[str, _SoakRecord | None] = {"run": None}
+"""The soak record of the run in progress, or ``None``; set for one test by :func:`_install`."""
+
+
+class _CloseRecord:
+    """One recorder's write count, taken at the delivery method's first statement, and its closes.
+
+    SPEC-086 FR-001. A recorder calls :meth:`wrote` as the first statement of the method the
+    library calls, and :meth:`closing` and :meth:`closed` as the first and last of ``close``.
+    Counted any later, a delivery already inside the sink when a close began reads as a write
+    after it: counting at ``HTTPRecorder``'s opener rather than at ``deliver`` failed the
+    late-write rule on 113 of 1,000 ``http`` runs that are clean counted at entry (the spec's
+    evidence). It holds no reference to its recorder, which passes itself to each call, so the
+    record keeps nothing alive. While a soak runs it also feeds :data:`_SOAK`.
+    """
+
+    def __init__(self) -> None:
+        """Starts at no writes and no closes.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._writes = 0
+        self._at_entry: list[int] = []
+        self._at_return: list[int] = []
+        self._lock = threading.Lock()
+
+    def wrote(self, sink: object) -> None:
+        """Counts one delivery call entering the sink.
+
+        Args:
+          sink: The recorder it entered.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._writes += 1
+            soak = _SOAK["run"]
+            if soak is not None:
+                soak.add(sink, Write(threading.current_thread().name))
+
+    def closing(self, sink: object) -> None:
+        """Records the count as a close enters.
+
+        Args:
+          sink: The recorder being closed.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._at_entry.append(self._writes)
+            soak = _SOAK["run"]
+            if soak is not None:
+                name = threading.current_thread().name
+                soak.add(sink, Close(self._writes, name, time.monotonic()))
+
+    def closed(self) -> None:
+        """Records the count as a close returns.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            self._at_return.append(self._writes)
+
+    def closes(self) -> Closes:
+        """Returns the record as the oracles read it.
+
+        Args:
+          None.
+
+        Returns:
+          The writes and the count at each close's entry and return.
+
+        Raises:
+          None.
+        """
+        with self._lock:
+            return Closes(self._writes, tuple(self._at_entry), tuple(self._at_return))
 
 
 class Recorder:
@@ -139,15 +481,27 @@ class Recorder:
         self.inside = 0
         self.overlapped = 0
         self.emit_delay = emit_delay
+        self.record = _CloseRecord()
         self._lock = threading.Lock()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
+        self.record.wrote(self)
+        self._keep(batch)
+
+    def _keep(self, batch: list[dict[str, object]]) -> None:
+        """The body of :meth:`emit` past its count, so an override counts once."""
         if self.emit_delay:
             time.sleep(self.emit_delay)
         with self._lock:
             self.events.extend(batch)
 
     def close(self) -> None:
+        self.record.closing(self)
+        self._shut()
+        self.record.closed()
+
+    def _shut(self) -> None:
+        """The body of :meth:`close` between its two records, so an override records once."""
         with self._lock:
             self.closes += 1
             self.inside += 1
@@ -207,6 +561,7 @@ class DeliverRecorder(Recorder):
         self.offered: dict[str, int] = {}
 
     def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        self.record.wrote(self)
         if self.emit_delay:
             time.sleep(self.emit_delay)
         ids = [str(event.get("log_id")) for event in batch]
@@ -281,7 +636,19 @@ class HTTPRecorder(HTTPSink):
         self.closes = 0
         self.inside = 0
         self.overlapped = 0
+        self.record = _CloseRecord()
         self._lock = threading.Lock()
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Counts the delivery call at its first statement, then runs ``HTTPSink``'s round.
+
+        The library calls ``deliver`` for this class, not the opener, and a class whose own body
+        defines ``deliver`` keeps being offered it: ``HTTPSink.__init_subclass__`` leaves such a
+        class alone, and the probe finds this ``deliver`` no later in the MRO than the ``emit``
+        it inherits (SPEC-086 FR-001).
+        """
+        self.record.wrote(self)
+        return super().deliver(batch)
 
     def _answer(self, request: Any, timeout: float | None = None) -> FakeResponse:
         if self.emit_delay:
@@ -310,6 +677,7 @@ class HTTPRecorder(HTTPSink):
         return FakeResponse(status, b"")
 
     def close(self) -> None:
+        self.record.closing(self)
         with self._lock:
             self.closes += 1
             self.inside += 1
@@ -318,6 +686,7 @@ class HTTPRecorder(HTTPSink):
         time.sleep(CLOSE_SECONDS)
         with self._lock:
             self.inside -= 1
+        self.record.closed()
 
     def count(self, message: str) -> int:
         with self._lock:
@@ -364,14 +733,17 @@ class Ledger:
 
     spans: int = 0
     orphans: int = 0
-    slowest_flush: float = 0.0
-    slowest_shutdown: float = 0.0
     sinks: list[Recorder] = field(default_factory=list)
+    calls: list[Call] = field(default_factory=list)
     form: str = "emit"
     seed: int = 0
+    soak: _SoakRecord | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def add_sink(self, sink: Recorder) -> None:
+        """Keeps a sink before the library is handed it, and starts the soak's record of it."""
+        if self.soak is not None:
+            self.soak.register(sink)
         with self._lock:
             self.sinks.append(sink)
 
@@ -380,9 +752,17 @@ class Ledger:
             for name, value in counts.items():
                 setattr(self, name, getattr(self, name) + value)
 
-    def timed(self, name: str, elapsed: float) -> None:
+    def timed(self, name: str, budget: float, call: Callable[[], object]) -> None:
+        """Makes one library call and records it, for the bound judged after the run (FR-001).
+
+        Judged after the run rather than here, because an assertion raised on an actor's thread
+        would reach ``run_concurrently`` and read as an escaped exception, invariant 1's failure.
+        """
+        began = time.monotonic()
+        call()
+        ended = time.monotonic()
         with self._lock:
-            setattr(self, name, max(getattr(self, name), elapsed))
+            self.calls.append(Call(name, threading.get_ident(), budget, began, ended))
 
 
 @log_foundry.trace
@@ -409,23 +789,22 @@ def _actor(ledger: Ledger, rng: random.Random, *, shutdown_in_mix: bool) -> None
         roll = rng.random()
         if roll < 0.55 or (roll >= 0.95 and not shutdown_in_mix):
             nested = rng.random() < 0.3
-            _outer(nested)
+            ledger.timed("span", 0.0, functools.partial(_outer, nested))
             ledger.note(spans=2 if nested else 1)
         elif roll < 0.75:
-            log_foundry.info("orphan")
+            ledger.timed("info", 0.0, functools.partial(log_foundry.info, "orphan"))
             ledger.note(orphans=1)
         elif roll < 0.85:
-            started = time.monotonic()
-            log_foundry.flush(timeout=FLUSH_TIMEOUT)
-            ledger.timed("slowest_flush", time.monotonic() - started)
+            flush = functools.partial(log_foundry.flush, timeout=FLUSH_TIMEOUT)
+            ledger.timed("flush", FLUSH_TIMEOUT, flush)
         elif roll < 0.95:
             sink = _recorder(ledger, rng.choice([0.0, 0.0, 0.002]))
             ledger.add_sink(sink)
-            log_foundry.configure(service="model", sink=sink)
+            change = functools.partial(log_foundry.configure, service="model", sink=sink)
+            ledger.timed("configure", _lifecycle.DEFAULT_SWAP_TIMEOUT, change)
         else:
-            started = time.monotonic()
-            log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
-            ledger.timed("slowest_shutdown", time.monotonic() - started)
+            stop = functools.partial(log_foundry.shutdown, timeout=SHUTDOWN_TIMEOUT)
+            ledger.timed("shutdown", SHUTDOWN_TIMEOUT, stop)
 
 
 def _recorder(ledger: Ledger, emit_delay: float) -> Recorder:
@@ -497,7 +876,7 @@ class _StateSampler:
 
     def stop(self) -> None:
         self._done.set()
-        self._thread.join(BOUND_SLACK)
+        self._thread.join(SAMPLER_JOIN)
 
 
 def _stranded_markers() -> int:
@@ -520,35 +899,218 @@ def _stranded_markers() -> int:
         return sum(1 for item in worker._queue.queue if not isinstance(item, list))
 
 
-@pytest.mark.parametrize("form", ["emit", "deliver", "http"])
-@pytest.mark.parametrize("seed", SEEDS)
-def test_the_accounting_identity_holds_under_every_interleaving(
+def _concurrent_params(seeds: tuple[int, ...]) -> list[Any]:
+    """One ``(form, seed)`` per passive form and seed, each id naming both (SPEC-086 FR-002)."""
+    return [pytest.param(form, seed, id=f"{form}-seed{seed}") for seed in seeds for form in FORMS]
+
+
+@contextlib.contextmanager
+def _rerun_on_failure(
+    request: pytest.FixtureRequest, seed: int, *, concurrent: bool, soak: bool = False
+) -> Iterator[None]:
+    """Ends any failure inside it with the one command that re-runs its item alone (FR-002).
+
+    It catches every ``Exception`` and pytest's ``fail()`` alike, a ``ValueError`` from reading
+    a forked child's report included, and adds the command as a note before re-raising, so the
+    original traceback and message survive and the command is the last thing the failure says.
+    """
+    try:
+        yield
+    except (Exception, pytest.fail.Exception) as exc:
+        lines = []
+        if concurrent:
+            lines.append(
+                "A concurrent seed replays its draw, the operations each thread makes, and not "
+                "its schedule, which is the operating system's: a re-run can pass."
+            )
+        lines.append(f"Re-run it alone: {rerun_command(request.node.nodeid, seed, soak=soak)}")
+        exc.add_note("\n".join(lines))
+        raise
+
+
+def _bounded(call: Call, where: str) -> float:
+    """Holds one call to ``elapsed <= budget + EPSILON`` and returns its margin (FR-001).
+
+    No sink-code interval is subtracted: a passive recorder waits on nothing, so all of a call's
+    time is the library's.
+    """
+    try:
+        check_call(call, ())
+    except (BoundExceeded, Stalled) as exc:
+        raise AssertionError(
+            f"invariant 3 (within its timeout plus {EPSILON:.1f} s): "
+            f"{' '.join(exc.signatures)}, {exc.detail}; {_machine()} {where}"
+        ) from exc
+    return (call.ended - call.began) - call.budget
+
+
+def _machine() -> str:
+    """How loaded this machine was when a bound failed, so starvation reads apart from a stall.
+
+    Under 40 busy-loops on a 10-core machine, a load of 81 to 112, 4 of 6 runs of this file
+    failed a zero-budget call at 1.03 to 1.35 s of own time; at a load of 50 to 55 it was green 13
+    of 13. The bound is not skipped or widened under load, since that would let a real stall pass
+    as starvation; the failure says how starved the run was, and a reader decides.
+    """
+    try:
+        one, five, fifteen = os.getloadavg()
+    except OSError:
+        return f"load average unavailable on {os.cpu_count()} CPUs"
+    return f"load average {one:.1f} / {five:.1f} / {fifteen:.1f} on {os.cpu_count()} CPUs"
+
+
+_WRAPPED: tuple[tuple[object, str, str], ...] = (
+    (_lifecycle._CloseRegistry, "arm", "_lifecycle._CloseRegistry.arm"),
+    (_lifecycle._CloseRegistry, "take", "_lifecycle._CloseRegistry.take"),
+    (log_foundry.api, "_note_orphan_emit", "log_foundry.api._note_orphan_emit"),
+    (_lifecycle, "_get_worker", "_lifecycle._get_worker"),
+)
+"""The four private names the soak wraps, by owner, attribute and the name it reports.
+
+``api._note_orphan_emit`` is called as a global of ``api`` and ``_lifecycle._get_worker`` as an
+attribute of ``_lifecycle`` (``decorator.py``), the only callers of either, so a patch of each
+intercepts every call, here and at ``31dda162``.
+"""
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
+    """Wraps the four private names for the length of one test, by name (SPEC-086 FR-003).
+
+    A name that no longer exists fails the item instead of silencing it: a rename would
+    otherwise leave the soak reading no arms or takes, and every repeat close would look unowed,
+    or none would be recorded at all.
+    """
+    for owner, name, label in _WRAPPED:
+        if name not in vars(owner):
+            pytest.fail(f"the soak cannot wrap {label}: the name no longer exists")
+    real_arm = _lifecycle._CloseRegistry.arm
+    real_take = _lifecycle._CloseRegistry.take
+    real_note = log_foundry.api._note_orphan_emit
+    real_build = _lifecycle._get_worker
+
+    def arm(registry: Any, sink: Any) -> None:
+        soak.add(sink, Arm(by_writer=soak.by_writer(sink)))
+        real_arm(registry, sink)
+
+    def take(registry: Any, sink: Any, rule: Any) -> Any:
+        soak.add(sink, Take())
+        return real_take(registry, sink, rule)
+
+    def note(sink: Any) -> None:
+        soak.entering(sink)
+        try:
+            real_note(sink)
+        finally:
+            soak.leaving()
+
+    def build() -> Any:
+        soak.entering(_BUILD)
+        try:
+            return real_build()
+        finally:
+            soak.leaving()
+
+    monkeypatch.setitem(_SOAK, "run", soak)
+    monkeypatch.setattr(_lifecycle._CloseRegistry, "arm", arm)
+    monkeypatch.setattr(_lifecycle._CloseRegistry, "take", take)
+    monkeypatch.setattr(log_foundry.api, "_note_orphan_emit", note)
+    monkeypatch.setattr(_lifecycle, "_get_worker", build)
+    soak.installed = [label for _, _, label in _WRAPPED]
+
+
+def _judge_soak(soak: _SoakRecord, ledger: Ledger, err: str) -> str:
+    """Judges every sink the run handed the library by the soak's two rules (SPEC-086 FR-003).
+
+    No run and no sink is exempt. Returns the failure text, empty when every sink is clean.
+    """
+    found: list[str] = []
+    for index, sink in enumerate(ledger.sinks):
+        events = soak.events_of(sink)
+        closes = sink.record.closes()
+        keys: list[str] = []
+        soak.judged_repeat += 1
+        try:
+            check_unowed_repeat(events)
+        except CloseBroken as exc:
+            keys.extend(exc.signatures)
+        soak.judged_late += 1
+        try:
+            check_late_write(closes)
+        except CloseBroken as exc:
+            keys.extend(exc.signatures)
+        if keys:
+            found.append(_sink_record(index, keys, events, closes))
+    if not found:
+        return ""
+    stderr = [line for line in err.splitlines() if line.startswith("log-foundry")]
+    return "\n".join(
+        [
+            (
+                f"soak {ledger.form} seed={ledger.seed}: invariant 5 (a close per write, owed by "
+                f"its writer) broke on {len(found)} of {len(ledger.sinks)} sinks"
+            ),
+            *found,
+            f"the library's stderr ({len(stderr)} lines):",
+            *(f"  {line}" for line in stderr),
+            f"log_foundry.__file__={log_foundry.__file__}",
+        ]
+    )
+
+
+def _sink_record(index: int, keys: list[str], events: list[SinkEvent], closes: Closes) -> str:
+    """One failing sink's record: each close's counts and thread, the gaps, and what lay between."""
+    lines = [f"sink {index}: {' '.join(keys)}; writes={closes.writes}"]
+    marks: list[str] = []
+    seen = 0
+    previous: float | None = None
+    for event in events:
+        if isinstance(event, Close):
+            returned = closes.at_return[seen] if seen < len(closes.at_return) else None
+            gap = "" if previous is None else f", {1000 * (event.at - previous):.1f} ms after"
+            between = " ".join(marks) or "nothing"
+            lines.append(
+                f"  close {seen}: entered at {event.count}, returned at {returned}, on "
+                f"{event.thread}{gap}; arms, writes and takes before it: {between}"
+            )
+            previous = event.at
+            seen += 1
+            marks = []
+        elif isinstance(event, Arm):
+            marks.append("arm(writer)" if event.by_writer else "arm(change)")
+        elif isinstance(event, Take):
+            marks.append("take")
+        elif isinstance(event, Write):
+            marks.append(f"write({event.thread})")
+    return "\n".join(lines)
+
+
+def _interleaving(
     seed: int,
     form: str,
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
-) -> None:
-    """Invariants 1, 2, 3, 5 and 6 of ``docs/invariants.md``, over one seeded interleaving.
+    soak: _SoakRecord | None,
+) -> tuple[Ledger, float]:
+    """Runs one seeded interleaving and makes every gating assertion; the soak judges too.
 
-    The identity is the whole test: every span the actors started is either delivered as a
-    ``span.end``, still queued where a ``shutdown()`` left it, or counted as dropped; every
-    orphan is delivered or counted in ``orphan_lost``; nothing is missing and nothing is counted
-    twice. A regression in the lifecycle plumbing shows up here as a seed whose ledger does not
-    balance, before anyone has written the test that names it.
+    Shared by the gating item, the soak item and the wiring test, so a soak runs the concurrent
+    half exactly as the gate does. With a soak record its two rules are judged right after the
+    final shutdown, before the gating assertions, and a gating failure carries the soak's text
+    as a note, so neither can hide the other; the soak's own verdict is left in ``soak.report``.
 
-    The ``deliver`` form (SPEC-072 FR-005) runs the same seeds with :class:`DeliverRecorder`,
-    whose mixed verdicts make "delivered" a per-event fate, and holds each counted term to its
-    exact share (:func:`_assert_the_deliver_ledger`). The ``http`` form (SPEC-073 FR-005) runs
-    them with :class:`HTTPRecorder`, a shipped family sink behind a scripted opener
-    (:func:`_assert_the_http_ledger`).
+    Returns:
+      The ledger, and the worst ``elapsed - budget`` over every call the run made.
     """
-    ledger = Ledger(form=form, seed=seed)
+    ledger = Ledger(form=form, seed=seed, soak=soak)
     runs = _spy_on_runs(monkeypatch) if form != "emit" else None
     if form == "http":
         monkeypatch.setattr("log_foundry.sinks._retry.wait", lambda _delay, _stop=None: None)
+    if soak is not None:
+        _install(monkeypatch, soak)
     first = _recorder(ledger, random.Random(seed).choice([0.0, 0.0, 0.002]))  # noqa: S311
     ledger.add_sink(first)
-    log_foundry.configure(service="model", sink=first)
+    change = functools.partial(log_foundry.configure, service="model", sink=first)
+    ledger.timed("configure", _lifecycle.DEFAULT_SWAP_TIMEOUT, change)
 
     def work(index: int, _iteration: int) -> None:
         _actor(ledger, random.Random(seed * 10 + index), shutdown_in_mix=seed % 2 == 0)  # noqa: S311
@@ -559,12 +1121,16 @@ def test_the_accounting_identity_holds_under_every_interleaving(
         escaped = run_concurrently(work, threads=THREADS)
     finally:
         sampler.stop()
-    log_foundry.shutdown(timeout=FINAL_SHUTDOWN_TIMEOUT)
+    stop = functools.partial(log_foundry.shutdown, timeout=FINAL_SHUTDOWN_TIMEOUT)
+    ledger.timed("final-shutdown", FINAL_SHUTDOWN_TIMEOUT, stop)
     final_state = _lifecycle._state.state
     tokens_left = len(_lifecycle._state._swaps_running) + len(_lifecycle._state._stops_running)
     health = log_foundry.health()
     markers = _stranded_markers()
     queued = health.queued - markers
+    err = capfd.readouterr().err
+    if soak is not None:
+        soak.report = _judge_soak(soak, ledger, err)
 
     ends = sum(sink.count("span.end") for sink in ledger.sinks)
     orphans = sum(sink.count("orphan") for sink in ledger.sinks)
@@ -588,39 +1154,260 @@ def test_the_accounting_identity_holds_under_every_interleaving(
         f"unclosed={unclosed} overlapped={overlapped} escaped={escaped!r}"
     )
 
-    assert not escaped, f"invariant 1 (never fail the caller): {picture}"
-    assert not sampler.wrong, f"invariant 1 (state always answers a State): {sampler.wrong[:3]}"
-    assert sampler.reads, "the sampler never read the state, so it checked nothing"
-    assert final_state is State.CLOSED, f"after the final shutdown: {final_state} {picture}"
-    assert tokens_left == 0, f"a token outlived its call: {tokens_left} {picture}"
-    assert health.in_span_lost == 0, f"nothing here can fail assembly: {picture}"
-    if runs is None:
-        assert health.failed_batches == 0, f"the recorder never raises: {picture}"
-    elif form == "http":
-        _assert_the_http_ledger(ledger, runs, health.orphan_lost, capfd.readouterr().err, picture)
-    else:
-        _assert_the_deliver_ledger(
-            ledger, runs, health.orphan_lost, capfd.readouterr().err, picture
+    try:
+        assert not escaped, f"invariant 1 (never fail the caller): {picture}"
+        assert not sampler.wrong, f"invariant 1 (state always answers a State): {sampler.wrong[:3]}"
+        assert sampler.reads, "the sampler never read the state, so it checked nothing"
+        assert final_state is State.CLOSED, f"after the final shutdown: {final_state} {picture}"
+        assert tokens_left == 0, f"a token outlived its call: {tokens_left} {picture}"
+        assert health.in_span_lost == 0, f"nothing here can fail assembly: {picture}"
+        if runs is None:
+            assert health.failed_batches == 0, f"the recorder never raises: {picture}"
+        elif form == "http":
+            _assert_the_http_ledger(ledger, runs, health.orphan_lost, err, picture)
+        else:
+            _assert_the_deliver_ledger(ledger, runs, health.orphan_lost, err, picture)
+        assert ends + queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
+        assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
+        assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
+        assert health.submitted_after_shutdown >= queued, (
+            f"invariant 2 (what a shutdown left queued was counted as submitted after it): "
+            f"{picture}"
         )
-    assert ends + queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
-    assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
-    assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
-    assert health.submitted_after_shutdown >= queued, (
-        f"invariant 2 (what a shutdown left queued was counted as submitted after it): {picture}"
+        assert not unclosed, f"invariant 5 (every sink written to is closed): {picture}"
+        assert not overlapped, (
+            f"invariant 5 (closed **once**, and a close in flight is waited for): {picture}"
+        )
+        worst = max(_bounded(call, picture) for call in ledger.calls)
+    except AssertionError as exc:
+        if soak is not None and soak.report:
+            exc.add_note(soak.report)
+        raise
+    return ledger, worst
+
+
+@pytest.mark.parametrize(("form", "seed"), _concurrent_params(SEEDS))
+def test_the_accounting_identity_holds_under_every_interleaving(
+    seed: int,
+    form: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
+) -> None:
+    """Invariants 1, 2, 3, 5 and 6 of ``docs/invariants.md``, over one seeded interleaving.
+
+    The identity is the whole test: every span the actors started is either delivered as a
+    ``span.end``, still queued where a ``shutdown()`` left it, or counted as dropped; every
+    orphan is delivered or counted in ``orphan_lost``; nothing is missing and nothing is counted
+    twice. A regression in the lifecycle plumbing shows up here as a seed whose ledger does not
+    balance, before anyone has written the test that names it. Every call the run makes, the
+    first ``configure`` and the final ``shutdown`` included, returns within its own timeout plus
+    ``EPSILON`` (SPEC-086 FR-001), and the worst margin is recorded for the session's line.
+
+    The ``deliver`` form (SPEC-072 FR-005) runs the same seeds with :class:`DeliverRecorder`,
+    whose mixed verdicts make "delivered" a per-event fate, and holds each counted term to its
+    exact share (:func:`_assert_the_deliver_ledger`). The ``http`` form (SPEC-073 FR-005) runs
+    them with :class:`HTTPRecorder`, a shipped family sink behind a scripted opener
+    (:func:`_assert_the_http_ledger`).
+    """
+    with _rerun_on_failure(request, seed, concurrent=True):
+        _, worst = _interleaving(seed, form, monkeypatch, capfd, None)
+    record_property(GATE_MARGIN, f"{worst:.6f}")
+
+
+if SOAK:
+
+    @pytest.mark.parametrize(("form", "seed"), _concurrent_params(SEEDS))
+    def test_soak_the_close_count_under_concurrency(
+        seed: int,
+        form: str,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+        request: pytest.FixtureRequest,
+        record_property: Callable[[str, object], None],
+    ) -> None:
+        """SPEC-086 FR-003: the close count under four callers, collected only on request.
+
+        The concurrent half exactly as the gating item runs it, with the library's arms and
+        takes recorded, and every sink it was handed judged after the final shutdown for an
+        unowed repeat close and a write after its last close returned. A red item is a finding,
+        not a regression in the change under test, and gates nothing; it records no margin.
+        """
+        record_property("model_tree", log_foundry.__file__)
+        soak = _SoakRecord()
+        with _rerun_on_failure(request, seed, concurrent=True, soak=True):
+            _interleaving(seed, form, monkeypatch, capfd, soak)
+            if soak.report:
+                raise AssertionError(soak.report)
+
+
+WIRING_SEED = 2
+"""The seed the wiring test soaks: measured among the fastest in all three forms."""
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_the_soak_is_wired(
+    form: str, monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-086 FR-003: the soak's body for one seed, asserting its wiring and never its verdict.
+
+    Once per passive form, because each form counts its writes in a method of its own:
+    ``emit``, ``DeliverRecorder.deliver`` and ``HTTPRecorder.deliver``. With only the ``emit``
+    form here, deleting the count from either ``deliver`` left every soak item green, since a
+    sink with no writes recorded has no write after its last close and no repeat it can blame.
+    Over the seeded run, only what its draw makes certain whatever the schedule: the four
+    wrappers are installed; arms, takes, writes and closes are recorded; the orphan path's
+    wrapper was entered; both rules were evaluated once per sink; and every close discharged a
+    take, since a close with no take means the take wrapper missed one. Whether either rule found
+    anything is not asserted, and neither is which thread wrote: under 40 busy-loops seed 2's run
+    delivered no batch on the drain thread in 2 of 6 runs. So this cannot fail at a race's rate.
+
+    The coda, on the runtime the final shutdown left with nothing owed, holds the orphan path's
+    attribution, which the run cannot be relied on to exercise: one orphan log's arm of a fresh
+    sink is a writer's, and its write is on this thread. The worker path's attribution and a write
+    on the drain thread are :func:`test_the_soak_records_the_worker_path`'s, on a fresh runtime,
+    because a traced call after the final shutdown meets the retired worker and builds none.
+    """
+    soak = _SoakRecord()
+    ledger, _ = _interleaving(WIRING_SEED, form, monkeypatch, capfd, soak)
+    assert soak.installed == [label for _, _, label in _WRAPPED]
+    events = soak.all_events()
+    kinds = collections.Counter(type(event).__name__ for event in events)
+    assert {kinds[name] > 0 for name in ("Arm", "Take", "Write", "Close")} == {True}, kinds
+    assert soak.orphan_entries > 0, "the orphan path's wrapper was never entered"
+    assert soak.judged_repeat == soak.judged_late == len(ledger.sinks), (
+        soak.judged_repeat,
+        soak.judged_late,
+        len(ledger.sinks),
     )
-    assert not unclosed, f"invariant 5 (every sink written to is closed): {picture}"
-    assert not overlapped, (
-        f"invariant 5 (closed **once**, and a close in flight is waited for): {picture}"
-    )
-    assert ledger.slowest_flush < FLUSH_TIMEOUT + BOUND_SLACK, f"invariant 3 (flush): {picture}"
-    assert ledger.slowest_shutdown < SHUTDOWN_TIMEOUT + BOUND_SLACK, (
-        f"invariant 3 (shutdown): {picture}"
-    )
+    untaken = [
+        index
+        for index, sink in enumerate(ledger.sinks)
+        if None in take_of_each_close(soak.events_of(sink))
+    ]
+    assert not untaken, f"a close with no take: the take wrapper missed one on sinks {untaken}"
+
+    fresh = Recorder(0.0)
+    soak.register(fresh)
+    log_foundry.configure(service="model", sink=fresh)
+    log_foundry.info("coda")
+    assert soak.events_of(fresh) == [
+        Arm(by_writer=True),
+        Write(threading.current_thread().name),
+    ], soak.events_of(fresh)
+
+
+def test_the_soak_records_the_worker_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SPEC-086 FR-003: a worker build's arm is a writer's, and its write is on the drain thread.
+
+    Deterministic, one step at a time, on a fresh runtime with the soak's wrappers installed: a
+    sink is registered and configured, a traced call builds the worker, whose arm of that sink is
+    recorded as a writer's, and a ``flush()`` makes the drain thread write the span. The seeded
+    run's own drain-thread writes are not asserted, because under load a run can deliver none.
+    """
+    soak = _SoakRecord()
+    _install(monkeypatch, soak)
+    sink = Recorder(0.0)
+    soak.register(sink)
+    log_foundry.configure(service="model", sink=sink)
+    _outer(False)
+    assert soak.builds > 0, "the traced call never entered the worker build's wrapper"
+    assert log_foundry.flush(timeout=FLUSH_TIMEOUT), "the flush did not settle"
+    events = soak.events_of(sink)
+    assert events[:1] == [Arm(by_writer=True)], f"the worker build's arm: {events}"
+    assert Write("log-foundry-worker") in events, f"no write on the drain thread: {events}"
+    log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+    assert isinstance(soak.events_of(sink)[-1], Close), soak.events_of(sink)
+
+
+def test_a_bound_failure_names_the_machines_load() -> None:
+    """SPEC-086 FR-001: a call over its bound fails naming the load average and the CPU count."""
+    with pytest.raises(AssertionError) as caught:
+        _bounded(Call("info", 0, 0.0, 0.0, 1.5), "where=here")
+    text = str(caught.value)
+    assert "Stalled:info" in text, text
+    assert re.search(r"load average [0-9.]+ / [0-9.]+ / [0-9.]+ on \d+ CPUs", text), text
+    assert text.endswith("where=here"), text
+    assert _bounded(Call("flush", 0, 2.0, 0.0, 2.5), "") == 0.5
+
+
+def test_a_writers_arm_is_matched_to_its_sink() -> None:
+    """SPEC-086 FR-003: inside the orphan path only that sink's arm is a writer's; in a build, any."""
+    soak, mine, other = _SoakRecord(), object(), object()
+    assert not soak.by_writer(mine)
+    soak.entering(mine)
+    assert soak.by_writer(mine)
+    assert not soak.by_writer(other)
+    soak.entering(_BUILD)
+    assert soak.by_writer(other)
+    soak.leaving()
+    soak.leaving()
+    assert not soak.by_writer(mine)
+    assert (soak.orphan_entries, soak.builds) == (1, 1)
+
+
+class _Node:
+    """A stand-in for ``request.node``: the one attribute the rerun note reads."""
+
+    nodeid = "tests/test_invariants_model.py::test_x[emit-seed7]"
+
+
+class _Request:
+    """A stand-in for ``pytest.FixtureRequest`` in :func:`test_a_failure_ends_with_its_rerun`."""
+
+    node = _Node()
+
+
+@pytest.mark.parametrize(
+    ("raised", "concurrent", "soak"),
+    [
+        (AssertionError("an invariant broke"), True, False),
+        (ValueError("a child's report did not parse"), False, False),
+        (AssertionError("a soak report"), True, True),
+    ],
+    ids=["assertion-concurrent", "exception-sequential", "assertion-soak"],
+)
+def test_a_failure_ends_with_its_rerun(raised: Exception, concurrent: bool, soak: bool) -> None:
+    """SPEC-086 FR-002: a failure inside the wrapper is re-raised unchanged, with the command last.
+
+    The same exception comes out, message intact, and its last note ends with the command that
+    re-runs the item alone; a concurrent item's note also says the seed replays its draw and not
+    its schedule, and a sequential one's does not.
+    """
+    request: Any = _Request()
+    with (
+        pytest.raises(type(raised)) as caught,
+        _rerun_on_failure(request, 7, concurrent=concurrent, soak=soak),
+    ):
+        raise raised
+    assert caught.value is raised
+    note = (getattr(caught.value, "__notes__", None) or [""])[-1]
+    expected = rerun_command(_Node.nodeid, 7, soak=soak)
+    assert note.endswith(f"Re-run it alone: {expected}"), note
+    assert ("replays its draw" in note) is concurrent, note
+
+
+@pytest.mark.parametrize(
+    ("owner", "name", "label"), _WRAPPED, ids=[label for _, _, label in _WRAPPED]
+)
+def test_a_name_the_soak_cannot_wrap_fails_it(
+    owner: object, name: str, label: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC-086 FR-003: a rename of any wrapped name fails the soak item instead of silencing it."""
+    monkeypatch.delattr(owner, name)
+    with pytest.raises(pytest.fail.Exception, match=re.escape(label)):
+        _install(monkeypatch, _SoakRecord())
 
 
 # -- the sequential driver (SPEC-077 FR-004) ----------------------------------------------------
 
-SEQ_SEEDS = range(24)
+DEFAULT_SEQ_SEEDS = range(24)
+"""The sequential half's gating seeds; only this range gates (SPEC-086 FR-002)."""
+
+SEQ_SEEDS = seeds_from(os.environ, DEFAULT_SEQ_SEEDS)
+"""The sequential seeds this session runs: ``LOG_FOUNDRY_MODEL_SEEDS``, else the default."""
+
 SEQ_STEPS = 40
 STEP_WEIGHTS = (
     ("configure", 0.17),
@@ -745,10 +1532,11 @@ def test_the_seed_range_covers_every_cell() -> None:
     Pure — no library call — because the draws do not depend on the library's state and every live
     seed asserts, step by step, that the library is where this model says it is. So the cells the
     model visits are the cells the live runs visit, and the coverage is asserted here once rather
-    than summed across ``-n 12`` workers.
+    than summed across ``-n 12`` workers. It reads the **default** range whatever
+    ``LOG_FOUNDRY_MODEL_SEEDS`` holds (SPEC-086 FR-002), because the default is what gates.
     """
     visited: set[tuple[str, State, str]] = set()
-    for seed in SEQ_SEEDS:
+    for seed in DEFAULT_SEQ_SEEDS:
         model = _Model()
         for step, _ in _draws(seed):
             visited.add(model.take(step))
@@ -779,14 +1567,17 @@ class StateRecorder(Recorder):
         self.threads: list[tuple[int, object]] = []
 
     def emit(self, batch: list[dict[str, object]]) -> None:
+        self.record.wrote(self)
         _sample("emit")
         with self._lock:
             self.threads.extend((threading.get_ident(), e.get("message")) for e in batch)
-        super().emit(batch)
+        self._keep(batch)
 
     def close(self) -> None:
+        self.record.closing(self)
         _sample("close")
-        super().close()
+        self._shut()
+        self.record.closed()
 
     def forget(self) -> None:
         super().forget()
@@ -821,7 +1612,7 @@ class _Run:
 
 
 def _budget(step: str) -> float:
-    """The budget a step is bounded by, before the slack (invariant 3)."""
+    """The budget a step is bounded by, before ``EPSILON`` (invariant 3)."""
     return {
         "configure": _lifecycle.DEFAULT_SWAP_TIMEOUT,
         "flush": FLUSH_TIMEOUT,
@@ -855,8 +1646,15 @@ def derived_current(runtime: Any) -> State:
     return _U
 
 
-def _fork_step(run: _Run, expected: State, where: str) -> None:
-    """Forks at a step boundary and checks the child's half of invariant 12 and the parent's."""
+_CHILD_BUDGETS = {"info": 0.0, "flush": FLUSH_TIMEOUT, "shutdown": SHUTDOWN_TIMEOUT}
+"""The budget of each of a forked child's three calls, each held to its own (SPEC-086 FR-001)."""
+
+
+def _fork_step(run: _Run, expected: State, where: str) -> float:
+    """Forks at a step boundary and checks the child's half of invariant 12 and the parent's.
+
+    Returns the worst ``elapsed - budget`` over the child's three calls.
+    """
     before = [(len(s.threads), s.closes) for s in run.sinks]
     parent_state = _lifecycle._state.state
     inherited = len(run.sinks)
@@ -866,17 +1664,21 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
         initial = _lifecycle._state.state.name
         stored = _lifecycle._state._current.name
         derived = derived_current(_lifecycle._state).name
-        started = time.monotonic()
-        log_foundry.info("child-orphan")
-        log_foundry.flush(timeout=FLUSH_TIMEOUT)
-        log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
-        elapsed = time.monotonic() - started
+        calls: list[tuple[str, float]] = []
+        for name, call in (
+            ("info", functools.partial(log_foundry.info, "child-orphan")),
+            ("flush", functools.partial(log_foundry.flush, timeout=FLUSH_TIMEOUT)),
+            ("shutdown", functools.partial(log_foundry.shutdown, timeout=SHUTDOWN_TIMEOUT)),
+        ):
+            started = time.monotonic()
+            call()
+            calls.append((name, time.monotonic() - started))
         return json.dumps(
             {
                 "initial": initial,
                 "stored": stored,
                 "derived": derived,
-                "elapsed": elapsed,
+                "calls": calls,
                 "in_inherited": sum(s.count("child-orphan") for s in run.sinks[:inherited]),
                 "in_own": sum(s.count("child-orphan") for s in run.sinks[inherited:]),
                 "closed_inherited": [
@@ -892,8 +1694,11 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
     assert report["stored"] == report["derived"], (
         f"SPEC-078 FR-003 (the child's stored state is its derived one): {report} {where}"
     )
-    assert report["elapsed"] < FLUSH_TIMEOUT + SHUTDOWN_TIMEOUT + BOUND_SLACK, (
-        f"invariant 12 (the child's three calls returned within a bound): {report} {where}"
+    names = [name for name, _ in report["calls"]]
+    assert names == list(_CHILD_BUDGETS), f"invariant 12 (the child made its three calls): {where}"
+    worst = max(
+        _bounded(Call(f"child-{name}", 0, _CHILD_BUDGETS[name], 0.0, elapsed), f"{report} {where}")
+        for name, elapsed in report["calls"]
     )
     assert report["in_inherited"] + report["in_own"] == 1, (
         f"invariant 12 (the child's event landed in a child recorder): {report} {where}"
@@ -910,6 +1715,7 @@ def _fork_step(run: _Run, expected: State, where: str) -> None:
             f"invariant 12 (the parent's ledger moved only by its own drain thread, which keeps "
             f"delivering spans queued before the fork while the child runs): {arrived} {where}"
         )
+    return worst
 
 
 def _take(run: _Run, step: str, nested: bool, label: str) -> object:
@@ -1046,16 +1852,51 @@ def _check_invariants(run: _Run, step: str, result: object, driver: int, where: 
         assert not overlapped, f"invariant 5 (closed once, never overlapping): {overlapped} {where}"
 
 
-@pytest.mark.parametrize("seed", SEQ_SEEDS)
+def _check_close_count(run: _Run, step: str, where: str) -> None:
+    """SPEC-086 FR-001's two close rules, which one caller makes exact (invariant 5).
+
+    After every step, no close of a sink enters at the write count of the close before it
+    (``check_repeat``); after every ``shutdown`` and ``exit`` step, no sink has a write above its
+    count when its last close returned (``check_late_write``). The late-write rule is read only
+    after a step that closes, because a log made after a shutdown leaves its sink written and owed
+    until the next one, which invariant 5 records as correct.
+    """
+    for index, sink in enumerate(run.sinks):
+        closes = sink.record.closes()
+        try:
+            check_repeat(closes)
+            if step in {"shutdown", "exit"}:
+                check_late_write(closes)
+        except CloseBroken as exc:
+            raise AssertionError(
+                f"invariant 5 (a sink is closed once per write, and nothing writes it after its "
+                f"last close): sink {index} {' '.join(exc.signatures)} {exc.detail} {where}"
+            ) from exc
+
+
+@pytest.mark.parametrize("seed", [pytest.param(seed, id=f"seed{seed}") for seed in SEQ_SEEDS])
 def test_the_sequential_driver_holds_the_state_table(
-    seed: int, monkeypatch: pytest.MonkeyPatch
+    seed: int,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    record_property: Callable[[str, object], None],
 ) -> None:
     """FR-004: every step against the table, and invariants 1-6 and 12 after each.
 
     After every step the state is the table's, both token sets are empty, the (before, after) pair
     is a row, and the two facts the table is keyed by that the runtime holds — something owed, a
-    live worker — are read back rather than trusted to the model.
+    live worker — are read back rather than trusted to the model. Every step returns within its
+    budget plus ``EPSILON`` and the close count holds after it (SPEC-086 FR-001); the worst margin
+    is recorded for the session's line.
     """
+    with _rerun_on_failure(request, seed, concurrent=False):
+        worst = _drive(seed, monkeypatch)
+    record_property(GATE_MARGIN, f"{worst:.6f}")
+
+
+def _drive(seed: int, monkeypatch: pytest.MonkeyPatch) -> float:
+    """Runs one sequential seed, asserting after every step; returns the worst margin."""
+    margins: list[float] = []
     run = _Run(seed)
     monkeypatch.setattr("log_foundry.sinks.stdout.StdoutSink", run.recorder)
     _SAMPLES.clear()
@@ -1068,15 +1909,19 @@ def test_the_sequential_driver_holds_the_state_table(
         run.history.append(f"{step}@{cell[1].name}")
         where = run.where(index)
         if step == "fork":
-            _fork_step(run, expected, where)
+            started = time.monotonic()
+            margins.append(_fork_step(run, expected, where))
+            ended = time.monotonic()
+            margins.append(_bounded(Call(step, driver, _budget(step), started, ended), where))
             model.take(step)
+            _check_close_count(run, step, where)
             continue
         started = time.monotonic()
         try:
             result = _take(run, step, nested, label)
         except BaseException as exc:
             pytest.fail(f"invariant 1 (never fail the caller): {step} raised {exc!r} {where}")
-        elapsed = time.monotonic() - started
+        ended = time.monotonic()
         model.take(step)
         state = _lifecycle._state.state
         assert state is expected, f"state {state.name} is not the table's {expected.name} {where}"
@@ -1094,11 +1939,12 @@ def test_the_sequential_driver_holds_the_state_table(
         assert (_lifecycle._state.live_worker() is not None) == model.live, (
             f"liveness is not the model's {where}"
         )
-        bound = _budget(step) + BOUND_SLACK
-        assert elapsed < bound, f"invariant 3 (bounded): {step} took {elapsed:.2f}s {where}"
+        margins.append(_bounded(Call(step, driver, _budget(step), started, ended), where))
         _check_samples(label, step, driver, where)
         _check_transient(cell, label, transient, where)
         _check_invariants(run, step, result, driver, where)
+        _check_close_count(run, step, where)
+    return max(margins)
 
 
 def _ids(sink: Recorder, message: str) -> list[str]:
