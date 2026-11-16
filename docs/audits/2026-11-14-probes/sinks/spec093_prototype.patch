@@ -247,7 +247,7 @@ diff -ruN a/src/log_foundry/sinks/_rounds.py b/src/log_foundry/sinks/_rounds.py
          returned = (
 diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 --- a/src/log_foundry/sinks/_socket.py	2026-11-15 23:02:15
-+++ b/src/log_foundry/sinks/_socket.py	2026-11-16 09:49:28
++++ b/src/log_foundry/sinks/_socket.py	2026-11-16 10:17:07
 @@ -4,7 +4,11 @@
  
  import errno
@@ -268,7 +268,7 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
  )
  from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
  from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
-@@ -45,6 +50,15 @@
+@@ -45,6 +50,21 @@
  it is configurable. TCP is a stream and has no such limit, so this bounds nothing there.
  """
  
@@ -276,7 +276,13 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 +"""Pending socket errors that mean the peer reset or abandoned the connection (SPEC-093 FR-001)."""
 +
 +_RESET_WAIT = 0.25
-+"""Seconds the end-of-round check waits for the peer's acknowledgement or a reset (SPEC-093)."""
++"""Seconds the end-of-round check waits for the peer's acknowledgement or a reset (SPEC-093).
++
++It covers a 50 ms round trip under Linux's longest delayed acknowledgement, 200 ms
++(``TCP_DELACK_MAX``), which is how long a peer that never writes back may hold its answer. A
++longer bound would close more of the window a late reset leaves, and would cost every round
++against a peer that neither acknowledges nor resets that much more.
++"""
 +
 +_RESET_STEP = 0.001
 +"""Seconds between two reads of the socket while the end-of-round check waits."""
@@ -284,7 +290,7 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
  _PERMANENT_ERRNOS = frozenset({errno.EMSGSIZE})
  """Socket errnos that describe the message rather than the destination (FR-007 AC-3).
  
-@@ -116,6 +130,96 @@
+@@ -116,6 +136,133 @@
      )
  
  
@@ -349,7 +355,7 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 +        return None
 +
 +
-+def _end_state(sock: socket.socket) -> str:
++def _end_state(sock: socket.socket, wait_for_ack: bool = True) -> str:
 +    """Checks a held connection after a round, waiting for the peer to answer what it wrote.
 +
 +    A peer that closed before the round's frames reached it answers them with a reset and never
@@ -360,6 +366,8 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 +
 +    Args:
 +      sock: The held socket.
++      wait_for_ack: ``False`` reads :func:`_peer_state` once and waits for nothing, the check a
++        caller who passed ``ack_wait=False`` chose.
 +
 +    Returns:
 +      ``reset`` when a reset arrived first, else what :func:`_peer_state` answers last.
@@ -367,6 +375,8 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 +    Raises:
 +      None.
 +    """
++    if not wait_for_ack:
++        return _peer_state(sock)
 +    deadline = time.monotonic() + _RESET_WAIT
 +    while True:
 +        state = _peer_state(sock)
@@ -378,10 +388,69 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
 +        wait(_RESET_STEP)
 +
 +
++def require_ack_wait(value: object, owner: str, transport: object) -> bool:
++    """Judges a sink's ``ack_wait`` argument and answers whether its TCP rounds wait (SPEC-093).
++
++    ``None``, the default, waits. A ``bool`` is the caller's choice. Anything else is refused
++    rather than read for its truth, because a new keyword has no 1.x caller to keep working and
++    ``"false"`` would otherwise turn the wait on. A value on the UDP transport is refused as an
++    argument the chosen backend cannot use, since a datagram has no acknowledgement to wait for;
++    a transport that is neither is left to :class:`SocketTransport` to refuse.
++
++    Args:
++      value: The argument as passed.
++      owner: The sink's class name, for the message.
++      transport: The transport the sink was given.
++
++    Returns:
++      Whether the end-of-round check waits.
++
++    Raises:
++      TypeError: If ``value`` is neither ``None`` nor a ``bool``.
++      ValueError: If ``value`` is a ``bool`` and the transport is UDP.
++    """
++    if value is None:
++        return True
++    if not _diag.is_a(value, bool):
++        raise TypeError(f"{owner} ack_wait must be a bool or None, not {_diag.type_name(value)}")
++    if transport == "udp":
++        raise ValueError(
++            f"{owner} cannot apply ack_wait to the UDP transport, which has no acknowledgement "
++            "to wait for; drop it, or pass transport='tcp'"
++        )
++    return bool(value)
++
++
  def _json_frame(event: dict[str, object]) -> bytes:
      """Frames an event as its UTF-8 JSON text, the transport's default when a caller gives none.
  
-@@ -400,12 +504,20 @@
+@@ -178,6 +325,7 @@
+         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
+         frame: Callable[[dict[str, object]], bytes] | None = None,
+         sink_name: str = "SocketTransport",
++        ack_wait: bool = True,
+     ) -> None:
+         """Configures the destination, framing and retry bound without opening a socket yet.
+ 
+@@ -203,6 +351,9 @@
+           frame: The caller's per-event frame function (SPEC-074 FR-005), or ``None`` for an
+             event's UTF-8 JSON text.
+           sink_name: The class name SPEC-069's encode line names: the sink that built this.
++          ack_wait: Whether a TCP round's end check waits for the peer to acknowledge what the
++            round wrote (SPEC-093 FR-001). ``False`` checks once, at once, as the transport did
++            before the wait; the sink that builds this has judged the value.
+ 
+         Returns:
+           None.
+@@ -240,6 +391,7 @@
+         self._sock: socket.socket | None = None
+         self._frame = frame if frame is not None else _json_frame
+         self._sink_name = sink_name
++        self._ack_wait = ack_wait
+         self.log_foundry_counters = SinkCounters()
+         self.dropped_oversized = 0
+         self.log_foundry_stop_signal: threading.Event | None = None
+@@ -400,12 +552,20 @@
              fates = [Outcome.DROPPED] * len(batch)
              pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
              lost = Lost(self)
@@ -402,11 +471,11 @@ diff -ruN a/src/log_foundry/sinks/_socket.py b/src/log_foundry/sinks/_socket.py
                  fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
                  kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
                  lost.add(
-@@ -414,8 +526,40 @@
+@@ -414,8 +574,40 @@
                      key=kind,
                      line=raised_line("message", "SocketTransport", kind),
                  )
-+            if unconfirmed and self._sock is not None and _end_state(self._sock) == "reset":
++            if unconfirmed and self._sock is not None and _end_state(self._sock, self._ack_wait) == "reset":
 +                self._unconfirm(unconfirmed, fates, context)
 +                self._reset()
              lost.register()
@@ -455,6 +524,74 @@ diff -ruN a/src/log_foundry/sinks/elasticsearch.py b/src/log_foundry/sinks/elast
              return self._unadjudicated(items, _detail(sent))
          if not data.get("errors"):
              return (Outcome.ACCEPTED,) * sent
+diff -ruN a/src/log_foundry/sinks/logstash.py b/src/log_foundry/sinks/logstash.py
+--- a/src/log_foundry/sinks/logstash.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/logstash.py	2026-11-16 10:17:31
+@@ -8,7 +8,7 @@
+ from log_foundry import _diag, _lifecycle
+ from log_foundry.sinks._args import ReadOnlyCount, ReadOnlySeconds
+ from log_foundry.sinks._engine import emit_via_deliver
+-from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
++from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport, require_ack_wait
+ from log_foundry.sinks._wrapper import (
+     ForwardedStopSignal,
+     copy_budget,
+@@ -129,6 +129,7 @@
+         timeout: float = 5.0,
+         max_retries: int = 3,
+         max_datagram_bytes: int | None = None,
++        ack_wait: bool | None = None,
+         **http_kwargs: Unpack[HTTPAuthKwargs],
+     ) -> None:
+         """Selects and builds exactly one backend.
+@@ -157,6 +158,11 @@
+             than sent, retried and abandoned (SPEC-038 FR-007). ``None`` by default for the reason
+             ``transport`` is. Still ignored over TCP, which is a stream — that is a property of the
+             transport the caller chose, not an argument the backend cannot use.
++          ack_wait: In TCP socket mode, whether each round ends by waiting, up to 0.25 s, for the
++            peer to acknowledge what it wrote, so frames a closed peer discarded are counted
++            (SPEC-093 FR-001). ``None``, the default, waits; ``False`` checks once without
++            waiting. Unlike ``max_datagram_bytes`` its default is ``None`` in every mode, so a
++            value given for UDP or beside ``url=`` is told from the default and refused.
+           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode,
+             typed as ``HTTPAuthKwargs`` (SPEC-051 FR-005) — every keyword it takes except
+             ``body_format``, ``timeout`` and ``max_retries``, each a parameter of this sink's
+@@ -167,7 +173,8 @@
+           None.
+ 
+         Raises:
+-          TypeError: If ``max_retries`` (either mode) or ``port`` (socket mode) is not an ``int``,
++          TypeError: If ``ack_wait`` is neither ``None`` nor a ``bool``, or if ``max_retries``
++            (either mode) or ``port`` (socket mode) is not an ``int``,
+             or in HTTP mode a forwarded ``max_batch_count`` is not an ``int`` or
+             ``max_retry_after`` not an ``int`` or ``float`` (SPEC-066), refused by the backend this
+             sink builds.
+@@ -195,6 +202,7 @@
+             "port": port,
+             "transport": transport,
+             "max_datagram_bytes": max_datagram_bytes,
++            "ack_wait": ack_wait,
+         }
+         if url is not None:
+             unusable = sorted(n for n, v in socket_only.items() if v is not None)
+@@ -217,6 +225,9 @@
+                     "HTTP backend"
+                 )
+             self._http = None
++            wait_for_ack = require_ack_wait(
++                ack_wait, _diag.type_name(self), transport if transport is not None else "tcp"
++            )
+             self._socket = SocketTransport(
+                 host,
+                 port,
+@@ -230,6 +241,7 @@
+                 ),
+                 frame=self._frame,
+                 sink_name=_diag.type_name(self),
++                ack_wait=wait_for_ack,
+             )
+         else:
+             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")
 diff -ruN a/src/log_foundry/sinks/rabbitmq.py b/src/log_foundry/sinks/rabbitmq.py
 --- a/src/log_foundry/sinks/rabbitmq.py	2026-11-15 23:02:15
 +++ b/src/log_foundry/sinks/rabbitmq.py	2026-11-16 08:42:00
@@ -724,3 +861,55 @@ diff -ruN a/src/log_foundry/sinks/sqs.py b/src/log_foundry/sinks/sqs.py
  
      @property
      def _counter_lock(self) -> threading.Lock:
+diff -ruN a/src/log_foundry/sinks/syslog.py b/src/log_foundry/sinks/syslog.py
+--- a/src/log_foundry/sinks/syslog.py	2026-11-15 23:02:15
++++ b/src/log_foundry/sinks/syslog.py	2026-11-16 10:17:13
+@@ -10,7 +10,7 @@
+ from log_foundry import _diag
+ from log_foundry.sinks._args import ReadOnlyCount, store_read_only
+ from log_foundry.sinks._engine import emit_via_deliver
+-from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
++from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport, require_ack_wait
+ 
+ if TYPE_CHECKING:
+     import threading
+@@ -83,6 +83,7 @@
+         timeout: float = 5.0,
+         max_retries: int = 3,
+         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
++        ack_wait: bool | None = None,
+     ) -> None:
+         """Configures the destination, framing and message identity.
+ 
+@@ -104,17 +105,21 @@
+           max_datagram_bytes: The largest UDP datagram to attempt; a frame over it is dropped
+             and counted rather than sent, retried and abandoned (SPEC-038 FR-007). Ignored for
+             TCP, which is a stream.
++          ack_wait: For TCP, whether each round ends by waiting, up to 0.25 s, for the peer to
++            acknowledge what it wrote, so frames a closed peer discarded are counted (SPEC-093
++            FR-001). ``None``, the default, waits; ``False`` checks once without waiting.
+ 
+         Returns:
+           None.
+ 
+         Raises:
+           TypeError: If ``port`` or ``max_retries`` is not an ``int`` (SPEC-066), refused by the
+-            transport this sink builds.
++            transport this sink builds, or ``ack_wait`` is neither ``None`` nor a ``bool``.
+           ValueError: If the facility is not one of the supported keywords, or ``app_name`` is
+             empty or contains whitespace, or the transport refuses ``port``, ``timeout`` or
+-            ``max_datagram_bytes``.
++            ``max_datagram_bytes``, or ``ack_wait`` is given for UDP.
+         """
++        wait_for_ack = require_ack_wait(ack_wait, _diag.type_name(self), transport)
+         if facility not in _FACILITY:
+             raise ValueError(f"invalid facility {facility!r}; expected one of {sorted(_FACILITY)}")
+         if not app_name or any(char.isspace() for char in app_name):
+@@ -135,6 +140,7 @@
+             max_datagram_bytes=max_datagram_bytes,
+             frame=self._frame,
+             sink_name=_diag.type_name(self),
++            ack_wait=wait_for_ack,
+         )
+         store_read_only(self, "max_retries", self._socket.max_retries)
+         self.log_foundry_counters = self._socket.log_foundry_counters

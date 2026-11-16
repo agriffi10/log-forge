@@ -20,8 +20,10 @@ each one, and SPEC-092's conformance corpus pins each one red. This spec makes t
 what they can actually know. An event is landed only when something confirmed it. It is lost when the
 backend refused it. It is ambiguous, counted and announced as one that may have landed and never sent
 again, when the sink cannot tell. `RabbitMQSink` gains publisher confirms as an option, off by default
-as Andrew decided, and its default's unconfirmed publish becomes a recorded departure. Andrew decided
-four of these rules on 2026-11-15, and this spec builds three of them. The fourth, a client-buffered
+as Andrew decided, and its default's unconfirmed publish becomes a recorded departure. The TCP
+sinks' wait for the peer's acknowledgement is the other way round, on by default with an opt-out,
+as he decided on 2026-11-16. Andrew decided four of these rules on 2026-11-15, and this spec builds
+three of them. The fourth, a client-buffered
 sink waiting for its delivery report, is SPEC-094, the arc's next spec, because it moves `KafkaSink`
 and `GooglePubSubSink` onto the delivery engine.
 
@@ -29,9 +31,10 @@ and `GooglePubSubSink` onto the delivery engine.
 
 ### In Scope
 
-- A TCP socket transport that checks its held connection before each round and after it, and calls
-  `UNKNOWN` every frame written into a connection that a later write or a reset shows was closed
-  (FR-001).
+- A TCP socket transport that checks its held connection before each round and after it, waiting
+  at the end for the peer's acknowledgement, and calls `UNKNOWN` every frame written into a
+  connection that a later write or a reset shows was closed; and `ack_wait=False` on `SyslogSink`
+  and `LogstashSink`, which turns the wait off (FR-001).
 - `SentrySink`'s SDK backend reading what `capture_event` returns, so a discarded event is counted
   as dropped rather than as sent (FR-002).
 - Andrew's decision A for the AWS batch replies that name no event, and the same reading for a `_bulk`
@@ -91,7 +94,8 @@ that names no failure should read as delivered. The examples were `{}`, a `Succe
 **"Unadjudicated (Recommended)"**: every event the reply does not name is `UNKNOWN`, counted in
 `failed` and `dropped_unadjudicated`, announced once as one that may have landed, and never resent.
 That matches the existing rule for an unreadable `2xx` on `_bulk`, Honeycomb and OTLP. Two more of
-his answers that day bind FR-002 and FR-004, and *Revision history* quotes them.
+his answers that day bind FR-002 and FR-004, and a third, on 2026-11-16, binds FR-001's default;
+*Revision history* quotes them.
 
 ### FR-001: A TCP socket transport never calls a frame taken by a connection it can see is closed
 
@@ -186,6 +190,50 @@ it waited for nothing and stayed silent in every run.
    SocketTransport, written to a connection its peer closed; may have landed, not retried`. The
    engine counts them in `failed_events`, and they are never sent again.
 
+**The opt-out, `ack_wait`.** Andrew answered on 2026-11-16, choosing **"On, opt out
+(Recommended)"**: the wait is on by default, and a keyword turns it off.
+
+- **The keyword.** `SyslogSink.__init__` and `LogstashSink.__init__` each gain a keyword-only
+  `ack_wait: bool | None = None`. On `SyslogSink` it is appended after `max_datagram_bytes`, its
+  last parameter. On `LogstashSink` it follows `max_datagram_bytes`, its last named parameter, and
+  precedes `**http_kwargs`, which Python requires to stay last; a keyword-only parameter has no
+  position a caller can depend on, so invariant 10's rule, that the surface grows by appending, holds
+  either way. `SocketTransport` gains `ack_wait: bool = True`, appended last, which the two sinks
+  pass and nothing else sets.
+- **The name.** `ack_wait` names what it controls, the wait for the peer's TCP acknowledgement, and
+  says that turning it off turns a wait off. `confirm`, `RabbitMQSink`'s keyword, was not reused: it
+  turns on a broker's application-level confirmation, and this acknowledgement is the peer kernel's,
+  which says the bytes arrived and nothing about whether the collector kept them.
+- **`None`, the default, and `True`** wait, as the rule above says.
+- **`False`** is the check the previous revision specified: `_end_state` reads `_peer_state` once,
+  `SO_ERROR` and the peek, and waits for nothing. It is not 1.x: the pre-round check, the raise rule
+  and the end check all still run, so a reset that has landed by the end of the round is still
+  counted. The corpus measured what it gives up (*Evidence*): silent loss on the FIN-after-the-
+  pre-check, RST-before-the-end-check and reset-after-the-end-check rows under 10 ms of delay, and on
+  macOS loopback.
+- **Validation**, in a helper beside `SocketTransport`, `_socket.require_ack_wait`, which both sinks
+  call before anything is built:
+  - a value that is neither `None` nor a `bool`, judged with `_diag.is_a(value, bool)`, is refused
+    with `TypeError` naming `ack_wait` and the type. It is not read for its truth, because a new
+    keyword has no 1.x caller to keep working and `"false"` would otherwise turn the wait on. That is
+    *A bad argument is floored if it works and refused if it is already broken; a new one is
+    refused* (`docs/decisions/sink-delivery/`): the argument is new, so nothing is floored;
+  - a `bool` with the UDP transport is refused with `ValueError` naming `ack_wait`, as an argument
+    the chosen backend cannot use: a datagram has no acknowledgement to wait for. On `LogstashSink`, a
+    `bool` beside `url=` is refused by the existing socket-only rule, which gains `ack_wait`.
+    `max_datagram_bytes` is accepted and ignored over TCP, and that is not a precedent here: its
+    default on `SyslogSink` is an `int`, so a value given cannot be told from the default, while
+    `ack_wait`'s default is `None` on both sinks, so it can, and invariant 13 says no argument is
+    silently ignored because another was given;
+  - a transport that is neither is left to `SocketTransport`, which refuses it as today.
+
+**The bound is decided in session.** `_RESET_WAIT` stays 0.25 s: the coordinator kept it on
+2026-11-16, and it is not Andrew's call. The reasoning, which the constant's docstring carries: it
+covers a 50 ms round trip under Linux's longest delayed acknowledgement, 200 ms (`TCP_DELACK_MAX`),
+the longest a peer that never writes back may hold its answer; a longer bound would close more of
+the window a late reset leaves, and would cost every round against a peer that neither acknowledges
+nor resets that much more.
+
 **What the wait costs.** One round trip, plus however long the peer holds its acknowledgement, on
 every TCP round, because the check returns once the last byte is acknowledged. Logstash and a syslog
 collector never write back, so the peer acknowledges on its delayed-acknowledgement timer, which
@@ -251,6 +299,19 @@ FR-006 records the first two windows and the cost in §13.
       cleared but not believed, the FIN-after-the-pre-check row at 1 frame and the
       RST-before-the-end-check row read silent loss on Linux, and the second on macOS
       (invariant 2).
+- [ ] `SyslogSink(transport="tcp")` and `LogstashSink(host=, port=)` built with no `ack_wait`, or
+      with `ack_wait=True`, wait at the end check: under the seam test's first case each reads
+      `_unacked` four times. With `ack_wait=False` each reads `_peer_state` once and `_unacked`
+      never, and the corpus test run with `ack_wait=False` reads every row as the rule does on
+      Linux loopback, where it runs (invariants 2 and 10).
+- [ ] `ack_wait="false"`, `ack_wait=0` and `ack_wait=1.0` are refused with `TypeError` naming
+      `ack_wait` and the type, on both sinks, before any socket is built. `ack_wait=True` or
+      `False` with `transport="udp"` is refused with `ValueError` naming `ack_wait`, and on
+      `LogstashSink` beside `url=` by the socket-only rule; `ack_wait=None` is accepted in every mode
+      (invariant 13).
+- [ ] `tests/test_public_surface.py` and `tests/typed_consumer/` accept the new keyword as an
+      addition, and a 1.x call to either constructor builds the same sink as before with the wait
+      on (invariant 10).
 - [ ] With `SO_ERROR` holding `EHOSTUNREACH` on a connection whose peer is open, `_peer_state`
       answers `"open"` and the round's frames are `ACCEPTED` (invariant 2).
 - [ ] A peer closed between two rounds leaves every frame of the second round on the new
@@ -563,6 +624,14 @@ baseline.
   - `confirm-borrowed-unprobed` holds `RabbitMQSink[confirmed-borrowed]-peer-closed` at
     `ambiguous-when-knowable`. Its record is the same file and the phrase "A borrowed connection is
     not probed before a round, so a publish on one that died while idle reads as a lost confirm".
+- **No variant for `ack_wait=False`, and so no departure.** RabbitMQ's opt-in earned variants
+  because the corpus's double can tell a confirmed publish from an unconfirmed one. Its fake TCP
+  socket cannot tell a waited end check from an unwaited one: it cannot be polled and has no send
+  queue to read, so `_peer_state` answers `"open"` and `_unacked` answers `None`, and both settings
+  read it once. Measured: with the default flipped to `False` in an export of the prototype, all 268
+  rows read as with it on. A variant would add rows that only repeat the TCP rows, so the opt-out's
+  cost is held where it shows, in `spec093_close_corpus.py` and `tests/test_socket_close_corpus.py`
+  (FR-001), and recorded in §13 (FR-006). The totals do not move.
 - **Totals.** 268 rows: 62 pinned under seven pins, 15 departure rows under nine departures, and 191
   that must pass. SPEC-092's FR-004 asserts its totals as literals, and those literals change to
   these numbers.
@@ -622,7 +691,9 @@ that text.
     the corpus's clean-round medians on loopback and under 1 ms and 10 ms of delay, the delayed
     acknowledgement behind them, and the 0.25 s a round that a peer which neither acknowledges nor
     resets costs. It says that where `_unacked` cannot read the send queue, Windows among them, the
-    check does not wait and a reset in flight at the check goes uncounted.
+    check does not wait and a reset in flight at the check goes uncounted, and that `ack_wait=False`
+    makes every platform behave so, with the rows the corpus measured silent under delay. It says
+    the 0.25 s bound was decided in session, and why.
   - "**A FIN alone is not read as a loss, because it is also a legal half-close.**" The bullet
     carries the reproduction (`halfclose.py`, all 60 frames received with `failed=60` under a
     FIN-counting check) and the corpus's rows in which every frame arrived after a FIN. A false
@@ -638,7 +709,11 @@ that text.
 - **Decisions in `docs/decisions/sink-delivery/`, each one file with its fence, entry and dated
   History.**
   - A new decision for FR-001's rule, with the half-close reasoning, the acknowledgement wait and
-    its cost, and why a reset the next round sees is not counted.
+    its cost, and why a reset the next round sees is not counted. It quotes Andrew's "On, opt out
+    (Recommended)" with the date 2026-11-16, beside the RabbitMQ decision's "Off, opt in" as the
+    precedent the other way, and says why the two differ: a confirm costs a broker round trip per
+    message, and the acknowledgement wait one round trip per round, bounded. It records `ack_wait`'s
+    name and validation, and the 0.25 s bound as decided in session.
   - A new decision for FR-002's rule. It quotes Andrew's "Dropped, with a line (Recommended)" with
     the date, and the counter-precedent he was shown.
   - A new decision for decision A, which quotes Andrew's question and answer with the date, together
@@ -657,7 +732,8 @@ that text.
   7 name the new tests.
 - **README.**
   - The `SyslogSink` and `LogstashSink` rows (`README.md:783-784`) gain the TCP checks, the wait
-    for the peer's acknowledgement at the end of each round, and the may-have-landed line.
+    for the peer's acknowledgement at the end of each round, `ack_wait=False` to turn it off, and
+    the may-have-landed line.
   - The `SentrySink` paragraph (`:842-845`) says that a discarded event is in `losses().dropped`,
     including one sampled out or dropped by `before_send`.
   - The AWS paragraphs (`:870-880`) state decision A's reading, and that `dropped_unadjudicated` is
@@ -671,14 +747,17 @@ that text.
   words it.
   - **The file's title and opening paragraphs are rewritten**, so that no sentence there becomes
     false. Today's title is about the file and stream sinks only, and the opener says "No constructor
-    signature or default changed", which `RabbitMQSink(confirm=)` makes false. So does the same
-    sentence under *What did not change* (`v1.2.1.md:240` at `97a03f45`), which is rewritten too. The file keeps its
-    name. Whether the release is 1.2.1 or 1.3.0 is chosen when it is tagged, since a new keyword
+    signature or default changed", which `RabbitMQSink(confirm=)` and the two `ack_wait=` keywords
+    make false. So does the same sentence under *What did not change* (`v1.2.1.md:240` at
+    `97a03f45`), which is rewritten too. The file keeps its name. Whether the release is 1.2.1 or 1.3.0 is chosen when it is tagged, since a new keyword
     argument is additive. The opener says so, and no sentence depends on the number.
   - The entry lists:
     - the TCP line and its `UNKNOWN` counts, the end-of-round wait for the peer's acknowledgement, a
       round trip plus the peer's delayed acknowledgement and at most 0.25 s, and a half-closing
       peer's connection replaced each round;
+    - `SyslogSink(ack_wait=)` and `LogstashSink(ack_wait=)`, on by default; `False` keeps the
+      checks without the wait, and what that gives up; a non-`bool` refused with `TypeError`, and a
+      value for UDP or beside `url=` with `ValueError`;
     - `SentrySink.discarded` and its line, that sampling or `before_send` now moves `dropped` and
       prints a line, and the stand-in returning `None`;
     - decision A's counts and lines, the new ending of the unread-reply line, the stand-in returning
@@ -698,7 +777,8 @@ that text.
       and naming SPEC-093, and §13 carries the five bullets.
 - [ ] The four new decision files and the two dated History entries exist. The decision-A file quotes
       "Unadjudicated (Recommended)", the Sentry file "Dropped, with a line (Recommended)" and the
-      RabbitMQ file "Off, opt in", each with the date 2026-11-15.
+      RabbitMQ file "Off, opt in", each with the date 2026-11-15, and the FR-001 file "On, opt out
+      (Recommended)" with the date 2026-11-16.
 - [ ] `docs/invariants.md`'s recorded exceptions for a sink that delivered nothing name a
       `SentrySink` batch with a discard and nothing sent.
 - [ ] Each README site above states the new behaviour. Nothing in the README says a TCP frame, a
@@ -720,7 +800,20 @@ _RESET_WAIT: float = 0.25       # the end check's bound
 _RESET_STEP: float = 0.001      # its pause between reads
 def _peer_state(sock: socket.socket) -> Literal["open", "fin", "reset"]: ...   # seam beside _make_tcp
 def _unacked(sock: socket.socket) -> int | None: ...                          # seam: SIOCOUTQ / SO_NWRITE
-def _end_state(sock: socket.socket) -> Literal["open", "fin", "reset"]: ...    # seam: the end check
+def _end_state(sock: socket.socket, wait_for_ack: bool = True) -> Literal["open", "fin", "reset"]: ...
+def require_ack_wait(value: object, owner: str, transport: object) -> bool: ...  # judges ack_wait
+class SocketTransport:
+    def __init__(self, host, port, *, ..., sink_name: str = "SocketTransport",
+                 ack_wait: bool = True) -> None: ...                  # new keyword, last
+
+# src/log_foundry/sinks/syslog.py, logstash.py
+class SyslogSink:
+    def __init__(self, host, port=514, *, ..., max_datagram_bytes: int = ...,
+                 ack_wait: bool | None = None) -> None: ...           # new keyword, last
+class LogstashSink:
+    def __init__(self, url=None, *, ..., max_datagram_bytes: int | None = None,
+                 ack_wait: bool | None = None,                        # new keyword
+                 **http_kwargs: Unpack[HTTPAuthKwargs]) -> None: ...
 
 # src/log_foundry/sinks/sentry.py
 class SentrySink:
@@ -758,7 +851,8 @@ def adds_faults(variants: Iterable[Variant]) -> list[str]: ...   # new: one line
 
 ```
 src/log_foundry/sinks/
-├── _socket.py        # FR-001: _peer_state, _unacked, _end_state, the round's checks
+├── _socket.py        # FR-001: _peer_state, _unacked, _end_state, require_ack_wait, the checks
+├── syslog.py, logstash.py  # FR-001: ack_wait=
 ├── sentry.py         # FR-002: discarded, the Deferral in emit
 ├── _rounds.py        # FR-003: read_keyed reads Successful; settle_keyed counts the unnamed
 ├── _batch.py         # FR-003: adjudicate_positional(absent=)
@@ -835,7 +929,9 @@ Some tests fail there with or without the prototype, because they read files the
 at `9d70f782` and 50 at `97a03f45`. The prototype fails 27 more. 25 of them are the same 25 at
 `33582484`, at `bb6656ff`, at `9d70f782` after the first revision, and at `97a03f45` after the
 second and third, so no revision's changes fail a test the first draft did not, except the
-third's end-of-round wait, which fails the two gates FR-001 names. Each is accounted for:
+third's end-of-round wait, which fails the two gates FR-001 names. The fourth revision's
+`ack_wait` keyword fails none: the same 27, and SPEC-094's 52 on top, as before it. Each is
+accounted for:
 
 - FR-001, 2: `test_sink_retry.py::test_only_the_engine_waits_or_backs_off` and
   `test_engine_sinks_roster.py::test_the_engine_sinks_are_the_sixteen`, which read `_socket`'s
@@ -918,6 +1014,15 @@ rows that went wrong and in how many runs:
 
 The candidate's wait never began under delay, because the FIN itself had not landed by the end
 check, so it did no better than the previous revision there.
+
+`ack_wait=False`, the opt-out, run through the same corpus with `--no-ack-wait` at 5 runs a
+scenario, reads as the previous revision's rule, which it is: every row right on Linux loopback; on
+macOS, FIN-after-the-pre-check at 1 frame silent in 5 runs, at 5 frames in 1, and
+RST-before-the-end-check in 1; under 10 ms of delay on Linux, both FIN-after-the-pre-check rows,
+RST-before-the-end-check and the reset-after-the-end-check row's second round silent in every run,
+and the mid-round rows in 4 and 2. Its clean round's median was 0.1 ms on macOS and 0.4 ms on Linux
+under 10 ms of delay, against 1.3 ms and 43.0 ms with the wait on in the same runs, every row of
+which read as the table above says.
 
 Each re-plant, run through the same corpus at 10 runs a scenario. A cell names the rows that went
 wrong and in how many runs; every other row read as the rule's did:
@@ -1074,3 +1179,15 @@ check waits on a healthy peer.
     so a soft ICMP error on a live Linux connection does not count frames that arrived.
   - The end check's pause is `_retry.wait`, so `_socket` joins `WAIT_EXCLUSIONS` rather than
     waiting where that gate cannot see it.
+- Revised a fourth time on 2026-11-16, after Andrew's answer on the wait's default.
+  - **Andrew, 2026-11-16, on the TCP acknowledgement wait: "On, opt out (Recommended)".** The wait
+    stays on by default, and `SyslogSink` and `LogstashSink` gain `ack_wait=`, whose `False` keeps
+    the previous revision's immediate check. It sits beside his 2026-11-15 "Off, opt in" for
+    `RabbitMQSink(confirm=)`, the precedent the other way: a confirm costs a broker round trip per
+    message, and this wait one round trip per round, bounded at 0.25 s. FR-001 specifies the
+    keyword, its name and its validation, and FR-006 records it in the decision, the README and the
+    release notes.
+  - **Decided in session, not Andrew's call.** `_RESET_WAIT` stays 0.25 s, kept by the coordinator:
+    it covers a 50 ms round trip under Linux's 200 ms longest delayed acknowledgement.
+  - The corpus gains no variant and no departure, because its fake socket reads alike either way,
+    measured with the default flipped. The totals do not move.

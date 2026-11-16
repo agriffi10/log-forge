@@ -2,22 +2,23 @@
 
 Written on 2026-11-16 while revising SPEC-093 against 97a03f45; not one of the audit's probes.
 Rebuilt after the execution-frame review: the first version modelled the transport and slept 50 ms
-before each check, which hid the timing that decides the rule. This one drives `LogstashSink` in
-TCP mode, from whichever tree is first on `PYTHONPATH` (apply `spec093_prototype.patch` to one),
-against a loopback peer. It arranges each scenario through the transport's two seams,
-`_socket._peer_state` (the pre-round check) and `_socket._end_state` (the end-of-round check), and
-never sleeps to let a packet arrive. `--wait SECONDS` sets `_socket._RESET_WAIT`, so `--wait 0`
-measures the rule without the wait for a reset. Per scenario and run it prints what the peer
+before each check, which hid the timing that decides the rule. This one drives `LogstashSink` in TCP
+mode, from whichever tree is first on `PYTHONPATH` (apply `spec093_prototype.patch` to one), against
+a loopback peer. It arranges each scenario through the transport's two seams, `_socket._peer_state`
+(the pre-round check) and `_socket._end_state` (the end-of-round check), and never sleeps to let a
+packet arrive. `--wait SECONDS` sets `_socket._RESET_WAIT`, so `--wait 0` measures the rule without
+the wait for a reset, and `--no-ack-wait` builds the sink with `ack_wait=False`, the opt-out
+SPEC-093 added after Andrew's answer of 2026-11-16. Per scenario and run it prints what the peer
 received, what the sink counted, what each check read, and `ok`, `SILENT-LOSS` or `FALSE-COUNT`; a
 scenario marked `unknowable` expects its first round's loss to go uncounted, which it prints as
-`residual`, and every later round to be right. A round loses frames silently when more frames
-went missing than it counted, and counts falsely when it counted more than went missing, except
-where the peer closes mid-round: a close with frames still arriving becomes a reset, which
-discards whatever the peer had not read, and nothing the sender sees says how much that was, so
-frames it had read may honestly read `UNKNOWN`, which prints as `unknown-but-read`. It also prints
-the median time of one round, which is what the end-of-round check costs. Run it on macOS and on Linux, under a delay:
+`residual`, and every later round to be right. A round loses frames silently when more frames went
+missing than it counted, and counts falsely when it counted more than went missing, except where the
+peer closes mid-round: a close with frames still arriving becomes a reset, which discards whatever
+the peer had not read, and nothing the sender sees says how much that was, so frames it had read may
+honestly read `UNKNOWN`, which prints as `unknown-but-read`. It also prints the median time of one
+round, which is what the end-of-round check costs. Run it on macOS and on Linux, under a delay:
 
-    PYTHONPATH=<tree>/src python -B spec093_close_corpus.py [runs] [--wait SECONDS]
+    PYTHONPATH=<tree>/src python -B spec093_close_corpus.py [runs] [--wait S] [--no-ack-wait]
     docker run --rm --cap-add NET_ADMIN -v ...:/w -w /w <image with iproute2> sh -c \\
         'tc qdisc add dev lo root netem delay 10ms; PYTHONPATH=<tree>/src python -B ...'
 """
@@ -37,6 +38,7 @@ from log_foundry.sinks import _socket as S
 from log_foundry.sinks.logstash import LogstashSink
 
 HOOKS: dict[str, object] = {}
+SINK_KWARGS: dict[str, object] = {}
 TIMES: list[float] = []
 LOG: list[tuple[str, str]] = []
 _peer_state = S._peer_state
@@ -58,13 +60,13 @@ def peer_state(sock: socket.socket) -> str:
     return state
 
 
-def end_state(sock: socket.socket) -> str:
+def end_state(sock: socket.socket, *args: object) -> str:
     hook = HOOKS.pop("before_end", None)
     if hook:
         hook()
     _inside_end.on = True
     try:
-        state = _end_state(sock)
+        state = _end_state(sock, *args)
     finally:
         _inside_end.on = False
     LOG.append(("end", state))
@@ -167,7 +169,7 @@ def run(name, n=5, setup=None, on_accept=None, rounds=1, unknowable=False, ambig
     HOOKS.clear()
     LOG.clear()
     srv = Server(on_accept)
-    sink = LogstashSink(host="127.0.0.1", port=srv.port, transport="tcp")
+    sink = LogstashSink(host="127.0.0.1", port=srv.port, transport="tcp", **SINK_KWARGS)
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         sink.emit([{"message": "warm"}])
@@ -297,6 +299,9 @@ def main() -> int:
         i = args.index("--wait")
         S._RESET_WAIT = float(args[i + 1])
         del args[i : i + 2]
+    if "--no-ack-wait" in args:
+        args.remove("--no-ack-wait")
+        SINK_KWARGS["ack_wait"] = False
     runs = int(args[0]) if args else 5
     print(
         platform.system(),
@@ -305,6 +310,8 @@ def main() -> int:
         sys.version.split()[0],
         "wait",
         S._RESET_WAIT,
+        "ack_wait",
+        SINK_KWARGS.get("ack_wait", True),
     )
     for name, kw in SCENARIOS:
         TIMES.clear()
