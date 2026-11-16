@@ -204,7 +204,9 @@ and `deliver-seed962`.
 > **Traced after the merge (2026-11-15).** `deliver-seed962` has the record of the defect probe
 > `p11` forces, which `docs/architecture.md` §12 now holds: a sink change arms the sink a concurrent
 > `shutdown()` took and closed. It is present at every tree measured, `31dda162` to `9d70f782`.
-> The other three records cannot name their arm.
+> It is not #339's double close, because the second taker is a `shutdown()`, which #339's lock does
+> not cover. That tracing session is done. The other three records cannot name their arm, and
+> nothing further is owed on them.
 
 **The bound under overload.** The second review ran the model file beside 40 busy-loops on this
 10-core Mac, at loads of 81 to 112. **4 of 6 runs failed**, at `Stalled:info` or `Stalled:span`,

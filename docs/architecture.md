@@ -1352,15 +1352,20 @@ close it.
   Measured at `a0f44b5f`, 2 cells red: the installed sink has one write and closes entered at
   counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
   by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
-  the swap began.
+  the config named it (the item below says why the config write, not the swap's entry). Its two
+  pinned cells retarget a worker that then declines, which SPEC-054 records as an accepted trade;
+  the item below says what closing it reverses.
 - **A sink a swap installs is closed twice with nothing written between when a concurrent
   `shutdown()` took it before the swap decided** (SPEC-086's soak; invariant 5). This is the item
   above with the `shutdown()` on another thread instead of inside a sink's code.
   `configure(sink=S)` writes S to the config before its swap decides (`config._change_sink` calls
   `_rebind`, then `_swap_live_sink`). In that window an orphan log arms S and writes to it, and a
-  `shutdown()` takes S and closes it. The swap then arms S as the sink it installs, on its
-  no-worker branch or after `Worker.retarget`, and a later take closes S again at the same write
-  count. `docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`
+  `shutdown()` takes S and closes it. The swap then arms S as the sink it installs, and a later
+  take closes S again at the same write count.
+
+  On the no-worker branch, the swap's config write precedes the shutdown's take of S, and its
+  critical section follows the drain's last take (before it, the swap declines at entry). None of invariant 5's recorded exceptions
+  covers that window. `docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`
   forces it:
   - At `9d70f782`, 7 of 7 forced runs closed S at counts 1 and 1. Both controls closed S once in 7
     of 7: one drops the first `shutdown()`, and the other drops the stale log that keeps the
@@ -1373,23 +1378,47 @@ close it.
     and the second close's take. The soak was run over its even seeds alternately at `5447d26a`
     and `9d70f782`, at loads of 28 to 82. It found 1 such report in 9,000 runs at `5447d26a` and 3
     in 9,000 at `9d70f782`. In each, the only arm between the two takes was the swap's arm of the
-    sink it installs, traced by caller.
+    sink it installs, traced by caller. Of the 3, the arm was on the no-worker branch in all 3,
+    and of 14 more found at higher load at `9d70f782`, 9 were on that branch and 5 were after
+    `Worker.retarget`.
   - The one other `repeat@<n>` at each commit is not counted here: `emit-seed1582` and
     `deliver-seed600` each had a write after the first take. At `emit-seed1582` that write made no
     arm because the swap's arm had already made the sink owed, so the soak's rule, which looks for
     a writer's arm, reads a close the write owes as unowed. At `deliver-seed600` the writer armed
     before the take, which is the race of the orphan-log item below. Whether its second close is
     owed depends on how that item closes.
-  - SPEC-086's `deliver-seed962` has the same record. Its take can land before the swap reaches
-    its critical section, so "since the swap began" in the item above has to mean since the
-    config write.
+  - SPEC-086's `deliver-seed962` has the same record. It is not #339's double close, as SPEC-086
+    and `check_unowed_repeat`'s docstring call such an arm, because the second taker is a
+    `shutdown()`.
+
+  After `Worker.retarget` the same arm is reached only through two windows invariant 5 already
+  records: a `shutdown()` that gave up waiting for the swap's decision, and a swap that retargets a
+  worker built during the shutdown. There the recorded consequence is a sink left open; this is a
+  second consequence, a sink closed twice. It is unforced. Where the retarget declined, it is the
+  redundant close SPEC-054 accepted as a trade. That trade is recorded in
+  `docs/decisions/pipeline/one-lifecycle-owner-the-bookkeeping-around-the-two-emit-paths-exists-once.md`,
+  in SPEC-054 and its delivery doc, in `_swap_sink`'s docstring, and in
+  `tests/test_shutdown_lifecycle.py::test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade`.
+  Not arming on a decline cost SPEC-035 FR-003's guarantee that a declined sink is owned by
+  somebody. The trade's text names a declined swap only. On the no-worker branch, withholding the
+  arm loses no owner, because the next orphan log to reach S arms it.
+
+  Three docstrings state as correct or complete what this item disproves:
+  - `_shutdown_worker`'s "the one not covered";
+  - `_swaps_to_await`'s claim that its snapshot holds every swap whose decision may still be ahead;
+  - `_swap_sink`'s no-worker paragraph, which arms the new sink after the drain's last take.
 
   **Closed by** the swap arming the sink it installs only if no take has closed that sink since
-  the config named it, or by the one lifecycle command path. On the no-worker branch, an orphan
-  log written after that close arms the sink itself. On the branch after `Worker.retarget`, what
-  withholding the arm needs is not settled: a worker retargeted onto S may still write to it after
-  the take, which would trade the double close for a write after the last close. It was not
-  measured.
+  the config named it, or by the one lifecycle command path. Measured with that withhold planted on
+  both branches at `4cda14ba` and the mark taken just before `_rebind`, then removed:
+  - p11 closed S once in 3 of 3 runs.
+  - The whole suite failed only the trade test and the two `installed-closed-twice` pins of the
+    item above, plus three tests that inventory the mutant's own scratch globals. The SPEC-035
+    FR-003 tests stayed green.
+  - A mark taken at the swap's entry instead left p11 at 3 of 3 double closes.
+
+  Closing it on the retarget branch therefore reverses SPEC-054's recorded trade. That is a
+  rewrite of its decision file in place, and Andrew's call.
 - **An orphan log that passed its owed check before a `shutdown()` took its sink writes after the
   close, and the sink is owed nothing** (SPEC-085; invariant 5). Measured at `a0f44b5f` by the
   reproduction in `tests/test_model_cells.py`: `writes=2`, one close entered and returned at count
