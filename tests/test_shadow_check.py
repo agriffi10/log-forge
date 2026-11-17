@@ -1,15 +1,18 @@
 """The fixture corpus for `shadow_check`, the teardown guard against a method shadowed by a patch.
 
-Each case plants the residue of a real ``MonkeyPatch`` round trip on a library singleton and
-asserts the guard's verdict by the name it reports, and the silent cases assert ``None``: a
-class-level patch and a data-attribute patch both undo cleanly and must not be reported. The
-last three cases drive the conftest hook itself, so a hook that stops failing, stops being a
-teardown wrapper, or stops repairing under a teardown that raised, reddens here rather than
-going quiet.
+Each reported case plants a shadow by restoring a method on a library singleton by hand, which
+leaves the bound method in its dict under any pytest (a single ``MonkeyPatch`` round trip stopped
+doing so in 9.2), and asserts the guard's verdict by the name it reports. The silent cases assert
+``None``: a ``MonkeyPatch`` round trip on the class and on a data attribute both undo cleanly, and
+the scope cases plant a real shadow on an object the guard does not own, which it must leave
+alone. The last three cases drive the conftest hook itself, so a hook that stops failing, stops
+being a teardown wrapper, or stops repairing under a teardown that raised, reddens here rather
+than going quiet.
 """
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 import pytest
@@ -25,20 +28,28 @@ def _round_trip(owner: object, name: str, value: object) -> None:
     patch.undo()
 
 
-def test_an_undone_instance_patch_one_level_down_is_reported_and_repaired() -> None:
-    """The defect itself: ``_state._closes.arm`` patched on the instance, then undone."""
+def _restored_by_hand(owner: object, name: str, value: object) -> None:
+    """Replaces ``owner.name`` with ``value``, then assigns back what it read, as a hand patch does."""
+    original = getattr(owner, name)
+    setattr(owner, name, value)
+    setattr(owner, name, original)
+
+
+def test_a_restored_instance_method_one_level_down_is_reported_and_repaired() -> None:
+    """The defect itself: ``_state._closes.arm`` replaced on the instance, then restored."""
     closes = _lifecycle._state._closes
-    _round_trip(closes, "arm", lambda sink: None)
-    assert "arm" in vars(closes), "the precondition: the undo left the bound method behind"
+    _restored_by_hand(closes, "arm", lambda sink: None)
+    assert "arm" in vars(closes), "the precondition: the restore left the bound method behind"
     message = shadow_check.check_and_repair()
     assert message is not None and "log_foundry._lifecycle._state._closes.arm" in message, message
     assert "arm" not in vars(closes), "the repair did not remove the shadow"
     assert shadow_check.check_and_repair() is None
 
 
-def test_an_undone_instance_patch_on_a_module_global_is_reported() -> None:
+def test_a_restored_instance_method_on_a_module_global_is_reported() -> None:
     """A method of a root singleton, reached straight from its module's globals."""
-    _round_trip(_lifecycle._state, "live_worker", lambda: None)
+    _restored_by_hand(_lifecycle._state, "live_worker", lambda: None)
+    assert "live_worker" in vars(_lifecycle._state), "the precondition: the restore left it"
     message = shadow_check.check_and_repair()
     assert message is not None and "log_foundry._lifecycle._state.live_worker" in message, message
     assert "live_worker" not in vars(_lifecycle._state)
@@ -88,13 +99,48 @@ def test_every_method_kind_and_an_inherited_method_are_reported(
     """Each method kind, and a method found on a base, is held before any library class has one."""
     probe = _Probe()
     monkeypatch.setattr(_lifecycle, "_shadow_probe", probe, raising=False)
-    _round_trip(probe, name, lambda *args: None)
-    assert name in vars(probe), "the precondition: the undo left the method behind"
+    _restored_by_hand(probe, name, lambda *args: None)
+    assert name in vars(probe), "the precondition: the restore left the method behind"
     message = shadow_check.check_and_repair()
     assert message is not None and f"log_foundry._lifecycle._shadow_probe.{name}" in message, (
         message
     )
     assert name not in vars(probe)
+
+
+_STRAY = _Probe()
+"""A library-typed instance held only by this test module, outside every ``log_foundry`` module."""
+
+
+def _scope_case(owner: object, name: str) -> str | None:
+    """Plants a real shadow on ``owner``, returns the guard's verdict, and removes the shadow."""
+    _restored_by_hand(owner, name, lambda *args: None)
+    try:
+        assert name in vars(owner), "the precondition: the restore left the method behind"
+        return shadow_check.check_and_repair()
+    finally:
+        vars(owner).pop(name, None)
+
+
+def test_a_foreign_type_held_by_a_library_global_is_out_of_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-library object at a library module's global is not walked, however it is shadowed."""
+    event = threading.Event()
+    monkeypatch.setattr(_lifecycle, "_foreign_probe", event, raising=False)
+    assert _scope_case(event, "is_set") is None
+
+
+def test_a_foreign_type_one_level_down_is_out_of_scope() -> None:
+    """A non-library object in a singleton's own dict (``_state._stop``) is not stepped into."""
+    stop = _lifecycle._state._stop
+    assert type(stop) is threading.Event, "the precondition: a foreign type one level down"
+    assert _scope_case(stop, "is_set") is None
+
+
+def test_a_library_instance_held_only_by_a_test_module_is_out_of_scope() -> None:
+    """Only ``log_foundry`` modules are roots; a library-typed object a test holds is not one."""
+    assert _scope_case(_STRAY, "inherited") is None
 
 
 def test_a_process_with_no_patch_is_silent() -> None:
@@ -123,7 +169,8 @@ def test_the_hook_fails_the_test_that_left_a_shadow(request: pytest.FixtureReque
     closes = _lifecycle._state._closes
     teardown = _hook(request).function(item=None, nextitem=None)
     next(teardown)
-    _round_trip(closes, "arm", lambda sink: None)
+    _restored_by_hand(closes, "arm", lambda sink: None)
+    assert "arm" in vars(closes), "the precondition: the restore left the bound method behind"
     with pytest.raises(pytest.fail.Exception, match=r"_state\._closes\.arm"):
         teardown.send(None)
     assert "arm" not in vars(closes)
@@ -136,7 +183,8 @@ def test_the_hook_repairs_a_shadow_under_a_teardown_that_raised(
     closes = _lifecycle._state._closes
     teardown = _hook(request).function(item=None, nextitem=None)
     next(teardown)
-    _round_trip(closes, "arm", lambda sink: None)
+    _restored_by_hand(closes, "arm", lambda sink: None)
+    assert "arm" in vars(closes), "the precondition: the restore left the bound method behind"
     with pytest.raises(RuntimeError, match="the teardown's own error"):
         teardown.throw(RuntimeError("the teardown's own error"))
     assert "arm" not in vars(closes), "the repair did not run on the raising path"

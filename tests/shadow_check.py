@@ -1,13 +1,15 @@
 """Finds a library object whose instance dict shadows its class's method, the residue of a patch.
 
-``MonkeyPatch.setattr(instance, "method", fake)`` records the old value with ``getattr``, which is
-the *bound* method, and its undo writes that bound method back with ``setattr`` — into the
-instance's ``__dict__``, where nothing stood before. The instance now answers ``method`` from its
-own dict, so a later test that patches the method on the *class* is silently bypassed for that
-object. ``test_fork_child_state.py`` did this to ``_lifecycle._state._closes.arm``, and the model
-soak's class-level wrapper of ``_CloseRegistry.arm`` then recorded no arm for the rest of the
+Restoring a method on an instance by assignment, ``obj.method = original`` where ``original``
+was read as ``obj.method``, writes the *bound* method into the instance's ``__dict__``, where
+nothing stood before. The instance then answers ``method`` from its own dict, so a later test that
+patches the method on the *class* is silently bypassed for that object. ``MonkeyPatch``'s undo did
+exactly this before pytest 9.2, which restores the instance dict instead (pytest #10644);
+``test_fork_child_state.py`` patched ``_lifecycle._state._closes.arm`` that way under 9.1, and the
+model soak's class-level wrapper of ``_CloseRegistry.arm`` then recorded no arm for the rest of the
 process: four soak tests failed whenever they ran after that file in one process, and passed
-under ``-n 12`` only because xdist rarely put the two files on one worker.
+under ``-n 12`` only because xdist rarely put the two files on one worker. A hand restore leaves
+the same residue under any pytest, which is what the guard is still for.
 
 The objects walked are derived, not listed: every global of every imported ``log_foundry`` module
 that is an instance of a ``log_foundry`` class, and the ``log_foundry``-typed instances in those
@@ -15,7 +17,8 @@ objects' own dicts, one level down (which is how ``_state._closes`` is reached).
 the conftest's reset has replaced the config and retired the worker, so a test's own sink is no
 longer reachable and what is walked is state that outlives the test. A shadow is an
 instance-dict key whose class-level value, found along the MRO, is a function, a staticmethod or a
-classmethod. Data attributes are not shadows: their undo restores what was there.
+classmethod. A data attribute is never reported, whatever its value: only a method-kind class
+value can be shadowed in a way that hides a later class patch.
 
 Two limits, both outside any shape the suite has today. The walk stops one level down and does not
 enter containers, so a singleton nested deeper, or held in a dict, is not seen. And the check runs
@@ -113,7 +116,7 @@ def check_and_repair() -> str | None:
     names = ", ".join(f"{path}.{key}" for path, _, key in found)
     return (
         f"this test left an instance attribute shadowing a class method on a library singleton: "
-        f"{names}. A monkeypatch of a method on an instance leaves the bound method in the "
-        f"instance's __dict__ when it is undone, which hides any later patch of the class; "
-        f"patch the method on the class instead (see tests/shadow_check.py). Repaired."
+        f"{names}. A method assigned on an instance (a hand restore, a fake never undone, or a "
+        f"monkeypatch undo before pytest 9.2) stays in its __dict__ and hides any later class "
+        f"patch; patch the method on the class instead (see tests/shadow_check.py). Repaired."
     )
