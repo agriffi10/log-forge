@@ -255,7 +255,11 @@ inside its budget and the sink is closed. The first batch of the exit is always 
 prediction assumes no call runs much longer than the longest one so far: a first batch that alone
 takes longer than the budget, a batch the exit has grown since, a retry after a call that failed
 at once, or a sink that turns much slower partway through the exit can still run past the
-deadline, and then `shutdown()` returns at its timeout and leaves the sink open.
+deadline, and then `shutdown()` returns at its timeout and leaves the sink open. Once one batch
+of the exit has been abandoned, the stderr lines a sink writes for each later batch are folded:
+each distinct line is written once more at the end of the exit, with its summed count and
+`; <k> line(s) folded at exit`, so a sink that died while the process ran writes a few lines at
+exit rather than one per batch. The worker's own lines are never folded.
 
 Both triggers can be pre-empted: `flush()` puts a marker in the queue and the worker emits the
 pending pile the moment it reaches it, ignoring the count and time triggers. Because the queue
@@ -1425,7 +1429,8 @@ transform, the predicate, an id callable — or the sink's render failed on, dro
 rest of its batch is still delivered, and every other sink that builds a record per event does
 the same for an event it cannot encode (`NATSSink` and `SentrySink` count that one in `failed`
 instead). Each such batch writes one `log-foundry: lost N event(s)` line to stderr naming the sink
-and the exception type. A batch in which the sink could encode nothing is not a failed batch: it
+and the exception type; at `shutdown()`, after a batch of the exit has been abandoned, such lines
+are folded into one per distinct line. A batch in which the sink could encode nothing is not a failed batch: it
 returns, counted in `sink.dropped`, because sending it again would fail the same way — so if you
 alert on `failed_batches` alone, add `sink.dropped`.
 

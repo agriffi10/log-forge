@@ -39,7 +39,7 @@ import pytest
 
 import log_foundry
 from conftest import install_worker
-from log_foundry import _fork, _lifecycle
+from log_foundry import _diag, _fork, _lifecycle
 from log_foundry.sinks import verdict
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.base import Sink, SinkDeliveryError
@@ -3443,6 +3443,126 @@ def test_a_sink_without_the_hook_is_unaffected(build: type) -> None:
         sys.stderr = saved
 
     assert child.output == "1,", child.output
+
+
+class _ForksInsideAFoldedEmit(Sink):
+    """A sink that forks inside its third ``emit``, a folded one, and whose fork hook raises.
+
+    Call 1 waits for the stop and fails, call 2 is the first abandoned exit batch, and call 3
+    begins with the fold window open. It forks there, optionally while a parent thread holds
+    ``hold``; the child writes a marker and leaves through ``os._exit``. The parent records when
+    ``fork`` returned to it, which is what the child's bound is timed from.
+    """
+
+    def __init__(self, hold: threading.Lock | None) -> None:
+        self.calls = 0
+        self.first_waits_on: threading.Event | None = None
+        self.hold = hold
+        self.child: int | None = None
+        self.forked: float | None = None
+
+    def reacquire_after_fork(self) -> None:
+        """Refuses, so the child's repair writes ``_fork``'s ``absorbed`` line for this sink."""
+        raise RuntimeError("cannot reacquire")
+
+    def emit(self, batch: list[dict[str, Any]]) -> None:
+        """Waits, forks or fails as planned."""
+        self.calls += 1
+        if self.calls == 1 and self.first_waits_on is not None:
+            self.first_waits_on.wait(30)
+        if self.calls == 3 and self.child is None:
+            assert _diag._FOLD.table is not None, "the premise: call 3 runs inside the window"
+            release, holder = (None, None)
+            if self.hold is not None:
+                release, holder = _held_by_a_parent_thread(self.hold)
+            dumpable = _set_dumpable(0)
+            try:
+                gc.collect()
+                pid = os.fork()
+            finally:
+                if pid != 0:
+                    _set_dumpable(dumpable)
+            if pid == 0:
+                try:
+                    sys.stderr.write("CHILD-RETURNED\n")
+                    sys.stderr.flush()
+                finally:
+                    os._exit(0)
+            self.forked = time.monotonic()
+            self.child = pid
+            if release is not None and holder is not None:
+                release.set()
+                holder.join(5.0)
+        raise ConnectionError("down")
+
+    def close(self) -> None:
+        """Releases nothing."""
+
+
+_FOLD_FORK_HOLDS = {
+    "nothing held": None,
+    "Worker._lock held": "worker",
+    "_diag._FOLD_LOCK held": "fold",
+}
+
+
+@pytest.mark.parametrize("held", sorted(_FOLD_FORK_HOLDS))
+def test_a_child_forked_inside_a_folded_emit_writes_its_lines_at_once(
+    held: str, tmp_path: pathlib.Path
+) -> None:
+    """SPEC-103 FR-001: the child withdraws the window first, so its repair's lines are written.
+
+    Left open, the window recorded ``_fork``'s ``re-acquiring a transport`` line into the table
+    the child inherited, and the worker's reset then erased it unwritten. Each case forks inside
+    a folded ``emit``, once with nothing held, once while a parent thread holds ``Worker._lock``
+    and once while one holds ``_diag._FOLD_LOCK``; each child must write that line, unfolded,
+    and finish within a bound timed from when ``fork`` returned to the parent (``_Child.forked``).
+    """
+    out = tmp_path / "stderr.txt"
+    stream = open(out, "a", buffering=1, encoding="utf-8")  # noqa: SIM115
+    old = sys.stderr
+    sys.stderr = stream
+    try:
+        sink = _ForksInsideAFoldedEmit(None)
+        worker = Worker(sink, batch_size=10, flush_interval=3_600.0, max_retries=0)
+        hold = _FOLD_FORK_HOLDS[held]
+        if hold == "worker":
+            sink.hold = worker._lock
+        elif hold == "fold":
+            sink.hold = _diag._FOLD_LOCK
+        sink.first_waits_on = worker._stop
+        install_worker(worker)
+        for seq in range(10):
+            worker.submit([{"message": "m", "seq": seq}])
+        deadline = time.monotonic() + 20
+        while worker._in_flight != 10 and time.monotonic() < deadline:
+            time.sleep(0.002)
+        for seq in range(10, 60):
+            worker.submit([{"message": "m", "seq": seq}])
+        log_foundry.shutdown(30.0)
+        worker._thread.join(5.0)
+        assert sink.child is not None and sink.forked is not None, "the premise: it forked"
+        status: int | None = None
+        while time.monotonic() < sink.forked + CHILD_TIMEOUT:
+            done, status = os.waitpid(sink.child, os.WNOHANG)
+            if done:
+                break
+            time.sleep(0.02)
+        else:
+            os.kill(sink.child, signal.SIGKILL)
+            _, status = os.waitpid(sink.child, 0)
+    finally:
+        sys.stderr = old
+        stream.close()
+    child = _Child(status, out.read_text(encoding="utf-8"), forked=sink.forked)
+    assert child.finished, f"the child {child.ending}: {child.output}"
+    lines = child.output.splitlines()
+    assert "CHILD-RETURNED" in lines, child.output
+    assert (
+        "log-foundry: absorbed a failure while re-acquiring a transport after a fork "
+        "(RuntimeError); _ForksInsideAFoldedEmit may write the parent's pending bytes again, and "
+        "this child will not release it"
+    ) in lines, child.output
 
 
 def test_the_hook_is_documented_where_an_implementer_reads_the_contract() -> None:

@@ -37,6 +37,38 @@ so the steady drain and the exit drain decide a batch boundary the same way, inv
 - **The cap is 1,000 events**, the private constant `_BACKLOG_BATCH_CAP`, a ceiling except for a
   batch of at most `batch_size` submissions, which the count trigger sent before this rule too.
 
+**A dead sink at exit keeps today's batches, and its repeated lines are folded** (SPEC-103).
+Andrew's answer, asked on 2026-11-17 whether to keep growing a dead sink's exit batches or to keep
+them and fold its lines, was "Fold lines, keep batches (Recommended)". Take a sink that died while
+the process ran, so the size target reads zero at the stop. It is still handed the exit backlog in
+`batch_size` submissions, and a refusing `HTTPSink` with 10,000 spans at exit still makes 16,016
+requests. Its stderr no longer follows those calls. From the first abandoned exit batch on, the
+lines a sink or the engine writes inside each later exit batch's call are folded into one line per
+distinct text, written at the end of the exit (*One module writes every diagnostic…*,
+`docs/decisions/failure-paths/`). That probe went from 1,004 lines to 6.
+
+**Why growth at exit was rejected.** Six designs grew a dead sink's exit batches behind a zero
+target, and every one broke the `shutdown()` budget for some sink. A grown batch is sized from what
+the last batch cost. A sink whose cost changes between batches is handed a batch grown while it was
+quick just as it turns slow, and that first slow attempt is longer by the factor the batch grew.
+**Any growth makes the first attempt after a slowdown proportionally longer, and no cost bound
+survives that.** Each bound added closed the instance before it, and a cost shape it had not
+assumed then broke it: linear, then a step, then quadratic, then a slowdown. The last design
+(`7f400f51`) grew only after quick failures and fell back to the count trigger's batch after a
+slow one. It never reached `main`. The two slowdown probes, run against `7f400f51`, still broke
+it:
+
+- `docs/audits/2026-11-14-probes/core-pipeline/spec103_sqs_slowdown_exit.py <slow_at> 0.5` is a
+  black-holed `SQSSink` or `SNSSink` that turns slow mid-exit. It ended the drain 1.60, 2.81 and
+  6.42 s past a 0.5 s deadline, for `slow_at` 0.004, 0.01 and 0.02 s.
+- `spec103_http_slowdown_exit.py 1.0` is a refusing `HTTPSink` whose requests turn into 0.3 s
+  timeouts. It returned `ShutdownTimeout` with `close()` never run, and the drain ran on 18.3 to
+  21.2 s after `shutdown()` returned.
+
+With the batches kept and the lines folded (`f28f17d4`, on 3.13.1 and 3.12.12 alike), the first
+probe's drain ends 0.18 to 0.20 s before the deadline and the second closes the sink once, as on
+the tree before.
+
 **Why half an interval of the sink's own rate.** Each batch to a per-call sink multiplies its
 target by `flush_interval / (2 × cost per call)`, so one costing well under half an interval
 reaches the cap at once, one costing near half an interval takes hundreds of batches, and one
@@ -70,12 +102,45 @@ fast abandons its batch whole, so the cap bounds that loss.
   against a per-event sink, above.
 - **A cap of 2,000.** It dropped fewer submissions on `p13`, whose sink costs the same per call at
   any size, which no shipped sink above 1,000 events does.
+- **At exit, reading a zero target as the cap** (SPEC-103's A). A sink that recovers by exit was
+  handed 1,000 events in its first exit batch, which the budget cannot decline, and its 1.2 s join
+  expired with the sink left open.
+- **At exit, declining every batch after the first abandoned one** (B). One batch refused for its
+  content declined every deliverable batch behind it, under a line blaming the deadline: 68 of
+  4,002 events delivered, against 3,002.
+- **An abandoned exit batch setting the target from its own rate** (D), and the same only while
+  the target reads zero (D2). One quick failure lifted the target past a sink's 400-event limit:
+  290 and 0 of 4,002 delivered, against 3,754 and 3,962.
+- **Doubling a dead sink's exit batches with no rate bound** (E). A slow-failing sink's batches
+  grew to 320 events, longer than any attempt the exit budget had seen.
+- **Doubling, bounded by the rate** (E′). With `max_retries=0` the join expired in 4 to 5 runs of
+  10 at a 1.28 to 1.32 s budget, where the tree before expired none.
+- **E′ bounded by the longest exit attempt** (E3), and its predictor fix at `1fa9ea15`. A step cost,
+  a black-holed `SQSSink` at 0.3 s a request, grew from 10 messages to 13, taking 0.6 s against a
+  predicted 0.4 s. Its join expired with `close()` never run in 3 of 3 runs, and a quadratic cost
+  broke it too.
+- **Growth only after quick failures, back to the count trigger's batch after a slow one** (E6, at
+  `7f400f51`). A sink that turned slow mid-exit broke it, by the slowdown probes above.
 
-**Do NOT build** a public tunable for any of the four, or split a submission across batches. The
+**Do NOT build** a public tunable for any of the four, or split a submission across batches, or
+grow a dead sink's exit batches behind a zero target. The
 exit drain's budget for the batches this sends at exit is *The exit drain declines a retry, or a
 later batch, predicted to end past the shutdown deadline* (`docs/decisions/sink-lifecycle/`).
 
 ## History
+
+### 2026-11-17
+
+- **Refined** by SPEC-103: a dead sink at exit keeps today's batches, and its repeated lines are
+  folded, by Andrew's answer "Fold lines, keep batches (Recommended)". `spec090_dead_http_exit.py
+  zero 10000 3` wrote 1,004 lines at `4599a0c5` and 6 at `f28f17d4`, with its 16,016 opener calls
+  and `failed_batches` 1,001 unchanged. The growth designs A, B, D, D2, E, E′, E3 and E6 are
+  rejected above.
+- **Withdrawn**: a trade the growth design needed, which never reached `main`. For that design,
+  Andrew accepted on 2026-11-17 that a sink refusing batches over 400 events, failing five quick
+  exit batches in a row and then recovering, would be handed batches past its limit and deliver 0
+  of 4,002 events (`spec103_size_limited_exit.py 2 400 1-5 2000 zero`, against 3,882 on the tree
+  before it). It was withdrawn the same day, because nothing grows now.
 
 ### 2026-11-16
 

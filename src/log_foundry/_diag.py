@@ -22,6 +22,23 @@ and ``pending`` for an outcome not yet decided. The fourth exists because a line
 the drain thread is still inside the sink cannot know whether what it describes will be
 delivered, and a ``lost`` line there announced a loss that another line then announced again.
 
+**Five stderr writes: the four writers and the fold's** (SPEC-103 FR-001). From the first
+abandoned exit batch on, the worker opens a fold window around each later exit batch's sink call
+(:func:`fold_into`), and inside it ``lost``, ``absorbed`` and ``pending`` record a row keyed on the
+text their line would carry, without its count, instead of writing it. :func:`take_folded` writes
+one line per key at the end of the exit, or before ``stop()``'s expiry line, each ending in
+``line(s) folded at exit``. ``rejected`` never folds. A ``lost`` call that passes
+``running_total=True`` is written at once, because summing a count that is not an increment — a
+running total or a snapshot — overstates a loss.
+The window is a thread-local, not a ``ContextVar``: a ``ContextVar`` would follow
+``asyncio.to_thread`` into a sink's own thread, whose lines must be written at once, and a forked
+child's withdrawal would reach only the context current at the fork. ``_FOLD_LOCK`` guards the
+rows and **is never waited on by a recorder**: one that cannot take it at once, because a
+finalizer the collector ran inside the section re-entered on the same thread or another thread
+holds it, writes its line at once, unfolded. It is on ``_fork._GLOBAL_PRIMITIVES``, and
+``_fork``'s child handler withdraws the window before anything else, so a child forked inside a
+folded call writes its repair's lines at once.
+
 Stderr stays the channel: routing through the ``logging`` module would make the library's own
 failure reports depend on machinery that may be the thing failing. This module must import
 nothing from its own package — it is reached at module scope while the package is still
@@ -31,12 +48,24 @@ partially initialised, and resolves only because it is a leaf.
 from __future__ import annotations
 
 import sys
+import threading
 from typing import TYPE_CHECKING, TypeGuard, cast, overload
 
 if TYPE_CHECKING:
     from typing_extensions import TypeIs
 
-__all__ = ["WARN_EVERY", "absorbed", "errno_of", "lost", "pending", "rejected"]
+__all__ = [
+    "WARN_EVERY",
+    "FoldTable",
+    "absorbed",
+    "errno_of",
+    "fold_into",
+    "lost",
+    "pending",
+    "rejected",
+    "take_folded",
+    "withdraw_fold_in_child",
+]
 
 WARN_EVERY = 1000
 """The period of every per-event throttle in the library (SPEC-017 FR-005, SPEC-055 FR-005).
@@ -152,6 +181,193 @@ def is_a(value: object, classes: type | tuple[type, ...]) -> bool:
     return bool(_SUBCLASS_CHECK(classes, kind))
 
 
+_FOLD_TAIL = "line(s) folded at exit"
+
+_CLOSING_TAKE_WAIT = 0.1
+"""Seconds a take waits for ``_FOLD_LOCK`` at a time (SPEC-103).
+
+The lock is held for a dictionary update, microseconds, so a holder still inside it after this is
+stuck, most likely in a finalizer or a signal handler running inside the section, and waiting
+longer buys nothing. ``stop()`` reaches its take only once its join has expired, with the caller's
+budget spent, so it must not wait unboundedly before its expiry line (invariant 3). A tenth of a
+second is the margin the worker already reserves past a predicted attempt
+(``worker._JOIN_MARGIN``), so the overrun it can add is one the budget's own arithmetic tolerates.
+The drain thread's take waits in steps of this length too, and gives way once the table is closed
+(:func:`take_folded`).
+
+**Rows a timed-out closing take leaves are not always written.** They stay in the table, and the
+drain thread's take writes them if it reaches the lock. It does not when the holder is the drain
+thread itself, stuck inside the section, when the holder is still inside it as the drain arrives,
+or when the process ends first: after an expired join at interpreter exit the drain is a daemon
+thread and is stopped before its take. Those rows' losses are still counted, because every
+caller moved its counter before the line (record first, announce second), so ``health()`` holds
+them; only their lines are missing.
+"""
+
+
+class FoldTable:
+    """The rows folded at one worker's exit: one per distinct line, in first-seen order (SPEC-103).
+
+    One object for the worker's life, cleared in place and never rebound, because an open window
+    holds this object and a rebind would drop every row recorded into the old one. ``closed`` is
+    set by ``stop()``'s take when its join expires; a record into a closed table is written at
+    once, so a sink call the expired join left running announces what it loses before it returns.
+
+    Attributes:
+      rows: Each key — the kind, then the rendered parts of the line without its count — mapped
+        to ``[summed count, lines folded]``.
+      closed: Whether every later record is written at once rather than held.
+    """
+
+    def __init__(self) -> None:
+        """Starts with no rows, open.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.rows: dict[tuple[str, ...], list[int]] = {}
+        self.closed = False
+
+    def reopen(self) -> None:
+        """Empties the rows in place and opens the table again, for a forked child's worker.
+
+        Takes no lock: its one caller is ``Worker._reinit_after_fork``, which runs on the child's
+        only thread after ``_fork`` has withdrawn the window and replaced ``_FOLD_LOCK``.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.rows.clear()
+        self.closed = False
+
+
+class _Window(threading.local):
+    """The fold window of the calling thread: the table its lines are folded into, or none.
+
+    ``table`` defaults to ``None`` on the class, so a thread that never opened a window reads
+    ``None`` through a plain attribute read, which calls nothing: a ``getattr`` with a default
+    would add a call to every diagnostic the library writes (SPEC-103 FR-001).
+
+    Attributes:
+      table: The table this thread's folded lines go into, or ``None`` outside a window.
+    """
+
+    table: FoldTable | None = None
+
+
+_FOLD = _Window()
+
+_FOLD_LOCK = threading.Lock()
+
+
+def fold_into(table: FoldTable | None) -> None:
+    """Opens the calling thread's fold window onto ``table``, or withdraws it with ``None``.
+
+    The worker opens it on the drain thread around an exit batch's sink call once the first
+    abandoned exit batch has been counted, and withdraws it in a ``finally`` when the call ends,
+    so this module holds no reference to a worker and still imports nothing from the package.
+
+    Args:
+      table: The worker's table, or ``None``.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _FOLD.table = table
+
+
+def withdraw_fold_in_child() -> None:
+    """Withdraws the forking thread's fold window in a child, taking no lock (SPEC-103 FR-001).
+
+    ``_fork._reinit_after_fork``'s first step. A sink that forks inside a folded call leaves the
+    child's only thread with the window open on the parent's table; the repair's own lines would
+    be recorded there and then erased by the worker's reset, never written.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _FOLD.table = None
+
+
+def take_folded(table: FoldTable, *, close: bool) -> None:
+    """Takes every folded row, clearing the table in place, and writes one line per key.
+
+    The fifth stderr write. The rows are copied and cleared under ``_FOLD_LOCK``, then written
+    outside it in first-seen order, each line ending in ``; <k> line(s) folded at exit`` after
+    the detail is bounded, so the bound never cuts the tail. A ``lost`` line sums the counts, an
+    ``absorbed`` line counts the failures, a ``pending`` line names its detail.
+
+    **No take waits unboundedly.** With ``close`` — ``stop()``'s take after an expired join — the
+    table is marked closed first, by a plain store without the lock, so every later record is
+    written at once; the lock is then waited on for :data:`_CLOSING_TAKE_WAIT` at most, and on a
+    timeout the rows stay in the table (:data:`_CLOSING_TAKE_WAIT` says when they are written and
+    when they are not). Without ``close`` — the drain thread's take at the end of the exit — the
+    lock is waited on in steps of :data:`_CLOSING_TAKE_WAIT`, and the take gives way as soon as
+    the table is closed, since a closer then holds or has held the rows. An unbounded wait here
+    deadlocked (diff review frame 2): the ``shutdown()`` caller holds the lock inside its closing
+    take, a signal handler run there calls ``shutdown()`` again, loses the claim and waits for the
+    drain to settle, and the drain waited for the lock the handler's own thread held. The take
+    asks for the lock even when the table is empty, so a forked child whose inherited lock the
+    roster failed to replace cannot finish its exit until its closing take gives up, which
+    ``tests/test_fork_roster.py`` observes as an expired ``shutdown()``.
+
+    Args:
+      table: The worker's table.
+      close: Whether every record after this take is written at once (``stop()``'s take).
+
+    Returns:
+      None.
+
+    Raises:
+      None on a stream fault; a ``BaseException`` from a write still propagates.
+    """
+    if close:
+        table.closed = True
+        if not _FOLD_LOCK.acquire(timeout=_CLOSING_TAKE_WAIT):
+            return
+    else:
+        while not _FOLD_LOCK.acquire(timeout=_CLOSING_TAKE_WAIT):
+            if table.closed:
+                return
+    try:
+        rows = list(table.rows.items())
+        table.rows.clear()
+    finally:
+        _FOLD_LOCK.release()
+    for key, (count, folded) in rows:
+        try:
+            if key[0] == "lost":
+                text = f"lost {count} {key[1]}(s){key[2]}"
+            elif key[0] == "absorbed":
+                text = f"absorbed {folded} failure(s) while {key[1]} ({key[2]}){key[3]}"
+            else:
+                text = key[1]
+            sys.stderr.write(f"log-foundry: {text}; {folded} {_FOLD_TAIL}\n")
+        except Exception:
+            pass
+
+
 def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     """Reports a failure the library swallowed rather than propagated.
 
@@ -163,6 +379,11 @@ def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
     swallowed because these writers are called from the ``except`` and ``finally`` blocks that
     exist to stop an exception reaching the caller, though a ``BaseException`` from the write
     still propagates.
+
+    Inside a fold window (SPEC-103) the failure is recorded instead, keyed on the phrase, the
+    type's stored name and the rendered detail, and counted once; the check is inline rather than
+    a helper, so a line outside a window costs no call the writer did not already make. A record
+    that cannot take ``_FOLD_LOCK`` at once, or finds the table closed, writes the line here.
 
     Args:
       where: What was being attempted, as a participle phrase that reads after "while", such
@@ -180,6 +401,26 @@ def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
         raising from the guard that protects the caller's exception would be worse (arch §4).
     """
     try:
+        table = _FOLD.table
+        if table is not None:
+            key = (
+                "absorbed",
+                _STR_STR(_escape(where)),
+                _escape(_STR_STR(_STORED_NAME(type(exc)))),
+                _suffix(detail),
+            )
+            if _FOLD_LOCK.acquire(blocking=False):
+                try:
+                    if not table.closed:
+                        row = table.rows.get(key)
+                        if row is None:
+                            table.rows[key] = [1, 1]
+                        else:
+                            row[0] += 1
+                            row[1] += 1
+                        return
+                finally:
+                    _FOLD_LOCK.release()
         sys.stderr.write(
             f"log-foundry: absorbed a failure while {_escape(where)} "
             f"({_escape(_STR_STR(_STORED_NAME(type(exc))))}){_suffix(detail)}\n"
@@ -188,11 +429,22 @@ def absorbed(where: str, exc: BaseException, detail: str = "") -> None:
         pass
 
 
-def lost(what: str, count: int, detail: str = "") -> None:
+def lost(what: str, count: int, detail: str = "", *, running_total: bool = False) -> None:
     """Reports a counted loss — events, messages, batches or rows that will not be delivered.
 
     Callers record the counter before calling this, because the write is best-effort by
     construction and the counter ``health()`` reports must not be able to ride on it.
+
+    Inside a fold window (SPEC-103) the loss is recorded instead, keyed on the unit and the
+    rendered detail, and its count summed into the row. A count that is not an increment is never
+    folded: summing a running total of 1 and then 1,000 would read 1,001 against a true 1,000, and
+    summing a snapshot overstates it the same way, so ``running_total`` writes at once.
+    ``tests/test_diag.py`` requires it of every ``lost`` call in a function that reads
+    :data:`WARN_EVERY`, and of every site on its snapshot roster, which holds the sites whose
+    count is a reading rather than an increment. A count that is not an exact ``int`` is written
+    at once too, so nothing
+    but ``int`` arithmetic runs under ``_FOLD_LOCK``. The check is inline, so a line outside a
+    window costs no call the writer did not already make.
 
     Args:
       what: Singular noun for the unit lost, such as ``"event"`` or ``"row"``. Rendered with
@@ -203,6 +455,8 @@ def lost(what: str, count: int, detail: str = "") -> None:
         thousand, and such a site says so in ``detail``.
       detail: Optional circumstances — the sink's class name, the attempt count, an
         ``errno``, an exception type. Escaped and truncated to ``_MAX_DETAIL``.
+      running_total: Whether ``count`` is a running total or a snapshot rather than an
+        increment, which a fold window writes at once.
 
     Returns:
       None.
@@ -211,6 +465,21 @@ def lost(what: str, count: int, detail: str = "") -> None:
       None on a stream fault; a ``BaseException`` from the write still propagates.
     """
     try:
+        table = _FOLD.table
+        if table is not None and not running_total and type(count) is int:
+            key = ("lost", _STR_STR(_escape(what)), _suffix(detail))
+            if _FOLD_LOCK.acquire(blocking=False):
+                try:
+                    if not table.closed:
+                        row = table.rows.get(key)
+                        if row is None:
+                            table.rows[key] = [count, 1]
+                        else:
+                            row[0] += count
+                            row[1] += 1
+                        return
+                finally:
+                    _FOLD_LOCK.release()
         sys.stderr.write(f"log-foundry: lost {count} {_escape(what)}(s){_suffix(detail)}\n")
     except Exception:
         pass
@@ -225,6 +494,9 @@ def pending(detail: str) -> None:
     drain that took it. The detail is escaped and bounded exactly as :func:`lost`'s is, through
     the same helper.
 
+    Inside a fold window (SPEC-103) the line is recorded instead, keyed on the rendered detail
+    and counted once, through the same inline check as :func:`lost`.
+
     Args:
       detail: What is pending and why, built from library-controlled values only. An empty
         detail writes nothing, because a bare prefix says nothing a reader could act on.
@@ -238,6 +510,21 @@ def pending(detail: str) -> None:
     if not detail:
         return
     try:
+        table = _FOLD.table
+        if table is not None:
+            key = ("pending", _STR_STR(_bounded(detail)))
+            if _FOLD_LOCK.acquire(blocking=False):
+                try:
+                    if not table.closed:
+                        row = table.rows.get(key)
+                        if row is None:
+                            table.rows[key] = [1, 1]
+                        else:
+                            row[0] += 1
+                            row[1] += 1
+                        return
+                finally:
+                    _FOLD_LOCK.release()
         sys.stderr.write(f"log-foundry: {_bounded(detail)}\n")
     except Exception:
         pass

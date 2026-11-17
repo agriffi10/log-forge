@@ -435,6 +435,27 @@ def test_the_batching_fields_are_reset_in_the_forked_child(resume: bool) -> None
         assert not worker._thread.is_alive(), "no drain thread outlives the test"
 
 
+@pytest.mark.parametrize("resume", [True, False])
+def test_the_exit_fold_is_emptied_and_reopened_in_the_forked_child(resume: bool) -> None:
+    """SPEC-103 FR-001: the child's worker keeps its one table, with no rows, open again."""
+    worker = Worker(_Sink(), batch_size=10, flush_interval=60.0)
+    worker.stop(5.0)
+    assert not worker._thread.is_alive(), "the premise: the parent's drain thread has ended"
+    table = worker._exit_fold
+    table.rows[("lost", "event", "; parent's")] = [40, 2]
+    table.closed = True
+
+    worker._reinit_after_fork(resume=resume)
+    try:
+        assert worker._exit_fold is table, "the table is cleared in place, never rebound"
+        assert (table.rows, table.closed) == ({}, False)
+    finally:
+        if resume:
+            worker.stop(2.0)
+        worker._thread.join(5.0)
+        assert not worker._thread.is_alive(), "no drain thread outlives the test"
+
+
 # ---------------------------------------------------------------------------- FR-001 markers
 
 

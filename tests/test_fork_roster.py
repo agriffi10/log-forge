@@ -64,6 +64,7 @@ _EXPECTED_ROSTER = (
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),
     ("_ledger", "_registry.lock"),
+    ("_diag", "_FOLD_LOCK"),
 )
 
 _EMPTIED_IN_CHILD = {"_lifecycle._state._closes._in_flight": "_clear_after_fork"}
@@ -185,11 +186,14 @@ def live_findings(
     return findings
 
 
-def test_the_roster_is_the_nine_pairs() -> None:
-    """FR-001: exactly the nine pairs, in the Data Model's order.
+def test_the_roster_is_its_eleven_pairs() -> None:
+    """FR-001: exactly the eleven pairs, in the Data Model's order.
 
     Eight at SPEC-079; ``config._sink_lock`` joined beside ``_config_lock`` when concurrent
-    ``configure(sink=...)`` calls were serialized.
+    ``configure(sink=...)`` calls were serialized, ``_ledger._registry.lock`` at SPEC-088, and
+    ``_diag._FOLD_LOCK`` at SPEC-103. The last is held across a fork by the parametrized pair
+    below like the others: the child's ``shutdown()`` takes it in ``_diag.take_folded``, which
+    waits on it even for an empty table, so without its pair the child blocks there.
     """
     assert _fork._GLOBAL_PRIMITIVES == _EXPECTED_ROSTER
 
@@ -447,7 +451,21 @@ unrepaired copy is delayed by that budget and then proceeds rather than blocking
 
 
 def _child_session() -> str:
-    """Every call FR-001's criterion names, in a child; returns once all of them have."""
+    """Every call FR-001's criterion names, in a child; returns once all of them have.
+
+    **It also waits for the child's drain thread to end, and reports an expired ``shutdown()``**
+    (SPEC-103). No take of the exit fold waits for ``_diag._FOLD_LOCK`` without bound: the
+    drain's own take asks in steps and gives way once ``stop()``'s closing take has closed the
+    table, because an unbounded drain take deadlocked behind a closing take whose thread ran a
+    signal handler that called ``shutdown()`` (diff review frame 2). So a child whose inherited
+    fold lock was not replaced does not block. Its drain waits in the end-of-exit take until the
+    child's ``shutdown(2.0)`` expires and closes the table, so the call ends in
+    ``ShutdownTimeout`` with the sink left open, which is the observable of that lock here. A
+    ``MemorySink`` exit is far inside two seconds, so with the lock replaced it never expires.
+    The child therefore returns ``"shutdown expired"`` in place of ``"returned"`` when its worker
+    stopped that way, and the control accepts that as the failure it looks for. The join is
+    unbounded; the child's watchdog is the bound.
+    """
     report_from_child("started;")
     log_foundry.configure(service="roster-child")
     log_foundry.configure(sink=MemorySink())
@@ -460,9 +478,18 @@ def _child_session() -> str:
     traced()
     log_foundry.flush()
     log_foundry.health()
+    worker = _lifecycle._state._worker
     log_foundry.shutdown(2.0)
+    if worker is not None:
+        worker._thread.join()
     log_foundry.info("echoed", echo=True)
+    if worker is not None and worker.stopped_reason == "ShutdownTimeout":
+        return _EXPIRED
     return "returned"
+
+
+_EXPIRED = "shutdown expired"
+"""What :func:`_child_session` returns when the child's ``shutdown()`` could not finish in time."""
 
 
 class _FailingStream:
@@ -510,13 +537,24 @@ def test_a_child_returns_while_a_parent_holds_a_roster_lock(
 def test_without_its_entry_the_child_blocks(
     module: str, path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The control: the same child, with that one pair taken off the roster, blocks."""
+    """The control: the same child, with that one pair taken off the roster, blocks.
+
+    Or, for ``_diag._FOLD_LOCK`` alone, finishes with its ``shutdown()`` expired: no take of the
+    exit fold waits on that lock without bound (SPEC-103), so an unreplaced one costs the child
+    its shutdown budget and leaves its sink open rather than hanging it. The other locks must
+    still block.
+    """
     monkeypatch.setattr(
         _fork,
         "_GLOBAL_PRIMITIVES",
         tuple(pair for pair in _EXPECTED_ROSTER if pair != (module, path)),
     )
     child = _forked_while_held(module, path, monkeypatch)
+    if (module, path) == ("_diag", "_FOLD_LOCK"):
+        assert child.finished and child.output.endswith(_EXPIRED), (
+            f"the child's shutdown did not expire: it {child.ending}, {child.output!r}"
+        )
+        return
     assert child.blocked, f"the child did not block: it {child.ending}, {child.output!r}"
 
 

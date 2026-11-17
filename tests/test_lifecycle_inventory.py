@@ -8,7 +8,7 @@ which is how a rename shrinks a roster silently.
 **The populations.**
 
 - *Constructions*: every ``Lock``, ``RLock``, ``Event``, ``Condition``, ``Semaphore``,
-  ``BoundedSemaphore`` or ``Barrier`` built in the six files of :data:`FILES`, found however
+  ``BoundedSemaphore`` or ``Barrier`` built in the files of :data:`FILES`, found however
   ``threading`` is imported (``test_fork_lifecycle._primitive_constructions``) and keyed
   ``(file, enclosing function or <module>, assignment target or <expr>, constructor)``. A site that
   stores nothing — ``_fork``'s type probes and its replacement factory — has home ``none``.
@@ -62,11 +62,20 @@ from test_fork_lifecycle import _PRIMITIVES, _primitive_constructions, _threadin
 _SRC = pathlib.Path(log_foundry.__file__).resolve().parent
 
 FILES = (
-    "_lifecycle.py", "worker.py", "_fork.py", "config.py", "decorator.py", "console.py", "_ledger.py"
+    "_lifecycle.py",
+    "worker.py",
+    "_fork.py",
+    "config.py",
+    "decorator.py",
+    "console.py",
+    "_ledger.py",
+    "_diag.py",
 )
 """The files whose lock constructions are inventoried. ``_ledger.py`` joined at SPEC-088 for its
 registration lock, a counter lock like ``decorator._loss_lock``, so the roster pair
-``_fork._GLOBAL_PRIMITIVES`` names for it has its row (plan review, m2)."""
+``_fork._GLOBAL_PRIMITIVES`` names for it has its row (plan review, m2). ``_diag.py`` joined at
+SPEC-103 for ``_FOLD_LOCK``, for the same reason: a roster pair with no construction row here is
+refused by ``check_roster_pairs``, and a row for a file outside this set by ``check_stale``."""
 PAIR = ("_lifecycle.py", "worker.py")
 FIELD_CLASSES = ("Runtime", "Worker", "_CloseRegistry")
 """The classes whose every ``self`` field is a lifecycle field.
@@ -933,6 +942,12 @@ INVENTORY: dict[Key, Row] = {
         "the ledger's registration lock; re-entrant so a __del__ or handler that logs on a thread "
         "with no cell cannot wait on itself (SPEC-088)",
     ),
+    _c("_diag.py", "<module>", "_FOLD_LOCK", "Lock"): Row(
+        "_diag",
+        _R,
+        "the exit fold's rows (SPEC-103); a recorder never waits on it and stop()'s take waits a "
+        "bounded time, so a finalizer re-entering on its holder writes at once",
+    ),
     _c("_fork.py", "<module>", "_RLOCK_TYPE", "RLock"): Row(
         "none", _NONE, "a type probe at import, fed to type(); stores no primitive"
     ),
@@ -1144,6 +1159,9 @@ INVENTORY: dict[Key, Row] = {
     ),
     _wk("_declined_tally"): Row(
         "Worker", (_REBUILD,), "declined exit batches not yet announced, under _lock (SPEC-090)"
+    ),
+    _wk("_exit_fold"): Row(
+        "Worker", (_REBUILD,), "the exit fold's table, emptied and reopened in place (SPEC-103)"
     ),
     _wk("_sweep"): Row(
         "Worker",
