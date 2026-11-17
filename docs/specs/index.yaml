@@ -666,13 +666,20 @@ specs:
     depends_on: ["SPEC-085", "SPEC-086"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-099-nightly-model-soak.md"
+  - id: "SPEC-102"
+    title: "NATSSink Resends the Tail Its Deadline Left Unattempted"
+    description: "Makes an event a NATSSink round never handed to the driver resendable when something else in the round was published, so the worker's existing retry rounds deliver the tail of a backlog batch that a short publish_timeout cuts, rather than counting it lost; closes the NATSSink residual SPEC-090 filed in architecture.md section 12, and the 1.2.1 tag waits for it."
+    spec_status: "Draft"
+    depends_on: ["SPEC-047", "SPEC-061", "SPEC-062", "SPEC-072", "SPEC-074", "SPEC-088", "SPEC-090"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-102-nats-resends-the-unattempted-tail.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098", "SPEC-099"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098", "SPEC-099", "SPEC-102"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
