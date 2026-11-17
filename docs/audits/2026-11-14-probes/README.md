@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Sixty-eight files here are not the audit's.** Each was added after the audit was brought in
+**Seventy-six files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -91,6 +91,24 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   `pre-push` and adds `scripts/pr-queue-soak-test.sh`, the corpus grown from the execution-frame
   reviewer's harness. It changes nothing installed: the queue in use runs from the copy
   `install.sh` wrote.
+- `core-pipeline/spec104_nats_exit_latch.py`, written for SPEC-104 against `03dbf502`: a JetStream
+  `NATSSink`'s rounds against its own abandoned-publish latch, over an injected client.
+- `sinks/spec100_moto_shapes.py`, `spec100_ids_once.py`, `spec100_ordering.py`,
+  `spec100_costing.py` and `spec100_corpus_rows.py`, written while authoring SPEC-100 against
+  `03dbf502`. The first needs `boto3` and `moto` in a scratch virtualenv, since moto is not a
+  repository dependency: it reads the shape moto gives each SNS FIFO refusal, and shows that moto's
+  SNS does not de-duplicate, so a FIFO SQS subscriber's single copy is the queue's doing. The next
+  three need no AWS library and read, on `SQSSink` and on a tree whose `SNSSink` takes `fifo`, the
+  ids a resend carries, the order a group lands in, and what an entry's ids cost. The last imports
+  SPEC-092's prototype, which it loads with one adaptation for SPEC-090's `exit_batch` keyword,
+  applied only where the prototype lacks it, as its docstring describes, so it needs `sinks/` and `tests/` on `PYTHONPATH`.
+  `sinks/spec100_prototype.patch` is not a probe: it is SPEC-100's prototype, applied with
+  `patch -p1` to `git archive 03dbf502 src tests docs/audits/2026-11-14-probes`, and SPEC-100's
+  *Evidence* says what it measured.
+- `sinks/spec100_refusals.py`, written while revising SPEC-100 against `03dbf502`. It needs no AWS
+  library and prints what each combination of `fifo`, `message_group_id` and
+  `message_deduplication_id` does at construction on `SQSSink`, and on `SNSSink` when the tree's
+  `SNSSink` takes `fifo`, and what a FIFO batch of one id failure and one oversized event returns.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded

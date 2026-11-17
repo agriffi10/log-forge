@@ -1,0 +1,1058 @@
+diff -ruN -x __pycache__ base/src/log_foundry/sinks/_fifo.py proto/src/log_foundry/sinks/_fifo.py
+--- base/src/log_foundry/sinks/_fifo.py	1969-12-31 19:00:00
++++ proto/src/log_foundry/sinks/_fifo.py	2026-11-17 11:57:42
+@@ -0,0 +1,361 @@
++"""FIFO ids, the per-run entry cache and the group hold that SQSSink and SNSSink share (SPEC-100)."""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from dataclasses import dataclass
++from typing import NamedTuple, cast
++
++from log_foundry import _diag
++from log_foundry.sinks._args import require_callable
++from log_foundry.sinks._engine import run_context
++from log_foundry.sinks.verdict import Outcome
++
++DEFAULT_GROUP_ID = "log-foundry"
++"""Fallback group for an event carrying no usable ``trace_id`` — never send an empty group id."""
++
++MAX_ID_LEN = 128
++"""The SQS and SNS maximum length for ``MessageGroupId`` and ``MessageDeduplicationId``."""
++
++GroupIdSource = str | Callable[[dict[str, object]], str] | None
++"""What ``message_group_id=`` accepts: a constant, a callable, or ``None`` for ``trace_id``."""
++
++DedupIdSource = Callable[[dict[str, object]], str] | None
++"""What ``message_deduplication_id=`` accepts: a callable, or ``None`` for ``log_id``."""
++
++
++def judge(
++    owner: str, kind: str, name: str, destination: str, fifo: object, group: object, dedup: object
++) -> bool:
++    """Judges the three FIFO arguments against the destination and returns the sink's type.
++
++    The types are judged first, the id sources' and then ``fifo``'s, and then the values.
++    ``fifo`` is asked its type, never its truth: anything but a ``bool`` or ``None`` is refused.
++    ``bool`` cannot be subclassed, so no subclass reaches the test. ``fifo=True`` on a
++    destination whose name does not end in ``.fifo`` is refused, because AWS requires every FIFO
++    queue and topic name to end so and that sink could never deliver. ``fifo=False`` on a
++    ``.fifo`` name is accepted: AWS does not say a standard name cannot end so (invariant 13's
++    recorded exception). An id argument passed to a sink that is not FIFO is refused, since a
++    standard destination never reads it.
++
++    Args:
++      owner: The constructing class's name.
++      kind: ``"queue"`` or ``"topic"``, for the message.
++      name: The destination's keyword, ``queue_url`` or ``topic_arn``, for the message.
++      destination: The queue URL or topic ARN.
++      fifo: ``fifo`` as passed.
++      group: ``message_group_id`` as passed.
++      dedup: ``message_deduplication_id`` as passed.
++
++    Returns:
++      Whether the sink is FIFO.
++
++    Raises:
++      TypeError: For a ``fifo`` that is neither a ``bool`` nor ``None``, or an id source outside
++        its declared type.
++      ValueError: For a blank constant group id, ``fifo=True`` on a name not ending in ``.fifo``,
++        or an id argument on a sink that is not FIFO.
++    """
++    require_callable(group, "message_group_id", owner, text=True)
++    require_callable(dedup, "message_deduplication_id", owner)
++    if fifo is not None and not issubclass(type(fifo), bool):
++        raise TypeError(
++            f"{owner} fifo must be a bool or None, not "
++            f"{_diag._STR_STR(_diag._STORED_NAME(type(fifo)))}"
++        )
++    if issubclass(type(group), str) and not _diag._STR_STR(cast("str", group)).strip():
++        raise ValueError(
++            "message_group_id must be a non-empty string; pass None to group by trace_id"
++        )
++    suffixed = destination.endswith(".fifo")
++    if fifo and not suffixed:
++        raise ValueError(
++            f"{owner} fifo=True needs a {name} ending in .fifo: AWS requires every FIFO {kind} "
++            "name to end so"
++        )
++    is_fifo = suffixed if fifo is None else bool(fifo)
++    if not is_fifo:
++        names = [
++            arg
++            for arg, value in (("message_group_id", group), ("message_deduplication_id", dedup))
++            if value is not None
++        ]
++        if names:
++            raise ValueError(
++                f"{owner} cannot apply {', '.join(names)} to a standard {kind}; drop it, or use "
++                f"a {name} ending in .fifo"
++            )
++    return is_fifo
++
++
++def bounded(raw: str, fallback: str) -> str:
++    """Normalizes a derived id, falling back when blank and truncating when over-long.
++
++    Args:
++      raw: The derived id.
++      fallback: What a blank id becomes.
++
++    Returns:
++      The id, at most the maximum length.
++
++    Raises:
++      None.
++    """
++    cleaned = raw.strip()
++    if not cleaned:
++        return fallback
++    return cleaned[:MAX_ID_LEN]
++
++
++def group_id(source: GroupIdSource, event: dict[str, object]) -> str:
++    """Resolves one event's ``MessageGroupId``: the constant, the callable's answer, or trace_id.
++
++    Args:
++      source: The sink's ``message_group_id``.
++      event: The event.
++
++    Returns:
++      The group id.
++
++    Raises:
++      Exception: A caller-supplied callable's own exception.
++    """
++    if issubclass(type(source), str):
++        raw = _diag._STR_STR(cast("str", source))
++    elif source is not None:
++        raw = cast("Callable[[dict[str, object]], str]", source)(event)
++    else:
++        raw = str(event.get("trace_id", ""))
++    return bounded(raw, DEFAULT_GROUP_ID)
++
++
++def dedup_id(source: DedupIdSource, event: dict[str, object]) -> str:
++    """Resolves one event's ``MessageDeduplicationId``: the callable's answer or ``log_id``.
++
++    Args:
++      source: The sink's ``message_deduplication_id``.
++      event: The event.
++
++    Returns:
++      The deduplication id: a minted UUID when the answer is blank, and the SHA-256 hex digest
++      of the stripped answer when it is longer than ``MAX_ID_LEN``, so two answers sharing their
++      first 128 characters never share an id (SPEC-100).
++
++    Raises:
++      Exception: A caller-supplied callable's own exception.
++    """
++    raw = source(event) if source is not None else str(event.get("log_id", ""))
++    cleaned = raw.strip()
++    if len(cleaned) > MAX_ID_LEN:
++        import hashlib
++
++        return hashlib.sha256(cleaned.encode("utf-8", "surrogatepass")).hexdigest()
++    if cleaned:
++        return cleaned
++    from log_foundry.ids import new_log_id
++
++    return new_log_id()
++
++
++class Prepared(NamedTuple):
++    """One event serialized and costed, with its FIFO ids resolved, at its place in the round.
++
++    Attributes:
++      position: The event's position in the round's batch.
++      body: The serialized event.
++      group_id: The resolved ``MessageGroupId``, or ``None``.
++      dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
++      size: The costed bytes.
++    """
++
++    position: int
++    body: str
++    group_id: str | None
++    dedup_id: str | None
++    size: int
++
++
++class Plan(NamedTuple):
++    """One round's prepared entries and drops.
++
++    Attributes:
++      prepared: The sendable entries, in batch order.
++      dropped: Each dropped position and its reason.
++      refused: The first id callable's exception when every event's raised.
++    """
++
++    prepared: list[Prepared]
++    dropped: dict[int, str]
++    refused: Exception | None
++
++
++@dataclass(slots=True)
++class Entry:
++    """One event occurrence's prepared entry or drop reason, kept for its delivery run.
++
++    Attributes:
++      body: The serialized event, or ``""`` for a drop.
++      group_id: The resolved ``MessageGroupId``, or ``None``.
++      dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
++      size: The costed bytes.
++      drop: The drop reason, or ``None``.
++      error: The id callable's exception, for an id failure.
++      landed: Whether the service has accepted this occurrence.
++    """
++
++    body: str = ""
++    group_id: str | None = None
++    dedup_id: str | None = None
++    size: int = 0
++    drop: str | None = None
++    error: Exception | None = None
++    landed: bool = False
++
++
++def prepare(
++    body: str | None,
++    event: dict[str, object],
++    *,
++    fifo: bool,
++    group: GroupIdSource,
++    dedup: DedupIdSource,
++    limit: int,
++) -> Entry:
++    """Prepares one event occurrence's entry, or decides its drop.
++
++    Args:
++      body: The encoded body, or ``None`` when it could not be encoded.
++      event: The event.
++      fifo: Whether the destination is FIFO.
++      group: The group source.
++      dedup: The dedup source.
++      limit: The message limit the costed size is held to.
++
++    Returns:
++      The entry.
++
++    Raises:
++      None. A ``BaseException`` from a caller's callable propagates.
++    """
++    if body is None:
++        return Entry(drop="unencodable")
++    size = len(body.encode("utf-8"))
++    gid: str | None = None
++    did: str | None = None
++    if fifo:
++        try:
++            gid = group_id(group, event)
++            did = dedup_id(dedup, event)
++        except Exception as err:
++            return Entry(drop="id failure", error=err)
++        size += len(gid.encode("utf-8")) + len(did.encode("utf-8"))
++    if size > limit:
++        return Entry(size=size, drop="oversize")
++    return Entry(body=body, group_id=gid, dedup_id=did, size=size)
++
++
++def plan_round(
++    owner: object,
++    batch: list[dict[str, object]],
++    bodies: dict[int, str],
++    prepare_one: Callable[[dict[str, object], str | None], Entry],
++) -> Plan:
++    """Prepares each event once per run and keeps the entry in the run's notes by identity.
++
++    Args:
++      owner: The sink.
++      batch: The round's events.
++      bodies: Each encodable position's body, from the sink's own ``encode_round`` call, which
++        stays in the sink's module so ``tests/test_encode.py``'s roster still derives the sink.
++      prepare_one: The sink's ``_prepare``.
++
++    Returns:
++      The round's plan; ``notes(owner)["prepared_round"]`` holds each position's entry.
++
++    Raises:
++      None. A ``BaseException`` from a caller's callable propagates.
++    """
++    notes = run_context().notes(owner)
++    cache = cast(
++        "dict[int, tuple[dict[str, object], list[Entry]]]", notes.setdefault("prepared", {})
++    )
++    round_entries: list[Entry | None] = [None] * len(batch)
++    notes["prepared_round"] = round_entries
++    taken: dict[int, int] = {}
++    prepared: list[Prepared] = []
++    dropped: dict[int, str] = {}
++    failures = 0
++    first: Exception | None = None
++    for position, event in enumerate(batch):
++        held = cache.get(id(event))
++        if held is None or held[0] is not event:
++            held = (event, [])
++            cache[id(event)] = held
++        live = [cached for cached in held[1] if not cached.landed]
++        skip = taken.get(id(event), 0)
++        taken[id(event)] = skip + 1
++        if skip < len(live):
++            entry = live[skip]
++        else:
++            entry = prepare_one(event, bodies.get(position))
++            held[1].append(entry)
++        round_entries[position] = entry
++        if entry.drop is not None:
++            dropped[position] = entry.drop
++            if entry.drop == "id failure":
++                failures += 1
++                first = first if first is not None else entry.error
++            continue
++        prepared.append(Prepared(position, entry.body, entry.group_id, entry.dedup_id, entry.size))
++    refused = first if batch and failures == len(batch) else None
++    return Plan(prepared, dropped, refused)
++
++
++def hold(chunk: list[Prepared], blocked: set[str], sends: list[int], limit: int) -> list[bool]:
++    """Decides, at send time, which entries of a FIFO chunk wait behind their group (SPEC-074).
++
++    Args:
++      chunk: The chunk's entries, in batch order.
++      blocked: Groups blocked so far this round, updated in place.
++      sends: Each entry's sends so far this run.
++      limit: ``max_retries + 1``.
++
++    Returns:
++      Per entry, whether it is held.
++
++    Raises:
++      None.
++    """
++    held: list[bool] = []
++    for item, count in zip(chunk, sends, strict=True):
++        group = item.group_id or ""
++        if group in blocked:
++            held.append(True)
++            continue
++        held.append(False)
++        if count and count + 1 < limit:
++            blocked.add(group)
++    return held
++
++
++def block(
++    sent: list[Prepared], fates: list[Outcome], sends: list[int], blocked: set[str], limit: int
++) -> None:
++    """Blocks the group of every sent entry that neither landed nor used its sends.
++
++    Args:
++      sent: The entries a call carried.
++      fates: The round's outcomes, by position.
++      sends: Each sent entry's sends so far this run, this call's included.
++      blocked: Groups blocked so far this round, updated in place.
++      limit: ``max_retries + 1``.
++
++    Returns:
++      None.
++
++    Raises:
++      None.
++    """
++    for item, count in zip(sent, sends, strict=True):
++        if fates[item.position] is not Outcome.ACCEPTED and count < limit:
++            blocked.add(item.group_id or "")
+diff -ruN -x __pycache__ base/src/log_foundry/sinks/sns.py proto/src/log_foundry/sinks/sns.py
+--- base/src/log_foundry/sinks/sns.py	2026-11-17 11:58:02
++++ proto/src/log_foundry/sinks/sns.py	2026-11-17 11:52:55
+@@ -3,15 +3,16 @@
+ from __future__ import annotations
+ 
+ import json
+-from typing import TYPE_CHECKING, Any
++from typing import TYPE_CHECKING, Any, cast
+ 
+ from log_foundry import _diag
+-from log_foundry.sinks import _engine
++from log_foundry.sinks import _engine, _fifo
+ from log_foundry.sinks._chunk import chunk_items
+ from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
+ from log_foundry.sinks._encode import encode_round
+-from log_foundry.sinks._engine import emit_via_deliver, run_context
++from log_foundry.sinks._engine import When, emit_via_deliver, run_context
+ from log_foundry.sinks._extras import import_extra
++from log_foundry.sinks._fifo import DedupIdSource, GroupIdSource, judge, plan_round
+ from log_foundry.sinks._retry import floor_count
+ from log_foundry.sinks._rounds import (
+     Called,
+@@ -20,6 +21,7 @@
+     entry_ids,
+     mark_sent,
+     read_keyed,
++    sends_of,
+     settle_keyed,
+ )
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+@@ -28,11 +30,10 @@
+     import threading
+     from collections.abc import Mapping
+ 
+-    from log_foundry.sinks._deferral import Deferral
+-    from log_foundry.sinks._engine import _Drops
++    from log_foundry.sinks._fifo import Entry, Prepared
+     from log_foundry.sinks.base import SinkLosses
+ 
+-__all__ = ["SNSSink"]
++__all__ = ["DedupIdSource", "GroupIdSource", "SNSSink"]
+ 
+ 
+ class SNSSink:
+@@ -69,7 +70,16 @@
+     MAX_BATCH = 10
+     MAX_BYTES = 256 * 1024
+ 
+-    def __init__(self, topic_arn: str, *, client: Any = None, max_retries: int = 3) -> None:
++    def __init__(
++        self,
++        topic_arn: str,
++        *,
++        client: Any = None,
++        max_retries: int = 3,
++        fifo: bool | None = None,
++        message_group_id: GroupIdSource = None,
++        message_deduplication_id: DedupIdSource = None,
++    ) -> None:
+         """Binds the sink to a topic.
+ 
+         Args:
+@@ -88,10 +98,17 @@
+           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
+         """
+         self.max_retries = floor_count(max_retries, 0, "max_retries", "SNSSink")
++        owner = _diag.type_name(self)
++        is_fifo = judge(
++            owner, "topic", "topic_arn", topic_arn, fifo, message_group_id, message_deduplication_id
++        )
+         if client is None:
+             client = import_extra("boto3", "aws").client("sns")
+         self.topic_arn = topic_arn
+         self.client = client
++        self.fifo = is_fifo
++        self.message_group_id = message_group_id
++        self.message_deduplication_id = message_deduplication_id
+         self.log_foundry_stop_signal: threading.Event | None = None
+         self.log_foundry_counters = SinkCounters()
+         self.dropped_oversized = 0
+@@ -212,15 +229,8 @@
+         return _engine.one_round(self._round, batch)
+ 
+     def _round(self, batch: list[dict[str, object]]) -> Verdict:
+-        """Publishes every remaining chunk once and classifies every event of the round.
++        """Publishes every remaining chunk once, holding a FIFO group as SQSSink does (SPEC-100).
+ 
+-        Every event is encoded once per run (:func:`~log_foundry.sinks._encode.encode_round`),
+-        an unencodable one ``DROPPED`` with SPEC-069's line; :meth:`_bodies` drops an oversized
+-        one; the rest are chunked with ``chunk_items`` and each chunk published once through
+-        :meth:`_send`, its reply settled by the keyed rule SQS shares — a sender fault
+-        ``REJECTED`` and a final rejection, any other failed entry ``RETRYABLE``, an unreadable
+-        reply ``UNKNOWN``, a raise ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+-
+         Args:
+           batch: The events this round is offered.
+ 
+@@ -228,24 +238,61 @@
+           A verdict with one outcome per event of ``batch``.
+ 
+         Raises:
+-          None. A ``BaseException`` from the client propagates.
++          None. A ``BaseException`` from the client or a caller's callable propagates.
+         """
+         context = run_context()
+-        fates = [Outcome.DROPPED] * len(batch)
+-        pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
+-        bodies = self._bodies(pairs, context.drops(self))
++        plan = plan_round(
++            self,
++            batch,
++            dict(encode_round(self, batch, self._encode, sink=_diag.type_name(self))),
++            self._prepare,
++        )
++        if plan.refused is not None:
++            context.refuse(plan.refused)
++            return Verdict.uniform(Outcome.REJECTED, len(batch))
++        fates = [Outcome.RETRYABLE] * len(batch)
++        self._register_drops(plan.dropped)
++        for position in plan.dropped:
++            fates[position] = Outcome.DROPPED
+         lost = Lost(self)
+         final: list[int] = []
++        blocked: set[str] = set()
++        limit = self.max_retries + 1
++        name = "SNSSink"
++        holding = bool(self.fifo) and not context.last
+         for chunk in chunk_items(
+-            bodies, max_count=self.MAX_BATCH, max_bytes=self.MAX_BYTES, size_of=lambda p: len(p[1])
++            plan.prepared,
++            max_count=self.MAX_BATCH,
++            max_bytes=self.MAX_BYTES,
++            size_of=lambda item: item.size,
+         ):
+-            positions = [position for position, _ in chunk]
+-            carried = [batch[position] for position in positions]
++            held = (
++                _fifo.hold(
++                    chunk, blocked, [sends_of(self, batch[item.position]) for item in chunk], limit
++                )
++                if holding
++                else [False] * len(chunk)
++            )
++            sending = [item for item, hold in zip(chunk, held, strict=True) if not hold]
++            waiting = [batch[item.position] for item, hold in zip(chunk, held, strict=True) if hold]
++            lost.add(
++                waiting,
++                when=When.LAST,
++                key="held",
++                line=lambda n, count: _diag.lost(
++                    "message",
++                    count,
++                    f"{name}, {n} attempt(s), held behind an earlier message of its FIFO group",
++                ),
++            )
++            if not sending:
++                continue
++            carried = [batch[item.position] for item in sending]
+             mark_sent(self, carried)
+-            sent = self._send([body for _, body in chunk], entry_ids(self, carried))
+-            settle_keyed(
++            sent = self._send(sending, entry_ids(self, carried))
++            landed = settle_keyed(
+                 self,
+-                positions=positions,
++                positions=[item.position for item in sending],
+                 carried=carried,
+                 error=sent.error,
+                 retryable=sent.retryable,
+@@ -256,10 +303,76 @@
+                 final=final,
+                 lost=lost,
+             )
++            entries = cast("list[Entry | None]", context.notes(self)["prepared_round"])
++            for position in landed:
++                cached = entries[position]
++                if cached is not None:
++                    cached.landed = True
++            if holding:
++                _fifo.block(
++                    sending, fates, [sends_of(self, event) for event in carried], blocked, limit
++                )
+         lost.register()
+         context.final_rejections(final)
+         return Verdict(outcomes=tuple(fates))
+ 
++    def _prepare(self, event: dict[str, object], body: str | None) -> Entry:
++        """Prepares one event occurrence's entry, ids included on a FIFO topic, or its drop.
++
++        Args:
++          event: The event.
++          body: Its encoded body, or ``None``.
++
++        Returns:
++          The entry.
++
++        Raises:
++          None. A ``BaseException`` from a caller's callable propagates.
++        """
++        return _fifo.prepare(
++            body,
++            event,
++            fifo=bool(self.fifo),
++            group=self.message_group_id,
++            dedup=self.message_deduplication_id,
++            limit=self.MAX_BYTES,
++        )
++
++    def _register_drops(self, dropped: dict[int, str]) -> None:
++        """Counts and announces the round's oversize and id-failure drops, ``SETTLED``.
++
++        Args:
++          dropped: Each dropped position and its reason.
++
++        Returns:
++          None.
++
++        Raises:
++          None.
++        """
++        context = run_context()
++        entries = cast("list[Entry | None]", context.notes(self)["prepared_round"])
++        oversize = sum(1 for reason in dropped.values() if reason == "oversize")
++        failures = [
++            cached.error
++            for position, reason in sorted(dropped.items())
++            if reason == "id failure" and (cached := entries[position]) is not None
++        ]
++        limit = self.MAX_BYTES
++        for _ in range(oversize):
++            context.count(self, "dropped_oversized", 1, when=When.SETTLED)
++            context.announce(
++                lambda: _diag.lost("event", 1, f"SNSSink, exceeds the {limit}-byte message limit"),
++                when=When.SETTLED,
++            )
++        if failures:
++            kind = _diag.type_name(failures[0])
++            count = len(failures)
++            context.announce(
++                lambda: _diag.lost("event", count, f"SNSSink, a FIFO id callable raised {kind}"),
++                when=When.SETTLED,
++            )
++
+     def close(self) -> None:
+         """Does nothing, since the sink buffers nothing internally (FR-001).
+ 
+@@ -290,45 +403,6 @@
+         """
+         return json.dumps(event)
+ 
+-    def _bodies(
+-        self, encoded: list[tuple[int, str]], pending: Deferral | _Drops
+-    ) -> list[tuple[int, str]]:
+-        """Keeps each encoded body, dropping any message too large to ever fit (FR-011).
+-
+-        It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
+-        encoded forms and nothing here can fail on an event. A body's UTF-8 length is its cost,
+-        as ``chunk_items`` reads it.
+-
+-        A drop goes to ``pending`` rather than to the counter, so it is counted and announced
+-        only when ``emit`` returns (SPEC-059 FR-001) — on the engine, ``pending`` is the run
+-        context's ``SETTLED`` view, so only when the run settles (SPEC-074). The line names no
+-        per-event value, so each drop registers its own count and its own line, one per event
+-        as before.
+-
+-        Args:
+-          encoded: Each encodable event's position in the round's batch with its JSON body.
+-          pending: The run's ``SETTLED`` view, which holds every drop decided here until the run
+-            is known to settle.
+-
+-        Returns:
+-          The position and body of each message that can be sent.
+-
+-        Raises:
+-          None.
+-        """
+-        bodies: list[tuple[int, str]] = []
+-        for position, body in encoded:
+-            if len(body.encode("utf-8")) > self.MAX_BYTES:
+-                pending.count("dropped_oversized")
+-                pending.announce(
+-                    lambda: _diag.lost(
+-                        "event", 1, f"SNSSink, exceeds the {self.MAX_BYTES}-byte message limit"
+-                    )
+-                )
+-                continue
+-            bodies.append((position, body))
+-        return bodies
+-
+     def _retryable_error(self, err: Exception) -> bool:
+         """Reports whether a failed call is worth another attempt (SPEC-070 FR-002).
+ 
+@@ -367,35 +441,29 @@
+         """
+         return not sender_fault(entry)
+ 
+-    def _send(self, bodies: list[str], ids: list[str]) -> Called[KeyedReply]:
++    def _send(self, prepared: list[Prepared], ids: list[str]) -> Called[KeyedReply]:
+         """Publishes one chunk once and reads the reply per entry (SPEC-074 FR-002).
+ 
+-        Nothing here waits or retries: the engine resends a ``RETRYABLE`` entry in a later round.
+-        The reply's ``Failed`` list is read through
+-        :func:`~log_foundry.sinks._batch.adjudicate_keyed` against each entry's ``Id``, so a
+-        malformed list adjudicates none of the chunk rather than escaping ``emit`` raw.
++        The FIFO ids go on an entry exactly when they were resolved, on a FIFO topic.
+ 
+-        **A client exception costs this chunk, never the batch** (SPEC-048 FR-002), and it is
+-        treated as **provable non-delivery** for the chunk: a read timeout means the request went
+-        out and the reply was lost, so a resend may duplicate — taken because an unreachable
+-        endpoint is the common case. **An entry SNS marks ``SenderFault`` is not resent**
+-        (SPEC-070 FR-003): SNS's ``BatchResultErrorEntry`` carries the same required field as
+-        SQS's, and a byte-identical resend of the caller's fault fails again.
+-
+         Args:
+-          bodies: One chunk's serialized events.
++          prepared: One chunk's prepared entries.
+           ids: Each entry's ``Id``, kept across the run's rounds.
+ 
+         Returns:
+           The call's reply.
+ 
+         Raises:
+-          None. ``Exception`` is caught rather than ``BaseException``, so a ``KeyboardInterrupt``
+-            or ``SystemExit`` still reaches the caller (SPEC-025 FR-004).
++          None. ``Exception`` is caught rather than ``BaseException``.
+         """
+-        entries = [
+-            {"Id": entry_id, "Message": body} for entry_id, body in zip(ids, bodies, strict=True)
+-        ]
++        entries: list[dict[str, str]] = []
++        for entry_id, item in zip(ids, prepared, strict=True):
++            entry = {"Id": entry_id, "Message": item.body}
++            if item.group_id is not None:
++                entry["MessageGroupId"] = item.group_id
++            if item.dedup_id is not None:
++                entry["MessageDeduplicationId"] = item.dedup_id
++            entries.append(entry)
+         try:
+             response = self.client.publish_batch(
+                 TopicArn=self.topic_arn, PublishBatchRequestEntries=entries
+diff -ruN -x __pycache__ base/src/log_foundry/sinks/sqs.py proto/src/log_foundry/sinks/sqs.py
+--- base/src/log_foundry/sinks/sqs.py	2026-11-17 11:58:02
++++ proto/src/log_foundry/sinks/sqs.py	2026-11-17 11:52:55
+@@ -12,18 +12,17 @@
+ from __future__ import annotations
+ 
+ import json
+-from collections.abc import Callable, Mapping
+-from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any, NamedTuple, cast
+ 
+ from log_foundry import _diag
+-from log_foundry.sinks import _engine
++from log_foundry.sinks import _engine, _fifo
+ from log_foundry.sinks._args import require_callable
+ from log_foundry.sinks._chunk import chunk_items
+ from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_fault
+ from log_foundry.sinks._encode import encode_round
+ from log_foundry.sinks._engine import When, emit_via_deliver, run_context
+ from log_foundry.sinks._extras import import_extra
++from log_foundry.sinks._fifo import DedupIdSource, GroupIdSource, judge, plan_round
+ from log_foundry.sinks._retry import floor_count
+ from log_foundry.sinks._rounds import (
+     Called,
+@@ -39,59 +38,32 @@
+ 
+ if TYPE_CHECKING:
+     import threading
++    from collections.abc import Mapping
+ 
++    from log_foundry.sinks._fifo import Entry as _Entry
++    from log_foundry.sinks._fifo import Prepared as _Prepared
+     from log_foundry.sinks.base import SinkLosses
+ 
+ __all__ = ["DedupIdSource", "GroupIdSource", "SQSSink"]
+ 
+-DEFAULT_GROUP_ID = "log-foundry"
++DEFAULT_GROUP_ID = _fifo.DEFAULT_GROUP_ID
+ """Fallback group for an event carrying no usable ``trace_id`` — never send an empty group id."""
+ 
+-MAX_ID_LEN = 128
++MAX_ID_LEN = _fifo.MAX_ID_LEN
+ """SQS maximum length for ``MessageGroupId`` and ``MessageDeduplicationId``."""
+ 
+-GroupIdSource = str | Callable[[dict[str, object]], str] | None
+-"""What ``message_group_id=`` accepts: an event key to read, a callable, or ``None``."""
++_bounded = _fifo.bounded
++_hold = _fifo.hold
++_block = _fifo.block
+ 
+-DedupIdSource = Callable[[dict[str, object]], str] | None
+-"""What ``message_deduplication_id=`` accepts: a callable, or ``None`` for a minted UUID."""
+ 
+-
+-class _Prepared(NamedTuple):
+-    """One event serialized and costed, with its FIFO ids resolved, at its place in the round.
+-
+-    The ids are ``None`` on a standard queue, and are derived once per run rather than again at
+-    send time or in a later round: the deduplication fallback mints a fresh UUID, so deriving
+-    twice would bill the byte budget for one value and put a different one on the wire, and a
+-    resend with a new id would lose SQS's five-minute de-duplication of it (SPEC-074 FR-002).
+-
+-    Attributes:
+-      position: The event's position in the batch the round was handed, so each chunk's outcomes
+-        map back to the verdict.
+-      body: The serialized event.
+-      group_id: The resolved ``MessageGroupId``, or ``None``.
+-      dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
+-      size: The costed bytes: the body's UTF-8 length plus, on a FIFO queue, both ids'. Carried
+-        so :func:`~log_foundry.sinks._chunk.chunk_items` reads the cost rather than recomputing
+-        it (SPEC-071 FR-004).
+-    """
+-
+-    position: int
+-    body: str
+-    group_id: str | None
+-    dedup_id: str | None
+-    size: int
+-
+-
+ class _Plan(NamedTuple):
+     """One round's sends and drops, every drop decided before the first send (SPEC-074 FR-002).
+ 
+     Attributes:
+-      chunks: The round's chunks, each valid for one request, built with ``chunk_items``.
+-      dropped: Each dropped position of the round's batch and its reason: ``"oversize"``,
+-        ``"id failure"`` or ``"unencodable"``.
+-      refused: The first id callable's exception, set only when every event's id callable
+-        raised; the round is then a refusal.
++      chunks: The round's chunks.
++      dropped: Each dropped position and its reason.
++      refused: The first id callable's exception when every event's raised.
+     """
+ 
+     chunks: list[list[_Prepared]]
+@@ -99,48 +71,6 @@
+     refused: Exception | None
+ 
+ 
+-@dataclass(slots=True)
+-class _Entry:
+-    """One event occurrence's prepared entry or drop reason, kept for its delivery run.
+-
+-    Attributes:
+-      body: The serialized event, or ``""`` for a drop.
+-      group_id: The resolved ``MessageGroupId``, or ``None``.
+-      dedup_id: The resolved ``MessageDeduplicationId``, or ``None``.
+-      size: The costed bytes.
+-      drop: The drop reason, or ``None`` for an entry that can be sent.
+-      error: The id callable's exception, for an id failure.
+-      landed: Whether SQS has accepted this occurrence.
+-    """
+-
+-    body: str = ""
+-    group_id: str | None = None
+-    dedup_id: str | None = None
+-    size: int = 0
+-    drop: str | None = None
+-    error: Exception | None = None
+-    landed: bool = False
+-
+-
+-def _bounded(raw: str, fallback: str) -> str:
+-    """Normalizes a derived id, falling back when blank and truncating when over-long.
+-
+-    Args:
+-      raw: The derived id.
+-      fallback: What a blank id becomes.
+-
+-    Returns:
+-      The id, at most the SQS maximum length.
+-
+-    Raises:
+-      None.
+-    """
+-    cleaned = raw.strip()
+-    if not cleaned:
+-        return fallback
+-    return cleaned[:MAX_ID_LEN]
+-
+-
+ class SQSSink:
+     """A :class:`~log_foundry.sinks.base.Sink` that sends events to an SQS queue.
+ 
+@@ -228,19 +158,15 @@
+         require_callable(message_group_id, "message_group_id", owner, text=True)
+         require_callable(message_deduplication_id, "message_deduplication_id", owner)
+         self.max_retries = floor_count(max_retries, 0, "max_retries", "SQSSink")
+-        if (
+-            issubclass(type(message_group_id), str)
+-            and not _diag._STR_STR(cast("str", message_group_id)).strip()
+-        ):
+-            raise ValueError(
+-                "message_group_id must be a non-empty string; pass None to group by trace_id"
+-            )
++        is_fifo = judge(
++            owner, "queue", "queue_url", queue_url, fifo, message_group_id, message_deduplication_id
++        )
+         if client is None:
+             client = import_extra("boto3", "aws").client("sqs")
+         self.queue_url = queue_url
+         self.client = client
+         self.log_foundry_stop_signal: threading.Event | None = None
+-        self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
++        self.fifo = is_fifo
+         self.message_group_id = message_group_id
+         self.message_deduplication_id = message_deduplication_id
+         self.log_foundry_counters = SinkCounters()
+@@ -528,14 +454,7 @@
+           Exception: A caller-supplied callable's own exception, which :meth:`_chunks` turns
+             into a drop of this one event (SPEC-058 FR-004).
+         """
+-        source = self.message_group_id
+-        if issubclass(type(source), str):
+-            raw = _diag._STR_STR(cast("str", source))
+-        elif source is not None:
+-            raw = cast("Callable[[dict[str, object]], str]", source)(event)
+-        else:
+-            raw = str(event.get("trace_id", ""))
+-        return _bounded(raw, DEFAULT_GROUP_ID)
++        return _fifo.group_id(self.message_group_id, event)
+ 
+     def _dedup_id(self, event: dict[str, object]) -> str:
+         """Resolves one event's ``MessageDeduplicationId`` (SPEC-016 FR-003).
+@@ -555,14 +474,8 @@
+           Exception: A caller-supplied callable's own exception, which :meth:`_chunks` turns
+             into a drop of this one event (SPEC-058 FR-004).
+         """
+-        source = self.message_deduplication_id
+-        raw = source(event) if source is not None else str(event.get("log_id", ""))
+-        if raw.strip():
+-            return _bounded(raw, "")
+-        from log_foundry.ids import new_log_id
++        return _fifo.dedup_id(self.message_deduplication_id, event)
+ 
+-        return new_log_id()
+-
+     def _encode(self, event: dict[str, object]) -> str:
+         """Encodes one event as its message body.
+ 
+@@ -616,51 +529,21 @@
+         Raises:
+           None. A ``BaseException`` from a caller's callable propagates.
+         """
+-        notes = run_context().notes(self)
+-        cache = cast(
+-            "dict[int, tuple[dict[str, object], list[_Entry]]]", notes.setdefault("prepared", {})
++        plan = plan_round(
++            self,
++            batch,
++            dict(encode_round(self, batch, self._encode, sink=_diag.type_name(self))),
++            self._prepare,
+         )
+-        round_entries: list[_Entry | None] = [None] * len(batch)
+-        notes["prepared_round"] = round_entries
+-        bodies = dict(encode_round(self, batch, self._encode, sink=_diag.type_name(self)))
+-        taken: dict[int, int] = {}
+-        prepared: list[_Prepared] = []
+-        dropped: dict[int, str] = {}
+-        failures = 0
+-        first: Exception | None = None
+-        for position, event in enumerate(batch):
+-            held = cache.get(id(event))
+-            if held is None or held[0] is not event:
+-                held = (event, [])
+-                cache[id(event)] = held
+-            live = [cached for cached in held[1] if not cached.landed]
+-            skip = taken.get(id(event), 0)
+-            taken[id(event)] = skip + 1
+-            if skip < len(live):
+-                entry = live[skip]
+-            else:
+-                entry = self._prepare(event, bodies.get(position))
+-                held[1].append(entry)
+-            round_entries[position] = entry
+-            if entry.drop is not None:
+-                dropped[position] = entry.drop
+-                if entry.drop == "id failure":
+-                    failures += 1
+-                    first = first if first is not None else entry.error
+-                continue
+-            prepared.append(
+-                _Prepared(position, entry.body, entry.group_id, entry.dedup_id, entry.size)
+-            )
+         chunks = list(
+             chunk_items(
+-                prepared,
++                plan.prepared,
+                 max_count=self.MAX_BATCH,
+                 max_bytes=self.MAX_BYTES,
+                 size_of=lambda item: item.size,
+             )
+         )
+-        refused = first if batch and failures == len(batch) else None
+-        return _Plan(chunks, dropped, refused)
++        return _Plan(chunks, plan.dropped, plan.refused)
+ 
+     def _prepare(self, event: dict[str, object], body: str | None) -> _Entry:
+         """Prepares one event occurrence's entry, or decides its drop.
+@@ -675,21 +558,14 @@
+         Raises:
+           None. A ``BaseException`` from a caller's callable propagates.
+         """
+-        if body is None:
+-            return _Entry(drop="unencodable")
+-        size = len(body.encode("utf-8"))
+-        group_id: str | None = None
+-        dedup_id: str | None = None
+-        if self.fifo:
+-            try:
+-                group_id = self._group_id(event)
+-                dedup_id = self._dedup_id(event)
+-            except Exception as err:
+-                return _Entry(drop="id failure", error=err)
+-            size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
+-        if size > self.MAX_BYTES:
+-            return _Entry(size=size, drop="oversize")
+-        return _Entry(body=body, group_id=group_id, dedup_id=dedup_id, size=size)
++        return _fifo.prepare(
++            body,
++            event,
++            fifo=bool(self.fifo),
++            group=self.message_group_id,
++            dedup=self.message_deduplication_id,
++            limit=self.MAX_BYTES,
++        )
+ 
+     def _announce_oversized(self, sizes: list[int]) -> None:
+         """Writes one line per event dropped for exceeding the message limit (FR-004).
+@@ -796,62 +672,3 @@
+         except Exception as err:
+             return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+         return Called(read_keyed(self._retryable_entry, ids, response))
+-
+-
+-def _hold(chunk: list[_Prepared], blocked: set[str], sends: list[int], limit: int) -> list[bool]:
+-    """Decides, at send time, which entries of a FIFO chunk wait behind their group.
+-
+-    SQS documents ordering within a message group as a FIFO guarantee, and 1.x kept it for as
+-    long as its loop retried a chunk, ``max_retries + 1`` sends. So an entry is held when its
+-    group is ``blocked`` — an earlier message of it, sent in an earlier chunk of this round or
+-    held itself, has neither landed nor used its sends — or when an earlier entry of its group in
+-    this chunk was already sent in an earlier round and this send will not be its last. Entries
+-    of a group never sent before travel together in one chunk, as 1.x sent them, so a healthy
+-    one-group batch is one call. A held entry blocks its group for the rest of the round. This is
+-    the one function deciding a hold, so another reading of it is a change here alone.
+-
+-    Args:
+-      chunk: The chunk's entries, in batch order.
+-      blocked: Groups blocked so far this round, updated in place.
+-      sends: Each entry's sends so far this run.
+-      limit: ``max_retries + 1``.
+-
+-    Returns:
+-      Per entry, whether it is held.
+-
+-    Raises:
+-      None.
+-    """
+-    held: list[bool] = []
+-    for item, count in zip(chunk, sends, strict=True):
+-        group = item.group_id or ""
+-        if group in blocked:
+-            held.append(True)
+-            continue
+-        held.append(False)
+-        if count and count + 1 < limit:
+-            blocked.add(group)
+-    return held
+-
+-
+-def _block(
+-    sent: list[_Prepared], fates: list[Outcome], sends: list[int], blocked: set[str], limit: int
+-) -> None:
+-    """Blocks the group of every sent entry that neither landed nor used its sends.
+-
+-    Args:
+-      sent: The entries a call carried.
+-      fates: The round's outcomes, by position.
+-      sends: Each sent entry's sends so far this run, this call's included.
+-      blocked: Groups blocked so far this round, updated in place.
+-      limit: ``max_retries + 1``.
+-
+-    Returns:
+-      None.
+-
+-    Raises:
+-      None.
+-    """
+-    for item, count in zip(sent, sends, strict=True):
+-        if fates[item.position] is not Outcome.ACCEPTED and count < limit:
+-            blocked.add(item.group_id or "")
