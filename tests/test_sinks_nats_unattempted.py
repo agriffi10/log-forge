@@ -101,8 +101,6 @@ class Run:
     failed: int
     failed_batches: int
     lines: list[str]
-    outcomes: tuple[Outcome, ...] | None = None
-    delivery: Any = None
 
 
 @contextlib.contextmanager
@@ -385,19 +383,41 @@ def test_a_direct_deliver_outside_a_run_returns_retryable_and_writes_the_line_at
         assert _lines(stderr) == [TIMEOUT_LINE.format(4)]
 
 
+def _drop_event_2(event: dict[str, object]) -> dict[str, object] | None:
+    """A ``TransformSink`` function that drops event 2 and passes every other event on unchanged.
+
+    Args:
+      event: The event the wrapper was handed.
+
+    Returns:
+      ``None`` for event 2, else a copy of the event.
+
+    Raises:
+      None.
+    """
+    return None if event["n"] == 2 else dict(event)
+
+
 @pytest.mark.parametrize(
     "wrap",
     [
-        lambda inner: FilteringSink(inner, predicate=lambda _event: True),
-        lambda inner: TransformSink(inner, dict),
+        lambda inner: FilteringSink(inner, predicate=lambda event: event["n"] != 2),
+        lambda inner: TransformSink(inner, _drop_event_2),
     ],
     ids=["filtering", "transform"],
 )
 def test_a_wrapper_around_nats_resends_the_tail(
     wrap: Callable[[NATSSink], Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A wrapper offers ``deliver`` exactly when ``NATSSink`` does (SPEC-075), so it resends too."""
+    """A wrapper offers ``deliver`` exactly when ``NATSSink`` does (SPEC-075), so it resends too.
+
+    The wrapper drops event 2, so the inner batch is the outer one without it and the wrapper
+    must map the inner verdict back by index: the unattempted tail is outer events 1, 3 and 4,
+    inner positions 1, 2 and 3. A wrong mapping would resend the dropped event or skip one of
+    the tail; here event 2 is never published and each tail event lands once.
+    """
     run = _run_worker([["late-ok"], ["ok"]], 5, monkeypatch, wrap=wrap)
-    assert run.offered == [[0, 1, 2, 3, 4], [1, 2, 3, 4]]
-    assert Counter(run.sent) == {0: 1, 1: 1, 2: 1, 3: 1, 4: 1}
+    assert run.offered == [[0, 1, 3, 4], [1, 3, 4]]
+    assert 2 not in run.sent, "the event the wrapper dropped is never published"
+    assert Counter(run.sent) == {0: 1, 1: 1, 3: 1, 4: 1}
     assert (run.failed, run.failed_batches, run.lines) == (0, 0, [])
