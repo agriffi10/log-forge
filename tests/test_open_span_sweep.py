@@ -1738,6 +1738,9 @@ def test_a_sweep_gives_up_on_a_queue_mutex_another_thread_holds(monkeypatch) -> 
     A traced close made inside the mutex itself is a different hang, and not this spec's: its own
     submit waits on the mutex its thread already holds, since ``queue.Queue``'s mutex is a plain
     ``Lock``. It hangs on the base ``33a44e99`` too (``architecture.md`` §13).
+
+    A takes the hold with a bounded wait of its own, so under an unbounded drain wait it gives up,
+    lets go of the mutex, and the test fails on its assertion rather than hanging in teardown.
     """
     sink = Recorder()
     worker = _quiet(sink, flush_interval=0.05)
@@ -1765,12 +1768,18 @@ def test_a_sweep_gives_up_on_a_queue_mutex_another_thread_holds(monkeypatch) -> 
         assert in_hand_in.wait(BOUND)
         with worker._queue.mutex:
             a_has_mutex.set()
-            with decorator._sweep_hold:
-                closed.set()
+            try:
+                with decorator._sweep_hold.within(3.0):
+                    closed.set()
+            except decorator._NotHeldError:
+                pass
 
     a = threading.Thread(daemon=True, target=thread_a)
     a.start()
-    assert closed.wait(5.0), "A waited on the hold while the drain waited on A's queue mutex"
+    try:
+        assert closed.wait(5.0), "A waited on the hold while the drain waited on A's queue mutex"
+    finally:
+        a.join(BOUND)
     assert worker._thread.is_alive()
     monkeypatch.undo()
     nested()
@@ -1918,3 +1927,177 @@ def test_a_deferred_close_is_submitted_with_no_hold_held(monkeypatch) -> None:
     monkeypatch.undo()
     lf.flush(BOUND)
     assert sink.messages("nested") == ["span.start", "inside", "span.end"]
+
+
+def test_the_exit_sweep_ships_an_open_span_past_a_full_queue() -> None:
+    """Execution review: a full queue at the stop leaves no open span's events behind.
+
+    The queue is full of submissions behind a drain parked in a gated emit when ``shutdown()``
+    begins, and another context's span holds 5 logs and never closes, as a daemon thread's does.
+    The exit drain's one sweep puts past ``max_queue``, since this drain is the queue's only
+    consumer and reads its bound right after, so the 5 logs ship in the exit batches; refused on
+    the full queue they stayed on a span nothing would close, delivered 0 of 5 and counted nowhere.
+    """
+    gate = GatedSink()
+    worker = _quiet(gate, max_queue=4, batch_size=1)
+    gate.gate.clear()
+
+    @lf.trace(name="filler")
+    def filler() -> None:
+        lf.info("fill")
+
+    filler()
+    assert gate.entered.wait(BOUND), "the drain never entered the gated emit"
+    for _ in range(4):
+        filler()
+    assert worker._queue.full()
+    parked = Parked(*[f"d{i}" for i in range(5)])
+    opener = threading.Timer(0.3, gate.gate.set)
+    opener.start()
+    try:
+        lf.shutdown(BOUND)
+    finally:
+        opener.cancel()
+        gate.gate.set()
+    got = [e["message"] for e in gate.events if e.get("function") == "parked"]
+    assert got == [f"d{i}" for i in range(5)], f"the exit drain left the open span's logs: {got}"
+    parked.finish()
+
+
+def test_a_refused_take_goes_back_before_what_the_owner_appended() -> None:
+    """Execution review: a take the queue refuses is restored at ``held``, not at the end.
+
+    While the drain's take is out, the owner logs ``late`` and closes, appending ``span.end``; the
+    offer is then refused. Restored at ``held`` the take goes back ahead of both, and the close
+    ships ``span.start, a, b, late, span.end``. Appended instead, ``a`` and ``b`` shipped after
+    ``span.end``.
+    """
+    sink = Recorder()
+    worker = _quiet(sink, flush_interval=0.05)
+    holder: list[Span] = []
+    ready = threading.Event()
+    go_late = threading.Event()
+    refused: list[bool] = []
+    real = worker._hand_in
+
+    def refusing(events: list[dict[str, Any]]) -> int | None:
+        if refused:
+            return real(events)
+        refused.append(True)
+        go_late.set()
+        deadline = time.monotonic() + BOUND
+        while not holder[0].closed and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return None
+
+    @lf.trace(name="owner")
+    def owner() -> None:
+        holder.append(context.current_span())  # type: ignore[arg-type]
+        lf.info("a")
+        lf.info("b")
+        ready.set()
+        assert go_late.wait(BOUND)
+        lf.info("late")
+
+    worker._hand_in = refusing  # type: ignore[method-assign]
+    try:
+        running = threading.Thread(daemon=True, target=owner)
+        running.start()
+        running.join(BOUND)
+        assert refused, "the drain never swept the owner's span"
+    finally:
+        del worker._hand_in
+    lf.flush(BOUND)
+    got = sink.messages("owner")
+    assert got == ["span.start", "a", "b", "late", "span.end"], (
+        f"the take went back out of order: {got}"
+    )
+
+
+def test_an_own_sweep_puts_its_buffer_back_before_a_sharing_threads_append(monkeypatch) -> None:
+    """Execution review: the caller's own sweep restores its buffer at the front of the span's list.
+
+    The span's context is shared with another thread, as ``asyncio.to_thread`` shares it. While the
+    own sweep's buffer is detached and its offer waits on a queue mutex another thread holds, the
+    sharing thread logs ``late`` into the span's new list; the offer is refused, and the buffer
+    goes back in front of it. Appended instead, ``late`` shipped before ``span.start``.
+    """
+    sink = Recorder()
+    worker = _quiet(sink)
+    holding = threading.Event()
+    release = threading.Event()
+    real_offer = worker._offer
+    shared: list[contextvars.Context] = []
+
+    def offer(events: list[dict[str, Any]], **kwargs: Any) -> int | None:
+        sharer = threading.Thread(daemon=True, target=lambda: shared[0].run(lf.info, "late"))
+        sharer.start()
+        sharer.join(BOUND)
+        return real_offer(events, **kwargs)
+
+    def hold_mutex() -> None:
+        with worker._queue.mutex:
+            holding.set()
+            release.wait(BOUND)
+
+    result: list[object] = []
+
+    @lf.trace(name="mine")
+    def mine() -> None:
+        lf.info("a")
+        lf.info("b")
+        shared.append(contextvars.copy_context())
+        holder = threading.Thread(daemon=True, target=hold_mutex)
+        holder.start()
+        assert holding.wait(BOUND)
+        monkeypatch.setattr(worker, "_offer", offer)
+        try:
+            result.append(decorator._sweep_open_spans())
+        finally:
+            monkeypatch.undo()
+            release.set()
+            holder.join(BOUND)
+
+    mine()
+    lf.flush(BOUND)
+    assert result == [False], result
+    got = sink.messages("mine")
+    assert got == ["span.start", "a", "b", "late", "span.end"], (
+        f"the buffer went back out of order: {got}"
+    )
+
+
+def test_a_refused_offer_stops_the_sweep_so_the_hold_is_soon_free(monkeypatch) -> None:
+    """Execution review: one refused offer ends the pass rather than each span waiting its bound.
+
+    With 20 open spans and the queue's mutex held by the test, a ``flush()``'s registry sweep is
+    refused once and stops, so the hold is free again after about one ``_SWEEP_WAIT``. Continuing
+    past a refusal waited the bound once per span, about a second with 20 spans, while every close
+    in the process waited on the hold.
+    """
+    worker = _quiet(Recorder())
+    spans = [Parked(f"s{i}") for i in range(20)]
+    first_offer = threading.Event()
+    real_offer = worker._offer
+
+    def offer(events: list[dict[str, Any]], **kwargs: Any) -> int | None:
+        first_offer.set()
+        return real_offer(events, **kwargs)
+
+    monkeypatch.setattr(worker, "_offer", offer)
+    worker._queue.mutex.acquire()
+    try:
+        flusher = threading.Thread(daemon=True, target=lambda: lf.flush(BOUND))
+        flusher.start()
+        assert first_offer.wait(BOUND), "the flush's registry sweep never offered"
+        began = time.monotonic()
+        with decorator._sweep_hold:
+            waited = time.monotonic() - began
+    finally:
+        worker._queue.mutex.release()
+    flusher.join(BOUND)
+    monkeypatch.undo()
+    assert waited < 0.5, f"the sweep held the hold {waited:.3f}s past a refused offer"
+    for parked in spans:
+        parked.finish()
+    lf.flush(BOUND)

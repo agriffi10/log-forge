@@ -142,6 +142,35 @@ bad_boundary=0 end_not_last=0` with 5,415, 8,134 and 7,681 shipped before their 
 `p12_kill.py` 50 of 51 and 9 of 9, `SIGTERM` 0 of 15; `spec091_exit.py` 5, 5 and 5 with
 `after_shutdown=1` in the latter two; `spec091_fork.py` no child row.
 
+## Diff review, execution frame
+
+The extra review in the execution frame found the mechanism correct, `Worker._offer` matching
+`queue.Queue.put` on 3.12 and 3.13 in a differential test and the ledger exact under stress, and
+five findings, each fixed with a test its mutant reddens:
+
+- **A full queue at the stop left an open span's logs neither delivered nor counted**
+  (`exit_full.py`: 0 of 5, `open_spans=6`, no counter). The exit drain's one sweep now hands in past
+  `max_queue` (`Worker._hand_in_at_exit`, `_offer(past_capacity=True)`), since that drain is the
+  queue's only consumer and fixes its bound right after; the mutex bound is kept. FR-003 says so.
+  Test: `test_the_exit_sweep_ships_an_open_span_past_a_full_queue`; the mutant that keeps the
+  capacity check at exit is killed.
+- **Neither restore position was pinned.** Appending a refused take, or the own sweep's refused
+  buffer, instead of restoring it at `held` or at the front survived the suite while breaking
+  `span.end`-last. Tests: `test_a_refused_take_goes_back_before_what_the_owner_appended` and
+  `test_an_own_sweep_puts_its_buffer_back_before_a_sharing_threads_append`, each asserting the
+  delivered order; both append mutants are killed.
+- **The `break` after a refused offer was not pinned.** With 20 open spans and the queue's mutex
+  held elsewhere, continuing past a refusal held the hold about a second, against about one
+  `_SWEEP_WAIT`. Test: `test_a_refused_offer_stops_the_sweep_so_the_hold_is_soon_free` (under
+  0.5 s); the `continue` mutant is killed.
+- **The prose claimed more than the mutex bound does.** `Worker._offer`'s docstring,
+  `_sweep_registered`'s and FR-001 now say what it does: it keeps a sweep from waiting for ever on a
+  thread inside the queue's section, so a thread there that then takes the hold gets it, and it
+  does not rescue a span closed inside that section.
+- **The mutex test hung its teardown under its own mutant.** Thread A now takes the hold with a
+  bounded wait and lets go of the mutex on expiry, so the unbounded-wait mutant fails on the
+  test's assertion (exit 1) instead of deadlocking teardown.
+
 ## Residuals and known gaps
 
 - **Accepted, in `architecture.md` §13:** an asynchronous `BaseException` between a successful put

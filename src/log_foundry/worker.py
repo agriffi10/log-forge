@@ -1272,7 +1272,12 @@ class Worker:
             )
 
     def _offer(
-        self, events: list[dict[str, object]], *, count_retired: bool, wait: float = _SWEEP_WAIT
+        self,
+        events: list[dict[str, object]],
+        *,
+        count_retired: bool,
+        wait: float = _SWEEP_WAIT,
+        past_capacity: bool = False,
     ) -> int | None:
         """Puts a sweep's take on the queue if there is room, never dropping and never blocking.
 
@@ -1289,17 +1294,28 @@ class Worker:
           will ship it. Overflowing instead dropped 6,000
           of 60,000 events with 12,000 spans open (``r_many_spans.py``).
         - **It never waits unboundedly for a lock**, because the caller holds the sweep hold. A
-          collector callback inside another thread's queue section, ``Condition.notify``
-          allocating say, can close a traced span and wait on that hold, while a sweep waiting on
-          the mutex waits on that thread: every close in the process then hung
-          (``r_mutex_cycle.py``). The worker's ``_lock`` is not taken at all: there is no overflow
-          to count, and the retirement read's count is returned for the caller to make through
-          :meth:`_settle_late` once the hold is released.
+          thread inside the queue's section that then takes the hold, as ``_abandon`` or
+          ``continue_trace()`` would from a collector callback there, waited on a sweep that waited
+          on it; the bound lets the sweep give up and release the hold, and keeps the drain from
+          waiting for ever. It does not rescue a span **closed** inside the queue's section: that
+          close's own submit then waits on the mutex its thread holds, a plain ``Lock``, as it did
+          before SPEC-091 (``r_mutex_cycle.py``, ``architecture.md`` §13). The worker's ``_lock``
+          is not taken at all: there is no overflow to count, and the retirement read's count is
+          returned for the caller to make through :meth:`_settle_late` once the hold is released.
+
+        **At exit the capacity check is skipped** (diff review, execution frame). The exit drain's
+        one sweep passes ``past_capacity=True``: the drain thread is the queue's only consumer, and
+        it fixes its bound on what it takes right after this sweep, so a put past ``max_queue``
+        there costs at most the open spans' takes once. Refused on a full queue, those takes stayed
+        on their spans, and a span the process never closes, a daemon thread's, lost them
+        uncounted: 0 of 5 with the queue full at ``shutdown()`` (``exit_full.py``).
 
         Args:
           events: One span's take, offered whole as one submission.
           count_retired: Whether a put after ``shutdown()`` began is to be counted as late.
           wait: The longest wait for the queue's mutex, in seconds.
+          past_capacity: Whether to put whatever the queue holds, which only the exit drain's
+            sweep asks for.
 
         Returns:
           ``None`` when the mutex was not free within ``wait`` and :data:`QUEUE_FULL` when the
@@ -1313,7 +1329,7 @@ class Worker:
         if not q.mutex.acquire(timeout=wait):
             return None
         try:
-            if 0 < q.maxsize <= q._qsize():
+            if not past_capacity and 0 < q.maxsize <= q._qsize():
                 return QUEUE_FULL
             q._put(events)
             q.unfinished_tasks += 1
@@ -1380,7 +1396,25 @@ class Worker:
         """
         return self._offer(events, count_retired=False)
 
-    def _run_sweep(self) -> int | None:
+    def _hand_in_at_exit(self, events: list[dict[str, object]]) -> int | None:
+        """Offers a take the exit drain's one sweep made, past the queue's capacity.
+
+        The exit drain is about to take what the queue holds and nothing reads it afterwards, so a
+        full queue there must not leave the open spans' events where no close may come for them
+        (:meth:`_offer`). The mutex is still taken with a bounded wait.
+
+        Args:
+          events: One open span's take.
+
+        Returns:
+          What :meth:`_offer` returned: ``None`` when the mutex was not free in time, else 0.
+
+        Raises:
+          None.
+        """
+        return self._offer(events, count_retired=False, past_capacity=True)
+
+    def _run_sweep(self, *, at_exit: bool = False) -> int | None:
         """Sweeps every open span into this queue from the drain thread, absorbing a fault.
 
         SPEC-091 FR-002. The sweep is the callable the owner passed as ``sweep=``,
@@ -1393,7 +1427,8 @@ class Worker:
         absorbed and announced by type; the events it had not yet taken stay on their spans.
 
         Args:
-          None.
+          at_exit: Whether this is the exit drain's sweep, which hands in past the queue's
+            capacity (:meth:`_hand_in_at_exit`).
 
         Returns:
           The events handed in, 0 when there is no sweep or it failed, and ``None`` when the
@@ -1407,7 +1442,8 @@ class Worker:
         if sweep is None:
             return 0
         try:
-            result = sweep(self._hand_in, wait=_SWEEP_WAIT)
+            hand_in = self._hand_in_at_exit if at_exit else self._hand_in
+            result = sweep(hand_in, wait=_SWEEP_WAIT)
         except Exception as exc:
             _diag.absorbed("sweeping open spans", exc, "events not yet taken stay on their spans")
             return 0
@@ -3098,7 +3134,11 @@ class Worker:
         ship in the exit batches by SPEC-090's rule and under its budget. ``span.start`` stays
         held, so a span still open then ships its boundary events later, counted after shutdown,
         or not at all if the process ends first. The attempt waits for the sweep hold no longer
-        than the steady drain does; a span whose events it could not take keeps them.
+        than the steady drain does; a span whose events it could not take keeps them. It hands in
+        **past ``max_queue``** (:meth:`_hand_in_at_exit`): this drain is the queue's only consumer
+        and reads its bound right after, so a full queue at the stop no longer leaves a daemon
+        thread's span with its events and no close to ship them, which delivered 0 of 5, uncounted
+        (diff review, execution frame).
 
         **It takes at most the entries the queue held when it began**, read ~~in its first
         statement~~ right after that sweep, so a caller that keeps logging after ``shutdown()``
@@ -3129,7 +3169,7 @@ class Worker:
           BaseException: Whatever an exit batch raises; :meth:`_run` is the guard.
         """
         if self._sweep is not None:
-            self._run_sweep()
+            self._run_sweep(at_exit=True)
         budget = self._queue.qsize()
         try:
             while budget > 0:

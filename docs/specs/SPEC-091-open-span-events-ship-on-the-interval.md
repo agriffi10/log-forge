@@ -133,9 +133,15 @@ queue's mutex acquired for at most `_SWEEP_WAIT`. A full queue, or a mutex not f
 nothing: the take goes back on its span at `held`, before anything the owner appended meanwhile,
 nothing is credited, and the pass stops. Events left on a span are safe, since the close ships them.
 No other lock is taken under the hold: the late-submission count and its line, a fault's
-`in_span_lost` debit, and a deferred close's submit all run once the hold is released. The bound on
+`in_span_lost` debit, and a deferred close's submit all run once the hold is released. ~~The bound on
 the mutex closes a deadlock across threads: a collector callback inside another thread's queue
-section can wait on the hold while the sweep waits on that section (frame 2's `r_mutex_cycle.py`).
+section can wait on the hold while the sweep waits on that section (frame 2's `r_mutex_cycle.py`).~~
+The bound on the mutex keeps the sweep from waiting for ever on a thread inside the queue's section,
+so a thread there that then takes the hold, as `_abandon` or `continue_trace()` would from a
+collector callback, gets it once the sweep gives up. It does not rescue a span closed inside that
+section: the close's own submit waits on the mutex its thread holds, a plain `Lock`, which hangs on
+the base `33a44e99` too, so `r_mutex_cycle.py` still reports a hang (revised 2026-11-17, the
+execution review: the struck sentence claimed more than the bound does).
 The caller's own sweep in `flush()` offers under the same bound and puts its buffer back when the
 mutex is not free, reporting `"abandoned"`; on a full queue it keeps SPEC-089 FR-003 AC-3's
 overflow, dropped and counted, with the count made after the hold.
@@ -430,7 +436,11 @@ thread and never calls sink code while it holds `_sweep_lock`.
   daemon thread's span with 5 buffered events when the main thread returned delivered 5, where
   today it delivers 0. The exit drain's sweep makes one attempt with the same bounded wait as the
   drain's (FR-002). A span whose lock it could not take keeps its events, counted after shutdown
-  if it closes later (added 2026-11-17).
+  if it closes later (added 2026-11-17). Its hand-in puts **past `max_queue`**: the drain thread is
+  the queue's only consumer and fixes its bound right after, so a full queue at the stop costs at
+  most the open spans' takes once, where a refusal left a span the process never closes, a daemon
+  thread's, with its events and no counter, 0 of 5 delivered (added 2026-11-17, the execution
+  review's `exit_full.py`).
 - **A stopped worker.** Once the drain thread has ended, nothing sweeps. A span that closes then
   submits to the retired worker and is counted in `submitted_after_shutdown`, as today; a `flush()`
   then sweeps every registered span into that worker with the same count. A drain thread that died

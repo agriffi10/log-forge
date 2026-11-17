@@ -344,8 +344,10 @@ def _sweep_registered(hand_in: _HandIn, *, wait: float | None = None) -> _SweepR
     in~~: with one submission per span and a queue of 10,000 submissions, 12,000 open spans each
     holding events overflowed 6,000 submissions in one pass (``r_many_spans.py 12000 3``: 54,000 of
     60,000 delivered), where the code before SPEC-091 delivered all 60,000. The bound on the queue's
-    lock closes a deadlock across threads: a collector callback inside another thread's queue
-    section can close a span and wait on this hold, while this sweep waits on that section.
+    lock keeps a sweep from waiting for ever on a thread inside that lock's section, so a thread
+    there that then takes this hold, as ``_abandon`` or ``continue_trace()`` would from a collector
+    callback, gets it once the sweep gives up. It does not rescue a span closed inside that
+    section, whose own submit waits on the lock its thread holds (``architecture.md`` §13).
 
     The slice and the ``del`` are outside the ``try``, so a fault there leaves the events where they
     were. A fault in ``hand_in`` after the ``del`` means the taken events are on neither the span
