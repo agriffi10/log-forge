@@ -45,10 +45,12 @@ round where something was published. A publish abandoned at the deadline stays `
 `ACCEPTED` where a core confirmation judges it, and is never resent. A round that published nothing
 is answered whole, every event `RETRYABLE` and sink-counted with its `SETTLED_LAST` line (SPEC-088),
 and that holds for a round resending a tail: when such a round's only publish raises, the next round
-resends it and it is counted once per round it raised in, although a JetStream ack wait that expired
-may have persisted it. That is the JetStream asymmetry invariant 2 records, which before SPEC-102
-could arise only in a batch's first round. It closes only with the `Nats-Msg-Id` header, §12's own
-item.
+resends it and it is counted in `failed` once per round it raised in, in either mode, which before
+SPEC-102 could arise only in a batch's first round. For a deterministic raise, such as nats-py's
+`MaxPayloadError` or `OutboundBufferLimitError`, that is an over-count of `failed` only, which the
+event ledger counts once: invariant 2's NATS exception, 1.x's own per-call count. For a JetStream
+ack wait that expired it is also the asymmetry invariant 2 records, since the server may have
+persisted the event, which closes only with the `Nats-Msg-Id` header, §12's own item.
 
 **Rejected.** A run-context signal telling a resend round from a first round, so that a resend
 round's raised publish could stay `REJECTED`: declined by the orchestrating session at the spec

@@ -98,10 +98,15 @@ wait (`DRIVER_DEADLINE_MARGIN`; before that margin the two tied and every such w
 abandoned, SPEC-061's diff review frame 3); a publish the driver never returns from — a force-flush
 into a peer that stopped reading, or a driver ignoring its own timeout — is abandoned, counted as
 unconfirmed, and never retried. Both mean the same thing — no ack, and the event may have been
-persisted — so the first can duplicate while the second can lose. Since SPEC-102 the first also
-occurs in a round that resends a batch's unattempted tail and publishes nothing: such a round is
-answered whole like any round that publishes nothing, so its raised publish is resent and counted
-once per round it raised in, where before it could happen only in a batch's first round. The
+persisted — so the first can duplicate while the second can lose. Since SPEC-102 the resend of a
+raised publish also occurs in a round that resends a batch's unattempted tail and publishes
+nothing: such a round is answered whole like any round that publishes nothing, so a publish that
+raised in it, in either mode, is resent by the next round and counted once per round it raised in,
+where before that could happen only in a batch's first round. For an expired JetStream ack wait
+that is the duplicating half above, since the server may have persisted the event; for any other
+raise, a deterministic one such as the driver's `MaxPayloadError` or `OutboundBufferLimitError`
+included, it is an over-count of `failed` alone, which this invariant records below as `NATSSink`'s
+per-call count. The
 closure is `architecture.md` §12's `Nats-Msg-Id` deduplication item, which
 makes a retry safe.
 At every shipped site that decides a per-event drop, a `dropped` count is made only by an `emit`
@@ -166,8 +171,11 @@ acquisition, so an engine sink's drop is counted only by a run that settled, and
 sink, a NATS latch, an SQS batch whose every id callable raised, and since SPEC-075 a wrapper call
 whose every event's predicate or transform raised — is marked on the run context and
 counted by its catcher alone; `NATSSink` registers 1.x's own per-publish counts for a round in which
-nothing was published, so its `failed` still moves once per raised publish per call, and counts and
-announces the round's unattempted events itself only when the run settles on that round, which has
+nothing was published, so its `failed` still moves once per raised publish per call — since
+SPEC-102 that includes a round resending a batch's unattempted tail, so an event whose publish
+raises in several resend rounds is counted in `failed` once per round, in either mode and for a
+deterministic raise too, a pure over-count of `failed` since the ledger counts the event once —
+and counts and announces the round's unattempted events itself only when the run settles on that round, which has
 no catcher (`When.SETTLED_LAST`). A sink whose own counters count something other than events — `HTTPSink.failed` counts
 requests — registers them on the engine's run context, which commits them once per run through
 one `Deferral` per owner, `SETTLED` for a drop.

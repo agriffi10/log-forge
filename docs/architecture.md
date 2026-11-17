@@ -1222,11 +1222,15 @@ close it.
   budget caps does, inside the sink's own wait) raises and its batch can be retried by the
   worker when nothing else in it landed, while a publish the driver never returns from is
   abandoned and counted, never retried (`docs/invariants.md`, invariant 2's recorded
-  exception). The same header closes both. Since SPEC-102 the first half reaches further: a
-  round that resends a batch's unattempted tail and publishes nothing is answered whole, like any
-  round that publishes nothing, so a publish whose ack wait expired in it is resent by the next
-  round and counted once per round it raised in, although the server may have persisted it. Before
-  SPEC-102 that could happen only in a batch's first round.
+  exception). The same header closes both. Since SPEC-102 the resend of a raised publish reaches
+  further: a round that resends a batch's unattempted tail and publishes nothing is answered whole,
+  like any round that publishes nothing, so a publish that raised in it, in either mode, is resent
+  by the next round and counted in `failed` once per round it raised in. Before SPEC-102 that could
+  happen only in a batch's first round. For a JetStream ack wait that expired it is the duplicating
+  half of this item, since the server may have persisted the event; for any other raise, a
+  deterministic one such as nats-py's `MaxPayloadError` or `OutboundBufferLimitError` included, it
+  is an over-count of `failed` only, which the event ledger counts once (invariant 2's NATS
+  exception). The header closes the first; the second is 1.x's own per-call count.
 - **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
   A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
   it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were

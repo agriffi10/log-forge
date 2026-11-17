@@ -66,6 +66,18 @@ one abandoned line and `lost 13` and `lost 5` `publish_timeout` lines, its round
 revised, since nothing in either was silent. Measured rates, none a threshold: 19 of 20 on
 3.13.1 and 3 of 3 on 3.12.12 here, and 58 of 60 in the review.
 
+**Diff review frame 2's reproduction.** The wider reach is not JetStream-only: a resend round in
+which every publish raises is answered whole and counts each raise, in either mode. With rounds
+`[["late-ok"], ["raise"], ["raise"]]` and `max_retries=2` the rounds were offered `[[0,1],[1],[1]]`,
+event 1 was never delivered, `failed` read 2 and `lost 1 event(s); NATSSink publish,
+RuntimeError` was written twice, where at `03dbf502` the event was `REJECTED` once with one
+`publish_timeout` line. The ledger still balances (`sink_lost` 1): this is 1.x's own per-call
+count, which the 1.x fixture's `every-publish-raising-core-injected` and
+`every-event-unencodable-core-injected` worker cells record as `failed` 9 for 3 events, and which
+invariant 2 records as `NATSSink`'s exception. For a deterministic raise it is an over-count of
+`failed` only; for an expired JetStream ack wait it is also the duplicating asymmetry. Invariant 2,
+§12's `Nats-Msg-Id` item, the release notes and the decision now say both.
+
 ## Verification
 
 - At `00ec9029`, every gate exited 0: ruff, mypy, spec-lint, spec-lint-test, docs-lint,
