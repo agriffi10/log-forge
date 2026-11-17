@@ -2996,7 +2996,8 @@ class Worker:
         this module gains no lock site. The table is cleared in place, so whoever takes a row
         writes it and no one writes it twice. :meth:`stop` passes ``close``, which writes every
         later record at once and bounds the wait for ``_diag``'s lock; the drain thread's take
-        waits normally.
+        waits in steps and gives way once the table is closed, so neither waits on a thread that
+        holds the lock inside its own take (``_diag.take_folded``).
 
         Args:
           close: Whether this is :meth:`stop`'s take after an expired join, which closes the fold.

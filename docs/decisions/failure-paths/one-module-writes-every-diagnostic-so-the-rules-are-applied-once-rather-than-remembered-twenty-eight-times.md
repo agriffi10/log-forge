@@ -13,14 +13,21 @@ batch's sink call: the engine run, or each 1.x `emit`, and nothing else. Inside 
 `take_folded`, `_diag`'s fifth stderr write, writes each row once with its summed count and the
 tail `; <k> line(s) folded at exit`. That happens where SPEC-090's exit tallies are written, before
 them, or before `stop()`'s expiry line. So a line inside the window is written later than its
-counter moved, which the record-first rule allows. It is never lost:
+counter moved, which the record-first rule allows. Its count is never lost, and its line is
+lost only in one case:
 
 - an expired join closes the fold, so a wedged call's later lines are written at once;
-- a recorder that cannot take `_FOLD_LOCK` at once writes at once;
-- a forked child withdraws the window as `_fork`'s first step.
+- a recorder that cannot take `_FOLD_LOCK` at once writes at once, and no take waits on it
+  without bound: `stop()`'s closing take waits 0.1 s, and the drain's take gives way once the
+  table is closed;
+- a forked child withdraws the window as `_fork`'s first step;
+- the one case: rows a timed-out closing take leaves are written only if the drain's take
+  reaches the lock, so at interpreter exit after an expired join, where the drain is a daemon
+  thread, their lines are not written. `health()` still counts their losses.
 
-The worker's own lines are never folded. Neither is a running total, which `lost` marks with
-`running_total=True`, because summing running totals overstates a loss. The fold check is
+The worker's own lines are never folded. Neither is a count that is not an increment, a running
+total or a snapshot, which `lost` marks with `running_total=True`, because summing either
+overstates a loss. The fold check is
 inline, so a line outside a window calls nothing the writer did not call before. Why the fold
 replaced growing a dead sink's exit batches is *A backlog drains in larger batches, and capacity
 is not a setting* (`docs/decisions/pipeline/`).

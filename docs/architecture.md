@@ -2117,8 +2117,8 @@ close made while its thread holds the worker queue's mutex does not return eithe
   abandoned exit batch on, the lines a sink or the delivery engine writes inside each later exit
   batch's sink call are folded into one line per distinct text. Each folded line carries its
   summed count and ends `; <k> line(s) folded at exit`, and is written with the exit tallies, or
-  by `stop()` before its expiry line. The worker's own lines and every running total are never
-  folded. The calls are unchanged, and Andrew accepted that on 2026-11-17 ("Fold lines, keep
+  by `stop()` before its expiry line. The worker's own lines and every count that is not an
+  increment, a running total or a snapshot, are never folded. The calls are unchanged, and Andrew accepted that on 2026-11-17 ("Fold lines, keep
   batches"). `spec090_dead_http_exit.py zero 10000 3`, before at `4599a0c5` and after at
   `f28f17d4`, on 3.13.1 and 3.12.12 alike: 16,016 opener calls, 1,004 lines and `failed_batches`
   1,001 before; 16,016, 6 and 1,001 after. `cap` mode: 321, 22 and 20 before; 321, 4 and 20 after.

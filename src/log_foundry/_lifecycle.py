@@ -5742,6 +5742,12 @@ def _check_ledger() -> None:
     first credit. The line itself is written after the lock is released, so a wedged stderr holds
     no lock.
 
+    **The count is a snapshot, so it passes ``running_total=True``** (SPEC-103 diff review frame
+    2). A sink that calls ``shutdown()`` from its ``emit`` during the exit reaches this inside an
+    exit fold window, where summing snapshots overstated the imbalance: measured, ``lost 123``
+    folded from three lines against a true 42. ``tests/test_diag.py`` holds this site on the
+    snapshot roster.
+
     Args:
       None.
 
@@ -5764,6 +5770,7 @@ def _check_ledger() -> None:
             unaccounted,
             "the event ledger does not balance at shutdown(): these are in no term; "
             "health().events.unaccounted counts them",
+            running_total=True,
         )
     except Exception as exc:
         _diag.absorbed("checking the event ledger", exc)

@@ -28,7 +28,8 @@ abandoned exit batch on, the worker opens a fold window around each later exit b
 text their line would carry, without its count, instead of writing it. :func:`take_folded` writes
 one line per key at the end of the exit, or before ``stop()``'s expiry line, each ending in
 ``line(s) folded at exit``. ``rejected`` never folds. A ``lost`` call that passes
-``running_total=True`` is written at once, because summing running totals overstates a loss.
+``running_total=True`` is written at once, because summing a count that is not an increment — a
+running total or a snapshot — overstates a loss.
 The window is a thread-local, not a ``ContextVar``: a ``ContextVar`` would follow
 ``asyncio.to_thread`` into a sink's own thread, whose lines must be written at once, and a forked
 child's withdrawal would reach only the context current at the fork. ``_FOLD_LOCK`` guards the
@@ -183,15 +184,24 @@ def is_a(value: object, classes: type | tuple[type, ...]) -> bool:
 _FOLD_TAIL = "line(s) folded at exit"
 
 _CLOSING_TAKE_WAIT = 0.1
-"""Seconds ``stop()``'s closing take waits for ``_FOLD_LOCK`` before it leaves the rows (SPEC-103).
+"""Seconds a take waits for ``_FOLD_LOCK`` at a time (SPEC-103).
 
 The lock is held for a dictionary update, microseconds, so a holder still inside it after this is
-stuck, most likely in a finalizer the collector ran inside the section, and waiting longer buys
-nothing. ``stop()`` reaches its take only once its join has expired, with the caller's budget
-spent, so it must not wait unboundedly before its expiry line (invariant 3). A tenth of a second
-is the margin the worker already reserves past a predicted attempt (``worker._JOIN_MARGIN``), so
-the overrun it can add is one the budget's own arithmetic tolerates. The rows a timed-out take
-leaves are written by the drain thread's own take at the end of the exit, so none is lost.
+stuck, most likely in a finalizer or a signal handler running inside the section, and waiting
+longer buys nothing. ``stop()`` reaches its take only once its join has expired, with the caller's
+budget spent, so it must not wait unboundedly before its expiry line (invariant 3). A tenth of a
+second is the margin the worker already reserves past a predicted attempt
+(``worker._JOIN_MARGIN``), so the overrun it can add is one the budget's own arithmetic tolerates.
+The drain thread's take waits in steps of this length too, and gives way once the table is closed
+(:func:`take_folded`).
+
+**Rows a timed-out closing take leaves are not always written.** They stay in the table, and the
+drain thread's take writes them if it reaches the lock. It does not when the holder is the drain
+thread itself, stuck inside the section, when the holder is still inside it as the drain arrives,
+or when the process ends first: after an expired join at interpreter exit the drain is a daemon
+thread and is stopped before its take. Those rows' losses are still counted, because every
+caller moved its counter before the line (record first, announce second), so ``health()`` holds
+them; only their lines are missing.
 """
 
 
@@ -306,13 +316,21 @@ def take_folded(table: FoldTable, *, close: bool) -> None:
     The fifth stderr write. The rows are copied and cleared under ``_FOLD_LOCK``, then written
     outside it in first-seen order, each line ending in ``; <k> line(s) folded at exit`` after
     the detail is bounded, so the bound never cuts the tail. A ``lost`` line sums the counts, an
-    ``absorbed`` line counts the failures, a ``pending`` line names its detail. **Closing never
-    waits unboundedly.** With ``close`` the table is marked closed first, by a plain store
-    without the lock, so every later record is written at once; the lock is then waited on for
-    :data:`_CLOSING_TAKE_WAIT` at most, and on a timeout the rows stay for the drain thread's own
-    take at the end of the exit. Without ``close`` — the drain thread's take — the lock is waited
-    on normally, and taken even when the table is empty, so a forked child whose inherited lock
-    the roster failed to replace blocks visibly rather than skipping the take.
+    ``absorbed`` line counts the failures, a ``pending`` line names its detail.
+
+    **No take waits unboundedly.** With ``close`` — ``stop()``'s take after an expired join — the
+    table is marked closed first, by a plain store without the lock, so every later record is
+    written at once; the lock is then waited on for :data:`_CLOSING_TAKE_WAIT` at most, and on a
+    timeout the rows stay in the table (:data:`_CLOSING_TAKE_WAIT` says when they are written and
+    when they are not). Without ``close`` — the drain thread's take at the end of the exit — the
+    lock is waited on in steps of :data:`_CLOSING_TAKE_WAIT`, and the take gives way as soon as
+    the table is closed, since a closer then holds or has held the rows. An unbounded wait here
+    deadlocked (diff review frame 2): the ``shutdown()`` caller holds the lock inside its closing
+    take, a signal handler run there calls ``shutdown()`` again, loses the claim and waits for the
+    drain to settle, and the drain waited for the lock the handler's own thread held. The take
+    asks for the lock even when the table is empty, so a forked child whose inherited lock the
+    roster failed to replace cannot finish its exit until its closing take gives up, which
+    ``tests/test_fork_roster.py`` observes as an expired ``shutdown()``.
 
     Args:
       table: The worker's table.
@@ -329,7 +347,9 @@ def take_folded(table: FoldTable, *, close: bool) -> None:
         if not _FOLD_LOCK.acquire(timeout=_CLOSING_TAKE_WAIT):
             return
     else:
-        _FOLD_LOCK.acquire()
+        while not _FOLD_LOCK.acquire(timeout=_CLOSING_TAKE_WAIT):
+            if table.closed:
+                return
     try:
         rows = list(table.rows.items())
         table.rows.clear()
@@ -416,10 +436,13 @@ def lost(what: str, count: int, detail: str = "", *, running_total: bool = False
     construction and the counter ``health()`` reports must not be able to ride on it.
 
     Inside a fold window (SPEC-103) the loss is recorded instead, keyed on the unit and the
-    rendered detail, and its count summed into the row. A running total is never folded: summing
-    1 and then 1,000 would read 1,001 against a true 1,000, so ``running_total`` writes at once,
-    and ``tests/test_diag.py`` requires it of every ``lost`` call in a function that reads
-    :data:`WARN_EVERY`. A count that is not an exact ``int`` is written at once too, so nothing
+    rendered detail, and its count summed into the row. A count that is not an increment is never
+    folded: summing a running total of 1 and then 1,000 would read 1,001 against a true 1,000, and
+    summing a snapshot overstates it the same way, so ``running_total`` writes at once.
+    ``tests/test_diag.py`` requires it of every ``lost`` call in a function that reads
+    :data:`WARN_EVERY`, and of every site on its snapshot roster, which holds the sites whose
+    count is a reading rather than an increment. A count that is not an exact ``int`` is written
+    at once too, so nothing
     but ``int`` arithmetic runs under ``_FOLD_LOCK``. The check is inline, so a line outside a
     window costs no call the writer did not already make.
 
@@ -432,7 +455,8 @@ def lost(what: str, count: int, detail: str = "", *, running_total: bool = False
         thousand, and such a site says so in ``detail``.
       detail: Optional circumstances — the sink's class name, the attempt count, an
         ``errno``, an exception type. Escaped and truncated to ``_MAX_DETAIL``.
-      running_total: Whether ``count`` is a running total, which a fold window writes at once.
+      running_total: Whether ``count`` is a running total or a snapshot rather than an
+        increment, which a fold window writes at once.
 
     Returns:
       None.

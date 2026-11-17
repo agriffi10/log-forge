@@ -131,6 +131,17 @@ can reach the last one. A roster derived from all of `src/` keeps the set comple
 carries its running total in its detail, so each of their lines is its own key and nothing is
 summed.
 
+**Nor is a snapshot** (diff review frame 2). `_lifecycle._check_ledger` writes `lost <unaccounted>
+event(s); the event ledger does not balance…` from a ledger reading at the end of every
+`shutdown()`, and a sink calling `shutdown()` from its `emit` during the exit reaches it inside the
+window: folded, three such lines read `lost 123` against a true 42. It passes
+`running_total=True` too, the keyword meaning a count that is not an increment. A snapshot cannot
+be derived as a throttled site can, so `tests/test_diag.py` lists it on a snapshot roster, and
+checks that every listed site passes the keyword, that no entry is stale, and that no site passes
+it unless one of the two rosters says why. A sweep of every `_diag.lost` call in `src/` at that
+review found no other count that is not an increment; a new snapshot site is added to the roster
+by hand.
+
 **How a row is recorded.** The table is a `_diag.FoldTable` the worker owns, `Worker._exit_fold`.
 It is guarded by a lock `_diag` owns, `_diag._FOLD_LOCK`. **The fold never waits on it.** The
 library takes no other lock under it, but it is not a leaf in the strict sense: the collector can
@@ -170,9 +181,19 @@ the keys were first recorded. **The take never waits unboundedly.** `stop()`'s t
 `close`, first sets `closed` without the lock, a plain attribute store, so every later record is
 written at once; it then waits for the lock 0.1 s at most (`_diag._CLOSING_TAKE_WAIT`, the
 margin the worker already reserves past a predicted attempt). The section is a dictionary update,
-so a holder still inside it after that is stuck, most likely in a finalizer; on a timeout the
-rows stay for the drain thread's take at the end of the exit, and none is lost from the table.
-The drain thread's own take waits normally, and takes the lock even for an empty table. In place, never rebound: the open window holds the same object,
+so a holder still inside it after that is stuck, most likely in a finalizer or a signal
+handler. On a timeout the rows stay in the table. ~~the rows stay for the drain thread's take at
+the end of the exit, and none is lost from the table~~: the drain thread's take writes them only
+if it reaches the lock. It does not when the drain thread is itself the stuck holder, or when
+the process ends first, as at interpreter exit after an expired join, where the drain is a daemon
+thread. Those losses are still counted, by the record-first rule, so `health()` holds them; only
+their lines are missing. ~~The drain thread's own take waits normally~~: the drain thread's take
+waits in steps of the same 0.1 s and gives way as soon as the table is closed, since a closer
+then holds or has held the rows. Unbounded, it deadlocked (diff review frame 2): the
+`shutdown()` caller holds the lock inside its closing take, a signal handler run there calls
+`shutdown()` again and waits for the drain to settle, and the drain waited for that thread's
+lock. It still asks for the lock even when the table is empty. The table is cleared in place,
+never rebound: the open window holds the same object,
 and a rebind would silently drop every row recorded after it. `_write_exit_tallies` calls it
 before it takes the abandon and decline tallies under its existing `with self._lock`, so the
 folded lines come first and `worker.py` gains no lock site. So the table is written, like the
@@ -649,3 +670,18 @@ budget through it.
   window is now withdrawn before it. The release notes' list of exceptions to a `>=1,<2` pin gains
   one, for code that counts or matches a sink's lines at exit. The before numbers are re-measured
   at `4599a0c5`, the build's base, where FR-003 named `6b9d50f6`: they read the same.
+- **2026-11-17, after the diff reviews**, every finding accepted.
+  - **The drain's take could deadlock behind `stop()`'s closing take** (invariant 3). A signal
+    handler run inside the closing take called `shutdown()`, lost the claim and waited for the
+    drain, whose take waited without bound for the handler's thread's lock: measured at
+    `60a988c1`, a nested `shutdown(4)` took 4.00 s, and `shutdown(None)` never returned. The
+    drain's take now waits in 0.1 s steps and gives way once the table is closed: 0.61 s.
+    ~~the rows stay for the drain thread's take at the end of the exit, and none is lost from the
+    table~~: those rows' lines are lost when the drain never reaches the lock, as at interpreter
+    exit after an expired join, though their counts are not. A forked child whose fold lock was
+    not replaced now shows it by its `shutdown()` expiring, not by hanging, and
+    `tests/test_fork_roster.py`'s control says so.
+  - **A snapshot count folded and was summed.** `_lifecycle._check_ledger` passes
+    `running_total=True`, and a snapshot roster holds it.
+  - **The never-waits guard covered one writer, then only by timing.** It is per writer, and
+    asserts each writer asks for the lock with `blocking=False`.

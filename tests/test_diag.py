@@ -1059,6 +1059,94 @@ def test_a_record_never_waits_on_the_fold_lock(writer: str, err: _Stderr) -> Non
     assert table.rows == {}
 
 
+class _RecordingLock:
+    """A stand-in for ``_FOLD_LOCK`` that records how it was asked for and is never free.
+
+    Attributes:
+      calls: The ``(args, kwargs)`` of every ``acquire`` call, in order.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def acquire(self, *args: object, **kwargs: object) -> bool:
+        """Records the call and refuses, as a lock held elsewhere would."""
+        self.calls.append((args, kwargs))
+        return False
+
+    def release(self) -> None:
+        """Never reached: nothing is acquired."""
+        raise AssertionError("released a lock that was never acquired")
+
+
+@pytest.mark.parametrize("writer", sorted(_EACH_WRITER))
+def test_each_writer_asks_for_the_fold_lock_without_waiting(
+    writer: str, err: _Stderr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each writer asks for ``_FOLD_LOCK`` with ``blocking=False`` and nothing else.
+
+    The timing test above passes a bounded wait shorter than its bound, such as
+    ``acquire(timeout=0.5)``, which still waits on the thread that holds the lock: a finalizer
+    re-entering there would stall for it on every line. So the call itself is asserted.
+    """
+    write, line = _EACH_WRITER[writer]
+    lock = _RecordingLock()
+    monkeypatch.setattr(_diag, "_FOLD_LOCK", lock)
+    table = _diag.FoldTable()
+    _folding(table, write)
+    assert lock.calls == [((), {"blocking": False})], f"{writer} asked for the lock: {lock.calls}"
+    assert err.getvalue() == line
+    assert table.rows == {}
+
+
+def test_the_drain_take_gives_way_once_the_table_is_closed(err: _Stderr) -> None:
+    """The drain's take returns once a closer has the table, rather than waiting on its lock.
+
+    The ``shutdown()`` caller holds the lock inside its closing take, a signal handler there can
+    call ``shutdown()`` again and wait for the drain to settle, and a drain take that waited for
+    the lock without bound then never returned (SPEC-103 diff review frame 2).
+    """
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("event", 3, "held by the closer"))
+    release, thread = _held_on_another_thread(_diag._FOLD_LOCK)
+    try:
+        table.closed = True
+        started = time.monotonic()
+        _diag.take_folded(table, close=False)
+        waited = time.monotonic() - started
+    finally:
+        release.set()
+        thread.join(5)
+    assert waited < _diag._CLOSING_TAKE_WAIT + 2.0, waited
+    assert list(table.rows) == [("lost", "event", "; held by the closer")], "the rows are kept"
+    assert err.getvalue() == ""
+
+
+def test_the_drain_take_keeps_waiting_while_the_table_is_open(err: _Stderr) -> None:
+    """While no closer has the table, the drain's take waits for the lock and then writes."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("event", 3, "waited for"))
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with _diag._FOLD_LOCK:
+            held.set()
+            release.wait(10)
+
+    holder = threading.Thread(target=hold, daemon=True)
+    holder.start()
+    assert held.wait(5)
+    taking = threading.Thread(target=_diag.take_folded, args=(table,), kwargs={"close": False})
+    taking.start()
+    taking.join(4 * _diag._CLOSING_TAKE_WAIT)
+    still_waiting = taking.is_alive()
+    release.set()
+    holder.join(5)
+    taking.join(5)
+    assert still_waiting, "the drain take gave up while the table was open"
+    assert err.getvalue() == f"log-foundry: lost 3 event(s); waited for; 1 {_TAIL}\n"
+
+
 def test_the_closing_take_waits_for_the_fold_lock_a_bounded_time(err: _Stderr) -> None:
     """``stop()``'s take closes the table at once and leaves the rows when the lock stays held."""
     table = _diag.FoldTable()
@@ -1308,3 +1396,112 @@ def test_the_running_total_roster_refuses_its_shapes(case: str) -> None:
 def test_the_running_total_roster_is_silent_on_its_shapes(case: str) -> None:
     """Half a gate's regressions are false positives: these must pass."""
     assert running_total_findings(_ROSTER_IS_SILENT[case], "fixture.py") == []
+
+
+# -- SPEC-103 diff review frame 2: a snapshot count is not an increment either ----------------
+
+_SNAPSHOT_SITES = frozenset({("_lifecycle.py", "_check_ledger")})
+"""The ``lost`` sites whose count is a reading rather than an increment, by file and function.
+
+A throttled running total is derived (``WARN_EVERY``); a snapshot cannot be, so it is listed.
+``_check_ledger`` writes ``unaccounted`` from a ledger reading at the end of every
+``shutdown()``, which a sink calling ``shutdown()`` from its ``emit`` reaches inside an exit fold
+window: folded, three such lines read ``lost 123`` against a true 42. A sweep of every
+``_diag.lost`` call in ``src/`` at SPEC-103's diff review found no other count that is not an
+increment. **A new snapshot site has to be added here by hand**; what the checks below hold is
+that each listed site passes ``running_total=True``, that no entry is stale, and that nothing
+passes it without one of the two rosters saying why.
+"""
+
+_SNAPSHOT_MISSING = "a snapshot lost call does not pass running_total=True"
+_SNAPSHOT_STALE = "a snapshot roster entry names no lost call"
+_RUNNING_TOTAL_UNLISTED = "running_total=True where neither roster says the count is not one"
+
+
+def snapshot_findings(
+    source: str, where: str, roster: frozenset[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    """The snapshot roster's refusals in one module, each ``(reason, site)``."""
+    findings: list[tuple[str, str]] = []
+    listed = {name for file, name in roster if file == where}
+    seen: set[str] = set()
+    throttled = {line for _name, line, _passes in throttled_lost_calls(source)}
+    for function in ast.walk(ast.parse(source)):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Call) and _is_lost_call(node)):
+                continue
+            site = f"{where}:{node.lineno} {function.name}"
+            if function.name in listed:
+                seen.add(function.name)
+                if not _passes_running_total(node):
+                    findings.append((_SNAPSHOT_MISSING, site))
+            elif _passes_running_total(node) and node.lineno not in throttled:
+                findings.append((_RUNNING_TOTAL_UNLISTED, site))
+    findings.extend((_SNAPSHOT_STALE, f"{where} {name}") for name in sorted(listed - seen))
+    return sorted(set(findings))
+
+
+def test_every_snapshot_lost_call_passes_running_total() -> None:
+    """Every listed snapshot site passes it, no entry is stale, and no other site passes it."""
+    findings = [
+        finding
+        for path in sorted(_SRC.rglob("*.py"))
+        for finding in snapshot_findings(
+            path.read_text(encoding="utf-8"), path.relative_to(_SRC).as_posix(), _SNAPSHOT_SITES
+        )
+    ]
+    assert findings == [], findings
+
+
+_FIXTURE_ROSTER = frozenset({("fixture.py", "reading")})
+
+_SNAPSHOT_REFUSES = {
+    "a listed site without the keyword": (
+        "from log_foundry import _diag\ndef reading(n):\n    _diag.lost('event', n)\n",
+        _SNAPSHOT_MISSING,
+    ),
+    "a listed function with no lost call": (
+        "from log_foundry import _diag\ndef reading(n):\n    return n\n",
+        _SNAPSHOT_STALE,
+    ),
+    "an unlisted site passing the keyword": (
+        (
+            "from log_foundry import _diag\ndef reading(n):\n"
+            "    _diag.lost('event', n, running_total=True)\n"
+            "def other(n):\n    _diag.lost('event', n, running_total=True)\n"
+        ),
+        _RUNNING_TOTAL_UNLISTED,
+    ),
+}
+
+_SNAPSHOT_IS_SILENT = {
+    "a listed site with the keyword": (
+        "from log_foundry import _diag\ndef reading(n):\n"
+        "    _diag.lost('event', n, running_total=True)\n"
+    ),
+    "an unlisted increment": (
+        "from log_foundry import _diag\ndef reading(n):\n    _diag.lost('event', n, running_total=True)\n"
+        "def other():\n    _diag.lost('event', 1)\n"
+    ),
+    "an unlisted throttled site with the keyword": (
+        "from log_foundry import _diag\ndef reading(n):\n    _diag.lost('event', n, running_total=True)\n"
+        "def other(n):\n    if n % _diag.WARN_EVERY == 0:\n"
+        "        _diag.lost('event', n, running_total=True)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SNAPSHOT_REFUSES))
+def test_the_snapshot_roster_refuses_its_shapes(case: str) -> None:
+    """Each shape is refused, for its own reason."""
+    source, reason = _SNAPSHOT_REFUSES[case]
+    findings = snapshot_findings(source, "fixture.py", _FIXTURE_ROSTER)
+    assert [found for found, _site in findings] == [reason], findings
+
+
+@pytest.mark.parametrize("case", sorted(_SNAPSHOT_IS_SILENT))
+def test_the_snapshot_roster_is_silent_on_its_shapes(case: str) -> None:
+    """Half a gate's regressions are false positives: these must pass."""
+    assert snapshot_findings(_SNAPSHOT_IS_SILENT[case], "fixture.py", _FIXTURE_ROSTER) == []

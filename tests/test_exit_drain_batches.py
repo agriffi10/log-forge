@@ -26,6 +26,7 @@ import collections
 import math
 import pathlib
 import re
+import signal
 import threading
 import time
 from typing import Any
@@ -1432,6 +1433,78 @@ def test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit
     )
     assert "folded at exit" in err, "the outer records still folded"
     assert worker._delivered + worker._batch_lost == 2 * 310, "an event was left uncounted"
+
+
+class _SignallingRows(dict[tuple[str, ...], list[int]]):
+    """A fold table's rows whose first read on the main thread raises ``SIGUSR1`` there.
+
+    ``stop()``'s closing take reads the rows while it holds ``_diag._FOLD_LOCK``, so the handler
+    runs inside that section, as any signal handler arriving there would.
+
+    Attributes:
+      raised: Whether the signal has been raised.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raised = False
+
+    def items(self) -> Any:
+        """Raises the signal once, on the main thread, then reads the rows."""
+        if not self.raised and threading.current_thread() is threading.main_thread():
+            self.raised = True
+            signal.raise_signal(signal.SIGUSR1)
+        return super().items()
+
+
+_NESTED_BUDGET = 5.0
+"""The budget of the ``shutdown()`` a signal handler calls inside the closing take, in seconds."""
+
+
+def test_a_shutdown_from_a_handler_inside_the_closing_take_is_not_held_by_the_drain(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-103 diff review frame 2 (invariant 3): the drain's take gives way to a closing take.
+
+    ``shutdown(0.5)``'s join expires while call 4 idles 1 s, so ``stop()``'s closing take runs
+    and holds ``_diag._FOLD_LOCK``. A ``SIGUSR1`` handler runs there and calls ``shutdown()``
+    again, which loses the claim and waits for the drain to settle. The drain, once call 4
+    returns, reaches its own take at the end of the exit. When that take waited for the lock
+    without bound, it waited on the handler's thread, and the handler waited on it: measured by
+    the reviewer, the nested call took its whole budget, or never returned with ``None``. Now the
+    take sees the table closed and gives way, so the nested call returns once call 4 does.
+    """
+    assert threading.current_thread() is threading.main_thread(), "the premise: signals land here"
+    _ten_span_batches(monkeypatch)
+    sink = _ExitSink(fails=True)
+    sink.on_call = lambda call: threading.Event().wait(1.0) if call == 4 else None
+    worker = _at_exit(sink, 60, max_retries=0)
+    rows = _SignallingRows()
+    worker._exit_fold.rows = rows
+    nested: list[tuple[float, bool, bool]] = []
+
+    def handler(signum: int, frame: object) -> None:
+        held, closed = _diag._FOLD_LOCK.locked(), worker._exit_fold.closed
+        started = time.monotonic()
+        log_foundry.shutdown(_NESTED_BUDGET)
+        nested.append((time.monotonic() - started, held, closed))
+
+    previous = signal.signal(signal.SIGUSR1, handler)
+    try:
+        retire_process(worker, 0.5)
+    finally:
+        signal.signal(signal.SIGUSR1, previous)
+        worker._thread.join(10.0)
+    capsys.readouterr()
+    assert rows.raised, "the premise: the closing take read the rows on the main thread"
+    assert len(nested) == 1, "the premise: the handler ran"
+    waited, held, closed = nested[0]
+    assert held and closed, "the premise: the handler ran inside the closing take"
+    assert waited < _NESTED_BUDGET - 2.0, (
+        f"the nested shutdown() waited {waited:.2f}s: the drain's take was held behind the lock "
+        f"the handler's own thread held"
+    )
+    assert not worker._thread.is_alive(), "the drain thread ended"
 
 
 # ---------------------------------------------------------------------------- SPEC-103 FR-002

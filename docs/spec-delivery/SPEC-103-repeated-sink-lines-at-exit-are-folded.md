@@ -12,7 +12,14 @@
     closes the fold.
   - A recorder never waits on `_diag._FOLD_LOCK`. One that cannot take it writes at once, which
     is what keeps a `__del__` that writes a line inside the locked section from deadlocking.
-  - `lost(..., running_total=True)` is never folded, and is passed at the three throttled sites.
+  - No take waits on it without bound either. `stop()`'s closing take waits 0.1 s at most. The
+    drain's take waits in 0.1 s steps and gives way once the table is closed, so a signal handler
+    that calls `shutdown()` inside the closing take cannot hold the drain (diff review frame 2).
+    Rows a timed-out closing take leaves are written only if the drain's take reaches the lock;
+    at interpreter exit after an expired join they are not. Their losses are still counted.
+  - `lost(..., running_total=True)` is never folded. It is passed at the three throttled sites
+    and at `_lifecycle._check_ledger`, whose count is a snapshot. A sweep of every `_diag.lost`
+    in `src/` found no other count that is not an increment.
   - A forked child withdraws the window as `_fork._reinit_after_fork`'s first step.
     `_FOLD_LOCK` joined `_GLOBAL_PRIMITIVES` and the lifecycle inventory.
 - **Timing and batching are today's** (FR-002): the SQS slowdown guard, the exit budget, the
@@ -92,3 +99,10 @@
   "the drain thread deadlocked on the fold lock". ~~M24 (recorders block)~~, which blocked all
   three at once and so could not show that each is guarded, is replaced by those three. M25
   (every acquire blocks, the closing take's too) was killed with "stop() did not return".
+
+  After diff review frame 2, a recording stand-in for the lock asserts that each writer asks
+  with `blocking=False`. A bounded `acquire(timeout=0.5)` in each writer had survived the timing
+  test, and is now killed per writer ("asked for the lock: [((), {'timeout': 0.5})]"). An
+  unbounded drain take is killed by the signal-handler test ("the nested shutdown() waited
+  5.00s") and by a unit test. `_check_ledger` without the keyword is killed by the snapshot
+  roster.
