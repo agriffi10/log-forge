@@ -52,5 +52,7 @@
   `harness-error:batch-count` and the control moved none.
 - **Mutation sweep.** Eight planned mutants, seven killed. The survivor, `_limit` testing
   truthiness rather than `is None`, is equivalent: the only falsy `int`, 0, is refused at
-  construction. Four further mutants were run and killed.
+  construction. Four further mutants were run and killed: `_prepare` and `_bodies` judging by
+  `self.MAX_BYTES`, `_limit` ignoring the argument (each on both sinks), the floor off by one
+  on `SQSSink`, and the cap off by one on `SNSSink`.
 - The spec's "§8" was §9.1; the spec is corrected in its revision history.
