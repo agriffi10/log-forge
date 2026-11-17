@@ -746,6 +746,32 @@ def test_a_settled_family_run_writes_only_its_1x_lines(capsys: pytest.CaptureFix
 
 @pytest.mark.parametrize("lock", ["owner-lock", "engine-counters-lock"])
 def test_a_forked_child_commits_a_family_round_past_a_held_lock(lock: str) -> None:
+    """A child commits its round past a lock a parent thread held at the fork, and promptly.
+
+    The clock starts at :attr:`_Child.forked`, as ``fork`` returns, not before the helper,
+    because the helper's ``gc.collect()`` in the parent costs whatever the parent's heap costs to
+    walk, which is what made
+    ``test_sink_factory.test_the_at_fork_handler_never_calls_the_factory`` flaky late in full
+    serial runs; its docstring carries the measurement.
+
+    **That the lock was held at the fork is asserted, not inferred from the clock.** The parent
+    thread holds it for a bounded 5 s that starts before the helper, so a slow enough collection
+    lets it go before ``fork``, and the child then commits past a free lock and proves nothing.
+    The old clock happened to fail in that case; once it no longer spans the collection, only the
+    holder still being alive after the child returns says the lock was held throughout. Planting
+    a 5.5 s sleep just above the collection fails this test on that assertion. It is checked after
+    ``finished``, because a child that really blocks on the lock outlives the hold too, and must
+    read as the deadlock it is.
+
+    Args:
+      lock: Which of the sink's two locks a parent thread holds across the fork.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
     from test_fork_lifecycle import _held_by_a_parent_thread, run_in_child
 
     sink = HTTPSink("http://h", opener=Scripted(_status(400)))
@@ -763,13 +789,15 @@ def test_a_forked_child_commits_a_family_round_past_a_held_lock(lock: str) -> No
         return f"failed={sink.losses().failed}"
 
     try:
-        started = time.monotonic()
         child = run_in_child(emit_then_read, timeout=5)
+        held_throughout = holder.is_alive()
     finally:
         released.set()
         holder.join(5.0)
     assert child.finished, f"the child {child.ending}, having written {child.output!r}"
-    assert time.monotonic() - started < 5.0
+    assert held_throughout, "the parent's hold lapsed before the child returned"
+    assert child.forked is not None
+    assert time.monotonic() - child.forked < 5.0
     assert child.output == "failed=2", "the child's count adds to the inherited one"
 
 
