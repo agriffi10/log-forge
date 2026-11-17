@@ -35,8 +35,9 @@ def _parked_in(
 
     Gated on the parent's pid, so a child that calls the same function runs the original.
     ``owner`` is a module or a class, never an instance, and ``name`` a plain function or method
-    (``getattr`` on a class strips a staticmethod's descriptor): undoing an instance patch leaves the
-    bound method in the instance's dict, shadowing every later class patch (``shadow_check``).
+    (``getattr`` on a class strips a staticmethod's descriptor): before pytest 9.2, undoing an
+    instance patch left the bound method in the instance's dict, shadowing every later class patch
+    (``shadow_check``).
     """
     original = getattr(owner, name)
     parent = os.getpid()
