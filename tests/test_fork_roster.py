@@ -64,6 +64,7 @@ _EXPECTED_ROSTER = (
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),
     ("_ledger", "_registry.lock"),
+    ("_diag", "_FOLD_LOCK"),
 )
 
 _EMPTIED_IN_CHILD = {"_lifecycle._state._closes._in_flight": "_clear_after_fork"}
@@ -185,11 +186,14 @@ def live_findings(
     return findings
 
 
-def test_the_roster_is_the_nine_pairs() -> None:
-    """FR-001: exactly the nine pairs, in the Data Model's order.
+def test_the_roster_is_its_eleven_pairs() -> None:
+    """FR-001: exactly the eleven pairs, in the Data Model's order.
 
     Eight at SPEC-079; ``config._sink_lock`` joined beside ``_config_lock`` when concurrent
-    ``configure(sink=...)`` calls were serialized.
+    ``configure(sink=...)`` calls were serialized, ``_ledger._registry.lock`` at SPEC-088, and
+    ``_diag._FOLD_LOCK`` at SPEC-103. The last is held across a fork by the parametrized pair
+    below like the others: the child's ``shutdown()`` takes it in ``_diag.take_folded``, which
+    waits on it even for an empty table, so without its pair the child blocks there.
     """
     assert _fork._GLOBAL_PRIMITIVES == _EXPECTED_ROSTER
 
@@ -447,7 +451,17 @@ unrepaired copy is delayed by that budget and then proceeds rather than blocking
 
 
 def _child_session() -> str:
-    """Every call FR-001's criterion names, in a child; returns once all of them have."""
+    """Every call FR-001's criterion names, in a child; returns once all of them have.
+
+    **It also waits for the child's drain thread to end** (SPEC-103). ``shutdown()`` returns
+    once its join has expired, and ``stop()``'s take of the exit fold waits for
+    ``_diag._FOLD_LOCK`` a bounded time only, so a child whose inherited fold lock was not
+    replaced still returned from ``shutdown()``, while its drain thread blocked for good in the
+    end-of-exit take, its sink left open. Measured: without this wait,
+    ``test_without_its_entry_the_child_blocks[_diag._FOLD_LOCK]`` did not block. The join is
+    unbounded on purpose; the child's watchdog is the bound, and a blocked drain is the hang the
+    control exists to see.
+    """
     report_from_child("started;")
     log_foundry.configure(service="roster-child")
     log_foundry.configure(sink=MemorySink())
@@ -460,7 +474,10 @@ def _child_session() -> str:
     traced()
     log_foundry.flush()
     log_foundry.health()
+    worker = _lifecycle._state._worker
     log_foundry.shutdown(2.0)
+    if worker is not None:
+        worker._thread.join()
     log_foundry.info("echoed", echo=True)
     return "returned"
 

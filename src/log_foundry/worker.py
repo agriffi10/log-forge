@@ -829,7 +829,10 @@ class Worker:
         ``_exit_abandoned_seen`` that the first abandoned exit batch has written its own line,
         all drain thread only; ``_abandoned_tally`` and ``_declined_tally`` are the
         ``(events, batches)`` not yet announced, written under ``_lock`` because :meth:`stop`
-        takes them too.
+        takes them too. ``_exit_fold`` is the table the sink's and the engine's lines are folded
+        into once the first abandoned exit batch is counted (SPEC-103 FR-001): one object for the
+        worker's life, cleared in place and never rebound, guarded by ``_diag``'s own lock rather
+        than ``_lock``, and taken by :meth:`_write_exit_tallies`.
 
         **``_drain_accounted`` is the third drain event** (SPEC-089 FR-003). It is set once the
         drain has debited everything it will ever debit: by :meth:`_terminal_failure` right after
@@ -926,6 +929,7 @@ class Worker:
         self._exit_abandoned_seen = False
         self._abandoned_tally = (0, 0)
         self._declined_tally = (0, 0)
+        self._exit_fold = _diag.FoldTable()
         self._sweep = sweep
         if offer_signal:
             _lifecycle.offer_stop_signal(sink, self._stop)
@@ -975,7 +979,9 @@ class Worker:
         drain thread starts with an empty batch, and ``_target`` to zero so the child's first
         batch under a backlog is the count trigger's, measured afresh against the child's sink.
         The exit fields and both tallies go to their unstarted values, so a child neither
-        declines against nor announces an exit the parent was making. ``_sink_generation`` is
+        declines against nor announces an exit the parent was making, and ``_exit_fold`` is
+        emptied and reopened in place (SPEC-103), by the time ``_fork`` has already withdrawn the
+        fold window the forking thread may have had open. ``_sink_generation`` is
         **not** reset: the child inherits it harmlessly, as it inherits ``sink``, and
         ``_target_generation`` is set to it, so the zeroed target is the current one.
         ``_lifecycle._adopt_factory_after_fork`` then reassigns ``sink`` without a bump, which
@@ -1104,6 +1110,7 @@ class Worker:
         self._exit_abandoned_seen = False
         self._abandoned_tally = (0, 0)
         self._declined_tally = (0, 0)
+        self._exit_fold.reopen()
         if not resume:
             self._drain_finished.set()
             self._drain_settled.set()
@@ -1249,6 +1256,9 @@ class Worker:
         ``decorator._sweep_hold`` is announced by its caller once the hold is released. The lines
         and their throttle are the ones :meth:`submit` always wrote: a line at the first count and
         every ``WARN_EVERY`` after, since a caller making either mistake makes it on every call.
+        Each carries a running total, so each passes ``running_total=True`` and is written at once
+        even inside an exit fold window, where a sink that logs from its ``emit`` would otherwise
+        have its totals summed (SPEC-103 FR-001).
 
         Args:
           totals: The ``dropped`` and ``submitted_after_shutdown`` totals one enqueue moved, each
@@ -1262,13 +1272,16 @@ class Worker:
         """
         dropped, late = totals
         if dropped and (dropped == 1 or dropped % _diag.WARN_EVERY == 0):
-            _diag.lost("submission", dropped, "log queue full; count is cumulative")
+            _diag.lost(
+                "submission", dropped, "log queue full; count is cumulative", running_total=True
+            )
         if late and (late == 1 or late % _diag.WARN_EVERY == 0):
             _diag.lost(
                 "submission",
                 late,
                 "logged after shutdown(), which is terminal; nothing will drain these. Use "
                 "flush() in a process that logs again. Count is cumulative",
+                running_total=True,
             )
 
     def _offer(
@@ -2225,7 +2238,11 @@ class Worker:
         debited it from ``_in_flight``, so taking them before reading the figure leaves no batch
         named both in a tally line and in this line's in-flight figure, and the tally lines
         precede the expiry line. What the drain thread adds after this take it writes at its
-        own end.
+        own end. The folded sink and engine lines come first of all (SPEC-103 FR-001), and this
+        take **closes the fold**: a line the still-running sink call writes afterwards is written
+        at once, before that call returns, since a call that never returns, or an interpreter
+        that exits first, would otherwise leave it unwritten. The take waits for ``_diag``'s
+        lock for a bounded time only, so the expiry line is never held behind it.
 
         Args:
           timeout: The caller's budget in seconds, or ``None`` to wait indefinitely. It bounds the
@@ -2263,7 +2280,7 @@ class Worker:
             return
         self._thread.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         if self._thread.is_alive():
-            self._write_exit_tallies()
+            self._write_exit_tallies(close=True)
             queued = self._queued_submissions()
             in_flight = self._in_flight
             with self._lock:
@@ -2719,10 +2736,12 @@ class Worker:
         target so a failing sink is retried with small batches while it may recover; at exit
         nothing waits for it to recover, and resetting there cut the rest of a dead sink's
         backlog into ``batch_size`` submissions each. Every such batch costs the sink's own
-        calls and lines, which the exit tallies cannot aggregate: the engine's per-run line and
-        a sink's own per-batch line, such as ``HTTPSink``'s. Measured with a refusing
-        ``HTTPSink`` and 10,000 spans at exit: 15,217 opener calls and 953 lines with the
-        reset, 321 calls and 22 lines without it, against 321 and 21 before SPEC-090.
+        calls and lines: the engine's per-run line and a sink's own per-batch line, such as
+        ``HTTPSink``'s. ~~which the exit tallies cannot aggregate~~ — refined by SPEC-103: from
+        the first abandoned exit batch on, those lines are folded into one per distinct line,
+        written at the end of the exit (:meth:`_emit`); the calls are unchanged. Measured with
+        a refusing ``HTTPSink`` and 10,000 spans at exit: 15,217 opener calls and 953 lines with
+        the reset, 321 calls and 22 lines without it, against 321 and 21 before SPEC-090.
 
         **An exit batch is declined unattempted when it is predicted to overrun** (FR-003). An
         exit batch is one whose first attempt begins after :meth:`claim_stop` set ``_stopped``,
@@ -2962,7 +2981,7 @@ class Worker:
             events, batches = self._declined_tally
             self._declined_tally = (events + size, batches + 1)
 
-    def _write_exit_tallies(self) -> None:
+    def _write_exit_tallies(self, *, close: bool = False) -> None:
         """Takes both exit tallies and writes at most one line for each (SPEC-090 FR-003).
 
         Taking zeroes them in the same locked section, so no batch is announced twice whoever
@@ -2972,8 +2991,15 @@ class Worker:
         name has already moved, by ``_diag``'s record-first rule. Not drain-thread only, because
         :meth:`stop` calls it.
 
+        **The folded lines are taken first** (SPEC-103 FR-001), through ``_diag.take_folded``,
+        before the tallies' locked section and outside it, so they precede both tally lines and
+        this module gains no lock site. The table is cleared in place, so whoever takes a row
+        writes it and no one writes it twice. :meth:`stop` passes ``close``, which writes every
+        later record at once and bounds the wait for ``_diag``'s lock; the drain thread's take
+        waits normally.
+
         Args:
-          None.
+          close: Whether this is :meth:`stop`'s take after an expired join, which closes the fold.
 
         Returns:
           None.
@@ -2981,6 +3007,7 @@ class Worker:
         Raises:
           None.
         """
+        _diag.take_folded(self._exit_fold, close=close)
         with self._lock:
             abandoned, declined = self._abandoned_tally, self._declined_tally
             self._abandoned_tally = (0, 0)
@@ -3321,13 +3348,22 @@ class Worker:
         :meth:`_emit_pending` says. The first abandoned exit batch writes the abandon line as
         any batch does; every later one is added to the abandon tally under the lock, beside
         ``failed_batches``, and announced by :meth:`_write_exit_tallies`, so a dead sink at exit
-        writes two of the worker's lines where a line per batch would write a thousand. The
-        tallies do not reach a line the engine or the sink itself writes per batch, the engine's
-        ``absorbed`` line or ``HTTPSink``'s ``lost 1 request(s)``: those follow the number of exit
-        batches, which :meth:`_emit_pending` keeps near one per target's worth of events, which
-        is ``_BACKLOG_BATCH_CAP`` when it was measured there, by leaving the target as it was
-        after an abandoned exit batch, except when the target was already zero at the stop
-        (``architecture.md`` §12). On every route that can tally,
+        writes two of the worker's lines where a line per batch would write a thousand.
+
+        **The engine's and the sink's own lines are folded from the first abandoned exit batch
+        on** (SPEC-103 FR-001). The tallies do not reach a line the engine or the sink itself
+        writes per batch, the engine's ``absorbed`` line or ``HTTPSink``'s ``lost 1
+        request(s)``. So an exit batch whose sink call begins once ``_exit_abandoned_seen`` is
+        set has that call run inside a fold window (``_diag.fold_into``): the engine run, or each
+        1.x ``sink.emit``, and nothing else here. The worker's own ``retry declined`` and abandon
+        lines are outside it and are written as before, and the first abandoned exit batch's own
+        sink lines are written as before, because the flag is set only once that batch is
+        counted. The window is opened on this thread alone and withdrawn in a ``finally``, so a
+        line a sink writes from a thread of its own is written at once. Inside it ``_diag``
+        records one row per distinct line in ``_exit_fold``, which :meth:`_write_exit_tallies`
+        writes. The steady drain opens no window and makes no extra call. No batch, retry, wait
+        or deadline changes: SPEC-103 rejected growing a dead sink's exit batches, which broke
+        the budget for a sink that turns slow mid-exit. On every route that can tally,
         :meth:`_settle` runs before the locked count, so a batch :meth:`stop` finds in a tally it
         took has already left ``_in_flight``.
 
@@ -3361,14 +3397,21 @@ class Worker:
         retries = max(self.max_retries, 0)
         longest = 0.0
         size = len(batch)
+        fold = exit_batch and self._exit_abandoned_seen
         run_started = time.monotonic()
-        delivery = _engine.run_delivery(
-            self.sink,
-            batch,
-            worker_retries=self.max_retries,
-            stop=self._stop,
-            decline=self._retry_declined,
-        )
+        if fold:
+            _diag.fold_into(self._exit_fold)
+        try:
+            delivery = _engine.run_delivery(
+                self.sink,
+                batch,
+                worker_retries=self.max_retries,
+                stop=self._stop,
+                decline=self._retry_declined,
+            )
+        finally:
+            if fold:
+                _diag.fold_into(None)
         if delivery is not None:
             if exit_batch:
                 self._exit_longest = max(self._exit_longest, time.monotonic() - run_started)
@@ -3408,7 +3451,13 @@ class Worker:
             started = time.monotonic()
             sink = self.sink
             try:
-                sink.emit(batch)
+                if fold:
+                    _diag.fold_into(self._exit_fold)
+                try:
+                    sink.emit(batch)
+                finally:
+                    if fold:
+                        _diag.fold_into(None)
             except Exception as err:
                 longest = max(longest, time.monotonic() - started)
                 if exit_batch:

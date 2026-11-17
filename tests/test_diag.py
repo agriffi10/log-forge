@@ -9,7 +9,10 @@ the no-``stderr.write``-outside-``_diag`` guard below (FR-001).
 from __future__ import annotations
 
 import ast
+import io
 import sys
+import threading
+import time
 import urllib.error
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +23,7 @@ from conftest import armed, object_probe, str_probe
 from log_foundry import _diag
 
 if TYPE_CHECKING:
+    import types
     from collections.abc import Callable
 
 
@@ -783,19 +787,21 @@ def test_the_stderr_walker_states_what_it_does_not_catch(source: str) -> None:
     assert _stderr_writes(ast.parse(source)) == []
 
 
-def test_diag_still_has_exactly_the_four_writers_it_documents() -> None:
+def test_diag_still_has_exactly_the_five_writes_it_documents() -> None:
     """A tripwire, separate from the vacuity check above, and deliberately brittle.
 
     ``_diag``'s own docstring names four writers, one per kind of line: ``absorbed``, ``lost``,
-    ``rejected`` and, since SPEC-068 FR-001, ``pending``. A fifth is fine — it just has to be a
-    decision, taken with the docs in front of you, rather than a quiet fifth spelling of a line
-    the other four already write.
+    ``rejected`` and, since SPEC-068 FR-001, ``pending``, and since SPEC-103 FR-001 a fifth
+    write, ``take_folded``'s, which writes the lines folded at exit. A sixth is fine — it just
+    has to be a decision, taken with the docs in front of you, rather than a quiet sixth spelling
+    of a line the others already write.
     """
     writes = _stderr_writes(ast.parse((_SRC / "_diag.py").read_text(encoding="utf-8")))
-    assert len(writes) == 4, (
-        f"_diag has {len(writes)} stderr writes, not 4 — if a writer was added, update "
+    assert len(writes) == 5, (
+        f"_diag has {len(writes)} stderr writes, not 5 — if a write was added, update "
         f"_diag's docstring to match"
     )
+    assert "Five stderr writes" in (_diag.__doc__ or ""), "the docstring names the five writes"
 
 
 # -- SPEC-063 FR-004: the announcement names the type's stored name ---------------------------
@@ -882,3 +888,407 @@ def test_an_orphan_loss_from_a_hostile_exception_class_is_counted_and_announced(
         pytest.fail("the hostile class's exception escaped lf.info: the orphan guard regressed")
     assert lf.health().orphan_lost == before + 1
     assert "absorbed a failure while emitting an orphan log (Stored)" in err.getvalue()
+
+
+# -- SPEC-103 FR-001: the fold ----------------------------------------------------------------
+
+_TAIL = "line(s) folded at exit"
+
+
+def _folding(table: _diag.FoldTable, write: Callable[[], None]) -> None:
+    """Runs ``write`` with this thread's fold window open on ``table``, then withdraws it."""
+    _diag.fold_into(table)
+    try:
+        write()
+    finally:
+        _diag.fold_into(None)
+
+
+def test_each_writer_folds_inside_the_window_and_take_writes_one_line_per_key(
+    err: _Stderr,
+) -> None:
+    """Inside the window nothing is written; the take writes one line per key, first seen first."""
+    table = _diag.FoldTable()
+
+    def write() -> None:
+        for count in (2, 3):
+            _diag.lost("event", count, "Sink, refused")
+            _diag.absorbed("sending a batch", ConnectionError(), "Sink")
+            _diag.pending("Sink, a request may still land")
+        _diag.lost("event", 7)
+
+    _folding(table, write)
+    assert err.getvalue() == "", "a folded line was written inside the window"
+    _diag.take_folded(table, close=False)
+    assert err.getvalue().splitlines() == [
+        f"log-foundry: lost 5 event(s); Sink, refused; 2 {_TAIL}",
+        (
+            "log-foundry: absorbed 2 failure(s) while sending a batch (ConnectionError); Sink; "
+            f"2 {_TAIL}"
+        ),
+        f"log-foundry: Sink, a request may still land; 2 {_TAIL}",
+        f"log-foundry: lost 7 event(s); 1 {_TAIL}",
+    ]
+    assert table.rows == {}, "the take clears the table"
+
+
+def test_rejected_never_folds(err: _Stderr) -> None:
+    """``rejected`` is written at once inside a window: no shipped sink and no engine reach it."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.rejected("unparseable traceparent", "x"))
+    assert "ignoring inbound trace context" in err.getvalue()
+    assert table.rows == {}
+
+
+def test_two_details_that_render_alike_are_one_key(err: _Stderr) -> None:
+    """The key is the rendered detail: an escaped newline and a cut past the bound fold together."""
+    table = _diag.FoldTable()
+    long_a = "x" * _diag._MAX_DETAIL + "a"
+    long_b = "x" * _diag._MAX_DETAIL + "b"
+
+    def write() -> None:
+        _diag.lost("event", 1, "a\nb")
+        _diag.lost("event", 1, "a\\nb")
+        _diag.pending(long_a)
+        _diag.pending(long_b)
+
+    _folding(table, write)
+    _diag.take_folded(table, close=False)
+    lines = err.getvalue().splitlines()
+    assert lines[0] == f"log-foundry: lost 2 event(s); a\\nb; 2 {_TAIL}", lines
+    assert lines[1].endswith(f"…; 2 {_TAIL}"), lines
+    assert len(lines) == 2, lines
+
+
+def test_the_tail_survives_a_detail_cut_at_the_bound(err: _Stderr) -> None:
+    """The tail is appended after the detail is bounded, so a long detail never cuts it."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("event", 4, "y" * 500))
+    _diag.take_folded(table, close=False)
+    line = err.getvalue().rstrip("\n")
+    assert line.endswith(f"y…; 1 {_TAIL}"), line
+
+
+def test_a_running_total_inside_the_window_is_written_at_once(err: _Stderr) -> None:
+    """``running_total=True`` writes at once: summing running totals overstates a loss."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("submission", 1000, "cumulative", running_total=True))
+    assert err.getvalue() == "log-foundry: lost 1000 submission(s); cumulative\n"
+    assert table.rows == {}
+
+
+def test_a_count_that_is_not_an_exact_int_is_written_at_once(err: _Stderr) -> None:
+    """Only ``int`` arithmetic runs under the fold lock, so any other count is written at once."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("event", True, "a bool"))
+    assert err.getvalue() == "log-foundry: lost True event(s); a bool\n"
+    assert table.rows == {}
+
+
+def test_a_record_into_a_closed_table_is_written_at_once(err: _Stderr) -> None:
+    """After ``stop()``'s closing take, a record is written at once, unfolded, and never held."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("event", 1, "before"))
+    _diag.take_folded(table, close=True)
+    assert table.closed
+    _folding(table, lambda: _diag.lost("event", 1, "after"))
+    assert err.getvalue().splitlines() == [
+        f"log-foundry: lost 1 event(s); before; 1 {_TAIL}",
+        "log-foundry: lost 1 event(s); after",
+    ]
+    assert table.rows == {}
+
+
+def test_take_clears_the_table_in_place_and_keeps_its_object(err: _Stderr) -> None:
+    """The open window holds the table object, so the take clears its rows rather than rebinding."""
+    table = _diag.FoldTable()
+    rows = table.rows
+    _folding(table, lambda: _diag.lost("event", 1, "d"))
+    _diag.take_folded(table, close=False)
+    assert table.rows is rows
+    assert rows == {}
+    _diag.take_folded(table, close=False)
+    assert err.getvalue().count(_TAIL) == 1, "a taken row is written once"
+
+
+def _held_on_another_thread(lock: threading.Lock) -> tuple[threading.Event, threading.Thread]:
+    """Holds ``lock`` on a daemon thread until the returned event is set."""
+    held, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with lock:
+            held.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    assert held.wait(5)
+    return release, thread
+
+
+def test_a_record_never_waits_on_the_fold_lock(err: _Stderr) -> None:
+    """A recorder that cannot take ``_FOLD_LOCK`` at once writes its line at once, unfolded."""
+    table = _diag.FoldTable()
+    release, thread = _held_on_another_thread(_diag._FOLD_LOCK)
+    try:
+        started = time.monotonic()
+        _folding(table, lambda: _diag.absorbed("sending a batch", ValueError(), "held"))
+        assert time.monotonic() - started < 1.0
+    finally:
+        release.set()
+        thread.join(5)
+    assert err.getvalue() == (
+        "log-foundry: absorbed a failure while sending a batch (ValueError); held\n"
+    )
+    assert table.rows == {}
+
+
+def test_the_closing_take_waits_for_the_fold_lock_a_bounded_time(err: _Stderr) -> None:
+    """``stop()``'s take closes the table at once and leaves the rows when the lock stays held."""
+    table = _diag.FoldTable()
+    _folding(table, lambda: _diag.lost("event", 3, "kept"))
+    release, thread = _held_on_another_thread(_diag._FOLD_LOCK)
+    try:
+        started = time.monotonic()
+        _diag.take_folded(table, close=True)
+        waited = time.monotonic() - started
+    finally:
+        release.set()
+        thread.join(5)
+    assert waited < _diag._CLOSING_TAKE_WAIT + 2.0, waited
+    assert table.closed, "closing is a plain store, made before the lock is asked for"
+    assert list(table.rows) == [("lost", "event", "; kept")], "the rows stay for the drain's take"
+    assert err.getvalue() == ""
+    _diag.take_folded(table, close=False)
+    assert err.getvalue() == f"log-foundry: lost 3 event(s); kept; 1 {_TAIL}\n"
+
+
+def test_withdraw_in_child_clears_the_window_while_another_thread_holds_the_fold_lock() -> None:
+    """The child's first step clears this thread's window and takes no lock."""
+    _diag.fold_into(_diag.FoldTable())
+    release, thread = _held_on_another_thread(_diag._FOLD_LOCK)
+    try:
+        _diag.withdraw_fold_in_child()
+        assert _diag._FOLD.table is None
+    finally:
+        release.set()
+        thread.join(5)
+        _diag.fold_into(None)
+
+
+def test_the_window_is_this_threads_alone() -> None:
+    """A thread that did not open a window reads none, so a sink's own thread writes at once."""
+    seen: list[object] = []
+    _diag.fold_into(_diag.FoldTable())
+    try:
+        other = threading.Thread(target=lambda: seen.append(_diag._FOLD.table))
+        other.start()
+        other.join(5)
+    finally:
+        _diag.fold_into(None)
+    assert seen == [None]
+
+
+_UNBUILT_CALLS = {
+    "lost": [
+        ("call", "lost"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("call", "_suffix"),
+        ("call", "_bounded"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("c_call", "len"),
+        ("c_call", "StringIO.write"),
+    ],
+    "lost bare": [
+        ("call", "lost"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("call", "_suffix"),
+        ("c_call", "StringIO.write"),
+    ],
+    "absorbed": [
+        ("call", "absorbed"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("call", "_suffix"),
+        ("call", "_bounded"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("c_call", "len"),
+        ("c_call", "StringIO.write"),
+    ],
+    "pending": [
+        ("call", "pending"),
+        ("call", "_bounded"),
+        ("call", "_escape"),
+        ("c_call", "str.isprintable"),
+        ("c_call", "len"),
+        ("c_call", "StringIO.write"),
+    ],
+}
+"""Every call each writer made outside a window before SPEC-103, measured at ``1a86ad87``.
+
+Recorded with ``sys.setprofile`` on CPython 3.13.1 and 3.12.12, identically. Python frames and C
+calls both: ``tests/test_event_ledger_defects.py::test_p11_counts_every_assembly_fault`` runs at a
+recursion limit of 400, and a fold check written as a helper adds a frame to every line the
+library writes. This is the guard for that rather than p11 itself, which a helper-based check
+passed in the plan review (SPEC-103 FR-001).
+"""
+
+_WRITER_CALLS: dict[str, Callable[[], None]] = {
+    "lost": lambda: _diag.lost("event", 3, "detail"),
+    "lost bare": lambda: _diag.lost("event", 3),
+    "absorbed": lambda: _diag.absorbed("sending", ConnectionError(), "detail"),
+    "pending": lambda: _diag.pending("detail"),
+}
+
+
+@pytest.mark.parametrize("writer", sorted(_WRITER_CALLS))
+def test_a_writer_outside_the_window_calls_what_the_unbuilt_writer_called(
+    writer: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-001: outside a window each writer calls exactly what it called before the fold."""
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    call = _WRITER_CALLS[writer]
+    seen: list[tuple[str, str]] = []
+
+    def profile(frame: types.FrameType, event: str, arg: object) -> None:
+        if event == "call" and frame.f_code is not call.__code__:
+            seen.append(("call", frame.f_code.co_qualname))
+        elif event == "c_call":
+            seen.append(("c_call", getattr(arg, "__qualname__", repr(arg))))
+
+    sys.setprofile(profile)
+    try:
+        call()
+    finally:
+        sys.setprofile(None)
+    assert [s for s in seen if s != ("c_call", "setprofile")] == _UNBUILT_CALLS[writer]
+
+
+# -- SPEC-103 FR-001: every throttled ``lost`` passes ``running_total`` -----------------------
+
+_THROTTLED_WITHOUT = (
+    "a lost call in a function that reads WARN_EVERY does not pass running_total=True"
+)
+
+
+def _reads_warn_every(function: ast.AST) -> bool:
+    """Whether a function's body reads ``WARN_EVERY``, as a bare name or as an attribute."""
+    return any(
+        (isinstance(node, ast.Name) and node.id == "WARN_EVERY")
+        or (isinstance(node, ast.Attribute) and node.attr == "WARN_EVERY")
+        for node in ast.walk(function)
+    )
+
+
+def _is_lost_call(node: ast.AST) -> bool:
+    """Whether a node is a call of ``_diag.lost`` or of a bare ``lost``."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == "lost"
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "lost"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "_diag"
+    )
+
+
+def _passes_running_total(call: ast.Call) -> bool:
+    """Whether a call passes ``running_total=True`` as a literal."""
+    return any(
+        k.arg == "running_total" and isinstance(k.value, ast.Constant) and k.value.value is True
+        for k in call.keywords
+    )
+
+
+def throttled_lost_calls(source: str) -> list[tuple[str, int, bool]]:
+    """Each ``lost`` call in a function reading ``WARN_EVERY``: ``(function, line, passes it)``."""
+    found: dict[int, tuple[str, int, bool]] = {}
+    for function in ast.walk(ast.parse(source)):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if not _reads_warn_every(function):
+            continue
+        for node in ast.walk(function):
+            if isinstance(node, ast.Call) and _is_lost_call(node):
+                found.setdefault(
+                    id(node), (function.name, node.lineno, _passes_running_total(node))
+                )
+    return sorted(found.values(), key=lambda site: site[1])
+
+
+def running_total_findings(source: str, where: str) -> list[tuple[str, str]]:
+    """The roster's refusals in one module, each ``(reason, site)``."""
+    return [
+        (_THROTTLED_WITHOUT, f"{where}:{line} {name}")
+        for name, line, passes in throttled_lost_calls(source)
+        if not passes
+    ]
+
+
+def test_every_throttled_lost_call_passes_running_total() -> None:
+    """FR-001: a throttled site passes a running total, which a fold window must never sum."""
+    findings = [
+        finding
+        for path in sorted(_SRC.rglob("*.py"))
+        for finding in running_total_findings(
+            path.read_text(encoding="utf-8"), path.relative_to(_SRC).as_posix()
+        )
+    ]
+    assert findings == [], findings
+
+
+def test_the_running_total_roster_finds_todays_three_sites() -> None:
+    """The roster is derived from all of ``src/``, and it sees the three throttled sites."""
+    sites = [
+        (path.relative_to(_SRC).as_posix(), name)
+        for path in sorted(_SRC.rglob("*.py"))
+        for name, _line, _passes in throttled_lost_calls(path.read_text(encoding="utf-8"))
+    ]
+    assert sites == [
+        ("context.py", "_announce_dropped"),
+        ("worker.py", "_announce"),
+        ("worker.py", "_announce"),
+    ]
+
+
+_THROTTLE = "from log_foundry import _diag\ndef f(total):\n    if total % _diag.WARN_EVERY == 0:\n"
+
+_ROSTER_REFUSES = {
+    "no keyword": _THROTTLE + "        _diag.lost('event', total, 'cumulative')\n",
+    "running_total=False": _THROTTLE + "        _diag.lost('event', total, running_total=False)\n",
+    "a variable": _THROTTLE + "        _diag.lost('event', total, running_total=flag)\n",
+    "a bare WARN_EVERY and a bare lost": (
+        "from log_foundry._diag import WARN_EVERY, lost\ndef f(total):\n"
+        "    if total % WARN_EVERY == 0:\n        lost('event', total)\n"
+    ),
+}
+
+_ROSTER_IS_SILENT = {
+    "an unthrottled lost": "from log_foundry import _diag\ndef f():\n    _diag.lost('event', 1)\n",
+    "a throttled absorbed": _THROTTLE + "        _diag.absorbed('x', ValueError(), 'total')\n",
+    "a throttled lost with the keyword": (
+        _THROTTLE + "        _diag.lost('event', total, running_total=True)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ROSTER_REFUSES))
+def test_the_running_total_roster_refuses_its_shapes(case: str) -> None:
+    """Each shape is refused, for the reason the roster exists."""
+    findings = running_total_findings(_ROSTER_REFUSES[case], "fixture.py")
+    assert [reason for reason, _site in findings] == [_THROTTLED_WITHOUT], findings
+
+
+@pytest.mark.parametrize("case", sorted(_ROSTER_IS_SILENT))
+def test_the_running_total_roster_is_silent_on_its_shapes(case: str) -> None:
+    """Half a gate's regressions are false positives: these must pass."""
+    assert running_total_findings(_ROSTER_IS_SILENT[case], "fixture.py") == []

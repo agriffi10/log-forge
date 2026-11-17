@@ -22,10 +22,13 @@ test here patches.
 from __future__ import annotations
 
 import ast
+import collections
+import gc
 import math
 import pathlib
 import re
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -33,9 +36,10 @@ import pytest
 import log_foundry
 from conftest import install_worker, retire_process
 from ledger_sinks import ledger
-from log_foundry import Outcome, SinkCounters, Verdict, emit_via_deliver
+from log_foundry import Outcome, SinkCounters, Verdict, _diag, _lifecycle, emit_via_deliver
 from log_foundry import worker as worker_mod
 from log_foundry.sinks.http import HTTPSink
+from log_foundry.sinks.sqs import SQSSink
 from log_foundry.worker import _SHUTDOWN, Worker, _FlushMarker
 from test_sinks_http import FakeResponse
 from test_worker_exit_budget import _SLACK, _lost_lines, _measured
@@ -708,13 +712,14 @@ def test_a_dead_engine_sink_at_exit_is_handed_batches_at_the_cap(
     """FR-001 rule 4 at exit: an abandoned exit batch leaves the target as it was.
 
     The pre-stop batch is delivered, so the target is the cap, and then every ``deliver``
-    raises. Each failed run writes the engine's own ``absorbed`` line, which the exit tallies
-    cannot aggregate, so the lines grow with the number of exit batches. Before SPEC-090 the
-    whole backlog was one call and two lines; the bound asserted here is the backlog over the
-    cap, plus one for a carry, in calls, and that plus two lines (the pre-stop path writes none,
-    the first abandoned exit batch writes the worker's line, the tally one more). Had the first
-    abandoned exit batch reset the target, the rest would go ten spans a call: about 150 calls
-    and 150 lines here (diff review, 2026-11-16).
+    raises. Each failed run writes the engine's own ``absorbed`` line; ~~which the exit tallies
+    cannot aggregate, so the lines grow with the number of exit batches~~ — refined by SPEC-103:
+    from the first abandoned exit batch on, those lines are folded into one per distinct line,
+    and the calls are unchanged. Before SPEC-090 the whole backlog was one call and two lines;
+    the bound asserted here is the backlog over the cap, plus one for a carry, in calls, and
+    that plus two in lines, an upper bound the fold only lowers. Had the first abandoned exit
+    batch reset the target, the rest would go ten spans a call: about 150 calls here (diff
+    review, 2026-11-16).
     """
     sink = _EngineSink(seconds=0.0, raises=True)
     worker = _at_exit(sink, _DEAD_BACKLOG)
@@ -732,11 +737,12 @@ def test_a_refused_http_sink_at_exit_is_handed_batches_at_the_cap(
 ) -> None:
     """FR-001 rule 4 at exit, through a shipped sink: a refusing ``HTTPSink`` keeps the cap.
 
-    ``HTTPSink`` writes its own line per failed request, which the exit tallies cannot
-    aggregate either. Its opener answers the pre-stop batch once the stop is claimed, so the
-    target is the cap, then refuses every request. With no retries at either level, each exit
-    batch is one request, so the opener calls and the lines are bounded as the engine twin's
-    are, where a reset target made them about 150 each.
+    ``HTTPSink`` writes its own line per failed request, and from the first abandoned exit
+    batch on those lines are folded (SPEC-103), while the requests are unchanged. Its opener
+    answers the pre-stop batch once the stop is claimed, so the target is the cap, then refuses
+    every request. With no retries at either level, each exit batch is one request, so the
+    opener calls are bounded as the engine twin's are, where a reset target made them about 150,
+    and the lines, an upper bound the fold only lowers, likewise.
     """
     calls = [0]
     stop: list[threading.Event] = []
@@ -993,3 +999,523 @@ def test_a_declined_exit_batch_leaves_the_target_as_it_was(
     capsys.readouterr()
     assert worker.failed_batches == 2, "the premise: two exit batches were declined"
     assert measured == [20, 20], "only the two batches attempted set the target"
+
+
+# ---------------------------------------------------------------------------- SPEC-103 FR-001
+
+_FOLDED = re.compile(r"; (\d+) line\(s\) folded at exit$")
+_ABSORBED_FOLDED = re.compile(r"^absorbed (\d+) failure\(s\) while (.*)$")
+_LOST = re.compile(r"^lost (\d+) (.*)$")
+
+
+def _line_key(line: str) -> tuple[tuple[str, str], int, int | None]:
+    """A sink line's key, the count it names, and its folded-line count when it is folded."""
+    body = line.removeprefix("log-foundry: ")
+    folded: int | None = None
+    tail = _FOLDED.search(body)
+    if tail is not None:
+        folded = int(tail.group(1))
+        body = body[: tail.start()]
+    lost = _LOST.match(body)
+    if lost is not None:
+        return ("lost", lost.group(2)), int(lost.group(1)), folded
+    absorbed = _ABSORBED_FOLDED.match(body)
+    if absorbed is not None:
+        return ("absorbed", absorbed.group(2)), int(absorbed.group(1)), folded
+    if body.startswith("absorbed a failure while "):
+        return ("absorbed", body.removeprefix("absorbed a failure while ")), 1, folded
+    return ("pending", body), folded or 1, folded
+
+
+def _sink_lines(err: str, mark: str) -> list[str]:
+    """The ``log-foundry:`` lines carrying ``mark``, the sink's own, in order."""
+    return [line for line in err.splitlines() if line.startswith("log-foundry: ") and mark in line]
+
+
+class _FoldingSink(_ExitSink):
+    """An ``_ExitSink`` whose every call writes one line of each kind first, keyed by parity."""
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Writes a ``lost``, an ``absorbed`` and a ``pending`` line, then behaves as planned."""
+        call = len(self.handed) + 1
+        _diag.lost("event", call % 3 + 1, f"Folding, key {call % 2}")
+        _diag.absorbed("sending a batch", ConnectionError(), f"Folding, key {call % 2}")
+        _diag.pending(f"Folding, a request may still land, key {call % 2}")
+        super().emit(batch)
+
+
+def _exit_of(sink: Any, queued: int, capsys: pytest.CaptureFixture[str]) -> str:
+    """Runs one exit of a worker built here, uninstalled, and returns what it wrote to stderr.
+
+    The worker is built directly and stopped with ``Worker.stop``, so one test can run two exits:
+    the process's lifecycle is not involved, and the exit drain is the same.
+    """
+    capsys.readouterr()
+    worker = Worker(sink, batch_size=10, flush_interval=3_600.0, max_retries=0)
+    sink.first_waits_on = worker._stop
+    for seq in range(10):
+        worker.submit(_span(seq))
+    _until(lambda: worker._in_flight == 20)
+    for seq in range(10, 10 + queued):
+        worker.submit(_span(seq))
+    worker.stop(30.0)
+    worker._thread.join(5.0)
+    assert not worker._thread.is_alive(), "the premise: the exit drain ended"
+    return capsys.readouterr().err
+
+
+def test_a_folded_exit_writes_each_distinct_line_once_with_the_unfolded_totals(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC3: one exit, held shut and as built, writes the same lines with the same totals.
+
+    Every exit batch is ten spans, one call, and every call after the pre-stop one fails, so the
+    first exit batch is the first abandoned one: its lines and the pre-stop call's are written as
+    they are, and the five calls after it are folded. Held shut, ``_diag.fold_into`` is a no-op,
+    so nothing folds. Per key, the built run's folded count plus its unfolded counts must equal
+    what the unfolded run's lines name, and each folded line must precede the abandon tally.
+    """
+    _ten_span_batches(monkeypatch)
+    with monkeypatch.context() as shut:
+        shut.setattr(_diag, "fold_into", lambda table: None)
+        unfolded = _exit_of(_FoldingSink(fails=True), 60, capsys)
+    built = _exit_of(_FoldingSink(fails=True), 60, capsys)
+    assert _FOLDED.pattern not in unfolded
+    assert "folded at exit" not in unfolded, "the premise: the held-shut run folds nothing"
+
+    expected: collections.Counter[tuple[str, str]] = collections.Counter()
+    expected_lines: collections.Counter[tuple[str, str]] = collections.Counter()
+    for line in _sink_lines(unfolded, "Folding"):
+        key, count, _ = _line_key(line)
+        expected[key] += count
+        expected_lines[key] += 1
+    got: collections.Counter[tuple[str, str]] = collections.Counter()
+    folded_lines: dict[tuple[str, str], tuple[int, int]] = {}
+    unfolded_lines: collections.Counter[tuple[str, str]] = collections.Counter()
+    for line in _sink_lines(built, "Folding"):
+        key, count, folded = _line_key(line)
+        got[key] += count
+        if folded is None:
+            unfolded_lines[key] += 1
+        else:
+            assert key not in folded_lines, f"a key folded twice: {line}"
+            folded_lines[key] = (count, folded)
+    assert {kind for kind, _ in folded_lines} == {"lost", "absorbed", "pending"}, built
+    assert set(got) == set(expected), (built, unfolded)
+    assert got == expected, "a folded total differs from what the unfolded lines name"
+    for key, (count, folded) in folded_lines.items():
+        assert folded == expected_lines[key] - unfolded_lines[key], key
+        if key[0] != "lost":
+            assert count == folded, f"{key}: an absorbed or pending count is its folded lines"
+    lines = built.splitlines()
+    tally = next(i for i, line in enumerate(lines) if "more exit batch(es) abandoned" in line)
+    assert all(i < tally for i, line in enumerate(lines) if "folded at exit" in line), (
+        "a folded line was written after the abandon tally"
+    )
+
+
+class _TwinSink(_ExitSink):
+    """A 1.x sink whose every later call writes the twins' ``lost`` and ``absorbed`` lines."""
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Writes the two lines on every call after the first, then behaves as planned."""
+        if self.handed:
+            _diag.lost("event", len(batch), "Twin, refused")
+            _diag.absorbed("sending a batch", ConnectionError(), "Twin")
+        super().emit(batch)
+
+
+class _TwinEngineSink(_EngineSink):
+    """An engine sink whose every later call writes the twins' lines, then answers RETRYABLE."""
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Writes the two lines on every call after the first, then answers as planned."""
+        if self.calls:
+            _diag.lost("event", len(batch), "Twin, refused")
+            _diag.absorbed("sending a batch", ConnectionError(), "Twin")
+        return super().deliver(batch)
+
+
+def test_a_dead_1x_sink_and_a_dead_engine_sink_fold_to_the_same_lines(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC4 (invariant 6): the engine run and the 1.x ``emit`` are folded alike."""
+    _ten_span_batches(monkeypatch)
+    one_x = _exit_of(_TwinSink(fails=True), 60, capsys)
+    engine = _exit_of(_TwinEngineSink(seconds=0.0), 60, capsys)
+    folded_1x = [line for line in _sink_lines(one_x, "Twin") if "folded at exit" in line]
+    folded_engine = [line for line in _sink_lines(engine, "Twin") if "folded at exit" in line]
+    assert folded_1x == [
+        "log-foundry: lost 100 event(s); Twin, refused; 5 line(s) folded at exit",
+        (
+            "log-foundry: absorbed 5 failure(s) while sending a batch (ConnectionError); Twin; "
+            "5 line(s) folded at exit"
+        ),
+    ], one_x
+    assert folded_engine == folded_1x, engine
+
+
+class _PlannedEngineSink(_EngineSink):
+    """An engine sink answering RETRYABLE after the first call, idling on the calls planned."""
+
+    def __init__(self, idle: dict[int, float]) -> None:
+        super().__init__(seconds=0.0)
+        self.idle = idle
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Writes a sink line, idles as planned, then answers as the base sink does."""
+        call = self.calls + 1
+        if call > 1:
+            _diag.lost("event", 1, "Retry, sink line")
+            threading.Event().wait(self.idle.get(call, 0.0))
+        return super().deliver(batch)
+
+
+def _declining_1x(worker_retries: int) -> Any:
+    """A 1.x sink failing every later call, call 4 after idling 0.6 s, each writing a line."""
+    sink = _ExitSink(fails=True)
+
+    def on_call(call: int) -> None:
+        if call > 1:
+            _diag.lost("event", 1, "Retry, sink line")
+        if call == 4:
+            threading.Event().wait(_SLOW_CALL)
+
+    sink.on_call = on_call
+    return sink
+
+
+@pytest.mark.parametrize("path", ["1.x", "engine"])
+def test_a_retry_declined_after_the_fold_began_is_written_once_unfolded(
+    path: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC5: SPEC-062's ``retry declined`` line is the worker's, outside the window.
+
+    ``max_retries=1``: the first exit batch fails both attempts, quickly, and is the first
+    abandoned one; the second exit batch's first attempt idles 0.6 s and fails, so against a
+    1.0 s budget its retry is declined. That batch's sink line is folded; the decline line is not.
+    """
+    _ten_span_batches(monkeypatch)
+    sink: Any = _declining_1x(1) if path == "1.x" else _PlannedEngineSink({4: _SLOW_CALL})
+    worker = _at_exit(sink, 40, max_retries=1)
+    retire_process(worker, 1.0)
+    worker._thread.join(5.0)
+    err = capsys.readouterr().err
+    declined = [line for line in err.splitlines() if "retry declined after" in line]
+    assert len(declined) == 1, err
+    assert "folded at exit" not in declined[0], declined
+    assert declined[0].startswith("log-foundry: lost 20 event(s); retry declined after 1 emit")
+    assert (
+        "log-foundry: lost 40 event(s); 2 exit batch(es) declined unattempted; each was "
+        "predicted to end after the shutdown() deadline"
+    ) in err.splitlines(), err
+    assert "log-foundry: lost 1 event(s); Retry, sink line; 1 line(s) folded at exit" in err, err
+
+
+def _snapshot_at(sink: _ExitSink, call: int, capsys: pytest.CaptureFixture[str]) -> str:
+    """Stderr so far, read once call number ``call`` has begun and while it is held."""
+    _until(sink.entered(call).is_set)
+    return capsys.readouterr().err
+
+
+def test_lines_before_the_first_abandoned_exit_batch_is_counted_are_written_at_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC6: the steady drain's, an earlier exit batch's and the first abandoned one's.
+
+    Call 1 is the steady drain's, call 2 an exit batch that succeeds, call 3 the first exit
+    batch abandoned; each writes its line. Call 4 is held, and stderr read then already holds all
+    three, unfolded, while call 4's own line, written inside the window, is not there yet.
+    """
+    _ten_span_batches(monkeypatch)
+    sink = _ExitSink()
+    sink.fail_calls = {3, 4}
+    sink.on_call = lambda call: _diag.lost("event", 1, f"Early, call {call}")
+    held = sink.hold(4)
+    worker = _at_exit(sink, 30, max_retries=0)
+    retiring = _retire_on_thread(worker, 30.0)
+    try:
+        snapshot = _snapshot_at(sink, 4, capsys)
+    finally:
+        held.set()
+        retiring.join(30.0)
+        worker._thread.join(5.0)
+    for call in (1, 2, 3):
+        assert f"log-foundry: lost 1 event(s); Early, call {call}\n" in snapshot, snapshot
+    assert "Early, call 4" not in snapshot, snapshot
+    assert "folded at exit" not in snapshot, snapshot
+    assert "Early, call 4; 1 line(s) folded at exit" in capsys.readouterr().err
+
+
+def test_an_expired_join_writes_the_folded_lines_once_before_its_line_and_closes_the_fold(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC7: ``stop()`` writes the folded lines before its expiry line, and closes the fold.
+
+    Call 2 is the first abandoned exit batch; call 3 is folded and fails; call 4 writes a line,
+    then waits past the 0.5 s deadline. Once ``shutdown()`` has returned, call 4 is released and
+    writes a second line, then waits again: that line is already on stderr, unfolded, before the
+    call returns. No folded row is written twice.
+    """
+    _ten_span_batches(monkeypatch)
+    release, wrote_after, may_return = threading.Event(), threading.Event(), threading.Event()
+    sink = _ExitSink()
+    sink.fail_calls = {2, 3, 4}
+
+    def on_call(call: int) -> None:
+        if call == 3:
+            _diag.lost("event", 1, "Expiry, call 3")
+        if call == 4:
+            _diag.lost("event", 1, "Expiry, mid-call")
+            release.wait(30.0)
+            _diag.lost("event", 1, "Expiry, after expiry")
+            wrote_after.set()
+            may_return.wait(30.0)
+
+    sink.on_call = on_call
+    worker = _at_exit(sink, 40, max_retries=0)
+    try:
+        retire_process(worker, 0.5)
+        assert worker.stopped_reason == "ShutdownTimeout", "the premise: the join expired"
+        at_return = capsys.readouterr().err
+        release.set()
+        assert wrote_after.wait(10.0)
+        while_inside = capsys.readouterr().err
+    finally:
+        release.set()
+        may_return.set()
+        worker._thread.join(10.0)
+    at_end = capsys.readouterr().err
+    expiry = at_return.index("shutdown timed out")
+    for text in ("Expiry, call 3", "Expiry, mid-call"):
+        folded = f"log-foundry: lost 1 event(s); {text}; 1 line(s) folded at exit"
+        assert at_return.index(folded) < expiry, at_return
+    assert while_inside == "log-foundry: lost 1 event(s); Expiry, after expiry\n", while_inside
+    everything = at_return + while_inside + at_end
+    assert everything.count("folded at exit") == 2, everything
+    assert everything.count("Expiry, after expiry") == 1, everything
+
+
+def test_a_flush_answered_after_the_fold_began_returns_before_its_batchs_lines(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC8: a marker met at exit emits an exit batch, whose lines are folded.
+
+    Fifteen spans are queued ahead of the marker and ten behind it, so the exit drain sends ten
+    (call 2, the first abandoned), then the five ahead of the marker (call 3, folded), answers
+    the ``flush()``, and holds call 4. The ``flush()`` has returned by then, and call 3's line is
+    nowhere on stderr; it appears folded at the end of the exit.
+    """
+    _ten_span_batches(monkeypatch)
+    sink = _ExitSink(fails=True)
+    sink.on_call = lambda call: _diag.lost("event", 1, f"Flush, call {call}")
+    held = sink.hold(4)
+    worker = _at_exit(sink, 15, max_retries=0)
+    results: dict[str, object] = {}
+    flushing = _flush_behind(worker, results, "flush")
+    for seq in range(100, 110):
+        worker.submit(_span(seq))
+    retiring = _retire_on_thread(worker, 30.0)
+    try:
+        snapshot = _snapshot_at(sink, 4, capsys)
+        flushing.join(10.0)
+        assert "flush" in results, "the premise: the flush() returned while call 4 is held"
+        snapshot += capsys.readouterr().err
+    finally:
+        held.set()
+        retiring.join(30.0)
+        worker._thread.join(5.0)
+    assert sink.handed[:3] == [20, 20, 10], sink.handed
+    assert "Flush, call 3" not in snapshot, snapshot
+    assert "Flush, call 3; 1 line(s) folded at exit" in capsys.readouterr().err
+
+
+def test_a_line_from_a_thread_the_sink_starts_is_written_at_once(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-001 AC10: the window is the drain thread's, so a sink's own thread writes at once."""
+    _ten_span_batches(monkeypatch)
+    sink = _ExitSink(fails=True)
+
+    def on_call(call: int) -> None:
+        if call == 3:
+            own = threading.Thread(
+                target=lambda: _diag.lost("event", 1, "OwnThread, from the sink's thread")
+            )
+            own.start()
+            own.join(5.0)
+
+    sink.on_call = on_call
+    held = sink.hold(4)
+    worker = _at_exit(sink, 30, max_retries=0)
+    retiring = _retire_on_thread(worker, 30.0)
+    try:
+        snapshot = _snapshot_at(sink, 4, capsys)
+    finally:
+        held.set()
+        retiring.join(30.0)
+        worker._thread.join(5.0)
+    assert "log-foundry: lost 1 event(s); OwnThread, from the sink's thread\n" in snapshot
+
+
+class _Cyclic:
+    """Garbage the collector must find: an object that refers to itself, with a finalizer."""
+
+    def __init__(self, seen: list[bool], drain: list[threading.Thread]) -> None:
+        self.me = self
+        self.seen = seen
+        self.drain = drain
+
+    def __del__(self) -> None:
+        reentered = bool(self.drain) and threading.current_thread() is self.drain[0]
+        self.seen.append(reentered and _diag._FOLD_LOCK.locked())
+        _diag.absorbed("finalizing an object", ValueError(), "from __del__")
+
+
+class _GarbageSink(_ExitSink):
+    """Every later call makes cyclic garbage and writes lines with many keys, then fails."""
+
+    def __init__(self) -> None:
+        super().__init__(fails=True)
+        self.seen: list[bool] = []
+        self.drain: list[threading.Thread] = []
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        """Makes the garbage and writes the lines, then behaves as planned."""
+        call = len(self.handed) + 1
+        if call > 1:
+            for i in range(40):
+                _Cyclic(self.seen, self.drain)
+                _diag.lost("event", 1, f"Garbage, key {call * 40 + i}")
+        super().emit(batch)
+
+
+def test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """SPEC-103 plan review B1 (invariant 3): a recorder never waits on the fold lock.
+
+    With the collector run at every allocation, a ``__del__`` runs on the drain thread inside a
+    recorder's locked section and writes a line of its own. A recorder that waited for the lock
+    waited on its own thread for good, and ``stop()``'s take then never returned. Every event
+    must still be counted once the drain ends.
+    """
+    _ten_span_batches(monkeypatch)
+    sink = _GarbageSink()
+    worker = Worker(sink, batch_size=10, flush_interval=3_600.0, max_retries=0)
+    sink.first_waits_on = worker._stop
+    sink.drain.append(worker._thread)
+    for seq in range(10):
+        worker.submit(_span(seq))
+    _until(lambda: worker._in_flight == 20)
+    for seq in range(10, 310):
+        worker.submit(_span(seq))
+    thresholds = gc.get_threshold()
+    gc.set_threshold(1, 1, 1)
+    try:
+        stopping = threading.Thread(target=worker.stop, args=(1.0,), daemon=True)
+        stopping.start()
+        stopping.join(15.0)
+        assert not stopping.is_alive(), "stop() did not return: the fold lock deadlocked"
+        worker._thread.join(15.0)
+        assert not worker._thread.is_alive(), "the drain thread deadlocked on the fold lock"
+    finally:
+        gc.set_threshold(*thresholds)
+        gc.collect()
+    capsys.readouterr()
+    assert any(sink.seen), "the premise: a finalizer ran on the drain thread inside the lock"
+    assert worker._delivered + worker._batch_lost == 2 * 310, "an event was left uncounted"
+
+
+# ---------------------------------------------------------------------------- SPEC-103 FR-002
+
+
+class _SlowdownClock:
+    """A monotonic clock that only the black-holed client moves."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class _SlowdownClient:
+    """An SQS client whose first request waits for the stop; every request raises."""
+
+    def __init__(self, clock: _SlowdownClock, slow_at: float) -> None:
+        self.clock = clock
+        self.slow_at = slow_at
+        self.sizes: list[int] = []
+        self.first_waits_on: threading.Event | None = None
+
+    def send_message_batch(self, *, QueueUrl: str, Entries: list[Any]) -> None:
+        """Costs 0.5 ms on the clock until ``slow_at``, then 0.3 s, and raises."""
+        self.sizes.append(len(Entries))
+        if len(self.sizes) == 1:
+            assert self.first_waits_on is not None
+            self.first_waits_on.wait(30.0)
+        else:
+            self.clock.now += 0.3 if self.clock.now >= self.slow_at else 0.0005
+        raise ConnectionError("black-holed")
+
+
+@pytest.mark.parametrize("slow_at", [0.004, 0.01, 0.02])
+def test_a_sqs_sink_that_turns_slow_mid_exit_ends_before_the_deadline(
+    slow_at: float, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FR-002 AC4 (invariant 3): exit batches do not grow, so a slowdown cannot outrun the budget.
+
+    ``spec103_sqs_slowdown_exit.py``'s shape through the shipped ``shutdown(0.5)``: a black-holed
+    ``SQSSink`` whose requests cost 0.5 ms on a clock only the client moves until ``slow_at``,
+    then 0.3 s. ``time.monotonic`` and ``_lifecycle.monotonic`` are patched process-wide, as the
+    probe patches them, so the 7f400f51 numbers stay comparable: run in a worktree at that
+    commit, this test failed with the drain ending 1.60, 2.81 and 6.42 s past the deadline.
+
+    **The drain's end on that clock is the assertion that carries the guard**: the join and the
+    close pass at 7f400f51 too. The join's own wait is the deadline on the fake clock less the
+    fake now, which is real seconds, so a loaded runner (``-n 12``) can expire it while the drain
+    is still well inside the fake budget. The worker thread's ``join`` is therefore given 30 real
+    seconds more, which changes no fake-clock arithmetic: a drain that overran the fake deadline
+    still fails the first assertion, however long the real join waited for it.
+    """
+    clock = _SlowdownClock()
+    monkeypatch.setattr(time, "monotonic", clock)
+    monkeypatch.setattr(_lifecycle, "monotonic", clock)
+    client = _SlowdownClient(clock, slow_at)
+    sink = SQSSink("https://sqs/q", client=client, max_retries=0)
+    closes = [0]
+    monkeypatch.setattr(sink, "close", lambda: closes.__setitem__(0, closes[0] + 1))
+    worker = Worker(sink, batch_size=10, flush_interval=1.0, max_retries=0)
+    real_join = worker._thread.join
+    monkeypatch.setattr(
+        worker._thread,
+        "join",
+        lambda timeout=None: real_join(None if timeout is None else timeout + 30.0),
+    )
+    client.first_waits_on = worker._stop
+    install_worker(worker)
+    for seq in range(10):
+        worker.submit([{"message": "m", "seq": seq}])
+    _until(lambda: bool(client.sizes))
+    for seq in range(10, 2010):
+        worker.submit([{"message": "m", "seq": seq}])
+    ended: list[float] = []
+
+    def watch() -> None:
+        worker._drain_finished.wait(60.0)
+        ended.append(clock.now)
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    log_foundry.shutdown(0.5)
+    closes_at_return = closes[0]
+    real_join(60.0)
+    watcher.join(60.0)
+    capsys.readouterr()
+    deadline = worker._exit_deadline
+    assert deadline is not None
+    assert ended, "the drain never finished"
+    assert ended[0] < deadline, f"the drain ended {ended[0] - deadline:+.2f}s past the deadline"
+    assert worker.stopped_reason is None, "the join completed"
+    assert closes_at_return == 1, "close() ran once"

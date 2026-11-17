@@ -490,7 +490,10 @@ def _announce_dropped(count: int) -> None:
     value it drew is 1 or a multiple of ``_diag.WARN_EVERY``, carrying the last value it drew as
     the running total, the throttle every per-event site in the library uses. Each value is
     unique, so each crossing is announced by exactly one call even under concurrent calls. The
-    line names a count only; ``_diag.lost`` cannot raise on a stream fault.
+    line names a count only; ``_diag.lost`` cannot raise on a stream fault. The count is a running
+    total, so the call passes ``running_total=True``: a sink can reach this on the drain thread
+    inside an exit fold window, and summing running totals there would overstate the loss
+    (SPEC-103 FR-001).
 
     Args:
       count: How many members this call dropped, at least 1.
@@ -512,6 +515,7 @@ def _announce_dropped(count: int) -> None:
             "baggage member",
             total,
             "running total; members dropped from the outbound baggage header",
+            running_total=True,
         )
 
 

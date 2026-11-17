@@ -772,6 +772,7 @@ _GLOBAL_PRIMITIVES: tuple[tuple[str, str], ...] = (
     ("decorator", "_loss_lock"),
     ("api", "_console._lock"),
     ("_ledger", "_registry.lock"),
+    ("_diag", "_FOLD_LOCK"),
 )
 """Every lock and event the package holds as module state, listed (SPEC-079 FR-001).
 
@@ -1047,8 +1048,15 @@ def _reinit_after_fork() -> None:
     """Repairs the library in a child that has just returned from ``fork``.
 
     **The order of work here is the contract** (SPEC-039 FR-001 AC-2, SPEC-079 FR-002,
-    SPEC-081 FR-004):
+    SPEC-081 FR-004, SPEC-103 FR-001):
 
+    0. withdraw ``_diag``'s fold window on the forking thread
+       (:func:`_diag.withdraw_fold_in_child`), before anything below can write a line, taking no
+       lock. A sink that forks inside a folded
+       exit call leaves the child's only thread with the window open on the parent's table, and
+       every line the repair writes would be recorded there and then erased, unwritten, by the
+       worker's reset. It is a step here rather than a second ``os.register_at_fork`` handler in
+       ``_diag``, because the package holds to one registration;
     1. run the registered pin (:data:`_pin`), which holds strongly every inherited ownership
        record entry whose sink is alive, before anything below can drop the last reference to
        one — the rebind in step 2 drops a list that may hold one — and before the roster, since it
@@ -1084,6 +1092,7 @@ def _reinit_after_fork() -> None:
         only writer, appending only.
     """
     global reacquired_in_child
+    _diag.withdraw_fold_in_child()
     pin = _pin
     if pin is not None:
         try:
