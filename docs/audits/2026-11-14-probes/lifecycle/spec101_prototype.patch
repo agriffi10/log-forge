@@ -1,0 +1,502 @@
+diff -ruN a/src/log_foundry/_lifecycle.py b/src/log_foundry/_lifecycle.py
+--- a/src/log_foundry/_lifecycle.py	2026-11-17 14:56:42
++++ b/src/log_foundry/_lifecycle.py	2026-11-17 15:04:56
+@@ -484,6 +484,7 @@
+           None.
+         """
+         self.owed[id(sink)] = sink
++        _ARMED[id(sink)] = _ref(sink)
+ 
+     def owes(self, sink: Sink) -> bool:
+         """Whether the record owes *sink* a close right now; the caller holds ``_state._lock``.
+@@ -1833,6 +1834,8 @@
+     with _state._lock:
+         with _state._closes._lock:
+             _state._closes._in_flight.clear()
++            _AFTER.clear()
++            _ARMED.clear()
+             _state._swaps_running.clear()
+             _state._stops_running.clear()
+         _state._shutdown_running = 0
+@@ -2838,6 +2841,221 @@
+     return entry
+ 
+ 
++_AFTER: dict[int, tuple[object, list[list[object]]]] = {}
++"""SPEC-101 prototype: by holder id, a reference to the holder and its attached members.
++
++Each member is ``[member, closing]``. ``closing`` is ``None`` for a member kept or skipped on the
++holder's account, which stays attached for as long as the holder lives, so it is closed after every
++library close of that holder; it is the member's taken entry for a member one take ordered after
++the holder (FR-002), which is closed once and dropped."""
++
++_SKIP_REPORTED_CLOSED = os.environ.get("SPEC101_OPTION", "a") == "b"
++"""SPEC-101 prototype: option (b), skip a member whose closed guard reports a close."""
++
++_HONOUR_DECLARATION = os.environ.get("SPEC101_OPTION", "a") == "c"
++"""SPEC-101 prototype: option (c), a holder declaring log_foundry_closes_members = True is trusted."""
++
++
++def _ref(holder: object) -> object:
++    """A weak reference to *holder* where its type allows one, else the holder itself."""
++    try:
++        return weakref.ref(holder)
++    except TypeError:
++        return holder
++
++
++def _deref(ref: object) -> object | None:
++    """The holder a :func:`_ref` names, or ``None`` once it is gone."""
++    return ref() if isinstance(ref, weakref.ReferenceType) else ref
++
++
++def _entry_of(holder: object) -> list[list[object]] | None:
++    """The live attachment list of *holder*, pruning a dead entry on its id."""
++    entry = _AFTER.get(id(holder))
++    if entry is None:
++        return None
++    if _deref(entry[0]) is not holder:
++        _AFTER.pop(id(holder), None)
++        return None
++    return entry[1]
++
++
++def _prune_after() -> None:
++    """Drops every entry whose holder is gone (SPEC-101 prototype's bound)."""
++    for key, (ref, _members) in list(_AFTER.items()):
++        if _deref(ref) is None:
++            _AFTER.pop(key, None)
++
++
++def _ships_close(holder: object) -> bool:
++    """Whether *holder*'s ``close`` is the package's own, so its forward closes its members."""
++    import inspect
++
++    try:
++        close = inspect.getattr_static(type(holder), "close", None)
++    except Exception:
++        return False
++    close = getattr(close, "__func__", close)
++    return str(getattr(close, "__module__", "")).startswith("log_foundry.")
++
++
++def _attach(holder: object, member: object, closing: object = None) -> None:
++    """Records *member* to be released after each library close of *holder* (SPEC-101)."""
++    if holder is member:
++        return
++    entries = _entry_of(holder)
++    if entries is None:
++        _prune_after()
++        entries = []
++        _AFTER[id(holder)] = (_ref(holder), entries)
++    for item in entries:
++        if item[0] is member:
++            if closing is not None:
++                item[1] = closing
++            return
++    entries.append([member, closing])
++
++
++def _unattach(holder: object, member: object) -> None:
++    """Drops *member* from *holder*'s persistent attachments, when it moves to another holder."""
++    entries = _entry_of(holder)
++    if entries is not None:
++        entries[:] = [item for item in entries if item[0] is not member or item[1] is not None]
++
++
++def _take_deferred(holder: object) -> list[tuple[object, object]]:
++    """Removes and returns the one-shot members of *holder*, those carrying a taken entry."""
++    entries = _entry_of(holder)
++    if entries is None:
++        return []
++    taken = [(item[0], item[1]) for item in entries if item[1] is not None]
++    entries[:] = [item for item in entries if item[1] is None]
++    return taken
++
++
++def _caller_holder_for(sink: object, roots: list[object]) -> object | None:
++    """The closest holder whose close is not the package's, among *roots* and their graphs."""
++    best: object | None = None
++    best_size = 0
++    seen: set[int] = set()
++    for root in roots:
++        for node in _installed_graph(root).values():
++            if id(node) in seen or node is sink or _ships_close(node):
++                continue
++            seen.add(id(node))
++            graph = _installed_graph(node)
++            if graph.get(id(sink)) is not sink:
++                continue
++            if best is None or len(graph) < best_size:
++                best, best_size = node, len(graph)
++    return best
++
++
++_ARMED: dict[int, object] = {}
++"""SPEC-101 prototype: by id, a reference to every sink the library has armed as a root, which is
++what "the library wrote to it" means; the build keeps this on the sink's ownership entry."""
++
++
++def _was_armed(sink: object) -> bool:
++    """Whether the library has armed *sink* as a root in this process (SPEC-101 prototype)."""
++    ref = _ARMED.get(id(sink))
++    return ref is not None and _deref(ref) is sink
++
++
++def _attach_written(root: object, graph: Mapping[int, object]) -> None:
++    """Attaches every sink in *root*'s graph the library wrote to, to its closest caller holder."""
++    for key, ref in list(_ARMED.items()):
++        if _deref(ref) is None:
++            _ARMED.pop(key, None)
++    for member in list(graph.values()):
++        if member is root or not _was_armed(member):
++            continue
++        _attach_kept(root, member)
++
++
++def _attach_kept(root: object, sink: object) -> None:
++    """Attaches a sink a swap kept to the closest caller's holder of it in the installed graph."""
++    holder = _caller_holder_for(sink, [root])
++    if holder is not None:
++        _attach(holder, sink)
++
++
++def _attach_skipped(keep: "_Keep", sink: object, previous: object | None = None) -> None:
++    """Attaches a member a keep spared to the caller's holder on whose account it was spared."""
++    root = getattr(keep, "root", None)
++    holder: object | None = None
++    if keep.kept.get(id(sink)) is sink:
++        if root is not None:
++            holder = _caller_holder_for(sink, [root])
++    elif keep.remaining and keep.remaining_graph().get(id(sink)) is sink:
++        if any(item is sink for item in keep.remaining):
++            holder = None
++        else:
++            holder = _caller_holder_for(sink, list(keep.remaining))
++    else:
++        return
++    if previous is not None and holder is not previous:
++        _unattach(previous, sink)
++    if holder is not None:
++        _attach(holder, sink)
++
++
++def _reports_closed(sink: object) -> bool:
++    """Option (b): whether a shipped closed guard on *sink* reports a close has begun."""
++    from log_foundry.sinks._guard import ClosedGuard
++
++    try:
++        guard = vars(sink).get("_guard")
++    except TypeError:
++        return False
++    return isinstance(guard, ClosedGuard) and guard.closed
++
++
++def _release_after(holder: object, keep: "_Keep") -> None:
++    """Releases each member attached to *holder*, in sequence, after its close (SPEC-101).
++
++    A persistent member stays attached; a one-shot member is dropped. A ``BaseException`` from a
++    member's close puts back every one-shot member not yet closed, its entry discharged, and
++    propagates."""
++    entries = _entry_of(holder)
++    if not entries:
++        return
++    pending = [(item[0], item[1]) for item in entries]
++    entries[:] = [item for item in entries if item[1] is None]
++    declared = _HONOUR_DECLARATION and type(holder).__dict__.get("log_foundry_closes_members") is True
++    index = 0
++    try:
++        for index, (member, closing) in enumerate(pending):
++            if declared:
++                if closing is not None:
++                    _state._closes.finish(member, closing)
++                continue
++            if closing is None:
++                if _state._closes.owes(member) or _state._closes.in_flight(member):
++                    continue
++                if keep.spares(member):
++                    _attach_skipped(keep, member, previous=holder)
++                    continue
++            if _SKIP_REPORTED_CLOSED and _reports_closed(member):
++                if closing is not None:
++                    _state._closes.finish(member, closing)
++                continue
++            try:
++                release(member, closing=closing, keeping=keep)
++            except Exception as exc:
++                _diag.absorbed(
++                    "closing a sink after the wrapper that holds it",
++                    exc,
++                    "it may still hold its resources",
++                )
++    except BaseException:
++        with _state._lock:
++            for member, closing in pending[index + 1 :]:
++                if closing is not None:
++                    _state._closes.put_back(member, closing)
++        raise
++
++
+ def release(
+     sink: Sink,
+     *,
+@@ -2947,6 +3165,7 @@
+         return None
+     active = keeping if keeping is not None else (_active_keep() if owner is not None else None)
+     if owner is not None and active is not None and active.spares(sink):
++        _attach_skipped(active, sink)
+         _state._closes.finish(sink, closing)
+         return None
+     if detached:
+@@ -2961,7 +3180,11 @@
+     try:
+         _state._releasing_here.depth = depth + 1
+         _state._releasing_here.keep = active
+-        sink.close()
++        try:
++            sink.close()
++        finally:
++            if active is not None:
++                _release_after(sink, active)
+     finally:
+         _state._releasing_here.depth = depth
+         _state._releasing_here.keep = prior
+@@ -3462,6 +3685,7 @@
+         self.remaining = remaining
+         self.closed = closed
+         self._remaining_graph: dict[int, object] | None = None
++        self.root: object | None = None
+ 
+     def took(self, sink: object) -> None:
+         """Records a sink the decision took, before any of its closes starts.
+@@ -3564,6 +3788,28 @@
+     return False
+ 
+ 
++def _order_after(taken: list[Sink]) -> dict[int, object]:
++    """For each taken sink lying strictly beneath another taken one, its closest such holder."""
++    if len(taken) < 2:
++        return {}
++    graphs = {id(sink): _installed_graph(sink) for sink in taken}
++    order: dict[int, object] = {}
++    for member in taken:
++        best = None
++        for holder in taken:
++            if holder is member or _ships_close(holder):
++                continue
++            if graphs[id(holder)].get(id(member)) is not member:
++                continue
++            if graphs[id(member)].get(id(holder)) is holder:
++                continue
++            if best is None or len(graphs[id(holder)]) < len(graphs[id(best)]):
++                best = holder
++        if best is not None:
++            order[id(member)] = best
++    return order
++
++
+ def _active_keep() -> _Keep | None:
+     """The keep of the release this thread is performing right now, or ``None`` outside one.
+ 
+@@ -4730,9 +4976,15 @@
+             else set()
+         )
+         taken = [sink for sink in taken if id(sink) not in passed]
++        order = _order_after(taken)
++        for sink, close in entries:
++            if id(sink) in order:
++                _attach(order[id(sink)], sink, close)
++                del undischarged[id(sink)]
++        taken = [sink for sink in taken if id(sink) not in order]
+         inline = _inline_close_choice(taken, worker) if taken and not detach else None
+         for sink, close in entries:
+-            if sink is inline or id(sink) in passed:
++            if sink is inline or id(sink) in passed or id(sink) in order:
+                 continue
+             del undischarged[id(sink)]
+             if close.rule is _Rule.GRACED:
+@@ -4764,7 +5016,9 @@
+     finally:
+         if undischarged:
+             with _state._lock:
+-                for sink, close in undischarged.values():
++                for sink, close in list(undischarged.values()):
++                    for member, held in _take_deferred(sink):
++                        _state._closes.put_back(member, held)
+                     _state._closes.put_back(sink, close)
+         _state._closes.join_joined(joined)
+     if not waiting:
+@@ -5640,6 +5894,7 @@
+     hand_new = False
+     try:
+         kept = _installed_graph(new_sink)
++        _attach_written(new_sink, kept)
+         closed: dict[int, tuple[object, object]] = {}
+         owed_now = list(_state._closes.owed.values())
+         graphs = (
+@@ -5675,9 +5930,16 @@
+                 [sink for sink in _state._closes.owed.values() if id(sink) not in leaving],
+                 closed,
+             )
++            keep.root = new_sink
+             for stale in taking:
+                 keep.took(stale)
++            order = _order_after(taking)
+             for stale in taking:
++                if id(stale) in order:
++                    _attach(order[id(stale)], stale, _state._closes.take(stale, _Rule.GRACED))
++            for stale in taking:
++                if id(stale) in order:
++                    continue
+                 closer = release(
+                     stale,
+                     detached=True,
+@@ -5738,6 +6000,7 @@
+                             [sink for sink in _state._closes.owed.values() if sink is not previous],
+                             closed,
+                         )
++                        second.root = new_sink
+                         second.took(previous)
+                         closer = release(
+                             previous,
+diff -ruN a/tests/model_oracles.py b/tests/model_oracles.py
+--- a/tests/model_oracles.py	2026-11-16 11:52:30
++++ b/tests/model_oracles.py	2026-11-17 15:02:14
+@@ -210,6 +210,11 @@
+     stop_entered: float
+ 
+ 
++import os as _os
++REPEAT_RULE = _os.environ.get("REPEAT_RULE", "lib-after-wrapper")
++WRAPPER_MARK = __import__("threading").local()
++
++
+ @dataclass(frozen=True)
+ class Closes:
+     """One sink's writes and the write count at each of its closes.
+@@ -223,6 +228,7 @@
+     writes: int
+     at_entry: tuple[int, ...]
+     at_return: tuple[int, ...]
++    by_wrapper: tuple[bool, ...] = ()
+ 
+ 
+ @dataclass(frozen=True)
+@@ -407,7 +413,13 @@
+       CloseBroken: ``repeat@<count>``, one key for each count at which it happened.
+     """
+     counts: list[int] = []
+-    for before, after in zip(closes.at_entry, closes.at_entry[1:], strict=False):
++    marks = closes.by_wrapper or (False,) * len(closes.at_entry)
++    pairs = list(zip(closes.at_entry, marks, strict=False))
++    for (before, wrapped), (after, by_w) in zip(pairs, pairs[1:], strict=False):
++        if wrapped and not by_w and REPEAT_RULE == "lib-after-wrapper":
++            continue
++        if wrapped and REPEAT_RULE == "any-after-wrapper":
++            continue
+         if after == before and after not in counts:
+             counts.append(after)
+     if counts:
+diff -ruN a/tests/test_invariants_model.py b/tests/test_invariants_model.py
+--- a/tests/test_invariants_model.py	2026-11-16 11:52:30
++++ b/tests/test_invariants_model.py	2026-11-17 15:02:54
+@@ -120,6 +120,7 @@
+ from log_foundry.sinks._engine import emit_via_deliver
+ from log_foundry.sinks.http import HTTPSink
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
++import model_oracles
+ from model_oracles import (
+     EPSILON,
+     GATE_MARGIN,
+@@ -378,6 +379,7 @@
+         self._writes = 0
+         self._at_entry: list[int] = []
+         self._at_return: list[int] = []
++        self._by_wrapper: list[bool] = []
+         self._lock = threading.Lock()
+ 
+     def wrote(self, sink: object) -> None:
+@@ -412,6 +414,7 @@
+         """
+         with self._lock:
+             self._at_entry.append(self._writes)
++            self._by_wrapper.append(bool(getattr(model_oracles.WRAPPER_MARK, "on", False)))
+             soak = _SOAK["run"]
+             if soak is not None:
+                 name = threading.current_thread().name
+@@ -445,7 +448,7 @@
+           None.
+         """
+         with self._lock:
+-            return Closes(self._writes, tuple(self._at_entry), tuple(self._at_return))
++            return Closes(self._writes, tuple(self._at_entry), tuple(self._at_return), tuple(self._by_wrapper))
+ 
+ 
+ class Recorder:
+@@ -1585,6 +1588,26 @@
+             self.threads.clear()
+ 
+ 
++class Leaves:
++    def __init__(self, m: Any) -> None:
++        self.m = m
++
++    def emit(self, batch: Any) -> None:
++        self.m.emit(batch)
++
++    def close(self) -> None:
++        pass
++
++
++class Mine(Leaves):
++    def close(self) -> None:
++        model_oracles.WRAPPER_MARK.on = not os.environ.get("NO_MARK")
++        try:
++            self.m.close()
++        finally:
++            model_oracles.WRAPPER_MARK.on = False
++
++
+ def _sample(kind: str) -> None:
+     """Records what the state read at this instant of a recorder call."""
+     stop = _lifecycle._state._stop.is_set()
+@@ -1607,6 +1630,22 @@
+         self.sinks.append(sink)
+         return sink
+ 
++    def install(self) -> object:
++        if not hasattr(self, "_rng"):
++            self._rng = random.Random(f"install:{self.seed}")  # noqa: S311
++            self.drawn = collections.Counter()
++        kind = self._rng.choice(["fresh", "Leaves", "Mine"])
++        from log_foundry import config as _config
++
++        held = _config._live_config().sink
++        if kind == "fresh" or not isinstance(held, StateRecorder) or not held.events:
++            self.drawn["fresh" if kind == "fresh" else kind + "-not-drawn"] += 1
++            self.history.append(f"<fresh {len(self.sinks)}>")
++            return self.recorder()
++        self.drawn[kind] += 1
++        self.history.append(f"<{kind} over sink {self.sinks.index(held)}>")
++        return (Leaves if kind == "Leaves" else Mine)(held)
++
+     def where(self, index: int) -> str:
+         return f"seed={self.seed} step={index} history={self.history}"
+ 
+@@ -1723,7 +1762,7 @@
+     _BRACKET[0] = label
+     try:
+         if step == "configure":
+-            log_foundry.configure(service="model", sink=run.recorder())
++            log_foundry.configure(service="model", sink=run.install())
+         elif step == "info":
+             log_foundry.info("orphan")
+             run.orphans += 1
+@@ -1944,6 +1983,7 @@
+         _check_transient(cell, label, transient, where)
+         _check_invariants(run, step, result, driver, where)
+         _check_close_count(run, step, where)
++    print("DRAWN", seed, dict(getattr(run, "drawn", {})))
+     return max(margins)
+ 
+ 

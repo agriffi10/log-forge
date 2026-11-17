@@ -673,6 +673,13 @@ specs:
     depends_on: ["SPEC-010", "SPEC-016", "SPEC-058", "SPEC-071", "SPEC-074", "SPEC-092", "SPEC-093", "SPEC-095", "SPEC-096"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-100-sns-fifo-topics.md"
+  - id: "SPEC-101"
+    title: "A Kept Sink Behind a Caller's Wrapper Is Closed After That Wrapper, Never Beside It"
+    description: "Has the library close a sink it wrote to, wherever a caller's wrapper holds it, after each close of that wrapper the library makes, so a wrapper that leaves its member alone no longer leaves the member closed by nobody, a wrapper that closes its member gives it a second close in sequence rather than two at once, and the model test learns to tell a wrapper's close from the library's."
+    spec_status: "Draft"
+    depends_on: ["SPEC-042", "SPEC-054", "SPEC-076", "SPEC-081", "SPEC-086", "SPEC-087", "SPEC-097", "SPEC-098"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-101-a-kept-sink-is-closed-after-its-holder.md"
   - id: "SPEC-102"
     title: "NATSSink Resends the Tail Its Deadline Left Unattempted"
     description: "Makes an event a NATSSink round never handed to the driver resendable when something else in the round was published, so the worker's existing retry rounds deliver the tail of a backlog batch that a short publish_timeout cuts, rather than counting it lost; closes the NATSSink residual SPEC-090 filed in architecture.md section 12, and the 1.2.1 tag waits for it."
@@ -698,7 +705,7 @@ arcs:
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098", "SPEC-099", "SPEC-100", "SPEC-102"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098", "SPEC-099", "SPEC-100", "SPEC-101", "SPEC-102"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
