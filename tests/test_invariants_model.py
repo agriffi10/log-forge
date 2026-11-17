@@ -834,6 +834,20 @@ class _Runs:
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
 
+def _ends_out_of_the_queue(offered: set[str], runs: _Runs, where: str) -> int:
+    """Counts the ``span.end`` events that left the worker's queue, offered or declined.
+
+    An event offered to a recorder is out of the queue whatever its fate; one in an exit batch
+    declined unattempted was never offered, yet it left the queue as a ``failed_batches`` too
+    (SPEC-090 FR-003). The two sets are disjoint, since an event offered and then declined
+    would be one handled twice, and an overlap is reported rather than absorbed by a union.
+    """
+    declined = [i for _, batch in runs.declined for i, m in batch if m == "span.end"]
+    both = offered.intersection(declined)
+    assert not both, f"invariant 2 (a span.end offered and declined): {sorted(both)[:5]} {where}"
+    return len(offered) + len(set(declined))
+
+
 def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
     """Records each ``run_delivery`` call's batch, path and ``Delivery``, and each declined batch."""
     runs = _Runs()
@@ -1165,10 +1179,9 @@ def _interleaving(
         # In the deliver form an event offered to the sink has a fate rather than a delivery: a
         # span.end offered once is out of the queue whatever its fate (a failed worker run is
         # failed_batches, held below), and an orphan whose run failed is the orphan_lost term,
-        # so "delivered" is the orphans whose run settled. A span.end in an exit batch declined
-        # unattempted was never offered, yet it left the queue as failed_batches too.
-        declined_ends = {i for _, batch in runs.declined for i, m in batch if m == "span.end"}
-        ends = len({e for s in ledger.sinks for e in _ids(s, "span.end")} | declined_ends)
+        # so "delivered" is the orphans whose run settled.
+        offered = {e for s in ledger.sinks for e in _ids(s, "span.end")}
+        ends = _ends_out_of_the_queue(offered, runs, f"seed={seed} form={form}")
         failed_orphans = sum(1 for _, path, d in runs.calls if path == "orphan" and d.failed)
         orphans = len({e for s in ledger.sinks for e in _ids(s, "orphan")}) - failed_orphans
     unclosed = [i for i, sink in enumerate(ledger.sinks) if sink.events and sink.closes == 0]
@@ -1990,8 +2003,10 @@ _TALLY_WRITER = "_write_exit_tallies"
 def _detail_pattern(node: ast.expr, *, tally: bool) -> str:
     """Renders a lost line's ``detail`` argument as a regex, every interpolation any text.
 
-    A tally's first interpolation, its batch count, is the one group, ``(\\d+)``. The literal
-    text must fit ``_diag._MAX_DETAIL``, past which the line is cut and no shape could read it.
+    A tally's first interpolation, its batch count, is the one group, ``(\\d+)``. The detail's
+    literal text must fit ``_diag._MAX_DETAIL``, past which the line is cut and no shape could
+    read it. Only the literal is held: an interpolation that renders a line past the cut is not
+    caught here, and every worker interpolation today is a count.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         parts: list[ast.expr] = [node]
@@ -2224,10 +2239,12 @@ class _ExitDeliverSink:
     def __init__(self) -> None:
         self.log_foundry_counters = SinkCounters()
         self.calls = 0
+        self.offered: set[str] = set()
         self.first_waits_on: threading.Event | None = None
 
     def deliver(self, batch: list[dict[str, object]]) -> Verdict:
         self.calls += 1
+        self.offered.update(str(e.get("log_id")) for e in batch)
         if self.calls == 1:
             assert self.first_waits_on is not None
             self.first_waits_on.wait(30.0)
@@ -2254,7 +2271,9 @@ def test_an_exit_drain_tally_balances_the_worker_ledger(
     sends them in batches of one span against a sink that never accepts again. A shutdown with
     time left abandons every exit batch, the first in its own line and the rest in one tally; a
     shutdown at ``timeout=0`` declines the first exit batch's retry and every later batch
-    unattempted, in a tally. Before the lines were derived from ``worker.py``, a ``deliver`` or
+    unattempted, in a tally. Every span left the queue either way, so the spans identity's
+    ``ends`` term counts all eleven, the declined ones too. Before the lines were derived from
+    ``worker.py``, a ``deliver`` or
     ``http`` run that met either failed invariant 2: 4 of 16,000 such items, seeds 0 to 7999,
     against the hand-listed pattern this file carried at ``03dbf502``.
     """
@@ -2264,13 +2283,13 @@ def test_an_exit_drain_tally_balances_the_worker_ledger(
     worker = Worker(sink, batch_size=1, flush_interval=3_600.0, max_retries=1)
     sink.first_waits_on = worker._stop
     install_worker(worker)
-    worker.submit([{"message": "m", "log_id": "held"}])
+    worker.submit([{"message": "span.end", "log_id": "held"}])
     for _ in range(1_000):
         if sink.calls:
             break
         threading.Event().wait(0.01)
     for seq in range(10):
-        worker.submit([{"message": "m", "log_id": f"exit-{seq}"}])
+        worker.submit([{"message": "span.end", "log_id": f"exit-{seq}"}])
     retire_process(worker, timeout)
     worker._thread.join(10.0)
     assert not worker._thread.is_alive(), "the drain thread outlived the test, and its lines too"
@@ -2281,6 +2300,9 @@ def test_an_exit_drain_tally_balances_the_worker_ledger(
     held = [i for _, batch in runs.declined for i, _m in batch]
     assert held == [f"exit-{seq}" for seq in range(10 - len(held), 10)], picture
     _assert_the_worker_lost_lines(runs, err, picture)
+    assert _ends_out_of_the_queue(sink.offered, runs, picture) == 11, (
+        f"invariant 2 (every span.end left the queue, offered or declined): {picture}"
+    )
 
 
 def test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do() -> None:
