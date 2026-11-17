@@ -1203,11 +1203,11 @@ class Worker:
         """Puts one submission on the queue and counts its overflow or retirement, writing nothing.
 
         :meth:`submit`'s counting half (SPEC-091 FR-001), in the order :meth:`submit` documents:
-        the put; on a full queue, ``dropped`` and ``_overflow_lost`` under ``_lock``; otherwise, when
-        ``count_retired`` is set, the single post-put retirement read and its count. Nothing after
-        a put that succeeded can raise an ``Exception``: an attribute load, an ``int`` comparison
-        and a locked increment. So a hand-in that raises raised before its events were queued,
-        which is what lets a sweep debit a raising hand-in's take to ``in_span_lost``; an
+        the put; on a full queue, ``dropped`` and ``_overflow_lost`` under ``_lock``; otherwise,
+        when ``count_retired`` is set, the single post-put retirement read and its count. Nothing
+        after a put that succeeded can raise an ``Exception``: an attribute load, an ``int``
+        comparison and a locked increment. So a hand-in that raises raised before its events were
+        queued, which is what lets a sweep debit a raising hand-in's take to ``in_span_lost``; an
         asynchronous ``BaseException`` landing after the put is the one residual, counted twice,
         and recorded in ``architecture.md`` §13.
 
@@ -3002,12 +3002,12 @@ class Worker:
         than the steady drain does; a span whose events it could not take keeps them.
 
         **It takes at most the entries the queue held when it began**, read ~~in its first
-        statement~~ right after that sweep, so a caller that keeps logging after ``shutdown()`` cannot keep it running:
-        what arrives later stays queued, in ``stranded`` and ``submitted_after_shutdown``. A
-        sentinel put after that read is never taken, so the window a late sentinel strands in
-        now opens when this drain begins rather than where its one pull loop used to end, which
-        widens it by that loop's duration, sub-millisecond to a few milliseconds
-        (``architecture.md`` §12).
+        statement~~ right after that sweep, so a caller that keeps logging after ``shutdown()``
+        cannot keep it running: what arrives later stays queued, in ``stranded`` and
+        ``submitted_after_shutdown``. A sentinel put after that read is never taken, so the window
+        a late sentinel strands in now opens when this drain begins rather than where its one pull
+        loop used to end, which widens it by that loop's duration, sub-millisecond to a few
+        milliseconds (``architecture.md`` §12).
 
         **A marker is answered where it is met**, through :meth:`_answer_marker`, after the
         batch ahead of it is emitted, so a ``flush()`` that raced ``shutdown()`` is answered by

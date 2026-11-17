@@ -56,7 +56,7 @@ before the hold is released, so the list needs no lock of its own. It holds span
 so no new module state holds a sink. A forked child clears it (:func:`_forget_open_spans_in_child`).
 """
 _open_spans: dict[int, Span] = {}
-"""Every open span, keyed by ``id(span)``, from its push to the start of its close (SPEC-091 FR-001).
+"""Every open span, keyed by ``id(span)``, from its push to the start of its close (SPEC-091).
 
 Written without a lock: :func:`_begin` registers a span with one ``__setitem__`` after its push,
 and :func:`_close_span` removes it with one ``pop`` as its first statement, before ``span.end`` is
@@ -74,15 +74,15 @@ type _SweepResult = tuple[int, list[_Totals], list[Exception]]
 """The events a sweep handed in, each hand-in's totals, and each hand-in's fault."""
 
 
-class _NotHeld(Exception):
+class _NotHeldError(Exception):
     """Raised by a bounded hold's entry when the sweep lock was not free within its wait."""
 
 
 class _BoundedHold:
     """One entry into the sweep hold, whose acquire waits at most ``wait`` seconds.
 
-    ``with _sweep_hold.within(wait):`` raises :class:`_NotHeld` from ``__enter__`` when the wait
-    expires, so its body never runs without the lock; ``wait=None`` blocks, as ``with
+    ``with _sweep_hold.within(wait):`` raises :class:`_NotHeldError` from ``__enter__`` when the
+    wait expires, so its body never runs without the lock; ``wait=None`` blocks, as ``with
     _sweep_hold:`` does. The exit is the hold's own (:func:`_release_hold`).
 
     Attributes:
@@ -115,12 +115,12 @@ class _BoundedHold:
           None.
 
         Raises:
-          _NotHeld: When the wait expired.
+          _NotHeldError: When the wait expired.
         """
         if self._wait is None:
             _sweep_lock.acquire()
         elif not _sweep_lock.acquire(timeout=self._wait):
-            raise _NotHeld
+            raise _NotHeldError
 
     def __exit__(self, *exc_info: object) -> None:
         """Drains the deferred closes, releases the lock, then announces what they handed in.
@@ -380,7 +380,7 @@ def _sweep_registered(hand_in: _HandIn, *, wait: float | None = None) -> _SweepR
                     raise
                 cell.handed += len(take)
                 handed += len(take)
-    except _NotHeld:
+    except _NotHeldError:
         return None
     return handed, totals, faults
 
@@ -464,8 +464,9 @@ def continue_trace(
     it is never refused, since nothing has been logged to take. The check and the re-parent are
     made inside one sweep hold, so no sweep can land between them. Called from inside a sweep on
     the same thread, as a collector callback inside one can, it is refused with "a sweep is in
-    progress on this thread; trace context refused". A span that is not a root is left alone, and a call with no span open
-    re-parents nothing; in every case the context applies to the next root span opened here.
+    progress on this thread; trace context refused". A span that is not a root is left alone,
+    and a call with no span open re-parents nothing; in every case the context applies to the
+    next root span opened here.
 
     The adoption is consumed by that one root span and does not survive it (SPEC-024), which
     is what stops a warm container logging every later invocation into the first caller's

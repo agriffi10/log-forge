@@ -240,8 +240,11 @@ interpreter on this machine was not usable, and the argument is not claimed for 
 #### Acceptance Criteria:
 
 - [ ] `spec091_exactly_once.py` reports `dup=0 missing=0 bad_boundary=0 end_not_last=0` and a
-      positive `shipped_before_their_close` in each of five runs, with and without `swap`
-      (invariants 2 and 6).
+      positive `shipped_before_their_close` in each of five runs ~~, with and without `swap`~~,
+      and `dup=0 missing=0 bad_boundary=0` in each of five runs with `swap` (revised 2026-11-17:
+      with `swap` the batch order is per sink, so the probe's own docstring says
+      `end_not_last` and `shipped_before_their_close` do not apply there; a build run read
+      `end_not_last=118` with every other count clean) (invariants 2 and 6).
 - [ ] With a `list` subclass installed as `span.events` whose `append` pauses on an event the test
       controls, before it inserts in one case and after in the other, the test forces the sweep into
       each pause: with the take replaced by a slice-and-rebind the paused append's event is lost,
@@ -331,7 +334,7 @@ a `flush(3.0)` made while holding the lock returned `reason="timed-out"` after 3
 waiting unboundedly, and `ok=True` with the 0.05 s bound. With FR-001's guard the same `flush()`
 reports `"abandoned"`, because its own sweep takes nothing, so what the bound changes is when it
 returns. The longest hold measured, one sweep of 1,000 spans at 555.8 µs under a load average of
-about 30 (`spec091_hot_path.py hold`, on the prototype ported to `30b34a4f` during planning), is
+about 30 (`spec091_hot_path.py hold`, on the prototype ported to the base `33a44e99` during planning), is
 about a ninetieth of the wait.
 
 **Its own clock, and the trigger made due.** The sweep keeps `last_sweep` beside SPEC-090's
@@ -1000,7 +1003,7 @@ millisecond once an interval; FR-001 takes it for the cap.
 the prototype.
 
 **Measured during planning, 2026-11-17.** The re-entry guard's readings in FR-001, FR-002 and
-FR-005 were taken on the second-cut prototype ported to `30b34a4f` with SPEC-088's hand-over
+FR-005 were taken on the second-cut prototype ported to the base `33a44e99` with SPEC-088's hand-over
 credit, by throwaway scripts that are not committed: a collector callback closing the span a sweep
 was mid-take on, a thread holding the lock calling `flush(3.0)`, and a `timeit` of the close's
 hold. The build's tests for FR-001's and FR-002's new criteria are what reproduce them.

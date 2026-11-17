@@ -2106,8 +2106,8 @@ turn. A handler on a thread inside any of the other locks still waits. One nesti
   open span is registered, the worker is built when the first span opens, and about once a flush
   interval the drain thread takes what each open span holds past its `span.start`; `flush()`
   reaches every open span and the exit drain sweeps before it drains. `p12_kill.py`, before, in the
-  core frame's run at `a2cd4b36`: the `SIGKILL` root span delivered 0 of 51. After, at `459d1592`
-  on 3.13.1 and 3.12.12: 50 of 51, the missing one its held `span.start`, and 9 of 9 from the
+  core frame's run at `a2cd4b36`: the `SIGKILL` root span delivered 0 of 51. After, on SPEC-091's build over
+  `33a44e99`, on 3.13.1 and 3.12.12: 50 of 51, the missing one its held `span.start`, and 9 of 9 from the
   closed children. The `SIGTERM` case still delivers 0 of 15 on both: those five spans had closed
   and were queued, so no sweep of open spans reaches them, and the default disposition skips
   `atexit`. What a kill still loses is stated in §13 and the README. Decision:
@@ -2965,7 +2965,7 @@ and a third copy is a fork with no merge.
   hold, and `continue_trace` holds the same hold across its check and its re-parent
   (`decorator._adopt_unswept`). With a 50 ms pause forced inside the re-parent and a 1 ms interval,
   19 of 20 root spans reached the sink with two trace ids without the hold and none with it;
-  `spec091_continue_trace.py` on the build (`459d1592`) reads `split_spans=0`. What it cannot keep is its correlation: it becomes a standalone one-event span with
+  `spec091_continue_trace.py` on SPEC-091's build over `33a44e99` reads `split_spans=0`. What it cannot keep is its correlation: it becomes a standalone one-event span with
   a **fresh `trace_id`**, so it leaves the trace it was logically part of, not merely the span.
   `contextvars` offers no way to recover the parent once the span is gone, and the choice is
   against losing the event outright. Ordering is not promised either. A task whose logs must stay
@@ -2988,13 +2988,9 @@ and a third copy is a fork with no merge.
   **A collector callback or finalizer that runs inside a sweep hold** runs there, so its own
   stderr lines and orphan emits are written while the hold lasts and other closes wait on it: the
   one exception to "nothing is written to stderr under the lock", accepted because the callback's
-  own runtime already extends the hold. **Whether the deferred closes drain before or after the
-  hold's release** cannot be told apart by a single-thread test, so
-  `tests/test_span_events_site_rule.py` checks only that the drain is called from nowhere but
-  `_release_hold`; that it runs there before the `release()` is read from the code, not tested. The
-  take's exactly-once argument rests on the GIL
-  (each `list` and `dict` operation it uses is one C call with no switch point); on a
-  free-threaded build it is unproven, and no free-threaded run was made.
+  own runtime already extends the hold. The take's exactly-once argument rests on the GIL (each
+  `list` and `dict` operation it uses is one C call with no switch point); on a free-threaded
+  build it is unproven, and no free-threaded run was made.
 
 - **An orphan log can wait on the sink lock.** A sink holding mutable transport state serializes
   `emit` for the whole operation (§9, SPEC-028), so a level call made with no active span — which

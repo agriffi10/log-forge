@@ -9,7 +9,7 @@
   split into `_enqueue` and `_announce`, so no library line is written inside the hold.
   `backfill_baggage` iterates a snapshot.
 - **The re-entry guard** (FR-001, revised 2026-11-17): `_sweep_lock` is an `RLock` entered only
-  through `_sweep_hold` (`_SweepHold`, `.within(wait)` via `_BoundedHold` and `_NotHeld`); its
+  through `_sweep_hold` (`_SweepHold`, `.within(wait)` via `_BoundedHold` and `_NotHeldError`); its
   exit, `_release_hold`, drains `_deferred_closes` (`_drain_deferred_closes`) before the release
   and announces after it. The five sites ask `_sweep_held_here()` first.
 - **The worker sweeps** (FR-002, FR-003): `_begin` builds the worker before its credit;
@@ -28,7 +28,8 @@
   through `list` subclasses) and `tests/test_span_events_site_rule.py` (the AST site rule and the
   hold-site gate, each with a fixture corpus).
 
-**Decided in the build, beyond the spec's text** (each read in `git diff 548155e4..459d1592 -- src/`):
+**Decided in the build, beyond the spec's text** (each read in SPEC-091's diff of `src/` against
+its base `33a44e99`):
 
 - `continue_trace`'s check and re-parent live in `_adopt_unswept`, which is the hold site the
   gate's roster names; it returns the refusal and the caller writes the line after the release.
@@ -49,7 +50,7 @@
 ## The suite, re-measured on the tree with SPEC-088 to SPEC-090
 
 The spec's Evidence lists were the prototype's against `a2cd4b36`. On the build, the base
-`548155e4` collects 11,721 ids and the build 11,797; four exist only at the base, three renamed
+`33a44e99` collects 11,721 ids and the build 11,797; four exist only at the base, three renamed
 tests and one id carrying a line number. The existing tests that failed before they were
 rewritten: up to 19 rows of `test_invariants_model.py::test_the_accounting_identity_holds_under_every_interleaving`
 and, **new against the Evidence**, its `test_the_soak_is_wired`; the eight `empty-submission`
@@ -65,15 +66,15 @@ as FR-004 says (`sink_lost == 2`, `open_spans == 1`).
 
 ## Measurements
 
-On the build at `459d1592`, run from `docs/audits/2026-11-14-probes/core-pipeline/` on a shared
-macOS machine (10 cores). One-minute load averages: about 39 at the start of the 3.13.1 runs and
+On SPEC-091's build over `33a44e99`, run from `docs/audits/2026-11-14-probes/core-pipeline/`
+on a shared macOS machine (10 cores). One-minute load averages: about 39 at the start of the 3.13.1 runs and
 137 at the start of the 3.12.12 runs. Pairs read 3.13.1, then 3.12.12.
 
 | Probe | Before (`a2cd4b36`, the spec's Evidence) | Build |
 |---|---|---|
 | `p12_kill.py`, `SIGKILL` 3.5 s into the root span | 0 of 51 | 50 of 51 on both, the held `span.start` missing; children 9 of 9 |
 | `p12_kill.py`, `SIGTERM` after five closed spans | 0 of 15 | 0 of 15: queued, not open |
-| `spec091_exactly_once.py`, 5 runs each | — | `dup=0 missing=0 bad_boundary=0 end_not_last=0`; 6,319 to 9,129 and 4,142 to 5,352 shipped before their close; `swap` 5 runs each, `dup=0 missing=0 bad_boundary=0` |
+| `spec091_exactly_once.py`, 5 runs each | — | `dup=0 missing=0 bad_boundary=0 end_not_last=0`; 6,319 to 9,129 and 4,142 to 5,352 shipped before their close; `swap` 5 runs each, `dup=0 missing=0 bad_boundary=0`, with `end_not_last` 30 to 101: with `swap` the events of one span reach two sinks whose batches interleave, so order across them means nothing, and the probe's docstring says those two counts do not apply in that mode (FR-001 AC-1, revised 2026-11-17) |
 | `spec091_latency.py 6`, idle and `busy` | every sample at the 5 s cap | max 1.001 s and 1.000 s; 1.000 s and 1.000 s |
 | `spec091_fork.py` | — | no `child` row on both |
 | `spec091_exit.py` `exit` / `inside` / `inside-warm` | 0 / all 8 / 0 of 8 | 5 / 5 / 5 of 8, `after_shutdown=1` in the latter two, on both |
@@ -94,9 +95,7 @@ the spec's. `whole` was not run on the build.
 - **Accepted, in `architecture.md` §13:** an asynchronous `BaseException` between a successful put
   and `_enqueue`'s return in `flush()`'s registry sweep counts that take twice, queued and in
   `in_span_lost`; a collector callback's own stderr lines and orphan emits inside a hold are
-  written there; whether the deferred-close drain runs before or after the release is not
-  distinguishable by a single-thread test, and the gate checks only that `_release_hold` is its
-  one caller; the free-threaded case is unproven.
+  written there; the free-threaded case is unproven.
 - **Known gap:** one instrumented suite run reported a second failure whose name was not captured
   (the instrumentation itself fails `test_stored_name_roster.py`). Three un-instrumented full runs
   and six repeats of the new and changed test files were clean.
@@ -116,7 +115,9 @@ the spec's. `whole` was not run on the build.
 
 ## Verification
 
-Full suite on CPython 3.13.1, exit 0 in three runs: 11,745 passed, 39 skipped, 13 xfailed. Not
+Full suite on CPython 3.13.1, exit 0 in three runs on SPEC-091's build over `33a44e99`: 11,745
+passed, 39 skipped, 13 xfailed. After the diff review's first frame added four tests and the
+branch moved onto `dd77b3fb`: 11,894 passed, 39 skipped, 13 xfailed, exit 0. Not
 run locally on 3.12, where no environment has the test dependencies; CI's matrix runs it. The
 probes ran on both. The completion's gates, `gen-index.sh`, `spec-lint.sh`, `docs-lint.sh` and
 `docstring-lint.py`, ran on this branch.

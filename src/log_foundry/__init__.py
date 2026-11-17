@@ -52,9 +52,9 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
     **It sweeps every open span first** (SPEC-091). The caller's own spans ship whole, their
     ``span.start`` included, as the call's context sees them; every other thread's and task's
     open span hands over what it has buffered past its ``span.start``, which stays on the span
-    until it closes. ~~events submitted before this call~~ So the events a call carries are
-    those submitted before it and those its sweeps took from open spans. The worker also sweeps
-    every open span about once a flush interval on its own.
+    until it closes. So the events a call carries are those submitted before it and those its
+    sweeps took from open spans. The worker also sweeps every open span about once a flush
+    interval on its own.
 
     Called from inside a ``sink_factory``, while the factory runs, an emit on another thread
     that would wait for that build refuses instead, for the length of this call: the wait here can
@@ -68,11 +68,12 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
         number subclass is read as the exact ``int`` or ``float`` it holds.
 
     Returns:
-      A :class:`FlushResult`. Truthy when the drain that carried the events submitted before
-      this call, and those its sweeps took from open spans, finished and abandoned no batch while the call was outstanding, not merely that a
-      drain took place. A truthy result can still carry loss: a sink that settles a run having
-      dropped events does not make it falsy, and the result's ``lost`` and its five counts say
-      what the process lost while the call ran (SPEC-089). The counts are process-wide and so
+      A :class:`FlushResult`. Truthy when the drain that carried the events submitted before this
+      call, and those its sweeps took from open spans, finished and abandoned no batch while the
+      call was outstanding, not merely that a drain took place. A truthy result can still carry
+      loss: a sink that settles a run having dropped events does not make it falsy, and the
+      result's ``lost`` and its five counts say what the process lost while the call ran
+      (SPEC-089). The counts are process-wide and so
       over-count, and a zero count covers only the terms the event ledger counts; a loss a sink
       takes inside an ``emit`` that returned stays in :func:`health`'s ``sink``. A call whose
       drain dies under it waits, within its ``timeout``, until that drain has debited what it

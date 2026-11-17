@@ -8,7 +8,7 @@ description: "about once a flush interval the drain thread takes every open span
 closes? Today they wait for the close, so a process killed mid-span (SIGKILL, OOM, timeout) loses
 every event in it, uncounted.", Andrew answered "Ship every ~1s (Recommended)". The loss it
 answered was finding 8 of the 2026-11-14 audit: `p12_kill.py`'s `SIGKILL` 3.5 s into an open root
-span delivered 0 of its 51 events, with nothing on stderr. On the build (`459d1592`) it delivers
+span delivered 0 of its 51 events, with nothing on stderr. On SPEC-091's build over `33a44e99` it delivers
 50, the missing one being the held `span.start`.
 
 **The rule** (`decorator._sweep_registered`, run by `Worker._run_sweep`; SPEC-091 FR-001, FR-002):
@@ -93,7 +93,7 @@ derives the last two from the AST. The residuals the build accepted are in `arch
 
 ### 2026-11-17
 
-- **Built** by SPEC-091 at `459d1592`: the registry, `Span.held`, `_sweep_registered`,
+- **Built** by SPEC-091, over `33a44e99`: the registry, `Span.held`, `_sweep_registered`,
   `_SweepHold` with the per-site check and the deferred closes, the drain's bounded wait, the
   open-time build, `flush()`'s registry sweep and the exit drain's sweep, and the child forgetting
   the registry. The plan review's two deadlocks on the lock gave the hold its re-entry guard and the

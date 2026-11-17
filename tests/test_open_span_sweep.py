@@ -686,6 +686,11 @@ def test_each_hold_site_survives_nested_calls_from_a_collector_callback(enter, m
     assert nested["continue"].reason == "rejected", nested  # type: ignore[attr-defined]
     lf.flush(BOUND)
     assert sink.messages("nested") == ["span.start", "nested", "span.end"], sink.messages("nested")
+    if enter is not _enter_abandon:
+        outer = sink.messages("outer")
+        assert sorted(outer) == sorted(["span.start", "outer", "span.end"]), (
+            f"the outer call's events were not each delivered once: {outer}"
+        )
     assert not _once(sink.events)
 
 
@@ -1559,3 +1564,98 @@ def test_a_close_inside_a_hold_ships_when_the_holder_releases() -> None:
     assert decorator._deferred_closes == [], "the release drained it"
     lf.flush(BOUND)
     assert sink.messages("nested") == ["span.start", "inside", "span.end"]
+
+
+class _ReleaseWatch:
+    """``decorator._sweep_lock``, recording how many closes are still deferred at each release."""
+
+    def __init__(self, real: Any) -> None:
+        self.real = real
+        self.deferred_at_release: list[int] = []
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        return bool(self.real.acquire(blocking, timeout))
+
+    def release(self) -> None:
+        self.deferred_at_release.append(len(decorator._deferred_closes))
+        self.real.release()
+
+    def _is_owned(self) -> bool:
+        return bool(self.real._is_owned())
+
+
+def test_the_deferred_closes_drain_before_the_hold_is_released(monkeypatch) -> None:
+    """FR-001: the holder ships a deferred close while it still holds the lock.
+
+    Drained after the release, another thread's sweep could take the lock between the release
+    and the drain and act on the deferred span's list before the deferred swap, which the
+    ordering argument for ``span.end`` rests on not happening.
+    """
+    sink = Recorder()
+    _quiet(sink)
+    watch = _ReleaseWatch(decorator._sweep_lock)
+    monkeypatch.setattr(decorator, "_sweep_lock", watch)
+
+    @lf.trace(name="nested")
+    def nested() -> None:
+        lf.info("inside")
+
+    with decorator._sweep_hold:
+        nested()
+    assert watch.deferred_at_release == [0], (
+        f"the lock was released with closes still deferred: {watch.deferred_at_release}"
+    )
+    monkeypatch.undo()
+    lf.flush(BOUND)
+    assert sink.messages("nested") == ["span.start", "inside", "span.end"]
+
+
+def test_a_flush_whose_registry_hand_in_fails_reports_abandoned(monkeypatch) -> None:
+    """FR-003: a hand-in fault in ``flush()``'s registry sweep makes the call ``"abandoned"``."""
+    sink = Recorder()
+    worker = _quiet(sink)
+    parked = Parked("boom")
+    real_enqueue = worker._enqueue
+
+    def enqueue(events: list[dict[str, Any]], *, count_retired: bool) -> tuple[int, int]:
+        if any(e.get("message") == "boom" for e in events):
+            raise RuntimeError("hand-in fault")
+        return real_enqueue(events, count_retired=count_retired)
+
+    monkeypatch.setattr(worker, "_enqueue", enqueue)
+    result = lf.flush(BOUND)
+    assert not result and result.reason == "abandoned", (
+        f"a flush whose registry sweep lost a take reported {result}"
+    )
+    assert lf.health().in_span_lost == 1
+    monkeypatch.undo()
+    parked.finish()
+    lf.flush(BOUND)
+
+
+def test_the_sweep_keeps_its_own_clock_through_a_burst_of_passes() -> None:
+    """FR-002: a drain taking many submissions within an interval sweeps about once per interval.
+
+    Each submission is one pass of the drain loop, so a sweep made on every pass would run once
+    per submission; the sweep's own clock lets it run only once an interval has passed.
+    """
+    sweeps = [0]
+    interval = 0.3
+
+    def counting(hand_in: Any, *, wait: float | None = None) -> tuple[int, list[Any], list[Any]]:
+        sweeps[0] += 1
+        return 0, [], []
+
+    worker = worker_mod.Worker(Recorder(), flush_interval=interval, sweep=counting)
+    install_worker(worker)
+    began = time.monotonic()
+    submissions = 200
+    for i in range(submissions):
+        worker.submit([{"message": f"m{i}", "log_id": str(i)}])
+    _wait(lambda: worker._queue.qsize() == 0, "the drain to take every submission")
+    elapsed = time.monotonic() - began
+    bound = int(elapsed / interval) + 2
+    assert sweeps[0] <= bound, (
+        f"the drain swept {sweeps[0]} times over {submissions} passes in {elapsed:.2f}s, "
+        f"more than once an interval"
+    )
