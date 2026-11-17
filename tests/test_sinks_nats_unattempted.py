@@ -222,7 +222,7 @@ def test_verdict_of_maps_each_fate_as_the_spec_tables_it(
     outcomes: tuple[Outcome, ...],
     counted: tuple[int, ...],
 ) -> None:
-    """FR-001: beside a publish an unattempted event is ``RETRYABLE`` and uncounted; all else as before.
+    """FR-001: beside a publish, unattempted is ``RETRYABLE`` and uncounted; all else as before.
 
     The rows where something was published read SPEC-102's Data Model table; the rows where
     nothing was are the unchanged branch, every event ``RETRYABLE`` and sink-counted.
@@ -357,7 +357,7 @@ def test_a_declined_run_counts_and_names_the_tail_once(monkeypatch: pytest.Monke
 def test_a_batch_makes_at_most_max_retries_plus_one_deliver_calls(
     max_retries: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """FR-003: the resends are the engine's existing rounds, however many events stay unattempted."""
+    """FR-003: the resends are the engine's existing rounds, however many stay unattempted."""
     run = _run_worker([["late-ok"]] * 3, 10, monkeypatch, max_retries=max_retries)
     assert run.calls == max_retries + 1
     assert run.failed == 10 - (max_retries + 1)

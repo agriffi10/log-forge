@@ -851,7 +851,9 @@ class NATSSink:
 
         ~~Registers, ``ALWAYS``, the counts and lines 1.x's ``emit`` made for this round.~~
         **Superseded in part by SPEC-102 FR-002**: the unattempted remainder of a round where
-        something was published is registered ``LAST``, below. Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
+        something was published is registered ``LAST``, below.
+
+        Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
         per publish that raised, in order — 1.x counted each as it happened and then raised. The
         round's events are sink-counted, so the engine adds nothing, and an event the deadline
         left unattempted is its catcher's when the run fails, as in 1.x. A run can still settle
@@ -951,7 +953,8 @@ class NATSSink:
         """
         if os.getpid() != self._pid:
             return Outcome.REJECTED, final_refusal(
-                self, f"{prefix}: a forked child acquired no connection"
+                self,
+                f"{prefix}: a forked child acquired no connection"
             )
         if self._closed:
             return Outcome.REJECTED, final_refusal(self, f"{prefix}: the sink is closed")
