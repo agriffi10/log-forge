@@ -458,6 +458,10 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   command path is judged against the harness's adversarial model, because each of the four ownership
   redesigns before it was judged by tests that had missed the defects.
 
+  > **Superseded by SPEC-091.** An open span's events no longer wait on Andrew: on 2026-11-15 he
+  > answered "Ship every ~1s (Recommended)", and SPEC-091 built it. Decision: *An open span's events
+  > ship on the worker's interval* (`docs/decisions/pipeline/`).
+
   Andrew made the decisions in chat on 2026-11-14, after the findings were reported: "I'll take your
   recommendations other than the mac os specific one", and "You can additionally evaluate and do any
   of the outstanding spec work as a part of this". Taken: an adversarial model test; one event-unit
@@ -483,6 +487,11 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   `UNKNOWN` outcome or an exception escaping `deliver` is never resent, and what stays resendable,
   at the cost already accepted, is a client exception the sink's retry predicate accepts, caught
   inside `deliver` and answered `RETRYABLE`.
+
+  > **Superseded by SPEC-091.** Shipping an open span's events before the span closes was answered
+  > on 2026-11-15, "Ship every ~1s (Recommended)", and SPEC-091 built it, so nothing in the
+  > pipeline track waits on him for it. Decision: *An open span's events ship on the worker's
+  > interval* (`docs/decisions/pipeline/`).
 
   Andrew answered two of the open questions on 2026-11-15. Asked "Should flush() stay truthy over a
   counted loss and gain loss counts, or turn falsy?", he answered "Keep truthy, add counts": the
