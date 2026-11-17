@@ -34,13 +34,15 @@ or the deadline changes, and no setting is added.
 ### In Scope
 
 - The fold. After the first abandoned exit batch, `_diag`'s per-batch writers fold rather than
-  write inside each later exit batch's sink call. The folded table is held on the worker and
-  written once, by the same writers and in the same order that write SPEC-090's exit tallies.
-  The worker's own lines are never folded. A forked child resets the table (FR-001).
+  write inside each later exit batch's sink call, under a leaf lock of `_diag`'s own. The folded
+  table is held on the worker and written once, where and when SPEC-090's exit tallies are
+  written. An expired join closes the fold, so later lines are written at once. The worker's own
+  lines and every running total are never folded. A forked child withdraws the window first
+  (FR-001).
 - Proof that timing and batching are today's: the slowdown probes, the exit budget, and a suite
   guard that keeps growth out (FR-002).
 - The record: §12, the pipeline and diagnostics decisions, SPEC-090's marker, the README and the
-  pending release notes, and the §12 item for a sink that recovers by exit (FR-003).
+  pending release notes (FR-003).
 
 ### Out of Scope
 
@@ -52,15 +54,23 @@ or the deadline changes, and no setting is added.
   still makes 16,016 requests. Andrew accepted that call volume in place of growth.
 - **The worker's own lines and tallies.** Their text, order and counts are unchanged, including
   SPEC-062's `retry declined` line, which SPEC-090 FR-003 already writes at most once at exit.
-- **Lines outside an exit batch's sink call**: the steady drain, the exit batches up to and
-  including the first abandoned one, the orphan path, `flush()`, a sink's `close()`, its build
-  and its hand-off. These are written as today.
+- **Lines outside an exit batch's sink call**: the steady drain (a `flush()` answered while the
+  process runs included), the exit batches up to and including the first abandoned one, the
+  orphan path, a sink's `close()`, its build and its hand-off. These are written as today. A
+  flush marker met at exit is not among them, because its batch is an exit batch (FR-001).
 - **A line a sink writes on a thread of its own.** The fold is per thread, so such a line is
   written as today.
 - **`_diag.rejected`.** No shipped sink and not the engine reaches it. Its only callers are
   `continue_trace`'s parsers in `decorator.py`.
-- **A sink that recovers by exit and is handed a second batch the exit budget did not predict.**
-  FR-003 files it in §12, and SPEC-105 closes it.
+- **The exit drain's sizing from an earlier rate, and its prediction from the longest attempt
+  seen.** A sink that recovers by exit can be handed a second batch the exit budget did not
+  predict. This is filed separately in §12 as "The exit drain sizes a batch from a rate it
+  measured earlier, and predicts its next attempt from the longest one it has seen, so an attempt
+  the exit budget never saw can outrun the `shutdown()` deadline and leave the sink open", by
+  another session's docs change (branch `s12-exit-slowdown`). SPEC-105 is its spec.
+- **That item's retry-predicate twin.** Take a target measured before the stop, a first exit
+  attempt that fails at once, and a slow retry. That shape expires the join at 0.5, 2 and 5 s on
+  `main`. The same §12 item records it, with no closer named. It is not this spec's.
 - **The `NATSSink` abandoned-publish latch at exit** (SPEC-104), and any wait inside a refused
   exit round.
 - **Any public setting, argument or environment variable** (invariant 10).
@@ -89,8 +99,12 @@ its sink call folded. The window covers the engine run, or each 1.x `sink.emit`,
 else in `_emit`. So the worker's own `retry declined` lines (`:3387` on the engine path, `:3441`
 on the 1.x path) and its abandon lines are outside it and are written as today. The first
 abandoned exit batch's own sink lines are written as today, because the flag is set only once
-that batch is counted, after its sink call. The window is set on the drain thread alone, through
-a thread-local in `_diag`, so a line a sink writes from a thread of its own is written at once.
+that batch is counted, after its sink call. The window is opened on the drain thread alone,
+through a thread-local in `_diag`, so a line a sink writes from a thread of its own is written at
+once. A flush marker the exit drain meets (`_final_drain`, `worker.py:3181-3182`) has
+`_answer_marker` emit the batch ahead of it through `_emit_pending` (`:2930`). That is an exit
+batch like any other, so once the fold has begun its sink lines are folded too. They appear at
+the end of the exit, after the `flush()` that marker answered has returned.
 
 **What folds.** Inside the window, three writers record a row instead of writing a line. Each
 row's key is the text the line would have carried, without its count:
@@ -104,20 +118,54 @@ row's key is the text the line would have carried, without its count:
 key exactly when their lines would have read the same. `rejected` does not fold. No shipped sink
 and not the engine reaches it.
 
-**How a row is recorded.** A row is added to `Worker._exit_fold` under `Worker._lock`, the lock
-the exit tallies are written under. The worker hands `_diag` the table and the lock when the
-window opens and withdraws them when it closes, in a `finally`, so `_diag` stays a leaf that
-imports nothing from the package. Every counter a folded line names has already moved, because
-the callers follow `_diag`'s record-first rule. Folding changes only whether the line is written
-then. The worker never holds `_lock` across a sink call (`:3365`, `:3411`), so recording under it
-cannot deadlock on the drain thread.
+**A running total is never folded.** `lost` normally takes the increment its caller has just
+counted. A throttled site passes a running total instead, and summing running totals overstates
+a loss: 1 then 1,000 would read 1,001 against a true 1,000. So `lost` gains a keyword,
+`running_total=True`, which writes the line at once even inside the window. Every throttled
+`lost` site in `src/` passes it. Today there are three: the worker's queue-full and post-shutdown
+lines (`Worker._announce`, `worker.py:1265` and `:1267`), and the baggage header's dropped-member
+line (`context._announce_dropped`, `context.py:511`). Any code a sink calls on the drain thread
+can reach the last one. A roster derived from all of `src/` keeps the set complete. The throttled
+`absorbed` sites, the console's echo line and the sink factory's build line, need nothing: each
+carries its running total in its detail, so each of their lines is its own key and nothing is
+summed.
 
-**How the table is written.** `_write_exit_tallies` takes the table under the lock, leaves it
-empty, and writes one line per key, in the order the keys were first recorded. These folded lines
-come before the abandon tally's line and the decline tally's line. So the table is written, like
-the tallies, by whichever takes it first: the exit drain when it ends, or `stop()` when its join
-expires, before the expiry line. A drain thread that goes on after an expired join writes what it
-added afterwards at its own end. Nothing is written twice. The lines read:
+**How a row is recorded.** The table is a `_diag.FoldTable` the worker owns, `Worker._exit_fold`.
+It is guarded by a leaf lock `_diag` owns, `_diag._FOLD_LOCK`, which no other lock is taken
+under. The fold adds no edge to the library's lock order and takes nothing from `Worker._lock`.
+The worker opens the window by handing `_diag` its table when an exit batch's sink call begins.
+It withdraws the table in a `finally` when the call ends, so `_diag` stays a leaf that imports
+nothing from the package. Every counter a folded line names has already moved, because the
+callers follow `_diag`'s record-first rule. Folding changes only when the line is written.
+
+The fold check in each writer is written inline, inside the writer's existing guard: one
+`getattr` of the thread-local, and on the folded path an inline `with _FOLD_LOCK:` that adds the
+row. On the unfolded path that is the whole of the check, and no helper is called. A helper would
+add a Python frame to every diagnostic the library writes.
+`tests/test_event_ledger_defects.py::test_p11_counts_every_assembly_fault` passes at a recursion
+limit of 400 only by parity, and a helper made it fail 3 of 3 runs (`unaccounted=-2`). That parity
+defect predates this spec and is going to a session of its own. This spec carries only the
+constraint.
+
+`_diag._FOLD_LOCK` is module state, so it is a row in `_fork._GLOBAL_PRIMITIVES`, which
+`tests/test_fork_roster.py` holds complete, and a forked child replaces it there. SPEC-077's
+lock-sites roster, `tests/test_runtime_holder.py`'s `LOCK_SITES_AT_BASE` (`:115`, checked at
+`:333-343`), reads only the `with` statements in `_lifecycle.py` and `worker.py`. It needs no row
+for a lock in `_diag`, and it gains no site, because `worker.py` takes the table only through
+`_diag`.
+
+**How the table is written.** `_diag.take_folded(table, *, close)` copies the rows and clears the
+table in place under `_FOLD_LOCK`, then writes one line per key, outside the lock, in the order
+the keys were first recorded. In place, never rebound: the open window holds the same object,
+and a rebind would silently drop every row recorded after it. `_write_exit_tallies` calls it
+before it takes the abandon and decline tallies under its existing `with self._lock`, so the
+folded lines come first and `worker.py` gains no lock site. So the table is written, like the
+tallies, by whichever takes it first: the exit drain when it ends, or `stop()` when its join
+expires, before the expiry line. `stop()`'s call passes `close=True`. That **closes the fold for
+good**: a row recorded into that table afterwards, by a sink call the expired join left running,
+is written at once rather than held. Otherwise a call that never returns, or an interpreter that
+exits first, would leave those lines unwritten and the loss unannounced (invariant 2). The lines
+read:
 
 - `log-foundry: lost <total> <what>(s); <detail>; <k> line(s) folded at exit`
 - `log-foundry: absorbed <k> failure(s) while <where> (<Type>); <detail>; <k> line(s) folded at exit`
@@ -126,29 +174,40 @@ added afterwards at its own end. Nothing is written twice. The lines read:
 The `; <detail>` part is present only when the folded line had one. The tail is appended after
 the detail is bounded, so the bound never cuts it. Every folded line ends in the same tail,
 `line(s) folded at exit`, so a reader can find them all with one search. The folded lines go
-through one new `_diag` function, the module's fifth stderr write, so `_diag` stays the one
-writer (invariant 11). They are never written through a `_diag.lost` call in `worker.py`,
-because `tests/test_invariants_model.py` derives `_WORKER_LOST` from every such call and requires
-each one's noun to be a literal.
+through `take_folded`, `_diag`'s fifth stderr write, so `_diag` stays the one writer (invariant
+11). They are never written through a `_diag.lost` call in `worker.py`, because
+`tests/test_invariants_model.py` derives `_WORKER_LOST` from every such call and requires each
+one's noun to be a literal.
 
 **What a reader sees.** Every distinct line still appears at least once. If it was written before
 the fold began, it appears as written. If it recurs inside the window, it appears once more as a
 folded total. The prototype, on the zero-target probe below, wrote
 `log-foundry: lost 999 request(s); HTTPSink, 16 attempt(s), connection error, ConnectionRefusedError errno=61; 999 line(s) folded at exit`.
 
-**Why summing a count is truthful.** `lost` normally takes the increment its caller has just
-counted. A throttled site passes a running total instead. Summing a running total would overstate
-a loss. No `lost` call under `src/log_foundry/sinks/` is throttled: the throttled sites are the
-worker's queue-full and post-shutdown lines and the console's echo line, none of them inside a
-sink call. The sink factory's throttled line (`sinks/_factory.py:452`) is an `absorbed` whose
-detail carries the running total, so each of its lines is its own key. A roster keeps it that way
-(criteria).
+**A forked child.** A sink can fork from inside a folded call. The child's only thread is then
+the drain thread, with the window open, holding the parent's table. `_fork._reinit_after_fork`'s
+repair (`_fork.py:1046-1116`) writes `_diag` lines on that thread before the worker's own reset
+runs, which is the last child handler (`_lifecycle.py:6927`). Those lines come from the pin, the
+roster, the walk, a transport's `reacquire_after_fork` and the handlers (`_fork.py:1092-1116`;
+`_lifecycle.py:2484-2491`). Left open, the window recorded them into the inherited table, and the
+worker's reset then erased them unwritten. Worse, the fold's lock could be one a parent thread
+held at the fork, and the child hung.
 
-**A forked child.** `_reinit_after_fork` (`worker.py:935`) empties `_exit_fold` on both branches,
-beside the tallies (`:1104-1105`), because a child does not announce an exit the parent was
-making. It also withdraws the fork target on the forking thread, which is the child's only
-thread. So a sink that forks from inside a folded call leaves no window open in the child. The
-field gets a row in `tests/test_lifecycle_inventory.py`'s Worker table.
+So the withdrawal is the **first step of `_fork._reinit_after_fork`**, ahead of the pin. It
+clears the thread-local window on the forking thread and takes no lock. `_fork` already imports
+`_diag`, the one package module it may import (`tests/test_fork_lifecycle.py`,
+`test_fork_imports_nothing_from_the_package_but_diag`). After it, every line the repair writes is
+written at once. The roster's step then replaces `_FOLD_LOCK`. `Worker._reinit_after_fork`
+(`worker.py:935`) clears `_exit_fold` in place and reopens it on both branches, beside the
+tallies (`:1104-1105`), and the field gets a row in `tests/test_lifecycle_inventory.py`'s Worker
+table.
+
+A second `os.register_at_fork` handler in `_diag` would also run first. CPython calls
+`after_in_child` callbacks in registration order (`os.register_at_fork`'s docstring), and `_diag`
+is imported by `_fork` (`_fork.py:13`) before `__init__` calls `_fork.install()`
+(`__init__.py:39`). It is ruled out because the package holds to one registration:
+`tests/test_fork_lifecycle.py::test_nothing_else_in_the_package_registers_a_fork_handler` refuses
+any other, and `_lifecycle.py:6865` and `_fork.install`'s docstring say why.
 
 **Threads of a sink's own.** The implementer's inventory of the `_diag` calls a shipped sink or
 the engine can make per batch on the drain thread found none written from a sink's own thread.
@@ -171,10 +230,11 @@ steady drain is not a twin of this rule: it folds nothing.
       11).
 - [ ] A suite test runs one exit twice: once as built, and once with the fold window held shut.
       The exit has a dead sink, a backlog of several exit batches, and sink lines of all three
-      kinds. Both runs write the same set of distinct line texts, once counts and the fold tail
-      are set aside. For each key, the folded line's count plus the counts of that key's lines
-      written before the fold equals the sum the unfolded run's lines of that key name. For
-      `absorbed` and `pending`, `<k>` equals the number of lines folded (invariants 2 and 11).
+      kinds. The built run writes at least one folded line of each kind: `lost`, `absorbed` and
+      `pending`. Both runs write the same set of distinct line texts, once counts and the fold
+      tail are set aside. For each key, the folded line's count plus the counts of that key's
+      lines written before the fold equals the sum the unfolded run's lines of that key name.
+      For `absorbed` and `pending`, `<k>` equals the number of lines folded (invariants 2 and 11).
 - [ ] A dead 1.x sink and a dead engine sink at exit, whose calls write the same `lost` and
       `absorbed` lines, write the same folded lines with the same totals (invariant 6).
 - [ ] Two exits, one on the engine path and one on the 1.x path, in each of which a batch after
@@ -185,21 +245,38 @@ steady drain is not a twin of this rule: it folds nothing.
       unfolded. That covers the steady drain's, the earlier exit batches', and the first
       abandoned exit batch's own sink lines (invariant 11).
 - [ ] When the join expires during folded exit batches, `stop()` writes the folded lines once,
-      before the expiry line. The drain thread then writes only the rows it recorded
-      afterwards, at its own end, and no folded row is counted in both (invariants 2 and 11).
+      before the expiry line, and closes the fold. A line the still-running sink call records
+      afterwards is written at once and unfolded, before that call returns. No folded row is
+      written twice (invariants 2 and 11).
+- [ ] A `flush()` whose marker the exit drain meets after the first abandoned exit batch returns
+      before its batch's sink lines are written. Those lines appear folded at the end of the exit
+      (invariant 11).
 - [ ] In the zero probe's output, the folded `request(s)` line comes before
       `more exit batch(es) abandoned` (invariant 11).
 - [ ] A line a sink writes with `_diag.lost`, from a thread it starts inside a folded `emit`, is
       written at once and unfolded (invariant 11).
-- [ ] `_reinit_after_fork` empties `_exit_fold` with `resume=True` and with `resume=False`. A
-      child forked from inside a folded sink call writes its own `_diag` lines at once.
-      `tests/test_lifecycle_inventory.py` lists `_exit_fold` with its child column (invariant 12).
+- [ ] A `_diag.lost(..., running_total=True)` inside the window is written at once. A roster
+      derived from all of `src/` fails on any `_diag.lost` call, in a function that reads
+      `WARN_EVERY`, that does not pass it. The roster finds today's three sites. A fixture corpus
+      shows it refusing such a call and staying silent on an unthrottled one (invariant 2).
+- [ ] A sink forks inside a folded `emit`, and its `reacquire_after_fork` raises. The child writes
+      `_fork`'s `absorbed` line for it at once and unfolded, and finishes (invariants 11 and 12).
+- [ ] The same fork, made while a parent thread holds `Worker._lock`, and again while one holds
+      `_diag._FOLD_LOCK`: in each case the child writes that line and exits within a bound, where
+      the window left open hung it (invariants 3 and 12).
+- [ ] `Worker._reinit_after_fork` leaves `_exit_fold` empty and open with `resume=True` and with
+      `resume=False`. `tests/test_lifecycle_inventory.py` lists `_exit_fold` with its child column,
+      and `_fork._GLOBAL_PRIMITIVES` lists `_diag._FOLD_LOCK` with `tests/test_fork_roster.py`
+      passing (invariant 12).
+- [ ] `tests/test_runtime_holder.py::test_the_lock_sites_are_the_base_commits` passes unchanged,
+      and `worker.py` gains no `with` statement (invariant 12).
+- [ ] `tests/test_event_ledger_defects.py::test_p11_counts_every_assembly_fault` passes, and a
+      writer called outside the window calls no function the unbuilt writer did not (invariant
+      2).
 - [ ] `_diag`'s module docstring names its five stderr writes, and `tests/test_diag.py`'s
       tripwire (`test_diag_still_has_exactly_the_four_writers_it_documents`) is rewritten in
       place to expect five. `tests/test_diag.py`'s other rosters pass with the new writer
       (invariant 11).
-- [ ] A test derived from `src/log_foundry/sinks/` fails on a `_diag.lost` call in a function that
-      reads `WARN_EVERY`, because summing a running total overstates a loss (invariant 2).
 - [ ] `tests/test_invariants_model.py` passes unchanged. `_WORKER_LOST`, derived from the
       `_diag.lost` calls in `worker.py`, finds the same shapes as today (invariants 2 and 11).
 
@@ -263,12 +340,17 @@ Each site and what the build does with it:
 | Site | Says | The build |
 |---|---|---|
 | `docs/architecture.md:1584-1606`, §12 | the dead-sink residual and its three candidate closures | strikes it to one line, in SPEC-088's form (`:1536-1542`), and moves the full text under *Resolved*. It gains `→ **closed by SPEC-103 FR-001**`: the lines are folded, the calls accepted by Andrew's decision, the zero and cap rows before (`6b9d50f6`) and after on 3.12 and 3.13, and one clause for each rejected design |
-| `docs/architecture.md` §12, open | nothing; the recovered-sink item is not on `main` | files it: "A sink that recovers by exit can be handed a second exit batch whose attempt the exit budget did not predict", with `spec103_recovered_slow_exit.py 2 2000 <timeout>`, its expiries at 0.45, 0.5, 0.6 and 0.65 s, invariants 3 and 5, and "Closed by SPEC-105" |
+| `docs/architecture.md` §12, open | "The exit drain sizes a batch from a rate it measured earlier, and predicts its next attempt from the longest one it has seen…", filed by `s12-exit-slowdown` | keeps it as found and files no second copy. It is not this spec's (Out of Scope) |
 | `docs/decisions/pipeline/a-backlog-drains-in-larger-batches-and-capacity-is-not-a-setting.md` | an abandoned exit batch leaves the target as it was, and the trade for a sink refusing large batches | keeps the rule. It adds that growth behind a zero target at exit was built six ways and rejected, with the reasoning (any growth makes the first attempt after a slowdown proportionally longer, and no cost bound survives that) and the two slowdown probes' numbers. **Rejected** gains A, B, D, D2, E, E′, E3 with `1fa9ea15`, and E6, one line each with its defect. A dated History entry names this spec and Andrew's answer |
 | `docs/decisions/failure-paths/one-module-writes-every-diagnostic-so-the-rules-are-applied-once-rather-than-remembered-twenty-eight-times.md` | `_diag` owns its writers | the body gains the fold: at exit `_diag` folds per-batch sink lines into one per distinct text, through its fifth write. Its fence is unchanged, and a dated History entry is added |
 | `src/log_foundry/worker.py:2722-2723`, `_emit_pending` | the sink's and engine's lines are ones "the exit tallies cannot aggregate" | rewrites: they are folded after the first abandoned exit batch |
 | `src/log_foundry/worker.py:3325-3330`, `_emit` | "The tallies do not reach a line the engine or the sink itself writes per batch … those follow the number of exit batches" | rewrites to state the fold window and that the worker's own lines stay outside it |
-| `src/log_foundry/_diag.py` module docstring | "Four writers, one per kind of line" | names the fifth write and the fold |
+| `src/log_foundry/_diag.py` module docstring | "Four writers, one per kind of line" | names the fifth write, the fold and `running_total` |
+| `src/log_foundry/_fork.py`, `_reinit_after_fork`'s docstring | "The order of work here is the contract", steps 1 to 6 | adds the withdrawal of `_diag`'s window as the step ahead of the pin, and why |
+| `src/log_foundry/_fork.py`, `_GLOBAL_PRIMITIVES` | ten rows | adds `("_diag", "_FOLD_LOCK")` |
+| `docs/component-inventory.md:84`, fork repair | "the roster of the package's ten global locks and events" | eleven |
+| `docs/audits/2026-11-14-probes/core-pipeline/spec090_dead_http_exit.py:2` | "the exit drain's tallies cannot aggregate, so the lines at exit follow the number of exit batches" | keeps: a probe's record of what it measured |
+| this spec's own text | its grep, this table and its Evidence | keeps: the record |
 | `tests/test_exit_drain_batches.py:705-727`, `:730-766` | the engine's and `HTTPSink`'s lines "grow with the number of exit batches" | the docstrings are rewritten: the lines are folded, and the call bound is unchanged. The assertions stay, since they bound lines from above |
 | `docs/specs/SPEC-090-backlog-batching.md:392-400`, FR-003 *What the tallies do not reach* | the sink's and engine's lines are written once per exit batch | adds a superseded marker: closed by SPEC-103, which folds them, and where the decisions live |
 | `README.md:245-254` | the exit drain's batches and its one decline line | adds a sentence: once a batch of the exit has been abandoned, the stderr lines a sink writes for each later batch are folded into one per distinct line, written at the end of the exit with its count |
@@ -283,10 +365,9 @@ part of the old claim, and the fold adds no module, so the build adds nothing to
 - [ ] `docs/architecture.md` §12 carries the dead-sink item struck to one line naming SPEC-103.
       *Resolved* carries the full item, with the zero and cap rows before and after on 3.12 and
       3.13 and the rejected designs (serves no invariant: a record of a closed item).
-- [ ] §12 carries the recovered-sink item as an open item, with its reproduction and numbers, the
-      invariants the Description names, and "Closed by SPEC-105". If `main` already carries it
-      when the build lands, it is left as found (serves no invariant: it files a defect and fixes
-      none).
+- [ ] §12 carries "The exit drain sizes a batch from a rate it measured earlier…" exactly as
+      found, and no second item for a sink that recovers by exit is filed (serves no invariant:
+      it leaves another spec's item alone).
 - [ ] The pipeline decision states that growth at exit was rejected, gives the reasoning and the
       slowdown numbers, lists A, B, D, D2, E, E′, E3 with `1fa9ea15`, and E6 under **Rejected**,
       and carries a History entry dated the build's day (serves no invariant: the register's
@@ -306,16 +387,23 @@ part of the old claim, and the fold adds no module, so the build adds nothing to
 
 ```python
 # src/log_foundry/_diag.py (a leaf: imports nothing from the package)
-_FOLD: threading.local   # .table and .lock, set only on a drain thread inside an exit sink call
+_FOLD: threading.local      # .table, set only on a drain thread inside an exit batch's sink call
+_FOLD_LOCK: threading.Lock  # a leaf: no other lock is taken under it; a _GLOBAL_PRIMITIVES row
 
-def fold_into(table: dict[tuple[str, ...], list[int]] | None,
-              lock: threading.Lock | None) -> None: ...   # opens or closes the window
-def write_folded(rows: list[tuple[tuple[str, ...], list[int]]]) -> None: ...  # the fifth write
+class FoldTable:
+    rows: dict[tuple[str, ...], list[int]]  # key -> [summed count, lines folded]; first-seen order
+    closed: bool                            # set by stop()'s take; a later record is written at once
+
+def fold_into(table: FoldTable | None) -> None: ...          # opens or withdraws the window
+def withdraw_fold_in_child() -> None: ...                    # _fork's first step; takes no lock
+def take_folded(table: FoldTable, *, close: bool) -> None: ...  # clears in place; the fifth write
+def lost(what: str, count: int, detail: str = "", *, running_total: bool = False) -> None: ...
 
 # src/log_foundry/worker.py, private
 class Worker:
-    # SPEC-103 FR-001; written under _lock; emptied by _reinit_after_fork on both branches
-    _exit_fold: dict[tuple[str, ...], list[int]]   # key -> [summed count, lines folded]
+    # SPEC-103 FR-001; one object for the worker's life, cleared in place, never rebound;
+    # emptied and reopened by _reinit_after_fork on both branches
+    _exit_fold: _diag.FoldTable
 ```
 
 The key's first element names the kind: `"lost"`, `"absorbed"` or `"pending"`.
@@ -339,17 +427,23 @@ log-foundry: lost 19980 event(s); 999 more exit batch(es) abandoned
 
 ```
 src/log_foundry/
-├── _diag.py                       # the fold window, the three folding writers, write_folded
+├── _diag.py                       # the window, _FOLD_LOCK, FoldTable, the inline fold in three
+│                                  # writers, running_total, take_folded, the child withdrawal
+├── _fork.py                       # the withdrawal as the first child step; the roster row
+├── context.py                     # running_total=True on the baggage line
 └── worker.py                      # the window around each exit sink call; _exit_fold; the
-                                   # write in _write_exit_tallies; the fork reset; docstrings
+                                   # take in _write_exit_tallies and stop(); running_total=True
+                                   # on the two throttled lines; the fork reset; docstrings
 tests/
 ├── test_exit_drain_batches.py     # FR-001's comparison, twins, worker-lines, expiry and thread
 │                                  # tests; FR-002's SQS slowdown guard; two docstrings
-├── test_diag.py                   # the five-write tripwire; the WARN_EVERY roster
+├── test_diag.py                   # the five-write tripwire; the running-total roster
+├── test_fork_lifecycle.py         # the two fork-inside-a-folded-call cases
 ├── test_backlog_batching.py       # the fork reset of _exit_fold
 └── test_lifecycle_inventory.py    # the _exit_fold row
 docs/
-├── architecture.md                # §12 struck, Resolved; the recovered-sink item
+├── architecture.md                # §12 struck, Resolved
+├── component-inventory.md         # the roster's count
 ├── decisions/pipeline/a-backlog-drains-in-larger-batches-and-capacity-is-not-a-setting.md
 ├── decisions/failure-paths/one-module-writes-every-diagnostic-….md
 ├── release-notes/v1.2.1.md
@@ -362,9 +456,11 @@ README.md
 
 ### Phase 1: The fold and its guards (FR-001, FR-002)
 
-- `_diag`'s window, the folding writers and `write_folded`. The worker's window around the engine
-  run and each 1.x `emit` of an exit batch, `_exit_fold`, its write in `_write_exit_tallies`, the
-  fork reset, and the inventory row.
+- `_diag`'s window, `_FOLD_LOCK`, `FoldTable`, the inline fold in three writers, `running_total`
+  and `take_folded`. The withdrawal as `_fork._reinit_after_fork`'s first step, and the roster row.
+  The worker's window around the engine run and each 1.x `emit` of an exit batch, `_exit_fold`,
+  its take in `_write_exit_tallies` and the closing take in `stop()`, the three throttled sites,
+  the fork reset, and the inventory row.
 - FR-001's tests, the `test_diag` tripwire and roster, and FR-002's SQS slowdown guard. The guard
   is run once in a worktree at `7f400f51`.
 - The zero, cap, exit-budget, poison, recovered and two slowdown probes on 3.12 and 3.13, for the
@@ -372,8 +468,8 @@ README.md
 
 ### Phase 2: The record (FR-003)
 
-- §12, both decisions, the docstrings FR-003 names, the README, the pending release notes and
-  SPEC-090's marker.
+- §12, both decisions, the docstrings FR-003 names, the inventory's count, the README, the
+  pending release notes and SPEC-090's marker.
 
 ---
 
@@ -426,11 +522,23 @@ measured at `fec8c8e8` with its prototype applied to `6b9d50f6`'s `src/` (`main`
   stderr write) and `test_every_lifecycle_entry_has_a_home` (a new `Worker` attribute). No test
   that reads a sink's or the engine's lines at exit failed. `tests/test_invariants_model.py`
   passed, because its oracle reads only the worker's lines.
-- **Where the prototype differs from FR-001.** The prototype folded across the whole of `_emit`,
-  so it also folded the worker's `retry declined` lines. FR-001 narrows the window to the sink
-  call, which excludes them. It recorded without a lock, and only `lost` and `absorbed`. None of
-  these differences moves a number above, because no retry was declined in those runs and no
-  `pending` line was written.
+- **Where the prototype differs from FR-001.**
+  - It folded across the whole of `_emit`, so it also folded the worker's `retry declined`
+    lines. FR-001 narrows the window to the sink call, which excludes them.
+  - It recorded without a lock, folded only `lost` and `absorbed`, and folded running totals.
+  - It left the window open across a fork.
+
+  None of these differences moves a number above: no retry was declined in those runs, no
+  `pending` line or running total was written, and nothing forked.
+- **The spec review's scratch build** (`fold_diag.py`, `fold_worker.py`, held outside the repo)
+  measured three defects, each answered in FR-001:
+  - The fork defect, with a sink that forks inside a folded `emit` and whose
+    `reacquire_after_fork` raises. The child's line was recorded into the inherited table and
+    erased, never written. With a parent thread holding `Worker._lock` at the fork, the child hung.
+  - A wedged call's lines, held after an expired join.
+  - A helper-based fold check. It made `test_p11_counts_every_assembly_fault` fail 3 of 3 runs
+    (`unaccounted=-2`), and adding a second `with self._lock` site failed
+    `test_the_lock_sites_are_the_base_commits`.
 
 **The reasoning Andrew asked to be recorded.** Every growth design sized the next exit batch from
 what the last one cost. A sink whose cost changes between batches defeats that. A batch grown
@@ -453,6 +561,27 @@ budget through it.
   Andrew answered "Fold lines, keep batches (Recommended)" on 2026-11-17. This spec replaces the
   growth spec, so it returns to spec review. Nothing of the growth design lands, except as this
   history.
+- **2026-11-17, after the spec review**, every finding accepted.
+  - **The fork withdrawal did not bind.** `_fork`'s repair writes `_diag` lines before the
+    worker's reset runs, so the child's lines were recorded into the inherited table and lost, and
+    the child hung on a `Worker._lock` a parent thread held. The window is now withdrawn as
+    `_fork._reinit_after_fork`'s first step, and the table is guarded by `_diag._FOLD_LOCK`, a leaf
+    lock. ~~`_diag` registers its own `after_in_child` handler~~: the package holds to one
+    registration, which `test_nothing_else_in_the_package_registers_a_fork_handler` enforces, so
+    the step lives in `_fork`'s one handler instead.
+  - **An expired join held a wedged call's lines.** `stop()`'s take now closes the fold.
+  - **A throttled running total would have been summed.** `context._announce_dropped` is reachable
+    from a sink. `lost` gains `running_total=True`, held by a roster over all of `src/`.
+  - **The comparison criterion was vacuous.** It now requires a folded line of each kind.
+  - **`flush()` was wrongly named outside the window.** A marker met at exit emits an exit batch,
+    and its lines are folded.
+  - **The take's shape.** The table is cleared in place, and the take is `_diag`'s, so `worker.py`
+    gains no lock site.
+  - **Missing grep hits.** Three sites are added to FR-003's table as kept.
+  - **The fold check adds no frame.** It is written inline, because of the recursion-limit parity
+    test.
+  - **The recovered-sink item.** It is filed separately, under its own title, and is left as found
+    here. Its retry-predicate twin is out of scope.
 - **2026-11-17, a trade withdrawn.** For the growth design, Andrew accepted on 2026-11-17 that a
   sink refusing batches over 400 events would be handed batches past its limit after five quick
   exit failures in a row. ~~A size-limited sink failing five quick exit batches in a row delivers
