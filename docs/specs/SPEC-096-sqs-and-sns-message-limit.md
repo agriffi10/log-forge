@@ -55,8 +55,8 @@ request is ever sized past the service's 1 MiB.
   `FirehoseSink`'s limits were read too and still match the service, which says they "cannot be
   changed".
 - **Validating `MAX_BYTES`, or `max_message_bytes` assigned after construction.** `MAX_BYTES` is
-  read per round when `max_message_bytes` is `None`, as in 1.x, and `sink.max_message_bytes` is a
-  public attribute a caller can reassign, as `sink.max_retries` is. An assignment made after
+  read once per run of `emit` when `max_message_bytes` is `None`, and `sink.max_message_bytes` is
+  a public attribute a caller can reassign, as `sink.max_retries` is. An assignment made after
   construction can be judged only on the drain thread, which invariant 13 forbids. Only the upper
   side of either is held, by the 1,048,576 cap (FR-002, FR-003).
 - **Not counting the FIFO ids.** `SQSSink` costs a FIFO entry as its body plus its
@@ -176,7 +176,8 @@ call level within a module only.
 
 #### Description:
 
-**The effective limit.** Each round reads one value, used for every decision that round makes:
+**The effective limit.** Each run of `emit` reads one value, used for every round of that run
+and every decision each round makes:
 `max_message_bytes` when it is not `None`, otherwise `self.MAX_BYTES` (FR-004), and then the
 smaller of that and 1,048,576. The cap is a private module constant, `_SERVICE_MAX_BYTES`,
 whose docstring quotes the service: "The maximum allowed individual message size and the maximum
@@ -192,8 +193,8 @@ alone, and each request is split under 1 MiB.
 length, plus on a FIFO queue the UTF-8 lengths of `MessageGroupId` and `MessageDeduplicationId`.
 An entry whose cost exceeds the effective limit is dropped, counted in `dropped_oversized` and
 announced. The line is today's, `SQSSink, <size> bytes exceeds the <limit>-byte message limit`,
-with `<limit>` the effective limit. An entry is still prepared once per run (SPEC-074 FR-002), so
-the limit an entry was judged against is the one read in the round that prepared it.
+with `<limit>` the effective limit. An entry is still prepared once per run (SPEC-074 FR-002), and
+the run reads one limit, so a later round's chunking agrees with the verdict its entry was given.
 
 **Each request.** `chunk_items` (`:655-660`) is given the effective limit as `max_bytes` where
 it is given `self.MAX_BYTES` today. A request therefore holds at most 10 entries whose costs sum
@@ -234,7 +235,8 @@ the service requires, which costs requests and never a refusal.
 
 #### Description:
 
-FR-002's rule on SNS's twin path (invariant 6). Each round reads one effective limit:
+FR-002's rule on SNS's twin path (invariant 6). Each run of `emit` reads one effective limit,
+used for every round of that run:
 `max_message_bytes`, else `self.MAX_BYTES`, then the smaller of that and `_SERVICE_MAX_BYTES`,
 1,048,576, the most any topic accepts ("supports values up to 1 MiB (1,048,576 bytes)",
 `PublishBatch`). `_bodies` (`sinks/sns.py:321`) drops a message whose UTF-8 body exceeds it,
@@ -293,7 +295,7 @@ the README tells the caller to pass the topic's value and nothing larger.
 `MAX_BYTES` is a public class attribute on both sinks. The frozen surface lets it grow and never
 shrink (invariant 10), and the `1.x` rule is no breaking change, so it is not removed, renamed or
 re-valued. After this spec it means one thing on each class: **the limit a sink uses when
-`max_message_bytes` is `None`.** It is read through `self` once per round, as today. So the three
+`max_message_bytes` is `None`.** It is read through `self` once per run of `emit`. So the three
 ways 1.x code sets a limit keep working: an assignment on the instance after construction, a
 subclass that overrides it, and the class's own value. The suite relies on the first in three
 places (`tests/test_sink_concurrency.py:484`, `tests/test_sinks_sqs_id_failures.py:129` and
@@ -427,8 +429,9 @@ class SNSSink:
     def _limit(self) -> int: ...
 ```
 
-`_limit` tests `is None`, never truthiness. It is called once per round, and its value is passed
-down to `_prepare`/`_bodies`, to `chunk_items` and to the oversize line.
+`_limit` tests `is None`, never truthiness. Each run of `emit` reads one value, kept in the run's
+notes and used for every round of that run, and its value is passed down to `_prepare`/`_bodies`,
+to `chunk_items` and to the oversize line.
 
 ---
 
@@ -501,7 +504,7 @@ docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte
 - Record, at `10ba21ee`, the requests a recording client receives for `spec096_limits_today.py`
   cases A, B, C, E, F1 and F2, as the fixture FR-002's and FR-003's first criteria compare with.
 - Route the effective limit through `_chunks`/`_prepare`/`_announce_oversized` on SQS and
-  `_round`/`_bodies` on SNS, read once per round, and cost an SNS request in UTF-8 bytes.
+  `_round`/`_bodies` on SNS, read once per run, and cost an SNS request in UTF-8 bytes.
 - Tests for each criterion of FR-002 and FR-003, the twin-path table included.
 
 ### Phase 3: The record (FR-005)
@@ -679,3 +682,9 @@ today, and this spec adds two.
   16-byte control moved none. The wrapper now forwards `_emit`'s keyword arguments, and the
   criterion was settled on the repaired prototype: 256 rows, 86 red, 0 moved at 1,048,576 and at
   1,024, and 7 moved at the 16-byte control, all of them SQS or SNS rows.
+- **2026-11-17, one limit per run.** The system-frame diff review found the twins diverged under
+  a limit changed between two rounds of one run: `SQSSink` kept each entry's verdict from the
+  round that prepared it, while `SNSSink` read the limit again every round, so a 300 KiB event
+  sent by one was dropped by the other (invariant 6). Both now read the limit once per run of
+  `emit` and use that value for every round of it. ~~Each round reads one value~~ is corrected in
+  FR-002, FR-003, FR-004, the Data Model and Phase 2.

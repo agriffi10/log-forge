@@ -9,11 +9,13 @@
   (`_LIMIT_FLOOR` and `_SERVICE_MAX_BYTES`, private `Final` constants in `sinks/sqs.py` and
   `sinks/sns.py`), the value rendered by `sanitize._int_text`.
 - **Applying it** (FR-002, FR-003). Each sink gains `_limit()`: `max_message_bytes`, else
-  `MAX_BYTES` read through `self` (an `is None` test), capped at 1,048,576. `SQSSink._chunks`
-  reads it once per round and carries it on `_Plan.limit`; `_prepare` takes it by keyword and
-  `_announce_oversized` takes it as an argument, so the line names the round's limit rather than
-  `MAX_BYTES` at settle time. `SNSSink._round` reads it once and passes it to `_bodies` and to
-  `chunk_items`, whose `size_of` is now the body's UTF-8 length rather than its characters.
+  `MAX_BYTES` read through `self` (an `is None` test), capped at 1,048,576. Each run of `emit`
+  reads it once, in its first round, and keeps it in the run's notes (`run_context().notes(self)`
+  under `"limit"`), so every later round of the run uses the same value on both sinks.
+  `SQSSink._chunks` carries it on `_Plan.limit`; `_prepare` takes it by keyword and
+  `_announce_oversized` takes it as an argument, so the line names the run's limit rather than
+  `MAX_BYTES` at settle time. `SNSSink._round` passes it to `_bodies` and to `chunk_items`, whose
+  `size_of` is now the body's UTF-8 length rather than its characters.
 - **`MAX_BYTES`** (FR-004) keeps 262,144 on both classes and its 1.x reach as the default limit.
 - **The record** (FR-005): the docstrings, `sanitize._MAX_RENDERED_BYTES`'s "256 KiB by default",
   the README's AWS section, `docs/release-notes/v1.2.1.md` (an *Added* and a *Changed* section, a
@@ -50,11 +52,17 @@
   0 rows moved at 1,048,576 and at 1,024, and 7 moved at the 16-byte control, all SQS or SNS
   rows, which proves the patch reached them. Before the repair every row read
   `harness-error:batch-count` and the control moved none.
-- **Mutation sweep.** Eight planned mutants, seven killed. The survivor, `_limit` testing
-  truthiness rather than `is None`, is equivalent: the only falsy `int`, 0, is refused at
-  construction. Four further mutants were run and killed: `_prepare` and `_bodies` judging by
+- **Mutation sweep.** Eight planned mutants, all killed. `_limit` testing truthiness rather than
+  `is None` is not equivalent: 0 is refused at construction, but `max_message_bytes` is a public
+  attribute a caller may reassign afterwards, and a 0 assigned then is the limit, so a 10-byte
+  event is dropped with a line naming 0 where the truthiness mutant falls back to 262,144 and
+  sends it; it is killed on each sink by the test that reassigns 0. Four further mutants were run and killed: `_prepare` and `_bodies` judging by
   `self.MAX_BYTES`, `_limit` ignoring the argument (each on both sinks), the floor off by one
   on `SQSSink`, and the cap off by one on `SNSSink`. A fifth, the oversize line formatting
   `self._limit()` when the run settles rather than the limit the round read, is killed on each
-  sink by a request that reassigns `MAX_BYTES` before the line is written.
+  sink by a request that reassigns `MAX_BYTES` before the line is written. A sixth, re-reading
+  the limit every round (the per-round read each sink had before the system-frame review), is
+  killed on each sink by a request that lowers `max_message_bytes` from 1 MiB to 2,048 and times
+  out: at the run's 1 MiB both sinks resend the 10-byte and the 300 KiB event together and drop
+  nothing, where the per-round read made SNS drop the large event and SQS send it alone.
 - The spec's "§8" was §9.1; the spec is corrected in its revision history.

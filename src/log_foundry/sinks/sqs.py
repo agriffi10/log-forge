@@ -109,8 +109,9 @@ class _Plan(NamedTuple):
         ``"id failure"`` or ``"unencodable"``.
       refused: The first id callable's exception, set only when every event's id callable
         raised; the round is then a refusal.
-      limit: The round's effective message limit (:meth:`SQSSink._limit`), read once, which
-        the chunks were bounded by and the round's oversize lines name (SPEC-096 FR-002).
+      limit: The run's effective message limit (:meth:`SQSSink._limit`), read once per run of
+        ``emit``, which the chunks were bounded by and the round's oversize lines name (SPEC-096
+        FR-002).
     """
 
     chunks: list[list[_Prepared]]
@@ -196,15 +197,15 @@ class SQSSink:
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
 
-    **Its message limit is the caller's to set** (SPEC-096). Each round reads one limit, used for
-    every decision the round makes: ``max_message_bytes`` when it is not ``None``, otherwise
-    :attr:`MAX_BYTES`, and then the smaller of that and SQS's own 1,048,576 bytes. An entry costing
-    more is dropped, counted in ``dropped_oversized`` and announced naming the limit, and a
-    request's entries together cost at most the same limit.
+    **Its message limit is the caller's to set** (SPEC-096). Each run of ``emit`` reads one limit,
+    used for every decision of every round of that run: ``max_message_bytes`` when it is not
+    ``None``, otherwise :attr:`MAX_BYTES`, and then the smaller of that and SQS's own 1,048,576
+    bytes. An entry costing more is dropped, counted in ``dropped_oversized`` and announced naming
+    the limit, and a request's entries together cost at most the same limit.
 
     Attributes:
       MAX_BYTES: The message limit when ``max_message_bytes`` is ``None``, 262,144 bytes, 1.x's
-        256 KiB. It is read through ``self`` once per round, so an assignment on the instance, a
+        256 KiB. It is read through ``self`` once per run, so an assignment on the instance, a
         subclass's override and the class's own value all set the limit as they did in 1.x; a
         ``max_message_bytes`` the caller passed wins over it, whatever it holds.
       max_message_bytes: The message limit the caller passed, an exact ``int`` from 1,024 to
@@ -642,8 +643,9 @@ class SQSSink:
         then the smaller of that and :data:`_SERVICE_MAX_BYTES` (SPEC-096 FR-002). The test is
         ``is None``, never truthiness. A judged ``max_message_bytes`` is never above the cap, so
         the cap binds only a ``MAX_BYTES`` raised past 1 MiB, which would otherwise send requests
-        SQS refuses whole. :meth:`_chunks` calls this once per round and carries the value on
-        its plan, so every decision of a round reads one limit.
+        SQS refuses whole. :meth:`_chunks` calls this once per run of ``emit``, keeps the value in
+        the run's notes and carries it on each round's plan, so every decision of every round of
+        the run reads one limit.
 
         Args:
           None.
@@ -661,8 +663,8 @@ class SQSSink:
         """Splits the round's batch into sends within both the entry-count and byte limits.
 
         The boundaries are :func:`~log_foundry.sinks._chunk.chunk_items`' (SPEC-071 FR-004): every
-        per-event drop is decided first, so an event that can never fit is filtered out before any
-        boundary is drawn, and the chunks are materialised as a list, so all of them are known
+        per-event drop is decided first, so an event over the sink's limit is filtered out before
+        any boundary is drawn, and the chunks are materialised as a list, so all of them are known
         before the first send.
 
         **Each entry is prepared once per run** (SPEC-074 FR-002). Its body comes from the encode
@@ -673,14 +675,16 @@ class SQSSink:
         random fallback run **once per event per run** and every round resends the identical
         entry. Only the grouping and each entry's index are per round. An identity that appears
         twice keeps one entry per occurrence, and a round hands an occurrence the first entry of
-        its identity that has not landed. An entry whose costed size exceeds the limit can never
-        fit a message, so it is dropped with a counted warning (FR-004) — and the check is made
-        on everything that travels, not the body alone.
+        its identity that has not landed. An entry whose costed size exceeds the sink's limit is
+        over what the sink sends as one message, so it is dropped with a counted warning
+        (FR-004) — and the check is made on everything that travels, not the body alone.
 
-        **The limit is read once here** (:meth:`_limit`, SPEC-096 FR-002): the effective message
-        limit bounds each entry :meth:`_prepare` costs and each chunk's summed cost, and rides
-        on the plan so the round's oversize lines name the same number. An entry prepared in an
-        earlier round of the run keeps the verdict that round's limit gave it.
+        **The limit is read once per run** of ``emit`` (:meth:`_limit`, SPEC-096 FR-002): the first
+        round reads it and keeps it in the run's notes, and every later round of the run takes
+        that value, so a limit changed mid-run reaches no round of it. The one value bounds each
+        entry :meth:`_prepare` costs and each chunk's summed cost, and rides on the plan so the
+        round's oversize lines name the same number; an entry prepared in an earlier round of
+        the run therefore keeps a verdict the later rounds' chunking agrees with.
 
         **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
         under the wrappers' ledger rule: when every event of the round failed in its id callable,
@@ -698,8 +702,8 @@ class SQSSink:
         Raises:
           None. A ``BaseException`` from a caller's callable propagates.
         """
-        limit = self._limit()
         notes = run_context().notes(self)
+        limit = cast("int", notes.setdefault("limit", self._limit()))
         cache = cast(
             "dict[int, tuple[dict[str, object], list[_Entry]]]", notes.setdefault("prepared", {})
         )
@@ -750,12 +754,12 @@ class SQSSink:
 
         An entry is costed as its body's UTF-8 length plus, on a FIFO queue, both ids' UTF-8
         lengths (SPEC-016 FR-005), and dropped as oversize when that cost exceeds ``limit``, the
-        round's effective message limit (SPEC-096 FR-002).
+        run's effective message limit (SPEC-096 FR-002).
 
         Args:
           event: The event.
           body: Its encoded body, or ``None`` when the encode step could not encode it.
-          limit: The round's effective message limit, in bytes (:meth:`_limit`).
+          limit: The run's effective message limit, in bytes (:meth:`_limit`).
 
         Returns:
           The entry.
@@ -784,13 +788,13 @@ class SQSSink:
 
         One line per event is today's shape, kept on purpose; what SPEC-058 FR-004 changed is
         only *when* the lines are written — after the count, and only by a run that settled
-        (SPEC-074). The limit each line names is the one the round judged against, passed in
-        rather than read here, since the lines are written when the run settles and
+        (SPEC-074). The limit each line names is the run's, the one the round judged against,
+        passed in rather than read here, since the lines are written when the run settles and
         ``MAX_BYTES`` could have been reassigned by then (SPEC-096 FR-002).
 
         Args:
           sizes: The costed size of each dropped event, in the order they were met.
-          limit: The effective message limit of the round that dropped them.
+          limit: The effective message limit of the run that dropped them.
 
         Returns:
           None.

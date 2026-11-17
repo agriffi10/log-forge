@@ -370,6 +370,73 @@ def test_the_oversize_line_names_the_limit_the_round_read(cls: type) -> None:
     assert _named(result["lines"]) == [2048], result["lines"]
 
 
+@pytest.mark.parametrize("cls", _CLASSES, ids=_IDS)
+def test_a_zero_limit_reassigned_after_construction_is_the_limit(cls: type) -> None:
+    """FR-002 / FR-003: the limit tests ``max_message_bytes is None``, never its truthiness.
+
+    ``max_message_bytes`` is a public attribute the caller may reassign after the constructor
+    judged it. A 0 is falsy but not ``None``, so it is the limit: the 10-byte event is dropped
+    against 0 and its line names 0, where a truthiness test would fall back to ``MAX_BYTES``'
+    262144 and send it.
+    """
+    sink = _build(cls)
+    sink.max_message_bytes = 0
+    result = cases.run(sink, [event(0, 10)])
+    assert sink.client.requests == []
+    assert sink.dropped_oversized == 1
+    assert _named(result["lines"]) == [0], result["lines"]
+
+
+class LoweringMidRun(Recorder):
+    """A recorder whose first request lowers ``max_message_bytes`` to 2048, then times out.
+
+    Every request is recorded, the refused first one too, so the two rounds' boundaries can be
+    compared. The retry round runs after the limit changed: a sink reading the limit again in
+    that round judges the 300 KiB event against 2048, while the run started at 1 MiB.
+    """
+
+    sink: Any = None
+
+    def _take(self, entries: list[dict[str, str]]) -> dict[str, Any]:
+        self.requests.append([dict(entry) for entry in entries])
+        if len(self.requests) == 1:
+            self.sink.max_message_bytes = 2048
+            raise TimeoutError("transient")
+        return {"Successful": [{"Id": e["Id"]} for e in entries], "Failed": []}
+
+    def send_message_batch(self, QueueUrl: str, Entries: list[dict[str, str]]) -> dict[str, Any]:
+        return self._take(Entries)
+
+    def publish_batch(
+        self, TopicArn: str, PublishBatchRequestEntries: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        return self._take(PublishBatchRequestEntries)
+
+
+def test_a_limit_changed_mid_run_reaches_no_round_of_that_run() -> None:
+    """FR-002 / FR-003, invariant 6: each run of ``emit`` reads one limit, on both sinks alike.
+
+    Both sinks start the run at 1 MiB with a 10-byte and a 300 KiB event; the first request
+    lowers ``max_message_bytes`` to 2048 and times out, so a second round follows. At the run's
+    1 MiB both events fit one request, so the retry resends the same two, nothing is dropped and
+    no line is written. A sink that re-read the limit in the retry round would drop the 300 KiB
+    event there, as SNSSink did while SQSSink kept the verdict it prepared in round one.
+    """
+    seen = {}
+    for cls in _CLASSES:
+        client = LoweringMidRun()
+        sink = _build(cls, client=client, max_message_bytes=MIB, max_retries=2)
+        client.sink = sink
+        result = cases.run(sink, [event(0, 10), event(1, 300 * KIB)])
+        assert sink.max_message_bytes == 2048, "the premise: the first request lowered it"
+        seen[cls.__name__] = (sink.dropped_oversized, _ns(sink), result["lines"])
+        assert sink.dropped_oversized == 0, cls.__name__
+        assert _ns(sink) == [[0, 1], [0, 1]], cls.__name__
+        assert result["lines"] == [], cls.__name__
+        assert sink.losses().failed == 0, cls.__name__
+    assert seen["SQSSink"] == seen["SNSSink"]
+
+
 # --- FR-002 / FR-003 AC1: the default sends what 1.x sent -------------------------------------
 
 

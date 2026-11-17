@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
@@ -78,16 +78,16 @@ class SNSSink:
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
 
-    **Its message limit is the caller's to set** (SPEC-096). Each round reads one limit, used for
-    every decision the round makes: ``max_message_bytes`` when it is not ``None``, otherwise
-    :attr:`MAX_BYTES`, and then the smaller of that and the 1,048,576 bytes any topic allows. A
-    message whose UTF-8 body costs more is dropped, counted in ``dropped_oversized`` and announced
-    naming the limit, and a request's bodies together cost at most the same limit, in UTF-8
-    bytes, as the topic itself counts them.
+    **Its message limit is the caller's to set** (SPEC-096). Each run of ``emit`` reads one limit,
+    used for every decision of every round of that run: ``max_message_bytes`` when it is not
+    ``None``, otherwise :attr:`MAX_BYTES`, and then the smaller of that and the 1,048,576 bytes
+    any topic allows. A message whose UTF-8 body costs more is dropped, counted in
+    ``dropped_oversized`` and announced naming the limit, and a request's bodies together cost at
+    most the same limit, in UTF-8 bytes, as the topic itself counts them.
 
     Attributes:
       MAX_BYTES: The message limit when ``max_message_bytes`` is ``None``, 262,144 bytes, 1.x's
-        256 KiB and every topic's default. It is read through ``self`` once per round, so an
+        256 KiB and every topic's default. It is read through ``self`` once per run, so an
         assignment on the instance, a subclass's override and the class's own value all set the
         limit as they did in 1.x; a ``max_message_bytes`` the caller passed wins over it,
         whatever it holds.
@@ -280,7 +280,8 @@ class SNSSink:
         then the smaller of that and :data:`_SERVICE_MAX_BYTES` (SPEC-096 FR-003). The test is
         ``is None``, never truthiness. A judged ``max_message_bytes`` is never above the cap, so
         the cap binds only a ``MAX_BYTES`` raised past 1 MiB, which would otherwise publish
-        requests every topic refuses whole. :meth:`_round` calls this once per round.
+        requests every topic refuses whole. :meth:`_round` calls this once per run of ``emit`` and
+        keeps the value in the run's notes, so every round of the run reads one limit.
 
         Args:
           None.
@@ -297,9 +298,11 @@ class SNSSink:
     def _round(self, batch: list[dict[str, object]]) -> Verdict:
         """Publishes every remaining chunk once and classifies every event of the round.
 
-        The round reads one effective message limit (:meth:`_limit`, SPEC-096 FR-003), by which
-        :meth:`_bodies` drops an oversized message and which bounds each chunk's summed UTF-8
-        bytes, so every decision and line of a round names one number.
+        **The limit is read once per run** of ``emit`` (:meth:`_limit`, SPEC-096 FR-003): the first
+        round reads it and keeps it in the run's notes, and every later round of the run takes
+        that value, so a limit changed mid-run reaches no round of it. By that one value
+        :meth:`_bodies` drops an oversized message and each chunk's summed UTF-8 bytes are
+        bounded, so every decision and line of the run names one number.
 
         Every event is encoded once per run (:func:`~log_foundry.sinks._encode.encode_round`),
         an unencodable one ``DROPPED`` with SPEC-069's line; :meth:`_bodies` drops an oversized
@@ -318,7 +321,7 @@ class SNSSink:
           None. A ``BaseException`` from the client propagates.
         """
         context = run_context()
-        limit = self._limit()
+        limit = cast("int", context.notes(self).setdefault("limit", self._limit()))
         fates = [Outcome.DROPPED] * len(batch)
         pairs = encode_round(self, batch, self._encode, sink=_diag.type_name(self))
         bodies = self._bodies(pairs, context.drops(self), limit)
@@ -384,13 +387,13 @@ class SNSSink:
     def _bodies(
         self, encoded: list[tuple[int, str]], pending: Deferral | _Drops, limit: int
     ) -> list[tuple[int, str]]:
-        """Keeps each encoded body, dropping one larger than the round's message limit (FR-011).
+        """Keeps each encoded body, dropping one larger than the run's message limit (FR-011).
 
         It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
         encoded forms and nothing here can fail on an event. A body's UTF-8 length is its cost,
         as ``chunk_items`` reads it in :meth:`_round` (SPEC-096 FR-003), the unit the topic
         counts; characters agreed with it only while ``json.dumps`` escaped every non-ASCII
-        character. A body costing more than ``limit``, the round's effective message limit, is
+        character. A body costing more than ``limit``, the run's effective message limit, is
         dropped, and its line names that limit, bound here rather than read when the line is
         written.
 
@@ -404,7 +407,7 @@ class SNSSink:
           encoded: Each encodable event's position in the round's batch with its JSON body.
           pending: The run's ``SETTLED`` view, which holds every drop decided here until the run
             is known to settle.
-          limit: The round's effective message limit, in bytes (:meth:`_limit`).
+          limit: The run's effective message limit, in bytes (:meth:`_limit`).
 
         Returns:
           The position and body of each message that can be sent.

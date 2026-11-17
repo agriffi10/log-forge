@@ -874,10 +874,11 @@ installed as somebody else's transitive dependency.
 #### AWS — the durable-buffer path (`aws` extra)
 
 `pip install 'log-foundry[aws]'` (pulls `boto3`). Credentials and region come from boto3's standard
-chain — log-foundry adds none of its own. Each re-chunks every batch to the service's hard per-request
-limits, retries partial failures, and drops any single event larger than the sink's message limit
-(counted on `.dropped_oversized`). For `KinesisSink` and `FirehoseSink` that limit is the service's;
-for `SQSSink` and `SNSSink` it is yours to set, as below.
+chain — log-foundry adds none of its own. Each re-chunks every batch to its per-request limits: the
+service's for `KinesisSink` and `FirehoseSink`, and the sink's message limit for `SQSSink` and
+`SNSSink`. Each retries partial failures and drops any single event larger than the sink's message
+limit (counted on `.dropped_oversized`). For `KinesisSink` and `FirehoseSink` that limit is the
+service's; for `SQSSink` and `SNSSink` it is yours to set, as below.
 
 `KinesisSink` and `FirehoseSink` learn which records failed **positionally** — the response carries a
 parallel array with no ids — so they check that it describes as many records as were sent before

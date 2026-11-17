@@ -223,7 +223,7 @@ areas:
         status: "stable"
         path: "docs/decisions/sink-delivery/a-client-exception-costs-its-chunk-and-is-provable-non-delivery-for-it.md"
       - title: "A destination limit the caller can configure is a constructor argument, defaulting to the 1.x value, under the service's ceiling"
-        fence: "`SQSSink` and `SNSSink` take `max_message_bytes`, keyword-only and appended, defaulting to `None` so `MAX_BYTES` still sets the limit on an instance, a subclass or the class as in 1.x; a value outside 1,024 to 1,048,576 is refused at construction; each round holds every message and each request's sum to one limit capped at 1,048,576; the default stays 256 KiB, and the limit is never read from AWS. (SPEC-096)"
+        fence: "`SQSSink` and `SNSSink` take `max_message_bytes`, keyword-only and appended, defaulting to `None` so `MAX_BYTES` still sets the limit on an instance, a subclass or the class as in 1.x; a value outside 1,024 to 1,048,576 is refused at construction; each run of `emit` reads one limit, capped at 1,048,576, and holds every message and each request's sum to it in every round; the default stays 256 KiB, and the limit is never read from AWS. (SPEC-096)"
         status: "stable"
         path: "docs/decisions/sink-delivery/a-destination-limit-the-caller-can-configure-is-a-constructor-argument-defaulting-to-the-1x-value-under-the-services-ceiling.md"
       - title: "A destination's limit is found by halving the *budget*, not the chunk"
