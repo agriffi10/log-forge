@@ -131,12 +131,14 @@ from model_oracles import (
     Close,
     CloseBroken,
     Closes,
+    LedgerBroken,
     SinkEvent,
     Stalled,
     Take,
     Write,
     check_call,
     check_late_write,
+    check_ledger,
     check_repeat,
     check_unowed_repeat,
     rerun_command,
@@ -144,6 +146,7 @@ from model_oracles import (
     soak_from,
     take_of_each_close,
 )
+from model_oracles import Ledger as OracleLedger
 from model_sinks import span_ends_queued
 from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
@@ -1291,6 +1294,78 @@ if SOAK:
 
 WIRING_SEED = 2
 """The seed the wiring test soaks: measured among the fastest in all three forms."""
+
+
+class _EndRecorder:
+    """Records each event the sink is handed."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+        self._lock = threading.Lock()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        with self._lock:
+            self.events.extend(batch)
+
+    def close(self) -> None:
+        return None
+
+
+def test_the_span_identity_counts_a_foreign_flushs_sweep_in_span_end_events() -> None:
+    """SPEC-091 FR-004 AC-6: the identity's queued term counts ``span.end`` events, not submissions.
+
+    The one shape that tells the two counts apart, and the one the model's rows went red on
+    (``span.end=0 queued=157 spans=155``): a swept submission left queued. A span opens on thread
+    A after ``shutdown()`` has retired the worker, so nothing will drain its queue; thread B's
+    ``flush()`` sweeps A's logs into that queue as a submission with no ``span.end``; A then
+    closes, queuing its ``span.start`` and ``span.end``. Two spans were started, one ``span.end``
+    was delivered before the shutdown and one is queued. Counted in submissions the queue holds
+    two, and ``check_ledger`` reads ``spans+1``.
+    """
+    sink = _EndRecorder()
+    log_foundry.configure(sink=sink)
+
+    @log_foundry.trace(name="warm")
+    def warm() -> None:
+        log_foundry.info("before the shutdown")
+
+    warm()
+    log_foundry.shutdown(timeout=5.0)
+    opened = threading.Event()
+    release = threading.Event()
+
+    @log_foundry.trace(name="late")
+    def late() -> None:
+        for i in range(3):
+            log_foundry.info(f"late{i}")
+        opened.set()
+        assert release.wait(10)
+
+    owner = threading.Thread(target=late)
+    owner.start()
+    assert opened.wait(10)
+    flusher = threading.Thread(target=log_foundry.flush, args=(0.5,))
+    flusher.start()
+    flusher.join(10)
+    release.set()
+    owner.join(10)
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None and worker._queue.qsize() == 2, "the swept and the closing submission"
+    health = log_foundry.health()
+    ledger = OracleLedger(
+        spans=2,
+        span_ends=sum(1 for e in sink.events if e["message"] == "span.end"),
+        queued=span_ends_queued(),
+        dropped=health.dropped,
+        abandoned=0,
+        orphans=0,
+        orphans_delivered=0,
+        orphan_lost=0,
+    )
+    try:
+        check_ledger(ledger)
+    except LedgerBroken as broken:
+        pytest.fail(f"invariant 2 (spans) read a swept submission as a queued span: {broken}")
 
 
 @pytest.mark.parametrize("form", FORMS)
