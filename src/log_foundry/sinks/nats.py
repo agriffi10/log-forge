@@ -255,11 +255,17 @@ def _verdict_of(
     published, an abandoned publish counting as published. **Nothing published**: 1.x's ``emit``
     raised and the worker resent the whole batch, so every event is ``RETRYABLE`` and marked
     sink-counted — the round registers 1.x's own counts and lines, which this function does not.
-    **Something published**: 1.x's ``emit`` returned, so a publish that raised and an event the
-    deadline left unattempted are ``REJECTED``; an abandoned publish counted where it was
+    **Something published**: 1.x's ``emit`` returned, so a publish that raised ~~and an event the
+    deadline left unattempted are~~ is ``REJECTED``; an abandoned publish counted where it was
     abandoned is ``UNKNOWN``, never resent; an unanswered confirmation makes every published
-    event ``UNKNOWN``; the rest are ``ACCEPTED``. Kept free of registrations so a test can plant
-    a wrong verdict here without also removing the counts.
+    event ``UNKNOWN``; the rest are ``ACCEPTED``. **SPEC-102 FR-001:** an event the deadline left
+    unattempted is ``RETRYABLE`` and not sink-counted, so the run's later rounds resend it. It is a
+    definitive non-delivery: :meth:`NATSSink._publish_all` never handed it to the driver, so no
+    attempt wrote it and a resend cannot duplicate it, and its cause is a spent budget the next
+    round renews, not a refusal every attempt would meet again. That covers the events after a
+    publish abandoned at the deadline too: the abandoned-publish latch refuses every later round
+    ``RETRYABLE`` while that publish is pending, so a resend never overtakes it. Kept free of
+    registrations so a test can plant a wrong verdict here without also removing the counts.
 
     Args:
       published: The round's publishes.
@@ -281,6 +287,8 @@ def _verdict_of(
         elif state == "abandoned":
             judged = published.abandoned_counted or unconfirmed
             outcomes.append(Outcome.UNKNOWN if judged else Outcome.ACCEPTED)
+        elif state == "unattempted":
+            outcomes.append(Outcome.RETRYABLE)
         else:
             outcomes.append(Outcome.REJECTED)
     return tuple(outcomes), frozenset()
@@ -369,6 +377,13 @@ class NATSSink:
     unconfirmed and never retried. Both mean the same thing -- no ack, and the event may have been
     persisted -- so the first can duplicate and the second can lose. What closes it is the
     ``Nats-Msg-Id`` deduplication item in ``architecture.md`` section 12, which makes a retry safe.
+    Since SPEC-102 the first also happens in a round that resends a batch's unattempted tail: a
+    resend round that publishes nothing is answered whole, like any such round, so a publish
+    that raised in it is resent by the next round and counted once per round it raised in. That
+    reaches a raise in either mode: for an expired JetStream ack wait it is the duplicating half
+    above, and for any other raise, a deterministic one such as the driver's ``MaxPayloadError``
+    included, it is an over-count of ``failed`` alone, which is 1.x's own per-call count
+    (``docs/invariants.md``, invariant 2).
 
     **This sink keeps its own closed state** rather than the closed guard the other transport
     sinks share (SPEC-076 FR-005). Its closed state is read from the event loop and from
@@ -791,7 +806,9 @@ class NATSSink:
         ``REJECTED`` refusal carrying SPEC-061's error: the sink has just closed itself, so no
         later round can pass — the one refusal marker used after events may have reached the
         transport (SPEC-074 FR-004's adjudication). Otherwise :func:`_verdict_of` maps the
-        publishes and :meth:`_register` registers 1.x's counts and lines.
+        publishes and :meth:`_register` registers 1.x's counts and lines, except that since
+        SPEC-102 the events a round's deadline left unattempted beside a published one are resent
+        by the run's later rounds, and their line is written only by the round that ends the run.
 
         Args:
           batch: The events this round is offered.
@@ -834,7 +851,11 @@ class NATSSink:
         return Verdict(outcomes=outcomes)
 
     def _register(self, published: _Published, unconfirmed: bool) -> None:
-        """Registers, ``ALWAYS``, the counts and lines 1.x's ``emit`` made for this round.
+        """Registers the counts and lines 1.x's ``emit`` made for this round, each under its rule.
+
+        ~~Registers, ``ALWAYS``, the counts and lines 1.x's ``emit`` made for this round.~~
+        **Superseded in part by SPEC-102 FR-002**: the unattempted remainder of a round where
+        something was published is registered ``LAST``, below.
 
         Nothing published: one ``failed_events`` count and one ``NATSSink publish, <Type>`` line
         per publish that raised, in order — 1.x counted each as it happened and then raised. The
@@ -852,7 +873,15 @@ class NATSSink:
         publish counted where it was abandoned, and an unanswered confirmation. The last two
         announce ``UNKNOWN`` events, so they are ``LAST`` rather than ``ALWAYS`` in a run that
         resends an ``UNKNOWN`` (``RunContext.resends_unknown``), announcing each event once per
-        run.
+        run. **SPEC-102 FR-002:** the unattempted remainder's ``NATSSink publish_timeout <t>s``
+        line is ``LAST``, not ``ALWAYS``, because :func:`_verdict_of` now answers those events
+        ``RETRYABLE`` and a later round resends them: it is written only when the run ends on this
+        round with them still unresolved, and the engine counts them then, once, through
+        ``unresolved``, since a run in which something was accepted or unknown settles. When the
+        run ends on a later round, that round names what it left; if the abandoned-publish latch
+        refused it, the engine's ``refused by NATSSink after others landed`` line names the
+        refused events instead. A detached round, a direct ``deliver`` outside any run, is its
+        own last, so it still writes the line at once.
 
         Args:
           published: The round's publishes.
@@ -894,7 +923,7 @@ class NATSSink:
         if unattempted:
             context.announce(
                 lambda: _diag.lost("event", unattempted, f"NATSSink publish_timeout {timeout}s"),
-                when=When.ALWAYS,
+                when=When.LAST,
             )
         unknown = When.LAST if context.resends_unknown(self) else When.ALWAYS
         abandoned = states.count("abandoned")
@@ -1642,11 +1671,17 @@ class NATSSink:
 
         Nothing is counted here (SPEC-074 FR-004): each event's fate is returned — published,
         raised (with the exception's type), abandoned or never attempted — and the round maps
-        them. An event whose publish **raised** is a driver failure; an event **never attempted**
-        because the budget expired is a loss only when something else in the round was published,
-        since otherwise the round is resent whole, as 1.x's raise sent the batch back to the
-        worker — the rule :meth:`~log_foundry.sinks.kafka.KafkaSink.flush` applies to its own
-        queued remainder.
+        them. An event whose publish **raised** is a driver failure; ~~an event **never
+        attempted** because the budget expired is a loss only when something else in the round
+        was published, since otherwise the round is resent whole, as 1.x's raise sent the batch
+        back to the worker — the rule :meth:`~log_foundry.sinks.kafka.KafkaSink.flush` applies to
+        its own queued remainder.~~ **Superseded by SPEC-102 FR-001:** an event **never
+        attempted** because the budget expired, or because a publish before it was abandoned, is
+        resendable whatever else the round did. When nothing was published the round is resent
+        whole, as 1.x's raise sent the batch back to the worker; when something was, the event is
+        ``RETRYABLE`` and the run's later rounds resend it, since it never reached the driver and
+        a resend cannot duplicate it. It is counted and announced only if it is still unresolved
+        when the run ends, by the round that ended it.
 
         Args:
           batch: The events to publish.

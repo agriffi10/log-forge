@@ -1222,7 +1222,15 @@ close it.
   budget caps does, inside the sink's own wait) raises and its batch can be retried by the
   worker when nothing else in it landed, while a publish the driver never returns from is
   abandoned and counted, never retried (`docs/invariants.md`, invariant 2's recorded
-  exception). The same header closes both.
+  exception). The same header closes both. Since SPEC-102 the resend of a raised publish reaches
+  further: a round that resends a batch's unattempted tail and publishes nothing is answered whole,
+  like any round that publishes nothing, so a publish that raised in it, in either mode, is resent
+  by the next round and counted in `failed` once per round it raised in. Before SPEC-102 that could
+  happen only in a batch's first round. For a JetStream ack wait that expired it is the duplicating
+  half of this item, since the server may have persisted the event; for any other raise, a
+  deterministic one such as nats-py's `MaxPayloadError` or `OutboundBufferLimitError` included, it
+  is an over-count of `failed` only, which the event ledger counts once (invariant 2's NATS
+  exception). The header closes the first; the second is 1.x's own per-call count.
 - **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
   A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
   it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
@@ -1532,27 +1540,31 @@ an item leaves this list when a spec closes it, not because the arc names it.
   current. **Closed by** popping the span and
   the scope whatever the guard lets through, in a spec of its own; that this closes it is
   unmeasured.
-- **A JetStream `NATSSink` whose `publish_timeout` is shorter than half the flush interval loses
-  the tail of a backlog batch** (SPEC-090 FR-004; invariant 2). Since SPEC-090 a batch under a
-  backlog grows to what the sink delivers in half a flush interval, 0.5 s at the default, and
-  `NATSSink` bounds a whole call by one `publish_timeout` with one JetStream ack per event, so a
-  budget shorter than that, or an ack time that grows more than twentyfold between one batch and
-  the next, is handed a batch it cannot finish: the events past the deadline are left unattempted
-  and counted lost and announced, never silent; with a steady ack and the default 10 s budget it
-  did not arise in the runs below. Before SPEC-090 the same loss needed ten spans' acks to outlast
-  the budget, so the window is wider now, not new.
+- ~~**A JetStream `NATSSink` whose `publish_timeout` is shorter than half the flush interval loses the tail of a backlog batch**~~ → **closed by SPEC-102**; struck and moved under *Resolved*.
+- **A JetStream `NATSSink` backlog batch whose delivery outlasts the worker's rounds still loses
+  its tail** (SPEC-102 FR-005; invariant 2). Since SPEC-102 an event a round's deadline left
+  unattempted beside a published one is resent by the worker's later rounds, so a backlog batch is
+  delivered as long as its delivery fits in `max_retries + 1` rounds, four at the default, of one
+  `publish_timeout` each. SPEC-090 sizes such a batch to about half a flush interval at the rate it
+  measured, 0.5 s at the default, so at a 0.2 s budget the rounds give 0.8 s against 0.5 s; a run
+  whose delivery slows by more than that margin between measuring and sending, as under CPU
+  starvation, loses the tail past its last round, counted in `failed` and named by that round's
+  `NATSSink publish_timeout` line, never silent.
   `docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 200 0.2` (a 2 ms
-  ack, 200 spans, a 0.2 s budget), at `be686953` on 3.13.1 and 3.12.12: 193 of 400 acked,
-  `health().sink.failed` 208, four `deliver` calls, the largest 210 and 206 events, two of them
-  cut at the 0.2 s budget, and `flush()` returned `reason='sink-flush'`; `failed` also counts one
-  event per cut batch as `unconfirmed`, whose ack may have landed, so the two can add past 400.
-  At `75e7bf1e`, before
-  SPEC-090, the same run acked all 400 in 20 calls of 20 events, the longest 0.049 to 0.076 s.
-  At the default budget, `spec090_nats_ack_backlog.py 0.002 200 10` at `be686953`: all 400 acked,
-  `failed` 0, the longest call 0.505 to 0.510 s. **Closed by** `NATSSink` answering an event its
-  deadline left unattempted as `RETRYABLE`, since it never reached the driver and a resend cannot
-  duplicate it, so the worker resends the tail rather than losing it. That is a change to a sink's
-  verdict, which SPEC-090 left to the sinks track.
+  ack, 200 spans, a 0.2 s budget), on 3.13.1: 19 of 20 runs at `b35ad63a` and `06b7ff41` acked 400
+  of 400, with `sink.failed` 2 to 4, equal in each to its `JetStream publish abandoned` lines, and no
+  `publish_timeout` line; the twentieth acked 361 in 10 `deliver` calls, with `sink.failed` 42,
+  three abandoned lines and one `lost 39 event(s); NATSSink publish_timeout 0.2s` line. The diff
+  review ran an instrumented copy 60 times at `1823bbe1` at load averages of 24 to 38: 58 acked 400.
+  One acked 382, with `sink.failed` 19, one abandoned line and `lost 13` and `lost 5`
+  `publish_timeout` lines, its rounds taking 0.237 to 0.394 s against the 0.2 s budget. The other
+  acked 399 with `sink.failed` 3, three abandoned lines and no `publish_timeout` line: its last
+  batch's abandoned publish was still pending when the process exited, counted and named as
+  unconfirmed. On 3.12.12 at `b35ad63a`, 3 of 3 acked 400, `failed` 2 or 3. At the default 10 s
+  budget the rounds give 40 s against 0.5 s, and the probe acked 400 of 400 with `failed` 0 on both
+  interpreters. **Closed by** the batch-size target, for a sink that bounds a whole call by one
+  budget, also respecting `(max_retries + 1) × publish_timeout`, or by the worker sizing a batch
+  from the sink's declared per-call budget; that either closes it is unmeasured.
 - **A dead sink whose target is already zero at the stop is handed the exit backlog in
   `batch_size` submissions, and its own per-batch lines are not aggregated** (SPEC-090 FR-001
   rule 4 and FR-003; invariants 2 and 11). FR-003 aggregates the worker's abandon and decline
@@ -1998,6 +2010,42 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 ### Resolved
 
+- ~~**A JetStream `NATSSink` whose `publish_timeout` is shorter than half the flush interval loses
+  the tail of a backlog batch**~~ (SPEC-090 FR-004; invariant 2). Since SPEC-090 a batch under a
+  backlog grows to what the sink delivers in half a flush interval, 0.5 s at the default, and
+  `NATSSink` bounds a whole call by one `publish_timeout` with one JetStream ack per event, so a
+  budget shorter than that, or an ack time that grows more than twentyfold between one batch and
+  the next, is handed a batch it cannot finish: the events past the deadline are left unattempted
+  and counted lost and announced, never silent; with a steady ack and the default 10 s budget it
+  did not arise in the runs below. Before SPEC-090 the same loss needed ten spans' acks to outlast
+  the budget, so the window is wider now, not new.
+  `docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 200 0.2` (a 2 ms
+  ack, 200 spans, a 0.2 s budget), at `be686953` on 3.13.1 and 3.12.12: 193 of 400 acked,
+  `health().sink.failed` 208, four `deliver` calls, the largest 210 and 206 events, two of them
+  cut at the 0.2 s budget, and `flush()` returned `reason='sink-flush'`; `failed` also counts one
+  event per cut batch as `unconfirmed`, whose ack may have landed, so the two can add past 400.
+  At `75e7bf1e`, before
+  SPEC-090, the same run acked all 400 in 20 calls of 20 events, the longest 0.049 to 0.076 s.
+  At the default budget, `spec090_nats_ack_backlog.py 0.002 200 10` at `be686953`: all 400 acked,
+  `failed` 0, the longest call 0.505 to 0.510 s. **Closed by** `NATSSink` answering an event its
+  deadline left unattempted as `RETRYABLE`, since it never reached the driver and a resend cannot
+  duplicate it, so the worker resends the tail rather than losing it. That is a change to a sink's
+  verdict, which SPEC-090 left to the sinks track.
+  → **closed by SPEC-102 FR-001 and FR-002**: an event a round's deadline left unattempted beside a
+  published one is `RETRYABLE` and not sink-counted, and its `publish_timeout` line is `LAST`, so
+  the worker's existing rounds resend the tail and count and name only what is still unresolved
+  when the run ends. `spec090_nats_ack_backlog.py 0.002 200 0.2` at `b35ad63a`, `00ec9029` and
+  `06b7ff41`: on 3.13.1, 19 of 20 runs acked 400 of 400, `sink.failed` 2 to 4, equal in each to
+  its `JetStream publish abandoned` lines, the unconfirmed publish invariant 2 records, and no `publish_timeout`
+  line; the twentieth acked 361, counted and named, and the diff review's 60 runs acked 400 in
+  58, each miss counted and named, which is the open item *A JetStream `NATSSink`
+  backlog batch whose delivery outlasts the worker's rounds still loses its tail*. On 3.12.12, 3 of
+  3 acked 400. At 10 s, 400 of 400 with `failed` 0 on both. A tail behind an abandoned publish that
+  is still pending when the rounds run out is still lost, counted once and named by `refused by
+  NATSSink after others landed`; on the exit drain the waits between rounds are zero, so such a
+  tail is lost there unless that publish finishes between two rounds. Decision:
+  `docs/decisions/sink-delivery/` (*An event a NATS round never handed to the driver is
+  resendable*).
 - ~~**The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
   that batch behind a promise of a count that never comes**~~ (2026-11-14 audit, finding 9; invariants
   2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
