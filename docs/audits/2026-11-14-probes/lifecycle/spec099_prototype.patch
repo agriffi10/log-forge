@@ -1,0 +1,1818 @@
+diff --git a/.github/workflows/model-soak.yml b/.github/workflows/model-soak.yml
+new file mode 100644
+index 0000000..92cb9ec
+--- /dev/null
++++ b/.github/workflows/model-soak.yml
+@@ -0,0 +1,74 @@
++name: Model soak
++
++# SPEC-099 prototype: the model test's close count under four callers, every night, on `main`.
++on:
++  schedule:
++    - cron: "37 9 * * *"
++  pull_request:
++    paths:
++      - ".github/workflows/model-soak.yml"
++      - ".github/actions/install-poetry/**"
++      - "scripts/model-soak-report.py"
++      - "tests/soak_known.py"
++      - "tests/soak_ceilings.py"
++      - "tests/model_oracles.py"
++      - "tests/test_invariants_model.py"
++      - "tests/conftest.py"
++      - "pyproject.toml"
++      - "poetry.lock"
++  workflow_dispatch:
++    inputs:
++      seeds:
++        description: "LOG_FOUNDRY_MODEL_SEEDS for this run, at most 10,000 seeds; empty for this run's window"
++        required: false
++        default: ""
++
++permissions:
++  contents: read
++
++concurrency:
++  group: model-soak-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
++  cancel-in-progress: true
++
++jobs:
++  soak:
++    name: soak the close count
++    runs-on: ubuntu-latest
++    timeout-minutes: 30
++    steps:
++      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
++        with:
++          persist-credentials: false
++
++      - name: Set up Python
++        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
++        with:
++          python-version: "3.12"
++
++      - name: Install Poetry
++        uses: ./.github/actions/install-poetry
++
++      - name: Install dependencies
++        run: poetry install --with dev
++
++      - name: Choose the seeds
++        id: seeds
++        env:
++          ASKED: ${{ inputs.seeds }}
++          EVENT: ${{ github.event_name }}
++          RUN_NUMBER: ${{ github.run_number }}
++        run: |
++          seeds="$(poetry run python scripts/model-soak-report.py seeds --event "$EVENT" --asked "$ASKED" --run-number "$RUN_NUMBER")"
++          echo "seeds=$seeds" >> "$GITHUB_OUTPUT"
++
++      - name: Soak
++        env:
++          LOG_FOUNDRY_MODEL_SOAK: "1"
++          LOG_FOUNDRY_MODEL_SEEDS: ${{ steps.seeds.outputs.seeds }}
++        run: poetry run pytest tests/test_invariants_model.py -k "test_soak_the_close_count_under_concurrency or test_the_soak_is_wired or test_the_soak_records_the_worker_path or test_a_name_the_soak_cannot_wrap_fails_it" -p no:cacheprovider -rfEx --junitxml=soak.xml
++
++      - name: Report
++        if: always()
++        env:
++          SEEDS: ${{ steps.seeds.outputs.seeds }}
++        run: poetry run python scripts/model-soak-report.py report soak.xml "$SEEDS" --summary "$GITHUB_STEP_SUMMARY"
+diff --git a/scripts/model-soak-report.py b/scripts/model-soak-report.py
+new file mode 100644
+index 0000000..719b7cb
+--- /dev/null
++++ b/scripts/model-soak-report.py
+@@ -0,0 +1,181 @@
++"""The nightly model soak's seeds and its report (SPEC-099 prototype)."""
++
++from __future__ import annotations
++
++import argparse
++import pathlib
++import sys
++import xml.etree.ElementTree as ET
++from collections import Counter
++
++sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tests"))
++
++import soak_known  # noqa: E402
++from soak_ceilings import ceiling_of  # noqa: E402
++from model_oracles import FORMS_SOAKED, parse_seeds, rerun_command  # noqa: E402
++
++WINDOW = 5000
++"""Seeds one night soaks: 15,000 items, about 280 s on the 4-CPU stand-in (SPEC-099 Evidence)."""
++
++WINDOWS = 30
++"""Windows the nights rotate through before seed 0 comes round again."""
++
++MAX_SEEDS = 10_000
++"""The most seeds a dispatch may ask for.
++
++30 minutes of job less 180 s of install and one hung item's 600 s guard leaves 1,020 s; 10,000
++seeds is 561 s at the stand-in's 56 ms a seed, and 842 s at half again that, so it fits.
++"""
++
++PULL_REQUEST_SEEDS = "0-99"
++"""What a pull request touching the soak runs."""
++
++SOAK = "test_soak_the_close_count_under_concurrency["
++WIRING = (
++    "test_the_soak_is_wired[emit]",
++    "test_the_soak_is_wired[deliver]",
++    "test_the_soak_is_wired[http]",
++    "test_the_soak_records_the_worker_path",
++    "test_a_name_the_soak_cannot_wrap_fails_it[_lifecycle._CloseRegistry.arm]",
++    "test_a_name_the_soak_cannot_wrap_fails_it[_lifecycle._CloseRegistry.take]",
++    "test_a_name_the_soak_cannot_wrap_fails_it[log_foundry.api._note_orphan_emit]",
++    "test_a_name_the_soak_cannot_wrap_fails_it[_lifecycle._get_worker]",
++)
++KNOWN_PREFIX = "known soak finding:"
++
++
++def normalise(seeds: tuple[int, ...]) -> str:
++    """Returns seeds as comma-separated ranges, digits, commas and hyphens only."""
++    parts: list[str] = []
++    start = prev = None
++    for seed in seeds:
++        if prev is not None and seed == prev + 1:
++            prev = seed
++            continue
++        if start is not None:
++            parts.append(str(start) if start == prev else f"{start}-{prev}")
++        start = prev = seed
++    if start is not None:
++        parts.append(str(start) if start == prev else f"{start}-{prev}")
++    return ",".join(parts)
++
++
++def seeds(event: str, asked: str, run_number: int) -> str:
++    """Returns the seeds a run soaks: a dispatch's, a pull request's, or the run number's window."""
++    if asked:
++        written = 0
++        for item in asked.split(","):
++            low, _, high = item.strip().partition("-")
++            if (
++                low.isascii()
++                and low.isdigit()
++                and (not high or (high.isascii() and high.isdigit()))
++            ):
++                written += max(int(high or low) - int(low) + 1, 0)
++        if written > MAX_SEEDS:
++            raise ValueError(f"seeds={asked!r} writes {written} seeds; at most {MAX_SEEDS}")
++        chosen = parse_seeds(asked)
++        return normalise(chosen)
++    if event == "pull_request":
++        return PULL_REQUEST_SEEDS
++    start = (run_number % WINDOWS) * WINDOW
++    return f"{start}-{start + WINDOW - 1}"
++
++
++def report(xml: pathlib.Path, seeds_value: str) -> tuple[str, int]:
++    """Returns the run's summary in Markdown and the exit status the floor and ceilings set."""
++    expected = len(parse_seeds(seeds_value)) * len(FORMS_SOAKED)
++    soaked, passed, unexplained = 0, 0, []
++    known: Counter[str] = Counter()
++    new: list[tuple[str, str]] = []
++    wiring: dict[str, bool] = {}
++    for case in ET.parse(xml).getroot().iter("testcase"):
++        name = case.get("name", "")
++        failure = case.find("failure")
++        if failure is None:
++            failure = case.find("error")
++        skipped = case.find("skipped")
++        if name in WIRING:
++            wiring[name] = failure is None and skipped is None
++        if not name.startswith(SOAK):
++            continue
++        soaked += 1
++        props = {p.get("name"): p.get("value") for p in case.iter("property")}
++        if failure is not None:
++            first = (failure.get("message") or "").splitlines()[:1]
++            seed = int(name.rsplit("seed", 1)[1].rstrip("]"))
++            node = f"tests/test_invariants_model.py::{name}"
++            new.append((name, " ".join(first) + f" -- {rerun_command(node, seed, soak=True)}"))
++        elif skipped is not None:
++            message = skipped.get("message") or ""
++            shapes = [s for s in (props.get("soak_known") or "").split(",") if s]
++            if (
++                skipped.get("type") == "pytest.xfail"
++                and message.startswith(KNOWN_PREFIX)
++                and shapes
++            ):
++                known.update(shapes)
++            else:
++                unexplained.append(name)
++        else:
++            passed += 1
++    lines = [f"## Model soak: seeds {seeds_value}", ""]
++    lines.append(f"- soak items run: {soaked} of {expected}")
++    lines.append(f"- clean: {passed}; known: {sum(known.values())}; new: {len(new)}")
++    lines.append(f"- wiring items passed: {sum(wiring.values())} of {len(WIRING)}")
++    status = 0
++    rows = {k.name: k for k in soak_known.KNOWN}
++    if known:
++        lines += ["", "### Known (each an open item of `docs/architecture.md` §12)", ""]
++        for shape, count in known.most_common():
++            row = rows.get(shape)
++            item = row.item if row else "(no such row)"
++            lines.append(f"- {count} x {shape}, ceiling {ceiling_of(shape)}: {item}")
++            if row is None or count > ceiling_of(shape):
++                lines.append(f"**Ceiling broken:** {shape} held {count} items.")
++                status = 1
++    if new:
++        lines += ["", "### New", ""]
++        lines += [f"- `{name}`: {text}" for name, text in new]
++    if soaked != expected:
++        lines += ["", f"**Floor broken:** {soaked} soak items ran where {expected} were asked for."]
++        status = 1
++    if unexplained:
++        lines += [
++            "",
++            f"**Floor broken:** {len(unexplained)} soak items were skipped or marked "
++            f"expected-to-fail without a known shape: {unexplained[:5]}",
++        ]
++        status = 1
++    if set(wiring) != set(WIRING) or not all(wiring.values()):
++        lines += ["", "**Wiring:** the soak's wiring items did not all run and pass."]
++        status = 1
++    return "\n".join(lines) + "\n", status
++
++
++def main() -> int:
++    """Runs one subcommand."""
++    parser = argparse.ArgumentParser()
++    sub = parser.add_subparsers(dest="command", required=True)
++    pick = sub.add_parser("seeds")
++    pick.add_argument("--event", default="")
++    pick.add_argument("--asked", default="")
++    pick.add_argument("--run-number", type=int, required=True)
++    rep = sub.add_parser("report")
++    rep.add_argument("xml", type=pathlib.Path)
++    rep.add_argument("seeds")
++    rep.add_argument("--summary", type=pathlib.Path)
++    args = parser.parse_args()
++    if args.command == "seeds":
++        print(seeds(args.event, args.asked, args.run_number))
++        return 0
++    text, status = report(args.xml, args.seeds)
++    print(text)
++    if args.summary is not None:
++        with args.summary.open("a", encoding="utf-8") as out:
++            out.write(text)
++    return status
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tests/model_oracles.py b/tests/model_oracles.py
+index 1e199da..e454d91 100644
+--- a/tests/model_oracles.py
++++ b/tests/model_oracles.py
+@@ -715,6 +715,9 @@ def _worst(reports: Iterable[object], prop: str) -> tuple[float, str] | None:
+ GATE_MARGIN = "model_gate_margin"
+ """The property each gating run of ``tests/test_invariants_model.py`` records its margin under."""
+ 
++FORMS_SOAKED = ("emit", "deliver", "http")
++"""The passive forms the concurrent half and its soak run, one item each per seed."""
++
+ SEEDS_VARIABLE = "LOG_FOUNDRY_MODEL_SEEDS"
+ """The environment variable that names the seeds both halves of the model run."""
+ 
+@@ -752,14 +755,33 @@ class Arm:
+     Attributes:
+       by_writer: Whether the arm was recorded on a thread inside ``api._note_orphan_emit``, the
+         orphan path's call that arms a sink for the write it is about to make.
++      by: The name of the library function that called ``arm``, or empty when not recorded.
+     """
+ 
+     by_writer: bool
++    by: str = ""
+ 
+ 
+ @dataclass(frozen=True)
+ class Take:
+-    """The library took a sink out of its owed record to close it (``_CloseRegistry.take``)."""
++    """The library took a sink out of its owed record to close it (``_CloseRegistry.take``).
++
++    Attributes:
++      by: The name of the library function that called ``take``, or empty when not recorded.
++    """
++
++    by: str = ""
++
++
++@dataclass(frozen=True)
++class Note:
++    """An orphan log entered ``api._note_orphan_emit`` for a sink, before its owed check.
++
++    Attributes:
++      thread: The name of the thread that made the log.
++    """
++
++    thread: str
+ 
+ 
+ @dataclass(frozen=True)
+@@ -788,7 +810,7 @@ class Close:
+     at: float
+ 
+ 
+-SinkEvent = Arm | Take | Write | Close
++SinkEvent = Arm | Take | Write | Close | Note
+ 
+ 
+ def take_of_each_close(events: Sequence[SinkEvent]) -> list[int | None]:
+@@ -854,14 +876,42 @@ def check_unowed_repeat(events: Sequence[SinkEvent]) -> None:
+             continue
+         if first_take is not None and second_take is not None:
+             low, high = sorted((first_take, second_take))
+-            between = events[low + 1 : high]
+-            if any(isinstance(event, Arm) and event.by_writer for event in between):
++            if owed_between(events[low + 1 : high]):
+                 continue
+         keys.append(f"repeat@{second.count}")
+     if keys:
+         raise CloseBroken(*keys, detail=f"{list(events)}")
+ 
+ 
++def owed_between(between: Sequence[SinkEvent]) -> bool:
++    """Whether a stretch between two closes' takes holds what owes the sink its second close.
++
++    SPEC-045 owes a second close to a sink written after its first close was taken. Two records
++    say so: a writer's arm, and an orphan log that entered ``_note_orphan_emit`` after the first
++    take and wrote before the second, which makes no arm of its own when another arm already put
++    the sink back in the record. A write whose log entered before the first take is the race of
++    the orphan-log item in ``docs/architecture.md`` §12, and owes nothing here (SPEC-099).
++
++    Args:
++      between: One sink's events strictly between the two takes, in the order recorded.
++
++    Returns:
++      Whether the second close is owed.
++
++    Raises:
++      None.
++    """
++    entered: set[str] = set()
++    for event in between:
++        if isinstance(event, Arm) and event.by_writer:
++            return True
++        if isinstance(event, Note):
++            entered.add(event.thread)
++        elif isinstance(event, Write) and event.thread in entered:
++            return True
++    return False
++
++
+ def parse_seeds(value: str) -> tuple[int, ...]:
+     """Reads :data:`SEEDS_VARIABLE`: a comma-separated list of integers and inclusive ``a-b`` ranges.
+ 
+diff --git a/tests/soak_ceilings.py b/tests/soak_ceilings.py
+new file mode 100644
+index 0000000..1b66f08
+--- /dev/null
++++ b/tests/soak_ceilings.py
+@@ -0,0 +1,20 @@
++"""SPEC-099's nightly ceilings for the known soak shapes, kept apart from the clearing files."""
++
++UNMEASURED_CEILING = 3
++"""A row with no measured ceiling: its first nights may hold three such items before the run is red.
++
++A clearing pull request adds a row and cannot touch this file, so a new shape has no rate yet.
++Three lets the night that filed it recur at a similar count; anything more needs a reviewed PR
++that measures it and writes its ceiling below.
++"""
++
++CEILINGS: dict[str, int] = {
++    "swap-arms-a-sink-a-shutdown-took": 20,  # measured at eda19f32: most 8 a night; x2 under, x3 over
++    "orphan-write-after-close": 25,  # measured at eda19f32: most 10 a night; x2 under, x3 over
++}
++"""Each measured ceiling, with its derivation and the commit it was measured at beside it."""
++
++
++def ceiling_of(name: str) -> int:
++    """Returns a known row's nightly ceiling."""
++    return CEILINGS.get(name, UNMEASURED_CEILING)
+diff --git a/tests/soak_known.py b/tests/soak_known.py
+new file mode 100644
+index 0000000..a59e99a
+--- /dev/null
++++ b/tests/soak_known.py
+@@ -0,0 +1,227 @@
++"""SPEC-099's known soak findings: each red soak shape an open item of ``architecture.md`` §12 records."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TYPE_CHECKING
++
++from model_oracles import (
++    Arm,
++    CloseBroken,
++    Closes,
++    Note,
++    SinkEvent,
++    Take,
++    Write,
++    check_late_write,
++    check_unowed_repeat,
++    owed_between,
++    take_of_each_close,
++)
++
++if TYPE_CHECKING:
++    from collections.abc import Sequence
++
++
++@dataclass(frozen=True)
++class Known:
++    """A soak shape an open item records, so a red soak item of that shape alone is expected.
++
++    Attributes:
++      name: A short name, printed in the run's summary.
++      item: The bold lead of a bullet under ``### Open`` in ``docs/architecture.md`` §12.
++      kind: The signature it explains: ``"repeat"`` or ``"late-write"``.
++    """
++
++    name: str
++    item: str
++    kind: str
++
++
++SWAP_ARM = Known(
++    "swap-arms-a-sink-a-shutdown-took",
++    "A sink a swap installs is closed twice with nothing written between when a concurrent "
++    "`shutdown()` took it before the swap decided",
++    "repeat",
++)
++ORPHAN_LATE_WRITE = Known(
++    "orphan-write-after-close",
++    "An orphan log that passed its owed check before a `shutdown()` took its sink writes after "
++    "the close, and the sink is owed nothing",
++    "late-write",
++)
++KNOWN: tuple[Known, ...] = (SWAP_ARM, ORPHAN_LATE_WRITE)
++"""Every known shape; a row whose item has left ``### Open`` fails the default suite."""
++
++FILED_NIGHTS: dict[str, str] = {}
++"""Each scheduled night a clearing pull request filed: ``"<run id>-<attempt>"`` to the §12 lead.
++
++One entry per line, four spaces, the quoted key, a colon, the quoted lead and a comma: the PR
++queue reads this file on ``origin/main`` as text, and a night is cleared only by its own entry.
++"""
++
++
++def unowed_pairs(events: Sequence[SinkEvent]) -> list[tuple[int | None, int | None]]:
++    """Returns the take indices of each pair of closes the unowed-repeat rule reports.
++
++    Args:
++      events: One sink's events, in the order recorded.
++
++    Returns:
++      ``(first take, second take)`` for each consecutive pair of closes at one count with nothing
++      between their takes that owes the second.
++
++    Raises:
++      None.
++    """
++    closes = [event for event in events if hasattr(event, "count")]
++    owners = take_of_each_close(events)
++    pairs: list[tuple[int | None, int | None]] = []
++    for first, second, a, b in zip(closes, closes[1:], owners, owners[1:], strict=False):
++        if first.count != second.count:  # type: ignore[attr-defined]
++            continue
++        if a is not None and b is not None:
++            low, high = sorted((a, b))
++            if owed_between(events[low + 1 : high]):
++                continue
++        pairs.append((a, b))
++    return pairs
++
++
++def is_swap_arm(events: Sequence[SinkEvent]) -> bool:
++    """Whether every unowed repeat is §12's swap arm after a ``shutdown()``'s take.
++
++    The first close's take is ``_close_owed``'s, a ``shutdown()`` or the exit drain, and the
++    only owing record between the two takes is ``_swap_sink`` arming the sink it installs.
++
++    Args:
++      events: One sink's events, in the order recorded.
++
++    Returns:
++      Whether the sink's every unowed repeat has that shape.
++
++    Raises:
++      None.
++    """
++    pairs = unowed_pairs(events)
++    if not pairs:
++        return False
++    for a, b in pairs:
++        if a is None or b is None:
++            return False
++        first = events[min(a, b)]
++        if not isinstance(first, Take) or first.by != "_close_owed":
++            return False
++        between = events[min(a, b) + 1 : max(a, b)]
++        arms = [e for e in between if isinstance(e, Arm) and not e.by_writer]
++        if not arms or any(e.by != "_swap_sink" for e in arms):
++            return False
++    return True
++
++
++def is_orphan_late_write(events: Sequence[SinkEvent], closes: Closes) -> bool:
++    """Whether every write after the sink's last close returned is §12's orphan late write.
++
++    Each such write is an orphan log's, on a caller's thread, whose ``_note_orphan_emit`` entry
++    came before the sink's last take, and nothing armed the sink after that take.
++
++    Args:
++      events: One sink's events, in the order recorded.
++      closes: The sink's close record.
++
++    Returns:
++      Whether the late writes have that shape.
++
++    Raises:
++      None.
++    """
++    if not closes.at_return or closes.writes <= closes.at_return[-1]:
++        return False
++    takes = [i for i, e in enumerate(events) if isinstance(e, Take)]
++    writes = [i for i, e in enumerate(events) if isinstance(e, Write)]
++    late = closes.writes - closes.at_return[-1]
++    if not takes or len(writes) < late:
++        return False
++    last_take = takes[-1]
++    if any(isinstance(e, Arm) for e in events[last_take + 1 :]):
++        return False
++    for index in writes[-late:]:
++        thread = events[index].thread  # type: ignore[union-attr]
++        notes = [
++            j for j in range(index) if isinstance(events[j], Note) and events[j].thread == thread
++        ]  # type: ignore[union-attr]
++        if thread.startswith("log-foundry-") or not notes or notes[-1] > last_take:
++            return False
++    return True
++
++
++def explain(signatures: Sequence[str], events: Sequence[SinkEvent], closes: Closes) -> list[Known]:
++    """Returns the known shape behind each signature of one sink, or ``[]`` if any is new.
++
++    Args:
++      signatures: The sink's ``CloseBroken:<kind>@<count>`` signatures.
++      events: Its events.
++      closes: Its close record.
++
++    Returns:
++      The shapes, one per kind, or an empty list when a signature has none.
++
++    Raises:
++      None.
++    """
++    found: list[Known] = []
++    for signature in signatures:
++        kind = signature.removeprefix("CloseBroken:").split("@", 1)[0]
++        if kind == "repeat" and is_swap_arm(events):
++            shape = SWAP_ARM
++        elif kind == "late-write" and is_orphan_late_write(events, closes):
++            shape = ORPHAN_LATE_WRITE
++        else:
++            return []
++        if shape not in found:
++            found.append(shape)
++    return found
++
++
++def reason(known: Sequence[Known]) -> str:
++    """Returns the one-line reason a known red soak item reports.
++
++    Args:
++      known: The shapes.
++
++    Returns:
++      ``known soak finding: <name> (§12: <item>); ...``.
++
++    Raises:
++      None.
++    """
++    return "known soak finding: " + "; ".join(f"{k.name} (§12: {k.item})" for k in known)
++
++
++def explain_run(sinks: Sequence[tuple[Sequence[SinkEvent], Closes]]) -> list[Known]:
++    """Returns the known shapes behind a red soak run, or ``[]`` if any sink's finding is new.
++
++    Args:
++      sinks: Each sink's events and close record.
++
++    Returns:
++      The shapes, or an empty list when the run has no finding or one with no known shape.
++
++    Raises:
++      None.
++    """
++    found: list[Known] = []
++    for events, closes in sinks:
++        signatures: list[str] = []
++        for check, arg in ((check_unowed_repeat, events), (check_late_write, closes)):
++            try:
++                check(arg)  # type: ignore[operator]
++            except CloseBroken as exc:
++                signatures.extend(exc.signatures)
++        if not signatures:
++            continue
++        shapes = explain(signatures, events, closes)
++        if not shapes:
++            return []
++        found.extend(shape for shape in shapes if shape not in found)
++    return found
+diff --git a/tests/test_invariants_model.py b/tests/test_invariants_model.py
+index 28a328e..1f5734f 100644
+--- a/tests/test_invariants_model.py
++++ b/tests/test_invariants_model.py
+@@ -104,6 +104,7 @@ import os
+ import pathlib
+ import random
+ import re
++import sys
+ import threading
+ import time
+ import weakref
+@@ -113,6 +114,7 @@ from typing import TYPE_CHECKING, Any
+ import pytest
+ 
+ import log_foundry
++import soak_known
+ from conftest import run_concurrently
+ from log_foundry import _lifecycle
+ from log_foundry._lifecycle import State
+@@ -122,6 +124,7 @@ from log_foundry.sinks.http import HTTPSink
+ from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+ from model_oracles import (
+     EPSILON,
++    FORMS_SOAKED,
+     GATE_MARGIN,
+     Arm,
+     BoundExceeded,
+@@ -129,6 +132,7 @@ from model_oracles import (
+     Close,
+     CloseBroken,
+     Closes,
++    Note,
+     SinkEvent,
+     Stalled,
+     Take,
+@@ -148,7 +152,7 @@ from test_sinks_http import FakeResponse
+ if TYPE_CHECKING:
+     from collections.abc import Callable, Iterator
+ 
+-FORMS = ("emit", "deliver", "http")
++FORMS = FORMS_SOAKED
+ DEFAULT_SEEDS = range(16)
+ """The concurrent half's gating seeds; only this range gates (SPEC-086 FR-002)."""
+ 
+@@ -989,14 +993,15 @@ def _install(monkeypatch: pytest.MonkeyPatch, soak: _SoakRecord) -> None:
+     real_build = _lifecycle._get_worker
+ 
+     def arm(registry: Any, sink: Any) -> None:
+-        soak.add(sink, Arm(by_writer=soak.by_writer(sink)))
++        soak.add(sink, Arm(by_writer=soak.by_writer(sink), by=sys._getframe(1).f_code.co_name))
+         real_arm(registry, sink)
+ 
+     def take(registry: Any, sink: Any, rule: Any) -> Any:
+-        soak.add(sink, Take())
++        soak.add(sink, Take(by=sys._getframe(1).f_code.co_name))
+         return real_take(registry, sink, rule)
+ 
+     def note(sink: Any) -> None:
++        soak.add(sink, Note(threading.current_thread().name))
+         soak.entering(sink)
+         try:
+             real_note(sink)
+@@ -1076,11 +1081,14 @@ def _sink_record(index: int, keys: list[str], events: list[SinkEvent], closes: C
+             seen += 1
+             marks = []
+         elif isinstance(event, Arm):
+-            marks.append("arm(writer)" if event.by_writer else "arm(change)")
++            marks.append(f"arm({'writer' if event.by_writer else 'change'}:{event.by})")
+         elif isinstance(event, Take):
+-            marks.append("take")
++            marks.append(f"take({event.by})")
+         elif isinstance(event, Write):
+             marks.append(f"write({event.thread})")
++        elif isinstance(event, Note):
++            marks.append(f"note({event.thread})")
++    lines.append(f"  after the last close: {' '.join(marks) or 'nothing'}")
+     return "\n".join(lines)
+ 
+ 
+@@ -1237,8 +1245,14 @@ if SOAK:
+         record_property("model_tree", log_foundry.__file__)
+         soak = _SoakRecord()
+         with _rerun_on_failure(request, seed, concurrent=True, soak=True):
+-            _interleaving(seed, form, monkeypatch, capfd, soak)
++            ledger, _ = _interleaving(seed, form, monkeypatch, capfd, soak)
+             if soak.report:
++                known = soak_known.explain_run(
++                    [(soak.events_of(sink), sink.record.closes()) for sink in ledger.sinks]
++                )
++                if known:
++                    record_property("soak_known", ",".join(k.name for k in known))
++                    pytest.xfail(f"{soak_known.reason(known)}\n{soak.report}")
+                 raise AssertionError(soak.report)
+ 
+ 
+@@ -1293,7 +1307,8 @@ def test_the_soak_is_wired(
+     log_foundry.configure(service="model", sink=fresh)
+     log_foundry.info("coda")
+     assert soak.events_of(fresh) == [
+-        Arm(by_writer=True),
++        Note(threading.current_thread().name),
++        Arm(by_writer=True, by="_arm_and_hand"),
+         Write(threading.current_thread().name),
+     ], soak.events_of(fresh)
+ 
+@@ -1315,7 +1330,7 @@ def test_the_soak_records_the_worker_path(monkeypatch: pytest.MonkeyPatch) -> No
+     assert soak.builds > 0, "the traced call never entered the worker build's wrapper"
+     assert log_foundry.flush(timeout=FLUSH_TIMEOUT), "the flush did not settle"
+     events = soak.events_of(sink)
+-    assert events[:1] == [Arm(by_writer=True)], f"the worker build's arm: {events}"
++    assert events[:1] == [Arm(by_writer=True, by="_get_worker")], f"the worker build's arm: {events}"
+     assert Write("log-foundry-worker") in events, f"no write on the drain thread: {events}"
+     log_foundry.shutdown(timeout=SHUTDOWN_TIMEOUT)
+     assert isinstance(soak.events_of(sink)[-1], Close), soak.events_of(sink)
+diff --git a/tests/test_model_oracles.py b/tests/test_model_oracles.py
+index f9db626..8b9543e 100644
+--- a/tests/test_model_oracles.py
++++ b/tests/test_model_oracles.py
+@@ -57,6 +57,7 @@ from model_oracles import (
+     Interval,
+     Ledger,
+     ModelFailure,
++    Note,
+     Take,
+     Wait,
+     Write,
+@@ -1434,6 +1435,8 @@ def _close(count: int, thread: str = "log-foundry-sink-close") -> Close:
+ 
+ _WRITE = Write("Thread-1 (runner)")
+ _BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
++_NOTE, _NOTE2, _WRITE2 = Note("Thread-1 (runner)"), Note("Thread-2 (runner)"), Write("Thread-2 (runner)")
++_BY_SWAP = Arm(by_writer=False, by="_swap_sink")
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -1473,6 +1476,36 @@ _BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
+             [Take(), _close(0), Take(), _close(0), _WRITE, Take(), _close(1), Take(), _close(1)],
+             frozenset({"CloseBroken:repeat@0", "CloseBroken:repeat@1"}),
+         ),
++        (
++            [_NOTE, _BY_WRITER, _WRITE, Take("_close_owed"), _BY_SWAP, _NOTE2, _WRITE2, _close(2),
++             Take("_close_owed"), _close(2)],
++            frozenset(),
++        ),
++        (
++            [_NOTE, _BY_WRITER, Take("_close_owed"), _WRITE, _BY_SWAP, _close(1),
++             Take("_close_owed"), _close(1)],
++            frozenset({"CloseBroken:repeat@1"}),
++        ),
++        (
++            [_NOTE, _BY_WRITER, _WRITE, Take("_close_owed"), _close(1), _BY_SWAP,
++             Take("_close_owed"), _close(1)],
++            frozenset({"CloseBroken:repeat@1"}),
++        ),
++        (
++            [_NOTE, _BY_WRITER, _WRITE, Take("_close_owed"), _close(1), _BY_SWAP, _NOTE2,
++             Take("_close_owed"), _close(1)],
++            frozenset({"CloseBroken:repeat@1"}),
++        ),
++        (
++            [_NOTE, _BY_WRITER, Take("_close_owed"), _NOTE2, _WRITE, _BY_SWAP, _close(1),
++             Take("_swap_sink"), _close(1)],
++            frozenset({"CloseBroken:repeat@1"}),
++        ),
++        (
++            [_NOTE, _BY_WRITER, Take("_close_owed"), _WRITE, _NOTE, _BY_SWAP, _close(1),
++             Take("_swap_sink"), _close(1)],
++            frozenset({"CloseBroken:repeat@1"}),
++        ),
+     ],
+     ids=[
+         "the-traced-rearm",
+@@ -1485,6 +1518,12 @@ _BY_WRITER, _BY_CHANGE = Arm(by_writer=True), Arm(by_writer=False)
+         "a-writers-arm-before-the-first-take-excuses-nothing",
+         "a-close-with-no-take-is-not-excused-by-a-wider-window",
+         "two-counts-each-repeated",
++        "shape-b-a-log-entering-after-the-take-finds-the-sink-owed",
++        "the-boundary-a-log-that-entered-before-the-take-writes-after-it",
++        "shape-a-the-swap-arms-after-a-shutdowns-take",
++        "a-log-entering-between-the-takes-that-writes-after-the-second",
++        "the-boundary-beside-another-threads-entry",
++        "the-boundary-then-the-same-threads-next-entry",
+     ],
+ )
+ def test_the_unowed_repeat_rule(events: list[object], expected: frozenset[str]) -> None:
+diff --git a/tests/test_model_soak_workflow.py b/tests/test_model_soak_workflow.py
+new file mode 100644
+index 0000000..d2868f4
+--- /dev/null
++++ b/tests/test_model_soak_workflow.py
+@@ -0,0 +1,248 @@
++"""SPEC-099 prototype: the nightly soak's workflow, its seeds and its report cannot rot unseen."""
++
++from __future__ import annotations
++
++import importlib.util
++import os
++import pathlib
++import re
++import subprocess
++import sys
++import tracemalloc
++
++import pytest
++
++import soak_ceilings
++import soak_known
++from test_model_oracles import open_item_leads
++
++_ROOT = pathlib.Path(__file__).resolve().parent.parent
++_WORKFLOW = _ROOT / ".github" / "workflows" / "model-soak.yml"
++_SPEC = importlib.util.spec_from_file_location(
++    "model_soak_report", _ROOT / "scripts" / "model-soak-report.py"
++)
++assert _SPEC and _SPEC.loader
++report_mod = importlib.util.module_from_spec(_SPEC)
++_SPEC.loader.exec_module(report_mod)
++
++
++def test_every_known_shape_names_an_open_item() -> None:
++    """A known shape whose §12 item has left ``### Open`` fails here, so its row goes with it."""
++    leads = open_item_leads()
++    missing = [k.name for k in soak_known.KNOWN if " ".join(k.item.split()) not in leads]
++    assert not missing, missing
++
++
++def _text() -> str:
++    return _WORKFLOW.read_text(encoding="utf-8")
++
++
++def test_the_workflow_runs_nightly_and_switches_the_soak_on() -> None:
++    """The schedule, the switch, the run number and the report step are where the soak needs them."""
++    text = _text()
++    assert re.search(r'^  schedule:\n    - cron: "37 9 \* \* \*"\n', text, re.MULTILINE), "cron"
++    assert "\n  workflow_dispatch:\n" in text, "dispatch"
++    assert re.search(r'^          LOG_FOUNDRY_MODEL_SOAK: "1"$', text, re.MULTILINE), "switch"
++    assert "RUN_NUMBER: ${{ github.run_number }}" in text, "run number"
++    assert "ASKED: ${{ inputs.seeds }}" in text and "run: |" in text, "dispatch input via env"
++    expressions = [line for line in text.splitlines() if "${{" in line]
++    allowed = re.compile(r"^(  group: model-soak-\$\{\{.*|          [A-Z_]+: \$\{\{ [\w.]+ \}\})$")
++    assert all(allowed.match(line) for line in expressions), "an expression outside env"
++    assert re.search(r"if: always\(\)\n.*\n.*\n.*report soak\.xml \"\$SEEDS\" --summary", text), (
++        "report"
++    )
++    assert "group: model-soak-${{" in text, "concurrency prefix"
++
++
++def test_the_workflow_is_hardened() -> None:
++    """Read-only, no persisted token, every action pinned with its version comment, the floor Python."""
++    text = _text()
++    assert re.findall(r"^permissions:\n  contents: read\n", text, re.MULTILINE), "permissions"
++    assert "write" not in text.split("\njobs:", 1)[0].split("permissions:", 1)[1], "write scope"
++    assert "persist-credentials: false" in text, "token"
++    for uses in re.findall(r"uses: (\S+)(.*)", text):
++        ref, comment = uses
++        assert ref.startswith("./") or re.fullmatch(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}", ref), ref
++        assert ref.startswith("./") or re.fullmatch(r" # v\d+\.\d+\.\d+", comment), comment
++    assert 'python-version: "3.12"' in text, "python"
++
++
++def test_the_workflows_selection_collects_the_soak_and_its_wiring() -> None:
++    """The workflow's own pytest arguments select every soak item and exactly the wiring set."""
++    command = re.search(r'run: poetry run pytest (tests/\S+) -k "([^"]+)"', _text())
++    assert command, "no pytest step"
++    env = dict(os.environ, LOG_FOUNDRY_MODEL_SOAK="1", LOG_FOUNDRY_MODEL_SEEDS="0-1")
++    out = subprocess.run(  # noqa: S603
++        [
++            sys.executable,
++            "-B",
++            "-m",
++            "pytest",
++            command.group(1),
++            "-k",
++            command.group(2),
++            "--collect-only",
++            "-q",
++            "-n",
++            "0",
++            "-p",
++            "no:cacheprovider",
++        ],
++        cwd=_ROOT,
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=120,
++        check=False,
++    ).stdout
++    ids = [line.split("::", 1)[1] for line in out.splitlines() if "::" in line]
++    soak = [i for i in ids if i.startswith(report_mod.SOAK)]
++    assert len(soak) == 6, ids
++    assert sorted(set(ids) - set(soak)) == sorted(report_mod.WIRING), ids
++
++
++def test_the_seeds_are_the_run_numbers_window_and_a_dispatch_is_bounded() -> None:
++    """A re-run keeps its run number and so its seeds; a dispatch is parsed, bounded and normalised."""
++    assert report_mod.seeds("schedule", "", 1) == "5000-9999"
++    assert report_mod.seeds("schedule", "", 31) == report_mod.seeds("schedule", "", 1)
++    assert report_mod.seeds("workflow_dispatch", "", 2) == "10000-14999"
++    assert report_mod.seeds("pull_request", "", 2) == "0-99"
++    assert report_mod.seeds("workflow_dispatch", "1,\n2, 4", 2) == "1-2,4"
++    assert report_mod.seeds("workflow_dispatch", f"0-{report_mod.MAX_SEEDS - 1}", 2)
++    with pytest.raises(ValueError, match="at most"):
++        report_mod.seeds("workflow_dispatch", f"0-{report_mod.MAX_SEEDS}", 2)
++    with pytest.raises(ValueError, match="refused"):
++        report_mod.seeds("workflow_dispatch", "0-3\nfoo=bar", 2)
++
++
++def test_a_dispatch_is_bounded_before_its_seeds_are_built() -> None:
++    """A range far past the bound is refused without building it: the bound reads the text first."""
++    tracemalloc.start()
++    try:
++        with pytest.raises(ValueError, match="at most"):
++            report_mod.seeds("workflow_dispatch", "0-300000", 2)
++        peak = tracemalloc.get_traced_memory()[1]
++    finally:
++        tracemalloc.stop()
++    assert peak < 1_000_000, peak
++
++
++_SOAK_CASE = '<testcase classname="t" name="test_soak_the_close_count_under_concurrency[{form}-seed{seed}]">{body}</testcase>'
++_CASE = '<testcase classname="t" name="{name}">{body}</testcase>'
++_KNOWN = (
++    '<properties><property name="soak_known" value="{shape}"/></properties>'
++    '<skipped type="pytest.xfail" message="known soak finding: {shape} (§12: x)">r</skipped>'
++)
++
++
++def _xml(bodies: list[str], wiring: dict[str, str] | None = None) -> str:
++    cases = []
++    forms = report_mod.FORMS_SOAKED
++    for index, body in enumerate(bodies):
++        cases.append(_SOAK_CASE.format(form=forms[index % 3], seed=index // 3, body=body))
++    for name in report_mod.WIRING:
++        if wiring is None or name in wiring:
++            cases.append(_CASE.format(name=name, body=(wiring or {}).get(name, "")))
++    return f'<?xml version="1.0"?><testsuites><testsuite name="pytest">{"".join(cases)}</testsuite></testsuites>'
++
++
++SWAP = soak_known.SWAP_ARM.name
++CEIL = soak_ceilings.ceiling_of(soak_known.SWAP_ARM.name)
++
++
++@pytest.mark.parametrize(
++    ("bodies", "seeds", "wiring", "status", "says"),
++    [
++        ([""] * 6, "0-1", None, 0, "clean: 6; known: 0; new: 0"),
++        ([_KNOWN.format(shape=SWAP)] + [""] * 5, "0-1", None, 0, "1 x " + SWAP),
++        (
++            ['<failure message="CloseBroken:repeat@1">r</failure>'] + [""] * 5,
++            "0-1",
++            None,
++            0,
++            "LOG_FOUNDRY_MODEL_SEEDS=0",
++        ),
++        ([""] * 5, "0-1", None, 1, "5 soak items ran where 6 were asked"),
++        (
++            ['<skipped type="pytest.skip" message="skip">r</skipped>'] * 6,
++            "0-1",
++            None,
++            1,
++            "skipped or marked",
++        ),
++        (
++            ['<skipped type="pytest.xfail" message="flaky">r</skipped>'] + [""] * 5,
++            "0-1",
++            None,
++            1,
++            "skipped or marked",
++        ),
++        (
++            ['<skipped type="pytest.xfail" message="known soak finding: x">r</skipped>'] + [""] * 5,
++            "0-1",
++            None,
++            1,
++            "skipped or marked",
++        ),
++        (
++            [
++                '<properties><property name="soak_known" value="x"/></properties>'
++                '<skipped type="pytest.xfail" message="flaky">r</skipped>'
++            ]
++            + [""] * 5,
++            "0-1",
++            None,
++            1,
++            "skipped or marked",
++        ),
++        ([""] * 6, "0-1", {report_mod.WIRING[0]: ""}, 1, "Wiring"),
++        (
++            [""] * 6,
++            "0-1",
++            {n: '<failure message="x">r</failure>' for n in report_mod.WIRING},
++            1,
++            "Wiring",
++        ),
++        (
++            [_KNOWN.format(shape=SWAP)] * (CEIL + 1) + [""] * (66 - CEIL - 1),
++            "0-21",
++            None,
++            1,
++            "Ceiling broken",
++        ),
++        (
++            [_KNOWN.format(shape=SWAP)] * CEIL + [""] * (66 - CEIL),
++            "0-21",
++            None,
++            0,
++            f"{CEIL} x {SWAP}",
++        ),
++    ],
++    ids=[
++        "clean",
++        "known",
++        "new-with-its-rerun",
++        "one-short",
++        "all-skipped",
++        "xfail-not-known",
++        "xfail-known-text-without-the-property",
++        "xfail-with-the-property-without-the-text",
++        "wiring-absent",
++        "wiring-failed",
++        "over-the-ceiling",
++        "at-the-ceiling",
++    ],
++)
++def test_the_report(
++    tmp_path: pathlib.Path,
++    bodies: list[str],
++    seeds: str,
++    wiring: dict[str, str] | None,
++    status: int,
++    says: str,
++) -> None:
++    """The floor, the wiring and the ceiling each set the exit status, and say why."""
++    xml = tmp_path / "soak.xml"
++    xml.write_text(_xml(bodies, wiring), encoding="utf-8")
++    text, got = report_mod.report(xml, seeds)
++    assert (got, says in text) == (status, True), text
+diff --git a/tests/test_soak_known.py b/tests/test_soak_known.py
+new file mode 100644
+index 0000000..e77ec3c
+--- /dev/null
++++ b/tests/test_soak_known.py
+@@ -0,0 +1,227 @@
++"""SPEC-099 prototype: the known shapes' predicates, near misses, and the write-site roster."""
++
++from __future__ import annotations
++
++import ast
++import pathlib
++import re
++
++import pytest
++
++import soak_ceilings
++import soak_known
++from model_oracles import Arm, Close, Note, Take, Write
++
++T1, T2, MT, WK = "Thread-1 (runner)", "Thread-2 (runner)", "MainThread", "log-foundry-worker"
++
++
++class _C:
++    def __init__(self, writes: int, at_return: list[int]) -> None:
++        self.writes, self.at_return = writes, at_return
++
++
++def _close(n: int, t: str = T1) -> Close:
++    return Close(n, t, 0.0)
++
++
++def _names(
++    events: list[object], writes: int | None = None, at_return: list[int] | None = None
++) -> list[str]:
++    if writes is None:
++        writes = sum(isinstance(e, Write) for e in events)
++    if at_return is None:
++        at_return = [e.count for e in events if isinstance(e, Close)]
++    return [k.name for k in soak_known.explain_run([(events, _C(writes, at_return))])]
++
++
++SHAPE_A = [Note(T1), Arm(True, "_arm_and_hand"), Write(T1), Take("_close_owed"), _close(1)]
++
++
++@pytest.mark.parametrize(
++    ("tail", "expected"),
++    [
++        (
++            [Arm(False, "_swap_sink"), Take("_close_owed"), _close(1)],
++            ["swap-arms-a-sink-a-shutdown-took"],
++        ),
++        (
++            [Arm(False, "_swap_sink"), Take("_swap_sink"), _close(1)],
++            ["swap-arms-a-sink-a-shutdown-took"],
++        ),
++        (
++            [
++                Arm(False, "_swap_sink"),
++                Take("_close_owed"),
++                _close(1),
++                Arm(False, "_swap_sink"),
++                Take("_close_owed"),
++                _close(1),
++            ],
++            ["swap-arms-a-sink-a-shutdown-took"],
++        ),
++        ([Take("_close_owed"), _close(1)], []),
++        ([Arm(False, "_some_new_rearm"), Take("_close_owed"), _close(1)], []),
++        (
++            [
++                Arm(False, "_swap_sink"),
++                Arm(False, "_some_new_rearm"),
++                Take("_close_owed"),
++                _close(1),
++            ],
++            [],
++        ),
++    ],
++    ids=[
++        "swap",
++        "swap-then-a-swaps-take",
++        "triple-close",
++        "no-arm",
++        "unknown-arm-caller-only",
++        "swap-arm-plus-unknown-arm-caller",
++    ],
++)
++def test_the_swap_shape(tail: list[object], expected: list[str]) -> None:
++    """The first take is ``_close_owed``'s and every non-writer arm between the takes is the swap's."""
++    assert _names(SHAPE_A + tail) == expected
++
++
++def test_the_swap_shape_needs_a_shutdowns_first_take() -> None:
++    """#339's shape, a sink change's take first, is never known."""
++    events = [
++        Note(T1),
++        Arm(True, "_arm_and_hand"),
++        Write(T1),
++        Take("_swap_sink"),
++        _close(1),
++        Arm(False, "_swap_sink"),
++        Take("_swap_sink"),
++        _close(1),
++    ]
++    assert _names(events) == []
++
++
++@pytest.mark.parametrize(
++    ("events", "writes", "at_return", "expected"),
++    [
++        (
++            [
++                Note(T1),
++                Arm(True, "_arm_and_hand"),
++                Write(T1),
++                Note(T2),
++                Take("_close_owed"),
++                _close(1),
++                Write(T2),
++            ],
++            2,
++            [1],
++            ["orphan-write-after-close"],
++        ),
++        (
++            [Arm(True, "_get_worker"), Write(WK), Take("_close_owed"), _close(1), Write(WK)],
++            2,
++            [1],
++            [],
++        ),
++        (
++            [
++                Note(T1),
++                Arm(True, "_arm_and_hand"),
++                Write(T1),
++                Take("_close_owed"),
++                _close(1),
++                Note(T2),
++                Write(T2),
++            ],
++            2,
++            [1],
++            [],
++        ),
++        (
++            [
++                Note(T1),
++                Arm(True, "_arm_and_hand"),
++                Write(T1),
++                Note(T2),
++                Take("_close_owed"),
++                _close(1),
++                Arm(False, "_swap_sink"),
++                Write(T2),
++            ],
++            2,
++            [1],
++            [],
++        ),
++    ],
++    ids=[
++        "orphan-late-write",
++        "worker-late-write",
++        "note-after-the-last-take",
++        "arm-after-the-last-take",
++    ],
++)
++def test_the_orphan_late_write_shape(
++    events: list[object], writes: int, at_return: list[int], expected: list[str]
++) -> None:
++    """A late write is the orphan item's only on a caller's thread whose entry preceded the last take."""
++    assert _names(events, writes, at_return) == expected
++
++
++def test_a_run_with_one_unknown_sink_is_not_known() -> None:
++    """One sink of a new shape makes the whole run new, beside a known one."""
++    known = SHAPE_A + [Arm(False, "_swap_sink"), Take("_close_owed"), _close(1)]
++    new = SHAPE_A + [Take("_close_owed"), _close(1)]
++    c = _C(1, [1, 1])
++    assert soak_known.explain_run([(known, c), (new, c)]) == []
++
++
++def test_every_ceiling_names_a_row_and_carries_its_derivation() -> None:
++    """Each measured ceiling names a known row and has its measurement and commit on its line."""
++    names = {k.name for k in soak_known.KNOWN}
++    assert set(soak_ceilings.CEILINGS) <= names, set(soak_ceilings.CEILINGS) - names
++    lines = pathlib.Path(soak_ceilings.__file__).read_text(encoding="utf-8").splitlines()
++    for name, value in soak_ceilings.CEILINGS.items():
++        (line,) = [text for text in lines if text.strip().startswith(f'"{name}":')]
++        assert value > 0 and re.search(
++            r"#.*measured at [0-9a-f]{8,40}\b.*x2 under, x3 over", line
++        ), line
++
++
++def test_every_filed_night_is_one_line_the_queue_can_read() -> None:
++    """``FILED_NIGHTS`` is written one entry a line, in the shape ``queue.sh`` greps for."""
++    text = pathlib.Path(soak_known.__file__).read_text(encoding="utf-8")
++    found = re.search(r"^FILED_NIGHTS: dict\[str, str\] = \{(\}$|\n(.*?)^\}$)", text, re.M | re.S)
++    assert found, "FILED_NIGHTS is not written as the queue reads it"
++    body = found.group(2) or ""
++    entries = [line for line in body.splitlines() if line.strip()]
++    assert all(re.fullmatch(r'    "[0-9]+-[0-9]+": ".+",', line) for line in entries), entries
++    assert len(entries) == len(soak_known.FILED_NIGHTS)
++
++
++_WRITE_SITES = {
++    ("api.py", "_log", "run_delivery"),
++    ("api.py", "_log", "emit"),
++    ("worker.py", "_emit", "run_delivery"),
++    ("worker.py", "_emit", "emit"),
++}
++
++
++def test_every_place_the_library_hands_a_sink_a_batch_is_known() -> None:
++    """The late-write shape assumes every caller-thread write follows its own ``_note_orphan_emit``.
++
++    That holds while the orphan path's ``_log`` and the worker's ``_emit`` are the only places outside
++    ``sinks/`` that hand a sink a batch. A new one must be read against the shape before this changes.
++    """
++    found = set()
++    for path in sorted((pathlib.Path(__file__).parent.parent / "src" / "log_foundry").glob("*.py")):
++        tree = ast.parse(path.read_text(encoding="utf-8"))
++        for fn in ast.walk(tree):
++            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
++                continue
++            for node in ast.walk(fn):
++                if isinstance(node, ast.Call):
++                    f = node.func
++                    name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
++                    if name in ("run_delivery", "emit", "deliver", "emit_via_deliver"):
++                        found.add((path.name, fn.name, name))
++    assert found == _WRITE_SITES, found ^ _WRITE_SITES
+diff --git a/scripts/pr-queue-soak-test.sh b/scripts/pr-queue-soak-test.sh
+new file mode 100644
+index 0000000..83918d4
+--- /dev/null
++++ b/scripts/pr-queue-soak-test.sh
+@@ -0,0 +1,272 @@
++#!/bin/sh
++# SPEC-099: the PR queue's reading of the nightly soak's verdict, its clearing branch and the hook.
++#
++# A stub `gh` on PATH answers three calls from the environment:
++#   gh run list ... --event schedule ...  -> $GH_SCHED, "<run id> <attempts> <head sha> [status]" a line,
++#                                            newest first; with --status completed, only completed ones
++#   gh run list ... (any other)           -> $GH_RUNS, "<head sha> <status> <conclusion> <workflow>" a line
++#   gh api .../runs/<id>/attempts/<n>     -> the line of $GH_ATT reading "<id> <n> <conclusion> <time>"
++# HEAD in either list is the trunk's head sha. GH_FAIL fails every call, GH_API_FAIL only `gh api`.
++# Every case asserts where it lands AND why: the state or exit, and a line of what the queue said,
++# including the cases that must stay silent. Needs git and bash; no network, no GitHub.
++set -u
++HERE="$(cd "$(dirname "$0")" && pwd)"
++T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
++fails=0
++check() { if [ "$2" = "$3" ]; then echo "ok    $1"; else echo "FAIL  $1: got [$2] want [$3]"; fails=$((fails+1)); fi; }
++has()   { case "$2" in *"$3"*) echo "ok    $1";; *) echo "FAIL  $1: [$3] not in [$(printf '%s' "$2" | tr '\n' '|' | cut -c1-200)]"; fails=$((fails+1));; esac; }
++hasnt() { case "$2" in *"$3"*) echo "FAIL  $1: [$3] in [$(printf '%s' "$2" | tr '\n' '|' | cut -c1-200)]"; fails=$((fails+1));; *) echo "ok    $1";; esac; }
++
++mkdir -p "$T/bin" "$T/q/tickets"
++cat > "$T/bin/gh" <<'GH'
++#!/bin/sh
++[ -n "${GH_FAIL:-}" ] && { echo "gh: stub failure" >&2; exit 1; }
++head="$(git -C "$REPO_FOR_STUB" ls-remote origin refs/heads/main | cut -f1)"
++case "$1" in
++  run) case " $* " in
++         *" --status completed "*) printf '%s\n' "${GH_SCHED:-}" | awk '$4=="" || $4=="completed" {print $1" "$2" "$3}' | sed "s/ HEAD\$/ $head/" ;;
++         *" schedule "*) printf '%s\n' "${GH_SCHED:-}" | awk '{print $1" "$2" "$3}' | sed "s/ HEAD\$/ $head/" ;;
++         *)              printf '%s\n' "${GH_RUNS:-}" | sed "s/^HEAD /$head /" ;;
++       esac ;;
++  api) [ -n "${GH_API_FAIL:-}" ] && { echo "gh: api failure" >&2; exit 1; }
++       id="$(printf '%s' "$2" | sed -n 's#.*/runs/\([0-9]*\)/attempts/\([0-9]*\)$#\1#p')"
++       n="$(printf '%s' "$2" | sed -n 's#.*/runs/\([0-9]*\)/attempts/\([0-9]*\)$#\2#p')"
++       line="$(printf '%s\n' "${GH_ATT:-}" | awk -v i="$id" -v n="$n" '$1==i && $2==n {print $3" "$4; exit}')"
++       [ -n "$line" ] || { echo "HTTP 404" >&2; exit 1; }
++       echo "$line" ;;
++  pr) : ;;
++  *) exit 1 ;;
++esac
++GH
++chmod +x "$T/bin/gh"
++git init -q --bare -b main "$T/origin.git"
++git clone -q "$T/origin.git" "$T/repo" 2>/dev/null
++git clone -q "$T/origin.git" "$T/peer" 2>/dev/null
++cd "$T/repo" && git config user.email t@t && git config user.name t
++mkdir -p tests docs src && echo 'KNOWN = ()' > tests/soak_known.py && echo a > docs/architecture.md && echo a > src/x.py
++git add -A && git commit -qm base && git push -q origin main
++(cd "$T/peer" && git config user.email p@p && git config user.name p && git pull -q origin main 2>/dev/null)
++cp "$HERE/pr-queue/queue.sh" "$HERE/pr-queue/pre-push" "$T/q/"
++chmod +x "$T/q/queue.sh" "$T/q/pre-push"
++echo "$T/repo" > "$T/q/repo"; echo main > "$T/q/main-branch"; echo '.' > "$T/q/enforce-branches"
++export PATH="$T/bin:$PATH" REPO_FOR_STUB="$T/repo"
++Qs() { bash "$T/q/queue.sh" "$@"; }
++NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
++OLD="2020-01-01T00:00:00Z"
++GREEN='HEAD completed success Release'
++export GH_RUNS="$GREEN"
++
++# night ATTEMPT-CONCLUSIONS...: one scheduled run 101 on HEAD, whose attempts concluded as given.
++night() { GH_SCHED="101 $# HEAD"; GH_ATT=""; n=0
++          for c in "$@"; do n=$((n+1)); GH_ATT="$GH_ATT
++101 $n $c $NOW"; done; export GH_SCHED GH_ATT; }
++# nights: newest run 102 with one attempt concluding $1, then run 101 with one concluding $2.
++nights() { export GH_SCHED="102 1 HEAD
++101 1 HEAD" GH_ATT="102 1 $1 $NOW
++101 1 $2 $NOW"; }
++verdict() { Qs soak-verdict 2>/dev/null; }
++vstate()  { Qs soak-verdict >/dev/null 2>&1; echo $?; }
++mstate()  { Qs main-state >/dev/null 2>&1; echo $?; }
++# turnout SPEC: ticket, turn, release; prints "<rc> <first line>".
++turnout() { Qs ticket "$1" >/dev/null; o="$(Qs turn "$1")"; r=$?; Qs release "$1" >/dev/null
++            echo "$r $o"; }
++newbranch() { cd "$T/repo" && git fetch -q origin && git checkout -q -B "$1" origin/main; }
++# file ID-N: a peer merges a clearing commit that files the night, as a squash merge would land it.
++file() { (cd "$T/peer" && git pull -q origin main 2>/dev/null && printf '    "%s": "a lead",\n' "$1" >> tests/soak_known.py \
++          && git commit -qam "file $1" && git push -q origin main); }
++
++echo "== which night is read, and what it says"
++night failure;            check "a failed night blocks"                       "$(vstate)" 4
++                          has   "  ...and names its run and attempt"          "$(verdict)" "4 101-1 "
++night success;            check "a passed night does not block"               "$(vstate)" 0
++                          has   "  ...and names the run it read"              "$(verdict)" "0 101 "
++night timed_out;          check "a timed-out night blocks"                    "$(vstate)" 4
++night failure success;    check "a green re-run does not clear a red attempt" "$(vstate)" 4
++                          has   "  ...the failing attempt is named"           "$(verdict)" "4 101-1 "
++night success failure;    check "a red re-run of a green night blocks"        "$(vstate)" 4
++                          has   "  ...naming attempt 2"                       "$(verdict)" "4 101-2 "
++night failure failure;    has   "two red attempts name the last"              "$(verdict)" "4 101-2 "
++for c in cancelled startup_failure action_required skipped neutral stale; do
++  nights "$c" failure;    check "$c night falls back to a failed one"         "$(vstate)" 4
++  nights "$c" success;    check "$c night falls back to a passed one"         "$(vstate)" 0
++done
++night cancelled failure;  check "a cancelled re-run of a red attempt blocks"  "$(vstate)" 4
++export GH_SCHED="102 2 HEAD in_progress
++101 1 HEAD" GH_ATT="102 1 failure $NOW
++102 2 null $NOW
++101 1 success $NOW"
++                          check "a red night being re-run still blocks"       "$(vstate)" 4
++export GH_SCHED="102 1 HEAD in_progress
++101 1 HEAD" GH_ATT="102 1 null $NOW
++101 1 failure $NOW"
++                          check "a night still running falls back to the last" "$(vstate)" 4
++export GH_ATT="102 1 null $NOW
++101 1 success $NOW"
++                          check "  ...a passed one"                            "$(vstate)" 0
++export GH_SCHED="101 1 0123456789012345678901234567890123456789" GH_ATT="101 1 failure $NOW"
++                          check "a red night on an older sha still blocks"    "$(vstate)" 4
++export GH_SCHED="" GH_ATT="";
++                          check "no scheduled night at all does not block"    "$(vstate)" 0
++                          has   "  ...and says none"                          "$(verdict)" "0 none"
++nights cancelled cancelled; check "only verdict-less nights do not block"     "$(vstate)" 0
++night success; export GH_RUNS="$GREEN
++HEAD completed failure Model soak"
++                          check "a red dispatch on the head does not block"   "$(mstate)" 0
++export GH_RUNS="$GREEN
++HEAD in_progress null Model soak"
++                          check "a soak running on the head is not unsettled" "$(mstate)" 0
++night failure; export GH_RUNS="HEAD completed failure CI"
++                          check "another red on the head answers 1"           "$(mstate)" 1
++                          check "  ...while the verdict still blocks"         "$(vstate)" 4
++export GH_RUNS="HEAD in_progress null Release"
++                          check "another run in progress answers 2"           "$(mstate)" 2
++export GH_RUNS="$GREEN"
++                          check "the verdict alone answers 4"                 "$(mstate)" 4
++check "gh failing: 3"                    "$(GH_FAIL=1 Qs main-state >/dev/null 2>&1; echo $?)" 3
++check "gh api failing: 3"                "$(GH_API_FAIL=1 Qs soak-verdict >/dev/null 2>&1; echo $?)" 3
++check "  ...and main-state reads it as 3, not clear" "$(GH_API_FAIL=1 Qs main-state >/dev/null 2>&1; echo $?)" 3
++export GH_SCHED="101 2 HEAD" GH_ATT="101 1 failure $NOW"
++check "an attempt the API cannot show: 3" "$(vstate)" 3
++check "gh absent: 3"                     "$(PATH=/usr/bin:/bin bash "$T/q/queue.sh" main-state >/dev/null 2>&1; echo $?)" 3
++
++echo "== what clears a night"
++night failure failure
++file "101-1";             check "filing an earlier attempt does not clear"    "$(vstate)" 4
++file "101-2";             check "filing the blocking attempt clears"          "$(vstate)" 0
++                          has   "  ...and says so"                            "$(verdict)" "0 101 $NOW filed"
++night failure;            check "a night whose one attempt was filed earlier"  "$(vstate)" 0
++export GH_SCHED="103 1 HEAD" GH_ATT="103 1 failure $NOW"
++                          check "another run's filing does not clear"          "$(vstate)" 4
++(cd "$T/peer" && printf '# "103-1": "a lead",\n' >> tests/soak_known.py && git commit -qam c && git push -q origin main)
++                          check "a filing in a comment does not clear"         "$(vstate)" 4
++(cd "$T/peer" && printf '  "103-1": "a lead",\n' >> tests/soak_known.py && git commit -qam c && git push -q origin main)
++                          check "a filing at the wrong indent does not clear"  "$(vstate)" 4
++newbranch localonly; printf '    "103-1": "a lead",\n' >> tests/soak_known.py; git commit -qam local
++                          check "a filing on a local branch does not clear"    "$(vstate)" 4
++mv "$T/origin.git" "$T/origin.off"
++                          check "an unreadable origin: 3"                      "$(vstate)" 3
++mv "$T/origin.off" "$T/origin.git"
++file "103-1";             check "a peer's filing, not yet fetched here, clears" "$(vstate)" 0
++
++echo "== turn and acquire while it blocks"
++export GH_SCHED="104 1 HEAD" GH_ATT="104 1 failure $NOW"
++r() { o="$(turnout "SPEC-$RANDOM")"; check "$1" "${o%% *}" "$2"; has "  ...$1" "$o" "$3"; }
++W="the nightly soak's verdict blocks (104-1"
++R="this branch only files its finding"
++newbranch ok;      echo b >> tests/soak_known.py; echo b >> docs/architecture.md; git commit -qam ok
++r "both clearing files"                   0 "$R"
++newbranch one;     echo b >> tests/soak_known.py; git commit -qam one
++r "tests/soak_known.py alone"             0 "$R"
++newbranch src;     echo b >> src/x.py; echo b >> tests/soak_known.py; git commit -qam src
++r "src beside a clearing file"            1 "$W"
++newbranch empty
++r "no commits"                            1 "$W"
++newbranch revert;  echo b >> tests/soak_known.py; git commit -qam a; git revert --no-edit HEAD >/dev/null
++r "a commit and its revert"               1 "$W"
++newbranch renin;   git rm -q tests/soak_known.py; git commit -qm rm; mkdir -p tests; git mv src/x.py tests/soak_known.py; git commit -qm renin
++r "src/x.py renamed onto tests/soak_known.py" 1 "$W"
++newbranch renout;  git mv tests/soak_known.py src/soak_known.py; git commit -qm renout
++r "tests/soak_known.py renamed out"       1 "$W"
++newbranch del;     git rm -q docs/architecture.md; git commit -qm del
++r "docs/architecture.md deleted"          1 "$W"
++newbranch modex;   chmod +x tests/soak_known.py; git commit -qam mode
++r "tests/soak_known.py made executable"   1 "$W"
++newbranch sym;     rm tests/soak_known.py; ln -s ../src/x.py tests/soak_known.py; git add -A; git commit -qm sym
++r "tests/soak_known.py made a symlink"    1 "$W"
++newbranch link;    git rm -q --cached tests/soak_known.py; rm tests/soak_known.py
++                   git update-index --add --cacheinfo 160000,"$(git rev-parse HEAD)",tests/soak_known.py; git commit -qm gitlink
++r "tests/soak_known.py made a gitlink"    1 "$W"
++newbranch space;   mkdir -p "docs/architecture.md tests"; echo x > "docs/architecture.md tests/soak_known.py"; git add -A; git commit -qm space
++r "a path with a space in it"             1 "$W"
++newbranch space2;  mkdir -p "tests/soak_known.py docs"; echo x > "tests/soak_known.py docs/architecture.md"; git add -A; git commit -qm space2
++r "a path holding both names, in order"   1 "$W"
++newbranch top;     echo x > soak_known.py; git add -A; git commit -qm top
++r "a top-level soak_known.py"             1 "$W"
++newbranch glob1;   mkdir -p '[t]ests'; echo x > '[t]ests/soak_known.py'; git add -A; git commit -qm glob1
++r "a path [t]ests/soak_known.py"          1 "$W"
++newbranch glob2;   echo x > 'tests/soak_known.p[y]'; git add -A; git commit -qm glob2
++r "a path tests/soak_known.p[y]"          1 "$W"
++newbranch nl;      printf x > "src/a
++b.py"; echo b >> tests/soak_known.py; git add -A; git commit -qm nl
++r "a src path with a newline in it"       1 "$W"
++newbranch ceil;    mkdir -p tests; echo 'CEILINGS = {}' > tests/soak_ceilings.py; echo b >> tests/soak_known.py; git add -A; git commit -qm ceil
++r "tests/soak_ceilings.py beside a filing" 1 "$W"
++newbranch side;    echo side >> src/x.py; git commit -qam side
++newbranch merged;  echo b >> tests/soak_known.py; git commit -qam m1; git merge -q --no-edit side
++r "a merge bringing in src"               1 "$W"
++newbranch cfg;     echo b >> src/x.py; echo b >> tests/soak_known.py; git commit -qam cfg
++git config diff.relative true; git config color.ui always; git config diff.external /bin/false; git config diff.noprefix true
++r "src under hostile diff settings"       1 "$W"
++cd tests; r "src, turn run from tests/"   1 "$W"; cd ..
++git config --unset diff.relative; git config --unset color.ui; git config --unset diff.external; git config --unset diff.noprefix
++newbranch ok2; echo c >> tests/soak_known.py; git commit -qam ok2
++git config diff.relative true; git config diff.external /bin/false
++r "a clearing branch under hostile diff settings" 0 "$R"
++git config --unset diff.relative; git config --unset diff.external
++
++newbranch codefix; echo d >> src/x.py; git commit -qam codefix
++night success; Qs ticket SPEC-900 >/dev/null; Qs acquire SPEC-900 >/dev/null
++export GH_SCHED="104 1 HEAD" GH_ATT="104 1 failure $NOW"
++o="$(Qs acquire SPEC-900)"; check "acquire: a holder re-stamping onto a non-clearing branch" "$?" 1
++has "  ...says why" "$o" "changes more than its filing"
++newbranch filing; echo e >> tests/soak_known.py; git commit -qam filing
++o="$(Qs acquire SPEC-900)"; check "acquire: the holder re-stamping onto a clearing branch" "$?" 0
++Qs release SPEC-900 >/dev/null
++night success; newbranch any; o="$(turnout SPEC-901)"
++check "not blocked: turn is READY"        "${o%% *}" 0
++hasnt "  ...and names no soak"            "$o" "soak"
++export GH_SCHED="" GH_ATT=""; o="$(turnout SPEC-902)"
++has   "no verdict in a month: turn says so" "$o" "no verdict in its last 30"
++export GH_SCHED="101 1 HEAD" GH_ATT="101 1 success $OLD"; o="$(turnout SPEC-903)"
++has   "an old verdict: turn names its date" "$o" "newest verdict is from $OLD"
++
++echo "== the hook"
++git -C "$T/repo" config core.hooksPath "$T/q"
++hold() { printf 'spec %s\nbranch %s\nsince x\n' "$1" "$2" > "$T/q/lock/holder"; }
++mkdir -p "$T/q/lock"
++p() { out="$(cd "$T/repo" && git push "$@" 2>&1)"; echo "$?"; printf '%s\n' "$out" > "$T/last"; }
++last() { cat "$T/last"; }
++S="the nightly soak's verdict blocks"
++export GH_SCHED="105 1 HEAD" GH_ATT="105 1 failure $NOW"
++newbranch hf; echo f >> tests/soak_known.py; git commit -qam hf; hold SPEC-1 hf
++check "a clearing push while it blocks"           "$(p origin hf)" 0
++hasnt "  ...draws no refusal"                     "$(last)" "REFUSED"
++echo g >> src/x.py; git commit -qam sneak
++check "the holder adds src to its clearing branch" "$(p origin hf)" 1
++has   "  ...refused for the soak"                 "$(last)" "$S"
++export GH_RUNS="HEAD completed failure CI"
++check "the same push while another red is on the head" "$(p origin hf)" 1
++has   "  ...still refused for the soak"           "$(last)" "$S"
++export GH_RUNS="$GREEN"
++check "the same push with gh failing (fails open)" "$(GH_FAIL=1 p origin hf)" 0
++hasnt "  ...and says nothing of the soak"         "$(last)" "$S"
++git -C "$T/origin.git" update-ref -d refs/heads/hf
++check "the same push with gh absent (fails open)"  "$(PATH="$(printf '%s' "$PATH" | sed "s#$T/bin:##")" p origin hf)" 0
++hasnt "  ...and says nothing of the soak"         "$(last)" "$S"
++git -C "$T/origin.git" update-ref -d refs/heads/hf
++night success
++check "the same push when nothing blocks"         "$(p origin hf)" 0
++export GH_SCHED="105 1 HEAD" GH_ATT="105 1 failure $NOW"
++newbranch t1; echo h >> src/x.py; git commit -qam trunk; hold SPEC-2 t1
++check "a trunk push with src while it blocks"     "$(p origin t1:main)" 1
++has   "  ...refused for the soak"                 "$(last)" "$S"
++newbranch st; echo i >> tests/soak_known.py; git commit -qam st; hold SPEC-3 st
++(cd "$T/peer" && git pull -q origin main 2>/dev/null && echo peer >> src/x.py && git commit -qam peer && git push -q origin main)
++cd "$T/repo" && git fetch -q origin && git checkout -q st
++check "a stale clearing branch"                   "$(p origin st)" 1
++has   "  ...gets the rebase message"              "$(last)" "your base is behind"
++hasnt "  ...and not the soak's"                   "$(last)" "$S"
++newbranch sp; mkdir -p "docs/architecture.md tests"; echo x > "docs/architecture.md tests/soak_known.py"; git add -A; git commit -qm sp; hold SPEC-4 sp
++check "a push of a path with a space"             "$(p origin sp)" 1
++has   "  ...refused for the soak"                 "$(last)" "$S"
++
++echo "== reaping"
++rm -rf "$T/q/lock"; mkdir -p "$T/q/lock"; hold SPEC-5 gone; touch -t 202001010000 "$T/q/lock"
++export GH_SCHED="106 1 HEAD" GH_ATT="106 1 failure $NOW"
++Qs ticket SPEC-906 >/dev/null
++check "a stale lock is kept while it blocks"      "$([ -d "$T/q/lock" ] && echo kept || echo broken)" kept
++file "106-1"; Qs ticket SPEC-907 >/dev/null
++check "the same lock is broken once the night is filed" "$([ -d "$T/q/lock" ] && echo kept || echo broken)" broken
++
++echo "----"; echo "pr-queue-soak-test: $fails failed."
++[ "$fails" -eq 0 ]
+diff --git a/scripts/pr-queue/pre-push b/scripts/pr-queue/pre-push
+index 5759864..9b9d069 100755
+--- a/scripts/pr-queue/pre-push
++++ b/scripts/pr-queue/pre-push
+@@ -138,7 +138,7 @@ fi
+ # Every decision below keys on the REMOTE ref, which is the one that decides what appears on the
+ # remote. `git push origin mine:main` is a push to the trunk however it is spelled locally, and
+ # `git push origin main:refs/heads/topic` is a topic branch however it is spelled locally.
+-refused=""; stale=""; unreadable=""; unfetched=""; notrunk=""; deltrunk=""; badpat=0
++pushed=""; refused=""; stale=""; unreadable=""; unfetched=""; notrunk=""; deltrunk=""; badpat=0
+ while read -r lref lsha rref _rsha; do
+   [ -n "$rref" ] || continue
+   case "$rref" in refs/heads/*) branch="${rref#refs/heads/}" ;; *) continue ;; esac
+@@ -185,9 +185,43 @@ while read -r lref lsha rref _rsha; do
+     stale="$stale $branch"; unfetched="$unfetched $branch"; continue
+   fi
+   git merge-base --is-ancestor "$main_sha" "$lsha" 2>/dev/null || stale="$stale $branch"
++  case " $stale " in *" $branch "*) ;; *) pushed="$pushed$branch $lsha
++" ;; esac
+ done
+ 
+-[ -n "$refused$stale$unreadable$notrunk$deltrunk" ] || [ "$badpat" -eq 1 ] || exit 0
++# SPEC-099: while the nightly soak's verdict blocks, a push may carry only the filing of its finding:
++# commits since main's head that change tests/soak_known.py and docs/architecture.md and nothing else.
++# The trunk is checked too, though the server's ruleset, not this hook, is what stops a trunk push.
++# A stale ref is not read here: it is refused below for its base, and the rebase is its answer.
++# The verdict is asked of queue.sh, which reads it through gh; when gh is missing or failing, the
++# answer is not 4 and this check is left out, as it was before it existed.
++soakbad=""
++if [ -n "$pushed" ] && [ -x "$Q/queue.sh" ]; then
++  "$Q/queue.sh" soak-verdict >/dev/null 2>&1
++  if [ $? -eq 4 ]; then
++    while read -r pb psha; do
++      [ -n "$pb" ] || continue
++      "$Q/queue.sh" clearing-range "$main_sha" "$psha" >/dev/null 2>&1 || soakbad="$soakbad $pb"
++    done <<PUSHED
++$pushed
++PUSHED
++  fi
++fi
++
++[ -n "$refused$stale$unreadable$notrunk$deltrunk$soakbad" ] || [ "$badpat" -eq 1 ] || exit 0
++
++if [ -n "$soakbad" ]; then
++  cat >&2 <<MSG
++
++  PUSH REFUSED — the nightly soak's verdict blocks, and only a branch that files its finding may land.
++
++  Refused ref(s):$soakbad
++
++  Such a branch changes tests/soak_known.py and docs/architecture.md and nothing else, and is
++  written once Andrew has answered the night's escalation. Protocol: $Q/PROTOCOL.md
++
++MSG
++fi
+ 
+ if [ -n "$deltrunk" ]; then
+   cat >&2 <<MSG
+diff --git a/scripts/pr-queue/queue.sh b/scripts/pr-queue/queue.sh
+index e6bde7a..0498dc5 100755
+--- a/scripts/pr-queue/queue.sh
++++ b/scripts/pr-queue/queue.sh
+@@ -109,16 +109,27 @@ all_prs() {
+ #             evidence that it passed.
+ main_green() {
+   [ -x "$Q/main-green" ] && { "$Q/main-green"; return $?; }
+-  local sha runs rsha status conclusion any=0 building=0 red=0
++  local hs v
++  head_green; hs=$?
++  [ "$hs" -eq 0 ] || return "$hs"
++  soak_verdict >/dev/null; v=$?
++  case $v in 0) return 0 ;; 4) return 4 ;; *) return 3 ;; esac
++}
++
++# head_green  0 · 1 · 2 · 3 as main_green, over the runs on main's head other than the soak's: a
++#             soak run on the head is a dispatch's or a schedule's, and only soak_verdict reads those.
++head_green() {
++  local sha runs rsha status conclusion wf any=0 building=0 red=0
+   # ls-remote rather than a fetch: it reads the remote's head without touching local refs, which
+   # several worktrees hitting FETCH_HEAD at once would race on.
+   sha="$( cd "$REPO" && git ls-remote origin "refs/heads/$MAIN" 2>/dev/null | cut -f1 )" || return 3
+   [ -n "$sha" ] || return 3
+   runs="$( cd "$REPO" && gh run list --branch "$MAIN" --limit 30 \
+-             --json headSha,status,conclusion \
+-             --jq '.[] | "\(.headSha) \(.status) \(.conclusion)"' )" || return 3
+-  while read -r rsha status conclusion; do
++             --json headSha,status,conclusion,workflowName \
++             --jq '.[] | "\(.headSha) \(.status) \(.conclusion) \(.workflowName)"' )" || return 3
++  while read -r rsha status conclusion wf; do
+     [ "$rsha" = "$sha" ] || continue
++    [ "$wf" = "$SOAK_WORKFLOW" ] && continue
+     any=1
+     [ "$status" = "completed" ] || { building=1; continue; }
+     case "$conclusion" in success|skipped|neutral) ;; *) red=1 ;; esac
+@@ -137,6 +148,106 @@ main_green() {
+   return 0
+ }
+ 
++# --- the nightly soak's verdict (SPEC-099) ----------------------------------------------------
++SOAK_WORKFLOW="Model soak"
++SOAK_FILE="model-soak.yml"
++SOAK_LOOKBACK=30        # scheduled runs read back through nights with no verdict: a month
++SOAK_QUIET_HOURS=48     # a verdict older than this is named in turn's answer
++
++# soak_verdict  0 nothing blocks · 4 the newest scheduled night with a verdict failed, and no
++#               clearing commit answers it · 3 the verdict could not be read. Prints
++#               "<state> <run id or none> <time>", the time being the blocking attempt's completion
++#               when it blocks, and otherwise the verdict's.
++#
++# Only SCHEDULED runs carry a verdict: a dispatch or a pull request's run is someone's experiment.
++# The newest run with a verdict is read, on any sha, so a merge made while the night ran cannot
++# step past it. Every attempt is read through the API, because `gh run list` reports only the
++# latest attempt's conclusion and status: an attempt that concluded failure or timed_out blocks,
++# whatever a re-run did later, and a re-run still in progress hides none of the attempts before
++# it. A run is listed whatever its status for that reason. A night whose every attempt has no
++# verdict yet or none at all (in progress, cancelled, startup_failure, action_required, skipped,
++# neutral, stale) is passed over for the one before it.
++soak_verdict() {
++  [ -x "$Q/soak-verdict" ] && { "$Q/soak-verdict"; return $?; }
++  local runs id attempts head n a c t seen blocked when last bad
++  runs="$( cd "$REPO" && gh run list --workflow "$SOAK_FILE" --event schedule \
++             --limit "$SOAK_LOOKBACK" --json databaseId,attempt,headSha \
++             --jq '.[] | "\(.databaseId) \(.attempt) \(.headSha)"' )" || { echo "3 unreadable"; return 3; }
++  while read -r id attempts head; do
++    [ -n "$id" ] || continue
++    case "$attempts" in ''|*[!0-9]*) echo "3 $id"; return 3 ;; esac
++    seen=0; blocked=0; when=""; last=""; bad=""
++    for (( n=1; n<=attempts; n++ )); do
++      a="$( cd "$REPO" && gh api "repos/{owner}/{repo}/actions/runs/$id/attempts/$n" \
++              --jq '"\(.conclusion) \(.updated_at)"' )" || { echo "3 $id"; return 3; }
++      c="${a%% *}"; t="${a#* }"
++      case "$c" in
++        failure|timed_out) seen=1; blocked=1; when="$t"; last="$t"; bad="$n" ;;
++        success)           seen=1; last="$t" ;;
++        *)                 ;;
++      esac
++    done
++    [ "$seen" -eq 1 ] || continue
++    if [ "$blocked" -eq 0 ]; then echo "0 $id $last"; return 0; fi
++    filed "$id-$bad"
++    case $? in
++      0) echo "0 $id $last filed"; return 0 ;;
++      1) echo "4 $id-$bad $when"; return 4 ;;
++      *) echo "3 $id"; return 3 ;;
++    esac
++  done <<< "$runs"
++  echo "0 none"; return 0
++}
++
++# filed <run id>-<attempt>  0 when tests/soak_known.py on origin/main files that attempt in
++#             FILED_NIGHTS, one entry a line as soak_known.py writes it; 1 when it does not; 2 when
++#             origin/main could not be read. The record is the night's own key, so no clock is
++#             compared: a filing cannot be made before the run exists, nor carried by the tree the
++#             night tested. Fetched into origin/main only, never FETCH_HEAD, which several worktrees
++#             would race on.
++filed() {
++  local text
++  git -C "$REPO" fetch -q --no-write-fetch-head origin "+refs/heads/$MAIN:refs/remotes/origin/$MAIN" 2>/dev/null || return 2
++  text="$(git -C "$REPO" show "origin/$MAIN:tests/soak_known.py" 2>/dev/null)" || return 2
++  printf '%s\n' "$text" | grep -qE "^    \"$1\": \".+\",\$" && return 0
++  return 1
++}
++
++# clearing_range <from> <to>  0 when the commits from..to in $PWD change something, and only
++#             tests/soak_known.py and docs/architecture.md, each left a regular file; 1 otherwise.
++#             Names are read NUL-delimited and compared whole, renames as a deletion and an
++#             addition, with no user diff setting able to change what is read.
++clearing_range() {
++  local meta path om nm rest n=0
++  while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
++    n=$((n+1))
++    read -r om nm rest <<< "${meta#:}"
++    [ "$nm" = 100644 ] || return 1
++    [ "$path" = tests/soak_known.py ] || [ "$path" = docs/architecture.md ] || return 1
++  done < <(git -C "$PWD" -c core.quotepath=false diff --raw -z --no-abbrev --no-renames \
++             --no-ext-diff --no-relative --no-color --no-textconv "$1" "$2" 2>/dev/null)
++  [ "$n" -gt 0 ]
++}
++
++# clearing_branch  0 when the branch in $PWD is a clearing range from its base on origin/main.
++clearing_branch() {
++  local base
++  base="$(git -C "$PWD" merge-base HEAD "origin/$MAIN" 2>/dev/null)" || return 1
++  clearing_range "$base" HEAD
++}
++
++# soak_note  a line for turn naming a verdict older than SOAK_QUIET_HOURS, or none at all.
++soak_note() {
++  local line t cut
++  line="$(soak_verdict 2>/dev/null)"
++  t="$(printf '%s' "$line" | awk '{print $3}')"
++  cut="$(date -u -v-"${SOAK_QUIET_HOURS}"H +%Y-%m-%dT%H:%M:%S 2>/dev/null \
++         || date -u -d "$SOAK_QUIET_HOURS hours ago" +%Y-%m-%dT%H:%M:%S 2>/dev/null)"
++  if [ -z "$t" ]; then echo "  note: the nightly soak has no verdict in its last $SOAK_LOOKBACK scheduled runs"
++  elif [ -n "$cut" ] && [[ "${t:0:19}" < "$cut" ]]; then echo "  note: the nightly soak's newest verdict is from $t"
++  fi
++}
++
+ # --- the holder file --------------------------------------------------------------------------
+ # `key value` lines, one fact per line, read by field name. The branch is compared as a STRING,
+ # never grepped: a substring match would let `spec-207/qu` push under `spec-207/queue`'s lock.
+@@ -260,8 +371,12 @@ cmd_turn() {
+   [ -z "$pr" ] || { echo "WAIT — a PR is open on the remote:"; echo "$pr" | head -3; return 1; }
+   main_green; rc=$?
+   case $rc in
+-    0) echo "READY — your turn, no PR open, $MAIN green"; return 0 ;;
++    0) echo "READY — your turn, no PR open, $MAIN green"; soak_note; return 0 ;;
+     1) echo "WAIT — $MAIN IS RED. Stop and escalate; a red $MAIN is fixed before anything merges."; return 1 ;;
++    4) if clearing_branch; then
++         echo "READY — the nightly soak's verdict blocks, and this branch only files its finding"; return 0
++       fi
++       echo "WAIT — the nightly soak's verdict blocks ($(soak_verdict | cut -d' ' -f2,3)). Escalate it; once Andrew has answered, only a branch that files the finding may land (PROTOCOL.md)."; return 1 ;;
+     3) echo "WAIT — could not read $MAIN's status (the check failed). Not assuming it is green."; return 1 ;;
+     *) echo "WAIT — $MAIN is building or unsettled"; return 1 ;;
+   esac
+@@ -305,6 +420,12 @@ MSG
+     echo "        lock orders the agents that take one and stops nobody else pushing it." >&2
+   fi
+   out="$(cmd_turn "$spec")" || { echo "BUSY — $out"; return 1; }
++  # A holder's turn answers READY before it reads the trunk, so the soak's verdict is read here too:
++  # the lock is never stamped onto a branch that does more than file the night's finding.
++  soak_verdict >/dev/null
++  if [ $? -eq 4 ] && ! clearing_branch; then
++    echo "REFUSED — the nightly soak's verdict blocks, and '$branch' changes more than its filing."; return 1
++  fi
+   # mkdir IS the atomicity: it either creates or fails, with no window between the two. A
+   # test-then-create has a gap, and agents polling on similar cadences land in it.
+   if ! mkdir "$LOCK" 2>/dev/null; then
+@@ -368,6 +489,9 @@ case "${1:-}" in
+   acquire) cmd_acquire "${2:?spec id required}" ;;
+   release) cmd_release "${2:?spec id required}" ;;
+   status)  cmd_status ;;
++  main-state)     main_green; rc=$?; echo "$rc"; exit "$rc" ;;
++  soak-verdict)   soak_verdict; exit $? ;;
++  clearing-range) clearing_range "${2:?from}" "${3:?to}"; exit $? ;;
+   reap)    mkdir -p "$TICKETS"; reap; echo "reaped" ;;
+   *) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 64 ;;
+ esac

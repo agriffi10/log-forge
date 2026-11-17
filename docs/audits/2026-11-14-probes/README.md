@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Sixty-six files here are not the audit's.** Each was added after the audit was brought in
+**Sixty-eight files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -80,6 +80,17 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   `SNSSink` apply their byte limit today, what each counts when the destination's limit is below
   the sink's, and whether any SPEC-092 row depends on the limit. The third imports SPEC-092's
   prototype, so it needs `sinks/` and `tests/` on `PYTHONPATH` as its docstring says.
+- `lifecycle/spec099_rule_corpus.py`, written while authoring SPEC-099 against `eda19f32`: it runs
+  `p11_swap_arms_a_sink_a_shutdown_closed.py`'s `forced` choreography, records the sink's events as
+  the soak records them, and judges each record, with rows written from §12's text, by three soak
+  rules and by the known shapes. It imports the prototype's `tests/model_oracles.py` and
+  `tests/soak_known.py`, so it runs only against a tree carrying the prototype, with `src` and
+  `tests` on `PYTHONPATH` as its docstring says. `lifecycle/spec099_prototype.patch` is not a
+  probe: it is SPEC-099's prototype, applied with `patch -p1` to `git archive eda19f32`, and
+  SPEC-099's *Evidence* says what it measured. It also changes `scripts/pr-queue/queue.sh` and
+  `pre-push` and adds `scripts/pr-queue-soak-test.sh`, the corpus grown from the execution-frame
+  reviewer's harness. It changes nothing installed: the queue in use runs from the copy
+  `install.sh` wrote.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded
