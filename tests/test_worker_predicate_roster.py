@@ -531,6 +531,144 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "destroyed with `flush()` reporting success and every counter zero."
         ),
     ),
+    ("_abandon", "_sweep_held_here()", 0): (
+        EXISTENCE,
+        (
+            "whether this thread is already inside the sweep hold (SPEC-091 FR-001), which a collector callback or finalizer run inside one is. Not a worker question at all: matched only because `held` is a base sentinel (SPEC-054, for `Worker._held`). Filed rather than excluded, since excluding a name from a completeness roster is how a later site under it goes unseen. Here a nested abandon defers its take and its debit to the holder."
+        ),
+    ),
+    ("_adopt_unswept", "_sweep_held_here()", 0): (
+        EXISTENCE,
+        (
+            "whether this thread is already inside the sweep hold (SPEC-091 FR-001), which a collector callback or finalizer run inside one is. Not a worker question at all: matched only because `held` is a base sentinel (SPEC-054, for `Worker._held`). Filed rather than excluded, since excluding a name from a completeness roster is how a later site under it goes unseen. Here a nested `continue_trace()` is refused rather than re-entering the hold."
+        ),
+    ),
+    ("_flush", "_sweep_held_here()", 0): (
+        EXISTENCE,
+        (
+            "whether this thread is already inside the sweep hold (SPEC-091 FR-001), which a collector callback or finalizer run inside one is. Not a worker question at all: matched only because `held` is a base sentinel (SPEC-054, for `Worker._held`). Filed rather than excluded, since excluding a name from a completeness roster is how a later site under it goes unseen. Here a nested close defers its swap and submit to the holder, after "
+            "`_lifecycle._get_worker()` has already resolved the worker."
+        ),
+    ),
+    ("_sweep_open_spans", "_sweep_held_here()", 0): (
+        EXISTENCE,
+        (
+            "whether this thread is already inside the sweep hold (SPEC-091 FR-001), which a collector callback or finalizer run inside one is. Not a worker question at all: matched only because `held` is a base sentinel (SPEC-054, for `Worker._held`). Filed rather than excluded, since excluding a name from a completeness roster is how a later site under it goes unseen. Here a nested `flush()` takes nothing from its own context and reports "
+            "`abandoned`."
+        ),
+    ),
+    ("_sweep_registered", "_sweep_held_here()", 0): (
+        EXISTENCE,
+        (
+            "whether this thread is already inside the sweep hold (SPEC-091 FR-001), which a collector callback or finalizer run inside one is. Not a worker question at all: matched only because `held` is a base sentinel (SPEC-054, for `Worker._held`). Filed rather than excluded, since excluding a name from a completeness roster is how a later site under it goes unseen. Here a nested sweep, the drain's or a `flush()`'s, takes nothing and returns "
+            "`None`."
+        ),
+    ),
+    ("_sweep_registered", "span.held", 0): (
+        EXISTENCE,
+        (
+            "the span's count of leading events a worker sweep leaves, 1 while `span.start` is "
+            "buffered (SPEC-091 FR-001). Not a worker question: matched only because `held` is a "
+            "base sentinel (SPEC-054)."
+        ),
+    ),
+    ("_sweep_open_spans", "worker is not None", 0): (
+        EXISTENCE,
+        (
+            "whether this sweep resolved a worker to announce its totals through, once the hold is "
+            "released (SPEC-091 FR-001) - a test of the sweep's own local, the sibling of its "
+            "`worker is None` row. A sweep that met no buffer resolved none and has nothing to "
+            "announce."
+        ),
+    ),
+    ("_begin", "_lifecycle._state._worker is None", 0): (
+        EXISTENCE,
+        (
+            "whether the process has built its worker yet, so the open builds it (SPEC-091 "
+            "FR-002): the drain thread can sweep the process's first span only once one exists. "
+            "Existence, not liveness: a retired worker is still the process worker, and building "
+            "another would fight a process trying to exit (SPEC-019). Read as one attribute load, "
+            "not through `worker_exists()`, so that once a worker exists the open calls no "
+            "`_lifecycle` function (FR-005)."
+        ),
+    ),
+    ("_drain_deferred_closes", "_lifecycle._state.worker_exists()", 0): (
+        EXISTENCE,
+        (
+            "the worker a deferred close's buffer is handed to (SPEC-091 FR-001). It exists by "
+            "construction, because the nested close resolved `_get_worker()` before it deferred. "
+            "Existence rather than liveness, as for `_flush`'s own submit: a retired worker is "
+            "still handed the buffer, and the retirement read counts it as submitted after "
+            "shutdown."
+        ),
+    ),
+    ("_drain_deferred_closes", "worker is None", 0): (
+        EXISTENCE,
+        (
+            "the row above's verdict, for a path no caller reaches: with no worker the buffer is "
+            "counted in `in_span_lost` rather than dropped silently."
+        ),
+    ),
+    ("_flush_worker", "_sweep_every_registered_span(worker)", 0): (
+        EXISTENCE,
+        (
+            "the registry sweep a `flush()` makes into the process worker (SPEC-091 FR-003), "
+            "existence for this function's other reads' reason: a `flush()` after `shutdown()` "
+            "hands to the retired worker and is counted as such, which the hand-in's retirement "
+            "read records."
+        ),
+    ),
+    ("_flush_worker", "worker is not None and swept", 0): (
+        EXISTENCE,
+        (
+            "whether there is a worker to sweep every registered span into, and the caller's own "
+            "sweep succeeded (SPEC-091 FR-003). With no worker there is nothing to hand to, and a "
+            "failed own sweep has already decided `abandoned`."
+        ),
+    ),
+    ("_sweep_every_registered_span", "_sweep_registered(hand_in)", 0): (
+        EXISTENCE,
+        (
+            "the binding of the registry sweep's result, whose hand-in enqueues into the worker "
+            "the caller passed (SPEC-091 FR-003). It asks nothing of the worker; it is filed by "
+            "the question its caller asked, `_flush_worker`'s existence read."
+        ),
+    ),
+    ("continue_trace", "_adopt_unswept(*adopted)", 0): (
+        EXISTENCE,
+        (
+            "the adoption's verdict, bound as a refusal reason (SPEC-091 FR-001). Not a worker "
+            "question: `_adopt_unswept` returns a refusal text containing the word `worker`, so "
+            "`_accessor_names` derives it as a function handing the worker back, which is the "
+            "safe over-match that function chooses."
+        ),
+    ),
+    ("_flush_worker", "worker is None and swept and _registered_spans_hold_events()", 0): (
+        EXISTENCE,
+        (
+            "whether no worker exists while some registered span holds events, so the flush "
+            "builds one for its registry sweep, as the caller's own sweep does (SPEC-091 diff "
+            "review, frame 2). Existence: with the open-time build failed there is no worker at "
+            "all, and a retired one is still the process worker, to which a late flush hands."
+        ),
+    ),
+    ("_flush_worker", "_get_worker()", 0): (
+        LIVENESS,
+        (
+            "who performs the registry sweep's hand-ins when the open-time build failed, filed as "
+            "`_sweep_open_spans`' own build is: `_get_worker` answers existence by construction, "
+            "and it is resolved before the sweep takes anything, so a build that raises loses "
+            "nothing."
+        ),
+    ),
+    ("_sweep_open_spans", "worker._offer(buffered, count_retired=True)", 0): (
+        LIVENESS,
+        (
+            "the binding of the offer's verdict, which the worker resolved above performs: a put, "
+            "a full queue or a mutex not free in time (SPEC-091 diff review, frame 2). It asks "
+            "nothing of the worker beyond what that resolution decided."
+        ),
+    ),
     ("_live_sinks", "(_state.worker_exists(), _state._late_worker)", 0): (
         EXISTENCE,
         (
@@ -1570,8 +1708,22 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 101, "log_foundry.decorator": 4}
+_SITE_FLOOR = {"log_foundry._lifecycle": 106, "log_foundry.decorator": 16}
 """The floor each walked module must still meet, by name.
+
+**Raised at SPEC-091's diff review, frame 2, 104 -> 106 and 15 -> 16, to the counts
+`_per_module_sites()` measured.** `_flush_worker` gains the build its registry sweep needs when the
+open-time build failed, a guard and its `_get_worker()` binding; `_sweep_open_spans` gains the
+binding of `worker._offer(...)`'s verdict. All three are filed above.
+
+**Raised at SPEC-091, 101 -> 104 and 4 -> 15, to the counts `_per_module_sites()` measured on its
+branch.** `_lifecycle` gains three, all filed above: `_flush_worker`'s registry sweep and its guard,
+and `_sweep_every_registered_span`'s binding. `decorator` gains eleven: the open-time build's
+existence read in `_begin`; five `_sweep_held_here()` checks, one per hold site, and the
+`span.held` read in `_sweep_registered`, all six matched only by the `held` sentinel;
+`_sweep_open_spans`' announcement guard; the two reads of `_drain_deferred_closes`; and
+`continue_trace`'s binding of `_adopt_unswept`, which `_accessor_names` derives because one of its
+refusal texts contains the word `worker`.
 
 **Raised from 100 to 101 at SPEC-089's execution-frame review, to the count measured on its
 branch.** The wait for a dying drain moved into `_await_accounting`, sliced so that a forked thread

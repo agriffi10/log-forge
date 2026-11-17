@@ -606,7 +606,7 @@ specs:
   - id: "SPEC-091"
     title: "An Open Span's Events Ship on the Worker's Interval"
     description: "Has the worker take every open span's buffered events about once a flush interval, on its own thread and exactly once, so a process killed mid-handler loses at most about one interval of a span's events rather than the whole span, and states plainly what a kill still loses."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-015", "SPEC-024", "SPEC-036", "SPEC-039", "SPEC-050", "SPEC-085", "SPEC-088", "SPEC-089", "SPEC-090"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-091-open-span-events-ship-on-the-interval.md"

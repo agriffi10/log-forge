@@ -1253,17 +1253,23 @@ def factory(hooks: Hooks) -> Callable[[], Recorder]:
     return build
 
 
-def stranded_markers() -> int:
-    """Counts the flush markers left on the worker's queue, which ``health().queued`` counts.
+def span_ends_queued() -> int:
+    """Counts the ``span.end`` events in the submissions still on the worker's queue (SPEC-091).
 
-    The rule of ``tests/test_invariants_model.py``'s ``_stranded_markers``, written again here
-    because the model files import nothing from ``tests/`` but the child runner.
+    The spans identity's queued term, restated in events: ~~``health().queued`` less the
+    stranded markers~~. A submission the worker's sweep or a ``flush()``'s registry sweep made
+    holds an open span's logs and no ``span.end``, so counting submissions read one queued span
+    per swept submission left on a retired worker's queue: 9 to 19 model rows went red that way
+    on the SPEC-091 prototype. Counted under the queue's mutex, so the drain cannot take an item
+    part-way through the count. ``tests/test_invariants_model.py`` imports this one helper for both
+    of its identities, so reverting the restatement is one edit
+    (``test_the_span_identity_counts_a_foreign_flushs_sweep_in_span_end_events``).
 
     Args:
       None.
 
     Returns:
-      The items on the queue that are not a submission.
+      The ``span.end`` events in queued submissions, 0 with no worker.
 
     Raises:
       None.
@@ -1272,7 +1278,13 @@ def stranded_markers() -> int:
     if worker is None:
         return 0
     with worker._queue.mutex:
-        return sum(1 for item in worker._queue.queue if not isinstance(item, list))
+        return sum(
+            1
+            for item in worker._queue.queue
+            if isinstance(item, list)
+            for event in item
+            if event.get("message") == SPAN_END
+        )
 
 
 def read_ledger(run: ChildRun) -> Ledger:
@@ -1292,7 +1304,7 @@ def read_ledger(run: ChildRun) -> Ledger:
     return Ledger(
         spans=run.spans,
         span_ends=sum(sink.count(SPAN_END) for sink in sinks),
-        queued=health.queued - stranded_markers(),
+        queued=span_ends_queued(),
         dropped=health.dropped,
         abandoned=run.abandoned,
         orphans=run.orphans,

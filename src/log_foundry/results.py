@@ -67,8 +67,9 @@ class FlushResult(_Result):
     lost events does not make the result falsy; the loss is counted in the five fields below
     instead, and :attr:`lost` is their total. Each field is named for the ``health().events``
     term it counts, and is the change in that term over the call's **window**: from just before
-    ``flush()`` sweeps the calling context's open spans to the moment the drain answers the
-    call's marker (or, where no drain answered it, to when the call reads for itself). The
+    ``flush()`` sweeps the open spans (every registered span since SPEC-091) to the moment the
+    drain answers the call's marker (or, where no drain answered it, to when the call reads for
+    itself). The
     counts are process-wide over that window, so they **over-count**: they include other
     threads' events that were ahead of the marker, other threads' submissions that overflowed
     while the call waited, and any orphan log's ``sink_lost`` in the window. A non-zero count

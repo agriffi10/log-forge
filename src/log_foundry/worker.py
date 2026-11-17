@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from log_foundry import _diag, _ledger, _lifecycle
 from log_foundry.results import FlushResult
@@ -16,6 +16,7 @@ from log_foundry.sinks._refusal import is_final_refusal
 from log_foundry.sinks._retry import floor_count
 
 if TYPE_CHECKING:
+    from log_foundry.decorator import _HandIn, _SweepResult
     from log_foundry.sinks.base import Sink, SinkLosses
 
 __all__ = ["EventLedger", "Health", "Worker"]
@@ -101,6 +102,50 @@ sink that fails after running fast abandons its batch whole, so the cap bounds t
 a module constant, not a ``Worker`` argument, because capacity is not a setting (Andrew,
 2026-11-15), and it is read at each use, as ``_JOIN_MARGIN`` is, so a test can patch it.
 """
+
+
+QUEUE_FULL = -1
+"""What :meth:`Worker._offer` returns when the queue had no room and nothing was put."""
+
+type _Totals = tuple[int, int]
+"""The ``dropped`` and ``submitted_after_shutdown`` totals one enqueue moved, each 0 if unmoved."""
+
+_SWEEP_WAIT: float = 0.05
+"""Seconds the drain thread waits for the sweep hold before it skips a sweep (SPEC-091 FR-002).
+
+Every other caller of the hold blocks; the drain alone is bounded, because it is the one thread
+the others wait on, so a thread holding the hold that then waits on the drain would otherwise wait
+on a drain waiting on it. On expiry the drain skips the sweep and tries again on its next pass, so
+a holder that keeps the hold costs the drain at most twenty idle waits a second rather than a
+spin. The longest hold measured while this was chosen, one sweep of 1,000 spans of ten events each
+(``spec091_hot_path.py hold``, 555.8 µs under a load average near 30), is about a ninetieth of it,
+so an ordinary hold never makes the drain skip. Shorter skips sweeps a busy process needs; longer
+holds a ``flush()`` made inside a hold that much longer.
+"""
+
+
+class _Sweep(Protocol):
+    """The type of ``Worker``'s ``sweep=``: ``decorator._sweep_registered`` (SPEC-091 FR-002).
+
+    A protocol rather than a ``Callable`` alias because the drain passes ``wait`` by keyword. The
+    shapes it names live in ``decorator``, imported for type checking only, so this module still
+    knows nothing of spans at runtime.
+    """
+
+    def __call__(self, hand_in: _HandIn, *, wait: float | None = None) -> _SweepResult | None:
+        """Hands in every open span's take, or takes nothing and returns ``None``.
+
+        Args:
+          hand_in: Offers one span's take, returning ``None`` when it put nothing.
+          wait: The longest wait for the sweep hold, or ``None`` to block.
+
+        Returns:
+          The events handed in, the late submissions left to count, and the hand-in faults, or
+          ``None`` when the hold was not taken.
+
+        Raises:
+          None.
+        """
 
 
 def _bounded_seconds(timeout: float | None) -> str:
@@ -731,6 +776,7 @@ class Worker:
         max_queue: int = 10_000,
         max_retries: int = 3,
         offer_signal: bool = True,
+        sweep: _Sweep | None = None,
     ) -> None:
         """Starts the drain thread and, unless told otherwise, offers the sink its stop signal.
 
@@ -826,6 +872,10 @@ class Worker:
             after releasing its lock. The library's own build does: the offer runs the sink's
             setter, and a setter that logs or calls ``configure()`` waited on the lock the build
             held (``_lifecycle._get_worker``).
+          sweep: The sweep of open spans the drain runs about once a flush interval, or ``None``
+            (SPEC-091 FR-002). The library's own build passes ``decorator._sweep_registered`` and
+            nothing else passes one, so a worker a test builds by hand sweeps nothing and this
+            module still knows nothing of spans.
 
         Returns:
           None.
@@ -876,6 +926,7 @@ class Worker:
         self._exit_abandoned_seen = False
         self._abandoned_tally = (0, 0)
         self._declined_tally = (0, 0)
+        self._sweep = sweep
         if offer_signal:
             _lifecycle.offer_stop_signal(sink, self._stop)
         self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
@@ -1081,7 +1132,17 @@ class Worker:
         self._thread = thread
 
     def submit(self, events: list[dict[str, object]]) -> None:
-        """Hands a finished span's events to the worker, without blocking.
+        """Hands a submission of span events to the worker, without blocking.
+
+        ~~a finished span's events~~ — widened by SPEC-091: a submission is a span's buffer handed
+        over at its close or by an in-span ``flush()``, and the worker's own sweep and a
+        ``flush()``'s registry sweep hand in what open spans hold through :meth:`_enqueue`.
+
+        **It is** :meth:`_enqueue` **then** :meth:`_announce` (SPEC-091 FR-001), unchanged to its
+        callers. The split exists for the callers that hand in while holding
+        ``decorator._sweep_hold``: they enqueue under the hold and announce once it is released,
+        because a line written under the hold stalls every span close in the process behind a
+        wedged console, where this method's own lines were only ever kept outside ``_lock``.
 
         This enqueues via ``put_nowait`` and returns immediately without touching the sink.
         When the queue is full it drops this submission and counts it in ``dropped`` rather
@@ -1142,6 +1203,33 @@ class Worker:
         Raises:
           None.
         """
+        self._announce(self._enqueue(events, count_retired=True))
+
+    def _enqueue(self, events: list[dict[str, object]], *, count_retired: bool) -> _Totals:
+        """Puts one submission on the queue and counts its overflow or retirement, writing nothing.
+
+        :meth:`submit`'s counting half (SPEC-091 FR-001), in the order :meth:`submit` documents:
+        the put; on a full queue, ``dropped`` and ``_overflow_lost`` under ``_lock``; otherwise,
+        when ``count_retired`` is set, the single post-put retirement read and its count. Nothing
+        after a put that succeeded can raise an ``Exception``: an attribute load, an ``int``
+        comparison and a locked increment. So a hand-in that raises raised before its events were
+        queued, which is what lets a sweep debit a raising hand-in's take to ``in_span_lost``; an
+        asynchronous ``BaseException`` landing after the put is the one residual, counted twice,
+        and recorded in ``architecture.md`` §13.
+
+        Args:
+          events: The submission, handed over whole.
+          count_retired: Whether a put after ``shutdown()`` began is counted in
+            ``submitted_after_shutdown``. The drain thread's own hand-in passes ``False``
+            (:meth:`_hand_in`).
+
+        Returns:
+          The ``dropped`` total this call moved, or 0, and the ``submitted_after_shutdown`` total
+          it moved, or 0, for :meth:`_announce`.
+
+        Raises:
+          None.
+        """
         try:
             self._queue.put_nowait(events)
         except queue.Full:
@@ -1149,23 +1237,116 @@ class Worker:
                 self.dropped += 1
                 self._overflow_lost += len(events)
                 total = self.dropped
-            if total == 1 or total % _diag.WARN_EVERY == 0:
-                _diag.lost("submission", total, "log queue full; count is cumulative")
-            return
-        if _lifecycle_state.retirements > self._epoch:
-            self._count_undeliverable()
+            return total, 0
+        if count_retired and _lifecycle_state.retirements > self._epoch:
+            return 0, self._count_undeliverable()
+        return 0, 0
 
-    def _count_undeliverable(self) -> None:
-        """Counts a post-shutdown submission and warns on the same throttle as overflow.
+    def _announce(self, totals: _Totals) -> None:
+        """Writes the throttled lines for the totals :meth:`_enqueue` moved (SPEC-091 FR-001).
 
-        The two conditions warrant the same treatment for the same reason (FR-002): a caller
-        making this mistake makes it on every invocation, so a line per submission would be its
-        own outage, while total silence is how the mistake survives to production. The counter
-        moves before the line is attempted, per ``_diag``'s record-first rule, and the write
-        happens outside the lock so a wedged console cannot stall the drain path.
+        :meth:`submit`'s writing half. Its callers hold no library lock: a hand-in made inside
+        ``decorator._sweep_hold`` is announced by its caller once the hold is released. The lines
+        and their throttle are the ones :meth:`submit` always wrote: a line at the first count and
+        every ``WARN_EVERY`` after, since a caller making either mistake makes it on every call.
 
         Args:
+          totals: The ``dropped`` and ``submitted_after_shutdown`` totals one enqueue moved, each
+            0 when it moved nothing.
+
+        Returns:
           None.
+
+        Raises:
+          None.
+        """
+        dropped, late = totals
+        if dropped and (dropped == 1 or dropped % _diag.WARN_EVERY == 0):
+            _diag.lost("submission", dropped, "log queue full; count is cumulative")
+        if late and (late == 1 or late % _diag.WARN_EVERY == 0):
+            _diag.lost(
+                "submission",
+                late,
+                "logged after shutdown(), which is terminal; nothing will drain these. Use "
+                "flush() in a process that logs again. Count is cumulative",
+            )
+
+    def _offer(
+        self,
+        events: list[dict[str, object]],
+        *,
+        count_retired: bool,
+        wait: float = _SWEEP_WAIT,
+        past_capacity: bool = False,
+    ) -> int | None:
+        """Puts a sweep's take on the queue if there is room, never dropping and never blocking.
+
+        The hand-in every sweep makes inside the sweep hold (SPEC-091, diff review frame 2). It is
+        ``queue.Queue.put(block=False)``'s own body, taken apart so that the queue's mutex is
+        acquired with a wait of at most ``wait`` seconds: under the mutex it refuses a full queue,
+        puts through :meth:`_CountingQueue._put`, so the taken-in count still moves, raises
+        ``unfinished_tasks`` and notifies ``not_empty``, exactly as ``put`` does. The mutex is a
+        plain ``Lock``, so it cannot be taken first and ``put_nowait`` called inside it. Two
+        things make it differ from :meth:`_enqueue`, and each closes a defect frame 2 measured:
+
+        - **It never drops.** A full queue returns :data:`QUEUE_FULL` with nothing put, and the
+          drain's and a ``flush()``'s registry sweep put the take back on its span, where the close
+          will ship it. Overflowing instead dropped 6,000
+          of 60,000 events with 12,000 spans open (``r_many_spans.py``).
+        - **It never waits unboundedly for a lock**, because the caller holds the sweep hold. A
+          thread inside the queue's section that then takes the hold, as ``_abandon`` or
+          ``continue_trace()`` would from a collector callback there, waited on a sweep that waited
+          on it; the bound lets the sweep give up and release the hold, and keeps the drain from
+          waiting for ever. It does not rescue a span **closed** inside the queue's section: that
+          close's own submit then waits on the mutex its thread holds, a plain ``Lock``, as it did
+          before SPEC-091 (``r_mutex_cycle.py``, ``architecture.md`` §13). The worker's ``_lock``
+          is not taken at all: there is no overflow to count, and the retirement read's count is
+          returned for the caller to make through :meth:`_settle_late` once the hold is released.
+
+        **At exit the capacity check is skipped** (diff review, execution frame). The exit drain's
+        one sweep passes ``past_capacity=True``: the drain thread is the queue's only consumer, and
+        it fixes its bound on what it takes right after this sweep, so a put past ``max_queue``
+        there costs at most the open spans' takes once. Refused on a full queue, those takes stayed
+        on their spans, and a span the process never closes, a daemon thread's, lost them
+        uncounted: 0 of 5 with the queue full at ``shutdown()`` (``exit_full.py``).
+
+        Args:
+          events: One span's take, offered whole as one submission.
+          count_retired: Whether a put after ``shutdown()`` began is to be counted as late.
+          wait: The longest wait for the queue's mutex, in seconds.
+          past_capacity: Whether to put whatever the queue holds, which only the exit drain's
+            sweep asks for.
+
+        Returns:
+          ``None`` when the mutex was not free within ``wait`` and :data:`QUEUE_FULL` when the
+          queue had no room, each having put nothing; otherwise 1 when the put is late and
+          ``count_retired`` is set, for the caller to count after the hold, and 0 otherwise.
+
+        Raises:
+          None.
+        """
+        q = self._queue
+        if not q.mutex.acquire(timeout=wait):
+            return None
+        try:
+            if not past_capacity and 0 < q.maxsize <= q._qsize():
+                return QUEUE_FULL
+            q._put(events)
+            q.unfinished_tasks += 1
+            q.not_empty.notify()
+        finally:
+            q.mutex.release()
+        return 1 if count_retired and _lifecycle_state.retirements > self._epoch else 0
+
+    def _count_overflow(self, events: int) -> None:
+        """Counts one submission the caller's own ``flush()`` sweep could not queue, after the hold.
+
+        The caller's own sweep keeps SPEC-089's overflow (FR-003 AC-3): its buffer is dropped and
+        counted, in ``dropped`` and ``overflow_lost``, as :meth:`_enqueue` counts one. It is counted
+        here, with no sweep hold held, so ``_lock`` is never taken under it.
+
+        Args:
+          events: The events of the dropped buffer.
 
         Returns:
           None.
@@ -1174,15 +1355,126 @@ class Worker:
           None.
         """
         with self._lock:
+            self.dropped += 1
+            self._overflow_lost += events
+            total = self.dropped
+        self._announce((total, 0))
+
+    def _settle_late(self, late: int) -> None:
+        """Counts and announces the late submissions a sweep's offers left, with no hold held.
+
+        Args:
+          late: How many of the sweep's puts landed after ``shutdown()`` began.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        for _ in range(late):
+            self._announce((0, self._count_undeliverable()))
+
+    def _hand_in(self, events: list[dict[str, object]]) -> int | None:
+        """Offers a submission the drain thread's own sweep took, with no retirement read.
+
+        The drain thread that hands this submission in is the thread whose exit drain takes it,
+        so a ``shutdown()`` never strands it (SPEC-091 FR-002): the exit drain sweeps before it
+        fixes its bound. A drain that dies, or an exit that expires first, leaves it in SPEC-088's
+        ``stranded`` or ``in_flight``, as any queued submission. Counting it in
+        ``submitted_after_shutdown`` would print "nothing will drain these" over events the exit
+        drain then delivers.
+
+        Args:
+          events: One open span's take.
+
+        Returns:
+          What :meth:`_offer` returned: ``None`` when nothing was put, else 0.
+
+        Raises:
+          None.
+        """
+        return self._offer(events, count_retired=False)
+
+    def _hand_in_at_exit(self, events: list[dict[str, object]]) -> int | None:
+        """Offers a take the exit drain's one sweep made, past the queue's capacity.
+
+        The exit drain is about to take what the queue holds and nothing reads it afterwards, so a
+        full queue there must not leave the open spans' events where no close may come for them
+        (:meth:`_offer`). The mutex is still taken with a bounded wait.
+
+        Args:
+          events: One open span's take.
+
+        Returns:
+          What :meth:`_offer` returned: ``None`` when the mutex was not free in time, else 0.
+
+        Raises:
+          None.
+        """
+        return self._offer(events, count_retired=False, past_capacity=True)
+
+    def _run_sweep(self, *, at_exit: bool = False) -> int | None:
+        """Sweeps every open span into this queue from the drain thread, absorbing a fault.
+
+        SPEC-091 FR-002. The sweep is the callable the owner passed as ``sweep=``,
+        ``decorator._sweep_registered``, called with :meth:`_hand_in` and a bounded wait for the
+        sweep hold, :data:`_SWEEP_WAIT`: the drain is the one thread every other waits on, so a
+        thread that holds the hold and then waits on the drain (a collector callback inside a hold
+        calling ``flush()``, ``shutdown()`` or a sink swap) would otherwise wait on a drain that
+        waits on it. Every late submission and fault the sweep hands back is counted and announced
+        here, after the hold is released, never under it. An ``Exception`` from the sweep itself is
+        absorbed and announced by type; the events it had not yet taken stay on their spans.
+
+        Args:
+          at_exit: Whether this is the exit drain's sweep, which hands in past the queue's
+            capacity (:meth:`_hand_in_at_exit`).
+
+        Returns:
+          The events handed in, 0 when there is no sweep or it failed, and ``None`` when the
+          sweep took nothing because the hold was not free within the wait (or this thread
+          already held it).
+
+        Raises:
+          None.
+        """
+        sweep = self._sweep
+        if sweep is None:
+            return 0
+        try:
+            hand_in = self._hand_in_at_exit if at_exit else self._hand_in
+            result = sweep(hand_in, wait=_SWEEP_WAIT)
+        except Exception as exc:
+            _diag.absorbed("sweeping open spans", exc, "events not yet taken stay on their spans")
+            return 0
+        if result is None:
+            return None
+        handed, late, faults = result
+        self._settle_late(late)
+        for fault in faults:
+            _diag.absorbed("handing in an open span's events", fault, "the events taken were lost")
+        return handed
+
+    def _count_undeliverable(self) -> int:
+        """Counts a post-shutdown submission under the lock, writing nothing.
+
+        The count's line is :meth:`_announce`'s now (SPEC-091 FR-001): it moved out so that a
+        hand-in made inside the sweep hold writes nothing there. It keeps the throttle it had,
+        and the counter still moves before the line is attempted, per ``_diag``'s record-first
+        rule.
+
+        Args:
+          None.
+
+        Returns:
+          The new ``submitted_after_shutdown`` total.
+
+        Raises:
+          None.
+        """
+        with self._lock:
             self.submitted_after_shutdown += 1
-            total = self.submitted_after_shutdown
-        if total == 1 or total % _diag.WARN_EVERY == 0:
-            _diag.lost(
-                "submission",
-                total,
-                "logged after shutdown(), which is terminal; nothing will drain these. Use "
-                "flush() in a process that logs again. Count is cumulative",
-            )
+            return self.submitted_after_shutdown
 
     @property
     def draining(self) -> bool:
@@ -2335,6 +2627,26 @@ class Worker:
         carry emit as long as the interval left the time trigger to fire on the very next take,
         and a per-event sink under a backlog was handed single-span batches.
 
+        **The sweep keeps a clock of its own** (SPEC-091 FR-002). With ``sweep=`` set, the top of
+        each pass runs :meth:`_run_sweep` once ``flush_interval`` has passed since ``last_sweep``,
+        and a sweep that handed anything in sets ``last_flush`` back by one interval, so the time
+        trigger fires on the take that follows and the swept submission leaves with it. The wait
+        is the smaller of the two remainders, and reads ``last_sweep`` only when ``sweep=`` is set,
+        so a worker built by hand waits as it always did. Two alternatives were measured and
+        rejected: a sweep tied to the time trigger never ran while the count trigger kept firing,
+        and one that did not make the trigger due waited for the next, up to two intervals. A
+        sweep that could not take the hold within :data:`_SWEEP_WAIT` leaves ``last_sweep`` as it
+        was and is tried again on the next pass. Under a backlog a carry right after a sweep
+        restarts ``last_flush``, so the swept submission waits behind the backlog like any queued
+        submission; the one-interval bound is a drain's without a backlog. **A skipped sweep waits
+        an interval too** (diff review, frame 2): one that could not take the hold within
+        :data:`_SWEEP_WAIT` sets ``last_sweep`` to the clock read after the attempt, so it is tried
+        again an interval later, not on every pass. Retrying every pass made each pass wait out the
+        bound while another thread held the hold, which slowed the drain to about twenty
+        submissions a second: a ``flush()`` made inside a hold with 200 submissions queued ahead of
+        its marker returned after 11.46 s (``r_hold_backlog.py``). A sweep that stopped because the
+        queue was full or its lock busy has run, and waits an interval like any other.
+
         The shutdown sentinel **breaks** rather than falling through to the loop condition.
         :meth:`shutdown` queues it before setting ``_stop``, so a thread that takes it may find
         ``_stop`` still clear; continuing would re-enter ``get`` and block for another
@@ -2353,9 +2665,19 @@ class Worker:
         Raises:
           Exception: Whatever the queue or a final drain raises; :meth:`_run` is the guard.
         """
-        last_flush = time.monotonic()
+        last_flush = last_sweep = time.monotonic()
         while not self._stop.is_set():
-            timeout = max(0.0, self.flush_interval - (time.monotonic() - last_flush))
+            now = time.monotonic()
+            if self._sweep is not None and now - last_sweep >= self.flush_interval:
+                handed = self._run_sweep()
+                last_sweep = now if handed is not None else time.monotonic()
+                if handed:
+                    last_flush = now - self.flush_interval
+            now = time.monotonic()
+            timeout = self.flush_interval - (now - last_flush)
+            if self._sweep is not None:
+                timeout = min(timeout, self.flush_interval - (now - last_sweep))
+            timeout = max(0.0, timeout)
             try:
                 item = self._queue.get(timeout=timeout)
             except queue.Empty:
@@ -2807,13 +3129,24 @@ class Worker:
         backlog in one call left a ``shutdown()`` that ran out of time with nearly 20,000 events
         inside one call whose outcome nobody would learn.
 
-        **It takes at most the entries the queue held when it began**, read in its first
-        statement, so a caller that keeps logging after ``shutdown()`` cannot keep it running:
-        what arrives later stays queued, in ``stranded`` and ``submitted_after_shutdown``. A
-        sentinel put after that read is never taken, so the window a late sentinel strands in
-        now opens when this drain begins rather than where its one pull loop used to end, which
-        widens it by that loop's duration, sub-millisecond to a few milliseconds
-        (``architecture.md`` §12).
+        **It sweeps open spans first** (SPEC-091 FR-003), with one :meth:`_run_sweep` before the
+        bound is read, so the events open spans hold when the drain stops are inside the bound and
+        ship in the exit batches by SPEC-090's rule and under its budget. ``span.start`` stays
+        held, so a span still open then ships its boundary events later, counted after shutdown,
+        or not at all if the process ends first. The attempt waits for the sweep hold no longer
+        than the steady drain does; a span whose events it could not take keeps them. It hands in
+        **past ``max_queue``** (:meth:`_hand_in_at_exit`): this drain is the queue's only consumer
+        and reads its bound right after, so a full queue at the stop no longer leaves a daemon
+        thread's span with its events and no close to ship them, which delivered 0 of 5, uncounted
+        (diff review, execution frame).
+
+        **It takes at most the entries the queue held when it began**, read ~~in its first
+        statement~~ right after that sweep, so a caller that keeps logging after ``shutdown()``
+        cannot keep it running: what arrives later stays queued, in ``stranded`` and
+        ``submitted_after_shutdown``. A sentinel put after that read is never taken, so the window
+        a late sentinel strands in now opens when this drain begins rather than where its one pull
+        loop used to end, which widens it by that loop's duration, sub-millisecond to a few
+        milliseconds (``architecture.md`` §12).
 
         **A marker is answered where it is met**, through :meth:`_answer_marker`, after the
         batch ahead of it is emitted, so a ``flush()`` that raced ``shutdown()`` is answered by
@@ -2835,6 +3168,8 @@ class Worker:
         Raises:
           BaseException: Whatever an exit batch raises; :meth:`_run` is the guard.
         """
+        if self._sweep is not None:
+            self._run_sweep(at_exit=True)
         budget = self._queue.qsize()
         try:
             while budget > 0:

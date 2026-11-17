@@ -4072,6 +4072,12 @@ def _get_worker() -> Worker:
     stop's last take, not the end of the registration window; a worker built a moment earlier
     already got that outcome as the late worker. A build after the last take still delivers.
 
+    **The worker sweeps open spans** (SPEC-091 FR-002): this build passes
+    ``decorator._sweep_registered`` as ``sweep=``, the one caller that does, so the drain thread
+    takes every open span's buffered events about once a flush interval. Since SPEC-091 the first
+    caller is a span's open (``decorator._begin``), not its close; ~~it is a span closing, or a
+    ``flush()`` sweeping one, that builds it~~.
+
     **The sink is handed its stop signal after the lock is released**, not by ``Worker.__init__``
     inside it: a setter is the sink's own code, and one that logs or calls ``configure()`` on
     this thread waited on the lock its own thread held. The build opens a hand token before it
@@ -4127,6 +4133,7 @@ def _get_worker() -> Worker:
     worker = _state.worker_exists()
     if worker is None:
         from log_foundry.config import _ensure_sink
+        from log_foundry.decorator import _sweep_registered
         from log_foundry.worker import Worker
 
         token: object | None = None
@@ -4141,7 +4148,7 @@ def _get_worker() -> Worker:
                     deferred = bool(_state._stops_running) and _state._closes.defer_hand(sink)
                     if not deferred and not handing_here(sink):
                         token = _open_hand()
-                    worker = Worker(sink, offer_signal=False)
+                    worker = Worker(sink, offer_signal=False, sweep=_sweep_registered)
                     _state._worker = worker
                     if _state._shutdown_running > 0:
                         _state._late_worker = worker
@@ -6333,6 +6340,21 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     that buffer, so the events most worth saving before a freeze were the ones left there. The
     reason reported is the most upstream failure, because that is the one to fix.
 
+    **It sweeps every registered span, not only the caller's** (SPEC-091 FR-003). After the
+    caller's own context is swept, which ships its spans whole with ``span.start`` backfilled,
+    :func:`_sweep_every_registered_span` hands in what every other thread's and task's open span
+    holds, past its held ``span.start``. ~~The bound is the calling context~~, which
+    ``contextvars`` forced, is widened: the registry removes it. Both sweeps run inside the
+    window. A sweep that raises, takes nothing because this thread already holds the sweep hold,
+    or meets a hand-in fault reports ``"abandoned"``, as a failed own-context sweep always did.
+    ~~an overflow either causes is in this call's counts~~ — revised at SPEC-091's diff review,
+    frame 2: a sweep never overflows. When the queue is full, or its lock busy past the sweep's
+    bound, the registry sweep leaves other threads' events on their spans for the next sweep or
+    the close and the call's reason is what it would otherwise be, since nothing was lost; the
+    caller's own sweep, which this call was asked to deliver, reports ``"abandoned"``. With no
+    worker, because the open-time build failed, the call builds one when a registered span holds
+    events, as the caller's own sweep already does.
+
     Raises:
       None. A flush is the call most likely to be made in a ``finally``, so the library must
         never be the reason a caller's function fails; a failure is reported by the return
@@ -6346,11 +6368,19 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     counted = start is not None
     swept = True
     try:
-        _sweep_open_spans()
+        swept = _sweep_open_spans() is not False
     except Exception as exc:
         _diag.absorbed("sweeping open spans for a flush", exc, "buffered events were not swept")
         swept = False
     worker = _state.worker_exists()
+    if worker is None and swept and _registered_spans_hold_events():
+        try:
+            worker = _get_worker()
+        except Exception as exc:
+            _diag.absorbed("starting the worker for a flush", exc, "buffered events were not swept")
+            swept = False
+    if worker is not None and swept:
+        swept = _sweep_every_registered_span(worker)
     drained: FlushResult = FlushResult(ok=True)
     marker: _FlushMarker | None = None
     thread_died = False
@@ -6368,6 +6398,87 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     if not sink_drained:
         return _with_counts(FlushResult(ok=False, reason="sink-flush"), start, end)
     return _with_counts(drained, start, end)
+
+
+def _registered_spans_hold_events() -> bool:
+    """Reports whether some registered open span holds events a sweep would take.
+
+    It lets ``flush()`` build the worker its registry sweep needs, as the caller's own sweep
+    already does, when the open-time build failed (diff review, frame 2): with no worker the
+    registry sweep was skipped, and a ``flush()`` reported success over another thread's buffered
+    logs (``r_no_worker_flush.py``). It reads a copy of the registry without the sweep hold, as a
+    hint only; the sweep itself re-reads each span under the hold.
+
+    Args:
+      None.
+
+    Returns:
+      Whether any registered span that has not begun closing holds more than its held events.
+
+    Raises:
+      None.
+    """
+    from log_foundry import decorator
+
+    return any(
+        len(span.events) > span.held
+        for span in decorator._open_spans.copy().values()
+        if not span.closed
+    )
+
+
+def _sweep_every_registered_span(worker: Worker) -> bool:
+    """Hands every registered open span's buffered events to ``worker`` for a ``flush()``.
+
+    SPEC-091 FR-003. ``decorator._sweep_registered`` runs with ``Worker._offer``, keeping the
+    retirement read, so a ``flush()`` after ``shutdown()`` hands to a retired worker and is counted
+    as such, and it blocks for the sweep hold as every caller but the drain does. Every late
+    submission and fault it hands back is counted and announced here, once the hold is released.
+
+    **A full queue leaves other threads' events on their spans** (diff review, frame 2). An offer
+    that finds the queue full, or its lock busy past the sweep's bound, puts nothing, the take goes
+    back on its span and the sweep stops; those events wait for the next sweep or the span's close,
+    and nothing is lost, so this does not make the call ``"abandoned"``.
+
+    Args:
+      worker: The process worker.
+
+    Returns:
+      ``False`` when the sweep raised, took nothing because this thread already held the sweep
+      hold, or lost a take to a hand-in fault; ``True`` otherwise, including a sweep that stopped
+      on a full queue with its takes back on their spans.
+
+    Raises:
+      None.
+    """
+    from log_foundry.decorator import _sweep_registered
+
+    def hand_in(events: list[dict[str, object]]) -> int | None:
+        """Offers one span's take with the retirement read kept.
+
+        Args:
+          events: One open span's take.
+
+        Returns:
+          ``None`` when nothing was put, else the late submissions the put leaves to count.
+
+        Raises:
+          None.
+        """
+        return worker._offer(events, count_retired=True)
+
+    try:
+        result = _sweep_registered(hand_in)
+    except Exception as exc:
+        _diag.absorbed("sweeping open spans for a flush", exc, "buffered events were not swept")
+        return False
+    if result is None:
+        return False
+    _, late, faults = result
+    worker._settle_late(late)
+    for fault in faults:
+        _diag.absorbed("handing in an open span's events", fault, "the events taken were lost")
+    return not faults
 
 
 def _open_window() -> tuple[int, EventLedger] | None:
@@ -6742,6 +6853,35 @@ def _ledger_snapshot() -> EventLedger:
     return _ledger_reading().ledger
 
 
+def _forget_open_spans_after_fork() -> None:
+    """Has a forked child's sweep forget every span the parent had open (SPEC-091 FR-003).
+
+    The child's drain must never ship a parent's pending event, which is *A value the child
+    inherits is stranded, never merely detached*: without this step the child wrote all 8 of the
+    parent's pre-fork events again (``spec091_fork.py``). It runs immediately before
+    :func:`_rebuild_worker_after_fork`, so the registry is empty before the child's drain thread
+    resumes, and after :func:`_restart_ledger_after_fork`, which reads the ledger's cells and never
+    the registry. It is registered here rather than from ``decorator``, which imports this module,
+    so a registration there would run after the rebuild; and never with ``os.register_at_fork``,
+    which the package holds to one registration. ``decorator`` is imported lazily for the same
+    import-order reason. The forgotten spans stay in the child's ``open_spans``, as SPEC-088 FR-005
+    records for spans of other threads, and the forking thread's own copies still ship at their
+    close in the child.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    from log_foundry import decorator
+
+    decorator._forget_open_spans_in_child()
+
+
 def _ledger_snapshot_if_free() -> EventLedger | None:
     """Returns one reading of the event ledger, or ``None`` when the registration lock is taken.
 
@@ -6783,4 +6923,5 @@ _fork.register_child_handler(_reclaim_after_fork)
 _fork.register_child_handler(_clear_after_fork)
 _fork.register_child_handler(_adopt_factory_after_fork)
 _fork.register_child_handler(_restart_ledger_after_fork)
+_fork.register_child_handler(_forget_open_spans_after_fork)
 _fork.register_child_handler(_rebuild_worker_after_fork)

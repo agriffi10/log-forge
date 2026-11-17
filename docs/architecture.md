@@ -45,7 +45,7 @@ We adopt standard observability terms (matches OpenTelemetry / ELK conventions):
 | **trace** | One logical end-to-end flow. Shares a single `trace_id` across every nested decorated call. |
 | **span** | One decorated function call. Has its own `span_id`, a start, an end, a duration, and a status. |
 | **log event** | One structured record a user emits inside a span (`info`, `error`, …). Has its own `log_id`. |
-| **queue** | The in-memory buffer of log events belonging to one span, flushed together at span end. |
+| **queue** | The in-memory buffer of log events belonging to one span. ~~Flushed together at span end.~~ Since SPEC-091 the worker takes what it holds past `span.start` about once a flush interval while the span is open, and the close hands over the rest. |
 | **sink** | The configured output destination (SQS, stdout, file, HTTP, …). |
 
 ---
@@ -102,19 +102,24 @@ trace_id = 7f3a9e...                         (one flow)
 ```
 @log_foundry.trace
 def process_payment(...):       # ── on enter ──────────────────────────────
+                                #  • build the process worker if none exists yet
                                 #  • resolve context: parent span? → inherit trace_id,
                                 #    set parent_span_id;  else → new trace_id, parent=null
                                 #  • mint span_id, record start_ts, capture function name,
                                 #    merge config defaults
-                                #  • push this span onto the context stack
+                                #  • push this span onto the context stack, then register
+                                #    it as open
     log_foundry.info("charging")   #  • append a log event (trace_id + new log_id stamped)
-    ...                         #
+    ...                         #  ── while open, about once a flush interval ──
+                                #  • the worker's thread takes the buffered events past
+                                #    span.start, in place, and ships them (SPEC-091)
                                 # ── on exit (success OR exception) ─────────
+                                #  • unregister the span, before span.end is built
                                 #  • record end_ts, duration, status (ok|error)
                                 #  • on error: capture exception type + traceback,
                                 #    then RE-RAISE (log-foundry never swallows)
                                 #  • pop the context stack
-                                #  • enqueue the finished span's queue to the worker
+                                #  • enqueue what the span still holds to the worker
 ```
 
 The decorator is **non-swallowing**: exceptions are recorded and re-raised unchanged.
@@ -580,7 +585,8 @@ know about spans or context.
 *(Decision: background, non-blocking flush.)*
 
 **An explicit `flush()` drains three places, not one** (SPEC-036): the worker's queue, the events
-still buffered on spans open in the **calling context** (FR-001), and whatever the sink is holding
+still buffered on **open** spans (FR-001; ~~in the calling context~~ every open span in the
+process since SPEC-091, below), and whatever the sink is holding
 in its own **client** (FR-002 — `KafkaSink` hands to librdkafka, `GooglePubSubSink` to an
 unresolved future, `SentrySink` to the SDK's background transport, `LoggingSink` to a handler
 chain). The third runs **after** the queue drain, because the queue's events have to reach the
@@ -598,17 +604,33 @@ the same list object the worker was just handed), and completes the boundary eve
 `span.start` therefore carries the baggage as of the flush rather than as of the close, which is a
 real semantic change and the alternative is mutating an event the worker already owns (§9.2,
 SPEC-028). It builds the worker when it has something to submit, which narrows SPEC-013's
-"a process that never logged has nothing to drain" rather than contradicting it.
+"a process that never logged has nothing to drain" rather than contradicting it. Since SPEC-091
+the first span's open builds the worker, so that build is reached only when the open's failed.
 
-Its bound is the calling context, and that is honest rather than incidental: `contextvars` offers
-no way to enumerate another thread's or task's context. A span swept this way is marked, and a
-later `continue_trace()` on it refuses the trace context rather than re-parenting a buffer whose
-events have already left — otherwise one span carries two trace ids, which is the SPEC-024
-category of wrong data rather than lost data.
+~~Its bound is the calling context, and that is honest rather than incidental: `contextvars` offers
+no way to enumerate another thread's or task's context.~~ **Widened by SPEC-091.** Every open span
+is registered (`decorator._open_spans`) from its push until its close begins, so the bound is no
+longer the calling context. A `flush()` ships the calling context's spans whole, as above, and then
+hands in what every other thread's and task's open span has buffered past its `span.start`. The
+worker does the same on its own thread about once a flush interval, so an open span's events
+leave before it closes and a kill loses about one interval of them rather than the whole span
+(§13). Those takes are **in place**: the span keeps its list, `span.start` stays on it for the
+close's backfill, and a span whose close has begun is never taken from. Every write to a span's
+buffer other than an append, and `continue_trace()`'s check and re-parent, happens inside one
+sweep hold, an `RLock` no thread re-enters; the drain waits for it at most `_SWEEP_WAIT`. The rule,
+what was measured and what was rejected: *An open span's events ship on the worker's interval*
+(`docs/decisions/pipeline/`).
+
+A span a sweep has taken from is marked, and a later `continue_trace()` on it refuses the trace
+context rather than re-parenting a buffer whose events have already left — otherwise one span
+carries two trace ids, which is the SPEC-024 category of wrong data rather than lost data. Since
+SPEC-091 that refusal depends on timing: any sweep, the worker's or any thread's `flush()`, marks
+the root span, so a `continue_trace()` made after the root span has logged can be refused, and one
+made on the entry point's first line never is.
 
 ```
-decorated call ends
-   │  enqueue finished span's events  (fast, in-process handoff)
+decorated call ends, or the worker's interval sweep takes from an open span
+   │  enqueue the span's events  (fast, in-process handoff)
    ▼
 [ in-memory worker queue ]  ──►  background worker thread
    │                                • drains the queue
@@ -1369,13 +1391,6 @@ close it.
   closer takes and closes the sink under the emit that called it. A sink whose `emit` and `close`
   share a non-reentrant lock never returns from `info()`. The same before SPEC-068. **Closed by** a
   per-thread inside-emit marker set around the orphan path's `sink.emit`, which `held()` consults.
-- **An empty batch submitted after a `shutdown()` is counted as queued, counted as submitted after
-  shutdown and announced as a lost submission** (SPEC-085; invariant 2). Measured at `a0f44b5f`,
-  8 cells red: `flush` then `shutdown` from the setter during the worker's build: the span is
-  delivered once, yet `queued=1` with an empty list on the retired queue,
-  `submitted_after_shutdown=1` and one "lost 1 submission(s)" line. `shutdown` then `flush`:
-  `queued=2`, `submitted_after_shutdown=2` for one span. **Closed by** not submitting, or not
-  counting, a batch with no events.
 - **A sink first written by an orphan log made inside a `shutdown()`'s close is not closed by that
   `shutdown()`** (SPEC-085; invariant 5, first observable). Measured at `a0f44b5f`, 2 cells red:
   `configure(sink=B)` then `info()` from inside the close: B has one write and no close when
@@ -1687,21 +1702,6 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (`docs/decisions/sink-lifecycle/`) and invariant 3's sentence that a shutdown cuts every backoff
   short. The alternative is to record it as a trade beside *A shutdown shortens a wait; it must
   never skip work*. It shares the exit drain with the dead-sink item above.
-- **A span's events stay on the span until it closes, so a process killed mid-handler loses the
-  whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
-  document states it). By the core frame's reading, only the close, or a `flush()` called on the
-  same thread or task from inside the traced code, moves a span's buffer to the worker: the worker's
-  time and count triggers read the queue only, and `shutdown()` does not sweep.
-  `docs/audits/2026-11-14-probes/core-pipeline/p12_kill.py`: a `SIGKILL` 3.5 s into an open root
-  span delivered 0 of its 51 events and 9 of 9 from its closed child spans, and a `SIGTERM` straight
-  after five spans closed delivered 0 of 15 with nothing on stderr. `README.md:1455-1512` covers a
-  Lambda freeze and not a timeout or out-of-memory kill, and neither the README nor this document
-  says that a `SIGKILL`, a `SIGTERM` or `os._exit` loses what is buffered. **Closed by** Andrew's
-  decision on whether an open span's events leave before the span closes, and then by whatever that
-  decision needs. Shipping them on the worker's interval is the orchestrating session's proposed
-  direction; it was put to him as his call, with no recommendation attached, and was unanswered when
-  this was written. Whichever way he answers, the documents still owe the sentence that a kill loses
-  what is buffered.
 - **`shutdown()` called from a signal handler deadlocks for good when the signal interrupts a
   library lock section** (2026-11-14 audit, finding 3; invariants 1 and 3). `Runtime._lock` is a
   plain `threading.Lock` (`_lifecycle.py:1018`) and `_shutdown_worker` takes it at `:5273`, so a
@@ -1725,7 +1725,19 @@ an item leaves this list when a spec closes it, not because the arc names it.
   drain's reading when it answers a counted marker, which **only tries** the lock: a `flush()` or
   `shutdown()` made inside the section waits on the drain, so a drain waiting on the lock waited
   on its own waiter, and `flush(None)` from a collector callback never returned (SPEC-089's second
-  diff review). A handler on a thread inside any of the other locks still waits. One nesting remains, and it is
+  diff review). SPEC-091 adds `decorator._sweep_lock`, which the drain thread now takes every
+interval, and which every close and `flush()` takes. It is an `RLock` entered only through
+`_sweep_hold`, and every site first asks whether its own thread already holds it, so a handler
+that calls `flush()` or closes a span on a thread inside a sweep does not wait on its own thread:
+its sweep takes nothing and its close is deferred to the holder. The drain waits for it at most
+`worker._SWEEP_WAIT`, so a thread holding it that then waits on the drain is not waited on in
+turn, and a sweep takes the queue's mutex for at most the same bound and takes no other lock while
+it holds the hold (SPEC-091's diff review, frame 2), so a handler inside the queue's section on
+another thread that then takes the hold is not waited on either. A handler on a thread inside any of
+the other locks still waits, and a handler inside the queue's own section that closes a span waits
+on that section from its own thread: the close's submit takes the queue's mutex, a plain `Lock`.
+That last hang is the standard library's and predates SPEC-091: on the base `33a44e99` a traced
+close made while its thread holds the worker queue's mutex does not return either. One nesting remains, and it is
   the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
   `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
   `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
@@ -2081,6 +2093,43 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `docs/decisions/sink-delivery/` (*A destination limit the caller can configure is a constructor
   argument, defaulting to the 1.x value, under the service's ceiling*). The `KinesisSink` item
   filed with this one stays under *Open*.
+- ~~**A span's events stay on the span until it closes, so a process killed mid-handler loses the
+  whole root span**~~ (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
+  document states it). By the core frame's reading, only the close, or a `flush()` called on the
+  same thread or task from inside the traced code, moves a span's buffer to the worker: the worker's
+  time and count triggers read the queue only, and `shutdown()` does not sweep.
+  `docs/audits/2026-11-14-probes/core-pipeline/p12_kill.py`: a `SIGKILL` 3.5 s into an open root
+  span delivered 0 of its 51 events and 9 of 9 from its closed child spans, and a `SIGTERM` straight
+  after five spans closed delivered 0 of 15 with nothing on stderr. `README.md:1455-1512` covers a
+  Lambda freeze and not a timeout or out-of-memory kill, and neither the README nor this document
+  says that a `SIGKILL`, a `SIGTERM` or `os._exit` loses what is buffered. **Closed by** Andrew's
+  decision on whether an open span's events leave before the span closes, and then by whatever that
+  decision needs. Shipping them on the worker's interval is the orchestrating session's proposed
+  direction; it was put to him as his call, with no recommendation attached, and was unanswered when
+  this was written. Whichever way he answers, the documents still owe the sentence that a kill loses
+  what is buffered.
+  → **closed by SPEC-091.** Andrew answered on 2026-11-15, "Ship every ~1s (Recommended)": every
+  open span is registered, the worker is built when the first span opens, and about once a flush
+  interval the drain thread takes what each open span holds past its `span.start`; `flush()`
+  reaches every open span and the exit drain sweeps before it drains. `p12_kill.py`, before, in the
+  core frame's run at `a2cd4b36`: the `SIGKILL` root span delivered 0 of 51. After, on SPEC-091's build over
+  `33a44e99`, on 3.13.1 and 3.12.12: 50 of 51, the missing one its held `span.start`, and 9 of 9 from the
+  closed children. The `SIGTERM` case still delivers 0 of 15 on both: those five spans had closed
+  and were queued, so no sweep of open spans reaches them, and the default disposition skips
+  `atexit`. What a kill still loses is stated in §13 and the README. Decision:
+  *An open span's events ship on the worker's interval* (`docs/decisions/pipeline/`).
+- ~~**An empty batch submitted after a `shutdown()` is counted as queued, counted as submitted after
+  shutdown and announced as a lost submission**~~ (SPEC-085; invariant 2). Measured at `a0f44b5f`,
+  8 cells red: `flush` then `shutdown` from the setter during the worker's build: the span is
+  delivered once, yet `queued=1` with an empty list on the retired queue,
+  `submitted_after_shutdown=1` and one "lost 1 submission(s)" line. `shutdown` then `flush`:
+  `queued=2`, `submitted_after_shutdown=2` for one span. **Closed by** not submitting, or not
+  counting, a batch with no events.
+  → **closed by SPEC-091 FR-004.** `decorator._flush` submits nothing when the list it detached is
+  empty. The worker is now built when a span opens, so the setter's `flush` and `shutdown` run
+  before the span exists and the eight pinned cells passed even before the guard; the guard closes
+  the shape for a close whose open-time build failed. The `empty-submission` pin is removed from
+  `tests/model_pins.py` and its eight cells pass.
 - ~~**The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
   that batch behind a promise of a count that never comes**~~ (2026-11-14 audit, finding 9; invariants
   2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
@@ -2892,7 +2941,11 @@ and a third copy is a fork with no merge.
   costs +0.4% single-threaded and +0.9% across eight threads on the traced path, which is noise.
   The *append* race above — `api._log` reading the flag, building, then appending — is the one that
   stays open: closing it needs a **per-span** lock on the hottest path in the library, which is a
-  different instrument and a real cost, and it is declined here rather than in passing.
+  different instrument and a real cost, and it is declined here rather than in passing. SPEC-091's
+  worker sweep adds no instance of it: it deletes a slice **in place** and never rebinds
+  `span.events`, so an append that read the attribute before the take lands on the same list and
+  ships with the next sweep or the close. The owner's `flush()` sweep and the close still detach
+  by swap, as before.
 
   **What the event ledger makes of these windows** (SPEC-088). An event the append window strands
   is credited when it is asked for and never handed over, so it stays in
@@ -2908,17 +2961,48 @@ and a third copy is a fork with no merge.
   span the parent had open, and those on other threads of the parent are in the child's memory
   with nothing in the child to close them, so they stay in its `open_spans` for life.
 
-  `Span.swept` is not a synchronization primitive either, and the guarantee it carries is
+  ~~`Span.swept` is not a synchronization primitive either, and the guarantee it carries is
   single-threaded. `continue_trace` reads it and then re-parents across an ordinary function call,
   so a sweep landing in that gap still splits one span across two trace ids — reproduced 10 of 10
   when forced, 0 of 400 unforced, and reachable only with a shared span plus a concurrent
   `continue_trace` and `flush()`. The flag is now set *before* the detach, which narrows the
   reader's window and errs toward refusing, but only a lock held across the guard and the re-parent
-  would close it. What it cannot keep is its correlation: it becomes a standalone one-event span with
+  would close it.~~ — **closed by SPEC-091 FR-001**: every sweep sets the flag inside the sweep
+  hold, and `continue_trace` holds the same hold across its check and its re-parent
+  (`decorator._adopt_unswept`). With a 50 ms pause forced inside the re-parent and a 1 ms interval,
+  19 of 20 root spans reached the sink with two trace ids without the hold and none with it;
+  `spec091_continue_trace.py` on SPEC-091's build over `33a44e99` reads `split_spans=0`. What it cannot keep is its correlation: it becomes a standalone one-event span with
   a **fresh `trace_id`**, so it leaves the trace it was logically part of, not merely the span.
   `contextvars` offers no way to recover the parent once the span is gone, and the choice is
   against losing the event outright. Ordering is not promised either. A task whose logs must stay
   in the trace should be awaited inside the span.
+- **A process killed without a drain loses what is buffered, and no counter survives to show it**
+  (SPEC-091). `SIGKILL`, `SIGTERM` without a `shutdown()`, and `os._exit` still lose up to about
+  one flush interval of an open span's events, every still-open span's `span.start`, and whatever
+  is queued or in a batch the sink has not yet accepted. Because the sweep runs on the drain thread
+  between emits, a kill that lands while the drain is inside an emit or a retry backoff loses
+  everything logged on open spans since the last sweep, for as long as that emit has run. The
+  default `SIGTERM` disposition does not run `atexit`, and a handler that calls `shutdown()` is
+  §12's finding-3 deadlock, so no signal handler sweeps. Decision: *An open span's events ship on
+  the worker's interval* (`docs/decisions/pipeline/`).
+
+- **The open-span sweep accepts four residuals** (SPEC-091). **A `KeyboardInterrupt` landing
+  just after a successful put** in `flush()`'s registry sweep, or any other asynchronous
+  `BaseException` between the put and `Worker._offer`'s return, counts that take twice: once
+  queued and once in `in_span_lost`, since the sweep debits a take whose hand-in did not return.
+  Nothing after a put that succeeded can raise an `Exception`, so no ordinary fault reaches it.
+  **A collector callback or finalizer that runs inside a sweep hold** runs there, so its own
+  stderr lines and orphan emits are written while the hold lasts and other closes wait on it: the
+  one exception to "nothing is written to stderr under the lock", accepted because the callback's
+  own runtime already extends the hold. **A traced close made while its own thread holds the worker
+  queue's mutex**, as a collector callback inside `put_nowait`'s section could make, waits on that
+  mutex in its own submit and never returns, since `queue.Queue`'s mutex is a plain `Lock`; this
+  predates SPEC-091 (it hangs on the base `33a44e99`), and SPEC-091's sweeps do not join it: they
+  take the mutex for at most `worker._SWEEP_WAIT` and no other lock under the hold (diff review,
+  frame 2). The take's exactly-once argument rests on the GIL (each
+  `list` and `dict` operation it uses is one C call with no switch point); on a free-threaded
+  build it is unproven, and no free-threaded run was made.
+
 - **An orphan log can wait on the sink lock.** A sink holding mutable transport state serializes
   `emit` for the whole operation (§9, SPEC-028), so a level call made with no active span — which
   emits on the caller's own thread — can block behind an in-flight emit, including its retry

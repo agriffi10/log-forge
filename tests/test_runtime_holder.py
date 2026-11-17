@@ -156,7 +156,8 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
     ),
     "worker.py": collections.Counter(
         {
-            ("Worker.submit", "self._lock"): 1,
+            ("Worker._enqueue", "self._lock"): 1,
+            ("Worker._count_overflow", "self._lock"): 1,
             ("Worker._count_undeliverable", "self._lock"): 1,
             ("Worker.health", "self._lock"): 1,
             ("Worker._flush_marked", "self._lock"): 1,
@@ -191,7 +192,19 @@ worker's lock, and ``_write_exit_tallies`` takes and zeroes both exit tallies un
 that lock alone, as a leaf, so the order does not move. ``retarget`` stays at three, because its
 generation bump is inside the reassign's existing section, ``_emit`` at three, because the
 abandon tally is added inside the sections that already count ``failed_batches``, and ``stop`` at
-one."""
+one.
+
+**Moved at SPEC-091 (2026-11-17), not added.** ``Worker.submit`` was split into ``_enqueue``, which
+puts and counts, and ``_announce``, which writes, so that a hand-in made inside the sweep hold
+writes nothing there (FR-001). The overflow count's ``self._lock`` section moved with the counting
+half, unchanged in what it guards and still taken alone, so ``Worker.submit``'s site is now
+``Worker._enqueue``'s and the lock order does not move.
+
+**One site added at SPEC-091's diff review, frame 2.** ``Worker._count_overflow`` counts the buffer
+a caller's own ``flush()`` sweep could not queue, in ``dropped`` and ``_overflow_lost``, the counting
+``_enqueue`` does on overflow. It takes the worker's lock alone, as a leaf, and only after the sweep
+hold is released, which is why it exists: no lock but the queue's mutex, bounded, is taken under the
+hold, so the order does not move."""
 
 
 def _tree(name: str) -> ast.Module:

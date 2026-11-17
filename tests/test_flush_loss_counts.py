@@ -265,8 +265,15 @@ def test_a_flush_inside_a_span_counts_the_buffer_it_sweeps() -> None:
     lf.flush(10)
 
 
-def test_a_span_open_on_another_thread_is_in_no_count() -> None:
-    """FR-002 AC-7, its second half: another thread's open span is pending, not counted."""
+def test_a_span_open_on_another_thread_ships_its_logs_and_holds_its_start() -> None:
+    """FR-002 AC-7, its second half, inverted by SPEC-091 FR-004.
+
+    ~~Another thread's open span is pending, not counted~~: a ``flush()`` now sweeps every
+    registered span, so the other thread's 2 logs are handed to this sink by the call's registry
+    sweep, inside its window. The sink drops every event, so they are counted as ``sink_lost``
+    on this call, where before SPEC-091 they stayed on the span and the call counted nothing.
+    The span's ``span.start`` stays held for its close, so ``open_spans`` reads 1.
+    """
     sink = PlanSink(every(D))
     _quiet_worker(sink)
     parked = threading.Event()
@@ -275,6 +282,7 @@ def test_a_span_open_on_another_thread_is_in_no_count() -> None:
     @lf.trace
     def holds_open() -> None:
         lf.info("buffered elsewhere")
+        lf.info("buffered elsewhere too")
         parked.set()
         release.wait(10)
 
@@ -283,8 +291,8 @@ def test_a_span_open_on_another_thread_is_in_no_count() -> None:
     try:
         assert parked.wait(10)
         result = lf.flush(10)
-        assert result and _counts(result) == _only(), result
-        assert lf.health().events.open_spans == 2
+        assert result and _counts(result) == _only(sink_lost=2), result
+        assert lf.health().events.open_spans == 1, "the held span.start"
     finally:
         release.set()
         other.join(10)

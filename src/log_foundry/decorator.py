@@ -30,13 +30,394 @@ if TYPE_CHECKING:
 
 __all__ = ["continue_trace", "trace"]
 
-_sweep_lock = threading.Lock()
-"""Serializes the span sweep, so two threads cannot deliver one span's buffer twice.
+_sweep_lock = threading.RLock()
+"""Serializes every non-append write to a span's buffer, so no event is handed over twice.
 
 The detach is a load and a store, and ``contextvars`` copies the same ``Span`` object into every
 task and into any ``copy_context()`` thread, so the two-reader case is ordinary rather than exotic
 (SPEC-036 FR-001 AC-10). A flush is not a hot path; a sink lock it is not competing with.
+
+**Taken only through** :data:`_sweep_hold` (SPEC-091 FR-001), and an ``RLock`` rather than a
+``Lock``. A collector callback or a finalizer runs on whichever thread allocates, and a hold
+allocates, so one can run inside a hold and close a traced span there, or call ``flush()``: with a
+plain ``Lock`` that close took the lock again on the thread already holding it, and the sweeping
+thread never returned. An ``RLock`` alone is not enough either, because the nested close would swap
+the list a sweep is part-way through taking; so every site first asks :func:`_sweep_held_here` and,
+on the holding thread, takes nothing or defers to the holder. The owner an ``RLock`` records is
+set and cleared inside its C ``acquire`` and ``release``, so there is no moment between taking the
+lock and recording the holder in which a callback could run.
 """
+_deferred_closes: list[tuple[Span, bool]] = []
+"""Closes and abandons a nested call left to the hold's holder (SPEC-091 FR-001).
+
+Each entry is a span and whether a guard abandoned it rather than closed it. Only the thread
+holding :data:`_sweep_hold` appends, and only that thread drains, in :func:`_drain_deferred_closes`
+before the hold is released, so the list needs no lock of its own. It holds spans, never a worker,
+so no new module state holds a sink. A forked child clears it (:func:`_forget_open_spans_in_child`).
+"""
+_open_spans: dict[int, Span] = {}
+"""Every open span, keyed by ``id(span)``, from its push to the start of its close (SPEC-091).
+
+Written without a lock: :func:`_begin` registers a span with one ``__setitem__`` after its push,
+and :func:`_close_span` removes it with one ``pop`` as its first statement, before ``span.end`` is
+built. Each is one C call under the GIL. This is module state relied on across threads, which
+``best-practices/python`` §13 asks code to avoid; it is accepted deliberately, because a lock here
+would sit on every traced call's open and close, and the take rule in :func:`_sweep_registered`
+is what keeps the readers exact. A free-threaded build is not argued for (``architecture.md`` §13).
+"""
+
+type _HandIn = Callable[[list[dict[str, object]]], int | None]
+"""Offers one span's take to the queue, never dropping and never waiting unboundedly.
+
+It returns ``None`` when the queue had no room or its lock was not free within the sweep's bound,
+having put nothing, and otherwise how many late submissions the put leaves for its caller to count
+once the hold is released (``Worker._offer``): 1 for a put after ``shutdown()`` began when the
+caller keeps the retirement read, else 0. It writes nothing to stderr.
+"""
+type _SweepResult = tuple[int, int, list[Exception]]
+"""The events a sweep handed in, the late submissions it left to count, and each hand-in fault."""
+
+
+class _NotHeldError(Exception):
+    """Raised by a bounded hold's entry when the sweep lock was not free within its wait."""
+
+
+class _BoundedHold:
+    """One entry into the sweep hold, whose acquire waits at most ``wait`` seconds.
+
+    ``with _sweep_hold.within(wait):`` raises :class:`_NotHeldError` from ``__enter__`` when the
+    wait expires, so its body never runs without the lock; ``wait=None`` blocks, as ``with
+    _sweep_hold:`` does. The exit is the hold's own (:func:`_release_hold`).
+
+    Attributes:
+      None.
+    """
+
+    __slots__ = ("_wait",)
+
+    def __init__(self, wait: float | None) -> None:
+        """Records the wait.
+
+        Args:
+          wait: The longest wait for the lock in seconds, or ``None`` to block.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._wait = wait
+
+    def __enter__(self) -> None:
+        """Takes the sweep lock, or raises when it was not free within the wait.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          _NotHeldError: When the wait expired.
+        """
+        if self._wait is None:
+            _sweep_lock.acquire()
+        elif not _sweep_lock.acquire(timeout=self._wait):
+            raise _NotHeldError
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Drains the deferred closes, releases the lock, then announces what they handed in.
+
+        Args:
+          *exc_info: The exception the body raised, if any, which propagates.
+
+        Returns:
+          None.
+
+        Raises:
+          None of its own.
+        """
+        _release_hold()
+
+
+class _SweepHold:
+    """The one way to take :data:`_sweep_lock` (SPEC-091 FR-001).
+
+    ``with _sweep_hold:`` blocks for the lock, and ``with _sweep_hold.within(wait):`` waits at
+    most ``wait``. Either exit drains :data:`_deferred_closes` while the lock is still held, so a
+    close a collector callback deferred ships after the holder's own in-place work, then releases
+    the lock, then writes the deferred closes' lines with no lock held. No site enters a hold its
+    own thread already holds: each asks :func:`_sweep_held_here` first, and
+    ``tests/test_open_span_sweep.py`` derives the sites and holds them to that.
+
+    Attributes:
+      None.
+    """
+
+    __slots__ = ()
+
+    def __enter__(self) -> None:
+        """Takes the sweep lock, blocking.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        _sweep_lock.acquire()
+
+    def __exit__(self, *exc_info: object) -> None:
+        """Drains the deferred closes, releases the lock, then announces what they handed in.
+
+        Args:
+          *exc_info: The exception the body raised, if any, which propagates.
+
+        Returns:
+          None.
+
+        Raises:
+          None of its own.
+        """
+        _release_hold()
+
+    def within(self, wait: float | None) -> _BoundedHold:
+        """Returns an entry into the hold whose acquire waits at most ``wait`` seconds.
+
+        Args:
+          wait: The longest wait, or ``None`` to block.
+
+        Returns:
+          The bounded entry.
+
+        Raises:
+          None.
+        """
+        return _BoundedHold(wait)
+
+
+_sweep_hold = _SweepHold()
+"""The sweep hold every non-append write to a span's buffer is made inside (SPEC-091 FR-001)."""
+
+
+def _sweep_held_here() -> bool:
+    """Reports whether the calling thread already holds the sweep hold (SPEC-091 FR-001).
+
+    It reads the owner the ``RLock`` itself records, through ``_is_owned``, the method
+    ``threading.Condition`` uses on a lock that has it. It exists on CPython's C ``RLock`` on every
+    supported version but is not in the type stubs, hence the directive.
+
+    Args:
+      None.
+
+    Returns:
+      Whether this thread is inside a hold, as a collector callback or finalizer run inside one is.
+
+    Raises:
+      None.
+    """
+    return bool(_sweep_lock._is_owned())  # type: ignore[attr-defined]
+
+
+def _release_hold() -> None:
+    """Ends a hold: swaps the deferred closes' buffers, releases the lock, then hands them over.
+
+    The swaps run before the release, so a pass's in-place work on a span's list comes before the
+    deferred swap of that list, and ``span.end`` ships last. Everything that takes another lock
+    runs after the release (diff review, frame 2): the submit takes the queue's mutex and the
+    worker's lock, and the debit takes ``_loss_lock``, and a collector callback inside any of those
+    sections on another thread may close a span and wait on this hold, so none of them is taken
+    under it. A deferred buffer is in no term between its swap and its submit, as a closing
+    span's buffer is in :func:`_flush`; the hand-over is credited once ``submit`` returns. A fault
+    in the swaps still releases the lock, and whatever was not swapped stays deferred for the next
+    hold on this thread.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None of its own; a ``BaseException`` from the swaps propagates after the release.
+    """
+    try:
+        handovers, lost = _drain_deferred_closes()
+    finally:
+        _sweep_lock.release()
+    if lost:
+        _note_in_span_loss(lost)
+    for worker, events in handovers:
+        worker.submit(events)
+        _ledger.cell().handed += len(events)
+
+
+def _drain_deferred_closes() -> tuple[list[tuple[Worker, list[dict[str, object]]]], int]:
+    """Swaps the buffer of every close a nested call deferred to this hold, inside the hold.
+
+    Only :func:`_release_hold` calls it, while the lock is still held. Each deferred close swaps
+    its span's buffer as :func:`_flush` would and returns a non-empty one with the process worker
+    for :func:`_release_hold` to submit after the release; a deferred abandon swaps the buffer and
+    returns its size as lost, as :func:`_abandon` would. The worker always exists for a deferred
+    close, which resolved it before deferring; one that does not, which no path reaches, is
+    counted lost rather than dropped silently. It loops until the list is empty, because its own
+    allocations can run a callback that defers another. It takes no lock of its own.
+
+    Args:
+      None.
+
+    Returns:
+      The buffers to submit, each with its worker, and the events to debit to ``in_span_lost``.
+
+    Raises:
+      None.
+    """
+    handovers: list[tuple[Worker, list[dict[str, object]]]] = []
+    lost = 0
+    while _deferred_closes:
+        span, abandoned = _deferred_closes.pop(0)
+        events, span.events = span.events, []
+        if abandoned:
+            lost += len(events)
+            continue
+        if not events:
+            continue
+        worker = _lifecycle._state.worker_exists()
+        if worker is None:
+            lost += len(events)
+            continue
+        handovers.append((worker, events))
+    return handovers, lost
+
+
+def _forget_open_spans_in_child() -> None:
+    """Forgets every registered span and deferred close, in a forked child (SPEC-091 FR-003).
+
+    The child's sweep must never ship what the parent had pending, which is *A value the child
+    inherits is stranded, never merely detached*. The spans stay on the child's copy of their
+    contexts, so the forking thread's own spans still ship at their close as they did before
+    SPEC-091; only the sweep forgets them. Called from ``_lifecycle``'s child handler, ahead of the
+    worker's rebuild.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    _open_spans.clear()
+    _deferred_closes.clear()
+
+
+def _sweep_registered(hand_in: _HandIn, *, wait: float | None = None) -> _SweepResult | None:
+    """Hands in every open span's buffered events but its held ``span.start`` (SPEC-091 FR-001).
+
+    The worker's sweep, run by the drain thread about once a flush interval with the worker's
+    :meth:`~log_foundry.worker.Worker._hand_in`, and a ``flush()``'s registry sweep, run with an
+    enqueue that keeps the retirement read. It takes one pass over a copy of the registry inside
+    the hold, and for each span:
+
+    - reads ``n = len(span.events)`` **first**, then skips the span if it is no longer the
+      registered value for its id or is ``closed``. The close leaves the registry before it
+      appends ``span.end``, so a length that counts ``span.end`` is always followed by a failed
+      membership read, and a take never ships ``span.end`` early;
+    - takes ``span.events[held:n]`` and deletes that slice **in place**. The list is never rebound,
+      so an append that read the attribute before the take lands on the same list after ``n`` and
+      is taken by the next sweep or the close; a rebinding take lost one event in 36,015 to that;
+    - offers the take as **its own submission**. One submission per span keeps SPEC-090's cap
+      meaningful. When the offer is accepted it sets ``swept`` and credits the hand-over in this
+      thread's cell, so every event the credit counts is already in the queue's taken-in count
+      (SPEC-088).
+
+    **A sweep never drops** (diff review, frame 2). When the queue has no room, or its lock is not
+    free within the sweep's bound, the offer puts nothing and returns ``None``: the take goes back
+    on the span at ``held``, where it came from, so it stays in order before anything the owner
+    appended meanwhile, nothing is credited, and the pass stops. Events left on a span are safe,
+    since the close ships them. ~~``dropped`` moves by one per span whose take it could not hand
+    in~~: with one submission per span and a queue of 10,000 submissions, 12,000 open spans each
+    holding events overflowed 6,000 submissions in one pass (``r_many_spans.py 12000 3``: 54,000 of
+    60,000 delivered), where the code before SPEC-091 delivered all 60,000. The bound on the queue's
+    lock keeps a sweep from waiting for ever on a thread inside that lock's section, so a thread
+    there that then takes this hold, as ``_abandon`` or ``continue_trace()`` would from a collector
+    callback, gets it once the sweep gives up. It does not rescue a span closed inside that
+    section, whose own submit waits on the lock its thread holds (``architecture.md`` §13).
+
+    The slice and the ``del`` are outside the ``try``, so a fault there leaves the events where they
+    were. A fault in ``hand_in`` after the ``del`` means the taken events are on neither the span
+    nor the queue: they are debited to ``in_span_lost`` once the hold is released, since
+    ``_loss_lock`` is never taken under it, and the fault is kept for the caller's line.
+    ``hand_in`` raises before its put or not at all (``Worker._offer``), so a debit is never also
+    queued, except for an asynchronous ``BaseException`` landing after a put, which is debited and
+    re-raised, counted twice, and recorded in ``architecture.md`` §13. Nothing is written to stderr
+    here; the caller counts the late submissions and announces every fault once the hold is
+    released.
+
+    The cell is bound **before** the hold is taken. A thread's first credit registers its cell
+    under the ledger's registration lock, and a collector callback inside that lock's section may
+    call ``flush()``, which takes this hold; binding first keeps the two from nesting here.
+
+    Args:
+      hand_in: Offers one span's take, returning ``None`` when it put nothing.
+      wait: The longest wait for the hold, or ``None`` to block. The drain passes
+        ``worker._SWEEP_WAIT``; every other caller blocks.
+
+    Returns:
+      The events handed in, the late submissions the offers left to count, and each hand-in's
+      fault; or ``None``, taking nothing, when this thread already holds the hold, which a
+      collector callback inside one does, or when the wait expired.
+
+    Raises:
+      BaseException: Whatever ``hand_in`` raises that is not an ``Exception``, after its take is
+        debited.
+    """
+    if _sweep_held_here():
+        return None
+    cell = _ledger.cell()
+    handed = late = lost = 0
+    faults: list[Exception] = []
+    try:
+        with _sweep_hold.within(wait):
+            for span in _open_spans.copy().values():
+                events = span.events
+                n = len(events)
+                if _open_spans.get(id(span)) is not span or span.closed:
+                    continue
+                first = span.held
+                if n <= first:
+                    continue
+                take = events[first:n]
+                del events[first:n]
+                try:
+                    offered = hand_in(take)
+                except Exception as exc:
+                    lost += len(take)
+                    faults.append(exc)
+                    continue
+                except BaseException:
+                    lost += len(take)
+                    raise
+                if offered is None or offered < 0:
+                    events[first:first] = take
+                    break
+                span.swept = True
+                cell.handed += len(take)
+                handed += len(take)
+                late += offered
+    except _NotHeldError:
+        return None
+    finally:
+        if lost:
+            _note_in_span_loss(lost)
+    return handed, late, faults
+
+
 _loss_lock = threading.Lock()
 """Guards the two loss counters, and deliberately not the lifecycle lock (SPEC-036 FR-003 AC-5).
 
@@ -88,6 +469,7 @@ def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
         defaults=defaults or {},
     )
     span.events.append(start_event(span))
+    span.held = 1
     return span
 
 
@@ -103,8 +485,21 @@ def continue_trace(
     Call it on the first line of the entry point: if a span is already open and it is a root,
     that span is re-parented in place and its buffered events are rewritten to match, while a
     child span that already finished has been handed to the worker and can no longer be
-    rewritten. A span that is not a root is left alone, and a call with no span open
-    re-parents nothing; in every case the context applies to the next root span opened here.
+    rewritten.
+
+    **Called after the root span has logged, it can be refused, and the verdict depends on
+    timing** (SPEC-091). The worker sweeps every open span's buffered events about once a flush
+    interval, and any ``flush()``, on any thread, sweeps them too; once a sweep has taken from the
+    root span, those events are on their way under the old trace id, so adopting would split the
+    span across two traces. The call is then refused with "the current span's events have already
+    been handed to the worker; trace context refused" and ``reason="rejected"``: more often the
+    longer the call waits, and always once a ``flush()`` has run. On the entry point's first line
+    it is never refused, since nothing has been logged to take. The check and the re-parent are
+    made inside one sweep hold, so no sweep can land between them. Called from inside a sweep on
+    the same thread, as a collector callback inside one can, it is refused with "a sweep is in
+    progress on this thread; trace context refused". A span that is not a root is left alone,
+    and a call with no span open re-parents nothing; in every case the context applies to the
+    next root span opened here.
 
     The adoption is consumed by that one root span and does not survive it (SPEC-024), which
     is what stops a warm container logging every later invocation into the first caller's
@@ -194,17 +589,12 @@ def continue_trace(
         _diag.rejected("parent_span_id given with no trace_id to join", parent_span_id)
         announced = True
 
-    if adopted is not None and _current_span_was_swept():
-        _diag.rejected(
-            "the current span has already been flushed; trace context refused",
-            traceparent if traceparent is not None else str(trace_id),
-        )
-        adopted = None
-        announced = True
-
     if adopted is not None:
-        context.set_adopted_context(*adopted)
-        _reparent_current_span(*adopted)
+        refusal = _adopt_unswept(*adopted)
+        if refusal is not None:
+            _diag.rejected(refusal, traceparent if traceparent is not None else str(trace_id))
+            adopted = None
+            announced = True
 
     if baggage is not None:
         parsed_baggage = context.parse_baggage_header(baggage)
@@ -278,8 +668,48 @@ def _stored_name(cls: type) -> str:
     return _diag._STR_STR(_diag._STORED_NAME(cls))
 
 
+def _adopt_unswept(trace_id: str, parent_span_id: str | None) -> str | None:
+    """Adopts a context and re-parents the current root span unless a sweep took from it.
+
+    The check and the re-parent happen inside one hold (SPEC-091 FR-001), so no sweep, the
+    worker's or another thread's ``flush()``, can take from the root span between them: with a
+    50 ms pause forced inside the re-parent and a 1 ms interval, 19 of 20 root spans reached the
+    sink with two trace ids without the hold and none with it. That closes ``architecture.md``
+    §13's "``Span.swept`` is not a synchronization primitive". The refusal's line is written by the
+    caller, after the hold is released.
+
+    On a thread that already holds the hold, which a collector callback inside one does, the
+    adoption is refused outright: the sweep part-way through on this thread may be taking from this
+    very span, and the hold cannot be taken again to wait for it.
+
+    Args:
+      trace_id: The adopted trace id.
+      parent_span_id: The adopted parent span id, or ``None``.
+
+    Returns:
+      ``None`` when the context was adopted; otherwise the reason for the rejection line.
+
+    Raises:
+      None.
+    """
+    if _sweep_held_here():
+        return "a sweep is in progress on this thread; trace context refused"
+    with _sweep_hold:
+        if _current_span_was_swept():
+            return (
+                "the current span's events have already been handed to the worker; trace context "
+                "refused"
+            )
+        context.set_adopted_context(trace_id, parent_span_id)
+        _reparent_current_span(trace_id, parent_span_id)
+    return None
+
+
 def _current_span_was_swept() -> bool:
-    """Reports whether an in-span ``flush()`` has already shipped this span's events.
+    """Reports whether a sweep has already handed the current root span's events to the worker.
+
+    ~~an in-span ``flush()``~~ — widened by SPEC-091: the worker's sweep and another thread's
+    ``flush()`` set the flag too, so the refusal it drives depends on timing.
 
     Read from ``context.current_span()`` — what :func:`_reparent_current_span` itself reads —
     **and only when that span is a root**, which is the other half of that function's own guard.
@@ -367,7 +797,7 @@ def _reparent_current_span(trace_id: str, parent_span_id: str | None) -> None:
 
 
 
-def _sweep_open_spans() -> None:
+def _sweep_open_spans() -> bool:
     """Hands the worker every event buffered on an open span in this context (SPEC-036 FR-001).
 
     An in-span event lives on ``span.events`` until the span *closes*, and ``Worker.flush``
@@ -397,8 +827,10 @@ def _sweep_open_spans() -> None:
     ``Worker.submit`` raises nothing, so once it is reached the batch is safe. Creating the worker
     at all narrows SPEC-013's refusal rather than contradicting it — that exists so an *empty*
     flush does not stand up a thread, and a sweep that found buffered events is not an empty
-    flush. A cold-start Lambda flushing before it returns is exactly this case: the worker is
-    built when the first span *closes*, so inside the first traced call there is none.
+    flush. ~~A cold-start Lambda flushing before it returns is exactly this case: the worker is
+    built when the first span *closes*, so inside the first traced call there is none.~~ —
+    superseded by SPEC-091 FR-002: the first span's open builds the worker, so this build is
+    reached only when that open-time build failed.
 
     Concurrent sweeps are serialized on ``_sweep_lock``. The detach is a load and a store with a
     real gap between them, and two threads sharing one ``Span`` — which ``contextvars`` makes
@@ -424,9 +856,26 @@ def _sweep_open_spans() -> None:
     (``api._log`` versus a detach) is a different window needing a per-span lock, and
     ``architecture.md`` §13 declines it on cost.
 
-    It reaches only the calling context's spans. ``contextvars`` offers no way to enumerate
+    ~~It reaches only the calling context's spans. ``contextvars`` offers no way to enumerate
     another thread's or task's context, so a ``flush()`` in a handler that fanned out does not
-    reach what those tasks buffered.
+    reach what those tasks buffered.~~ — superseded by SPEC-091 FR-003: this still walks only the
+    calling context, which ships its spans whole with ``span.start`` backfilled, and
+    :func:`_sweep_registered` then reaches every other registered span from
+    ``_lifecycle._flush_worker``. A span this ships has ``held`` set to 0, so a later worker sweep
+    takes from index 0.
+
+    **Nothing is written to stderr inside the hold** (SPEC-091 FR-001), and no lock is waited on
+    unboundedly there (diff review, frame 2). Each buffer is offered through ``Worker._offer``,
+    which never drops and gives up when the queue's lock is not free within the sweep's bound;
+    the late submissions it leaves are counted and announced once the hold is released. An offer
+    that could not take the queue's lock in time puts nothing: the buffer goes back at the front
+    of the span's list, before anything appended meanwhile, the pass stops, and it returns
+    ``False``, so the ``flush()`` reports ``"abandoned"`` and the events ship at the span's close.
+    A full queue keeps SPEC-089's overflow for the caller's own spans (FR-003 AC-3): the buffer
+    is dropped, and counted in ``dropped`` and ``overflow_lost`` once the hold is released, its
+    hand-over credited after that count, so the meeting residual never reads above zero. On a
+    thread that already holds the hold, which a collector callback inside one does, it takes
+    nothing and returns ``False`` too.
 
     **The worker is resolved outside** ``_sweep_lock``, as :func:`_flush` resolves it, and still
     before any detach. Building it hands the sink its stop signal, which runs the sink's setter,
@@ -438,21 +887,28 @@ def _sweep_open_spans() -> None:
     **Each take is a hand-over in the event ledger** (SPEC-088 FR-001), credited in the calling
     thread's cell after ``submit`` returns, so every event the credit counts is already in the
     queue's taken-in count or in ``overflow_lost``. The length is read under the lock, at the
-    swap, so a racing append cannot change what is counted.
+    swap, so a racing append cannot change what is counted. The cell is bound before the hold is
+    taken, for the reason :func:`_sweep_registered` gives.
 
     Args:
       None.
 
     Returns:
-      None.
+      ``False`` when this thread already held the hold or an offer put nothing, else ``True``.
 
     Raises:
       Exception: Whatever building the worker raises. :func:`_flush_worker` guards it, because a
         flush is the call most likely to be made in a ``finally``.
     """
+    if _sweep_held_here():
+        return False
+    cell = _ledger.cell()
     worker: Worker | None = None
+    late = 0
+    overflowed: list[int] = []
+    stopped = False
     while True:
-        with _sweep_lock:
+        with _sweep_hold:
             needs_worker = False
             for span in context._live_span_stack():
                 if not span.events:
@@ -462,14 +918,28 @@ def _sweep_open_spans() -> None:
                     needs_worker = True
                     break
                 backfill_baggage(span, context._live_baggage())
-                span.swept = True
                 buffered, span.events = span.events, []
-                count = len(buffered)
-                worker.submit(buffered)
-                _ledger.cell().handed += count
-            if not needs_worker:
-                return
+                offered = worker._offer(buffered, count_retired=True)
+                if offered is None:
+                    span.events[0:0] = buffered
+                    stopped = True
+                    break
+                span.swept = True
+                span.held = 0
+                if offered < 0:
+                    overflowed.append(len(buffered))
+                    continue
+                cell.handed += len(buffered)
+                late += offered
+        if not needs_worker:
+            break
         worker = _lifecycle._get_worker()
+    if worker is not None:
+        for count in overflowed:
+            worker._count_overflow(count)
+            cell.handed += count
+        worker._settle_late(late)
+    return not stopped
 
 
 
@@ -581,6 +1051,19 @@ def _flush(span: Span) -> None:
     without a count would read as balanced; after, it leaves the meeting of the caller's
     hand-overs with the queue's taken-in count positive, which the shutdown check reports.
 
+    **An empty detach submits nothing** (SPEC-091 FR-004). A worker sweep, or a ``flush()``, can
+    leave a closing span's list empty, and an empty submission after a ``shutdown()`` was counted
+    as queued, counted as submitted after shutdown and announced as a lost submission, the
+    ``empty-submission`` pin of SPEC-085 that ``architecture.md`` §12 now lists as resolved.
+
+    **A close on a thread already inside the hold is deferred to its holder** (SPEC-091 FR-001).
+    A collector callback or finalizer inside a hold can finish a traced call, or finalize a
+    traced coroutine, on the holding thread; that close has already left the registry, appended
+    ``span.end`` and backfilled, and its swap and submit are appended to ``_deferred_closes``,
+    which the holder drains before it releases the hold. So the holder's in-place take acts on
+    the list first and ``span.end`` still ships last, where taking the hold again here waited on
+    this thread for ever.
+
     Args:
       span: The finished span whose buffered events are submitted.
 
@@ -591,11 +1074,15 @@ def _flush(span: Span) -> None:
       Exception: Whatever creating the worker or submitting raises; :func:`_end` is the guard.
     """
     worker = _lifecycle._get_worker()
-    with _sweep_lock:
+    if _sweep_held_here():
+        _deferred_closes.append((span, False))
+        return
+    with _sweep_hold:
         events, span.events = span.events, []
         count = len(events)
-    worker.submit(events)
-    _ledger.cell().handed += count
+    if events:
+        worker.submit(events)
+        _ledger.cell().handed += count
 
 
 type _SpanScope = tuple[
@@ -626,6 +1113,19 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
     accepted means asked for, so a guard that forgets its debit leaves a remainder a check can
     see, where a credit after the build would hide exactly the events a failed open lost.
 
+    **The process worker is built here, ahead of that credit** (SPEC-091 FR-002), when none
+    exists yet, so the drain thread can sweep the process's first span while it is still open:
+    inside the first traced call there was no worker, and nothing could. It is read as one
+    attribute load, so once a worker exists the open calls no ``_lifecycle`` function. The build
+    runs before the span is pushed, so the sink's stop-signal setter, which the build runs, logs
+    on the orphan route: built after the push, a setter's ``info()`` became an in-span event and
+    two SPEC-085 cells went red as ``LedgerBroken:orphans-1``. A build that fails is announced by
+    type and the call runs traced; its close retries the build, as before. The guard catches only
+    ``Exception``, so a ``BaseException`` from the setter leaves before anything is credited.
+
+    **The span is registered after its push** (SPEC-091 FR-001), in ``_open_spans``, with one dict
+    write and no lock; a span whose push failed is never registered and is still closed as before.
+
     Args:
       name: The span name, normally the decorated function's qualified name.
       defaults: Per-decorator default fields, or ``None``.
@@ -640,12 +1140,18 @@ def _begin(name: str, defaults: dict[str, object] | None) -> _SpanScope:
     span: Span | None = None
     token: contextvars.Token[tuple[Span, ...]] | None = None
     scope: contextvars.Token[dict[str, object]] | None = None
+    if _lifecycle._state._worker is None:
+        try:
+            _lifecycle._get_worker()
+        except Exception as exc:
+            _diag.absorbed("starting the worker for a span", exc, "its events wait for its close")
     _ledger.cell().span += 1
     try:
         if context.current_span() is None:
             scope = context.push_baggage_scope()
         span = _open_span(name, defaults)
         token = context.push_span(span)
+        _open_spans[id(span)] = span
     except Exception as exc:
         if span is None:
             _ledger.cell().span += 1
@@ -732,6 +1238,11 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
     baggage known at their construction, empty for ``span.start``, so SPEC-015 completes them
     from the baggage live now, while the batch is still ours.
 
+    **The span leaves the registry first** (SPEC-091 FR-001), before ``span.end`` is built or
+    appended. A sweep reads a span's length before its membership, so a length that counts
+    ``span.end`` is always followed by a membership read that fails, and no sweep ships
+    ``span.end`` ahead of the span's logs: without that read, 25 and 29 spans a run ended early.
+
     ``closed`` is set **before** the flush, not after (SPEC-036 FR-004). ``_flush`` can raise —
     building the worker, or the queue path — and :func:`_end`'s guard absorbs it, so setting the
     flag afterwards would leave it ``False`` on exactly the runs where a later append most needs
@@ -750,6 +1261,7 @@ def _close_span(span: Span, status: str, exc: BaseException | None) -> None:
       Exception: Whatever building the end event or flushing raises; :func:`_end` is the
         guard.
     """
+    _open_spans.pop(id(span), None)
     event = end_event(span, status, exc)
     span.events.append(event)
     span.ended = True
@@ -769,16 +1281,27 @@ def _abandon(span: Span) -> int:
     span's ids (:func:`log_foundry.api._log`). Popping the span from its context is out of scope
     (``architecture.md`` §12), so it stays current there.
 
+    The span also leaves the registry (SPEC-091), so no sweep copies it again. On a thread that
+    already holds the sweep hold, which a collector callback inside one does, the take is deferred
+    to the holder, which debits it to ``in_span_lost`` before it releases the hold; this then
+    returns 0, so the guard counts only the ``span.end`` it adds itself.
+
     Args:
       span: The span the guard gave up on.
 
     Returns:
-      How many events it took.
+      How many events it took, 0 when the take was deferred.
 
     Raises:
       None.
     """
-    with _sweep_lock:
+    _open_spans.pop(id(span), None)
+    if _sweep_held_here():
+        span.closed = True
+        span.abandoned = True
+        _deferred_closes.append((span, True))
+        return 0
+    with _sweep_hold:
         taken, span.events = span.events, []
     span.closed = True
     span.abandoned = True

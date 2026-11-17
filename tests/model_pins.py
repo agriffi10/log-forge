@@ -209,18 +209,6 @@ PINS: tuple[Pin, ...] = (
         sibling="shutdown",
     ),
     Pin(
-        "empty-submission",
-        tuple(
-            _cell("reentrant", "setter", "worker", *pair)
-            for flush in ("flush", "flush-none")
-            for stop in ("shutdown", "shutdown-none")
-            for pair in ((flush, stop), (stop, flush))
-        ),
-        frozenset({"LedgerBroken:spans+1"}),
-        "An empty batch submitted after a `shutdown()` is counted as queued, counted as submitted "
-        "after shutdown and announced as a lost submission",
-    ),
-    Pin(
         "orphan-arm-in-close",
         tuple(_cell("reentrant", "close", path, "configure", "info") for path in PATHS),
         frozenset({"CloseBroken:never-closed@1"}),

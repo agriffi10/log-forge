@@ -19,9 +19,10 @@ calls form a tree you can query later.
 - **Structured, never free-form** — every event is the same named-field JSON shape.
 - **Safe by default** — never captures your arguments or return values (no accidental PII/secret leakage), and the decorator **never swallows exceptions**.
 - **Correct under threads and asyncio** — context propagates via `contextvars`.
-- **Non-blocking delivery from a traced call** — a finished span's events are handed to a
-  background worker, so code inside `@trace` never blocks on sink I/O, and a graceful drain at
-  exit means buffered events aren't lost. Two things you can do *deliberately* are synchronous:
+- **Non-blocking delivery from a traced call** — a span's events are handed to a background
+  worker, about once a second while the span is open and the rest when it closes, so code inside
+  `@trace` never blocks on sink I/O, and a graceful drain at exit means buffered events aren't
+  lost. Two things you can do *deliberately* are synchronous:
   a level call with **no open span**, which emits on your own thread, and `flush()`, which by
   definition waits for the drain it asked for.
 
@@ -190,9 +191,12 @@ synchronous route too.
 2. **A span opens** — a record of this one call. It inherits the current trace and parent (see
    below), or starts a fresh trace if nothing is active.
 3. **Events gather on the span** — an automatic `span.start`, then any events you emit, held in
-   memory as one bundle rather than written line by line.
+   memory rather than written line by line. While the span is open, the background worker takes
+   the events you have emitted about once a flush interval (a second by default) and ships them,
+   so a long-running call's logs do not wait for it to return. `span.start` stays on the span.
 4. **The span closes and hands off** — on return *or* exception, a `span.end` event is added
-   (with duration and status), and the whole bundle is handed to the background worker. This
+   (with duration and status), and what the span still holds, `span.start`, `span.end` and any
+   events logged since the worker last took from it, is handed to the background worker. This
    hand-off is instant and never blocks; on an exception the original error is re-raised unchanged.
 5. **The worker batches** — the worker groups bundles and flushes them together (see below).
 6. **The sink ships them out** — `StdoutSink` by default, or `SQSSink` in production.
@@ -218,9 +222,12 @@ gets a fresh context rather than a copy, so nothing follows it there unless the 
 
 ### When the worker flushes
 
-The worker is one background thread with a bounded queue in front of it. `submit` drops a
-finished span's events into the queue and returns; the worker drains the queue into a small
-pending pile and flushes that pile to the sink on whichever of two triggers fires first:
+The worker is one background thread with a bounded queue in front of it. A closing span drops
+what it holds into the queue and returns. About once a flush interval the worker also takes what
+every open span has buffered, past its `span.start`, and queues each span's take as a bundle of its
+own; that sweep makes the time trigger due, so those events leave within about one interval when
+nothing else is waiting. The worker drains the queue into a small pending pile and flushes that
+pile to the sink on whichever of two triggers fires first:
 
 - **By count** — once ~10 span bundles have accumulated and nothing more is waiting in the queue
   (note: that's 10 *spans*, and each span carries at least its start/end pair, so a flush is
@@ -249,8 +256,9 @@ its budget and the sink is still closed. The first batch of the exit is always a
 Both triggers can be pre-empted: `flush()` puts a marker in the queue and the worker emits the
 pending pile the moment it reaches it, ignoring the count and time triggers. Because the queue
 is FIFO, everything submitted before the call is necessarily ahead of that marker — which is
-exactly why the guarantee is "events submitted before this call", and why concurrent
-submissions from other threads may or may not be included.
+exactly why the guarantee is "events submitted before this call", together with what the call
+itself swept from open spans just before it queued the marker, and why concurrent submissions
+from other threads may or may not be included.
 
 **`flush()` also empties the sink's own client buffer**, when the sink has one. A sink that
 buffers in a driver rather than writing through — `KafkaSink` hands to librdkafka, `PubSubSink`
@@ -263,12 +271,13 @@ unaffected.
 
 **`flush()` also sweeps the spans that are still open**, so an in-span event does not have to wait
 for its span to close to be delivered. The span stays open and usable afterwards: its events go
-now and its `span.end` arrives later, in its own batch. Two consequences worth knowing. Boundary
-events swept this way carry the baggage as of the **flush** rather than as of the close, since
-that completion has to happen before they leave. And the sweep reaches only the **calling
-context's** spans — `contextvars` offers no way to enumerate another thread's or task's context,
-so a `flush()` in a handler that fanned out to tasks does not reach what those tasks have
-buffered; their events arrive when their own spans close.
+now and its `span.end` arrives later, in its own batch. Two consequences worth knowing. Your own
+spans (the ones open where you call `flush()`) ship whole, and their boundary events swept this
+way carry the baggage as of the **flush** rather than as of the close, since that completion has
+to happen before they leave. And the sweep reaches **every** open span in the process, including
+other threads' and tasks': for those it ships what they have buffered and leaves `span.start` on
+the span, so it still carries the span's final baggage when the span closes. A span's events can
+therefore reach the sink in several batches, with `span.start` and `span.end` last.
 
 ## Usage
 
@@ -465,7 +474,14 @@ def enqueue_check(location: str) -> None:
     )
 ```
 
-**The consumer adopts it — one line, and make it the first line:**
+**The consumer adopts it — one line, and make it the first line.** On the entry point's first
+line it always applies, because nothing has been logged yet. Called after the root span has
+logged, it can be refused, and the verdict depends on timing: about once a flush interval the
+worker takes the span's buffered events, and any `flush()` on any thread does the same, and once
+those events have left under the old trace id the span cannot be re-parented without splitting it
+across two traces. So the later the call, the likelier the refusal, and once any `flush()` has
+run after the log it is certain. A refused call returns `reason="rejected"`, and its stderr line
+says "the current span's events have already been handed to the worker; trace context refused".
 
 ```python
 @lf.trace
@@ -484,8 +500,9 @@ def handler(event, context):       # the entry point, deliberately not decorated
 
 `flush()` works either side of the traced function. Putting it outside, as above, is still the
 clearer shape — the span has closed, so there is nothing to reason about. But a `flush()`
-*inside* an open span is no longer a mistake: it sweeps every open span in the calling context,
-hands their buffered events to the worker and drains them, leaving the spans open. It does not
+*inside* an open span is no longer a mistake: it sweeps every open span, hands their buffered
+events to the worker and drains them, leaving the spans open. When the queue is full, other
+threads' spans keep their events for the next sweep or their close. It does not
 deliver a `span.end` that has not happened yet. Before `1.0.0` a flush inside a span swept
 nothing, and this recipe with the `flush()` moved into the traced function delivered **nothing**
 with every counter clean.
@@ -1294,11 +1311,12 @@ class MyBatchSink:
 ### Flushing and shutdown
 
 Delivery is off the hot path. When a span ends, its events are handed to a per-process
-background worker via a fast, non-blocking submit — your function returns without waiting on
+background worker via a fast, non-blocking submit, and while it is open the worker takes what it
+has buffered about once a flush interval — your function returns without waiting on
 the sink. A level call with no **open** span has no span to end, so it emits synchronously on
 the calling thread — including a call from a task that outlived the span it inherited, whose
 span is present but closed. That path needs no worker, and in a process that only ever logs
-that way none is ever built; it is a span closing, or a `flush()` sweeping one, that builds it.
+that way none is ever built; it is the first span opening that builds it.
 The rest of this paragraph is about the buffered path.
 The worker batches events (by count and time), emits them on its own thread, retries
 a failing sink with backoff, and applies backpressure so a slow or down sink can never block or
@@ -1328,7 +1346,7 @@ They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
 |---|---|---|
-| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per open span a `flush()` sweeps — so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
+| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per `flush()` made inside a span whose own buffer met the full queue — so the events lost are a multiple of it. The worker's interval sweep and a `flush()`'s sweep of other threads' spans never drop: a full queue leaves those events on their spans, and the close ships them. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
 | `failed_batches` | A sink stayed broken through the whole retry budget, or the exit drain declined a batch's retry, or a whole later batch unattempted, because it was predicted to end after `shutdown()`'s deadline. Delivery continues while the process runs; after a decline on the exit drain the process is shutting down and nothing follows. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused while the rest of its batch was handed off. A batch the client refused **whole** is not counted here: the sink raises, and it is counted where the raise is caught — in `failed_batches` by the worker once its retries are spent, in `orphan_lost` outside a span, or in the fan-out's `sink.failed` when a `MultiSink` sibling delivered. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |
@@ -1366,7 +1384,8 @@ not a term: it is the events the ledger cannot place, and it is zero in a correc
 ever above zero when `shutdown()` ends, one stderr line says so; nothing is raised. The ledger ends
 where a sink's `emit` returns, so a loss a sink takes inside an `emit` that returned is in
 `h.sink`, not here. After a `flush()` returns, `open_spans` is the events still buffered on spans
-that have not closed, which a `flush()` made inside them hands over.
+that have not closed: each open span's `span.start`, which stays on it until it closes, and
+whatever was logged after the call swept it.
 
 ```python
 e = log_foundry.health().events
@@ -1522,7 +1541,8 @@ process lost events while the call ran, not that yours were among them. A **zero
 only the terms the ledger counts: a loss a sink takes inside an `emit` that returned — a failed
 Kafka delivery report, a `MultiSink` child that raised beside one that accepted, an `emit`-only
 sink's own internal loss — is in none of them and shows in `health().sink`, and events still
-buffered on another thread's open span are in `health().events.open_spans`. `repr()` and `==`
+buffered on an open span, its `span.start` or what was logged after the sweep, are in
+`health().events.open_spans`. `repr()` and `==`
 include the counts, so a result whose window lost something is not equal to
 `FlushResult(ok=True)`.
 
@@ -1576,6 +1596,13 @@ getting them wrong is silent:
 - **Put it in a `finally`.** A flush written as the last line of the handler body is precisely
   the line that does not run when the handler raises, and the invocation whose logs are most
   worth having is the one that failed.
+- **A kill loses what is buffered.** A Lambda timeout or an out-of-memory kill ends the process
+  with no drain. The worker ships an open span's events about once a flush interval, so a
+  `SIGKILL`, a `SIGTERM` without a `shutdown()`, or `os._exit` loses up to about one interval of
+  an open span's events, every still-open span's `span.start`, and whatever is queued or in a
+  batch the sink has not yet accepted, and no counter survives to show it. The worker takes from
+  open spans between sends, so a kill that lands while it is sending a batch, or waiting to retry
+  one, loses everything logged on open spans since it last took from them.
 - **Never call `shutdown()` per invocation.** It is terminal: the worker does not come back, so
   the first invocation on a warm container would log and every later one would silently log
   nothing. That failure reads as "works locally, broken in production".
@@ -1601,8 +1628,8 @@ def _handler(event, context):
 
 def handler(event, context):
     # NOT decorated, so the span closes when `_handler` returns and its events reach the queue
-    # before `flush()` runs. Since 1.0.0 a `flush()` *inside* the traced function also works —
-    # it sweeps the open span — but keeping it out here means there is nothing to reason about.
+    # before `flush()` runs. A `flush()` *inside* the traced function also works — it sweeps
+    # every open span — but keeping it out here means there is nothing to reason about.
     try:
         return _handler(event, context)
     finally:

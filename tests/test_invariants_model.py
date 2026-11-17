@@ -131,12 +131,14 @@ from model_oracles import (
     Close,
     CloseBroken,
     Closes,
+    LedgerBroken,
     SinkEvent,
     Stalled,
     Take,
     Write,
     check_call,
     check_late_write,
+    check_ledger,
     check_repeat,
     check_unowed_repeat,
     rerun_command,
@@ -144,6 +146,8 @@ from model_oracles import (
     soak_from,
     take_of_each_close,
 )
+from model_oracles import Ledger as OracleLedger
+from model_sinks import span_ends_queued
 from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
 
@@ -1169,6 +1173,7 @@ def _interleaving(
     health = log_foundry.health()
     markers = _stranded_markers()
     queued = health.queued - markers
+    ends_queued = span_ends_queued()
     err = capfd.readouterr().err
     if soak is not None:
         soak.report = _judge_soak(soak, ledger, err)
@@ -1188,6 +1193,7 @@ def _interleaving(
     overlapped = [i for i, sink in enumerate(ledger.sinks) if sink.overlapped]
     picture = (
         f"seed={seed} spans={ledger.spans} span.end={ends} queued={health.queued} "
+        f"span.end_queued={ends_queued} "
         f"markers={markers} dropped={health.dropped} in_span_lost={health.in_span_lost} | "
         f"orphans={ledger.orphans} delivered={orphans} orphan_lost={health.orphan_lost} | "
         f"failed_batches={health.failed_batches} incomplete_swaps={health.incomplete_swaps} "
@@ -1209,7 +1215,9 @@ def _interleaving(
             _assert_the_http_ledger(ledger, runs, health.orphan_lost, err, picture)
         else:
             _assert_the_deliver_ledger(ledger, runs, health.orphan_lost, err, picture)
-        assert ends + queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
+        assert ends + ends_queued + health.dropped == ledger.spans, (
+            f"invariant 2 (spans): {picture}"
+        )
         assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
         assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
         assert health.submitted_after_shutdown >= queued, (
@@ -1286,6 +1294,78 @@ if SOAK:
 
 WIRING_SEED = 2
 """The seed the wiring test soaks: measured among the fastest in all three forms."""
+
+
+class _EndRecorder:
+    """Records each event the sink is handed."""
+
+    def __init__(self) -> None:
+        self.events: list[dict[str, object]] = []
+        self._lock = threading.Lock()
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        with self._lock:
+            self.events.extend(batch)
+
+    def close(self) -> None:
+        return None
+
+
+def test_the_span_identity_counts_a_foreign_flushs_sweep_in_span_end_events() -> None:
+    """SPEC-091 FR-004 AC-6: the identity's queued term counts ``span.end`` events, not submissions.
+
+    The one shape that tells the two counts apart, and the one the model's rows went red on
+    (``span.end=0 queued=157 spans=155``): a swept submission left queued. A span opens on thread
+    A after ``shutdown()`` has retired the worker, so nothing will drain its queue; thread B's
+    ``flush()`` sweeps A's logs into that queue as a submission with no ``span.end``; A then
+    closes, queuing its ``span.start`` and ``span.end``. Two spans were started, one ``span.end``
+    was delivered before the shutdown and one is queued. Counted in submissions the queue holds
+    two, and ``check_ledger`` reads ``spans+1``.
+    """
+    sink = _EndRecorder()
+    log_foundry.configure(sink=sink)
+
+    @log_foundry.trace(name="warm")
+    def warm() -> None:
+        log_foundry.info("before the shutdown")
+
+    warm()
+    log_foundry.shutdown(timeout=5.0)
+    opened = threading.Event()
+    release = threading.Event()
+
+    @log_foundry.trace(name="late")
+    def late() -> None:
+        for i in range(3):
+            log_foundry.info(f"late{i}")
+        opened.set()
+        assert release.wait(10)
+
+    owner = threading.Thread(target=late)
+    owner.start()
+    assert opened.wait(10)
+    flusher = threading.Thread(target=log_foundry.flush, args=(0.5,))
+    flusher.start()
+    flusher.join(10)
+    release.set()
+    owner.join(10)
+    worker = _lifecycle._state.worker_exists()
+    assert worker is not None and worker._queue.qsize() == 2, "the swept and the closing submission"
+    health = log_foundry.health()
+    ledger = OracleLedger(
+        spans=2,
+        span_ends=sum(1 for e in sink.events if e["message"] == "span.end"),
+        queued=span_ends_queued(),
+        dropped=health.dropped,
+        abandoned=0,
+        orphans=0,
+        orphans_delivered=0,
+        orphan_lost=0,
+    )
+    try:
+        check_ledger(ledger)
+    except LedgerBroken as broken:
+        pytest.fail(f"invariant 2 (spans) read a swept submission as a queued span: {broken}")
 
 
 @pytest.mark.parametrize("form", FORMS)
@@ -1879,10 +1959,10 @@ def _check_invariants(run: _Run, step: str, result: object, driver: int, where: 
                 assert thread == driver, f"invariant 4 (an orphan left the caller's thread) {where}"
     if (step == "flush" and result) or step in {"shutdown", "exit"}:
         ends = sum(s.count("span.end") for s in run.sinks)
-        queued = health.queued - _stranded_markers()
+        queued = span_ends_queued()
         assert ends + queued + health.dropped == run.spans, (
-            f"invariant 2 (spans): span.end={ends} queued={queued} dropped={health.dropped} "
-            f"started={run.spans} {where}"
+            f"invariant 2 (spans): span.end={ends} span.end_queued={queued} "
+            f"dropped={health.dropped} started={run.spans} {where}"
         )
     if step in {"shutdown", "exit"}:
         unclosed = [i for i, s in enumerate(run.sinks) if s.events and s.closes == 0]

@@ -611,9 +611,16 @@ def _reset_worker() -> None:
     between its threads with the count it inherited. Only a forked child writes the last three,
     and every offer pops its own entry, so all of them are already empty here. They are
     reset beside the other thread-locals so that each test starts from the same runtime.
+
+    SPEC-091 adds the open-span registry and the deferred closes. The registry is process-wide,
+    so a span a test leaves open, on a parked thread or in a coroutine it never finishes, would
+    otherwise stay registered, and a later test's ``flush()`` would sweep that span's events into
+    the later test's sink. That is isolation, not a measured leak: no test was seen to fail for
+    want of it. They are cleared after the worker is stopped, so its exit sweep has already taken
+    what it will.
     """
     try:
-        from log_foundry import _lifecycle
+        from log_foundry import _lifecycle, decorator
     except ImportError:
         return
     import ledger_check
@@ -623,6 +630,8 @@ def _reset_worker() -> None:
     if worker is not None:
         worker.stop()
         _lifecycle._state._worker = None
+    decorator._open_spans.clear()
+    decorator._deferred_closes.clear()
     _lifecycle._state._closes.owed.clear()
     _lifecycle._state.retirements = 0
     _lifecycle._state._stop = threading.Event()

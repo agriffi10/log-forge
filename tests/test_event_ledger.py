@@ -512,7 +512,13 @@ def test_an_expired_shutdown_with_a_batch_in_the_sink_balances(capsys) -> None:
 
 
 def test_shutdown_inside_a_traced_function_balances(capsys) -> None:
-    """FR-003 AC-9: events buffered on the caller's open span are legitimately pending."""
+    """FR-003 AC-9: events buffered on the caller's open span are legitimately pending.
+
+    ~~``open_spans == 2``~~ — refined by SPEC-091 FR-003: the worker now exists inside the
+    process's first traced call, so this ``shutdown()`` retires it, and its exit drain sweeps the
+    buffered log before it drains; only the held ``span.start`` is still on the span. The ledger
+    balances either way, which is what this criterion is for.
+    """
     lf.configure(sink=GatedSink())
     seen: dict[str, object] = {}
 
@@ -524,7 +530,7 @@ def test_shutdown_inside_a_traced_function_balances(capsys) -> None:
 
     work()
     e = seen["ledger"]
-    assert e.unaccounted == 0 and e.open_spans == 2, e  # type: ignore[attr-defined]
+    assert e.unaccounted == 0 and e.open_spans == 1 and e.delivered == 1, e  # type: ignore[attr-defined]
     assert not _lines(capsys.readouterr().err)
 
 
