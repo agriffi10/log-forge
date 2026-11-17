@@ -328,7 +328,12 @@ def test_p17_logs_after_an_interrupted_close_keep_the_span_ids() -> None:
 
 
 def test_a_log_after_an_interrupted_close_ships_as_an_orphan_on_the_spans_ids(monkeypatch) -> None:
-    """FR-002, the abandoned span's orphan, in process: counted once, on the orphan path."""
+    """FR-002, the abandoned span's orphan, in process: counted once, on the orphan path.
+
+    The interrupted close leaves ``work``'s span on the stack, swept, so the call and the
+    handler's log run in a copied context: on the test's own, the span would stay current for
+    every later test, and ``continue_trace`` would refuse each adoption as already flushed.
+    """
     sink = GatedSink()
     lf.configure(sink=sink)
     ids: dict[str, str] = {}
@@ -342,11 +347,14 @@ def test_a_log_after_an_interrupted_close_ships_as_an_orphan_on_the_spans_ids(mo
         ids["trace"], ids["span"] = span.trace_id, span.span_id  # type: ignore[union-attr]
         monkeypatch.setattr(decorator, "end_event", interrupt)
 
-    try:
-        work()
-    except KeyboardInterrupt:
-        monkeypatch.undo()
-        lf.info("from the handler")
+    def abandon() -> None:
+        try:
+            work()
+        except KeyboardInterrupt:
+            monkeypatch.undo()
+            lf.info("from the handler")
+
+    contextvars.copy_context().run(abandon)
     orphan = [event for event in sink.events if event["message"] == "from the handler"]
     assert [(event["trace_id"], event["span_id"]) for event in orphan] == [
         (ids["trace"], ids["span"])

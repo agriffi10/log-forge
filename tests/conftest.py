@@ -445,6 +445,11 @@ def _reset_config():
 
     The config is replaced again at teardown, so the test's sink is unreachable from a library
     global once the test ends: what ``shadow_check`` then walks is only state that outlives it.
+
+    The span stack is a third ``contextvars`` singleton, and ``reset_context`` does not touch it,
+    because inside the library an open span is never a leak. Between tests it is: a span still on
+    the stack at teardown is current for every later test in the process. The teardown empties
+    it and fails the test that left it (``_left_spans``).
     """
     try:
         from log_foundry import config, context
@@ -455,10 +460,47 @@ def _reset_config():
     context.reset_context()
     _reset_worker()
     yield
+    left = _left_spans()
     # Tear down any process worker a test created so its daemon thread / sink don't leak.
     _reset_worker()
     context.reset_context()
     config._config = config.Config()
+    if left is not None:
+        pytest.fail(left, pytrace=False)
+
+
+def _left_spans() -> str | None:
+    """Empties the span stack a test left on its context; returns the failure, or ``None``.
+
+    An interrupted close leaves its root span on the stack by design, swept and closed, so a log
+    from the handler still ships on the span's ids (SPEC-088 FR-002). Pytest runs every sync test
+    and its fixtures in one ``contextvars`` context, so that span stays current for the rest of
+    the process: ``continue_trace`` then refuses every adoption as "the current span has already
+    been flushed". ``test_event_ledger_defects`` did this, and at ``04e99c6d`` 79 tests failed in
+    a serial run after it while passing under ``-n 12``, where xdist rarely put them on its worker.
+    ``ledger_check`` fails a span left *open*; a closed one passed every check until here.
+
+    So the stack is emptied of every span, open or closed, but only the closed ones are reported:
+    an open one is already the ledger check's failure, and a second report of it would have
+    pytest group the two and print its own traceback for each. A test that means to abandon a
+    span runs that call in ``contextvars.copy_context().run``. The stack is reset rather than
+    popped, because the tokens that would pop it died with the interrupted frames.
+    """
+    from log_foundry import context
+
+    left = context._live_span_stack()
+    if not left:
+        return None
+    context._span_stack.set(())
+    closed = [span for span in left if span.closed]
+    if not closed:
+        return None
+    names = ", ".join(span.name for span in closed)
+    return (
+        f"the test left {len(closed)} closed span(s) on its context's span stack: {names}; they "
+        "would be current for every later test in this process. If the test means to abandon "
+        "the span, run that call in a copied context; otherwise the library failed to pop it"
+    )
 
 
 @pytest.fixture(autouse=True)
