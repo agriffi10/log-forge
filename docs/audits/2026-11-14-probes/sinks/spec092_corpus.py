@@ -552,14 +552,16 @@ def run(row: Row, disabled: frozenset[str] = frozenset()) -> tuple[tuple[str, ..
             sink, target = row.build(backend)
             built_as = type(sink).__name__
 
-            def emit(self: Worker, event_lists: list[list[dict[str, object]]]) -> None:
+            def emit(
+                self: Worker, event_lists: list[list[dict[str, object]]], **kw: Any
+            ) -> None:
                 carried = [str(e.get("log_id")) for events in event_lists for e in events]
                 mark = len(seen)
                 failed = self.failed_batches
                 start = losses_total(sink)
                 text_at = len(stderr.getvalue())
                 try:
-                    original_emit(self, event_lists)
+                    original_emit(self, event_lists, **kw)
                 finally:
                     after = losses_total(sink)
                     if carried:
