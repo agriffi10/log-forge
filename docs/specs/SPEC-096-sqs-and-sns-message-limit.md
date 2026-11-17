@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-096
 title: "SQSSink and SNSSink Take Their Message Limit as an Argument, and Never Send Past the Service's"
 description: "Gives SQSSink and SNSSink a keyword-only max_message_bytes argument, judged at construction against the 1,024 to 1,048,576 range a queue's or topic's MaximumMessageSize takes, so a caller can match the destination's own limit; the default stays 1.x's 256 KiB through MAX_BYTES, and no message or request is ever sized past the service's 1 MiB."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-005, SPEC-010, SPEC-016, SPEC-049, SPEC-051, SPEC-066, SPEC-071, SPEC-074]
 arc: audit-2026-11-14
 arc_order: 12
@@ -36,7 +36,7 @@ request is ever sized past the service's 1 MiB.
 - `SNSSink` applies it the same way (FR-003).
 - `MAX_BYTES` keeps its value and its 1.x reach as the default limit (FR-004).
 - The record: the README, the docstrings, `docs/release-notes/v1.2.1.md`, `docs/architecture.md`
-  §8 and §12, one decision file, and SPEC-092's parameter roster if it has been built (FR-005).
+  §9.1, §12 and §13, one decision file, and SPEC-092's parameter roster if it has been built (FR-005).
 
 ### Out of Scope
 
@@ -347,7 +347,7 @@ What a caller and the next session read:
   sinks each gain one keyword-only argument, appended, and that no default changed. The sentence
   that says *Added* lists one new public name counts the new ones. The opening list of carried
   specs names SPEC-096.
-- **`docs/architecture.md`.** §8's "≤ 256 KB apiece" becomes the sink's message limit, 256 KiB by
+- **`docs/architecture.md`.** §9.1's "≤ 256 KB apiece" becomes the sink's message limit, 256 KiB by
   default and at most 1 MiB. §13's "past SQS's 256 KB" (the payload-ceilings bullet) becomes "past
   `SQSSink`'s default 256 KiB, and SQS's own 1 MiB". §12's item for `SQSSink.MAX_BYTES` moves to
   *Resolved*, closed by this spec. Its Kinesis item stays open.
@@ -480,7 +480,7 @@ tests/test_numeric_doors.py         # FR-001: _BUILDS refusals and four _HUGE_DO
 tests/conformance_classes.py        # FR-005, only if SPEC-092 is built
 README.md
 docs/release-notes/v1.2.1.md
-docs/architecture.md                # §8, §12, §13
+docs/architecture.md                # §9.1, §12, §13
 docs/decisions/sink-delivery/a-destination-limit-the-caller-can-configure-is-a-constructor-argument-defaulting-to-the-1x-value-under-the-services-ceiling.md
 docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte-budget.md
 ```
@@ -506,7 +506,7 @@ docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte
 
 ### Phase 3: The record (FR-005)
 
-- README, docstrings, release notes, §8, §12 and §13, the two decision files, `LIMIT_GAINED`, and
+- README, docstrings, release notes, §9.1, §12 and §13, the two decision files, `LIMIT_GAINED`, and
   SPEC-092's roster if built.
 
 ---
@@ -669,3 +669,13 @@ today, and this spec adds two.
   - SPEC-093's FR-003 and SPEC-095 are cited as Draft on `main`. Neither contradicts a
     requirement here.
   - SNS's whole-call `BatchRequestTooLong` and the 100-subscription precondition are quoted.
+- **2026-11-17, corrected at completion.** ~~§8~~ is §9.1 throughout: the "≤ 256 KB apiece"
+  sentence sits under `### 9.1 The sink is a durable buffer, not the final store`, so FR-005,
+  *Scope*, *File & Folder Structure* and Phase 3 now name §9.1, and *Scope* names §13 beside it.
+  The build also repaired the SPEC-092 prototype FR-005's last criterion runs:
+  `docs/audits/2026-11-14-probes/sinks/spec092_corpus.py` wrapped `Worker._emit` with a
+  two-argument function, which raised `TypeError` once `_emit` gained the keyword-only
+  `exit_batch` at `14711e7e` (SPEC-090), so every row read `harness-error:batch-count` and the
+  16-byte control moved none. The wrapper now forwards `_emit`'s keyword arguments, and the
+  criterion was settled on the repaired prototype: 256 rows, 86 red, 0 moved at 1,048,576 and at
+  1,024, and 7 moved at the 16-byte control, all of them SQS or SNS rows.

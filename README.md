@@ -875,8 +875,9 @@ installed as somebody else's transitive dependency.
 
 `pip install 'log-foundry[aws]'` (pulls `boto3`). Credentials and region come from boto3's standard
 chain — log-foundry adds none of its own. Each re-chunks every batch to the service's hard per-request
-limits, retries partial failures, and drops any single event too large to ever fit (counted on
-`.dropped_oversized`).
+limits, retries partial failures, and drops any single event larger than the sink's message limit
+(counted on `.dropped_oversized`). For `KinesisSink` and `FirehoseSink` that limit is the service's;
+for `SQSSink` and `SNSSink` it is yours to set, as below.
 
 `KinesisSink` and `FirehoseSink` learn which records failed **positionally** — the response carries a
 parallel array with no ids — so they check that it describes as many records as were sent before
@@ -896,8 +897,8 @@ earlier message, as before.
 
 | Sink | Import from | Configure |
 |---|---|---|
-| `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3, fifo=None, message_group_id=None, message_deduplication_id=None)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages. Standard **and** FIFO queues |
-| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3)` |
+| `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3, fifo=None, message_group_id=None, message_deduplication_id=None, max_message_bytes=None)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages. Standard **and** FIFO queues |
+| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3, max_message_bytes=None)` |
 | `KinesisSink` | `log_foundry.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
 | `FirehoseSink` | `log_foundry.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
 
@@ -905,6 +906,21 @@ earlier message, as before.
 from log_foundry.sinks.sqs import SQSSink
 lf.configure(service="payments",
              sink=SQSSink(queue_url="https://sqs.us-east-1.amazonaws.com/123456789012/logs"))
+```
+
+By default `SQSSink` and `SNSSink` each drop a message larger than 256 KiB. To match your
+queue or topic, pass its `MaximumMessageSize`, in bytes, as `max_message_bytes`: `1048576` for a
+queue created at the service default, or whatever value you gave a topic or queue yourself. The
+argument takes 1,024 to 1,048,576 and refuses anything else when the sink is built, and neither
+sink ever sends a message or a request larger than 1 MiB. Pass your destination's own value and
+nothing larger. The service refuses a message above it, and an SNS topic also refuses a request
+whose messages together exceed it; when the service refuses the whole request, every event in that
+request is lost with it, including the ones that would have fit. That is why the sinks do not default to 1 MiB, although a new queue does: against
+a queue still at 256 KiB, or any SNS topic left at its 256 KiB default, a 1 MiB sink would have
+whole requests refused.
+
+```python
+SQSSink(queue_url=QUEUE_URL, max_message_bytes=1_048_576)  # a queue at the 1 MiB default
 ```
 
 Consuming from the buffer and indexing into ELK is a separate component, outside this library.
