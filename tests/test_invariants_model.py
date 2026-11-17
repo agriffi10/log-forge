@@ -1989,10 +1989,15 @@ def _worker_lost_shapes() -> dict[re.Pattern[str], bool]:
     """Every lost line ``worker.py`` can write for an event, mapped to whether it is a tally.
 
     Derived from the source, not hand-listed, so a lost line added there is read here without
-    an edit (SPEC-090 added two and the hand-listed pattern read neither, about one run in two
-    thousand). A call whose noun is not a literal, or whose detail is neither a literal nor an
-    f-string, fails here rather than being skipped. A line written in :data:`_TALLY_WRITER` is
-    a tally whose detail's first number is its batch count; every other line is one batch.
+    an edit: SPEC-090 added two, the hand-listed pattern read neither, and a ``deliver`` or
+    ``http`` run whose exit drain wrote one failed invariant 2. A call whose noun is not a
+    literal, or whose detail is neither a literal nor an f-string, fails here rather than being
+    skipped. A line written in :data:`_TALLY_WRITER` is a tally whose detail's first number is
+    its batch count; every other line is one batch. Two signals must agree on which is which,
+    the writer and the count: a one-batch line counts the bare name ``size``, the batch it
+    lost, and a tally counts something else. A tally written anywhere else, or a one-batch line
+    written in the tally writer, therefore fails here, naming the call, rather than being read
+    as the wrong kind in the rare run that writes it.
     """
     tree = ast.parse(_WORKER_SOURCE.read_text(encoding="utf-8"))
     writer: dict[int, tuple[ast.Call, str]] = {}
@@ -2017,7 +2022,15 @@ def _worker_lost_shapes() -> dict[re.Pattern[str], bool]:
         details = call.args[2:] + [k.value for k in call.keywords if k.arg == "detail"]
         assert len(details) == 1, f"a worker lost line without one detail: {ast.unparse(call)}"
         line = rf"^log-foundry: lost (\d+) event\(s\); {_detail_pattern(details[0])}$"
-        shapes[line] = shapes.get(line, False) or name == _TALLY_WRITER
+        tally = name == _TALLY_WRITER
+        count = call.args[1] if len(call.args) > 1 else None
+        one_batch = isinstance(count, ast.Name) and count.id == "size"
+        assert tally != one_batch, (
+            f"a worker lost line in {name} counts {ast.unparse(count) if count else None}, so "
+            f"the writer and the count disagree on whether it is a tally: {ast.unparse(call)}"
+        )
+        assert shapes.get(line, tally) == tally, f"one line read as both kinds: {line}"
+        shapes[line] = tally
     return {re.compile(line, re.MULTILINE): tally for line, tally in shapes.items()}
 
 
@@ -2196,8 +2209,9 @@ def test_an_exit_drain_tally_balances_the_worker_ledger(
     sends them in batches of one span against a sink that never accepts again. A shutdown with
     time left abandons every exit batch, the first in its own line and the rest in one tally; a
     shutdown at ``timeout=0`` declines the first exit batch's retry and every later batch
-    unattempted, in a tally. Before the lines were derived from ``worker.py``, about one
-    ``deliver`` or ``http`` run in two thousand met either and failed invariant 2.
+    unattempted, in a tally. Before the lines were derived from ``worker.py``, a ``deliver`` or
+    ``http`` run that met either failed invariant 2: 4 of 16,000 such items, seeds 0 to 7999,
+    against the hand-listed pattern this file carried at ``03dbf502``.
     """
     monkeypatch.setattr("log_foundry.worker._BACKLOG_BATCH_CAP", 1)
     runs = _spy_on_runs(monkeypatch)
