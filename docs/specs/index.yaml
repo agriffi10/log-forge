@@ -679,6 +679,12 @@ specs:
     spec_status: "Draft"
     depends_on: ["SPEC-047", "SPEC-061", "SPEC-062", "SPEC-102"]
     path: "docs/specs/SPEC-104-nats-abandoned-publish-latch-ages.md"
+  - id: "SPEC-105"
+    title: "A Delivered Exit Batch's Successor Fits the Remaining Shutdown Budget"
+    description: "Holds the exit drain's next batch, after an exit batch is delivered, to what that batch's measured rate fits into the time left before the shutdown() deadline less the join margin, so a sink healthy at exit is never handed a batch the exit budget's prediction did not allow for, and a tight shutdown() completes its join and closes the sink, with no setting, line, tally or Health field added."
+    spec_status: "Draft"
+    depends_on: ["SPEC-062", "SPEC-090"]
+    path: "docs/specs/SPEC-105-exit-batch-fits-the-remaining-budget.md"
 arcs:
   - name: "assembly-decoration-and-echo-residue"
     order: ["SPEC-055"]
