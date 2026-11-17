@@ -20,9 +20,12 @@ import pytest
 
 import ledger_check
 import log_foundry as lf
+from conftest import _reset_worker
 from ledger_sinks import GatedSink
-from log_foundry import _ledger, decorator
+from log_foundry import _ledger, api, decorator
 from log_foundry import worker as worker_mod
+from log_foundry.sinks.base import SinkDeliveryError
+from log_foundry.sinks.null import NullSink
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -564,6 +567,80 @@ def test_a_marked_test_that_balances_fails(tmp_path) -> None:
     out = done.stdout + done.stderr
     assert "ERROR at teardown of test_balances" in out, out
     assert "marked ledger_exempt but the event ledger balances" in out, out
+
+
+class _DeadSink:
+    """A sink whose every ``emit`` delivers nothing, so an orphan event sent to it is lost."""
+
+    def emit(self, batch: list[dict]) -> None:
+        raise SinkDeliveryError(f"delivered none of {len(batch)} event(s)")
+
+    def close(self) -> None:
+        pass
+
+
+def _lose_one_of_each(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Loses one event on the orphan path and one inside a span, each through its real path."""
+    lf.configure(sink=_DeadSink())
+    lf.info("orphan, lost")
+    lf.configure(sink=NullSink())
+
+    def interrupt(*args: object, **kwargs: object) -> dict:
+        raise KeyboardInterrupt
+
+    @lf.trace
+    def work() -> None:
+        monkeypatch.setattr(api, "build_event", interrupt)
+        try:
+            lf.info("in a span, lost")
+        finally:
+            monkeypatch.undo()
+
+    with pytest.raises(KeyboardInterrupt):
+        work()
+    assert lf.flush(5)
+    events = lf.health().events
+    assert (events.orphan_lost, events.in_span_lost, events.unaccounted) == (1, 1, 0), events
+
+
+def test_the_teardown_reset_keeps_a_lost_event_in_its_term(monkeypatch) -> None:
+    """`_reset_worker` empties the ledger with its loss counters, so lost events stay placed.
+
+    It used to zero ``orphan_lost`` and ``in_span_lost`` alone. The orphan event's credit was
+    then in no term, ``unaccounted`` 1 through the orphan residual, which is what the ``atexit``
+    check reports; the in-span event's credit read as an open span no context holds, which
+    ``unaccounted`` does not count and the balance check's ``open_spans`` reason does.
+    """
+    _lose_one_of_each(monkeypatch)
+    _reset_worker()
+    assert lf.health().events.unaccounted == 0, lf.health().events
+    assert _reasons() == [], _reasons()
+
+
+def test_the_exit_shutdown_after_a_test_that_lost_events_reports_no_loss(tmp_path) -> None:
+    """The ``atexit`` ``shutdown()`` after the last test reads a balanced ledger, and is silent.
+
+    The probe is registered after the library's handler, so it runs first, and prints the reading
+    that handler's check is about to take: the reason the line is absent, not only its absence.
+    """
+    done = _run_suite_on(tmp_path, '''
+        import atexit
+        import os
+
+        import log_foundry as lf
+        from test_ledger_check import _lose_one_of_each
+
+        def _probe():
+            os.write(2, f"exit reading: unaccounted={lf.health().events.unaccounted}\\n".encode())
+
+        def test_loses_one_of_each(monkeypatch):
+            _lose_one_of_each(monkeypatch)
+            atexit.register(_probe)
+    ''')
+    out = done.stdout + done.stderr
+    assert "1 passed" in out, out
+    assert "exit reading: unaccounted=0" in out, out
+    assert "does not balance at shutdown()" not in out, out
 
 
 def _lf_users() -> set[tuple[str, str]]:

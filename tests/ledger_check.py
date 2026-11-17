@@ -116,6 +116,26 @@ def begin() -> None:
     A test that plants an imbalance on purpose, to show the shutdown check sees it, calls this
     again once it has asserted, so the imbalance it made is its own and does not need a marker.
     """
+    restart()
+    _track_workers()
+    _tracked.clear()
+    _direct[0] = 0
+
+
+def restart() -> None:
+    """Empties the ledger and the two loss counters together, so no reading sees one alone.
+
+    ``orphan_lost`` and ``in_span_lost`` are terms of the ledger: an event lost on the orphan path
+    is a credit in a cell and one in ``orphan_lost``, and the reading balances only while both are
+    there. So nothing in the suite zeroes the counters without emptying the cells in the same
+    step, and this is the one place that does it — :func:`begin` at each test's setup and
+    `conftest._reset_worker` at each test's teardown both call it. Until this existed the
+    teardown zeroed the counters alone, after this module's verdict: a test that lost an event
+    left its credit with no loss term, the next test's setup hid it, and the last test an xdist
+    worker ran left it for the ``atexit`` ``shutdown()``, which wrote a ``lost 1 event(s); the
+    event ledger does not balance`` line on most runs of the suite (``tests/test_api.py`` alone
+    wrote it on 5 of 12 workers) for an event that was in a term all along.
+    """
     from log_foundry import _ledger, _lifecycle, decorator
 
     _ledger.restart(0)
@@ -123,9 +143,6 @@ def begin() -> None:
         decorator._orphan_lost = 0
         decorator._in_span_lost = 0
     _lifecycle._state._ledger_announced = 0
-    _track_workers()
-    _tracked.clear()
-    _direct[0] = 0
 
 
 def emitted_directly(count: int) -> None:
