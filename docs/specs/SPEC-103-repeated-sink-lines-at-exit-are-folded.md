@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-103
 title: "Repeated Sink Lines at Exit Are Folded"
 description: "Has the exit drain, from its first abandoned batch on, fold the stderr lines a sink or the delivery engine writes inside each later exit batch's sink call into one line per distinct text, with its summed count and how many lines it stands for, written once at the end of the exit or before an expiry line, so a dead sink at exit writes a handful of lines rather than one per ten spans, while its batches, retries, waits and deadline stay exactly as they are."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-062, SPEC-090]
 arc: audit-2026-11-14
 arc_order: 19
