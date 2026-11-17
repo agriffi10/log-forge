@@ -687,6 +687,13 @@ specs:
     depends_on: ["SPEC-047", "SPEC-061", "SPEC-062", "SPEC-072", "SPEC-074", "SPEC-088", "SPEC-090"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-102-nats-resends-the-unattempted-tail.md"
+  - id: "SPEC-103"
+    title: "Repeated Sink Lines at Exit Are Folded"
+    description: "Has the exit drain, from its first abandoned batch on, fold the stderr lines a sink or the delivery engine writes inside each later exit batch's sink call into one line per distinct text, with its summed count and how many lines it stands for, written once at the end of the exit or before an expiry line, so a dead sink at exit writes a handful of lines rather than one per ten spans, while its batches, retries, waits and deadline stay exactly as they are."
+    spec_status: "Draft"
+    depends_on: ["SPEC-062", "SPEC-090"]
+    arc: "audit-2026-11-14"
+    path: "docs/specs/SPEC-103-repeated-sink-lines-at-exit-are-folded.md"
   - id: "SPEC-104"
     title: "NATSSink's Abandoned-Publish Latch Ages, as Its PING Latch Does"
     description: "Makes a NATSSink call that meets a publish abandoned less than one publish_timeout ago wait for it on the loop until that window ends, without cancelling it and without publishing past it, so a stall a little longer than one budget no longer loses a batch, and with SPEC-102's resend no event but the abandoned one, while a longer stall still costs one window in all."
@@ -705,7 +712,7 @@ arcs:
   - name: "audit-2026-08-07"
     order: ["SPEC-035", "SPEC-034", "SPEC-037", "SPEC-038", "SPEC-036", "SPEC-039", "SPEC-041", "SPEC-040"]
   - name: "audit-2026-11-14"
-    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098", "SPEC-099", "SPEC-100", "SPEC-101", "SPEC-102"]
+    order: ["SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091", "SPEC-092", "SPEC-093", "SPEC-094", "SPEC-095", "SPEC-096", "SPEC-097", "SPEC-098", "SPEC-099", "SPEC-100", "SPEC-101", "SPEC-102", "SPEC-103"]
   - name: "audit-remediation"
     order: ["SPEC-024", "SPEC-025", "SPEC-029", "SPEC-026", "SPEC-027", "SPEC-028", "SPEC-030", "SPEC-031"]
   - name: "coercer-and-invariant-8"
