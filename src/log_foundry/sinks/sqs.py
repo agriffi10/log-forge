@@ -14,9 +14,10 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, Final, NamedTuple, cast
 
 from log_foundry import _diag
+from log_foundry.sanitize import _int_text
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import require_callable
 from log_foundry.sinks._chunk import chunk_items
@@ -24,7 +25,7 @@ from log_foundry.sinks._classify import aws_retryable, is_retryable, sender_faul
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
-from log_foundry.sinks._retry import floor_count
+from log_foundry.sinks._retry import exact_int, floor_count
 from log_foundry.sinks._rounds import (
     Called,
     KeyedReply,
@@ -49,6 +50,22 @@ DEFAULT_GROUP_ID = "log-foundry"
 
 MAX_ID_LEN = 128
 """SQS maximum length for ``MessageGroupId`` and ``MessageDeduplicationId``."""
+
+_SERVICE_MAX_BYTES: Final = 1_048_576
+"""The most bytes SQS takes in one message and in one request's messages together (SPEC-096).
+
+``SendMessageBatch``: "The maximum allowed individual message size and the maximum total payload
+size (the sum of the individual lengths of all of the batched messages) are both 1 MiB 1,048,576
+bytes". Every limit the sink applies is capped here, so a ``MAX_BYTES`` raised past it costs the
+events over 1 MiB one at a time rather than a request the service refuses whole.
+"""
+
+_LIMIT_FLOOR: Final = 1_024
+"""The smallest ``max_message_bytes`` the sink accepts, a queue's least ``MaximumMessageSize``.
+
+``CreateQueue`` and ``SetQueueAttributes``: "Valid values: An integer from 1,024 bytes (1 KiB) to
+1,048,576 bytes (1 MiB)" (SPEC-096 FR-001).
+"""
 
 GroupIdSource = str | Callable[[dict[str, object]], str] | None
 """What ``message_group_id=`` accepts: an event key to read, a callable, or ``None``."""
@@ -92,11 +109,15 @@ class _Plan(NamedTuple):
         ``"id failure"`` or ``"unencodable"``.
       refused: The first id callable's exception, set only when every event's id callable
         raised; the round is then a refusal.
+      limit: The run's effective message limit (:meth:`SQSSink._limit`), read once per run of
+        ``emit``, which the chunks were bounded by and the round's oversize lines name (SPEC-096
+        FR-002).
     """
 
     chunks: list[list[_Prepared]]
     dropped: dict[int, str]
     refused: Exception | None
+    limit: int
 
 
 @dataclass(slots=True)
@@ -176,7 +197,20 @@ class SQSSink:
     It keeps **no** client buffer (SPEC-036 FR-002): the driver call returns only once the
     destination has the batch, so nothing is queued locally between emits.
 
+    **Its message limit is the caller's to set** (SPEC-096). Each run of ``emit`` reads one limit,
+    used for every decision of every round of that run: ``max_message_bytes`` when it is not
+    ``None``, otherwise :attr:`MAX_BYTES`, and then the smaller of that and SQS's own 1,048,576
+    bytes. An entry costing more is dropped, counted in ``dropped_oversized`` and announced naming
+    the limit, and a request's entries together cost at most the same limit.
+
     Attributes:
+      MAX_BYTES: The message limit when ``max_message_bytes`` is ``None``, 262,144 bytes, 1.x's
+        256 KiB. It is read through ``self`` once per run, so an assignment on the instance, a
+        subclass's override and the class's own value all set the limit as they did in 1.x; a
+        ``max_message_bytes`` the caller passed wins over it, whatever it holds.
+      max_message_bytes: The message limit the caller passed, an exact ``int`` from 1,024 to
+        1,048,576, or ``None`` for :attr:`MAX_BYTES`. It should be the queue's own
+        ``MaximumMessageSize``: a larger value sends what the queue then refuses.
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
       dropped_oversized: Events dropped for exceeding the message limit, counted only by a run
         that settled.
@@ -194,6 +228,7 @@ class SQSSink:
         fifo: bool | None = None,
         message_group_id: GroupIdSource = None,
         message_deduplication_id: DedupIdSource = None,
+        max_message_bytes: int | None = None,
     ) -> None:
         """Binds the sink to a queue and decides its type once, not per emit.
 
@@ -212,6 +247,14 @@ class SQSSink:
             ``trace_id``.
           message_deduplication_id: A callable deriving the dedup id, or ``None`` to use the
             event's ``log_id``.
+          max_message_bytes: The most bytes one message may cost, and the most a request's
+            messages may cost together, or ``None`` for :attr:`MAX_BYTES` (SPEC-096 FR-001). Pass
+            the queue's ``MaximumMessageSize``, in bytes: ``1048576`` for a queue created at the
+            service default. It is judged after every other argument and before any client is
+            built, read through ``exact_int``, so a ``bool`` or ``int`` subclass is judged and
+            stored as the exact ``int`` it holds, and refused outside 1,024 to 1,048,576, the
+            range a queue's own limit takes, rather than floored, since a new argument has no
+            working configuration to keep.
 
         Returns:
           None.
@@ -220,8 +263,11 @@ class SQSSink:
           TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), or if ``message_group_id``
             is not a ``str``, a callable or ``None``, or ``message_deduplication_id`` is neither
             callable nor ``None`` (SPEC-071 FR-005). Both are judged on a standard queue too,
-            which never reads either: the value is outside the declared type.
-          ValueError: If a constant group id is blank.
+            which never reads either: the value is outside the declared type. Also if
+            ``max_message_bytes`` is neither ``None`` nor an ``int`` (SPEC-096).
+          ValueError: If a constant group id is blank, or if ``max_message_bytes`` holds a number
+            below 1,024 or above 1,048,576; the message names the exact number, an integer too
+            long to print as ``<int: ~N digits>``.
           ImportError: If ``boto3`` is needed and the ``aws`` extra is not installed.
         """
         owner = _diag.type_name(self)
@@ -235,6 +281,13 @@ class SQSSink:
             raise ValueError(
                 "message_group_id must be a non-empty string; pass None to group by trace_id"
             )
+        if max_message_bytes is not None:
+            max_message_bytes = exact_int(max_message_bytes, "max_message_bytes", "SQSSink")
+            if max_message_bytes < _LIMIT_FLOOR or max_message_bytes > _SERVICE_MAX_BYTES:
+                raise ValueError(
+                    f"SQSSink max_message_bytes must be from {_LIMIT_FLOOR} to "
+                    f"{_SERVICE_MAX_BYTES} bytes, got {_int_text(max_message_bytes)}"
+                )
         if client is None:
             client = import_extra("boto3", "aws").client("sqs")
         self.queue_url = queue_url
@@ -243,6 +296,7 @@ class SQSSink:
         self.fifo = queue_url.endswith(".fifo") if fifo is None else fifo
         self.message_group_id = message_group_id
         self.message_deduplication_id = message_deduplication_id
+        self.max_message_bytes = max_message_bytes
         self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
 
@@ -485,8 +539,9 @@ class SQSSink:
             if reason == "id failure" and (cached := entries[position]) is not None
         ]
         if sizes:
+            limit = plan.limit
             context.count(self, "dropped_oversized", len(sizes), when=When.SETTLED)
-            context.announce(lambda: self._announce_oversized(sizes), when=When.SETTLED)
+            context.announce(lambda: self._announce_oversized(sizes, limit), when=When.SETTLED)
         if failures:
             kind = _diag.type_name(failures[0])
             count = len(failures)
@@ -580,12 +635,36 @@ class SQSSink:
         """
         return json.dumps(event)
 
+    def _limit(self) -> int:
+        """Returns the effective message limit: the caller's, else ``MAX_BYTES``, at most 1 MiB.
+
+        ``max_message_bytes`` when it is not ``None``, otherwise :attr:`MAX_BYTES` read through
+        ``self``, so an instance assignment and a subclass override both reach it as in 1.x, and
+        then the smaller of that and :data:`_SERVICE_MAX_BYTES` (SPEC-096 FR-002). The test is
+        ``is None``, never truthiness. A judged ``max_message_bytes`` is never above the cap, so
+        the cap binds only a ``MAX_BYTES`` raised past 1 MiB, which would otherwise send requests
+        SQS refuses whole. :meth:`_chunks` calls this once per run of ``emit``, keeps the value in
+        the run's notes and carries it on each round's plan, so every decision of every round of
+        the run reads one limit.
+
+        Args:
+          None.
+
+        Returns:
+          The limit in bytes.
+
+        Raises:
+          None.
+        """
+        limit = self.MAX_BYTES if self.max_message_bytes is None else self.max_message_bytes
+        return min(limit, _SERVICE_MAX_BYTES)
+
     def _chunks(self, batch: list[dict[str, object]]) -> _Plan:
         """Splits the round's batch into sends within both the entry-count and byte limits.
 
         The boundaries are :func:`~log_foundry.sinks._chunk.chunk_items`' (SPEC-071 FR-004): every
-        per-event drop is decided first, so an event that can never fit is filtered out before any
-        boundary is drawn, and the chunks are materialised as a list, so all of them are known
+        per-event drop is decided first, so an event over the sink's limit is filtered out before
+        any boundary is drawn, and the chunks are materialised as a list, so all of them are known
         before the first send.
 
         **Each entry is prepared once per run** (SPEC-074 FR-002). Its body comes from the encode
@@ -596,9 +675,16 @@ class SQSSink:
         random fallback run **once per event per run** and every round resends the identical
         entry. Only the grouping and each entry's index are per round. An identity that appears
         twice keeps one entry per occurrence, and a round hands an occurrence the first entry of
-        its identity that has not landed. An entry whose costed size exceeds the limit can never
-        fit a message, so it is dropped with a counted warning (FR-004) — and the check is made
-        on everything that travels, not the body alone.
+        its identity that has not landed. An entry whose costed size exceeds the sink's limit is
+        over what the sink sends as one message, so it is dropped with a counted warning
+        (FR-004) — and the check is made on everything that travels, not the body alone.
+
+        **The limit is read once per run** of ``emit`` (:meth:`_limit`, SPEC-096 FR-002): the first
+        round reads it and keeps it in the run's notes, and every later round of the run takes
+        that value, so a limit changed mid-run reaches no round of it. The one value bounds each
+        entry :meth:`_prepare` costs and each chunk's summed cost, and rides on the plan so the
+        round's oversize lines name the same number; an entry prepared in an earlier round of
+        the run therefore keeps a verdict the later rounds' chunking agrees with.
 
         **A FIFO id callable that raises for one event costs only that event** (SPEC-058 FR-004),
         under the wrappers' ledger rule: when every event of the round failed in its id callable,
@@ -617,6 +703,7 @@ class SQSSink:
           None. A ``BaseException`` from a caller's callable propagates.
         """
         notes = run_context().notes(self)
+        limit = cast("int", notes.setdefault("limit", self._limit()))
         cache = cast(
             "dict[int, tuple[dict[str, object], list[_Entry]]]", notes.setdefault("prepared", {})
         )
@@ -639,7 +726,7 @@ class SQSSink:
             if skip < len(live):
                 entry = live[skip]
             else:
-                entry = self._prepare(event, bodies.get(position))
+                entry = self._prepare(event, bodies.get(position), limit=limit)
                 held[1].append(entry)
             round_entries[position] = entry
             if entry.drop is not None:
@@ -655,19 +742,24 @@ class SQSSink:
             chunk_items(
                 prepared,
                 max_count=self.MAX_BATCH,
-                max_bytes=self.MAX_BYTES,
+                max_bytes=limit,
                 size_of=lambda item: item.size,
             )
         )
         refused = first if batch and failures == len(batch) else None
-        return _Plan(chunks, dropped, refused)
+        return _Plan(chunks, dropped, refused, limit)
 
-    def _prepare(self, event: dict[str, object], body: str | None) -> _Entry:
+    def _prepare(self, event: dict[str, object], body: str | None, *, limit: int) -> _Entry:
         """Prepares one event occurrence's entry, or decides its drop.
+
+        An entry is costed as its body's UTF-8 length plus, on a FIFO queue, both ids' UTF-8
+        lengths (SPEC-016 FR-005), and dropped as oversize when that cost exceeds ``limit``, the
+        run's effective message limit (SPEC-096 FR-002).
 
         Args:
           event: The event.
           body: Its encoded body, or ``None`` when the encode step could not encode it.
+          limit: The run's effective message limit, in bytes (:meth:`_limit`).
 
         Returns:
           The entry.
@@ -687,19 +779,22 @@ class SQSSink:
             except Exception as err:
                 return _Entry(drop="id failure", error=err)
             size += len(group_id.encode("utf-8")) + len(dedup_id.encode("utf-8"))
-        if size > self.MAX_BYTES:
+        if size > limit:
             return _Entry(size=size, drop="oversize")
         return _Entry(body=body, group_id=group_id, dedup_id=dedup_id, size=size)
 
-    def _announce_oversized(self, sizes: list[int]) -> None:
+    def _announce_oversized(self, sizes: list[int], limit: int) -> None:
         """Writes one line per event dropped for exceeding the message limit (FR-004).
 
         One line per event is today's shape, kept on purpose; what SPEC-058 FR-004 changed is
         only *when* the lines are written — after the count, and only by a run that settled
-        (SPEC-074).
+        (SPEC-074). The limit each line names is the run's, the one the round judged against,
+        passed in rather than read here, since the lines are written when the run settles and
+        ``MAX_BYTES`` could have been reassigned by then (SPEC-096 FR-002).
 
         Args:
           sizes: The costed size of each dropped event, in the order they were met.
+          limit: The effective message limit of the run that dropped them.
 
         Returns:
           None.
@@ -711,7 +806,7 @@ class SQSSink:
             _diag.lost(
                 "event",
                 1,
-                f"SQSSink, {size} bytes exceeds the {self.MAX_BYTES}-byte message limit",
+                f"SQSSink, {size} bytes exceeds the {limit}-byte message limit",
             )
 
     def _retryable_error(self, err: Exception) -> bool:

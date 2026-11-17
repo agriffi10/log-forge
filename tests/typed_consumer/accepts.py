@@ -66,6 +66,7 @@ from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.otlp import OTLPSink
 from log_foundry.sinks.sentry import Backend, SentrySink
+from log_foundry.sinks.sns import SNSSink
 from log_foundry.sinks.splunk import SplunkHECSink
 from log_foundry.sinks.sqs import DedupIdSource, GroupIdSource, SQSSink
 
@@ -316,6 +317,11 @@ def _sinks() -> list[object]:
         OTLPSink(),
         SentrySink("https://public@example.invalid/1", backend=_BACKEND),
         SQSSink("https://sqs.invalid/q", message_group_id=_GROUP, message_deduplication_id=_DEDUP),
+        # SPEC-096 FR-001: the message limit, an int or None, on both AWS queue sinks.
+        SQSSink("https://sqs.invalid/q", max_message_bytes=262144),
+        SQSSink("https://sqs.invalid/q", max_message_bytes=None),
+        SNSSink("arn:aws:sns:us-east-1:0:t", max_message_bytes=262144),
+        SNSSink("arn:aws:sns:us-east-1:0:t", max_message_bytes=None),
     ]
 
 

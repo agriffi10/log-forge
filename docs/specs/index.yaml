@@ -641,7 +641,7 @@ specs:
   - id: "SPEC-096"
     title: "SQSSink and SNSSink Take Their Message Limit as an Argument, and Never Send Past the Service's"
     description: "Gives SQSSink and SNSSink a keyword-only max_message_bytes argument, judged at construction against the 1,024 to 1,048,576 range a queue's or topic's MaximumMessageSize takes, so a caller can match the destination's own limit; the default stays 1.x's 256 KiB through MAX_BYTES, and no message or request is ever sized past the service's 1 MiB."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-005", "SPEC-010", "SPEC-016", "SPEC-049", "SPEC-051", "SPEC-066", "SPEC-071", "SPEC-074"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-096-sqs-and-sns-message-limit.md"

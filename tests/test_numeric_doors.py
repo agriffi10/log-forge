@@ -419,6 +419,41 @@ def test_max_retries_is_judged_before_the_client_is_built(
     assert calls == [], f"{door} built its client before refusing max_retries"
 
 
+_REFUSED_LIMITS = [
+    (1023, ValueError, "must be from 1024 to 1048576 bytes, got 1023"),
+    (1048577, ValueError, "must be from 1024 to 1048576 bytes, got 1048577"),
+    (0, ValueError, "must be from 1024 to 1048576 bytes, got 0"),
+    (-1, ValueError, "must be from 1024 to 1048576 bytes, got -1"),
+    (True, ValueError, "must be from 1024 to 1048576 bytes, got 1"),
+    (1.5e6, TypeError, "must be an integer, not float"),
+    (262144.0, TypeError, "must be an integer, not float"),
+    ("262144", TypeError, "must be an integer, not str"),
+    (decimal.Decimal(262144), TypeError, "must be an integer, not Decimal"),
+]
+
+
+@pytest.mark.parametrize(
+    ("bad", "error", "text"),
+    _REFUSED_LIMITS,
+    ids=[f"{type(row[0]).__name__}-{row[0]!r}" for row in _REFUSED_LIMITS],
+)
+@pytest.mark.parametrize("door", ["SNSSink", "SQSSink"])
+def test_max_message_bytes_is_judged_before_the_client_is_built(
+    monkeypatch: pytest.MonkeyPatch, door: str, bad: object, error: type[Exception], text: str
+) -> None:
+    """SPEC-096 FR-001 AC4: a refused limit leaves no client behind, as `max_retries` does."""
+    stub, build = _BUILDS[door]
+    calls = stub(monkeypatch)
+    build(max_message_bytes=262144)
+    assert len(calls) == 1, "the premise: a good value reaches the stand-in's build exactly once"
+    calls.clear()
+    with pytest.raises(error) as info:
+        build(max_message_bytes=bad)
+    assert type(info.value) is error
+    assert str(info.value) == f"{door} max_message_bytes {text}"
+    assert calls == [], f"{door} built its client before refusing max_message_bytes={bad!r}"
+
+
 def test_worker_refuses_a_float_max_retries_and_floors_a_negative() -> None:
     """FR-001 AC-5: the worker stored `max_retries` unjudged; the floor was only in `_emit`."""
     with pytest.raises(TypeError, match=r"^Worker max_retries must be an integer, not float$"):
@@ -993,6 +1028,22 @@ _HUGE_DOORS: dict[str, tuple[Callable[[], Any], str]] = {
     "configure": (
         lambda: log_foundry.configure(max_value_bytes=-_HUGE),
         f"max_value_bytes must be >= 1, got {_HUGE_TEXT}",
+    ),
+    "sqs-max_message_bytes-high": (
+        lambda: SQSSink("https://q", client=object(), max_message_bytes=_HUGE),
+        f"SQSSink max_message_bytes must be from 1024 to 1048576 bytes, got {_HUGE_TEXT}",
+    ),
+    "sqs-max_message_bytes-low": (
+        lambda: SQSSink("https://q", client=object(), max_message_bytes=-_HUGE),
+        f"SQSSink max_message_bytes must be from 1024 to 1048576 bytes, got {_HUGE_TEXT}",
+    ),
+    "sns-max_message_bytes-high": (
+        lambda: SNSSink("arn", client=object(), max_message_bytes=_HUGE),
+        f"SNSSink max_message_bytes must be from 1024 to 1048576 bytes, got {_HUGE_TEXT}",
+    ),
+    "sns-max_message_bytes-low": (
+        lambda: SNSSink("arn", client=object(), max_message_bytes=-_HUGE),
+        f"SNSSink max_message_bytes must be from 1024 to 1048576 bytes, got {_HUGE_TEXT}",
     ),
 }
 

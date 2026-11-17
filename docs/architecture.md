@@ -812,7 +812,8 @@ app  ──►  in-memory worker queue  ──►  durable sink (SQS)  ──►
 - **Batching honors the sink's limits, but the worker stays sink-agnostic** — the worker
   flushes on fixed count/time thresholds and hands the sink whatever it accumulated; each
   sink re-chunks that batch to its own transport constraints. For SQS that means splitting
-  into sends of ≤ 10 messages and ≤ 256 KB apiece. This keeps the worker dumb and lets each
+  into sends of ≤ 10 messages, each message and each send within the sink's message limit,
+  256 KiB by default and at most 1 MiB (SPEC-096). This keeps the worker dumb and lets each
   sink own the limits only it knows about.
 
 
@@ -2003,22 +2004,6 @@ an item leaves this list when a spec closes it, not because the arc names it.
   it is has not been established. **Closed by** reading the CI and Integration runs of the pull
   request that landed each spec (#294, #307, #308 and #299 in that order), and for each line
   striking it with the run that settled it, or filing here what did not settle.
-- **`SQSSink.MAX_BYTES` is below what the service now accepts, and neither SQS nor SNS sink lets a
-  caller match a destination's own limit** (2026-11-14 audit, raised by the sinks frame from memory;
-  read against the live AWS pages on 2026-11-15 and 2026-11-16 while SPEC-096 was authored;
-  invariant 2's `dropped_oversized`). The class holds 256 KiB (`sinks/sqs.py:186`), and an event
-  whose message exceeds it is dropped and counted (`:690`). AWS raised the limit on 2025-08-04
-  ("Amazon Simple Queue Service (Amazon SQS) has increased the maximum message payload size from
-  256 KiB to 1 MiB", *What's New*, posted Aug 4, 2025), and a queue's `MaximumMessageSize` is now
-  "An integer from 1,024 bytes (1 KiB) to 1,048,576 bytes (1 MiB). Default: 1,048,576 bytes (1
-  MiB)" (`CreateQueue`). So the sink
-  drops an event between 256 KiB and 1 MiB that a queue at the service default would take, and
-  sends one that a queue configured below 256 KiB refuses; when that refusal is the whole call, the
-  call's other events are lost with it, counted in `failed`
-  (`docs/audits/2026-11-14-probes/sinks/spec096_destination_below_limit.py`, case S4). `SNSSink`
-  has the second half: a topic's `MaximumMessageSize` defaults to 262,144 bytes and may be raised to
-  1,048,576, and `SNSSink.MAX_BYTES` (`sinks/sns.py:70`) cannot follow it. **Closed by** SPEC-096,
-  which gives both sinks a `max_message_bytes=` argument.
 - **Three comments give a suite time that CI may no longer show** (2026-11-14 audit, raised by the
   verification frame and unverified here; no invariant). `.github/workflows/ci.yml:131` says the
   pytest step fell to about 49 s, `:108` reasons from that figure, and `pyproject.toml`'s comments
@@ -2067,6 +2052,35 @@ an item leaves this list when a spec closes it, not because the arc names it.
   tail is lost there unless that publish finishes between two rounds. Decision:
   `docs/decisions/sink-delivery/` (*An event a NATS round never handed to the driver is
   resendable*).
+- ~~**`SQSSink.MAX_BYTES` is below what the service now accepts, and neither SQS nor SNS sink lets
+  a caller match a destination's own limit**~~ (2026-11-14 audit, raised by the sinks frame from
+  memory; read against the live AWS pages on 2026-11-15 and 2026-11-16 while SPEC-096 was authored;
+  invariant 2's `dropped_oversized`). The class holds 256 KiB (`sinks/sqs.py:186`), and an event
+  whose message exceeds it is dropped and counted (`:690`). AWS raised the limit on 2025-08-04
+  ("Amazon Simple Queue Service (Amazon SQS) has increased the maximum message payload size from
+  256 KiB to 1 MiB", *What's New*, posted Aug 4, 2025), and a queue's `MaximumMessageSize` is now
+  "An integer from 1,024 bytes (1 KiB) to 1,048,576 bytes (1 MiB). Default: 1,048,576 bytes (1
+  MiB)" (`CreateQueue`). So the sink
+  drops an event between 256 KiB and 1 MiB that a queue at the service default would take, and
+  sends one that a queue configured below 256 KiB refuses; when that refusal is the whole call, the
+  call's other events are lost with it, counted in `failed`
+  (`docs/audits/2026-11-14-probes/sinks/spec096_destination_below_limit.py`, case S4). `SNSSink`
+  has the second half: a topic's `MaximumMessageSize` defaults to 262,144 bytes and may be raised to
+  1,048,576, and `SNSSink.MAX_BYTES` (`sinks/sns.py:70`) cannot follow it. **Closed by** SPEC-096,
+  which gives both sinks a `max_message_bytes=` argument. → **closed by SPEC-096 FR-001 to
+  FR-004.** Both sinks take `max_message_bytes`, keyword-only and appended, refused at
+  construction outside 1,024 to 1,048,576, the range a queue's or topic's `MaximumMessageSize`
+  takes. `None`, the default, keeps `MAX_BYTES`, 262,144, as the limit, read through `self` as in
+  1.x, so a caller who passes nothing sends, entry for entry and byte for byte
+  apart from each `Id`, the requests recorded at `10ba21ee`
+  (`tests/data/spec096_requests_10ba21ee.json`). Each run of `emit` applies one effective limit, read once, to every
+  message and to each request's sum, capped at 1,048,576, so a `MAX_BYTES` raised past 1 MiB now
+  drops each message over 1 MiB alone, counted in `dropped_oversized`, rather than sending a
+  request the service refuses whole, and `SNSSink` costs a request in UTF-8 bytes, as the topic
+  does. The default stays 256 KiB by Andrew's choice of 2026-11-16. Decision:
+  `docs/decisions/sink-delivery/` (*A destination limit the caller can configure is a constructor
+  argument, defaulting to the 1.x value, under the service's ceiling*). The `KinesisSink` item
+  filed with this one stays under *Open*.
 - ~~**The exit drain sends the whole backlog as one batch, and a budget that expires inside it loses
   that batch behind a promise of a count that never comes**~~ (2026-11-14 audit, finding 9; invariants
   2 and 3). `Worker._final_drain` gathers everything queued into one list and emits it once
@@ -3191,7 +3205,8 @@ and a third copy is a fork with no merge.
 - **The payload ceilings bound each *value*, and the pass budgets of 131,072 values and 16 MiB
   of text bound the work, not the event's size at a destination.** `max_value_bytes`,
   `max_stack_bytes`, `max_keys` and `max_depth` (SPEC-017) each bound one value, so a legal event
-  can still be large: 256 keys × 8192 bytes is roughly 2 MB, past SQS's 256 KB — measured at
+  can still be large: 256 keys × 8192 bytes is roughly 2 MB, past `SQSSink`'s default 256 KiB,
+  and SQS's own 1 MiB — measured at
   `456e9b7` as a 2,060,506-byte event, serializable and marked `truncated` (2026-09-04 audit,
   N11). Acceptable because
   it is *visible* — a sink with a hard limit drops the event and counts `dropped_oversized`, so

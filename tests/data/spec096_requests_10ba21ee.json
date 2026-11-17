@@ -1,0 +1,321 @@
+{
+ "A": {
+  "dropped_oversized": 0,
+  "failed": 0,
+  "lines": [],
+  "raised": null,
+  "requests": [
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "735b14953492f188eb7341472cfcf9cb2c541357be5bb969117b81117d9b8609"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "3fb2d0b743dee4a31a35c7746b16aae31ec9932f3dda5f4287833555febcf640"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "386ac509f222a77e24eb9b39813a67d6a2391d917d50def5b875ae0ccc1937b4"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "e8e6342c700af7f709e10f78fb8a273bd96d87101cdbb66196a2532d2816b2df"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "c7fa0620bac7c3bc11a111880b3055ba1629d80615924e5ad4277067f39b0750"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "6b2377707f366ac74f1ce8a3387e280a94ae953a547ed163ea916e6499e8071d"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "f8c1a509f672494cebaa7ecbb0a11319ddd631beee421ee797082b10a9510afc"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "e4aa7f91559a1378203356b521b8c133b1da29bb0c11caa2585729b8244b63dc"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "2fcd8d971ad190fd0e63e0e4bd90422497a010ce5ad7548caac1e93b2386893e"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "6a80eb982e1967a630af2717be7e3c84347601c1027cdcfd4b60d5ae9174f3fd"
+    }
+   ]
+  ]
+ },
+ "B": {
+  "dropped_oversized": 0,
+  "failed": 0,
+  "lines": [],
+  "raised": null,
+  "requests": [
+   [
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "3336eb8bb9b23ac63a141845d96f21ef0758921d93d763ea5e1788a1297e6f42"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "41740681d5ee0be6c486a6e156ce1f1b852fa261474b8137ed9c5c1f71acd65e"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "0af263f786813a9a177ffd503e1b2fbeeaea8c2385310e75dc8ee83787688c51"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "e10bee0c186937e6dd1eb5b2b43c7abbe4e094f5c9174e5360e6d7b2ad09b2c5"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "5f227f780a4727ad1b4ccc6f7a6692d212d6930ae3b79e80fbf01c29396c38cf"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "26eb4898250e824e0e37c35d4efbecb2ed74f57fff8ce41d22ea7af81b4d0abb"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "957fa51d7c14902d428693089ddbb0440db9bb9c9304b7863e8f19a80e506067"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "101954883f15096a4b99defdb6aaed9dd2396c3c5e1e6090f951d310aede495d"
+    }
+   ],
+   [
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "4b1cacd6d9d8e81abdc5c7448d541d643b53151d1f217ceded234347e49baa81"
+    },
+    {
+     "cost": 30806,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "5ece0e2261b46d70ded864dba2b04c3e9f0cff625820be118b9b2bfd927633b8"
+    }
+   ]
+  ]
+ },
+ "C": {
+  "dropped_oversized": 1,
+  "failed": 0,
+  "lines": [
+   "log-foundry: lost 1 event(s); SQSSink, 307286 bytes exceeds the 262144-byte message limit"
+  ],
+  "raised": null,
+  "requests": [
+   [
+    {
+     "cost": 96,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "96b2e4db580e69193b0b37ab1d961c14f65ab23c09f02f472af88dda05bb3328"
+    },
+    {
+     "cost": 96,
+     "keys": [
+      "MessageBody"
+     ],
+     "sha256": "46ad9430c7424d9f2ffd126edcf520c1b424038ca7caf7aad2a2fc86f252c794"
+    }
+   ]
+  ]
+ },
+ "E": {
+  "dropped_oversized": 1,
+  "failed": 0,
+  "lines": [
+   "log-foundry: lost 1 event(s); SQSSink, 262171 bytes exceeds the 262144-byte message limit"
+  ],
+  "raised": null,
+  "requests": []
+ },
+ "F1": {
+  "dropped_oversized": 0,
+  "failed": 0,
+  "lines": [],
+  "raised": null,
+  "requests": [
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "dc59389de65761b831ad3ded3ab3401460d6c8e2842ba803c4923cf57786a527"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "39ce8bf09c3be82da067eab5944c6c1dfb51c2dda6f1f2c4e42bfbf2ccbb24dd"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "31bfb57ad8838bc74fe2b2679a57b895497f365b5593e448546c873a3f1a181a"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "7f4f772384b0534001bed8f55b17d3328acdfdad764361109616107cf904b9ce"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "ddea765683beb41653b78730ff1afaf833cb39e1f6a7ff49ca233ca130b39996"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "db755f23df21661a1ebdb78521beb614a3b410877ae601fcbc1e1688caf494f7"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "6ab5d76f1f29beea2326f8b9b259f49226a53ba90671d2b4d907b51dd47850e7"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "b6525acb97f1e7a9c19a8bc415c8284b9ca10d81f0c3f9eca7f96ed754eb8911"
+    }
+   ],
+   [
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "85dbb3f9441c7ad62b6b30a8fa5134e4e55a022fe8d268ad329ae53d8877f6e2"
+    },
+    {
+     "cost": 102486,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "e17d195e9b727ea87ba7ff6dc4aa8dce88edaf306e77d081292c8b701cdab223"
+    }
+   ]
+  ]
+ },
+ "F2": {
+  "dropped_oversized": 1,
+  "failed": 0,
+  "lines": [
+   "log-foundry: lost 1 event(s); SNSSink, exceeds the 262144-byte message limit"
+  ],
+  "raised": null,
+  "requests": [
+   [
+    {
+     "cost": 96,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "7d4f73cf95cdb3f2093b5d9d6103922e1f72f35563552cf79c7a242d990cc29a"
+    },
+    {
+     "cost": 96,
+     "keys": [
+      "Message"
+     ],
+     "sha256": "0113132b8978b7859ae29316d352434681dd4b75f527e057e8b65d08abc32c61"
+    }
+   ]
+  ]
+ }
+}

@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-096
 title: "SQSSink and SNSSink Take Their Message Limit as an Argument, and Never Send Past the Service's"
 description: "Gives SQSSink and SNSSink a keyword-only max_message_bytes argument, judged at construction against the 1,024 to 1,048,576 range a queue's or topic's MaximumMessageSize takes, so a caller can match the destination's own limit; the default stays 1.x's 256 KiB through MAX_BYTES, and no message or request is ever sized past the service's 1 MiB."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-005, SPEC-010, SPEC-016, SPEC-049, SPEC-051, SPEC-066, SPEC-071, SPEC-074]
 arc: audit-2026-11-14
 arc_order: 12
@@ -36,7 +36,7 @@ request is ever sized past the service's 1 MiB.
 - `SNSSink` applies it the same way (FR-003).
 - `MAX_BYTES` keeps its value and its 1.x reach as the default limit (FR-004).
 - The record: the README, the docstrings, `docs/release-notes/v1.2.1.md`, `docs/architecture.md`
-  §8 and §12, one decision file, and SPEC-092's parameter roster if it has been built (FR-005).
+  §9.1, §12 and §13, one decision file, and SPEC-092's parameter roster if it has been built (FR-005).
 
 ### Out of Scope
 
@@ -55,8 +55,8 @@ request is ever sized past the service's 1 MiB.
   `FirehoseSink`'s limits were read too and still match the service, which says they "cannot be
   changed".
 - **Validating `MAX_BYTES`, or `max_message_bytes` assigned after construction.** `MAX_BYTES` is
-  read per round when `max_message_bytes` is `None`, as in 1.x, and `sink.max_message_bytes` is a
-  public attribute a caller can reassign, as `sink.max_retries` is. An assignment made after
+  read once per run of `emit` when `max_message_bytes` is `None`, and `sink.max_message_bytes` is
+  a public attribute a caller can reassign, as `sink.max_retries` is. An assignment made after
   construction can be judged only on the drain thread, which invariant 13 forbids. Only the upper
   side of either is held, by the 1,048,576 cap (FR-002, FR-003).
 - **Not counting the FIFO ids.** `SQSSink` costs a FIFO entry as its body plus its
@@ -176,7 +176,8 @@ call level within a module only.
 
 #### Description:
 
-**The effective limit.** Each round reads one value, used for every decision that round makes:
+**The effective limit.** Each run of `emit` reads one value, used for every round of that run
+and every decision each round makes:
 `max_message_bytes` when it is not `None`, otherwise `self.MAX_BYTES` (FR-004), and then the
 smaller of that and 1,048,576. The cap is a private module constant, `_SERVICE_MAX_BYTES`,
 whose docstring quotes the service: "The maximum allowed individual message size and the maximum
@@ -192,8 +193,8 @@ alone, and each request is split under 1 MiB.
 length, plus on a FIFO queue the UTF-8 lengths of `MessageGroupId` and `MessageDeduplicationId`.
 An entry whose cost exceeds the effective limit is dropped, counted in `dropped_oversized` and
 announced. The line is today's, `SQSSink, <size> bytes exceeds the <limit>-byte message limit`,
-with `<limit>` the effective limit. An entry is still prepared once per run (SPEC-074 FR-002), so
-the limit an entry was judged against is the one read in the round that prepared it.
+with `<limit>` the effective limit. An entry is still prepared once per run (SPEC-074 FR-002), and
+the run reads one limit, so a later round's chunking agrees with the verdict its entry was given.
 
 **Each request.** `chunk_items` (`:655-660`) is given the effective limit as `max_bytes` where
 it is given `self.MAX_BYTES` today. A request therefore holds at most 10 entries whose costs sum
@@ -234,7 +235,8 @@ the service requires, which costs requests and never a refusal.
 
 #### Description:
 
-FR-002's rule on SNS's twin path (invariant 6). Each round reads one effective limit:
+FR-002's rule on SNS's twin path (invariant 6). Each run of `emit` reads one effective limit,
+used for every round of that run:
 `max_message_bytes`, else `self.MAX_BYTES`, then the smaller of that and `_SERVICE_MAX_BYTES`,
 1,048,576, the most any topic accepts ("supports values up to 1 MiB (1,048,576 bytes)",
 `PublishBatch`). `_bodies` (`sinks/sns.py:321`) drops a message whose UTF-8 body exceeds it,
@@ -293,7 +295,7 @@ the README tells the caller to pass the topic's value and nothing larger.
 `MAX_BYTES` is a public class attribute on both sinks. The frozen surface lets it grow and never
 shrink (invariant 10), and the `1.x` rule is no breaking change, so it is not removed, renamed or
 re-valued. After this spec it means one thing on each class: **the limit a sink uses when
-`max_message_bytes` is `None`.** It is read through `self` once per round, as today. So the three
+`max_message_bytes` is `None`.** It is read through `self` once per run of `emit`. So the three
 ways 1.x code sets a limit keep working: an assignment on the instance after construction, a
 subclass that overrides it, and the class's own value. The suite relies on the first in three
 places (`tests/test_sink_concurrency.py:484`, `tests/test_sinks_sqs_id_failures.py:129` and
@@ -347,7 +349,7 @@ What a caller and the next session read:
   sinks each gain one keyword-only argument, appended, and that no default changed. The sentence
   that says *Added* lists one new public name counts the new ones. The opening list of carried
   specs names SPEC-096.
-- **`docs/architecture.md`.** §8's "≤ 256 KB apiece" becomes the sink's message limit, 256 KiB by
+- **`docs/architecture.md`.** §9.1's "≤ 256 KB apiece" becomes the sink's message limit, 256 KiB by
   default and at most 1 MiB. §13's "past SQS's 256 KB" (the payload-ceilings bullet) becomes "past
   `SQSSink`'s default 256 KiB, and SQS's own 1 MiB". §12's item for `SQSSink.MAX_BYTES` moves to
   *Resolved*, closed by this spec. Its Kinesis item stays open.
@@ -427,8 +429,9 @@ class SNSSink:
     def _limit(self) -> int: ...
 ```
 
-`_limit` tests `is None`, never truthiness. It is called once per round, and its value is passed
-down to `_prepare`/`_bodies`, to `chunk_items` and to the oversize line.
+`_limit` tests `is None`, never truthiness. Each run of `emit` reads one value, kept in the run's
+notes and used for every round of that run, and its value is passed down to `_prepare`/`_bodies`,
+to `chunk_items` and to the oversize line.
 
 ---
 
@@ -480,7 +483,7 @@ tests/test_numeric_doors.py         # FR-001: _BUILDS refusals and four _HUGE_DO
 tests/conformance_classes.py        # FR-005, only if SPEC-092 is built
 README.md
 docs/release-notes/v1.2.1.md
-docs/architecture.md                # §8, §12, §13
+docs/architecture.md                # §9.1, §12, §13
 docs/decisions/sink-delivery/a-destination-limit-the-caller-can-configure-is-a-constructor-argument-defaulting-to-the-1x-value-under-the-services-ceiling.md
 docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte-budget.md
 ```
@@ -501,12 +504,12 @@ docs/decisions/event-assembly/each-coercion-pass-is-bounded-by-a-node-and-a-byte
 - Record, at `10ba21ee`, the requests a recording client receives for `spec096_limits_today.py`
   cases A, B, C, E, F1 and F2, as the fixture FR-002's and FR-003's first criteria compare with.
 - Route the effective limit through `_chunks`/`_prepare`/`_announce_oversized` on SQS and
-  `_round`/`_bodies` on SNS, read once per round, and cost an SNS request in UTF-8 bytes.
+  `_round`/`_bodies` on SNS, read once per run, and cost an SNS request in UTF-8 bytes.
 - Tests for each criterion of FR-002 and FR-003, the twin-path table included.
 
 ### Phase 3: The record (FR-005)
 
-- README, docstrings, release notes, §8, §12 and §13, the two decision files, `LIMIT_GAINED`, and
+- README, docstrings, release notes, §9.1, §12 and §13, the two decision files, `LIMIT_GAINED`, and
   SPEC-092's roster if built.
 
 ---
@@ -669,3 +672,19 @@ today, and this spec adds two.
   - SPEC-093's FR-003 and SPEC-095 are cited as Draft on `main`. Neither contradicts a
     requirement here.
   - SNS's whole-call `BatchRequestTooLong` and the 100-subscription precondition are quoted.
+- **2026-11-17, corrected at completion.** ~~§8~~ is §9.1 throughout: the "≤ 256 KB apiece"
+  sentence sits under `### 9.1 The sink is a durable buffer, not the final store`, so FR-005,
+  *Scope*, *File & Folder Structure* and Phase 3 now name §9.1, and *Scope* names §13 beside it.
+  The build also repaired the SPEC-092 prototype FR-005's last criterion runs:
+  `docs/audits/2026-11-14-probes/sinks/spec092_corpus.py` wrapped `Worker._emit` with a
+  two-argument function, which raised `TypeError` once `_emit` gained the keyword-only
+  `exit_batch` at `14711e7e` (SPEC-090), so every row read `harness-error:batch-count` and the
+  16-byte control moved none. The wrapper now forwards `_emit`'s keyword arguments, and the
+  criterion was settled on the repaired prototype: 256 rows, 86 red, 0 moved at 1,048,576 and at
+  1,024, and 7 moved at the 16-byte control, all of them SQS or SNS rows.
+- **2026-11-17, one limit per run.** The system-frame diff review found the twins diverged under
+  a limit changed between two rounds of one run: `SQSSink` kept each entry's verdict from the
+  round that prepared it, while `SNSSink` read the limit again every round, so a 300 KiB event
+  sent by one was dropped by the other (invariant 6). Both now read the limit once per run of
+  `emit` and use that value for every round of it. ~~Each round reads one value~~ is corrected in
+  FR-002, FR-003, FR-004, the Data Model and Phase 2.
