@@ -318,13 +318,56 @@ def test_max_bytes_still_sets_the_limit_when_max_message_bytes_is_none(cls: type
 
 @pytest.mark.parametrize("cls", _CLASSES, ids=_IDS)
 def test_max_message_bytes_wins_over_max_bytes(cls: type) -> None:
-    """FR-004 AC4: a passed limit beats MAX_BYTES, in the round and in the line written later."""
+    """FR-004 AC4: a passed limit beats MAX_BYTES, in the round and in the line it names.
+
+    ``MAX_BYTES`` is set before the run starts, so this cannot tell a limit bound in the round
+    from one read again when the line is written; the test after it holds that.
+    """
     sink = _build(cls, max_message_bytes=65536)
     sink.MAX_BYTES = 2048
     result = cases.run(sink, [event(0, 3 * KIB), event(1, 100 * KIB)])
     assert _ns(sink) == [[0]], "the 3 KiB event lands under 65536 though MAX_BYTES says 2048"
     assert sink.dropped_oversized == 1
     assert _named(result["lines"]) == [65536], result["lines"]
+
+
+class Reassigning(Recorder):
+    """A recorder whose request sets the sink's ``MAX_BYTES`` to 8192 before taking it.
+
+    The drop is decided in the round, before the request, and its line is written when the run
+    settles, after it: a sink that read the limit again for the line would name 8192.
+    """
+
+    sink: Any = None
+
+    def send_message_batch(self, QueueUrl: str, Entries: list[dict[str, str]]) -> dict[str, Any]:
+        self.sink.MAX_BYTES = 8192
+        return super().send_message_batch(QueueUrl, Entries)
+
+    def publish_batch(
+        self, TopicArn: str, PublishBatchRequestEntries: list[dict[str, str]]
+    ) -> dict[str, Any]:
+        self.sink.MAX_BYTES = 8192
+        return super().publish_batch(TopicArn, PublishBatchRequestEntries)
+
+
+@pytest.mark.parametrize("cls", _CLASSES, ids=_IDS)
+def test_the_oversize_line_names_the_limit_the_round_read(cls: type) -> None:
+    """FR-002: the line names the round's 2048, though MAX_BYTES is 8192 by the time it is written.
+
+    The 3 KiB event is dropped against 2048 and the 10-byte one sent; that send reassigns
+    ``MAX_BYTES``, and only then does the run settle and write the line. A line formatted from
+    ``self._limit()`` at that point would name 8192, which is what this catches.
+    """
+    client = Reassigning()
+    sink = _build(cls, client=client)
+    client.sink = sink
+    sink.MAX_BYTES = 2048
+    result = cases.run(sink, [event(0, 10), event(1, 3 * KIB)])
+    assert _ns(sink) == [[0]]
+    assert sink.MAX_BYTES == 8192, "the premise: the request reassigned it before the line"
+    assert sink.dropped_oversized == 1
+    assert _named(result["lines"]) == [2048], result["lines"]
 
 
 # --- FR-002 / FR-003 AC1: the default sends what 1.x sent -------------------------------------
@@ -335,7 +378,7 @@ def _recording() -> dict[str, Any]:
 
 
 def test_the_recording_matches_the_specs_evidence_table() -> None:
-    """The fixture is what the spec measured at 10ba21ee, so it is not a recording of anything."""
+    """The fixture is a recording of the 10ba21ee tree, not of the tree under test."""
     rec = _recording()
     assert sorted(rec) == ["A", "B", "C", "E", "F1", "F2"]
 
@@ -404,6 +447,12 @@ def test_sns_default_requests_match_the_10ba21ee_recording(name: str) -> None:
 # --- FR-002: SQSSink applies the limit --------------------------------------------------------
 
 
+_ONE_BYTE_PAST_MIB = (
+    "log-foundry: lost 1 event(s); SQSSink, 1048577 bytes exceeds the 1048576-byte message limit"
+)
+"""The line ``SQSSink`` writes for a message costing one byte past a 1 MiB limit."""
+
+
 def test_sqs_at_one_mib_sends_the_largest_message_and_drops_one_byte_more() -> None:
     """FR-002 AC2: 1,048,576 bytes is sent alone and lands; one byte more is dropped."""
     sink = _build(SQSSink, client=Ceiling(), max_message_bytes=MIB)
@@ -412,9 +461,7 @@ def test_sqs_at_one_mib_sends_the_largest_message_and_drops_one_byte_more() -> N
     assert len(sink.client.requests[0][0]["MessageBody"].encode("utf-8")) == MIB
     assert sink.dropped_oversized == 1
     assert sink.losses().failed == 0
-    assert result["lines"] == [
-        "log-foundry: lost 1 event(s); SQSSink, 1048577 bytes exceeds the 1048576-byte message limit"
-    ]
+    assert result["lines"] == [_ONE_BYTE_PAST_MIB]
 
 
 def test_sqs_fifo_at_one_mib_costs_the_ids() -> None:
@@ -430,9 +477,7 @@ def test_sqs_fifo_at_one_mib_costs_the_ids() -> None:
     assert sent["MessageDeduplicationId"] == "l0000"
     assert cases.costed(sent) == MIB
     assert sink.dropped_oversized == 1
-    assert result["lines"] == [
-        "log-foundry: lost 1 event(s); SQSSink, 1048577 bytes exceeds the 1048576-byte message limit"
-    ]
+    assert result["lines"] == [_ONE_BYTE_PAST_MIB]
 
 
 def test_sqs_at_64_kib_drops_the_100_kib_event_and_sends_the_rest_together() -> None:

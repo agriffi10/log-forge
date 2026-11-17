@@ -384,7 +384,7 @@ class SNSSink:
     def _bodies(
         self, encoded: list[tuple[int, str]], pending: Deferral | _Drops, limit: int
     ) -> list[tuple[int, str]]:
-        """Keeps each encoded body, dropping any message too large to ever fit (FR-011).
+        """Keeps each encoded body, dropping one larger than the round's message limit (FR-011).
 
         It takes what :meth:`_encode` built (SPEC-069 FR-001), so the size check runs over
         encoded forms and nothing here can fail on an event. A body's UTF-8 length is its cost,

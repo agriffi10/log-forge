@@ -44,8 +44,8 @@
 ## Verification
 
 - **The 1.x requests.** The six default-limit cases (A, B, C, E, F1, F2) were recorded entry by
-  entry against a `git archive` of `10ba21ee`, and re-recorded against `3949936f` byte-identical;
-  the branch's requests equal the recording apart from each `Id`.
+  entry against a `git archive` of `10ba21ee`, and re-recorded against `61b942c0`, the branch's
+  base on `main`, byte-identical; the branch's requests equal the recording apart from each `Id`.
 - **SPEC-092's corpus** (`spec096_corpus_rows.py`), on the repaired prototype: 256 rows, 86 red;
   0 rows moved at 1,048,576 and at 1,024, and 7 moved at the 16-byte control, all SQS or SNS
   rows, which proves the patch reached them. Before the repair every row read
@@ -54,5 +54,7 @@
   truthiness rather than `is None`, is equivalent: the only falsy `int`, 0, is refused at
   construction. Four further mutants were run and killed: `_prepare` and `_bodies` judging by
   `self.MAX_BYTES`, `_limit` ignoring the argument (each on both sinks), the floor off by one
-  on `SQSSink`, and the cap off by one on `SNSSink`.
+  on `SQSSink`, and the cap off by one on `SNSSink`. A fifth, the oversize line formatting
+  `self._limit()` when the run settles rather than the limit the round read, is killed on each
+  sink by a request that reassigns `MAX_BYTES` before the line is written.
 - The spec's "§8" was §9.1; the spec is corrected in its revision history.

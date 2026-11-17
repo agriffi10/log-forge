@@ -143,7 +143,7 @@ def record() -> dict[str, dict[str, object]]:
 
 
 def dumps(recording: dict[str, dict[str, object]]) -> str:
-    """The recording's file form: sorted keys and a trailing newline, so equal runs are equal bytes."""
+    """The recording's file form: sorted keys and a final newline, so equal runs are equal bytes."""
     return json.dumps(recording, sort_keys=True, indent=1) + "\n"
 
 

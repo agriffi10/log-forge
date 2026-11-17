@@ -908,16 +908,16 @@ lf.configure(service="payments",
              sink=SQSSink(queue_url="https://sqs.us-east-1.amazonaws.com/123456789012/logs"))
 ```
 
-By default `SQSSink` and `SNSSink` each drop a message larger than 256 KiB. To match your
-queue or topic, pass its `MaximumMessageSize`, in bytes, as `max_message_bytes`: `1048576` for a
-queue created at the service default, or whatever value you gave a topic or queue yourself. The
-argument takes 1,024 to 1,048,576 and refuses anything else when the sink is built, and neither
-sink ever sends a message or a request larger than 1 MiB. Pass your destination's own value and
-nothing larger. The service refuses a message above it, and an SNS topic also refuses a request
-whose messages together exceed it; when the service refuses the whole request, every event in that
-request is lost with it, including the ones that would have fit. That is why the sinks do not default to 1 MiB, although a new queue does: against
-a queue still at 256 KiB, or any SNS topic left at its 256 KiB default, a 1 MiB sink would have
-whole requests refused.
+By default `SQSSink` and `SNSSink` each drop a message larger than 256 KiB. To match your queue or
+topic, pass its `MaximumMessageSize`, in bytes, as `max_message_bytes`: `1048576` for a queue
+created at the service default, or whatever value you gave a topic or queue yourself. The argument
+takes 1,024 to 1,048,576 and refuses anything else when the sink is built, and neither sink ever
+sends a message or a request larger than 1 MiB. Pass your destination's own value and nothing
+larger. The service refuses a message above it, and an SNS topic also refuses a request whose
+messages together exceed it; when the service refuses the whole request, every event in that request
+is lost with it, including the ones that would have fit. That is why the sinks do not default to
+1 MiB, although a new queue does: against a queue still at 256 KiB, or any SNS topic left at its
+256 KiB default, a 1 MiB sink would have whole requests refused.
 
 ```python
 SQSSink(queue_url=QUEUE_URL, max_message_bytes=1_048_576)  # a queue at the 1 MiB default
