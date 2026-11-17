@@ -5,7 +5,7 @@ ran against this repository at `a0f44b5f` (tag `v1.2.0`), kept byte for byte as 
 that a later session can prove a finding closed by re-running the probe that found it. Each
 directory is named for its frame report.
 
-**Seventy-six files here are not the audit's.** Each was added after the audit was brought in
+**Eighty-two files here are not the audit's.** Each was added after the audit was brought in
 (`5cb0f449`) and names in its first lines the spec it was written for. The list below was derived
 from `git log --diff-filter=A` per file; rederive it the same way when adding one.
 
@@ -109,6 +109,21 @@ from `git log --diff-filter=A` per file; rederive it the same way when adding on
   library and prints what each combination of `fifo`, `message_group_id` and
   `message_deduplication_id` does at construction on `SQSSink`, and on `SNSSink` when the tree's
   `SNSSink` takes `fifo`, and what a FIFO batch of one id failure and one oversized event returns.
+- `lifecycle/spec101_sequences.py`, `spec101_second_close.py` and `spec101_rounds.py`, written while
+  authoring SPEC-101 against `a38bd80c`, and `spec101_slow_holder.py` and `spec101_interrupt.py`,
+  adapted from its spec reviewer's probes while revising it. The first runs every sequence in which
+  a caller's wrapper holds a kept sink, for a wrapper that leaves its member alone and one that
+  closes it, and judges the member's record by SPEC-086's close oracles, so it needs `src` and
+  `tests` on `PYTHONPATH`; the second closes each shipped sink that needs no server twice in
+  sequence; the third counts the closes and the records over 200 sink changes; the fourth times a
+  member's close behind a slow or hung holder; the fifth interrupts a `shutdown()` after its take
+  of a caller's wrapper and reads whether its member is still closed. Each is run with `PYTHONPATH=<tree>/src` against
+  `a38bd80c`, SPEC-097's prototype tree and SPEC-101's. `lifecycle/spec101_prototype.patch` is not
+  a probe: it is SPEC-101's prototype, applied with `patch -p1` after
+  `core-pipeline/spec097_prototype.patch` to `git archive ead40798 src tests
+  docs/audits/2026-11-14-probes`, and SPEC-101's *Evidence* says what it measured. It changes
+  `src` and builds SPEC-101's model-test change in `tests`. It reads `SPEC101_OPTION` to build the
+  alternatives the *Evidence* compares, which the spec itself does not carry.
 
 **They are evidence, not tests.** An audit wrote them quickly to answer one question each; they
 assert nothing, they print what they measured, and a reader compares that with the output recorded
