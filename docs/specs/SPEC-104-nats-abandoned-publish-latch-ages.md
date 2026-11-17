@@ -4,7 +4,7 @@ id: SPEC-104
 title: "NATSSink's Abandoned-Publish Latch Ages, as Its PING Latch Does"
 description: "Makes a NATSSink call that meets a publish abandoned less than one publish_timeout ago wait for it on the loop until that window ends, without cancelling it and without publishing past it, so a stall a little longer than one budget no longer loses a batch, and with SPEC-102's resend no event but the abandoned one, while a longer stall still costs one window in all."
 spec_status: Draft
-depends_on: [SPEC-047, SPEC-061, SPEC-062]
+depends_on: [SPEC-047, SPEC-061, SPEC-062, SPEC-102]
 ---
 
 ## Overview
@@ -29,12 +29,10 @@ each. Nothing a caller configures changes, and no line or counter is added. The 
 against four alternatives and chosen; the numbers are under *Evidence* and the rejected designs
 under *Revision history*.
 
-**Sequencing.** SPEC-102, being built on its own branch, makes `NATSSink` resend the unattempted
-tail of a round and relies on this latch so that a resend never overtakes the abandoned publish.
-It edits `_verdict_of`, `_register` and the docstrings of `_publish_all`, `_round` and the class.
-This spec is built after SPEC-102 lands, its branch rebases onto it, and FR-003's event-level
-criteria assume its resend. SPEC-102 is absent from `depends_on` only because `spec-lint.sh` refuses
-a dependency on a spec not yet in `docs/specs/`; Phase 1's first step adds it.
+**Sequencing.** SPEC-102 (Completed, `e7b437f9`) makes `NATSSink` resend the unattempted tail of a
+round and relies on this latch so that a resend never overtakes the abandoned publish. It edited
+`_verdict_of`, `_register` and the docstrings of `_publish_all`, `_round` and the class, so this
+spec is built on top of it, and FR-003's event-level criteria assume its resend.
 
 ## Scope
 
@@ -316,7 +314,6 @@ docs/invariants.md, docs/architecture.md, docs/release-notes/<next tag>.md      
 
 ### Phase 1: The aged latch and the wait (FR-001, FR-002)
 
-- Rebase onto `main` with SPEC-102 landed, and add SPEC-102 to `depends_on`.
 - Date each abandonment in `self._stuck`; read the age in `_stuck_refusal`.
 - Add the window-bounded, never-cancelling wait and its re-check to `_round_on_loop` and
   `_flush_on_loop`.
@@ -403,3 +400,4 @@ So a stall that outlives the window costs `flush()` the rest of one window, once
     reads the same.
   - The Evidence gives observed ranges with run counts, the reviewer's runs as further points, and
     "losses of the same order" for the slow exit.
+- **Rebased onto `e7b437f9`, 2026-11-17.** SPEC-102 landed, so it joins `depends_on` now rather than in Phase 1, and the Sequencing paragraph says it landed.
