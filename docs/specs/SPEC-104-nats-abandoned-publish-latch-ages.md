@@ -68,7 +68,8 @@ is the twin of a round and keeps the same rule. `close()` keeps its own rule (FR
   buffer undrained, so the confirmation leaves a probe behind dated from the start of that round
   (`_confirm`), and the PING latch refuses the next call at once whatever this spec does. This spec's
   change therefore reaches an owned JetStream client and every injected client. That reading is
-  derived from the code at `61b942c0`, not measured.
+  derived from the code at `61b942c0`, not measured; `docs/architecture.md` §12 carries it as its own
+  item ("An owned core `NATSSink` whose abandoned publish leaves its buffer undrained…").
 - **A destination that refuses at once during the stop**, such as a client that reports itself
   disconnected. Nothing is in flight for the sink to wait on; `docs/architecture.md` §12 carries it
   as its own item ("A destination that refuses at once during the stop…").
@@ -308,11 +309,18 @@ in 1 ms; 2,000 events; `shutdown(timeout=10)`.
 `slow exit`, every publish after the stop taking 3 s: the prototype exits in 8.02 s of the 10 s
 budget and loses what `03dbf502` loses.
 
-The cost of a long stall: a 30 s stall with 50 spans logged during it, then `flush(timeout=5)`,
-then `shutdown(timeout=10)`. At `03dbf502` `flush` took 0.37 s and `shutdown` 0.00 s; with this
-spec's design `flush` took 2.09 s and `shutdown` 0.00 s, so the stall costs one window, once. That
-run used a `long` mode of the same probe which is not committed; FR-003's long-stall criterion is
-its test.
+The cost of a stall to the calls that wait on the drain thread, from the same probe's `cost`
+trigger (`<mode> cost 10 2 10`: 10 spans whose round meets the stall, 50 more logged 2.5 s into it,
+then `flush(timeout=5)` and `shutdown(timeout=10)` each timed), at `61b942c0`, whose `src/` differs
+from `03dbf502` only in `_ledger.py`, two runs each on 3.13.1 and 3.12.12:
+
+| Mode | `03dbf502`'s design | This spec's design (prototype) |
+|---|---|---|
+| `long`, a 30 s stall | `flush` 0.36 to 0.43 s, `shutdown` 0.00 s, `batch_lost` 100 to 118 | `flush` 1.93 to 2.08 s, `shutdown` 0.00 s, `batch_lost` 100 to 118 |
+| `transient`, a 3 s stall | `flush` 0.36 to 0.43 s and not truthy, `batch_lost` 100 to 118 | `flush` 0.63 to 0.66 s and truthy, `batch_lost` 0 |
+
+So a stall that outlives the window costs `flush()` the rest of one window, once, and
+`shutdown()` nothing; FR-003's long-stall criterion is its test.
 
 ## Revision history
 
