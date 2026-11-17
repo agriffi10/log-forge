@@ -31,10 +31,14 @@ plus whatever is queued and not yet delivered.
 
 - A registry of open spans, and one rule by which a sweep from another thread takes a span's
   buffer: in place, never its `span.start`, never once its close has begun, one submission per
-  span, a fault after a take counted, no stderr written under the sweep lock, and exactly once
-  against every other reader and writer of that buffer (FR-001).
+  span, a fault after a take counted, ~~no stderr written under the sweep lock,~~ no stderr
+  written under the sweep lock, except by a collector callback or finalizer the holding thread
+  runs, whose own runtime already extends the hold, and a hold never re-entered on its own thread
+  (revised 2026-11-17: the plan review's re-entry guard), and exactly once against every other
+  reader and writer of that buffer (FR-001).
 - The worker built before the first span opens, and a sweep on the drain thread on a clock of its
-  own that makes the time trigger due, so an event leaves within about one interval (FR-002).
+  own that makes the time trigger due, so an event leaves within about one interval, and that
+  never waits more than a bounded time for the sweep lock (FR-002).
 - `flush()`, `shutdown()`, the exit drain, events recorded after the worker has stopped, sink
   swaps and a forked child, each stated against the sweep (FR-003).
 - The sweep in SPEC-088's event ledger, ~~with SPEC-088 FR-001's snapshot read order refined~~
@@ -143,6 +147,44 @@ of the same stall. The reviewer's `wedged.py`, with the queue at one slot and fu
 blocked on the overflow line: the first cut's traced call on another thread did not close within
 4 s (`close returned=False after=4.01s`); the prototype as specified closes it at 0.00 s.
 
+**A hold is never re-entered, and its own thread never waits on it** (added 2026-11-17, after the
+plan review). A collector callback or a finalizer runs on whichever thread allocates, and a hold
+allocates (the registry copy, the slice, the list of totals), so one can run inside a hold and
+finish a traced call there, or close a span by finalizing a traced coroutine. With a plain `Lock`
+that close takes the lock again on the thread already holding it. So `_sweep_lock` is a
+`threading.RLock`, taken only through `_sweep_hold`, an instance of `_SweepHold`, and every site
+that takes it first asks `_sweep_held_here()` whether its own thread already holds it. The
+ownership an `RLock` records is set and cleared inside its C `acquire` and `release`, so there is
+no window between taking the lock and recording the holder in which a callback could run. The
+five sites, and what each does when its thread already holds the hold:
+
+- `_sweep_registered`, the worker's sweep or a `flush()`'s registry sweep, takes nothing and
+  returns `None`; a `flush()` that met this reports `"abandoned"`.
+- `_sweep_open_spans`, the owner's `flush()` sweep, takes nothing and returns `False`, and that
+  `flush()` reports `"abandoned"`.
+- `_flush`, a close, has already left the registry, appended `span.end` and backfilled, as every
+  close does; it then defers its swap and its submit to the holder by appending to
+  `_deferred_closes`.
+- `_abandon`, which `_begin`'s and `_end`'s guards call, marks the span and defers its take and its
+  debit the same way.
+- `continue_trace()` is refused with "a sweep is in progress on this thread; trace context
+  refused" and `reason="rejected"`.
+
+The hold drains `_deferred_closes` before it releases the lock, and writes their announcements
+after the release, so a pass's in-place `del` acts on the list first and the deferred swap ships
+the rest with `span.end` last. That holds when the deferred close is for the very span the pass
+was taking from: if the close's registry removal lands before the pass's membership read, the pass
+skips the span; if after, the pass's `n` predates `span.end`, the pass takes `[held:n]`, and the
+deferred swap takes the rest, `span.start` and `span.end` included. Measured on the prototype
+during planning, with a collector callback closing the suspended traced coroutine whose span the
+sweep was mid-take on: a plain `Lock` did not return within 5 s; an `RLock` with no per-site check
+let the nested close swap the list the pass was taking from, so `span.end` shipped ahead of the
+three logs and `shutdown()` reported the ledger 3 events short; the guard delivered one batch,
+`log0`, `log1`, `log2`, `span.start`, `span.end`, each once, with the ledger balanced. What a
+callback runs inside a hold runs there, so a stderr line or an orphan emit it makes is written
+while the hold lasts; that is the one exception to the rule above, the callback's own runtime
+already extends the hold, and §13 records it (FR-006).
+
 **Why this is exactly once.** Four readers or writers meet one buffer:
 
 - *The owner's append.* The take never rebinds `span.events`, so an append that read the
@@ -173,13 +215,18 @@ a concurrent one on the same object: `list.append`, `len(list)`, a slice read `l
 slice delete `del lst[a:b]`, and the dict's `__setitem__`, `pop`, `get` and `copy`. Under the GIL
 each is one C call with no eval-breaker check inside it, so it is. The rule that makes the rest
 hold is a **site rule**: every mutation of `span.events` other than `append`, and every rebinding of
-the attribute, happens under `_sweep_lock`. Today that is the close's swap (`decorator.py:583`) and
-the owner's sweep (`:461`); this spec adds the worker's take. `span.events.append` in `api._log`,
+the attribute, ~~happens under `_sweep_lock`~~ happens inside a hold (`with _sweep_hold:` or
+`with _sweep_hold.within(…):`) or in the deferred-close drain the hold runs before its release, and
+`_sweep_lock` is acquired nowhere but inside `_SweepHold` (revised 2026-11-17: the re-entry
+guard). Today that is the close's swap (`decorator.py:583`) and
+the owner's sweep (`:461`), and SPEC-088's `_abandon` (revised 2026-11-17: SPEC-088 added it after
+this spec was written); this spec adds the worker's take. `span.events.append` in `api._log`,
 `_open_span` and `_close_span` is the only write allowed outside it. A test derives every write to
 an `events` attribute of a `Span` from the AST of `src/` (an assignment, an augmented assignment, a
 `del` or a call of a mutating `list` method on it) and fails naming one that is neither an
-`append` nor inside a `with _sweep_lock:` block, so a later edit cannot add a fifth writer
-silently.
+`append` nor ~~inside a `with _sweep_lock:` block~~ inside a hold or the deferred-close drain, and
+fails naming any acquisition of `_sweep_lock` outside `_SweepHold` (revised 2026-11-17), so a later
+edit cannot add a fifth writer silently.
 
 **The ordering argument, and what it rests on.** Under the GIL, a thread switch orders everything
 one thread did before it against everything the next thread does after it, so the owner's registry
@@ -203,7 +250,8 @@ interpreter on this machine was not usable, and the argument is not claimed for 
       boundary event lacks its baggage; each failure names its event, and with the specified
       code each passes (invariant 2).
 - [ ] The AST site-rule test passes on the build, and fails naming the site when a
-      `span.events.clear()` is added to `api._log` (invariant 2).
+      `span.events.clear()` is added to `api._log`, and fails naming the site when a
+      `with _sweep_lock:` is added outside `_SweepHold` (revised 2026-11-17) (invariant 2).
 - [ ] A `hand_in` made to raise for one span's take moves `in_span_lost` by exactly that take's
       events, writes one line saying the events taken were lost, and leaves every other span's
       take delivered (invariants 2 and 11).
@@ -219,6 +267,20 @@ interpreter on this machine was not usable, and the argument is not claimed for 
       line and `reason="rejected"` (invariant 9).
 - [ ] The sync and async wrappers register and remove alike: the same test passes through both
       (invariant 6).
+- [ ] A collector callback that the test runs on the sweeping thread between the take's slice and
+      its `del` (a `list` subclass whose slice read runs it), and that closes the very span the
+      sweep is mid-take on, leaves no thread waiting: the sweep returns, each of the span's events
+      is delivered once with `span.end` last, and the ledger balances. With `_sweep_lock` a plain
+      `Lock` the sweeping thread does not return within 5 s; with an `RLock` and no deferral
+      `span.end` arrives before the logs (invariants 2 and 3). (added 2026-11-17)
+- [ ] At each of the five hold sites, entered on a thread other than the drain thread, a `flush()`,
+      a `continue_trace()` and a traced call that a collector callback the test injects makes
+      inside the hold each return: the `flush()` reports `"abandoned"`, the `continue_trace()`
+      reports `reason="rejected"`, and every event is delivered once (invariants 1, 2 and 3).
+      (added 2026-11-17)
+- [ ] A test derives from the AST of `src/` every function that enters the hold and fails naming
+      one that does not first call `_sweep_held_here()`; with that call removed from `_flush` it
+      fails naming `_flush` (invariant 3). (added 2026-11-17)
 
 ### FR-002: The worker exists while a span is open, and sweeps on a clock of its own that makes the time trigger due
 
@@ -255,6 +317,22 @@ that hands a submission in is the thread whose exit drain takes it, so a `shutdo
 strands it; a drain that dies or an exit that expires first leaves it in SPEC-088's `stranded` or
 `in_flight`, as any queued submission. Counting it in `submitted_after_shutdown` would print "nothing will drain these"
 over events the exit drain then delivers.
+
+**The drain never waits unboundedly for the lock** (added 2026-11-17, after the plan review). The
+drain's sweep enters `_sweep_hold.within(_SWEEP_WAIT)`, with `_SWEEP_WAIT` 0.05 s, and
+`_sweep_registered(hand_in, wait=_SWEEP_WAIT)` returns `None` when that wait expires. `_run_sweep`
+then returns `None`, the drain leaves `last_sweep` as it was, and it tries again on its next pass.
+Every other caller blocks. The drain is the one thread the others wait on, so a thread that holds
+the lock and then waits on the drain, through a collector callback that calls `flush()`,
+`shutdown()` or a sink swap, would otherwise wait for its timeout, or for ever with none: before
+this spec the drain never took the lock, and this cycle did not exist. Measured on the prototype
+during planning, on a build whose `flush()` sweep did not yet ask whether its thread held the hold:
+a `flush(3.0)` made while holding the lock returned `reason="timed-out"` after 3 s with the drain
+waiting unboundedly, and `ok=True` with the 0.05 s bound. With FR-001's guard the same `flush()`
+reports `"abandoned"`, because its own sweep takes nothing, so what the bound changes is when it
+returns. The longest hold measured, one sweep of 1,000 spans at 555.8 µs under a load average of
+about 30 (`spec091_hot_path.py hold`, on the prototype ported to `30b34a4f` during planning), is
+about a ninetieth of the wait.
 
 **Its own clock, and the trigger made due.** The sweep keeps `last_sweep` beside SPEC-090's
 `last_flush`. When a sweep hands anything in, the drain sets `last_flush` back by one interval, so
@@ -294,6 +372,10 @@ thread and never calls sink code while it holds `_sweep_lock`.
 - [ ] A swept submission handed in between a `shutdown()` moving the retirement count and the exit
       drain moves neither `submitted_after_shutdown` nor the stderr line, and is delivered
       (invariants 2 and 11).
+- [ ] A thread holding the hold, once the test has seen the drain thread enter its sweep's bounded
+      acquire, calls `flush(5.0)`: it returns `"abandoned"` in under 1 s, the drain having skipped
+      the sweep and answered its marker. With the drain's wait made unbounded it returns only at its
+      5 s deadline (invariant 3). (added 2026-11-17)
 
 ### FR-003: `flush()`, `shutdown()`, a stopped worker, a sink swap and a fork each meet the sweep as stated
 
@@ -317,7 +399,9 @@ thread and never calls sink code while it holds `_sweep_lock`.
   then loses its boundary events: counted in `submitted_after_shutdown` if it closes later, and in
   no counter if the process ends first, as a daemon thread's span does. Measured with `spec091_exit.py`: a
   daemon thread's span with 5 buffered events when the main thread returned delivered 5, where
-  today it delivers 0.
+  today it delivers 0. The exit drain's sweep makes one attempt with the same bounded wait as the
+  drain's (FR-002). A span whose lock it could not take keeps its events, counted after shutdown
+  if it closes later (added 2026-11-17).
 - **A stopped worker.** Once the drain thread has ended, nothing sweeps. A span that closes then
   submits to the retired worker and is counted in `submitted_after_shutdown`, as today; a `flush()`
   then sweeps every registered span into that worker with the same count. A drain thread that died
@@ -341,6 +425,10 @@ thread and never calls sink code while it holds `_sweep_lock`.
   already been flushed; trace context refused" (`decorator.py:199`) to "the current span's events
   have already been handed to the worker; trace context refused", and
   `tests/test_inbound_totality.py:585` asserts the new text.
+- **A `flush()` on the drain thread inside a sweep** (added 2026-11-17). A `flush()` that a
+  collector callback makes on the drain thread while the drain's sweep holds the hold takes
+  nothing (FR-001) and then waits on the drain itself. That is the pinned `drain-flush` defect
+  (`tests/model_pins.py`), which this spec neither widens nor closes.
 - **A sweep waits for an emit.** The sweep runs on the drain thread between emits, so while the
   drain is inside an emit, or inside a retry backoff, no sweep runs, and a process killed then
   loses everything logged on open spans since the last sweep, however long the emit has taken.
@@ -451,8 +539,13 @@ its sweep. One SPEC-089 criterion asserts the old bound and inverts: "A span lef
 thread with 2 buffered events is in no count, and `health().events.open_spans == 2` after the
 call" (`docs/specs/SPEC-089-flush-loss-counts.md:213-215`). Its test, the one SPEC-089's build adds
 with that assertion (`grep -rn 'events.open_spans == 2' tests/`), is rewritten: the other thread's
-span buffers its `span.start` and 2 logs, the 2 logs are delivered by the call and are in its window,
-and `health().events.open_spans == 1` after it, the held `span.start`.
+span buffers its `span.start` and 2 logs, ~~the 2 logs are delivered by the call and are in its
+window, and `health().events.open_spans == 1` after it, the held `span.start`~~ and the test keeps
+its sink, which drops every event (`PlanSink(every(D))`). The call's registry sweep hands the 2 logs
+to that sink, so the call's counts read `sink_lost == 2`: the loss falls inside its window, where
+today's code counts nothing. `health().events.open_spans == 1` after it, the held `span.start`
+(revised 2026-11-17: the test's sink drops every event, so the logs are counted lost, not
+delivered).
 
 **The harnesses.** Both span identities count submissions: `tests/test_invariants_model.py:567`,
 `:605` and `:1034-1035` read `health().queued` less markers, and `tests/model_oracles.py:483`
@@ -493,12 +586,16 @@ empty. The pin is removed and its §12 item moved to Resolved.
 - [ ] A `flush()` whose registry sweep meets a full queue returns counts that include the
       overflowed events (invariant 2).
 - [ ] `tests/test_invariants_model.py` and `tests/model_oracles.py` state each span identity over
-      `span.end` events, and every model row passes; with the restatement reverted, a row that
-      forces a sweep (a `flush()` from another thread while a span is open) fails (invariant 2).
+      `span.end` events, and every model row passes; with the restatement reverted, ~~a row that
+      forces a sweep (a `flush()` from another thread while a span is open) fails~~ a test that
+      forces a swept submission to stay queued (a `flush()` from another thread while a span is
+      open on a retired worker) fails (revised 2026-11-17: a delivered swept submission holds no
+      `span.end` under either count, so only one left queued tells them apart) (invariant 2).
 - [ ] SPEC-089's `open_spans == 2` test is rewritten as described and passes (invariant 2).
 - [ ] The `empty-submission` pin is gone, its eight cells pass, a close whose detached list is
-      empty submits nothing, and every other cell's verdict equals the verdict at `a2cd4b36`
-      (invariants 2 and 6).
+      empty submits nothing, and every other cell's verdict equals ~~the verdict at `a2cd4b36`~~
+      its verdict at the build's base commit (revised 2026-11-17: SPEC-088 to SPEC-090 moved the
+      cells' verdicts after `a2cd4b36`, which no longer runs with this suite) (invariants 2 and 6).
 
 ### FR-005: The traced call's added cost is measured, and neither the open nor a level call takes a lock
 
@@ -507,16 +604,25 @@ empty. The pin is removed and its §12 item moved to Resolved.
 What a traced call adds, and the whole list: at the open, one read of `_lifecycle._state._worker`,
 one registry write, and `span.held = 1` in `_open_span`; at the close, one registry removal, a list
 copy in the backfill, which runs only when baggage is set, and `_flush`'s `if events:` guard before
-its submit. A level call adds nothing. Measured in isolation by `spec091_hot_path.py
+its submit, and (added 2026-11-17) a check of whether its thread holds the sweep lock, with the
+hold's enter and exit around the swap in place of a bare lock. A level call adds nothing. Measured
+in isolation by `spec091_hot_path.py
 isolated`, best of 7 over 2M iterations, on a machine other sessions loaded: the write 28 to 65 ns,
 write and removal together 79 to 149 ns, the read 3 to 5 ns, and the copy of a three-event buffer
-25 to 94 ns, on CPython 3.12.12 and 3.13.1. A whole traced call with one log measured 26 to 42 µs
+25 to 94 ns, on CPython 3.12.12 and 3.13.1. The check and the hold add about 50 ns to the close:
+measured on the prototype during planning with `timeit` on CPython 3.13.1 at a load average near
+75, best of 7 over 200,000 iterations, a bare `Lock` took 66.7 ns, an `RLock` 75.9 ns, the check
+and an `RLock` 81.5 ns, and the check and the hold 119.1 ns (added 2026-11-17). A whole traced call with one log measured 26 to 42 µs
 on the unchanged tree and 26 to 32 µs on the prototype across three interleaved runs, so the
 end-to-end runs could not resolve the change. No criterion states a ratio for that reason.
 
 What a closing span may wait for: a sweep in progress, which holds `_sweep_lock` while it takes
-from every registered span and hands each take in with a `put_nowait`, and never anything else.
-No stderr write happens under the lock (FR-001), so a wedged console cannot lengthen the wait.
+from every registered span and hands each take in with a `put_nowait`, ~~and never anything
+else~~ and whatever a collector callback or finalizer does on the holding thread during a hold
+(revised 2026-11-17: the re-entry guard runs such a callback's nested closes inside the hold).
+~~No stderr write happens under the lock (FR-001)~~ No stderr write happens under the lock except
+one a collector callback or finalizer makes inside a hold (FR-001; revised 2026-11-17), so a wedged
+console cannot lengthen the wait through the library's own lines.
 `spec091_hot_path.py hold`, on a quiet machine (load average 2), measured one sweep of 10, 100 and
 1,000 spans of ten events each at 4.9, 43.5 to 43.9 and 428 to 433 µs on 3.13.1, and 5.4, 47.0 and
 489 µs on 3.12.12. A close waits at most that once per interval, and only when it lands on a
@@ -526,7 +632,8 @@ sweep.
 
 - [ ] A traced call's body starts, and a level call inside it returns, while another thread holds
       `_sweep_lock`; the close, which takes it today, is not in that set (invariant 4).
-- [ ] The delivery doc records `spec091_hot_path.py isolated` and `hold` run on the build on 3.12
+- [ ] The delivery doc records `spec091_hot_path.py isolated`, `hold` and `close` (the close's
+      hold, a mode the build adds; added 2026-11-17) run on the build on 3.12
       and 3.13, and the build adds no statement to the open, the close or `api._log` beyond the
       list above (invariant 4).
 - [ ] With the worker's queue full and `sys.stderr` blocked on the sweep's overflow line, a traced
@@ -551,7 +658,11 @@ The completion ritual writes the record, and this FR is its checklist.
   handler that logs and then blocks never makes; a sweep tied to the time trigger; a take that
   rebinds the list; one concatenated hand-in per sweep, which bypassed SPEC-090's cap; a stderr
   write under `_sweep_lock`, which stalled every close behind a wedged console; shipping
-  `span.start` early; and a per-span lock, which the in-place take makes unnecessary. Its History is dated 2026-11-15 for the decision and the build's date for the
+  `span.start` early; and a per-span lock, which the in-place take makes unnecessary. It also
+  records (added 2026-11-17) a plain `Lock` for `_sweep_lock`, which hung the sweeping thread when
+  a collector callback closed a span inside the hold, and an `RLock` with no per-site check, which
+  shipped `span.end` ahead of the logs and left the ledger 3 events short, each with FR-001's
+  reading, and the drain's bounded wait for the lock with FR-002's reading. Its History is dated 2026-11-15 for the decision and the build's date for the
   mechanism.
 - **Refined in place, each with a dated History entry naming this spec:**
   *`flush()` reports delivery, and answers from the drain that carried the events*
@@ -565,7 +676,10 @@ The completion ritual writes the record, and this FR is its checklist.
   process killed mid-handler loses the whole root span" is struck as closed by this spec, with
   `p12_kill.py`'s numbers before and after. The `empty-submission` item moves to Resolved (FR-004).
   §13's "`Span.swept` is not a synchronization primitive" paragraph is struck as closed by FR-001's
-  lock. §4's diagram, §9's three-places paragraph and its "Its bound is the calling context"
+  lock, and §13 gains two residuals (added 2026-11-17): a `KeyboardInterrupt` landing just after a
+  successful put in `flush()`'s registry sweep counts that take twice, once queued and once in
+  `in_span_lost`; and a collector callback's stderr lines or orphan emits inside a hold are written
+  while other closes wait. §4's diagram, §9's three-places paragraph and its "Its bound is the calling context"
   paragraph (`architecture.md:575-600`) are rewritten.
 - **What a kill loses, in plain words**, in `README.md`'s *Flushing and shutdown* section beside
   the Lambda list (`README.md:1455-1512`) and in `architecture.md` §13's Known constraints:
@@ -595,9 +709,13 @@ The completion ritual writes the record, and this FR is its checklist.
   span's shipping still waits on Andrew, each given a superseded marker naming this spec and the
   new decision.
 - **§12's finding-3 item** ("`shutdown()` called from a signal handler deadlocks for good when the
-  signal interrupts a library lock section") adds `decorator._sweep_lock` to the locks it lists: a
-  handler that calls `flush()` or closes a span on a thread inside a sweep waits on its own thread,
-  and the drain thread now takes that lock every interval.
+  signal interrupts a library lock section") adds `decorator._sweep_lock` to the locks it lists:
+  ~~a handler that calls `flush()` or closes a span on a thread inside a sweep waits on its own
+  thread, and the drain thread now takes that lock every interval~~ the drain thread now takes that
+  lock every interval, and a handler that calls `flush()` or closes a span on a thread inside a
+  sweep no longer waits on its own thread: its sweep takes nothing and its close is deferred to the
+  holder (FR-001), and the drain waits for the lock at most `_SWEEP_WAIT` (FR-002) (revised
+  2026-11-17: the re-entry guard removes the self-wait this item would have recorded).
 - **Invariant 2's observable.** SPEC-088 FR-001 restates it in events, and its last criterion
   removes the submission-unit sentence ("For spans, `span.end` delivered + `queued` + `dropped`
   equals spans started", `invariants.md:59-60`), which a swept submission would make false. This
@@ -624,7 +742,7 @@ The completion ritual writes the record, and this FR is its checklist.
       ones are named in the new decision.
 - [ ] The §12 finding-8 item is struck as closed with `p12_kill.py`'s before and after, the
       `empty-submission` item is under Resolved, and the §13 `Span.swept` paragraph is struck
-      (invariant 2).
+      and §13 states the two residuals listed above (revised 2026-11-17) (invariant 2).
 - [ ] `README.md` and `architecture.md` §13 each contain the sentence that `SIGKILL`, `SIGTERM`
       without a `shutdown()` and `os._exit` lose up to about one interval of an open span's events
       plus what is queued or not yet accepted, and that a kill during an emit or a backoff loses
@@ -653,14 +771,24 @@ class Span:
 
 # src/log_foundry/decorator.py, private
 _open_spans: dict[int, Span] = {}   # id(span) -> span, from push to the start of its close
+# added 2026-11-17, the re-entry guard (FR-001):
+_sweep_lock = threading.RLock()     # was threading.Lock(); acquired only inside _SweepHold
+_deferred_closes: list[tuple[Span, bool]] = []   # closes and abandons a nested call deferred to
+                                                 # the holder, drained before the hold's release
+class _SweepHold: ...               # enter/exit around _sweep_lock; within(wait) bounds the acquire
+_sweep_hold: _SweepHold
 
-# src/log_foundry/worker.py, private attributes of Worker
-_sweep: Callable[[HandIn], SweepResult] | None
+# src/log_foundry/worker.py
+_SWEEP_WAIT: float = 0.05           # added 2026-11-17: the drain's longest wait for the hold (FR-002)
+# private attribute of Worker; revised 2026-11-17, was Callable[[HandIn], SweepResult] | None
+_sweep: Sweep | None
 
 # the shapes, private, in decorator.py
 Totals = tuple[int, int]            # (dropped total moved, or 0; submitted_after_shutdown total, or 0)
 HandIn = Callable[[list[dict[str, object]]], Totals]
 SweepResult = tuple[int, list[Totals], list[Exception]]   # events handed in, totals, hand-in faults
+class Sweep(Protocol):              # added 2026-11-17: types Worker's sweep=
+    def __call__(self, hand_in: HandIn, *, wait: float | None = None) -> SweepResult | None: ...
 ```
 
 ## API / Interface Contract
@@ -669,8 +797,13 @@ SweepResult = tuple[int, list[Totals], list[Exception]]   # events handed in, to
 # decorator.py, private: the worker sweep. Holds _sweep_lock for the whole pass, calls hand_in
 # once per span's take under it, debits a take whose hand_in raised to in_span_lost, writes no
 # stderr, and hands back what the caller announces after the lock is released.
-def _sweep_registered(hand_in: HandIn) -> SweepResult: ...
-def _forget_open_spans_in_child() -> None: ...       # clears _open_spans
+# Revised 2026-11-17: was (hand_in) -> SweepResult. Returns None, taking nothing, when this thread
+# already holds the hold or the bounded wait expired.
+def _sweep_registered(hand_in: HandIn, *, wait: float | None = None) -> SweepResult | None: ...
+def _sweep_held_here() -> bool: ...                  # added 2026-11-17: this thread holds the hold
+def _sweep_open_spans() -> bool: ...                 # revised 2026-11-17: False when it took
+                                                     # nothing because this thread holds the hold
+def _forget_open_spans_in_child() -> None: ...       # clears _open_spans and _deferred_closes
 
 # worker.py
 class Worker:
@@ -681,7 +814,9 @@ class Worker:
     def _enqueue(self, events, *, count_retired: bool) -> Totals: ...  # no stderr
     def _announce(self, totals: Totals) -> None: ...  # the throttled lines; no library lock held
     def _hand_in(self, events) -> Totals: ...         # _enqueue(events, count_retired=False)
-    def _run_sweep(self) -> int: ...                  # _sweep(_hand_in), then the announcements
+    def _run_sweep(self) -> int | None: ...           # _sweep(_hand_in, wait=_SWEEP_WAIT), then
+                                                      # the announcements; None when the wait
+                                                      # expired (revised 2026-11-17, was -> int)
 
 # _lifecycle.py
 worker = Worker(sink, offer_signal=False, sweep=_sweep_registered)   # the one caller of sweep=
@@ -695,10 +830,11 @@ def _forget_open_spans_after_fork() -> None: ...     # lazy import; registered j
 src/log_foundry/
 ├── decorator.py      # _open_spans, _sweep_registered, the open-time build, the close's removal,
 │                     # continue_trace under _sweep_lock and its new line, _forget_open_spans_in_child,
-│                     # _flush's empty guard, _sweep_open_spans announcing after the lock
+│                     # _flush's empty guard, _sweep_open_spans announcing after the lock,
+│                     # _sweep_lock an RLock behind _SweepHold, _deferred_closes, the per-site check
 ├── model.py          # Span.held; backfill_baggage over a snapshot
 ├── worker.py         # sweep=, _enqueue, _announce, _hand_in, _run_sweep, the sweep clock in _drain,
-│                     # one sweep at the start of _final_drain
+│                     # one sweep at the start of _final_drain, _SWEEP_WAIT
 └── _lifecycle.py     # _get_worker passes sweep; _flush_worker's registry sweep; the fork handler
 tests/                # new tests for FR-001 to FR-005; the harness, roster and pin changes FR-004 and
                       # the Evidence list
@@ -712,12 +848,17 @@ docs/                 # FR-006's record
 - `_open_spans`, `Span.held`, `_sweep_registered` with one hand-in per span and the fault debit,
   `submit` split into `_enqueue` and `_announce` with every line written after the lock, the
   close's removal first, the backfill snapshot, `continue_trace` under the lock.
-- The exactly-once tests, their forced mutants, the AST site-rule test.
+- The re-entry guard (added 2026-11-17): `_sweep_lock` an `RLock` taken only through
+  `_sweep_hold`, the per-site `_sweep_held_here()` check at the five sites, and `_deferred_closes`
+  drained before the hold's release.
+- The exactly-once tests, their forced mutants, the AST site-rule test, and the re-entry tests and
+  the hold-site gate.
 
 ### Phase 2: The worker sweeps (FR-002, FR-003)
 
 - The open-time build, `sweep=`, `_run_sweep`, `_hand_in`, the clock in `_drain`, the exit
-  drain's sweep, `flush()`'s registry sweep, the child's forgetting.
+  drain's sweep, `flush()`'s registry sweep, the child's forgetting, and the drain's bounded wait
+  for the hold (added 2026-11-17).
 - The roster updates the prototype's suite run named (Evidence), re-measured on the tree with
   SPEC-088 to SPEC-090 landed: `tests/test_runtime_holder.py`'s lock sites (the overflow count's
   `self._lock` moving from `Worker.submit` to `Worker._enqueue`), `tests/test_worker_predicate_roster.py`'s
@@ -858,7 +999,32 @@ millisecond once an interval; FR-001 takes it for the cap.
 `whole`, interleaved: 41.90, 32.82 and 25.98 µs on `a2cd4b36` against 32.47, 29.06 and 25.68 µs on
 the prototype.
 
+**Measured during planning, 2026-11-17.** The re-entry guard's readings in FR-001, FR-002 and
+FR-005 were taken on the second-cut prototype ported to `30b34a4f` with SPEC-088's hand-over
+credit, by throwaway scripts that are not committed: a collector callback closing the span a sweep
+was mid-take on, a thread holding the lock calling `flush(3.0)`, and a `timeit` of the close's
+hold. The build's tests for FR-001's and FR-002's new criteria are what reproduce them.
+
 ## Revision history
+
+- **2026-11-17, revised in place after the plan review**, each change struck or marked in its
+  section. The review found two deadlocks on `_sweep_lock`. On one thread, a collector callback or
+  a finalizer running inside a hold, on the drain thread or any other, could close a traced span
+  or call `flush()` and take the lock again; with a plain `Lock` the sweeping thread hung. Across
+  threads, a thread holding the lock that then waited on the drain, by `flush()`, `shutdown()` or a
+  sink swap, met a drain that now takes the lock every interval. FR-001 now makes `_sweep_lock` an
+  `RLock` taken only through `_sweep_hold`, has each of its five sites ask whether its own thread
+  holds it (a sweep takes nothing, a close or abandon is deferred to the holder, `continue_trace()`
+  is refused), extends the site rule and its AST test to the hold, and adds three criteria; FR-002
+  bounds the drain's wait at `_SWEEP_WAIT` and adds one criterion; FR-003 states the exit drain's
+  one bounded attempt and the `drain-flush` pin the guard leaves as it was; FR-005 adds the check's
+  cost and what a callback adds to a close's wait. Four criteria are corrected: SPEC-089's
+  rewritten test counts the 2 logs as `sink_lost`, because its sink drops every event; the model
+  harness's forcing test leaves a swept submission queued on a retired worker, the only case where
+  the two counts differ; the SPEC-085 cells are compared against the build's base rather than
+  `a2cd4b36`; and FR-006 records the two rejected locks, the bounded wait and two §13 residuals,
+  and rewrites the finding-3 clause the guard made false. The site rule also names SPEC-088's
+  `_abandon` among today's writers.
 
 - **2026-11-15, revised in place after SPEC-088 was built**, each change struck in its section.
   SPEC-088 already reads its snapshot in two passes, with the worker's terms read before them
