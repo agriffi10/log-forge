@@ -518,7 +518,9 @@ def _reset_worker() -> None:
     failure this fixture's first paragraph describes, on a field whose whole purpose is to be
     believed. Since SPEC-088 they are also terms of the event ledger, so they are reset with it,
     through ``ledger_check.restart``: zeroed alone, they left a lost event's credit with no loss
-    term, and the ``atexit`` ``shutdown()`` of the last test an xdist worker ran reported it lost.
+    term, and the ``atexit`` ``shutdown()`` of the last test an xdist worker ran reported it lost. Called
+    inside a test's body, between rounds, it first hands ``ledger_check.carry`` what the process
+    does not balance on, so the restart hides no round from that test's teardown verdict.
 
     SPEC-050 FR-002 added the orphan close's in-flight count and its idle gate, and that pair
     leaked the most quietly of any here: three tests leave a daemon thread mid-``close()``, so the
@@ -568,6 +570,9 @@ def _reset_worker() -> None:
         from log_foundry import _lifecycle
     except ImportError:
         return
+    import ledger_check
+
+    ledger_check.carry()
     worker = _lifecycle._state.worker_exists()
     if worker is not None:
         worker.stop()
@@ -588,8 +593,6 @@ def _reset_worker() -> None:
     _lifecycle._state._stale_signals = []
     _lifecycle._state._fork_offers = []
     _lifecycle._state._fork_inherited = 0
-    import ledger_check
-
     ledger_check.restart()
     with _lifecycle._state._closes._lock:
         _lifecycle._state._closes._in_flight.clear()

@@ -565,6 +565,7 @@ def test_refused_orphans_racing_shutdown_write_no_false_line(capsys) -> None:
         assert not errors, errors
         assert not _lines(capsys.readouterr().err), outcome
         assert len(readings) == 1_000 and not any(readings), outcome
+        assert ledger_check.problems() == [], outcome
 
 
 # ── FR-004 ───────────────────────────────────────────────────────────────────────────────

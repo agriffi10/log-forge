@@ -569,6 +569,43 @@ def test_a_marked_test_that_balances_fails(tmp_path) -> None:
     assert "marked ledger_exempt but the event ledger balances" in out, out
 
 
+def test_a_mid_test_reset_carries_what_it_would_hide_into_the_teardown_verdict(tmp_path) -> None:
+    """A reset between rounds hides no round from the verdict, and carries nothing past a test.
+
+    The reset restarts the ledger, so an imbalance a round left would be gone by the teardown.
+    ``ledger_check.carry`` reads it first; without that, the second test below passes. The last
+    test follows one that failed at its own teardown, whose reset then carried that reading too;
+    ``begin`` discards it, and without that the last test fails on a reading that is not its own.
+    """
+    done = _run_suite_on(tmp_path, '''
+        from conftest import _reset_worker
+        from log_foundry import decorator
+
+        def test_balanced_rounds():
+            for _ in range(2):
+                _reset_worker()
+
+        def test_an_unbalanced_round_then_a_reset():
+            with decorator._loss_lock:
+                decorator._orphan_lost += 1
+            _reset_worker()
+
+        def test_unbalanced_at_its_own_teardown():
+            with decorator._loss_lock:
+                decorator._orphan_lost += 1
+
+        def test_after_them():
+            pass
+    ''')
+    out = done.stdout + done.stderr
+    assert "ERROR at teardown of test_an_unbalanced_round_then_a_reset" in out, out
+    assert "ERROR at teardown of test_after_them" not in out, out
+    assert "ERROR at teardown of test_unbalanced_at_its_own_teardown" in out, out
+    assert "ERROR at teardown of test_balanced_rounds" not in out, out
+    assert out.count("the event ledger does not balance: orphan residual=-1") == 2, out
+    assert "4 passed, 2 errors" in out, out
+
+
 class _DeadSink:
     """A sink whose every ``emit`` delivers nothing, so an orphan event sent to it is lost."""
 
