@@ -205,9 +205,11 @@ def test_a_flush_with_no_span_open_creates_no_worker() -> None:
 def test_a_sweep_that_finds_events_creates_the_worker() -> None:
     """AC-7. The cold-start path AC-1 exercises, and without it AC-1 cannot pass.
 
-    Inside the *first* traced call `_lifecycle._state._worker is None` — the worker is built when a span
-    *closes* — so a sweep that submits into a worker that does not exist delivers nothing and
-    still reports success.
+    ~~Inside the *first* traced call `_lifecycle._state._worker is None` — the worker is built when
+    a span *closes*~~ — superseded by SPEC-091 FR-002: the worker is built when the first span
+    *opens*, so it exists before the first call's body runs, and the in-span `flush()` still
+    delivers the cold start's event. The sweep's own build stays for a close whose open-time build
+    failed (`test_a_sweep_whose_worker_cannot_be_built_destroys_nothing`).
     """
     sink = Recorder()
     log_foundry.configure(service="t", sink=sink)
@@ -222,7 +224,7 @@ def test_a_sweep_that_finds_events_creates_the_worker() -> None:
 
     handler()
 
-    assert seen["worker_before"] is None, "precondition: no worker exists inside the first call"
+    assert seen["worker_before"] is not None, "SPEC-091: the first call's open built the worker"
     assert "cold start" in seen["delivered"]  # type: ignore[operator]
 
 
@@ -303,11 +305,13 @@ def test_two_threads_sweeping_one_shared_span_deliver_each_event_once() -> None:
         )
 
 
-async def test_the_sweep_reaches_only_the_calling_context() -> None:
-    """AC-9. The honest bound, pinned so it cannot silently widen or narrow.
+async def test_the_sweep_reaches_a_sibling_tasks_open_span_too() -> None:
+    """AC-9, inverted by SPEC-091 FR-003: a `flush()` now reaches every registered open span.
 
-    `contextvars` gives no way to enumerate another task's context, so a `flush()` in a handler
-    that fanned out does not reach what those tasks buffered.
+    ~~`contextvars` gives no way to enumerate another task's context, so a `flush()` in a handler
+    that fanned out does not reach what those tasks buffered.~~ The open-span registry removes
+    that bound: the `flush()` made inside one task delivers what a sibling task's open span
+    buffered, holding back that span's `span.start`, which ships with its close (FR-003 AC-1).
     """
     sink = Recorder()
     log_foundry.configure(service="t", sink=sink)
@@ -333,18 +337,24 @@ async def test_the_sweep_reaches_only_the_calling_context() -> None:
 
     await here()
 
-    assert "in-this-context" in seen["at_flush"], (
-        "positive control: without it the negative below passes against a sweep that does "
-        "nothing at all, which pins no bound"
+    assert "in-this-context" in seen["at_flush"], "the caller's own span still ships"
+    assert "in-another-task" in seen["at_flush"], (
+        "SPEC-091 FR-003: the flush reached the sibling task's open span"
     )
-    assert "in-another-task" not in seen["at_flush"], (
-        "the bound widened: a flush reached another task's open span"
-    )
+    other_starts = [
+        e
+        for e in sink.got
+        if e["message"] == "span.start" and str(e["function"]).endswith("other_task")
+    ]
+    assert not other_starts, "the sibling's span.start stays held until its close"
 
     release.set()
     await task
     log_foundry.flush(timeout=5.0)
-    assert "in-another-task" in sink.messages(), "and it still arrives when that span closes"
+    messages = sink.messages()
+    assert messages.count("in-another-task") == 1, "and it is not delivered again at the close"
+    own = [e["message"] for e in sink.got if str(e["function"]).endswith("other_task")]
+    assert own[-1] == "span.end", own
 
 
 def test_a_sweep_racing_a_span_close_delivers_each_event_once() -> None:
@@ -426,14 +436,26 @@ def test_the_close_path_detaches_under_the_same_lock_as_the_sweep() -> None:
     """
     taken: list[str] = []
     real = decorator._sweep_lock
+    here = threading.get_ident()
 
     class Watching:
-        def __enter__(self) -> None:
-            real.acquire()
-            taken.append("held")
+        """SPEC-091: the lock is taken through `_sweep_hold`, by `acquire`, and asked `_is_owned`.
 
-        def __exit__(self, *exc: object) -> None:
+        Only the test thread's acquisitions are recorded, since the drain thread now takes the
+        same lock for its own sweep about once an interval.
+        """
+
+        def acquire(self, *args: object, **kwargs: object) -> bool:
+            got = real.acquire(*args, **kwargs)  # type: ignore[arg-type]
+            if threading.get_ident() == here:
+                taken.append("held")
+            return got
+
+        def release(self) -> None:
             real.release()
+
+        def _is_owned(self) -> bool:
+            return bool(real._is_owned())  # type: ignore[attr-defined]
 
     sink = Recorder()
     log_foundry.configure(service="t", sink=sink)

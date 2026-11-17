@@ -1138,7 +1138,6 @@ def test_the_table_and_the_pins_hold_these_counts() -> None:
     assert [pin.name for pin in PINS] == [
         "drain-flush",
         "nested-shutdown",
-        "empty-submission",
         "orphan-arm-in-close",
         "installed-closed-twice",
         "fork-mid-swap",
@@ -1146,10 +1145,10 @@ def test_the_table_and_the_pins_hold_these_counts() -> None:
     ]
     pinned = [cell for cell in table if pin_of(cell) is not None]
     held = [cell for cell in table if withheld(cell)]
-    assert len(pinned) == 20
+    assert len(pinned) == 12, "SPEC-091 resolved `empty-submission`'s eight cells (was 20)"
     assert len(held) == 168
-    assert len(table) - len(pinned) - len(held) == 449
-    assert len(scheduled()) == 469
+    assert len(table) - len(pinned) - len(held) == 457, "the eight now run unpinned (was 449)"
+    assert len(scheduled()) == 469, "a pinned cell was scheduled too, so the total is unchanged"
 
 
 def test_every_cell_id_is_unique_and_spells_its_cell() -> None:

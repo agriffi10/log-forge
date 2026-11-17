@@ -232,7 +232,9 @@ class Ledger:
     Attributes:
       spans: Traced calls made.
       span_ends: ``span.end`` events delivered.
-      queued: ``health().queued`` less the flush markers left on the queue.
+      queued: ~~``health().queued`` less the flush markers left on the queue~~ the
+        ``span.end`` events in submissions still on the worker's queue (SPEC-091 FR-004), since
+        a swept submission holds no ``span.end``.
       dropped: ``health().dropped``.
       abandoned: ``span.end`` events in batches the worker abandoned.
       orphans: ``info`` calls made.

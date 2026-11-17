@@ -40,7 +40,9 @@ class Span:
 
     ``start_ts`` is a ``time.monotonic()`` reading rather than wall-clock, so
     ``duration_ms`` can never go negative across a clock change. ``defaults`` are per-
-    decorator field overrides, and ``events`` is the queue flushed together at span end.
+    decorator field overrides, and ``events`` is the span's buffer: ~~the queue flushed together
+    at span end~~ — refined by SPEC-091, the worker's sweep takes what it holds past ``held``
+    about once a flush interval, in place, and the close hands over the rest.
 
     ``closed`` marks a span whose events have already been handed to the worker (SPEC-036
     FR-004). ``contextvars`` copies the *same* ``Span`` object into every task created inside a
@@ -55,10 +57,15 @@ class Span:
     adoption after a sweep would leave one span carrying two trace ids. That is the SPEC-024
     category, wrong data rather than lost data, so the flag lets the adoption refuse instead.
 
-    The guarantee is **single-threaded**. The flag is not a synchronization primitive:
-    ``continue_trace`` reads it and then re-parents across an ordinary function call, so a sweep
-    arriving in that gap still splits the span. It is set before the detach so a concurrent reader
-    errs toward refusing, and the residual is recorded in ``architecture.md`` §13.
+    ~~The guarantee is **single-threaded**. The flag is not a synchronization primitive~~ —
+    closed by SPEC-091 FR-001: every sweep that sets it, the worker's, a ``flush()``'s registry
+    sweep and the owner's, does so inside ``decorator._sweep_hold``, and ``continue_trace`` holds
+    the same hold across its read of the flag and its re-parent, so no sweep can land between the
+    two. The worker's sweep sets it only on a span it took events from.
+
+    ``held`` is the number of leading buffered events a worker sweep leaves on the span (SPEC-091
+    FR-001): 1 while ``span.start`` is buffered, so that it ships with the span's final baggage at
+    the close, and 0 once an in-span ``flush()`` has shipped it.
 
     ``ended`` marks a span whose ``span.end`` event has been appended (SPEC-088 FR-002), set by
     ``_close_span`` just after the append. The close guard reads it to count one more lost event
@@ -82,6 +89,7 @@ class Span:
     swept: bool = False
     ended: bool = False
     abandoned: bool = False
+    held: int = 0
 
 
 def _iso_now() -> str:
@@ -376,6 +384,13 @@ def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
     above the loop. The merge can push a mapping past ``max_keys``, which is deliberate:
     re-capping would drop the correlation keys SPEC-015 shipped to add (SPEC-017 FR-001).
 
+    **It iterates a snapshot of the buffer** (SPEC-091 FR-001). The worker's sweep deletes a slice
+    of ``span.events`` in place, from the drain thread, and a deletion while this loop walked the
+    live list shifted the elements under its iterator: with a pause forced between the sweep's
+    check and its take, 1 and 3 boundary events were left without their baggage. The snapshot
+    still holds ``span.start`` and ``span.end``, which a worker sweep never takes, so the events
+    this mutates are the ones the close ships.
+
     Args:
       span: The span whose buffered events are completed.
       baggage: The span's final baggage, passed in because this module does not know where
@@ -390,7 +405,7 @@ def backfill_baggage(span: Span, baggage: dict[str, object]) -> None:
     if not baggage:
         return
     safe, clipped = sanitize_fields(baggage, cfg=_live_config())
-    for event in span.events:
+    for event in list(span.events):
         if event.get("message") in (_START_MESSAGE, _END_MESSAGE):
             fields = event.get("fields")
             if _diag.is_a(fields, dict):

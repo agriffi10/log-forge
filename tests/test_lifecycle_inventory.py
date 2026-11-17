@@ -917,8 +917,12 @@ INVENTORY: dict[Key, Row] = {
     _c("console.py", "ConsoleWriter.__init__", "self._lock", "Lock"): Row(
         "ConsoleWriter", _R, "no lifecycle state; serialises console writes (as api._console)"
     ),
-    _c("decorator.py", "<module>", "_sweep_lock", "Lock"): Row(
-        "decorator", _R, "no lifecycle state; guards the open-span sweep"
+    _c("decorator.py", "<module>", "_sweep_lock", "RLock"): Row(
+        "decorator",
+        _R,
+        "no lifecycle state; guards every non-append write to a span's buffer, taken only through "
+        "_sweep_hold; re-entrant so a collector callback inside a hold never waits on its own "
+        "thread (SPEC-091)",
     ),
     _c("decorator.py", "<module>", "_loss_lock", "Lock"): Row(
         "decorator", _R, "no lifecycle state; deliberately not the lifecycle lock"
@@ -1140,6 +1144,12 @@ INVENTORY: dict[Key, Row] = {
     ),
     _wk("_declined_tally"): Row(
         "Worker", (_REBUILD,), "declined exit batches not yet announced, under _lock (SPEC-090)"
+    ),
+    _wk("_sweep"): Row(
+        "Worker",
+        _INH,
+        "the open-span sweep the owner passes; the same callable in a child, whose registry the "
+        "forgetting step empties before the rebuild (SPEC-091)",
     ),
     _wk("_lock"): Row("Worker", _W, "guards the worker's counters"),
     _wk("_thread"): Row("Worker", (_REBUILD,), "the drain thread"),

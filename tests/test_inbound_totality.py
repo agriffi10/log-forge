@@ -582,7 +582,7 @@ def test_the_swept_span_refusal_runs_no_code_of_the_trace_id(
     assert not result
     assert result.reason == "rejected"
     assert len(lines) == 1, lines
-    assert "the current span has already been flushed" in lines[0]
+    assert "the current span's events have already been handed to the worker" in lines[0]
 
 
 class _RaisingStream:

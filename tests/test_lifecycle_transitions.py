@@ -840,22 +840,30 @@ def test_flush_after_a_shutdown_leaves_the_state() -> None:
     assert state() is State.CLOSED and current() is State.CLOSED
 
 
-def test_a_worker_a_flush_sweep_builds_moves_the_state_by_the_build_row() -> None:
-    """FR-003 AC-8: ``flush()`` moves nothing itself; a worker its sweep builds is a ``BUILD``."""
+def test_a_worker_a_span_open_builds_moves_the_state_by_the_build_row() -> None:
+    """FR-003 AC-8: ``flush()`` moves nothing itself; the worker the open builds is a ``BUILD``.
+
+    ~~a worker its sweep builds~~ — refined by SPEC-091 FR-002: the first span's open builds the
+    worker, before its body runs, so the ``BUILD`` row's move happens at the open, and a
+    ``flush()`` inside that span builds nothing and moves nothing.
+    """
     a = Rec("A")
     log_foundry.configure(service="cells", sink=a)
+    assert current() is State.UNCONFIGURED, "the premise: nothing built before the first span"
     inside: dict[str, object] = {}
 
     @log_foundry.trace
     def flushes_inside_a_span() -> None:
+        inside["opened"] = current()
+        built = _lifecycle._state.worker_exists()
         log("buffered on the open span")
-        assert current() is State.UNCONFIGURED, "the premise: nothing built yet"
         log_foundry.flush(timeout=5.0)
-        inside["worker"] = _lifecycle._state.worker_exists()
+        inside["same_worker"] = _lifecycle._state.worker_exists() is built
         inside["current"] = current()
 
     flushes_inside_a_span()
-    assert inside["worker"] is not None, "the sweep built a worker"
+    assert inside["opened"] is State.RUNNING, "the open's build moved the state by the build row"
+    assert inside["same_worker"], "the flush built nothing of its own"
     assert inside["current"] is State.RUNNING
 
 

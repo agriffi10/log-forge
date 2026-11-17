@@ -144,6 +144,7 @@ from model_oracles import (
     soak_from,
     take_of_each_close,
 )
+from model_sinks import span_ends_queued
 from test_fork_lifecycle import CHILD_TIMEOUT, run_in_child
 from test_sinks_http import FakeResponse
 
@@ -1169,6 +1170,7 @@ def _interleaving(
     health = log_foundry.health()
     markers = _stranded_markers()
     queued = health.queued - markers
+    ends_queued = span_ends_queued()
     err = capfd.readouterr().err
     if soak is not None:
         soak.report = _judge_soak(soak, ledger, err)
@@ -1188,6 +1190,7 @@ def _interleaving(
     overlapped = [i for i, sink in enumerate(ledger.sinks) if sink.overlapped]
     picture = (
         f"seed={seed} spans={ledger.spans} span.end={ends} queued={health.queued} "
+        f"span.end_queued={ends_queued} "
         f"markers={markers} dropped={health.dropped} in_span_lost={health.in_span_lost} | "
         f"orphans={ledger.orphans} delivered={orphans} orphan_lost={health.orphan_lost} | "
         f"failed_batches={health.failed_batches} incomplete_swaps={health.incomplete_swaps} "
@@ -1209,7 +1212,9 @@ def _interleaving(
             _assert_the_http_ledger(ledger, runs, health.orphan_lost, err, picture)
         else:
             _assert_the_deliver_ledger(ledger, runs, health.orphan_lost, err, picture)
-        assert ends + queued + health.dropped == ledger.spans, f"invariant 2 (spans): {picture}"
+        assert ends + ends_queued + health.dropped == ledger.spans, (
+            f"invariant 2 (spans): {picture}"
+        )
         assert orphans + health.orphan_lost == ledger.orphans, f"invariant 2 (orphans): {picture}"
         assert health.retired, f"invariant 2 (a shutdown ran, so retired reports it): {picture}"
         assert health.submitted_after_shutdown >= queued, (
@@ -1879,10 +1884,10 @@ def _check_invariants(run: _Run, step: str, result: object, driver: int, where: 
                 assert thread == driver, f"invariant 4 (an orphan left the caller's thread) {where}"
     if (step == "flush" and result) or step in {"shutdown", "exit"}:
         ends = sum(s.count("span.end") for s in run.sinks)
-        queued = health.queued - _stranded_markers()
+        queued = span_ends_queued()
         assert ends + queued + health.dropped == run.spans, (
-            f"invariant 2 (spans): span.end={ends} queued={queued} dropped={health.dropped} "
-            f"started={run.spans} {where}"
+            f"invariant 2 (spans): span.end={ends} span.end_queued={queued} "
+            f"dropped={health.dropped} started={run.spans} {where}"
         )
     if step in {"shutdown", "exit"}:
         unclosed = [i for i, s in enumerate(run.sinks) if s.events and s.closes == 0]

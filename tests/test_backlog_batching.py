@@ -544,14 +544,19 @@ _SIGNATURES = {
     ),
     "Worker.__init__": (
         "(self, sink: 'Sink', *, batch_size: 'int' = 10, flush_interval: 'float' = 1.0, "
-        "max_queue: 'int' = 10000, max_retries: 'int' = 3, offer_signal: 'bool' = True) -> "
-        "'None'"
+        "max_queue: 'int' = 10000, max_retries: 'int' = 3, offer_signal: 'bool' = True, "
+        "sweep: '_Sweep | None' = None) -> 'None'"
     ),
     "flush": "(timeout: float | None = 5.0) -> log_foundry.results.FlushResult",
     "shutdown": "(timeout: float | None = 30.0) -> None",
     "health": "() -> log_foundry.worker.Health",
 }
-"""The five signatures FR-005 AC1 names, captured at ``75e7bf1e``, before this spec's build."""
+"""The five signatures FR-005 AC1 names, captured at ``75e7bf1e``, before this spec's build.
+
+``Worker.__init__`` gains ``sweep=`` in SPEC-091 FR-002, the one keyword its owner passes;
+``Worker`` is not exported from ``log_foundry``, so no public signature moved, and no setting of
+the batch, the cap, the queue or the interval was added.
+"""
 
 _ALL = [
     "Config",

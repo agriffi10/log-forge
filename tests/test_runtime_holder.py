@@ -156,7 +156,7 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
     ),
     "worker.py": collections.Counter(
         {
-            ("Worker.submit", "self._lock"): 1,
+            ("Worker._enqueue", "self._lock"): 1,
             ("Worker._count_undeliverable", "self._lock"): 1,
             ("Worker.health", "self._lock"): 1,
             ("Worker._flush_marked", "self._lock"): 1,
@@ -191,7 +191,13 @@ worker's lock, and ``_write_exit_tallies`` takes and zeroes both exit tallies un
 that lock alone, as a leaf, so the order does not move. ``retarget`` stays at three, because its
 generation bump is inside the reassign's existing section, ``_emit`` at three, because the
 abandon tally is added inside the sections that already count ``failed_batches``, and ``stop`` at
-one."""
+one.
+
+**Moved at SPEC-091 (2026-11-17), not added.** ``Worker.submit`` was split into ``_enqueue``, which
+puts and counts, and ``_announce``, which writes, so that a hand-in made inside the sweep hold
+writes nothing there (FR-001). The overflow count's ``self._lock`` section moved with the counting
+half, unchanged in what it guards and still taken alone, so ``Worker.submit``'s site is now
+``Worker._enqueue``'s and the lock order does not move."""
 
 
 def _tree(name: str) -> ast.Module:
