@@ -1643,20 +1643,25 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (`_stuck_refusal`, `_refusal_under_the_lock`, `_latched` and the class docstring). The PING
   latch has the same shape and is unmeasured, and its headline case is a paused server, which the
   driver can take minutes to notice. SPEC-104 either measures it against one or leaves it out.
-- **An owned core `NATSSink` whose abandoned publish leaves its buffer undrained is refused at once
-  by the PING latch, so SPEC-104's aged wait does not reach it** (found while drafting SPEC-104,
-  2026-11-17; invariants 2 and 6; read from the code at `61b942c0`, not measured). For a core
-  client the sink connected itself, a round that abandoned a publish goes on to confirm the batch
-  (`_round_on_loop`, `src/log_foundry/sinks/nats.py:1127-1128`); the deadline has passed, so the
-  buffer cannot have drained, and `_confirm` (`:1369`) leaves a probe behind dated from the start of
+- **An owned core `NATSSink` whose abandoned publish leaves its buffer undrained refuses at once,
+  through the PING latch, every caller that arrives after the abandoning round returned** (found
+  while drafting SPEC-104, 2026-11-17; invariants 2 and 6; read from the code at `61b942c0`, not
+  measured). For a core client the sink connected itself, a round that abandoned a publish goes on
+  to confirm the batch (`_round_on_loop`, `src/log_foundry/sinks/nats.py:1127-1128`). In the common
+  shape, a pending buffer above 2 MiB behind an earlier blocked drain, the buffer cannot have
+  drained by the deadline, and `_confirm` (`:1369`) leaves a probe behind dated from the start of
   that round, `deadline - publish_timeout`, which makes `_latched` hold for the very next caller.
-  SPEC-061's diff review chose that dating so a silent server costs one caller one budget. So while
-  SPEC-104 gives an owned JetStream client and every injected client a window in which a call waits
-  for an abandoned publish, an owned core client keeps today's loss under the same transient stall:
-  the twin path does not keep the same promise. **Closed by** a spec that measures, against a real
-  server whose peer stops reading for a little longer than one budget, whether a left-behind probe
-  should age from when it was sent rather than from the start of the round, which reverses that
-  review's finding, or records the asymmetry here and in invariant 6 as a trade.
+  When the driver's flusher is itself blocked writing the forced batch, nats-py has already zeroed
+  `_pending_data_size` before `transport.drain()`, so `_drained` can read zero and no such probe is
+  left. SPEC-061's diff review chose that dating so a silent server costs one caller one budget. A
+  caller queued on the lock behind the abandoning round does wait for the abandoned publish under
+  SPEC-104, since the PING latch is read before the lock only; one arriving after that round
+  returned is refused at once, so in the common shape an owned core client keeps most of today's
+  loss under the same transient stall, where an owned JetStream client and every injected client do
+  not: the twin path does not keep the same promise. **Closed by** a spec that measures, against a
+  real server whose peer stops reading for a little longer than one budget, whether a left-behind
+  probe should age from when it was sent rather than from the start of the round, which reverses
+  that review's finding, or records the asymmetry here and in invariant 6 as a trade.
 - **A destination that refuses at once during the stop loses the whole exit backlog in
   milliseconds, even when it would be back long before the deadline** (found while measuring the
   item above, 2026-11-17; invariants 2 and 3). The exit drain's waits between rounds are zero for

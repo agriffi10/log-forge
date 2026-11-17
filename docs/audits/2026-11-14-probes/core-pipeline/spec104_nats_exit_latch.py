@@ -123,7 +123,7 @@ if WHEN == "cost":
         took = time.monotonic() - t0
     h = lf.health()
     print(f"{MODE} cost: flush={flush_took:.2f}s flush_ok={bool(flushed)} shutdown={took:.2f}s "
-          f"batch_lost={h.events.batch_lost} failed_batches={h.failed_batches}")
+          f"batch_lost={h.events.batch_lost} sink_lost={h.events.sink_lost} failed_batches={h.failed_batches}")
     sys.exit(0)
 with contextlib.redirect_stderr(err):
     if WHEN == "steady":
@@ -131,7 +131,7 @@ with contextlib.redirect_stderr(err):
         time.sleep(6)
         h = lf.health()
         print(f"{MODE} steady, 6 s after the trigger: steady_acked={ACKS['steady']} of {2 * SPANS} "
-              f"batch_lost={h.events.batch_lost} failed_batches={h.failed_batches}")
+              f"batch_lost={h.events.batch_lost} sink_lost={h.events.sink_lost} failed_batches={h.failed_batches}")
     else:
         TRIGGER[0] = time.monotonic()
     t0 = time.monotonic()
@@ -140,4 +140,4 @@ with contextlib.redirect_stderr(err):
 h = lf.health()
 lines = sum(1 for line in err.getvalue().splitlines() if line.startswith("log-foundry"))
 print(f"{MODE} {WHEN}: steady_acked={ACKS['steady']} exit_acked={ACKS['exit']} of {2 * SPANS} "
-      f"batch_lost={h.events.batch_lost} failed_batches={h.failed_batches} took={took:.2f}s lines={lines}")
+      f"batch_lost={h.events.batch_lost} sink_lost={h.events.sink_lost} failed_batches={h.failed_batches} took={took:.2f}s lines={lines}")
