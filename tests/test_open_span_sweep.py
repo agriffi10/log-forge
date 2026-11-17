@@ -197,7 +197,7 @@ def test_an_append_parked_before_its_insert_is_taken_exactly_once() -> None:
     assert parked.span is not None
     buffer = _PausingList(parked.span.events, after=False, message="paused")
     parked.span.events = buffer
-    owner = threading.Thread(target=parked.log, args=("paused",))
+    owner = threading.Thread(daemon=True, target=parked.log, args=("paused",))
     owner.start()
     try:
         assert buffer.parked.wait(BOUND), "the owner never reached its append"
@@ -213,11 +213,30 @@ def test_an_append_parked_before_its_insert_is_taken_exactly_once() -> None:
     assert sorted(got) == sorted(["span.start", "before", "paused", "span.end"]), got
 
 
-def test_a_close_parked_after_appending_span_end_is_not_swept_early() -> None:
+class _CopyParkedRegistry(dict):  # type: ignore[type-arg]
+    """``_open_spans`` whose ``copy`` parks the sweep once, just after the registry is copied."""
+
+    def __init__(self, items: dict[int, Span], thread: list[int]) -> None:
+        super().__init__(items)
+        self.thread = thread
+        self.parked = threading.Event()
+        self.go = threading.Event()
+
+    def copy(self) -> dict[int, Span]:
+        copied = dict(self)
+        if threading.get_ident() in self.thread and not self.parked.is_set():
+            self.parked.set()
+            assert self.go.wait(BOUND)
+        return copied
+
+
+def test_a_close_parked_after_appending_span_end_is_not_swept_early(monkeypatch) -> None:
     """FR-001 AC-2: the close leaves the registry first, and the sweep reads membership after length.
 
-    A sweep whose length counts ``span.end`` therefore always fails its membership read. Without
-    that read, the take shipped ``span.end`` with the logs, ahead of the close's ``span.start``.
+    The sweep copies the registry while the span is still in it, then the close removes the span,
+    appends ``span.end`` and is parked there; the sweep's length now counts ``span.end``, and its
+    membership read fails, so it takes nothing. Without that read, the take shipped ``span.end``
+    with the logs, ahead of the close's own ``span.start``.
     """
     sink = Recorder()
     worker = _quiet(sink)
@@ -225,14 +244,30 @@ def test_a_close_parked_after_appending_span_end_is_not_swept_early() -> None:
     assert parked.span is not None
     buffer = _PausingList(parked.span.events, after=True, message="span.end")
     parked.span.events = buffer
-    closer = threading.Thread(target=parked.finish)
-    closer.start()
+    sweeper: list[int] = []
+    registry = _CopyParkedRegistry(dict(decorator._open_spans), sweeper)
+    monkeypatch.setattr(decorator, "_open_spans", registry)
+    result: list[object] = []
+
+    def sweep() -> None:
+        sweeper.append(threading.get_ident())
+        result.append(decorator._sweep_registered(worker._hand_in))
+
+    sweeping = threading.Thread(daemon=True, target=sweep)
+    closer = threading.Thread(daemon=True, target=parked.finish)
+    sweeping.start()
     try:
+        assert registry.parked.wait(BOUND), "the sweep never copied the registry"
+        closer.start()
         assert buffer.parked.wait(BOUND), "the close never appended span.end"
-        result = decorator._sweep_registered(worker._hand_in)
-        assert result is not None and result[0] == 0, f"a closing span was taken from: {result}"
+        registry.go.set()
+        sweeping.join(BOUND)
+        assert result and result[0] is not None, result
+        assert result[0][0] == 0, f"a closing span was taken from: {result}"  # type: ignore[index]
     finally:
+        registry.go.set()
         buffer.go.set()
+        sweeping.join(BOUND)
         closer.join(BOUND)
     lf.flush(BOUND)
     got = sink.messages("parked")
@@ -301,8 +336,8 @@ def test_a_backfill_parked_mid_iteration_keeps_every_boundary_baggage(monkeypatc
         closer_id.append(threading.get_ident())
         parked.finish()
 
-    sweeping = threading.Thread(target=sweep)
-    closing = threading.Thread(target=close)
+    sweeping = threading.Thread(daemon=True, target=sweep)
+    closing = threading.Thread(daemon=True, target=close)
     sweeping.start()
     try:
         assert registry.parked.wait(BOUND), "the sweep never read membership"
@@ -504,7 +539,7 @@ def test_a_collector_callback_that_closes_the_span_mid_take_defers_its_close() -
     gc.callbacks.append(callback)
     try:
         sweeping = threading.Thread(
-            target=lambda: result.append(decorator._sweep_registered(worker._hand_in))
+            daemon=True, target=lambda: result.append(decorator._sweep_registered(worker._hand_in))
         )
         sweeping.start()
         sweeping.join(5.0)
@@ -640,7 +675,7 @@ def test_each_hold_site_survives_nested_calls_from_a_collector_callback(enter, m
 
     gc.callbacks.append(callback)
     try:
-        runner = threading.Thread(target=run)
+        runner = threading.Thread(daemon=True, target=run)
         runner.start()
         runner.join(BOUND)
     finally:
@@ -744,7 +779,7 @@ def test_an_event_in_the_first_span_ships_within_one_interval(busy, monkeypatch)
             parked.set()
             released.wait(BOUND)
 
-        owner = threading.Thread(target=first)
+        owner = threading.Thread(daemon=True, target=first)
         owner.start()
         assert parked.wait(BOUND)
         worker = _lifecycle._state.worker_exists()
@@ -760,7 +795,7 @@ def test_an_event_in_the_first_span_ships_within_one_interval(busy, monkeypatch)
             def closer() -> None:
                 lf.info("busy")
 
-            other = threading.Thread(target=closer)
+            other = threading.Thread(daemon=True, target=closer)
             other.start()
             other.join(BOUND)
         ticks.tick()
@@ -863,7 +898,7 @@ def test_a_hand_in_fault_on_the_drain_is_announced_after_the_hold(monkeypatch) -
                 if got:
                     decorator._sweep_lock.release()
 
-            t = threading.Thread(target=try_it)
+            t = threading.Thread(daemon=True, target=try_it)
             t.start()
             t.join(BOUND)
             free_at_line.append(probe == [True])
@@ -977,7 +1012,7 @@ def test_the_drain_does_not_wait_on_a_thread_whose_hold_waits_on_the_drain(monke
             outcome["result"] = lf.flush(5.0)
             outcome["elapsed"] = time.monotonic() - began
 
-    thread = threading.Thread(target=holder)
+    thread = threading.Thread(daemon=True, target=holder)
     thread.start()
     thread.join(BOUND + 6)
     assert outcome.get("tried", True), "the drain never tried to take the hold"
@@ -1153,7 +1188,7 @@ def test_a_sink_swap_during_sweeps_loses_and_duplicates_nothing() -> None:
             lf.info(f"e{i}")
             time.sleep(0.001)
 
-    swapping = threading.Thread(target=swapper)
+    swapping = threading.Thread(daemon=True, target=swapper)
     swapping.start()
     try:
         errors = run_concurrently(lambda t, i: work_call(), threads=4, per_thread=25)
@@ -1193,7 +1228,10 @@ def test_the_ledger_balances_while_sweeps_run() -> None:
         for i in range(3):
             lf.info(f"e{i}")
 
-    helpers = [threading.Thread(target=flusher), threading.Thread(target=sampler)]
+    helpers = [
+        threading.Thread(daemon=True, target=flusher),
+        threading.Thread(daemon=True, target=sampler),
+    ]
     for helper in helpers:
         helper.start()
     try:
@@ -1233,7 +1271,7 @@ def test_a_snapshot_held_inside_the_span_pass_reads_a_sweep_balanced() -> None:
         owner_logged.set()
         assert owner_release.wait(BOUND)
 
-    owning = threading.Thread(target=owner)
+    owning = threading.Thread(daemon=True, target=owner)
     owning.start()
     assert owner_ready.wait(BOUND)
     later_done = threading.Event()
@@ -1244,7 +1282,7 @@ def test_a_snapshot_held_inside_the_span_pass_reads_a_sweep_balanced() -> None:
         later_ready.set()
         later_done.wait(BOUND)
 
-    later = threading.Thread(target=later_cell)
+    later = threading.Thread(daemon=True, target=later_cell)
     later.start()
     assert later_ready.wait(BOUND)
     _, cells = _ledger.snapshot()
@@ -1262,7 +1300,7 @@ def test_a_snapshot_held_inside_the_span_pass_reads_a_sweep_balanced() -> None:
 
     _ledger._between = between
     try:
-        reader = threading.Thread(target=lambda: reading.append(lf.health().events))
+        reader = threading.Thread(daemon=True, target=lambda: reading.append(lf.health().events))
         reader.start()
         reader.join(BOUND)
     finally:
@@ -1382,10 +1420,10 @@ def test_the_open_and_a_level_call_take_no_sweep_lock() -> None:
         lf.info("x")
         logged.set()
 
-    hold = threading.Thread(target=holder)
+    hold = threading.Thread(daemon=True, target=holder)
     hold.start()
     assert holding.wait(BOUND)
-    caller = threading.Thread(target=call)
+    caller = threading.Thread(daemon=True, target=call)
     caller.start()
     try:
         assert started.wait(BOUND), "the open waited on the sweep hold"
@@ -1426,7 +1464,7 @@ def test_a_wedged_console_does_not_hold_a_close() -> None:
     sys.stderr = stream  # type: ignore[assignment]
     closed = threading.Event()
     try:
-        sweeping = threading.Thread(target=worker._run_sweep)
+        sweeping = threading.Thread(daemon=True, target=worker._run_sweep)
         sweeping.start()
         assert stream.writing.wait(BOUND), "the sweep's overflow line was never written"
 
@@ -1438,7 +1476,7 @@ def test_a_wedged_console_does_not_hold_a_close() -> None:
             closer()
             closed.set()
 
-        closing = threading.Thread(target=close)
+        closing = threading.Thread(daemon=True, target=close)
         closing.start()
         assert closed.wait(5.0), "a close waited on a sweep whose line was blocked on stderr"
         assert not stream.release.is_set() and sweeping.is_alive(), "the line was still pending"

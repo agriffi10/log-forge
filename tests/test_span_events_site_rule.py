@@ -190,6 +190,10 @@ class _Walker(ast.NodeVisitor):
                 self.aliases[-1].add(target.id)
         self.generic_visit(node)
 
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._target(node.target)
+        self.generic_visit(node)
+
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self._target(node.target)
         if isinstance(node.target, ast.Name) and node.target.id in self.aliases[-1]:
@@ -309,6 +313,18 @@ def test_a_sweep_lock_with_outside_the_hold_is_named() -> None:
             [Finding(SITE, "x.py:f")],
         ),
         (
+            "def f(span):\n    taken, span.events = span.events, []\n",
+            [Finding(SITE, "x.py:f")],
+        ),
+        (
+            "def f(span):\n    first, *span.events = [1, 2]\n",
+            [Finding(SITE, "x.py:f")],
+        ),
+        (
+            "def f(span):\n    span.events: list = []\n",
+            [Finding(SITE, "x.py:f")],
+        ),
+        (
             "def f(span):\n    span.events.pop()\n",
             [Finding(SITE, "x.py:f")],
         ),
@@ -338,6 +354,9 @@ def test_a_sweep_lock_with_outside_the_hold_is_named() -> None:
         "slice-assign",
         "rebind",
         "augmented",
+        "tuple-rebind",
+        "starred-rebind",
+        "annotated-rebind",
         "mutator",
         "acquire",
         "drain-caller",
