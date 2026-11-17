@@ -84,16 +84,21 @@ class _Child:
     Attributes:
       status: The raw ``os.waitpid`` status.
       output: Whatever the child wrote back down the pipe before exiting.
+      forked: The parent's ``time.monotonic()`` as ``fork`` returned to it, or ``None`` for a
+        record built by hand. A test timing the child from the fork reads this rather than a clock
+        of its own read before :func:`run_in_child`, whose window would then hold the parent's
+        pre-fork ``gc.collect()``, which costs whatever the parent's heap costs to walk.
     """
 
-    __slots__ = ("output", "status")
+    __slots__ = ("forked", "output", "status")
 
-    def __init__(self, status: int, output: str) -> None:
+    def __init__(self, status: int, output: str, *, forked: float | None = None) -> None:
         """Records one child's result.
 
         Args:
           status: The raw wait status.
           output: The bytes the child wrote, decoded.
+          forked: The parent's monotonic clock as ``fork`` returned to it, if one was read.
 
         Returns:
           None.
@@ -103,6 +108,7 @@ class _Child:
         """
         self.status = status
         self.output = output
+        self.forked = forked
 
     @property
     def finished(self) -> bool:
@@ -408,6 +414,7 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
                 pass
         finally:
             os._exit(code)
+    forked = time.monotonic()
     os.close(write_fd)
     deadline = time.monotonic() + timeout + 2.0
     chunks: list[bytes] = []
@@ -432,7 +439,7 @@ def run_in_child(work: Callable[[], str | None], *, timeout: int = CHILD_TIMEOUT
             except ProcessLookupError:
                 pass
         _, status = os.waitpid(pid, 0)
-    return _Child(status, b"".join(chunks).decode(errors="replace"))
+    return _Child(status, b"".join(chunks).decode(errors="replace"), forked=forked)
 
 
 class _Gate:
@@ -813,6 +820,46 @@ def test_an_unrestorable_dump_setting_is_refused_before_the_fork(
     assert not forks, "a setting that cannot be restored was refused only after the fork"
     leaked = set(os.listdir("/dev/fd")) - open_before
     assert not leaked, f"the refusal leaked descriptor(s) {sorted(leaked)} into the run"
+
+
+def test_the_recorded_fork_time_is_read_after_the_collect_and_before_the_reap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """:attr:`_Child.forked` is the parent's clock as ``fork`` returns, not either side of it.
+
+    Two tests time a child from it, and both pass silently with it in the wrong place: read above
+    the pre-fork ``gc.collect()`` it holds the heap-sized collection the field exists to leave
+    out, and read once the child is reaped it comes after the child's body, so every body reads
+    as prompt. A collection slowed by 1 s and a child that sleeps 2 s after reading its own clock
+    pin it from both sides, each with a second of slack for a descheduled parent.
+
+    Args:
+      monkeypatch: Slows the parent's collection for this test only.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    collect = gc.collect
+
+    def slow_collect(*args: Any) -> int:
+        time.sleep(1.0)
+        return collect(*args)
+
+    def body() -> str:
+        reached = time.monotonic()
+        time.sleep(2.0)
+        return f"{reached}"
+
+    monkeypatch.setattr(gc, "collect", slow_collect)
+    before = time.monotonic()
+    child = run_in_child(body)
+    assert child.finished, child.ending
+    assert child.forked is not None
+    assert child.forked >= before + 1.0, "the fork time was read above the collection"
+    assert child.forked < float(child.output) + 1.0, "the fork time was read after the child ran"
 
 
 def test_a_crashed_child_does_not_read_as_blocked() -> None:

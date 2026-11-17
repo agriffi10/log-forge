@@ -603,22 +603,57 @@ def test_a_forked_child_builds_its_own_sink(path: str) -> None:
 
 
 def test_the_at_fork_handler_never_calls_the_factory() -> None:
-    """FR-006: a factory that blocks forever does not delay the child's return from ``fork``."""
-    built: list[int] = []
+    """FR-006: a factory that blocks forever does not delay the child's return from ``fork``.
+
+    **The clock starts as ``fork`` returns, not before :func:`run_in_child`.** That helper runs a
+    full ``gc.collect()`` in the parent just before it forks, and a full collection walks every
+    object the collector tracks, so its cost is the parent's heap, not anything the fork handler
+    does. Timed from before the helper, the window held that collection, and the reported failure
+    reads as one: ``False,1``, with no factory called, only late in full serial runs at a load
+    average of 70 or more. Planting a 3.5 s sleep just above the helper's ``gc.collect()``
+    reproduces exactly that output against the old clock, and this test passes through it. One
+    probe, run as the last test of a full ``pytest -n 0 -p no:randomly`` on macOS at a load
+    average of 40 to 70 with ``time.monotonic()`` read around the collection and in the child,
+    found 2.7 million tracked objects, 0.86 s to 2.38 s to collect and 9 ms to 11 ms from the fork
+    to the child's body; it caught no failing run, and how long a collection takes depends on
+    what the heap holds, not only on its size. Timed from :attr:`_Child.forked`, the parent's
+    clock as ``fork`` returned to it, against the child's own clock read in its body, the window
+    holds only the child's fork handlers and the helper's prologue, so the 3 s budget sits two
+    orders of magnitude above what it measures, and still below the parent's 7 s deadline,
+    which is what kills a child whose handler waits on the factory: ``fork`` clears the child's
+    alarm, and the helper arms a new one only after ``fork`` returns. A parent descheduled
+    before it reads the clock only shortens the window it reports, so the error is leniency,
+    never a false failure.
+
+    Each call to the factory is counted on entry, before it blocks, so the child's count says
+    whether anything called it, not only whether a call finished.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    calls: list[int] = []
     never = threading.Event()
 
     def blocks_after_the_first() -> RecordingSink:
-        if built:
+        calls.append(1)
+        if len(calls) > 1:
             never.wait()
-        built.append(1)
         return RecordingSink()
 
     log_foundry.configure(service="factory", sink_factory=blocks_after_the_first)
     log_foundry.info("parent builds")
-    started = time.monotonic()
-    child = run_in_child(lambda: f"{time.monotonic() - started < 3.0},{len(built)}", timeout=5)
+    child = run_in_child(lambda: f"{time.monotonic()},{len(calls)}", timeout=5)
     assert child.finished, child.ending
-    assert child.output == "True,1", child.output
+    assert child.forked is not None
+    reached, count = child.output.split(",")
+    after = float(reached) - child.forked
+    assert (after < 3.0, count) == (True, "1"), f"{count} call(s), body at {after:.3f}s after fork"
 
 
 def test_a_grandchild_builds_its_own_and_a_childs_sink_is_inherited() -> None:
