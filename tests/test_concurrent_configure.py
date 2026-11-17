@@ -27,6 +27,7 @@ from typing import Any
 
 import pytest
 
+import ledger_check
 import log_foundry
 from conftest import _reset_worker, cpu_window
 from log_foundry import _fork, _lifecycle, config, context
@@ -196,6 +197,7 @@ def test_unforced_concurrent_sink_changes_close_each_sink_once_and_agree_with_de
             defects.append(f"round {round_}: the config names one sink, delivery goes to another")
         log_foundry.shutdown(timeout=5.0)
         defects.extend(f"round {round_}: {d}" for d in _defects([a, b, c]))
+        defects.extend(f"round {round_}: {d}" for d in ledger_check.problems())
         config._config = config.Config()
         context.reset_context()
         _reset_worker()

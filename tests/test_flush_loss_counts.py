@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+import ledger_check
 import log_foundry as lf
 from conftest import Stopwatch, _reset_worker, cpu_window, install_worker
 from ledger_sinks import GatedSink, PlanSink, every
@@ -496,6 +497,9 @@ def test_a_drain_dying_in_the_exit_drain_counts_drain_lost_every_time() -> None:
             result, _ = _dying_in_the_exit_drain()
             if result or _counts(result) != _only(drain_lost=6):
                 failures.append((run, result))
+            unbalanced = ledger_check.problems()
+            if unbalanced:
+                failures.append((run, unbalanced))
             _reset_worker()
     finally:
         sys.setswitchinterval(original)

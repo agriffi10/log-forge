@@ -450,9 +450,10 @@ def restart_in_child(span_base: int) -> None:
 def restart(span_base: int = 0) -> None:
     """Empties the registry and rebinds the thread-local, so every thread re-registers.
 
-    Used by a forked child, whose ledger starts as what it holds, and by the test suite's balance
-    fixture at each test's setup. It writes no other thread's cell: the old cells are dropped from
-    the registry, and a thread that writes into one afterwards writes into a cell nothing reads.
+    Used by the test suite's balance check at each test's setup and teardown; a forked child uses
+    :func:`restart_in_child`, which keeps the forking thread's cell. It writes no other thread's
+    cell: the old cells are dropped from the registry, and a thread that writes into one
+    afterwards writes into a cell nothing reads.
     The registry object and its lock are kept, under the lock, so a forked child relies on the
     fork roster to have replaced a lock a parent thread held, as every other package lock does,
     rather than on this replacing it in passing.

@@ -72,6 +72,14 @@ would wrongly fail those tests' balancing `emit`-path cases. Every other test ba
 _direct = [0]
 """Events the `lf` fixture emitted directly since the current test began."""
 
+_carried: list[str] = []
+"""Reasons a mid-test `conftest._reset_worker` found before it emptied the ledger.
+
+The reset restarts the ledger, so whatever a test's earlier rounds left unbalanced would be gone
+by its teardown and the verdict would read an empty ledger. :func:`carry` keeps those reasons here
+and :func:`verdict` reports them with its own, so a loop that resets between rounds is judged on
+every round without having to remember to ask (diff review frame 2)."""
+
 MARKER = "ledger_exempt"
 
 SETTLE = 2.0
@@ -116,6 +124,28 @@ def begin() -> None:
     A test that plants an imbalance on purpose, to show the shutdown check sees it, calls this
     again once it has asserted, so the imbalance it made is its own and does not need a marker.
     """
+    restart()
+    _track_workers()
+    _tracked.clear()
+    _carried.clear()
+
+
+def restart() -> None:
+    """Empties the ledger, its loss counters and the `lf` allowance together, so none is seen alone.
+
+    ``orphan_lost`` and ``in_span_lost`` are terms of the ledger: an event lost on the orphan path
+    is a credit in a cell and one in ``orphan_lost``, and the reading balances only while both are
+    there. So nothing in the suite zeroes the counters without emptying the cells in the same
+    step, and this is the one place that does it — :func:`begin` at each test's setup and
+    `conftest._reset_worker` at each test's teardown both call it. Until this existed the
+    teardown zeroed the counters alone, after this module's verdict: a test that lost an event
+    left its credit with no loss term, the next test's setup hid it, and the last test an xdist
+    worker ran left it for the ``atexit`` ``shutdown()``, which wrote a ``lost 1 event(s); the
+    event ledger does not balance`` line for an event that was in a term all along. How many
+    lines a run wrote depended on the schedule: one per xdist worker whose last test happened to
+    lose an event, which most runs of the suite, and of ``tests/test_api.py`` alone, had at
+    least one of.
+    """
     from log_foundry import _ledger, _lifecycle, decorator
 
     _ledger.restart(0)
@@ -123,9 +153,20 @@ def begin() -> None:
         decorator._orphan_lost = 0
         decorator._in_span_lost = 0
     _lifecycle._state._ledger_announced = 0
-    _track_workers()
-    _tracked.clear()
     _direct[0] = 0
+
+
+def carry() -> None:
+    """Keeps for the teardown verdict what the process does not balance on, read before a reset.
+
+    `conftest._reset_worker` calls it first, before it stops the worker and restarts the ledger.
+    It reads at every call, including the reset at each test's setup and teardown, where what it
+    keeps is discarded unread: :func:`begin` clears it at the next setup, which is the one clear,
+    so a failing test's teardown reading never reaches the next test's verdict. Gating it on a flag
+    raised by :func:`begin` would save one reading of about 0.1 ms per call and change no
+    verdict, so the flag would be a check no test could tell apart from its absence.
+    """
+    _carried.extend(problems())
 
 
 def emitted_directly(count: int) -> None:
@@ -224,4 +265,4 @@ def judge(found: list[str], marked: bool) -> str | None:
 
 def verdict(node) -> str | None:  # type: ignore[no-untyped-def]
     """Judges the test ``node`` at its teardown; ``None`` when it passes the check."""
-    return judge(problems(), node.get_closest_marker(MARKER) is not None)
+    return judge([*_carried, *problems()], node.get_closest_marker(MARKER) is not None)
