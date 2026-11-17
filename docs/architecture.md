@@ -1604,6 +1604,48 @@ an item leaves this list when a spec closes it, not because the arc names it.
   is the shape of a sink that died during the run rather than at `shutdown()`, since its last
   steady batch failed before the stop, so it is probably the commoner way a sink is dead at
   exit.
+- **The exit drain sizes a batch from a rate it measured earlier, so an attempt the exit budget
+  never saw can outrun the `shutdown()` deadline and leave the sink open** (SPEC-090 FR-001 rule 4
+  and FR-003; found by SPEC-103's spec review and by SPEC-105's, 2026-11-17; invariants 3 and 5).
+  `_set_target` (`src/log_foundry/worker.py:2868`; every line cited in this item is at
+  `6b9d50f6`) sizes each batch at `min(1000, events / elapsed * flush_interval / 2)`, on the exit
+  drain as in the steady one, and `_retry_declined` (`:3192`) starts a later exit batch whenever
+  `now + _exit_longest + _JOIN_MARGIN` falls inside the deadline. The prediction is the longest
+  attempt *seen*, so a batch the rate rule has just grown, or one that meets a sink that has just
+  slowed, starts although its attempt is many times that. Two shapes, each measured with
+  `docs/audits/2026-11-14-probes/core-pipeline/spec105_exit_slowdown.py` at `6b9d50f6`, at least
+  two runs a cell across 3.13.1 and 3.12.12, 2,000 two-event spans queued at the stop:
+  - **A sink that recovers by exit** (`unmeasured healthy 2000 <t> 1 0.002`: the last steady batch
+    fails so the target is zero at the stop, then every event costs 2 ms). The first exit batch is
+    20 events in 0.04 s, the rate rule grows the next to 220 to 246 events, about 0.5 s, and at
+    `shutdown(timeout=0.45)` and `(0.6)` the join expired in every run; at 30 s it completes in
+    8.19 to 8.24 s with 3,982 events handed.
+  - **A sink that slows during the exit** (`<start> slowdown 2000 <t>`: ten events a request, each
+    request 0.5 ms for the first two exit calls and 0.3 s after). Fast requests grow the batches
+    to the 1,000-event cap, so the first slow one is 100 requests, about 30 s. With the target
+    measured before the stop (`measured`) the join expired at 0.5, 2 and 5 s in every run, the
+    first exit batch already 1,000 events; from a zero target (`unmeasured`) it expired at 2 and
+    5 s. The failing-path twin does not show it: SPEC-103's probes for a sink whose requests fail
+    fast and then slowly (`spec103_sqs_slowdown_exit.py`, `spec103_http_slowdown_exit.py` on the
+    unpushed `spec-103-fold-exit-lines`, `fec8c8e8`) ended 0.18 to 0.20 s inside a 0.5 s deadline
+    and closed `HTTPSink` once at `6b9d50f6`, because a failed exit batch does not grow the target.
+  Every event is counted and announced either way; what an expired join costs is the sink left
+  open and the events inside the attempt. Two closures are measured, both as prototypes on
+  `6b9d50f6`. **A fit bound** (after each exit batch, cap the next target at the last delivered
+  exit batch's rate times `deadline - now - _JOIN_MARGIN`, applied when that room is at least
+  `_exit_longest`) closes the first shape (completes in 0.34 to 0.35 s at 0.45 and 0.48 to 0.50 s
+  at 0.6, 3,982 handed at 30 s) and leaves the second as it is, since it trusts a rate the slowdown
+  falsifies. **No growth at exit** (no exit batch above the target in force at the stop) closes
+  the first shape and, from a zero target, the second (completes in 1.40 to 1.42 s at 2 and 4.41
+  to 4.43 s at 5), but not from a measured target, where the first exit batch is already 1,000
+  events; and it slows a healthy exit that starts from a zero target, most for a sink that sends
+  one request a batch (`unmeasured healthy 2000 <t> 100000 0.02`: 4.37 to 5.03 s against 0.32 to
+  0.35 s at 30 s, and 1,380 to 1,620 events handed by the return against 3,982 at 2 s). Neither
+  closes a sink that is fast and measured at the stop and then slows, whose first exit batch
+  SPEC-062 never declines. **Closed by** SPEC-105 (Draft, paused by Andrew on 2026-11-17 until
+  SPEC-103's rewrite settles), which chooses among these, or a design that bounds the attempt
+  rather than the batch, such as the sinks' own per-request timeouts; SPEC-105's text still names
+  this item by the title SPEC-103's abandoned branch gave it.
 - **A `NATSSink` whose abandoned-publish latch is armed refuses every round of the worker's at
   once, so a stall a little longer than one `publish_timeout` loses every batch the drain makes
   during it, and at the stop the whole backlog** (found by SPEC-102's spec reviewer, 2026-11-17,
