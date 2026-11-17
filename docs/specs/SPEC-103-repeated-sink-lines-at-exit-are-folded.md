@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-103
 title: "Repeated Sink Lines at Exit Are Folded"
 description: "Has the exit drain, from its first abandoned batch on, fold the stderr lines a sink or the delivery engine writes inside each later exit batch's sink call into one line per distinct text, with its summed count and how many lines it stands for, written once at the end of the exit or before an expiry line, so a dead sink at exit writes a handful of lines rather than one per ten spans, while its batches, retries, waits and deadline stay exactly as they are."
-spec_status: In Progress
+spec_status: Completed
 depends_on: [SPEC-062, SPEC-090]
 arc: audit-2026-11-14
 arc_order: 19
@@ -358,7 +358,7 @@ Each site and what the build does with it:
 
 | Site | Says | The build |
 |---|---|---|
-| `docs/architecture.md:1584-1606`, §12 | the dead-sink residual and its three candidate closures | strikes it to one line, in SPEC-088's form (`:1536-1542`), and moves the full text under *Resolved*. It gains `→ **closed by SPEC-103 FR-001**`: the lines are folded, the calls accepted by Andrew's decision, the zero and cap rows before (`6b9d50f6`) and after on 3.12 and 3.13, and one clause for each rejected design |
+| `docs/architecture.md:1584-1606`, §12 | the dead-sink residual and its three candidate closures | strikes it to one line, in SPEC-088's form (`:1536-1542`), and moves the full text under *Resolved*. It gains `→ **closed by SPEC-103 FR-001**`: the lines are folded, the calls accepted by Andrew's decision, the zero and cap rows before (`4599a0c5`) and after (`f28f17d4`) on 3.12 and 3.13, and one clause for each rejected design |
 | `docs/architecture.md` §12, open | "The exit drain sizes a batch from a rate it measured earlier, and predicts its next attempt from the longest one it has seen…", filed by `s12-exit-slowdown` | keeps it as found and files no second copy. It is not this spec's (Out of Scope) |
 | `docs/decisions/pipeline/a-backlog-drains-in-larger-batches-and-capacity-is-not-a-setting.md` | an abandoned exit batch leaves the target as it was, and the trade for a sink refusing large batches | keeps the rule. It adds that growth behind a zero target at exit was built six ways and rejected, with the reasoning (any growth makes the first attempt after a slowdown proportionally longer, and no cost bound survives that) and the two slowdown probes' numbers. **Rejected** gains A, B, D, D2, E, E′, E3 with `1fa9ea15`, and E6, one line each with its defect. A dated History entry names this spec and Andrew's answer |
 | `docs/decisions/failure-paths/one-module-writes-every-diagnostic-so-the-rules-are-applied-once-rather-than-remembered-twenty-eight-times.md` | `_diag` owns its writers | the body gains the fold: at exit `_diag` folds per-batch sink lines into one per distinct text, through its fifth write. Its fence is unchanged, and a dated History entry is added |
@@ -367,7 +367,9 @@ Each site and what the build does with it:
 | `src/log_foundry/_diag.py` module docstring | "Four writers, one per kind of line" | names the fifth write, the fold and `running_total` |
 | `src/log_foundry/_fork.py`, `_reinit_after_fork`'s docstring | "The order of work here is the contract", steps 1 to 6 | adds the withdrawal of `_diag`'s window as the step ahead of the pin, and why |
 | `src/log_foundry/_fork.py`, `_GLOBAL_PRIMITIVES` | ten rows | adds `("_diag", "_FOLD_LOCK")` |
-| `docs/component-inventory.md:84`, fork repair | "the roster of the package's ten global locks and events" | eleven |
+| `docs/component-inventory.md:84`, fork repair | "the roster of the package's ten global locks and events", and the order in the child | eleven; the withdrawal first in the order |
+| `docs/component-inventory.md:17` and `:75` | the `_diag` row; "the seven lifecycle-adjacent modules" | the fold's names; eight, `_diag.py` joined at SPEC-103 (found at build) |
+| `docs/decisions/pipeline/only-the-forked-child-is-repaired-and-its-order-of-work-is-the-contract.md`, and `docs/invariants.md` invariant 12 | the inherited record "pinned first" | the withdrawal first, the decision refined in place with a dated History entry (found at completion) |
 | `docs/audits/2026-11-14-probes/core-pipeline/spec090_dead_http_exit.py:2` | "the exit drain's tallies cannot aggregate, so the lines at exit follow the number of exit batches" | keeps: a probe's record of what it measured |
 | this spec's own text | its grep, this table and its Evidence | keeps: the record |
 | `tests/test_exit_drain_batches.py:705-727`, `:730-766` | the engine's and `HTTPSink`'s lines "grow with the number of exit batches" | the docstrings are rewritten: the lines are folded, and the call bound is unchanged. The assertions stay, since they bound lines from above |
@@ -637,3 +639,9 @@ budget through it.
     on a `threading.local` subclass. A thread-local, not a `ContextVar`, against
     `best-practices/python.md` §13: a `ContextVar` would follow `asyncio.to_thread` into a sink's
     own thread, and a child's withdrawal would reach only the context current at the fork.
+- **2026-11-17, at completion.** The record reached three sites beyond FR-003's table, each now in
+  it: the inventory's `_diag` row and its count of lifecycle-adjacent modules, and the fork-order
+  decision and invariant 12, which said the inherited record is pinned first, where the fold
+  window is now withdrawn before it. The release notes' list of exceptions to a `>=1,<2` pin gains
+  one, for code that counts or matches a sink's lines at exit. The before numbers are re-measured
+  at `4599a0c5`, the build's base, where FR-003 named `6b9d50f6`: they read the same.

@@ -1581,30 +1581,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   interpreters. **Closed by** the batch-size target, for a sink that bounds a whole call by one
   budget, also respecting `(max_retries + 1) × publish_timeout`, or by the worker sizing a batch
   from the sink's declared per-call budget; that either closes it is unmeasured.
-- **A dead sink whose target is already zero at the stop is handed the exit backlog in
-  `batch_size` submissions, and its own per-batch lines are not aggregated** (SPEC-090 FR-001
-  rule 4 and FR-003; invariants 2 and 11). FR-003 aggregates the worker's abandon and decline
-  lines at exit, but not the lines a sink or the delivery engine writes per batch: `HTTPSink`'s
-  `lost 1 request(s)`, the engine's `absorbed a failure while delivering a batch`, and its line
-  for a run that settles with loss. Those follow the number of exit batches. An abandoned exit
-  batch leaves the size target as it was, so with a target at the cap the exit sends the backlog
-  in about one batch per 1,000 events; but when the target is already zero at the stop, because
-  the last steady batch failed or nothing was measured, every exit batch is `batch_size`
-  submissions. `docs/audits/2026-11-14-probes/core-pipeline/spec090_dead_http_exit.py` (a
-  refusing `HTTPSink`, 10,000 spans at exit, `max_retries=3`), on 3.13.1 and 3.12.12 alike: in
-  `zero` mode the build made 16,016 opener calls and wrote 1,004 `log-foundry:` lines with
-  `failed_batches` 1,001, where the tree before SPEC-090 (`75e7bf1e`) made 336 calls and 23 lines
-  with 2; in `cap` mode the build made 321 calls and 22 lines with 20, against 321 and 21. Every
-  event is still counted and announced; what grows is the sink's work and stderr. **Closed by**
-  one of: the exit drain reading a target of zero as the cap, since at exit nothing waits for a
-  failing sink to recover; or, after the first abandoned exit batch, declining every later one
-  unattempted, as FR-003 already does once a retry is declined, which changes what a dead sink
-  at exit is sent; or a channel through which a sink's per-batch loss line is tallied by the
-  worker at exit, which is new sink-contract surface. None is measured yet. The zero-target case
-  is the shape of a sink that died during the run rather than at `shutdown()`, since its last
-  steady batch failed before the stop, so it is probably the commoner way a sink is dead at
-  exit. The closure that reads a zero target as the cap pulls the opposite way from the next
-  item's: it makes the first exit batch, which is never declined, 1,000 events.
+- ~~**A dead sink whose target is already zero at the stop is handed the exit backlog in `batch_size` submissions, and its own per-batch lines are not aggregated**~~ → **closed by SPEC-103**; struck and moved under *Resolved*.
 - **The exit drain sizes a batch from a rate it measured earlier, and predicts its next attempt
   from the longest one it has seen, so an attempt the exit budget never saw can outrun the
   `shutdown()` deadline and leave the sink open** (SPEC-090 FR-001 rule 4 and FR-003, SPEC-062;
@@ -2110,6 +2087,55 @@ close made while its thread holds the worker queue's mutex does not return eithe
   `docs/process/completion-ritual.md` asks of a volatile number.
 
 ### Resolved
+
+- ~~**A dead sink whose target is already zero at the stop is handed the exit backlog in
+  `batch_size` submissions, and its own per-batch lines are not aggregated**~~ (SPEC-090 FR-001
+  rule 4 and FR-003; invariants 2 and 11). FR-003 aggregates the worker's abandon and decline
+  lines at exit, but not the lines a sink or the delivery engine writes per batch: `HTTPSink`'s
+  `lost 1 request(s)`, the engine's `absorbed a failure while delivering a batch`, and its line
+  for a run that settles with loss. Those follow the number of exit batches. An abandoned exit
+  batch leaves the size target as it was, so with a target at the cap the exit sends the backlog
+  in about one batch per 1,000 events; but when the target is already zero at the stop, because
+  the last steady batch failed or nothing was measured, every exit batch is `batch_size`
+  submissions. `docs/audits/2026-11-14-probes/core-pipeline/spec090_dead_http_exit.py` (a
+  refusing `HTTPSink`, 10,000 spans at exit, `max_retries=3`), on 3.13.1 and 3.12.12 alike: in
+  `zero` mode the build made 16,016 opener calls and wrote 1,004 `log-foundry:` lines with
+  `failed_batches` 1,001, where the tree before SPEC-090 (`75e7bf1e`) made 336 calls and 23 lines
+  with 2; in `cap` mode the build made 321 calls and 22 lines with 20, against 321 and 21. Every
+  event is still counted and announced; what grows is the sink's work and stderr. **Closed by**
+  one of: the exit drain reading a target of zero as the cap, since at exit nothing waits for a
+  failing sink to recover; or, after the first abandoned exit batch, declining every later one
+  unattempted, as FR-003 already does once a retry is declined, which changes what a dead sink
+  at exit is sent; or a channel through which a sink's per-batch loss line is tallied by the
+  worker at exit, which is new sink-contract surface. ~~None is measured yet.~~ The zero-target case
+  is the shape of a sink that died during the run rather than at `shutdown()`, since its last
+  steady batch failed before the stop, so it is probably the commoner way a sink is dead at
+  exit. The closure that reads a zero target as the cap pulls the opposite way from the next
+  item's (*The exit drain sizes a batch from a rate it measured earlier…*): it makes the first
+  exit batch, which is never declined, 1,000 events.
+  → **closed by SPEC-103 FR-001**, which folds the lines and keeps the batches. From the first
+  abandoned exit batch on, the lines a sink or the delivery engine writes inside each later exit
+  batch's sink call are folded into one line per distinct text. Each folded line carries its
+  summed count and ends `; <k> line(s) folded at exit`, and is written with the exit tallies, or
+  by `stop()` before its expiry line. The worker's own lines and every running total are never
+  folded. The calls are unchanged, and Andrew accepted that on 2026-11-17 ("Fold lines, keep
+  batches"). `spec090_dead_http_exit.py zero 10000 3`, before at `4599a0c5` and after at
+  `f28f17d4`, on 3.13.1 and 3.12.12 alike: 16,016 opener calls, 1,004 lines and `failed_batches`
+  1,001 before; 16,016, 6 and 1,001 after. `cap` mode: 321, 22 and 20 before; 321, 4 and 20 after.
+  The closures named above were each measured and rejected, as were the growth designs tried after
+  them:
+  - reading a zero target as the cap expired the join of a sink that recovers by exit;
+  - declining every later exit batch delivered 68 of 4,002 events behind one poisoned batch,
+    against 3,002;
+  - the channel, in the crude form that hushed every later line into one count, lost each line's
+    detail. The fold is that channel refined, with one line per distinct text;
+  - setting the target from a failed batch's rate, and four ways of growing exit batches behind a
+    zero target, each broke the `shutdown()` budget for some cost shape.
+
+  The last of the growth designs, at `7f400f51`, ran the drain 1.60 to 6.42 s past a 0.5 s
+  deadline for a black-holed `SQSSink` that turned slow mid-exit (`spec103_sqs_slowdown_exit.py`).
+  Decisions: `docs/decisions/pipeline/` (*A backlog drains in larger batches, and capacity is not
+  a setting*) and `docs/decisions/failure-paths/` (*One module writes every diagnostic…*).
 
 - ~~**A JetStream `NATSSink` whose `publish_timeout` is shorter than half the flush interval loses
   the tail of a backlog batch**~~ (SPEC-090 FR-004; invariant 2). Since SPEC-090 a batch under a

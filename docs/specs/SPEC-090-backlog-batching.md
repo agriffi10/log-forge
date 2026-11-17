@@ -399,6 +399,13 @@ against 321 and 21 before this spec. When the target is already `0` at the stop,
 is `batch_size` submissions and those lines are one per batch; that residual is filed in
 `docs/architecture.md` §12 with its measurement and its closures.
 
+> **Superseded by SPEC-103.** From the first abandoned exit batch on, those lines are folded into
+> one line per distinct text, written with the exit tallies, so a dead sink at exit writes a few
+> lines rather than one per batch: the refusing `HTTPSink` above, with a zero target at the stop,
+> went from 1,004 lines to 6, its batches and calls unchanged. The decisions:
+> `docs/decisions/pipeline/` (*A backlog drains in larger batches, and capacity is not a setting*)
+> and `docs/decisions/failure-paths/` (*One module writes every diagnostic…*).
+
 #### Acceptance Criteria:
 
 - [ ] `spec090_exit_budget.py tree` against the build on 3.12 and 3.13, with three exit batches,

@@ -748,7 +748,8 @@ hostile probe (SPEC-067).
 
 ## 12. A forked child is repaired; the parent is untouched; the child releases only what it acquired
 
-The inherited record pinned first, then the package's global locks and events from one roster,
+`_diag`'s exit fold window withdrawn first (SPEC-103), then the inherited record pinned, then
+the package's global locks and events from one roster,
 then one walk from the runtime's roots, inherited buffers next, registered handlers last; `before`
 never runs for a C-level fork; a value the child inherits is stranded, not detached (SPEC-039,
 SPEC-042, SPEC-079, SPEC-081). For the file sinks that value is no longer a buffer: their handle
