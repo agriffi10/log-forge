@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-102
 title: "NATSSink Resends the Tail Its Deadline Left Unattempted"
 description: "Makes an event a NATSSink round never handed to the driver resendable when something else in the round was published, so the worker's existing retry rounds deliver the tail of a backlog batch that a short publish_timeout cuts, rather than counting it lost; closes the NATSSink residual SPEC-090 filed in architecture.md section 12, and the 1.2.1 tag waits for it."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-047, SPEC-061, SPEC-062, SPEC-072, SPEC-074, SPEC-088, SPEC-090]
 arc: audit-2026-11-14
 arc_order: 18
