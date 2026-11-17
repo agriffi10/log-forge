@@ -9,6 +9,8 @@ depends_on: [SPEC-062, SPEC-090]
 
 ## Overview
 
+**Held, 2026-11-17: do not plan or build from this text; see the last entry of *Revision history*.**
+
 At `shutdown()`, the worker sends what is queued in batches and holds them to the caller's
 timeout: the first exit batch is always attempted, and a later one is declined when the longest
 attempt any exit batch has made, plus a 0.1 s join margin, predicts it would end past the deadline.
@@ -504,3 +506,4 @@ design hands 100 to 110 and declines 20 to 30; at 0.5 s on 3.12.12, today hands 
   - The §12 title quoted is SPEC-103's actual one.
   - The real-clock criteria name `stopped_reason` and the `close()` count as the assertions that
     tell the design from the delivered-path mutant.
+- **Held, 2026-11-17: do not plan or build from this text.** Andrew paused SPEC-105 until SPEC-103's rewrite settles. SPEC-103 no longer grows exit batches (it folds repeated exit lines instead), so every passage here that cites SPEC-103's exit probe, `_exit_probing`, its bounds or its sequence tests, or builds on its code, describes a design that will not land. On resume, this Draft is revised against the folded SPEC-103 and goes through a spec review before any plan. The §12 item it is pointed at, "The exit drain sizes a batch from a rate it measured earlier…", names it as the closer of that item's first shape only (a sink that recovers by exit); the slowdown and the fast-failure retry shapes stay open, so on resume either this spec's Out of Scope is revisited or its record strikes only the first shape, never the whole item.

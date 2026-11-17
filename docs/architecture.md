@@ -1603,7 +1603,90 @@ an item leaves this list when a spec closes it, not because the arc names it.
   worker at exit, which is new sink-contract surface. None is measured yet. The zero-target case
   is the shape of a sink that died during the run rather than at `shutdown()`, since its last
   steady batch failed before the stop, so it is probably the commoner way a sink is dead at
-  exit.
+  exit. The closure that reads a zero target as the cap pulls the opposite way from the next
+  item's: it makes the first exit batch, which is never declined, 1,000 events.
+- **The exit drain sizes a batch from a rate it measured earlier, and predicts its next attempt
+  from the longest one it has seen, so an attempt the exit budget never saw can outrun the
+  `shutdown()` deadline and leave the sink open** (SPEC-090 FR-001 rule 4 and FR-003, SPEC-062;
+  found by SPEC-103's spec review, SPEC-105's, and the review of this item, 2026-11-17;
+  invariants 3 and 5). `_set_target` (`src/log_foundry/worker.py:2868`; every line cited in this
+  item is at `6b9d50f6`) sizes each batch at `min(1000, events / elapsed * flush_interval / 2)`,
+  on the exit drain as in the steady one; `_retry_declined` (`:3192`) starts a later exit batch
+  when `now + _exit_longest + _JOIN_MARGIN` falls inside the deadline, and a retry when `now +` the
+  batch's own longest attempt `+ _JOIN_MARGIN` does (`:3435`); and the first exit batch is never
+  declined (SPEC-090 FR-003). The prediction is the longest attempt
+  *seen*, so a batch the rate rule has just grown, one that meets a sink that has just slowed, or
+  a retry predicted from a failure that came back fast, starts although its attempt is many times
+  that. Measured with `docs/audits/2026-11-14-probes/core-pipeline/spec105_exit_slowdown.py` at
+  `6b9d50f6`, at least two runs a cell across 3.13.1 and 3.12.12, 2,000 two-event spans queued at
+  the stop. The probe calls `Worker.stop(timeout)`, the join `shutdown()` makes, with no lifecycle
+  owner, so "the sink left open" here is the expiry line's own words rather than a counted close.
+  Three shapes:
+  - **A sink that recovers by exit** (`unmeasured healthy 2000 <t> 1 0.002`: nothing is measured
+    before the stop, so the target is zero; the steady batch in flight at the stop fails 0.2 s into
+    the budget, which keeps it zero and leaves the exit drain the timeout less about 0.2 s; then
+    every event costs 2 ms). The first exit batch is 20 events in 0.04 s, the rate rule grows the
+    next to about 250 events (220 to 248 observed), about 0.5 s, and at timeouts of 0.45 and 0.6 s,
+    exit budgets of about 0.25 and 0.4 s, the join expired in every run; the first review of this
+    item also saw it expire at 0.65 and complete at 0.8 (0.71 to 0.72 s, with 16 exit batches
+    declined). At 30 s it completes in 8.19 to 8.24 s with 3,982 events handed.
+  - **A sink that slows during the exit** (`<start> slowdown 2000 <t>`: ten events a request, each
+    request 0.5 ms for the first two exit calls and 0.3 s after). Fast requests grow the batches
+    to the 1,000-event cap, so the first slow one is 100 requests, about 30 s. With the target
+    measured before the stop (`measured`) the join expired at 0.5, 2 and 5 s in every run, the
+    first exit batch already 1,000 events; from a zero target (`unmeasured`) it expired at 2 and
+    5 s.
+  - **A retry predicted from a fast failure** (`<start> failslow 2000 <t>`: the first exit call
+    raises at once, every later call costs 0.3 s a request). The batch does not grow, but its
+    retry is predicted from a near-instant failure. From a measured target the retry carries 1,000
+    events and the join expired at 0.5, 2 and 5 s in every run; from a zero target it carries one
+    count-trigger batch of 20 events, about 0.6 s, and expired at 0.5 and 0.7 s and completed at
+    2 s (1.41 to 1.43 s). So the failing path shows it from either start. SPEC-103's probes for a
+    sink whose requests fail fast and then slowly make no retry at all, since both build the sink
+    and the worker with `max_retries=0`, and so do not show it: `spec103_sqs_slowdown_exit.py` and `spec103_http_slowdown_exit.py`
+    beside this one (copied unchanged from SPEC-103's branch), at `6b9d50f6` on both interpreters,
+    the SQS probe at `slow_at` 0.004, 0.01 and 0.02 with a 0.5 s budget ended 0.18 to 0.20 s inside
+    the deadline and closed the sink once, and the HTTP probe at a 1.0 s budget (`1.0 0.005`)
+    completed its join in 0.61 to 0.62 s and closed `HTTPSink` once.
+  Every event is counted and announced either way; what an expired join costs is the sink left
+  open and the events inside the attempt. The JetStream backlog-tail item, closed by SPEC-102 and
+  now under *Resolved*, had the same root, a batch sized at a rate measured earlier and sent
+  against a deadline, inside one sink's call, and its open successor, "A JetStream `NATSSink`
+  backlog batch whose delivery outlasts the worker's rounds still loses its tail", is a live
+  instance of it.
+  Two closures are measured, both as prototypes on `6b9d50f6`. **A fit bound** (after each exit
+  batch, cap the next target at the last delivered exit batch's rate times `deadline - now -
+  _JOIN_MARGIN`, applied when that room is at least `_exit_longest`) closes the first shape
+  (completes in 0.34 to 0.35 s at 0.45 and 0.48 to 0.50 s at 0.6, 3,982 handed at 30 s) and
+  leaves the second and third as they are, since it trusts a rate the slowdown falsifies and does
+  not touch the retry. **No growth at exit** (no exit batch above the target in force at the stop)
+  closes the first shape and, from a zero target, the second (completes in 1.40 to 1.42 s at 2 and
+  4.41 to 4.43 s at 5), but not from a measured target, where no growth inherits the 1,000 in force
+  at the stop, nor the third; and it slows a healthy exit that starts from a zero target, most for
+  a sink that sends one request a batch (`unmeasured healthy 2000 <t> 100000 0.02`: 4.36 to 5.03 s
+  against about 0.35 s at 30 s, and about 1,300 to 1,600 events handed by the return against
+  3,982 at 2 s). It also keeps the zero target the dead-sink item above would read as the cap, and
+  that item's cap closure is this item's first shape made worse: the first exit batch, never
+  declined, becomes 1,000 events. What this item shows false, for the closing spec to qualify: the
+  `Worker` class docstring's "The exit drain fits the caller's budget" (`worker.py:787`), the
+  `_JOIN_MARGIN` docstring (`:82-85`), `_set_target`'s "an emit stays shorter than the time
+  trigger's interval" (`:2879-2881`), `_emit`'s "a retry fits the caller's budget or is not made"
+  (`:3288`), the headline of `NATSSink`'s module docstring, "The exit drain fits the join"
+  (`src/log_foundry/sinks/nats.py:47`), though not the arithmetic under it, which holds because
+  `NATSSink` already bounds a whole call by one `publish_timeout`, the bound this item lacks,
+  invariant 3's *Guarded* clause that the exit drain's retries fit the budget, the pipeline
+  decision *A backlog drains in larger batches, and capacity is not a setting*, whose emit stays
+  inside the interval, and the sink-lifecycle decision on the exit decline, whose trade names only
+  a prediction that runs long. The README and the pending v1.2.1 notes are qualified in the same
+  change that files this item. **Closed by**, for the first shape, SPEC-105 (Draft, paused by
+  Andrew on 2026-11-17 until SPEC-103's rewrite settles), which chose the fit bound and is to be
+  revised against the folded SPEC-103;
+  the second and third shapes, and a sink slow from its very first exit call, have no closer yet:
+  a bound on the whole call, a per-call deadline handed to the sink, not a per-request timeout,
+  since each request here is well inside any. SPEC-105's text still names this item by the title
+  SPEC-103's growth branch gave it, "A sink that recovers by exit can be handed a second exit
+  batch whose attempt the exit budget did not predict" (SPEC-103's fold Draft did at `047cadce`;
+  its revision `5f6c9dea` uses this title).
 - **A `NATSSink` whose abandoned-publish latch is armed refuses every round of the worker's at
   once, so a stall a little longer than one `publish_timeout` loses every batch the drain makes
   during it, and at the stop the whole backlog** (found by SPEC-102's spec reviewer, 2026-11-17,
