@@ -133,8 +133,10 @@ def restart() -> None:
     teardown zeroed the counters alone, after this module's verdict: a test that lost an event
     left its credit with no loss term, the next test's setup hid it, and the last test an xdist
     worker ran left it for the ``atexit`` ``shutdown()``, which wrote a ``lost 1 event(s); the
-    event ledger does not balance`` line on most runs of the suite (``tests/test_api.py`` alone
-    wrote it on 5 of 12 workers) for an event that was in a term all along.
+    event ledger does not balance`` line for an event that was in a term all along. How many
+    lines a run wrote depended on the schedule: one per xdist worker whose last test happened to
+    lose an event, which most runs of the suite, and of ``tests/test_api.py`` alone, had at
+    least one of.
     """
     from log_foundry import _ledger, _lifecycle, decorator
 

@@ -590,11 +590,9 @@ def _lose_one_of_each(monkeypatch: pytest.MonkeyPatch) -> None:
 
     @lf.trace
     def work() -> None:
-        monkeypatch.setattr(api, "build_event", interrupt)
-        try:
+        with monkeypatch.context() as patch:
+            patch.setattr(api, "build_event", interrupt)
             lf.info("in a span, lost")
-        finally:
-            monkeypatch.undo()
 
     with pytest.raises(KeyboardInterrupt):
         work()
