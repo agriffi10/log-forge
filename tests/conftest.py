@@ -442,6 +442,9 @@ def _reset_config():
     it (SPEC-024, arch §5.1) — so one test's ``set_baggage`` reached later tests' events, and
     two `test_trace_continuation` cases failed only when run after a new file that set baggage,
     passing in isolation. That is SPEC-024's own finding, reproduced between two tests.
+
+    The config is replaced again at teardown, so the test's sink is unreachable from a library
+    global once the test ends: what ``shadow_check`` then walks is only state that outlives it.
     """
     try:
         from log_foundry import config, context
@@ -455,6 +458,7 @@ def _reset_config():
     # Tear down any process worker a test created so its daemon thread / sink don't leak.
     _reset_worker()
     context.reset_context()
+    config._config = config.Config()
 
 
 @pytest.fixture(autouse=True)
@@ -908,6 +912,29 @@ def count_grace_writes(monkeypatch) -> dict[int, int]:
 
     monkeypatch.setattr(_lifecycle._CloseRegistry, "_open_grace", counting)
     return writes
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Fails the test that left a library singleton shadowing its class's method; the logic is `shadow_check`.
+
+    It wraps the whole teardown so it reads after every fixture has been finalised, monkeypatch's
+    undo included, whatever order the fixtures were set up in: an autouse fixture would read before
+    an undo that ran after it. A teardown that already raised still gets the repair, and keeps its
+    own error.
+    """
+    del item, nextitem
+    import shadow_check
+
+    try:
+        result = yield
+    except BaseException:
+        shadow_check.check_and_repair()
+        raise
+    message = shadow_check.check_and_repair()
+    if message is not None:
+        pytest.fail(message, pytrace=False)
+    return result
 
 
 def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
