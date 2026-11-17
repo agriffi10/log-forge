@@ -96,6 +96,7 @@ LOG_FOUNDRY_MODEL_SOAK=1 LOG_FOUNDRY_MODEL_SEEDS=0-1999 poetry run pytest tests/
 
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import functools
@@ -113,13 +114,14 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 import log_foundry
-from conftest import run_concurrently
+from conftest import install_worker, retire_process, run_concurrently
 from log_foundry import _lifecycle
 from log_foundry._lifecycle import State
 from log_foundry.sinks import _engine
 from log_foundry.sinks._engine import emit_via_deliver
 from log_foundry.sinks.http import HTTPSink
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+from log_foundry.worker import Worker
 from model_oracles import (
     EPSILON,
     GATE_MARGIN,
@@ -818,17 +820,29 @@ def _recorder(ledger: Ledger, emit_delay: float) -> Recorder:
 
 @dataclass
 class _Runs:
-    """Every ``run_delivery`` call: its batch's ids, its path, its result and the worker."""
+    """Every ``run_delivery`` call and every exit batch declined unattempted, with the workers.
+
+    ``declined`` is each declined batch's size: such a batch never reaches ``run_delivery``, yet
+    it is one ``failed_batches`` and its events are in a lost line (SPEC-090 FR-003).
+    """
 
     calls: list[tuple[list[str], str, _engine.Delivery]] = field(default_factory=list)
+    declined: list[int] = field(default_factory=list)
     workers: dict[int, object] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
-    """Wraps ``_engine.run_delivery`` so each call's batch, path and ``Delivery`` are recorded."""
+    """Records each ``run_delivery`` call's batch, path and ``Delivery``, and each declined batch."""
     runs = _Runs()
     real = _engine.run_delivery
+    real_decline = Worker._decline_exit_batch
+
+    def decline(self: Worker, size: int) -> None:
+        real_decline(self, size)
+        with runs._lock:
+            runs.declined.append(size)
+            runs.workers[id(self)] = self
 
     def spy(sink: object, batch: list[dict[str, object]], **kwargs: object) -> object:
         ids = [str(event.get("log_id")) for event in batch]
@@ -843,6 +857,7 @@ def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
         return result
 
     monkeypatch.setattr(_engine, "run_delivery", spy)
+    monkeypatch.setattr(Worker, "_decline_exit_batch", decline)
     return runs
 
 
@@ -1953,11 +1968,99 @@ def _ids(sink: Recorder, message: str) -> list[str]:
         return [str(e.get("log_id")) for e in sink.events if e.get("message") == message]
 
 
-_WORKER_LOST = re.compile(
-    r"^log-foundry: lost (\d+) event\(s\); (?:batch abandoned after \d+ emit attempts|"
-    r"retry declined after \d+ emit attempt\(s\); the next was predicted)",
-    re.MULTILINE,
-)
+_WORKER_SOURCE = _REPO / "src" / "log_foundry" / "worker.py"
+_TALLY_WRITER = "_write_exit_tallies"
+"""The one ``Worker`` method whose lost lines each announce a tally of several batches."""
+
+
+def _detail_pattern(node: ast.expr) -> str:
+    """Renders a lost line's ``detail`` argument as a regex, each interpolation a ``(\\d+)``."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return re.escape(node.value)
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            re.escape(part.value) if isinstance(part, ast.Constant) else r"(\d+)"
+            for part in node.values
+        )
+    raise AssertionError(f"a worker lost line's detail is not derivable: {ast.unparse(node)}")
+
+
+def _worker_lost_shapes() -> dict[re.Pattern[str], bool]:
+    """Every lost line ``worker.py`` can write for an event, mapped to whether it is a tally.
+
+    Derived from the source, not hand-listed, so a lost line added there is read here without
+    an edit (SPEC-090 added two and the hand-listed pattern read neither, about one run in two
+    thousand). A call whose noun is not a literal, or whose detail is neither a literal nor an
+    f-string, fails here rather than being skipped. A line written in :data:`_TALLY_WRITER` is
+    a tally whose detail's first number is its batch count; every other line is one batch.
+    """
+    tree = ast.parse(_WORKER_SOURCE.read_text(encoding="utf-8"))
+    writer: dict[int, tuple[ast.Call, str]] = {}
+    for function in ast.walk(tree):
+        if isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            for node in ast.walk(function):
+                if isinstance(node, ast.Call):
+                    writer[id(node)] = (node, function.name)
+    shapes: dict[str, bool] = {}
+    for call, name in writer.values():
+        if not (
+            isinstance(call.func, ast.Attribute)
+            and call.func.attr == "lost"
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "_diag"
+        ):
+            continue
+        what = call.args[0]
+        assert isinstance(what, ast.Constant), f"a lost line's noun: {ast.unparse(what)}"
+        if what.value != "event":
+            continue
+        details = call.args[2:] + [k.value for k in call.keywords if k.arg == "detail"]
+        assert len(details) == 1, f"a worker lost line without one detail: {ast.unparse(call)}"
+        line = rf"^log-foundry: lost (\d+) event\(s\); {_detail_pattern(details[0])}$"
+        shapes[line] = shapes.get(line, False) or name == _TALLY_WRITER
+    return {re.compile(line, re.MULTILINE): tally for line, tally in shapes.items()}
+
+
+_WORKER_LOST = _worker_lost_shapes()
+
+
+def _worker_lost(err: str) -> tuple[list[int], list[tuple[int, int]]]:
+    """The worker's lost lines in ``err``: each one-batch line's events, each tally's two counts."""
+    singles: list[int] = []
+    tallies: list[tuple[int, int]] = []
+    for pattern, tally in _WORKER_LOST.items():
+        for match in pattern.finditer(err):
+            if tally:
+                tallies.append((int(match.group(1)), int(match.group(2))))
+            else:
+                singles.append(int(match.group(1)))
+    return singles, tallies
+
+
+def _assert_the_worker_lost_lines(runs: _Runs, err: str, picture: str) -> None:
+    """Holds the worker path's failed batches to ``failed_batches`` and to its lost lines.
+
+    A failed batch is a worker run that failed or an exit batch declined unattempted. Each is
+    one ``failed_batches`` (invariant 6). Each one-batch lost line names one of them by its
+    size, and the batches no such line names are exactly the tallies' (SPEC-090 FR-003): as
+    many as the tallies count, holding as many events as they name (invariant 2).
+    """
+    failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
+    failed += runs.declined
+    batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())
+    assert batches == len(failed), f"invariant 6 (one failed batch per run): {picture}"
+    singles, tallies = _worker_lost(err)
+    rest = collections.Counter(failed)
+    rest.subtract(singles)
+    assert min(rest.values(), default=0) >= 0, (
+        f"invariant 2 (a one-batch lost line names a failed batch): {singles} {picture}"
+    )
+    left = list(rest.elements())
+    assert (sum(left), len(left)) == (sum(e for e, _ in tallies), sum(b for _, b in tallies)), (
+        f"invariant 2 (a failed run's events are in its lost line): {tallies} {picture}"
+    )
+
+
 _ORPHAN_LOST = re.compile(
     r"^log-foundry: lost 1 event\(s\); orphan log not delivered after \d+ delivery round",
     re.MULTILINE,
@@ -1998,13 +2101,8 @@ def _assert_the_deliver_ledger(
     assert failed == sum(
         1 for fate in fates.values() if not any(fate is ok for ok in unconfirmed)
     ), f"invariant 2 (failed_events is each unconfirmed event once): {picture}"
-    worker_failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
     orphan_failed = sum(1 for _ids_, path, d in runs.calls if path == "orphan" and d.failed)
-    batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())
-    assert batches == len(worker_failed), f"invariant 6 (one failed batch per run): {picture}"
-    assert sorted(int(n) for n in _WORKER_LOST.findall(err)) == sorted(worker_failed), (
-        f"invariant 2 (a failed run's events are in its lost line): {picture}"
-    )
+    _assert_the_worker_lost_lines(runs, err, picture)
     assert orphan_lost == orphan_failed == len(_ORPHAN_LOST.findall(err)), (
         f"invariant 2 (a failed orphan run is one orphan_lost): {picture}"
     )
@@ -2037,16 +2135,90 @@ def _assert_the_http_ledger(
     assert sum(c.failed for c in counted) == sum(1 for fate in fates.values() if fate != 200), (
         f"invariant 2 (failed_events is each unconfirmed event once): {picture}"
     )
-    worker_failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
     orphan_failed = sum(1 for _ids_, path, d in runs.calls if path == "orphan" and d.failed)
-    batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())
-    assert batches == len(worker_failed), f"invariant 6 (one failed batch per run): {picture}"
-    assert sorted(int(n) for n in _WORKER_LOST.findall(err)) == sorted(worker_failed), (
-        f"invariant 2 (a failed run's events are in its lost line): {picture}"
-    )
+    _assert_the_worker_lost_lines(runs, err, picture)
     assert orphan_lost == orphan_failed == len(_ORPHAN_LOST.findall(err)), (
         f"invariant 2 (a failed orphan run is one orphan_lost): {picture}"
     )
+
+
+def test_every_worker_lost_line_is_derived_and_read() -> None:
+    """The derivation finds both kinds of worker lost line, and each tally names its batches.
+
+    A tally writer renamed out from under :data:`_TALLY_WRITER` would read every tally as one
+    batch, and a derivation that found nothing would hold an empty set of lines to the runs.
+    """
+    tallies = [p.pattern for p, tally in _WORKER_LOST.items() if tally]
+    singles = [p.pattern for p, tally in _WORKER_LOST.items() if not tally]
+    assert singles, "worker.py writes no one-batch lost line the derivation found"
+    assert tallies, f"worker.py writes no lost line in {_TALLY_WRITER}"
+    assert all(re.compile(p).groups >= 2 for p in tallies), tallies
+
+
+class _ExitDeliverSink:
+    """A ``deliver`` sink whose first call waits for the stop and accepts; later ones retry."""
+
+    max_retries = 0
+
+    def __init__(self) -> None:
+        self.log_foundry_counters = SinkCounters()
+        self.calls = 0
+        self.first_waits_on: threading.Event | None = None
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        self.calls += 1
+        if self.calls == 1:
+            assert self.first_waits_on is not None
+            self.first_waits_on.wait(30.0)
+            return Verdict(outcomes=(Outcome.ACCEPTED,) * len(batch))
+        return Verdict(outcomes=(Outcome.RETRYABLE,) * len(batch))
+
+    def emit(self, batch: list[dict[str, object]]) -> None:
+        emit_via_deliver(self, batch)
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.mark.parametrize(
+    ("timeout", "tally"),
+    [(30.0, "more exit batch(es) abandoned"), (0.0, "exit batch(es) declined unattempted")],
+)
+def test_an_exit_drain_tally_balances_the_worker_ledger(
+    timeout: float,
+    tally: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """The worker-path ledger reads SPEC-090's exit tallies, which the gating seeds rarely reach.
+
+    Ten spans wait behind a pre-stop batch the sink holds until the stop, then the exit drain
+    sends them in batches of one span against a sink that never accepts again. A shutdown with
+    time left abandons every exit batch, the first in its own line and the rest in one tally; a
+    shutdown at ``timeout=0`` declines the first exit batch's retry and every later batch
+    unattempted, in a tally. Before the lines were derived from ``worker.py``, about one
+    ``deliver`` or ``http`` run in two thousand met either and failed invariant 2.
+    """
+    monkeypatch.setattr("log_foundry.worker._BACKLOG_BATCH_CAP", 1)
+    runs = _spy_on_runs(monkeypatch)
+    sink = _ExitDeliverSink()
+    worker = Worker(sink, batch_size=1, flush_interval=3_600.0, max_retries=1)
+    sink.first_waits_on = worker._stop
+    install_worker(worker)
+    worker.submit([{"message": "m", "log_id": "held"}])
+    for _ in range(1_000):
+        if sink.calls:
+            break
+        threading.Event().wait(0.01)
+    for seq in range(10):
+        worker.submit([{"message": "m", "log_id": f"exit-{seq}"}])
+    retire_process(worker, timeout)
+    worker._thread.join(10.0)
+    assert not worker._thread.is_alive(), "the drain thread outlived the test, and its lines too"
+    err = capfd.readouterr().err
+    picture = f"timeout={timeout} declined={runs.declined} err={err!r}"
+    assert tally in err, f"the run never wrote the tally it forces: {picture}"
+    _assert_the_worker_lost_lines(runs, err, picture)
 
 
 def test_the_page_cites_tests_that_exist_and_this_file_cites_invariants_that_do() -> None:
