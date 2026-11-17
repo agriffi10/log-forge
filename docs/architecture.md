@@ -1614,21 +1614,29 @@ an item leaves this list when a spec closes it, not because the arc names it.
   attempt *seen*, so a batch the rate rule has just grown, or one that meets a sink that has just
   slowed, starts although its attempt is many times that. Two shapes, each measured with
   `docs/audits/2026-11-14-probes/core-pipeline/spec105_exit_slowdown.py` at `6b9d50f6`, at least
-  two runs a cell across 3.13.1 and 3.12.12, 2,000 two-event spans queued at the stop:
-  - **A sink that recovers by exit** (`unmeasured healthy 2000 <t> 1 0.002`: the last steady batch
-    fails so the target is zero at the stop, then every event costs 2 ms). The first exit batch is
-    20 events in 0.04 s, the rate rule grows the next to 220 to 246 events, about 0.5 s, and at
-    `shutdown(timeout=0.45)` and `(0.6)` the join expired in every run; at 30 s it completes in
-    8.19 to 8.24 s with 3,982 events handed.
+  two runs a cell across 3.13.1 and 3.12.12, 2,000 two-event spans queued at the stop. The probe
+  calls `Worker.stop(timeout)`, the join `shutdown()` makes, with no lifecycle owner, so "the sink
+  left open" here is the expiry line's own words rather than a counted close:
+  - **A sink that recovers by exit** (`unmeasured healthy 2000 <t> 1 0.002`: nothing is measured
+    before the stop, so the target is zero; the steady batch in flight at the stop fails 0.2 s into
+    the budget, which keeps it zero and leaves the exit drain the timeout less about 0.2 s; then
+    every event costs 2 ms). The first exit batch is 20 events in 0.04 s, the rate rule grows the
+    next to about 250 events (220 to 248 observed), about 0.5 s, and at timeouts of 0.45 and 0.6 s,
+    exit budgets of about 0.25 and 0.4 s, the join expired in every run; the frame-1 review also saw
+    it expire at 0.65 and complete at 0.8 (0.71 to 0.72 s, with 16 exit batches declined). At 30 s
+    it completes in 8.19 to 8.24 s with 3,982 events handed.
   - **A sink that slows during the exit** (`<start> slowdown 2000 <t>`: ten events a request, each
     request 0.5 ms for the first two exit calls and 0.3 s after). Fast requests grow the batches
     to the 1,000-event cap, so the first slow one is 100 requests, about 30 s. With the target
     measured before the stop (`measured`) the join expired at 0.5, 2 and 5 s in every run, the
     first exit batch already 1,000 events; from a zero target (`unmeasured`) it expired at 2 and
-    5 s. The failing-path twin does not show it: SPEC-103's probes for a sink whose requests fail
-    fast and then slowly (`spec103_sqs_slowdown_exit.py`, `spec103_http_slowdown_exit.py` on the
-    unpushed `spec-103-fold-exit-lines`, `fec8c8e8`) ended 0.18 to 0.20 s inside a 0.5 s deadline
-    and closed `HTTPSink` once at `6b9d50f6`, because a failed exit batch does not grow the target.
+    5 s. The failing-path twin does not show it, because a failed exit batch does not grow the
+    target (`:2780-2781`): SPEC-103's probes for a sink whose requests fail fast and then slowly,
+    `spec103_sqs_slowdown_exit.py` and `spec103_http_slowdown_exit.py` beside this one (copied
+    unchanged from SPEC-103's branch), at `6b9d50f6` on both interpreters: the SQS probe, `slow_at`
+    0.004, 0.01 and 0.02 with a 0.5 s budget, ended 0.18 to 0.20 s inside the deadline and closed
+    the sink once; the HTTP probe at a 1.0 s budget (`1.0 0.005`) completed its join in 0.61 to
+    0.62 s and closed `HTTPSink` once.
   Every event is counted and announced either way; what an expired join costs is the sink left
   open and the events inside the attempt. Two closures are measured, both as prototypes on
   `6b9d50f6`. **A fit bound** (after each exit batch, cap the next target at the last delivered
@@ -1639,10 +1647,12 @@ an item leaves this list when a spec closes it, not because the arc names it.
   the first shape and, from a zero target, the second (completes in 1.40 to 1.42 s at 2 and 4.41
   to 4.43 s at 5), but not from a measured target, where the first exit batch is already 1,000
   events; and it slows a healthy exit that starts from a zero target, most for a sink that sends
-  one request a batch (`unmeasured healthy 2000 <t> 100000 0.02`: 4.37 to 5.03 s against 0.32 to
-  0.35 s at 30 s, and 1,380 to 1,620 events handed by the return against 3,982 at 2 s). Neither
-  closes a sink that is fast and measured at the stop and then slows, whose first exit batch
-  SPEC-062 never declines. **Closed by** SPEC-105 (Draft, paused by Andrew on 2026-11-17 until
+  one request a batch (`unmeasured healthy 2000 <t> 100000 0.02`: 4.36 to 5.03 s against about
+  0.35 s at 30 s, and about 1,300 to 1,600 events handed by the return against 3,982 at 2 s).
+  Neither closes the slowdown from a measured target: the fit bound trusts the fast rate and sizes
+  the slow batch at the cap, and no growth inherits the 1,000 in force at the stop. A sink slow
+  from its very first exit call is out of reach of both, since SPEC-090 FR-003 never declines the
+  first exit batch. **Closed by** SPEC-105 (Draft, paused by Andrew on 2026-11-17 until
   SPEC-103's rewrite settles), which chooses among these, or a design that bounds the attempt
   rather than the batch, such as the sinks' own per-request timeouts; SPEC-105's text still names
   this item by the title SPEC-103's abandoned branch gave it.

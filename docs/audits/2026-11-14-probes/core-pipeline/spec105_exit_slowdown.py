@@ -1,8 +1,9 @@
 """SPEC-105 groundwork, written on 2026-11-17 against 1e9ab67e: a request-shaped sink that slows during the exit drain.
 Each emit costs ceil(n / CHUNK) requests; a request costs FAST_R s until SLOW_AFTER emits have been made after the stop,
-then SLOW s. The start is either `unmeasured` (the steady batch carrying the first span fails behind a gate, so the size
-target is 0 at the stop: SPEC-105's shape) or `measured` (the worker delivers normally first, so SPEC-090's rate rule
-has sized the target before the stop). `healthy` sets SLOW equal to FAST_R. Prints how long `Worker.stop` took, whether
+then SLOW s. The start is either `unmeasured` (nothing is measured before the stop, so the size target is 0; the steady
+batch carrying the first span is held behind a gate and fails 0.2 s after `stop` begins, which keeps the target at 0 and
+leaves the exit drain the timeout less about 0.2 s: SPEC-105's shape) or `measured` (the worker delivers normally first,
+so SPEC-090's rate rule has sized the target before the stop). `healthy` sets SLOW equal to FAST_R. Prints how long `Worker.stop` took, whether
 the join expired, the batch sizes handed to the sink after the stop, and what it had delivered when `stop` returned.
 Usage: python spec105_exit_slowdown.py <unmeasured|measured> <slowdown|healthy> <spans> <timeout> [chunk] [fast_r] [slow] [slow_after]
 """
