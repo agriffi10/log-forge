@@ -602,7 +602,8 @@ def test_a_mid_test_reset_carries_what_it_would_hide_into_the_teardown_verdict(t
     assert "ERROR at teardown of test_after_them" not in out, out
     assert "ERROR at teardown of test_unbalanced_at_its_own_teardown" in out, out
     assert "ERROR at teardown of test_balanced_rounds" not in out, out
-    assert out.count("the event ledger does not balance: orphan residual=-1") == 2, out
+    reason = "the event ledger does not balance: orphan residual=-1"
+    assert out.splitlines().count(reason) == 2, out
     assert "4 passed, 2 errors" in out, out
 
 
