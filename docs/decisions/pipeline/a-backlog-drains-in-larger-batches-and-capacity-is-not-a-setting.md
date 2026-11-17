@@ -55,7 +55,8 @@ quick just as it turns slow, and that first slow attempt is longer by the factor
 survives that.** Each bound added closed the instance before it, and a cost shape it had not
 assumed then broke it: linear, then a step, then quadratic, then a slowdown. The last design
 (`7f400f51`) grew only after quick failures and fell back to the count trigger's batch after a
-slow one. The two slowdown probes on `main` still broke it:
+slow one. It never reached `main`. The two slowdown probes, run against `7f400f51`, still broke
+it:
 
 - `docs/audits/2026-11-14-probes/core-pipeline/spec103_sqs_slowdown_exit.py <slow_at> 0.5` is a
   black-holed `SQSSink` or `SNSSink` that turns slow mid-exit. It ended the drain 1.60, 2.81 and

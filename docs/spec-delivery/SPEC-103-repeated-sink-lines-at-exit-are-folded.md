@@ -60,9 +60,9 @@
   2.81 and 6.42 s past the deadline, and it passes on the build.
 - **Mutation.** The build's plan names a mutant for every check in the fold, the rosters and the
   fork step (M1 to M29), and the build session reported their results. At completion nine were
-  re-run in place, on 3.13.1, against the six
-  SPEC-103 test files under `-n 8`, each restored and checked by hash. Each was killed by the test
-  for its reason:
+  re-run in place, on 3.13.1, against the six SPEC-103 test files under `-n 8`, each restored and
+  checked by hash. Eight were killed by the test for their reason, as below; the ninth, M15, is
+  equivalent:
 
   | Mutant | Killed by |
   |---|---|
@@ -84,5 +84,11 @@
   failed on its premise under `-n 8` on the unmutated build. It passed alone under `-n 0`. It
   relied on `gc.set_threshold(1, 1, 1)` to run a finalizer inside the locked section, which
   depends on what ran before it in the process. It now makes the re-entry deterministic: the
-  table's rows are a `dict` whose lookup, made under the lock, writes a `_diag` line. M24
-  (recorders block) and M25 (every acquire blocks) were re-run against that shape and killed.
+  table's rows are a `dict` whose lookup, made under the lock, writes a `_diag` line. Each
+  folding writer carries its own inline acquire, so the guard is per writer: the never-waits unit
+  test and that re-entry test are each parametrized over `lost`, `absorbed` and `pending`. Three
+  mutants, each turning one writer's non-blocking acquire into a blocking one, were each killed
+  by both: the unit test with "`<writer>` waited 10.01s on the fold lock", the re-entry test with
+  "the drain thread deadlocked on the fold lock". ~~M24 (recorders block)~~, which blocked all
+  three at once and so could not show that each is guarded, is replaced by those three. M25
+  (every acquire blocks, the closing take's too) was killed with "stop() did not return".

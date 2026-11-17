@@ -381,8 +381,9 @@ Each site and what the build does with it:
 | `README.md:1423` | "Each such batch writes one `log-foundry: lost N event(s)` line" | adds that at exit, after an abandoned batch, such lines are folded |
 | `docs/release-notes/v1.2.1.md:210-219` (pending; no `v1.2.1` tag exists) | a sink's own line "still writes one per exit batch … those lines are one per batch" | rewrites: a sink's own lines and the engine's at exit are folded after the first abandoned batch, so a dead sink at exit writes a few folded lines, 6 for the refusing `HTTPSink` with 10,000 spans. It names the new tail `line(s) folded at exit` as a changed diagnostic string |
 
-`docs/component-inventory.md`, `docs/implementation-guide.md` and `docs/invariants.md` state no
-part of the old claim, and the fold adds no module, so the build adds nothing to them.
+`docs/implementation-guide.md` states no part of the old claim, and the fold adds no module, so
+the build adds nothing to it. ~~`docs/component-inventory.md` … and `docs/invariants.md` state no
+part of the old claim, so the build adds nothing to them~~: both are edited, by the rows above.
 
 #### Acceptance Criteria:
 

@@ -1366,24 +1366,32 @@ class _ReenteringRows(dict[tuple[str, ...], list[int]]):
 
     Attributes:
       drain: The thread whose lookups count as re-entries.
+      kind: Which folding writer the nested write calls: ``lost``, ``absorbed`` or ``pending``.
       nested: For each lookup on that thread, whether ``_FOLD_LOCK`` was held during it.
     """
 
-    def __init__(self, drain: threading.Thread) -> None:
+    def __init__(self, drain: threading.Thread, kind: str) -> None:
         super().__init__()
         self.drain = drain
+        self.kind = kind
         self.nested: list[bool] = []
 
     def get(self, key: tuple[str, ...], default: Any = None) -> Any:  # type: ignore[override]
         """Writes a line of its own when called on the drain thread, then looks the key up."""
         if threading.current_thread() is self.drain:
             self.nested.append(_diag._FOLD_LOCK.locked())
-            _diag.absorbed("finalizing an object", ValueError(), "from inside the fold lock")
+            if self.kind == "lost":
+                _diag.lost("object", 1, "from inside the fold lock")
+            elif self.kind == "absorbed":
+                _diag.absorbed("finalizing an object", ValueError(), "from inside the fold lock")
+            else:
+                _diag.pending("from inside the fold lock")
         return super().get(key, default)
 
 
+@pytest.mark.parametrize("kind", ["absorbed", "lost", "pending"])
 def test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    kind: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """SPEC-103 plan review B1 (invariant 3): a recorder never waits on the fold lock.
 
@@ -1396,12 +1404,13 @@ def test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit
     runs, because whether the collector fires inside the section depends on what ran before it
     in the process. The exit is otherwise real: folded exit batches behind a dead sink,
     ``stop(1.0)`` on a thread, which must return within a bound, and every event counted once
-    the drain ends.
+    the drain ends. The nested write is each folding writer in turn, since each carries its own
+    inline acquire.
     """
     _ten_span_batches(monkeypatch)
     sink = _FoldingSink(fails=True)
     worker = Worker(sink, batch_size=10, flush_interval=3_600.0, max_retries=0)
-    rows = _ReenteringRows(worker._thread)
+    rows = _ReenteringRows(worker._thread, kind)
     worker._exit_fold.rows = rows
     sink.first_waits_on = worker._stop
     for seq in range(10):

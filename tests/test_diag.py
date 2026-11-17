@@ -1026,20 +1026,36 @@ def _held_on_another_thread(lock: threading.Lock) -> tuple[threading.Event, thre
     return release, thread
 
 
-def test_a_record_never_waits_on_the_fold_lock(err: _Stderr) -> None:
-    """A recorder that cannot take ``_FOLD_LOCK`` at once writes its line at once, unfolded."""
+_EACH_WRITER: dict[str, tuple[Callable[[], None], str]] = {
+    "lost": (lambda: _diag.lost("event", 2, "held"), "log-foundry: lost 2 event(s); held\n"),
+    "absorbed": (
+        lambda: _diag.absorbed("sending a batch", ValueError(), "held"),
+        "log-foundry: absorbed a failure while sending a batch (ValueError); held\n",
+    ),
+    "pending": (lambda: _diag.pending("held"), "log-foundry: held\n"),
+}
+"""One call of each folding writer, and the line it writes when it does not fold."""
+
+
+@pytest.mark.parametrize("writer", sorted(_EACH_WRITER))
+def test_a_record_never_waits_on_the_fold_lock(writer: str, err: _Stderr) -> None:
+    """A recorder that cannot take ``_FOLD_LOCK`` at once writes its line at once, unfolded.
+
+    Each folding writer carries its own inline acquire, so each is checked: a blocking acquire
+    in one of them waits out the other thread's hold, which here is 10 s.
+    """
+    write, line = _EACH_WRITER[writer]
     table = _diag.FoldTable()
     release, thread = _held_on_another_thread(_diag._FOLD_LOCK)
     try:
         started = time.monotonic()
-        _folding(table, lambda: _diag.absorbed("sending a batch", ValueError(), "held"))
-        assert time.monotonic() - started < 1.0
+        _folding(table, write)
+        waited = time.monotonic() - started
     finally:
         release.set()
         thread.join(5)
-    assert err.getvalue() == (
-        "log-foundry: absorbed a failure while sending a batch (ValueError); held\n"
-    )
+    assert waited < 1.0, f"{writer} waited {waited:.2f}s on the fold lock"
+    assert err.getvalue() == line
     assert table.rows == {}
 
 
