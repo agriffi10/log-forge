@@ -49,6 +49,13 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
     :func:`shutdown` the background worker stays alive and the sink stays open, so logging
     continues normally afterwards.
 
+    **It sweeps every open span first** (SPEC-091). The caller's own spans ship whole, their
+    ``span.start`` included, as the call's context sees them; every other thread's and task's
+    open span hands over what it has buffered past its ``span.start``, which stays on the span
+    until it closes. ~~events submitted before this call~~ So the events a call carries are
+    those submitted before it and those its sweeps took from open spans. The worker also sweeps
+    every open span about once a flush interval on its own.
+
     Called from inside a ``sink_factory``, while the factory runs, an emit on another thread
     that would wait for that build refuses instead, for the length of this call: the wait here can
     be on a drain thread that is itself waiting for the factory (``_lifecycle.yielding``).
@@ -62,7 +69,7 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
 
     Returns:
       A :class:`FlushResult`. Truthy when the drain that carried the events submitted before
-      this call finished and abandoned no batch while the call was outstanding, not merely that a
+      this call, and those its sweeps took from open spans, finished and abandoned no batch while the call was outstanding, not merely that a
       drain took place. A truthy result can still carry loss: a sink that settles a run having
       dropped events does not make it falsy, and the result's ``lost`` and its five counts say
       what the process lost while the call ran (SPEC-089). The counts are process-wide and so

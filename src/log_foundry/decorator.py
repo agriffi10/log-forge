@@ -452,7 +452,19 @@ def continue_trace(
     Call it on the first line of the entry point: if a span is already open and it is a root,
     that span is re-parented in place and its buffered events are rewritten to match, while a
     child span that already finished has been handed to the worker and can no longer be
-    rewritten. A span that is not a root is left alone, and a call with no span open
+    rewritten.
+
+    **Called after the root span has logged, it can be refused, and the verdict depends on
+    timing** (SPEC-091). The worker sweeps every open span's buffered events about once a flush
+    interval, and any ``flush()``, on any thread, sweeps them too; once a sweep has taken from the
+    root span, those events are on their way under the old trace id, so adopting would split the
+    span across two traces. The call is then refused with "the current span's events have already
+    been handed to the worker; trace context refused" and ``reason="rejected"``: more often the
+    longer the call waits, and always once a ``flush()`` has run. On the entry point's first line
+    it is never refused, since nothing has been logged to take. The check and the re-parent are
+    made inside one sweep hold, so no sweep can land between them. Called from inside a sweep on
+    the same thread, as a collector callback inside one can, it is refused with "a sweep is in
+    progress on this thread; trace context refused". A span that is not a root is left alone, and a call with no span open
     re-parents nothing; in every case the context applies to the next root span opened here.
 
     The adoption is consumed by that one root span and does not survive it (SPEC-024), which
@@ -660,7 +672,10 @@ def _adopt_unswept(trace_id: str, parent_span_id: str | None) -> str | None:
 
 
 def _current_span_was_swept() -> bool:
-    """Reports whether an in-span ``flush()`` has already shipped this span's events.
+    """Reports whether a sweep has already handed the current root span's events to the worker.
+
+    ~~an in-span ``flush()``~~ — widened by SPEC-091: the worker's sweep and another thread's
+    ``flush()`` set the flag too, so the refusal it drives depends on timing.
 
     Read from ``context.current_span()`` — what :func:`_reparent_current_span` itself reads —
     **and only when that span is a root**, which is the other half of that function's own guard.
@@ -778,8 +793,10 @@ def _sweep_open_spans() -> bool:
     ``Worker.submit`` raises nothing, so once it is reached the batch is safe. Creating the worker
     at all narrows SPEC-013's refusal rather than contradicting it — that exists so an *empty*
     flush does not stand up a thread, and a sweep that found buffered events is not an empty
-    flush. A cold-start Lambda flushing before it returns is exactly this case: the worker is
-    built when the first span *closes*, so inside the first traced call there is none.
+    flush. ~~A cold-start Lambda flushing before it returns is exactly this case: the worker is
+    built when the first span *closes*, so inside the first traced call there is none.~~ —
+    superseded by SPEC-091 FR-002: the first span's open builds the worker, so this build is
+    reached only when that open-time build failed.
 
     Concurrent sweeps are serialized on ``_sweep_lock``. The detach is a load and a store with a
     real gap between them, and two threads sharing one ``Span`` — which ``contextvars`` makes

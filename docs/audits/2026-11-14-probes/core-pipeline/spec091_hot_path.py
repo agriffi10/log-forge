@@ -9,7 +9,11 @@ snapshot the close's backfill takes of a three-event buffer. ``hold`` (prototype
 ``spec091_prototype.py``) times one sweep of 10, 100 and 1,000 registered spans holding ten
 events each past their ``span.start``, each handed into a plain ``queue.Queue`` as the worker's
 ``put_nowait`` does: how long the sweep holds the lock a closing span waits on.
-Run: PYTHONPATH=<src> python spec091_hot_path.py isolated|whole|hold
+``close`` (added by the build, 2026-11-17) times what the re-entry guard puts around the close's
+swap: a bare ``Lock`` taken and released, an ``RLock``, the check ``_sweep_held_here()`` plus an
+``RLock``, and the check plus ``with _sweep_hold:``, each over 2M iterations, best of 7, net of an
+empty loop. The last is what ``decorator._flush`` now does.
+Run: PYTHONPATH=<src> python spec091_hot_path.py isolated|whole|hold|close
 """
 
 import queue
@@ -112,5 +116,31 @@ def whole() -> None:
     print(f"traced_call_with_one_log={1e6 * best:.2f}us")
 
 
+def close() -> None:
+    import threading
+
+    from log_foundry import decorator
+
+    n = 2_000_000
+    names = {
+        "lock": threading.Lock(),
+        "rlock": threading.RLock(),
+        "held_here": decorator._sweep_held_here,
+        "hold": decorator._sweep_hold,
+    }
+    statements = {
+        "bare_lock": "with lock:\n    pass",
+        "rlock": "with rlock:\n    pass",
+        "check_and_rlock": "held_here()\nwith rlock:\n    pass",
+        "check_and_hold": "held_here()\nwith hold:\n    pass",
+    }
+    base = min(timeit.repeat("pass", number=n, repeat=7)) / n
+    parts = []
+    for name, statement in statements.items():
+        best = min(timeit.repeat(statement, globals=names, number=n, repeat=7)) / n
+        parts.append(f"{name}={1e9 * (best - base):.1f}ns")
+    print(" ".join(parts))
+
+
 if __name__ == "__main__":
-    {"isolated": isolated, "whole": whole, "hold": hold}[sys.argv[1]]()
+    {"isolated": isolated, "whole": whole, "hold": hold, "close": close}[sys.argv[1]]()
