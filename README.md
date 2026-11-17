@@ -251,7 +251,10 @@ stops, sends whatever was queued at that moment in batches by the same rule, ans
 after the `shutdown()` deadline — judged from the longest call the exit has made so far — that
 batch and every later one are not attempted: they are counted in `failed_batches` and in
 `health().events.batch_lost`, and one stderr line names them, so the exit still finishes inside
-its budget and the sink is still closed. The first batch of the exit is always attempted.
+its budget and the sink is still closed. The first batch of the exit is always attempted. The
+prediction assumes no later call runs much longer than the longest one so far: a batch the exit
+has grown since, or a sink that turns much slower partway through the exit, can still run past
+the deadline, and then `shutdown()` returns at its timeout and leaves the sink open.
 
 Both triggers can be pre-empted: `flush()` puts a marker in the queue and the worker emits the
 pending pile the moment it reaches it, ignoring the count and time triggers. Because the queue

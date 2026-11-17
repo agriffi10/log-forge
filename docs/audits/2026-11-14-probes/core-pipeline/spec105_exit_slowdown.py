@@ -3,9 +3,11 @@ Each emit costs ceil(n / CHUNK) requests; a request costs FAST_R s until SLOW_AF
 then SLOW s. The start is either `unmeasured` (nothing is measured before the stop, so the size target is 0; the steady
 batch carrying the first span is held behind a gate and fails 0.2 s after `stop` begins, which keeps the target at 0 and
 leaves the exit drain the timeout less about 0.2 s: SPEC-105's shape) or `measured` (the worker delivers normally first,
-so SPEC-090's rate rule has sized the target before the stop). `healthy` sets SLOW equal to FAST_R. Prints how long `Worker.stop` took, whether
+so SPEC-090's rate rule has sized the target before the stop). `healthy` sets SLOW equal to FAST_R. `failslow` is the
+retry-predicate twin: the first emit after the stop raises at once, so the exit drain predicts its retry from a fast
+failure, and every later emit costs SLOW a request. Prints how long `Worker.stop` took, whether
 the join expired, the batch sizes handed to the sink after the stop, and what it had delivered when `stop` returned.
-Usage: python spec105_exit_slowdown.py <unmeasured|measured> <slowdown|healthy> <spans> <timeout> [chunk] [fast_r] [slow] [slow_after]
+Usage: python spec105_exit_slowdown.py <unmeasured|measured> <slowdown|healthy|failslow> <spans> <timeout> [chunk] [fast_r] [slow] [slow_after]
 """
 
 import io
@@ -36,7 +38,11 @@ class Sink:
         per = FAST_R
         if stopping.is_set():
             after_stop.append(len(events))
-            if len(after_stop) > SLOW_AFTER:
+            if SHAPE == "failslow":
+                if len(after_stop) == 1:
+                    raise ConnectionError("refused at once")
+                per = SLOW
+            elif len(after_stop) > SLOW_AFTER:
                 per = SLOW
         time.sleep(math.ceil(len(events) / CHUNK) * per)
         delivered[0] += len(events)
