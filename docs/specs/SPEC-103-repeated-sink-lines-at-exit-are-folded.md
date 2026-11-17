@@ -280,9 +280,12 @@ steady drain is not a twin of this rule: it folds nothing.
 - [ ] The same fork, made while a parent thread holds `Worker._lock`, and again while one holds
       `_diag._FOLD_LOCK`: in each case the child writes that line and exits within a bound timed
       from the parent's return from the fork (invariants 3 and 12).
-- [ ] A sink whose folded exit batches make cyclic garbage with a `__del__` that writes a `_diag`
-      line, with the collector run at every allocation, reaches a `stop(1.0)` that returns within
-      a bound, and every event is counted once the drain ends (invariants 2 and 3).
+- [ ] An exit whose folded records each meet a `_diag` write made inside the locked section, on
+      the recording thread, as a finalizer the collector runs there would make, reaches a
+      `stop(1.0)` that returns within a bound, writes each nested line at once, and counts every
+      event once the drain ends (invariants 2 and 3). ~~with the collector run at every
+      allocation~~: whether the collector fires inside the section depends on what ran before
+      it in the process, so the re-entry is made deterministic.
 - [ ] `Worker._reinit_after_fork` leaves `_exit_fold` empty and open with `resume=True` and with
       `resume=False`. `tests/test_lifecycle_inventory.py` lists `_exit_fold` with its child column,
       and `_fork._GLOBAL_PRIMITIVES` lists `_diag._FOLD_LOCK` with `tests/test_fork_roster.py`

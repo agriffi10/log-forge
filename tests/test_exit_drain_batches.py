@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import ast
 import collections
-import gc
 import math
 import pathlib
 import re
@@ -1358,36 +1357,29 @@ def test_a_line_from_a_thread_the_sink_starts_is_written_at_once(
     assert "log-foundry: lost 1 event(s); OwnThread, from the sink's thread\n" in snapshot
 
 
-class _Cyclic:
-    """Garbage the collector must find: an object that refers to itself, with a finalizer."""
+class _ReenteringRows(dict[tuple[str, ...], list[int]]):
+    """A fold table's rows whose lookup writes a ``_diag`` line, as a finalizer there would.
 
-    def __init__(self, seen: list[bool], drain: list[threading.Thread]) -> None:
-        self.me = self
-        self.seen = seen
+    A recorder looks its key up while it holds ``_diag._FOLD_LOCK``, so this ``get`` runs inside
+    the locked section, on the recording thread, exactly where the collector can run a
+    ``__del__``. Each nested write records whether the lock was held by its own thread then.
+
+    Attributes:
+      drain: The thread whose lookups count as re-entries.
+      nested: For each lookup on that thread, whether ``_FOLD_LOCK`` was held during it.
+    """
+
+    def __init__(self, drain: threading.Thread) -> None:
+        super().__init__()
         self.drain = drain
+        self.nested: list[bool] = []
 
-    def __del__(self) -> None:
-        reentered = bool(self.drain) and threading.current_thread() is self.drain[0]
-        self.seen.append(reentered and _diag._FOLD_LOCK.locked())
-        _diag.absorbed("finalizing an object", ValueError(), "from __del__")
-
-
-class _GarbageSink(_ExitSink):
-    """Every later call makes cyclic garbage and writes lines with many keys, then fails."""
-
-    def __init__(self) -> None:
-        super().__init__(fails=True)
-        self.seen: list[bool] = []
-        self.drain: list[threading.Thread] = []
-
-    def emit(self, batch: list[dict[str, object]]) -> None:
-        """Makes the garbage and writes the lines, then behaves as planned."""
-        call = len(self.handed) + 1
-        if call > 1:
-            for i in range(40):
-                _Cyclic(self.seen, self.drain)
-                _diag.lost("event", 1, f"Garbage, key {call * 40 + i}")
-        super().emit(batch)
+    def get(self, key: tuple[str, ...], default: Any = None) -> Any:  # type: ignore[override]
+        """Writes a line of its own when called on the drain thread, then looks the key up."""
+        if threading.current_thread() is self.drain:
+            self.nested.append(_diag._FOLD_LOCK.locked())
+            _diag.absorbed("finalizing an object", ValueError(), "from inside the fold lock")
+        return super().get(key, default)
 
 
 def test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit(
@@ -1395,35 +1387,41 @@ def test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit
 ) -> None:
     """SPEC-103 plan review B1 (invariant 3): a recorder never waits on the fold lock.
 
-    With the collector run at every allocation, a ``__del__`` runs on the drain thread inside a
-    recorder's locked section and writes a line of its own. A recorder that waited for the lock
-    waited on its own thread for good, and ``stop()``'s take then never returned. Every event
-    must still be counted once the drain ends.
+    The collector can run a ``__del__`` on the drain thread inside a recorder's locked section,
+    and one that writes a ``_diag`` line re-enters a writer on the thread holding the lock: a
+    recorder that waited for the lock waited on its own thread for good, and ``stop()``'s take
+    then never returned. **The re-entry is made deterministic** rather than left to the
+    collector: the worker's table gets rows whose lookup, made under the lock, writes a line.
+    A version driven by ``gc.set_threshold(1, 1, 1)`` failed its own premise in 2 of 2 parallel
+    runs, because whether the collector fires inside the section depends on what ran before it
+    in the process. The exit is otherwise real: folded exit batches behind a dead sink,
+    ``stop(1.0)`` on a thread, which must return within a bound, and every event counted once
+    the drain ends.
     """
     _ten_span_batches(monkeypatch)
-    sink = _GarbageSink()
+    sink = _FoldingSink(fails=True)
     worker = Worker(sink, batch_size=10, flush_interval=3_600.0, max_retries=0)
+    rows = _ReenteringRows(worker._thread)
+    worker._exit_fold.rows = rows
     sink.first_waits_on = worker._stop
-    sink.drain.append(worker._thread)
     for seq in range(10):
         worker.submit(_span(seq))
     _until(lambda: worker._in_flight == 20)
     for seq in range(10, 310):
         worker.submit(_span(seq))
-    thresholds = gc.get_threshold()
-    gc.set_threshold(1, 1, 1)
-    try:
-        stopping = threading.Thread(target=worker.stop, args=(1.0,), daemon=True)
-        stopping.start()
-        stopping.join(15.0)
-        assert not stopping.is_alive(), "stop() did not return: the fold lock deadlocked"
-        worker._thread.join(15.0)
-        assert not worker._thread.is_alive(), "the drain thread deadlocked on the fold lock"
-    finally:
-        gc.set_threshold(*thresholds)
-        gc.collect()
-    capsys.readouterr()
-    assert any(sink.seen), "the premise: a finalizer ran on the drain thread inside the lock"
+    stopping = threading.Thread(target=worker.stop, args=(1.0,), daemon=True)
+    stopping.start()
+    stopping.join(15.0)
+    assert not stopping.is_alive(), "stop() did not return: the fold lock deadlocked"
+    worker._thread.join(15.0)
+    assert not worker._thread.is_alive(), "the drain thread deadlocked on the fold lock"
+    err = capsys.readouterr().err
+    assert rows.nested, "the premise: a recorder looked a key up on the drain thread"
+    assert all(rows.nested), "the premise: every nested write ran while the fold lock was held"
+    assert err.count("from inside the fold lock\n") == len(rows.nested), (
+        "each nested write is written at once, unfolded"
+    )
+    assert "folded at exit" in err, "the outer records still folded"
     assert worker._delivered + worker._batch_lost == 2 * 310, "an event was left uncounted"
 
 

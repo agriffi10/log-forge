@@ -81,5 +81,8 @@
   caller. So whenever the flag is set, `exit_batch` is true.
 
   One test, `test_a_finalizer_that_writes_inside_the_fold_lock_does_not_deadlock_the_exit`, also
-  failed on its premise under `-n 8` on the unmutated build. It passed alone under `-n 0`. It is
-  set aside from every kill above, and was reported to the coordinating session.
+  failed on its premise under `-n 8` on the unmutated build. It passed alone under `-n 0`. It
+  relied on `gc.set_threshold(1, 1, 1)` to run a finalizer inside the locked section, which
+  depends on what ran before it in the process. It now makes the re-entry deterministic: the
+  table's rows are a `dict` whose lookup, made under the lock, writes a `_diag` line. M24
+  (recorders block) and M25 (every acquire blocks) were re-run against that shape and killed.
