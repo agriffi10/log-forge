@@ -379,7 +379,11 @@ class NATSSink:
     ``Nats-Msg-Id`` deduplication item in ``architecture.md`` section 12, which makes a retry safe.
     Since SPEC-102 the first also happens in a round that resends a batch's unattempted tail: a
     resend round that publishes nothing is answered whole, like any such round, so a publish
-    that raised in it is resent by the next round and counted once per round it raised in.
+    that raised in it is resent by the next round and counted once per round it raised in. That
+    reaches a raise in either mode: for an expired JetStream ack wait it is the duplicating half
+    above, and for any other raise, a deterministic one such as the driver's ``MaxPayloadError``
+    included, it is an over-count of ``failed`` alone, which is 1.x's own per-call count
+    (``docs/invariants.md``, invariant 2).
 
     **This sink keeps its own closed state** rather than the closed guard the other transport
     sinks share (SPEC-076 FR-005). Its closed state is read from the event loop and from
