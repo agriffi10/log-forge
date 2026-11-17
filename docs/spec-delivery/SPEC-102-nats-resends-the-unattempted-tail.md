@@ -33,15 +33,17 @@
 ## The probe (FR-005)
 
 `docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 <spans 200> <budget>`
-at `b35ad63a` (the first three 0.2 s runs on each interpreter and both 10 s runs) or `00ec9029`,
-whose `src/` differ only in docstring and line layout. 3.13.1 is the worktree's `.venv`; 3.12.12
-is pyenv's with `PYTHONPATH=src`. Each row: acked of 400,
-`sink.failed`, `deliver` calls, longest `deliver`.
+at `b35ad63a` (the first three 0.2 s runs on each interpreter and both 10 s runs), `00ec9029` or
+`06b7ff41` (the orchestrating session's twelve), whose `src/` differ only in docstring and line
+layout. 3.13.1 is the worktree's `.venv`; 3.12.12 is pyenv's with `PYTHONPATH=src`. Each run:
+acked of 400, `sink.failed`, `deliver` calls, longest `deliver`. The orchestrating session's
+twelve replace an earlier set of twelve it ran at a load average near 140, whose output was not
+kept, so its per-run calls and longest `deliver` could not be recorded.
 
 | Budget | Interpreter | Runs |
 |---|---|---|
 | 0.2 s | 3.13.1, implementer's eight | 361, 42, 10, 0.209 s (one `lost 39 event(s); NATSSink publish_timeout 0.2s` line, 3 abandoned lines, 2.3 s); 400, 3, 8, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 6, 0.200 s; 400, 3, 7, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s |
-| 0.2 s | 3.13.1, orchestrating session's twelve, at a load average near 140 | each each 400 acked, `sink.failed` 2 to 4 equal to its abandoned lines, no `publish_timeout` line; calls and longest `deliver` not kept |
+| 0.2 s | 3.13.1, orchestrating session's twelve, load averages 16.26, 54.58, 61.66 before and 15.68, 51.96, 60.55 after | 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; each 0.9 s, largest batch 212 to 224 |
 | 0.2 s | 3.12.12 | 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 2, 8, 0.202 s |
 | 10 s | 3.13.1 | 400, 0, 3, 0.492 s |
 | 10 s | 3.12.12 | 400, 0, 4, 0.511 s |

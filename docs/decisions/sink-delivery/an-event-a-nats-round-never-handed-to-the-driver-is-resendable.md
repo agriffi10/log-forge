@@ -66,4 +66,4 @@ delivered.
 ### 2026-11-17
 
 - **Settled** by SPEC-102 FR-001 to FR-003, measured with `spec090_nats_ack_backlog.py 0.002 200 0.2`
-  at `b35ad63a` and `00ec9029`: 19 of 20 runs on 3.13.1 and 3 of 3 on 3.12.12 acked 400 of 400.
+  at `b35ad63a`, `00ec9029` and `06b7ff41`: 19 of 20 runs on 3.13.1 and 3 of 3 on 3.12.12 acked 400 of 400.

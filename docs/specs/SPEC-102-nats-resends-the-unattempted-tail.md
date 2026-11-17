@@ -429,8 +429,8 @@ docs/spec-delivery/SPEC-102-nats-resends-the-unattempted-tail.md
   prediction rather than "declined by" it; FR-001's mutant criterion names its tests; and the twin
   paths gain a direct `deliver` outside any run, whose outcomes the author also re-ran.
 - **2026-11-17, completion.** FR-005 AC1 revised to the measured outcome. Twenty runs on 3.13.1 at
-  `b35ad63a` and `00ec9029`, whose `src/` differ only in docstring and line layout, acked 400 of
-  400 in nineteen; the twentieth acked 361, with `sink.failed` 42 and one `lost 39 event(s);
+  `b35ad63a`, `00ec9029` and `06b7ff41`, whose `src/` differ only in docstring and line layout,
+  acked 400 of 400 in nineteen; the twentieth acked 361, with `sink.failed` 42 and one `lost 39 event(s);
   NATSSink publish_timeout 0.2s` line. The criterion as drafted, all 400 in every run, holds only
   while a batch's delivery fits the worker's four rounds of 0.2 s; FR-005's description now states
   that bound, and `docs/architecture.md` §12 files the residual. Also: FR-001's exit-drain sentence
