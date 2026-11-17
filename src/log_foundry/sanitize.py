@@ -44,7 +44,7 @@ _MAX_RENDERED_BYTES: int = 16 * 1024 * 1024
 """The most bytes of text one budgeted coercion pass charges, a work budget (SPEC-057 FR-002).
 
 Not a sink's size limit: a destination's hard limit is met by lowering ``max_value_bytes`` or
-``max_keys`` (``SQSSink`` sends at most 256 KiB). ``MongoDBSink``'s 16 MiB document limit is the
+``max_keys`` (``SQSSink`` sends at most 256 KiB by default). ``MongoDBSink``'s 16 MiB document limit is the
 same number, so through assembly one string over it becomes ``<size limit>`` before that sink's
 check sees it; escaping or the envelope can still carry an event past that limit. And reaching this budget takes at least 2,048 full strings at the default 8 KiB ceiling, so in
 practice it only catches amplification — one ``Decimal`` of ten million digits referenced 256

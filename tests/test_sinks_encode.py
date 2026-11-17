@@ -835,6 +835,14 @@ for the same reason.
 """
 ENGINE_LOST: dict[str, frozenset[str]] = {"SocketTransport": frozenset({"send_all"})}
 """SPEC-074 FR-005 deletes the private transport's ``send_all``; no public sink loses a name."""
+LIMIT_GAINED: dict[str, frozenset[str]] = {
+    "SQSSink": frozenset({"max_message_bytes"}),
+    "SNSSink": frozenset({"max_message_bytes"}),
+}
+"""SPEC-096 FR-001: the two sinks store the message limit their callers now pass.
+
+``BASE_PUBLIC`` stays as SPEC-069 found the surface; a name a later spec adds joins the union here.
+"""
 
 
 def _public(obj: object) -> set[str]:
@@ -862,6 +870,7 @@ def test_the_public_surface_grows_only_by_five_losses(
             BASE_PUBLIC[name]
             | ({"losses"} if name in GAINED_LOSSES else set())
             | ENGINE_GAINED.get(name, frozenset())
+            | LIMIT_GAINED.get(name, frozenset())
         ) - ENGINE_LOST.get(name, frozenset())
         assert names == expected, (name, sorted(names ^ expected))
 
