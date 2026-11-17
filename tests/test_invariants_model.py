@@ -115,7 +115,7 @@ import pytest
 
 import log_foundry
 from conftest import install_worker, retire_process, run_concurrently
-from log_foundry import _lifecycle
+from log_foundry import _diag, _lifecycle
 from log_foundry._lifecycle import State
 from log_foundry.sinks import _engine
 from log_foundry.sinks._engine import emit_via_deliver
@@ -822,12 +822,14 @@ def _recorder(ledger: Ledger, emit_delay: float) -> Recorder:
 class _Runs:
     """Every ``run_delivery`` call and every exit batch declined unattempted, with the workers.
 
-    ``declined`` is each declined batch's size: such a batch never reaches ``run_delivery``, yet
-    it is one ``failed_batches`` and its events are in a lost line (SPEC-090 FR-003).
+    ``declined`` is each declined batch's size and its events' ``(log_id, message)``: such a
+    batch never reaches ``run_delivery`` or a recorder, yet it is one ``failed_batches``, its
+    events are in a lost line (SPEC-090 FR-003), and its ``span.end`` events have left the queue.
+    The events are read from the ``_emit_pending`` call that declined it, on its own thread.
     """
 
     calls: list[tuple[list[str], str, _engine.Delivery]] = field(default_factory=list)
-    declined: list[int] = field(default_factory=list)
+    declined: list[tuple[int, list[tuple[str, object]]]] = field(default_factory=list)
     workers: dict[int, object] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -837,11 +839,20 @@ def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
     runs = _Runs()
     real = _engine.run_delivery
     real_decline = Worker._decline_exit_batch
+    real_pending = Worker._emit_pending
+    held = threading.local()
+
+    def emit_pending(self: Worker, pending: list[list[dict[str, object]]]) -> None:
+        held.batch = [(str(e.get("log_id")), e.get("message")) for es in pending for e in es]
+        try:
+            real_pending(self, pending)
+        finally:
+            held.batch = None
 
     def decline(self: Worker, size: int) -> None:
         real_decline(self, size)
         with runs._lock:
-            runs.declined.append(size)
+            runs.declined.append((size, getattr(held, "batch", None) or []))
             runs.workers[id(self)] = self
 
     def spy(sink: object, batch: list[dict[str, object]], **kwargs: object) -> object:
@@ -858,6 +869,7 @@ def _spy_on_runs(monkeypatch: pytest.MonkeyPatch) -> _Runs:
 
     monkeypatch.setattr(_engine, "run_delivery", spy)
     monkeypatch.setattr(Worker, "_decline_exit_batch", decline)
+    monkeypatch.setattr(Worker, "_emit_pending", emit_pending)
     return runs
 
 
@@ -1153,8 +1165,10 @@ def _interleaving(
         # In the deliver form an event offered to the sink has a fate rather than a delivery: a
         # span.end offered once is out of the queue whatever its fate (a failed worker run is
         # failed_batches, held below), and an orphan whose run failed is the orphan_lost term,
-        # so "delivered" is the orphans whose run settled.
-        ends = len({e for s in ledger.sinks for e in _ids(s, "span.end")})
+        # so "delivered" is the orphans whose run settled. A span.end in an exit batch declined
+        # unattempted was never offered, yet it left the queue as failed_batches too.
+        declined_ends = {i for _, batch in runs.declined for i, m in batch if m == "span.end"}
+        ends = len({e for s in ledger.sinks for e in _ids(s, "span.end")} | declined_ends)
         failed_orphans = sum(1 for _, path, d in runs.calls if path == "orphan" and d.failed)
         orphans = len({e for s in ledger.sinks for e in _ids(s, "orphan")}) - failed_orphans
     unclosed = [i for i, sink in enumerate(ledger.sinks) if sink.events and sink.closes == 0]
@@ -1973,16 +1987,29 @@ _TALLY_WRITER = "_write_exit_tallies"
 """The one ``Worker`` method whose lost lines each announce a tally of several batches."""
 
 
-def _detail_pattern(node: ast.expr) -> str:
-    """Renders a lost line's ``detail`` argument as a regex, each interpolation a ``(\\d+)``."""
+def _detail_pattern(node: ast.expr, *, tally: bool) -> str:
+    """Renders a lost line's ``detail`` argument as a regex, every interpolation any text.
+
+    A tally's first interpolation, its batch count, is the one group, ``(\\d+)``. The literal
+    text must fit ``_diag._MAX_DETAIL``, past which the line is cut and no shape could read it.
+    """
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return re.escape(node.value)
-    if isinstance(node, ast.JoinedStr):
-        return "".join(
-            re.escape(part.value) if isinstance(part, ast.Constant) else r"(\d+)"
-            for part in node.values
-        )
-    raise AssertionError(f"a worker lost line's detail is not derivable: {ast.unparse(node)}")
+        parts: list[ast.expr] = [node]
+    else:
+        assert isinstance(node, ast.JoinedStr), f"a detail not derivable: {ast.unparse(node)}"
+        parts = list(node.values)
+    literal = "".join(str(p.value) for p in parts if isinstance(p, ast.Constant))
+    assert len(literal) <= _diag._MAX_DETAIL, f"a detail longer than _diag cuts: {literal!r}"
+    pattern, counted = "", not tally
+    for part in parts:
+        if isinstance(part, ast.Constant):
+            pattern += re.escape(str(part.value))
+        elif counted:
+            pattern += ".+?"
+        else:
+            pattern, counted = pattern + r"(\d+)", True
+    assert counted, f"a tally names no batch count: {ast.unparse(node)}"
+    return pattern
 
 
 def _worker_lost_shapes() -> dict[re.Pattern[str], bool]:
@@ -2021,14 +2048,16 @@ def _worker_lost_shapes() -> dict[re.Pattern[str], bool]:
             continue
         details = call.args[2:] + [k.value for k in call.keywords if k.arg == "detail"]
         assert len(details) == 1, f"a worker lost line without one detail: {ast.unparse(call)}"
-        line = rf"^log-foundry: lost (\d+) event\(s\); {_detail_pattern(details[0])}$"
         tally = name == _TALLY_WRITER
         count = call.args[1] if len(call.args) > 1 else None
         one_batch = isinstance(count, ast.Name) and count.id == "size"
         assert tally != one_batch, (
             f"a worker lost line in {name} counts {ast.unparse(count) if count else None}, so "
-            f"the writer and the count disagree on whether it is a tally: {ast.unparse(call)}"
+            f"either the writer and the count disagree on whether it is a tally, or it is not "
+            f"a batch loss, which this model does not account: {ast.unparse(call)}"
         )
+        detail = _detail_pattern(details[0], tally=tally)
+        line = rf"^log-foundry: lost (\d+) event\(s\); {detail}$"
         assert shapes.get(line, tally) == tally, f"one line read as both kinds: {line}"
         shapes[line] = tally
     return {re.compile(line, re.MULTILINE): tally for line, tally in shapes.items()}
@@ -2050,6 +2079,20 @@ def _worker_lost(err: str) -> tuple[list[int], list[tuple[int, int]]]:
     return singles, tallies
 
 
+_EVENT_LOST = re.compile(r"^log-foundry: lost \d+ event\(s\);.*$", re.MULTILINE)
+
+
+def _unread_event_lines(err: str) -> list[str]:
+    """Up to five event lost lines no worker shape reads, for a failure message to show.
+
+    They are mostly the sinks' and the engine's own lines, which are not the worker's to
+    account, but a worker line rendered past its derived shape is among them too, and naming it
+    is what tells a stale shape from a library defect.
+    """
+    read = {m.start() for p in _WORKER_LOST for m in p.finditer(err)}
+    return [m.group(0) for m in _EVENT_LOST.finditer(err) if m.start() not in read][:5]
+
+
 def _assert_the_worker_lost_lines(runs: _Runs, err: str, picture: str) -> None:
     """Holds the worker path's failed batches to ``failed_batches`` and to its lost lines.
 
@@ -2058,19 +2101,24 @@ def _assert_the_worker_lost_lines(runs: _Runs, err: str, picture: str) -> None:
     size, and the batches no such line names are exactly the tallies' (SPEC-090 FR-003): as
     many as the tallies count, holding as many events as they name (invariant 2).
     """
+    unseen = [(size, len(batch)) for size, batch in runs.declined if size != len(batch)]
+    assert not unseen, f"a declined batch's events were not the ones it held: {unseen} {picture}"
     failed = [len(ids) for ids, path, d in runs.calls if path == "worker" and d.failed]
-    failed += runs.declined
+    failed += [size for size, _batch in runs.declined]
     batches = sum(getattr(w, "failed_batches", 0) for w in runs.workers.values())
     assert batches == len(failed), f"invariant 6 (one failed batch per run): {picture}"
     singles, tallies = _worker_lost(err)
+    unread = _unread_event_lines(err)
     rest = collections.Counter(failed)
     rest.subtract(singles)
     assert min(rest.values(), default=0) >= 0, (
-        f"invariant 2 (a one-batch lost line names a failed batch): {singles} {picture}"
+        f"invariant 2 (a one-batch lost line names a failed batch): {singles} "
+        f"unread={unread} {picture}"
     )
     left = list(rest.elements())
     assert (sum(left), len(left)) == (sum(e for e, _ in tallies), sum(b for _, b in tallies)), (
-        f"invariant 2 (a failed run's events are in its lost line): {tallies} {picture}"
+        f"invariant 2 (a failed run's events are in its lost line): {tallies} "
+        f"unread={unread} {picture}"
     )
 
 
@@ -2193,13 +2241,10 @@ class _ExitDeliverSink:
         pass
 
 
-@pytest.mark.parametrize(
-    ("timeout", "tally"),
-    [(30.0, "more exit batch(es) abandoned"), (0.0, "exit batch(es) declined unattempted")],
-)
+@pytest.mark.parametrize(("timeout", "declines"), [(30.0, False), (0.0, True)])
 def test_an_exit_drain_tally_balances_the_worker_ledger(
     timeout: float,
-    tally: str,
+    declines: bool,
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],
 ) -> None:
@@ -2231,7 +2276,10 @@ def test_an_exit_drain_tally_balances_the_worker_ledger(
     assert not worker._thread.is_alive(), "the drain thread outlived the test, and its lines too"
     err = capfd.readouterr().err
     picture = f"timeout={timeout} declined={runs.declined} err={err!r}"
-    assert tally in err, f"the run never wrote the tally it forces: {picture}"
+    assert _worker_lost(err)[1], f"the run wrote no tally the derived shapes read: {picture}"
+    assert bool(runs.declined) == declines, f"the run did not decline as it forces: {picture}"
+    held = [i for _, batch in runs.declined for i, _m in batch]
+    assert held == [f"exit-{seq}" for seq in range(10 - len(held), 10)], picture
     _assert_the_worker_lost_lines(runs, err, picture)
 
 
