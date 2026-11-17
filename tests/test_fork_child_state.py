@@ -34,6 +34,9 @@ def _parked_in(
     """Replaces ``owner.name`` with a version that parks the parent's caller until released.
 
     Gated on the parent's pid, so a child that calls the same function runs the original.
+    ``owner`` is a module or a class, never an instance, and ``name`` a plain function or method
+    (``getattr`` on a class strips a staticmethod's descriptor): undoing an instance patch leaves the
+    bound method in the instance's dict, shadowing every later class patch (``shadow_check``).
     """
     original = getattr(owner, name)
     parent = os.getpid()
@@ -127,7 +130,7 @@ def test_a_child_forked_inside_a_move_section_re_settles_it(
     """
     sink = FileSink(str(tmp_path / "section.ndjson"))
     log_foundry.configure(service="state", sink=sink)
-    entered, release = _parked_in(monkeypatch, _lifecycle._state._closes, "arm")
+    entered, release = _parked_in(monkeypatch, _lifecycle._CloseRegistry, "arm")
     builder = threading.Thread(target=_traced)
     builder.start()
     try:

@@ -1193,14 +1193,13 @@ def test_concurrent_callers_over_seeds(seed: int, monkeypatch: pytest.MonkeyPatc
     a = Shared("A")
     holders: list[tuple[Shared, object]] = []
     arms: dict[int, int] = {}
-    registry = _lifecycle._state._closes
-    real_arm = registry.arm
+    real_arm = _lifecycle._CloseRegistry.arm
 
-    def counting_arm(sink: Any) -> None:
+    def counting_arm(registry: Any, sink: Any) -> None:
         arms[id(sink)] = arms.get(id(sink), 0) + 1
-        real_arm(sink)
+        real_arm(registry, sink)
 
-    monkeypatch.setattr(registry, "arm", counting_arm)
+    monkeypatch.setattr(_lifecycle._CloseRegistry, "arm", counting_arm)
 
     def graph() -> object:
         other = Shared(f"O{len(holders)}")
