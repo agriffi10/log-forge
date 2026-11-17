@@ -16,8 +16,8 @@ a batch, the events it never reached are left unattempted. If something else in 
 published, today those events are counted lost and announced, and the worker never offers them
 again. Since SPEC-090 a batch under a backlog grows to what the sink delivers in half a flush
 interval, so a JetStream `NATSSink` whose budget is shorter than that loses the tail of a backlog
-batch: with a 2 ms ack, 200 spans and a 0.2 s budget, 200 of 400 events were acked, where all 400
-were before SPEC-090. Those events never reached the driver, so nothing about them can have landed,
+batch: with a 2 ms ack, 200 spans and a 0.2 s budget, 193 of 400 events were acked at `be686953`
+on 3.13.1 and 3.12.12, where all 400 were before SPEC-090 (`docs/architecture.md` §12). Those events never reached the driver, so nothing about them can have landed,
 and sending them again cannot duplicate them. This spec makes them resendable, so the worker's
 existing retry rounds deliver them. An event that is still undelivered when those rounds end is
 counted and announced once, as before. Andrew decided that the 1.2.1 release waits for this fix, so
@@ -44,19 +44,36 @@ return are unchanged, and so is `MultiSink`, which never offers `deliver` and ca
 `emit`. The orphan path delivers a batch of one event, which cannot hold an unattempted event beside
 a published one. A `FilteringSink` or `TransformSink` around a `NATSSink` offers `deliver` exactly
 when the sink does (SPEC-075) and maps the verdict to its own indices, so it resends the tail as the
-worker does. The exit drain's resend rounds are declined by SPEC-062 and SPEC-090's prediction, as
-any retry is.
+worker does. The exit drain's resend rounds are subject to SPEC-062 and SPEC-090's prediction, as
+any retry is. A `deliver` called directly, outside any run, now returns `ACCEPTED` for the published
+event and `RETRYABLE` for the unattempted ones, and still writes `lost <n> event(s); NATSSink
+publish_timeout <t>s` at once, because a detached round commits a `LAST` line at once, as every
+engine sink's `LAST` line does.
+
+**The accepted JetStream asymmetry reaches further.** A resend of the tail is a fresh round, and a
+round that publishes nothing is answered whole by the unchanged nothing-published branch: every
+event `RETRYABLE` and sink-counted, each raised publish counted and announced `ALWAYS`. So when a
+resend round's only publish raises, that raised publish is resent by the next round and is counted
+once per round it raised in, although a JetStream ack wait that expired may have persisted it. That
+is the asymmetry invariant 2 already records for a batch in which nothing else landed, closed only
+by the `Nats-Msg-Id` item; before this spec it could happen only in a batch's first round, and now
+it can also happen in a round that resends a tail. This spec keeps the nothing-published rule as it
+is, adds no run-context signal to tell a resend round from a first round, and records the wider
+reach (FR-002, FR-006).
 
 ### Out of Scope
 
-- **A publish that raised.** It stays `REJECTED` and is never resent. A JetStream ack wait that
-  expired may still have persisted the event, so a resend could duplicate it. Making that safe needs
-  the `Nats-Msg-Id` header, which is `docs/architecture.md` §12's own item and which SPEC-095 also
-  keeps out of its scope.
+- **A publish that raised.** A raised publish stays `REJECTED` in a round where something was
+  published. A round that publishes nothing, a resend round included, is answered whole as before,
+  so its raised publish is resent and counted once per call it raised in (*The accepted JetStream
+  asymmetry reaches further*, above). A JetStream ack wait that expired may still have persisted
+  the event, so such a resend can duplicate it. Making that safe needs the `Nats-Msg-Id` header,
+  which is `docs/architecture.md` §12's own item and which SPEC-095 also keeps out of its scope.
 - **A publish abandoned at the deadline.** It stays `UNKNOWN`, or `ACCEPTED` where a core
   confirmation judges it, exactly as today, and is never resent. Its line is unchanged.
 - **A round that published nothing.** Every event of it is already `RETRYABLE` and sink-counted,
-  with its `SETTLED_LAST` line (SPEC-088). Nothing in that branch changes.
+  with its `SETTLED_LAST` line (SPEC-088). Nothing in that branch changes, including when the round
+  is a resend of a tail.
 - **SPEC-095's resend count.** SPEC-095 counts a resend of an event a send *may have landed*, and
   lists `NATSSink` among the sinks that never mark one. An unattempted event was never sent, so
   its resend is not one SPEC-095 counts, whichever of the two specs is built first. This spec adds
@@ -98,7 +115,11 @@ any resend.
 spent and the events after a publish abandoned at the deadline (`_publish_all`'s `break`). For the
 second kind, the abandoned-publish latch (`_stuck_refusal`) refuses every later round `RETRYABLE`
 before it publishes while that publish is still pending, so a resend cannot overtake it. Once it
-clears, the resend delivers.
+clears, the next resend round delivers, but only if it clears before the run's rounds run out. On
+the worker path that means within the backoff waits between the remaining rounds. On the exit
+drain the stop event is set, so those waits are zero: the tail behind an abandoned publish is
+refused every round and lost, counted once and named by `lost <n> event(s); refused by NATSSink
+after others landed, SinkDeliveryError`.
 
 #### Acceptance Criteria:
 
@@ -113,8 +134,10 @@ clears, the resend delivers.
       that the raised event is in no later round's batch and that the unattempted one is.
 - [ ] A round in which nothing was published still answers every event `RETRYABLE` and
       sink-counted, and a round refused before its first publish is unchanged.
-- [ ] Reverting the new branch so that `unattempted` maps to `REJECTED` again makes the first two
-      tests fail. That is the mutant they exist to kill, and it is run once at the build.
+- [ ] Reverting the new branch so that `unattempted` maps to `REJECTED` again makes both tests
+      above fail: the test that every unattempted event is in the second round's batch, and the
+      test that the unattempted event beside a raised one is in a later round's batch. That is the
+      mutant they exist to kill, and it is run once at the build.
 - [ ] Serves invariants 2 and 7.
 
 ### FR-002: An unattempted event is counted and named once, and only if the run ends without it
@@ -135,8 +158,14 @@ This change of line is intended: the events are still counted once and announced
 
 #### Acceptance Criteria:
 
-- [ ] Through the worker, an event a later round delivered is in no counter and is named by no
-      `log-foundry:` line.
+- [ ] Through the worker, when every resend round publishes something, an event a later round
+      delivered is in no counter and is named by no `log-foundry:` line.
+- [ ] A deterministic test pins the wider asymmetry. Through `Worker(sink, max_retries=2)._emit`
+      with a JetStream `NATSSink` and a 5-event batch, where round 1's first publish spends the
+      budget, round 2's first publish raises after the budget is spent, and round 3's publishes
+      all succeed: the rounds are offered events `[0..4]`, `[1..4]` and `[1..4]`; the double sees
+      6 publishes, event 1 twice; and the run ends with `losses().failed` 1 and the one line
+      `lost 1 event(s); NATSSink publish, RuntimeError`.
 - [ ] Through the worker, an event still unresolved when the rounds run out is counted once in
       `losses().failed` and named once, by the last round's `publish_timeout` line when that round
       registered one, or by the engine's `refused by NATSSink after others landed` line when the
@@ -247,18 +276,29 @@ joins the `sink-delivery` area as one file, fence and entry together.
       such an event is `REJECTED` or lost.
 - [ ] `docs/architecture.md` §12's item *A JetStream `NATSSink` whose `publish_timeout` is shorter
       than half the flush interval loses the tail of a backlog batch* is struck where it stands
-      with a pointer, and moved under *Resolved* marked closed by SPEC-102 with FR-005's measurement.
+      with a pointer, and moved under *Resolved* marked closed by SPEC-102 with FR-005's
+      measurement, saying that a tail behind an abandoned publish that is still pending when the
+      rounds run out, always the case on the exit drain, is still lost, counted and named.
+- [ ] The JetStream asymmetry `docs/invariants.md` records under *Every accepted event is
+      delivered, or counted and announced* and §12's item *A
+      timed-out JetStream publish is not retried, and cannot safely be* each say that the
+      asymmetry also occurs in a round that resends a tail and publishes nothing, citing SPEC-102.
 - [ ] `docs/release-notes/v1.2.1.md` no longer has the known-gaps entry *A JetStream `NATSSink` with
       a `publish_timeout` under half a second can lose the tail of a backlog batch*; its *Fixed*
       section states the fix under a heading ending `(SPEC-102)`, including the changed worker
-      lines, and the opening paragraph that lists the specs the release carries names SPEC-102.
+      lines, the tail behind a still-pending abandoned publish that is still lost (always on the
+      exit drain), and that a resend round in which only a raised publish ran sends that publish
+      again; and the opening paragraph that lists the specs the release carries names SPEC-102.
 - [ ] The release notes' list of exceptions to a code-free upgrade, which at `03dbf502` names nine
       and none for `NATSSink`, gains code that counts or matches `NATSSink`'s `publish_timeout`
       lines on the worker path; the count and the sentence saying which section lists each are
       updated to match.
 - [ ] `docs/decisions/sink-delivery/` gains one decision file, *An event a NATS round never handed
-      to the driver is resendable*, whose fence states the rule, the definitive-non-delivery reason
-      and that a raised or abandoned publish is still never resent, ending in a dated `## History`;
+      to the driver is resendable*, whose fence states the rule and the definitive-non-delivery
+      reason, that an abandoned publish is never resent, and that a raised publish stays `REJECTED`
+      in a round where something was published while a round that publishes nothing, a resend
+      round included, is answered whole as before, so its raised publish is resent and counted
+      once per call it raised in; the file ends in a dated `## History`;
       `sh scripts/gen-index.sh` regenerates `docs/decisions/index.yaml` with it.
 - [ ] `grep -n "unattempted\|tail of a backlog" README.md` finds nothing, or what it finds states
       the new rule.
@@ -360,3 +400,16 @@ docs/spec-delivery/SPEC-102-nats-resends-the-unattempted-tail.md
   them; and the probe gave the figures in FR-005's description. The prototype was reverted. The
   orchestrating session's own run of the full suite with the prototype applied failed exactly the
   eight cells and passed the rest.
+- **2026-11-17, spec review.** A resend round that publishes nothing is answered whole by the
+  unchanged nothing-published branch, so its raised publish is resent and counted per call. The
+  reviewer reproduced it, and the author re-ran it with the prototype: offered `[0..4]`, `[1..4]`,
+  `[1..4]`, 6 publishes, `failed` 1. The first draft said a raised publish is never resent, and
+  that criterion and the planned fence were false. The orchestrating session kept the
+  nothing-published rule and declined a run-context signal, so the spec now states the wider
+  asymmetry, pins it with a test (FR-002) and records it in invariant 2, §12 and the release notes
+  (FR-006). Also: the Overview's acked figure is now §12's anchored 193 at `be686953`, since the
+  first draft's unanchored 200 did not reproduce (the reviewer measured 185 to 190 at `03dbf502`);
+  FR-001 says a tail behind an abandoned publish is delivered only if that publish clears before
+  the rounds run out, never on the exit drain; the exit drain's rounds are "subject to" the
+  prediction rather than "declined by" it; FR-001's mutant criterion names its tests; and the twin
+  paths gain a direct `deliver` outside any run, whose outcomes the author also re-ran.
