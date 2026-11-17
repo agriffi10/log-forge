@@ -1576,6 +1576,60 @@ an item leaves this list when a spec closes it, not because the arc names it.
   is the shape of a sink that died during the run rather than at `shutdown()`, since its last
   steady batch failed before the stop, so it is probably the commoner way a sink is dead at
   exit.
+- **A `NATSSink` whose latch is armed at the stop refuses every exit round at once, so the exit
+  drain gives up on work still in flight with most of its budget unspent** (found by SPEC-102's
+  spec reviewer, 2026-11-17, and present before it; invariants 2 and 3). A publish the driver
+  does not return from within the round's deadline is abandoned and arms the abandoned-publish
+  latch (`_publish_bounded`, `src/log_foundry/sinks/nats.py:1680`), and an unanswered PING aged
+  past `publish_timeout` arms the probe latch (`_latched`, `:1235`); while either holds, every
+  round is refused `RETRYABLE` before it takes the lock (`_refusal_outside_the_lock`, `:914`). In
+  the steady drain the delivery engine's backoff between rounds gives the abandoned publish time to
+  finish. On the exit drain the worker hands the engine its `_stop` (`src/log_foundry/worker.py:3034`),
+  which is set, so every wait between rounds is zero (`src/log_foundry/sinks/_engine.py:1703`): a
+  run's rounds are spent in microseconds, the batch is abandoned, and every later exit batch does
+  the same until the drain ends. `close()` then cancels the abandoned publish, so it never lands
+  either. Every event is counted and announced, never silent; what is lost is the budget. The
+  probe, `docs/audits/2026-11-14-probes/core-pipeline/spec104_nats_exit_latch.py`, injects a
+  JetStream client whose misbehaviour starts at `shutdown()` and reports what the worker had
+  delivered before it apart from what the exit drain delivered. `transient 1000 2 10`, where the
+  first publish after the stop takes 3 s against a 2 s `publish_timeout`, ignoring the driver
+  timeout it is handed, and every other acks in 1 ms, under `shutdown(timeout=10)`, at
+  `03dbf502`, two runs each on 3.13.1 and 3.12.12: the exit drain acked 0 or 1 events and
+  `batch_lost` read 1,676 to 1,980 of 2,000, in 1.89 to 1.98 s. The stall had ended at 3 s, with
+  8 s of the budget left. A prototype of the closure below made `batch_lost` 0 in all four runs,
+  in 5.0 to 5.4 s; the events it did not ack are the stalled batch's unattempted tail, which is
+  SPEC-102's to resend. With every publish taking 3 s, the prototype stayed inside the budget
+  (7.97 to 7.98 s) and lost what today loses. A real `nats-py` honours its JetStream timeout, so
+  reaching the latch needs a publish the driver does not return from: SPEC-061 M3 and M6's
+  force-flush into a peer that stopped reading, on either path, or a tail publish handed a
+  remainder below twice `DRIVER_DEADLINE_MARGIN`, where `_driver_timeout` says the driver's expiry
+  only probably lands first. **Closed by** SPEC-104 (reserved, not yet drafted): the delivery
+  engine marks a round that began while its run's stop event was set, and on such a round
+  `NATSSink` waits for its own abandoned publish, and its outstanding PING, inside the round's one
+  `publish_timeout` rather than refusing at once, and refuses as it does today if neither finishes.
+  This waits only for an attempt already in flight, as *A shutdown shortens a wait; it must never
+  skip work* asks, so every other round and every other caller is left as it is.
+- **A destination that refuses at once during the stop loses the whole exit backlog in
+  milliseconds, even when it would be back long before the deadline** (found while measuring the
+  item above, 2026-11-17; invariants 2 and 3). The exit drain's waits between rounds are zero for
+  every engine sink, as the item above describes, so a refusal that costs nothing, such as a
+  `NATSSink` client that reports itself disconnected (`src/log_foundry/sinks/nats.py:1113`),
+  spends a batch's rounds at once, and every later exit batch does the same. Nothing is in flight
+  for the sink to wait on, which is why SPEC-104 leaves this case alone. `spec104_nats_exit_latch.py
+  reconnect 1000 2 10`, where the client reports itself disconnected from the stop until 1 s after
+  it, at `03dbf502`, two runs each on 3.13.1 and 3.12.12: the exit drain lost 1,726 to 1,980
+  events in 0.01 to 0.31 s and was over before the client came back. `dead`, where it never comes
+  back, measured the same, as it should. Every event is counted and announced. A prototype that
+  kept the engine's backoff on the exit drain, ending each wait at the deadline rather than at the
+  stop, took 0.56 to 0.95 s on `reconnect` in the same four runs and still lost 1,674 to 1,980
+  events. It too was over before the client came back, so keeping the backoff does not close this
+  item on its own.
+  **Closed by** a decision, not yet made, on whether the exit drain should wait for a destination
+  to come back within the caller's budget: what it would wait on, how many rounds it would spend,
+  and how long a destination that is dead rather than recovering would then hold the process,
+  which is what `shutdown(timeout)` at interpreter exit would pay. The alternative is to record it
+  as a trade beside *A shutdown shortens a wait; it must never skip work*. It shares the exit drain
+  with the dead-sink item above, which SPEC-103 is taking.
 - **A span's events stay on the span until it closes, so a process killed mid-handler loses the
   whole root span** (2026-11-14 audit, finding 8; invariant 2 cannot count this loss, and no
   document states it). By the core frame's reading, only the close, or a `flush()` called on the
