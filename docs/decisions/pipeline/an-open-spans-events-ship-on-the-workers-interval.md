@@ -80,12 +80,25 @@ the repeatable one.
 - **An unbounded wait by the drain**: a `flush(3.0)` made while holding the lock returned
   `"timed-out"` after 3 s with the drain waiting on it, and `ok=True` with the bound (measured
   before the per-site check, which now makes that `flush()` report `"abandoned"` in under 1 s).
+- **A sweep that drops on a full queue** (diff review frame 2): one submission per span into a
+  queue of 10,000 submissions, so 12,000 open spans overflowed 6,000 submissions in one pass and
+  `r_many_spans.py 12000 3` delivered 54,000 of 60,000, where the code before SPEC-091 delivered
+  all 60,000. A take the queue cannot accept now goes back on its span and the pass stops; the
+  close ships it. On SPEC-091's build over `33a44e99` with this fixed, the same run delivers all
+  60,000 with `dropped=0`.
+- **A hand-in that waits unboundedly on the queue's mutex under the hold** (frame 2): a collector
+  callback inside another thread's queue section that takes the hold waited on the sweep, which
+  waited on that section. The offer takes the mutex for at most `_SWEEP_WAIT`.
+- **Retrying a skipped sweep on every pass** (frame 2): with another thread holding the hold each
+  pass waited out the bound, and a `flush()` made inside a hold with 200 submissions queued ahead
+  returned after 11.46 s; retried an interval later, it returns in 0.05 s.
 - **A `SIGTERM` handler that sweeps**: the default disposition skips `atexit`, `p12_kill.py`'s
   `SIGTERM` loss was of five **closed** spans already queued, and a handler calling `shutdown()`
   is §12's finding-3 deadlock.
 
-**Do NOT build** a setting for the sweep's cadence, a sweep that takes `span.start` or rebinds
-`span.events`, a write to a span's buffer outside the hold other than `append`, or a site that
+**Do NOT build** a setting for the sweep's cadence, a sweep that takes `span.start`, rebinds
+`span.events` or drops a take the queue cannot accept, a lock waited on unboundedly inside the
+hold, a write to a span's buffer outside the hold other than `append`, or a site that
 enters the hold without asking `_sweep_held_here()` first; `tests/test_span_events_site_rule.py`
 derives the last two from the AST. The residuals the build accepted are in `architecture.md` §13.
 
@@ -97,7 +110,11 @@ derives the last two from the AST. The residuals the build accepted are in `arch
   `_SweepHold` with the per-site check and the deferred closes, the drain's bounded wait, the
   open-time build, `flush()`'s registry sweep and the exit drain's sweep, and the child forgetting
   the registry. The plan review's two deadlocks on the lock gave the hold its re-entry guard and the
-  drain its bound.
+  drain its bound. The diff review's system frame then made a sweep never drop (the take goes back
+  on its span when the queue is full), bounded the hand-in's wait on the queue's mutex, moved every
+  other lock a hold took (the late count, a fault's debit, a deferred close's submit) to after its
+  release, had a skipped sweep wait an interval, and had `flush()` build the worker its registry
+  sweep needs when the open-time build failed.
 
 ### 2026-11-15
 

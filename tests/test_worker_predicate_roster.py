@@ -643,6 +643,32 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "safe over-match that function chooses."
         ),
     ),
+    ("_flush_worker", "worker is None and swept and _registered_spans_hold_events()", 0): (
+        EXISTENCE,
+        (
+            "whether no worker exists while some registered span holds events, so the flush "
+            "builds one for its registry sweep, as the caller's own sweep does (SPEC-091 diff "
+            "review, frame 2). Existence: with the open-time build failed there is no worker at "
+            "all, and a retired one is still the process worker, to which a late flush hands."
+        ),
+    ),
+    ("_flush_worker", "_get_worker()", 0): (
+        LIVENESS,
+        (
+            "who performs the registry sweep's hand-ins when the open-time build failed, filed as "
+            "`_sweep_open_spans`' own build is: `_get_worker` answers existence by construction, "
+            "and it is resolved before the sweep takes anything, so a build that raises loses "
+            "nothing."
+        ),
+    ),
+    ("_sweep_open_spans", "worker._offer(buffered, count_retired=True)", 0): (
+        LIVENESS,
+        (
+            "the binding of the offer's verdict, which the worker resolved above performs: a put, "
+            "a full queue or a mutex not free in time (SPEC-091 diff review, frame 2). It asks "
+            "nothing of the worker beyond what that resolution decided."
+        ),
+    ),
     ("_live_sinks", "(_state.worker_exists(), _state._late_worker)", 0): (
         EXISTENCE,
         (
@@ -1682,8 +1708,13 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 104, "log_foundry.decorator": 15}
+_SITE_FLOOR = {"log_foundry._lifecycle": 106, "log_foundry.decorator": 16}
 """The floor each walked module must still meet, by name.
+
+**Raised at SPEC-091's diff review, frame 2, 104 -> 106 and 15 -> 16, to the counts
+`_per_module_sites()` measured.** `_flush_worker` gains the build its registry sweep needs when the
+open-time build failed, a guard and its `_get_worker()` binding; `_sweep_open_spans` gains the
+binding of `worker._offer(...)`'s verdict. All three are filed above.
 
 **Raised at SPEC-091, 101 -> 104 and 4 -> 15, to the counts `_per_module_sites()` measured on its
 branch.** `_lifecycle` gains three, all filed above: `_flush_worker`'s registry sweep and its guard,

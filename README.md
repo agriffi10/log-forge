@@ -501,7 +501,8 @@ def handler(event, context):       # the entry point, deliberately not decorated
 `flush()` works either side of the traced function. Putting it outside, as above, is still the
 clearer shape — the span has closed, so there is nothing to reason about. But a `flush()`
 *inside* an open span is no longer a mistake: it sweeps every open span, hands their buffered
-events to the worker and drains them, leaving the spans open. It does not
+events to the worker and drains them, leaving the spans open. When the queue is full, other
+threads' spans keep their events for the next sweep or their close. It does not
 deliver a `span.end` that has not happened yet. Before `1.0.0` a flush inside a span swept
 nothing, and this recipe with the `flush()` moved into the traced function delivered **nothing**
 with every counter clean.
@@ -1345,7 +1346,7 @@ They tell you different things, and they want different responses:
 
 | Field | Means | What to do |
 |---|---|---|
-| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per open span a `flush()` or the worker's own interval sweep takes from — so the events lost are a multiple of it. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
+| `dropped` | The queue filled — the destination is not keeping up. Delivery continues. It counts **submissions** — one per span close, or per `flush()` made inside a span whose own buffer met the full queue — so the events lost are a multiple of it. The worker's interval sweep and a `flush()`'s sweep of other threads' spans never drop: a full queue leaves those events on their spans, and the close ships them. | Make the destination keep up: scale the sink, or reduce what you log. The worker's batch size, flush interval and queue depth are **not** reachable from the public API, so tuning them is not an option this version offers you. |
 | `failed_batches` | A sink stayed broken through the whole retry budget, or the exit drain declined a batch's retry, or a whole later batch unattempted, because it was predicted to end after `shutdown()`'s deadline. Delivery continues while the process runs; after a decline on the exit drain the process is shutting down and nothing follows. | Fix the destination. |
 | `stopped_reason` | The background thread **died** on that exception type. Nothing further will be delivered, ever. | Restart the process; investigate the named exception. |
 | `sink.dropped` | The sink discarded events **before** attempting delivery — an oversized record, or one the client refused while the rest of its batch was handed off. A batch the client refused **whole** is not counted here: the sink raises, and it is counted where the raise is caught — in `failed_batches` by the worker once its retries are spent, in `orphan_lost` outside a span, or in the fan-out's `sink.failed` when a `MultiSink` sibling delivered. | Read the stderr line: it names the cause. An oversized record means shrink what you log; a refused local produce/publish (Kafka, Pub/Sub) points at the client — a saturated buffer, a bad topic, a credential. |

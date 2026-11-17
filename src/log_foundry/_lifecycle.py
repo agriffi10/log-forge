@@ -6345,9 +6345,15 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     :func:`_sweep_every_registered_span` hands in what every other thread's and task's open span
     holds, past its held ``span.start``. ~~The bound is the calling context~~, which
     ``contextvars`` forced, is widened: the registry removes it. Both sweeps run inside the
-    window, so an overflow either causes is in this call's counts. A sweep that raises, takes
-    nothing because this thread already holds the sweep hold, or meets a hand-in fault reports
-    ``"abandoned"``, as a failed own-context sweep always did.
+    window. A sweep that raises, takes nothing because this thread already holds the sweep hold,
+    or meets a hand-in fault reports ``"abandoned"``, as a failed own-context sweep always did.
+    ~~an overflow either causes is in this call's counts~~ — revised at SPEC-091's diff review,
+    frame 2: a sweep never overflows. When the queue is full, or its lock busy past the sweep's
+    bound, the registry sweep leaves other threads' events on their spans for the next sweep or
+    the close and the call's reason is what it would otherwise be, since nothing was lost; the
+    caller's own sweep, which this call was asked to deliver, reports ``"abandoned"``. With no
+    worker, because the open-time build failed, the call builds one when a registered span holds
+    events, as the caller's own sweep already does.
 
     Raises:
       None. A flush is the call most likely to be made in a ``finally``, so the library must
@@ -6367,6 +6373,12 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
         _diag.absorbed("sweeping open spans for a flush", exc, "buffered events were not swept")
         swept = False
     worker = _state.worker_exists()
+    if worker is None and swept and _registered_spans_hold_events():
+        try:
+            worker = _get_worker()
+        except Exception as exc:
+            _diag.absorbed("starting the worker for a flush", exc, "buffered events were not swept")
+            swept = False
     if worker is not None and swept:
         swept = _sweep_every_registered_span(worker)
     drained: FlushResult = FlushResult(ok=True)
@@ -6388,39 +6400,72 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     return _with_counts(drained, start, end)
 
 
+def _registered_spans_hold_events() -> bool:
+    """Reports whether some registered open span holds events a sweep would take.
+
+    It lets ``flush()`` build the worker its registry sweep needs, as the caller's own sweep
+    already does, when the open-time build failed (diff review, frame 2): with no worker the
+    registry sweep was skipped, and a ``flush()`` reported success over another thread's buffered
+    logs (``r_no_worker_flush.py``). It reads a copy of the registry without the sweep hold, as a
+    hint only; the sweep itself re-reads each span under the hold.
+
+    Args:
+      None.
+
+    Returns:
+      Whether any registered span that has not begun closing holds more than its held events.
+
+    Raises:
+      None.
+    """
+    from log_foundry import decorator
+
+    return any(
+        len(span.events) > span.held
+        for span in decorator._open_spans.copy().values()
+        if not span.closed
+    )
+
+
 def _sweep_every_registered_span(worker: Worker) -> bool:
     """Hands every registered open span's buffered events to ``worker`` for a ``flush()``.
 
-    SPEC-091 FR-003. ``decorator._sweep_registered`` runs with an enqueue that keeps the
+    SPEC-091 FR-003. ``decorator._sweep_registered`` runs with ``Worker._offer``, keeping the
     retirement read, so a ``flush()`` after ``shutdown()`` hands to a retired worker and is counted
-    as such, and it blocks for the sweep hold as every caller but the drain does. Every total and
-    fault it hands back is announced here, once the hold is released.
+    as such, and it blocks for the sweep hold as every caller but the drain does. Every late
+    submission and fault it hands back is counted and announced here, once the hold is released.
+
+    **A full queue leaves other threads' events on their spans** (diff review, frame 2). An offer
+    that finds the queue full, or its lock busy past the sweep's bound, puts nothing, the take goes
+    back on its span and the sweep stops; those events wait for the next sweep or the span's close,
+    and nothing is lost, so this does not make the call ``"abandoned"``.
 
     Args:
       worker: The process worker.
 
     Returns:
-      Whether the sweep ran and every take was handed in: ``False`` when it raised, when it took
-      nothing because this thread already held the sweep hold, or when a hand-in failed.
+      ``False`` when the sweep raised, took nothing because this thread already held the sweep
+      hold, or lost a take to a hand-in fault; ``True`` otherwise, including a sweep that stopped
+      on a full queue with its takes back on their spans.
 
     Raises:
       None.
     """
     from log_foundry.decorator import _sweep_registered
 
-    def hand_in(events: list[dict[str, object]]) -> tuple[int, int]:
-        """Enqueues one span's take with the retirement read kept.
+    def hand_in(events: list[dict[str, object]]) -> int | None:
+        """Offers one span's take with the retirement read kept.
 
         Args:
           events: One open span's take.
 
         Returns:
-          The totals the enqueue moved.
+          ``None`` when nothing was put, else the late submissions the put leaves to count.
 
         Raises:
           None.
         """
-        return worker._enqueue(events, count_retired=True)
+        return worker._offer(events, count_retired=True)
 
     try:
         result = _sweep_registered(hand_in)
@@ -6429,9 +6474,8 @@ def _sweep_every_registered_span(worker: Worker) -> bool:
         return False
     if result is None:
         return False
-    _, totals, faults = result
-    for moved in totals:
-        worker._announce(moved)
+    _, late, faults = result
+    worker._settle_late(late)
     for fault in faults:
         _diag.absorbed("handing in an open span's events", fault, "the events taken were lost")
     return not faults

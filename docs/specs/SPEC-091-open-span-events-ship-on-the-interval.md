@@ -121,8 +121,24 @@ SPEC-090's cap meaningful: a concatenated sweep of many spans made one submissio
 `_BACKLOG_BATCH_CAP` that the rule must send whole, where a span's own take is no larger than
 the submission its close makes today. It costs the hold: with a `put_nowait` per span, one sweep
 of 1,000 spans of ten events held the lock 428 to 433 µs, against 157 to 159 µs for one
-concatenated put (Evidence). `dropped` stays in submissions, so a sweep that meets a full queue
-moves it by one per span whose take it could not hand in.
+concatenated put (Evidence). ~~`dropped` stays in submissions, so a sweep that meets a full queue
+moves it by one per span whose take it could not hand in.~~
+
+**A sweep never drops, and never waits unboundedly on the queue** (revised 2026-11-17, after diff
+review frame 2: with one submission per span and a queue of 10,000 submissions, 12,000 open spans
+overflowed 6,000 submissions in one pass, `r_many_spans.py 12000 3` delivering 54,000 of 60,000
+where the code before this spec delivered all 60,000). The drain's sweep and a `flush()`'s registry
+sweep hand each take in through `Worker._offer`, which is `queue.Queue.put`'s own body with the
+queue's mutex acquired for at most `_SWEEP_WAIT`. A full queue, or a mutex not free in time, puts
+nothing: the take goes back on its span at `held`, before anything the owner appended meanwhile,
+nothing is credited, and the pass stops. Events left on a span are safe, since the close ships them.
+No other lock is taken under the hold: the late-submission count and its line, a fault's
+`in_span_lost` debit, and a deferred close's submit all run once the hold is released. The bound on
+the mutex closes a deadlock across threads: a collector callback inside another thread's queue
+section can wait on the hold while the sweep waits on that section (frame 2's `r_mutex_cycle.py`).
+The caller's own sweep in `flush()` offers under the same bound and puts its buffer back when the
+mutex is not free, reporting `"abandoned"`; on a full queue it keeps SPEC-089 FR-003 AC-3's
+overflow, dropped and counted, with the count made after the hold.
 
 **A fault after a take is a counted loss.** The slice and the `del` run outside the `try`, so a
 fault there leaves the events where they were. A fault after the `del`, in `hand_in` or in setting
@@ -324,7 +340,11 @@ over events the exit drain then delivers.
 **The drain never waits unboundedly for the lock** (added 2026-11-17, after the plan review). The
 drain's sweep enters `_sweep_hold.within(_SWEEP_WAIT)`, with `_SWEEP_WAIT` 0.05 s, and
 `_sweep_registered(hand_in, wait=_SWEEP_WAIT)` returns `None` when that wait expires. `_run_sweep`
-then returns `None`, the drain leaves `last_sweep` as it was, and it tries again on its next pass.
+then returns `None`, ~~the drain leaves `last_sweep` as it was, and it tries again on its next
+pass~~ and the drain sets `last_sweep` to the clock read after the attempt, so it tries again an
+interval later (revised 2026-11-17, after diff review frame 2: retrying every pass made each pass
+wait out the bound while another thread held the hold, and a `flush()` made inside a hold with 200
+submissions queued ahead of its marker returned after 11.46 s).
 Every other caller blocks. The drain is the one thread the others wait on, so a thread that holds
 the lock and then waits on the drain, through a collector callback that calls `flush()`,
 `shutdown()` or a sink swap, would otherwise wait for its timeout, or for ever with none: before
@@ -388,8 +408,14 @@ thread and never calls sink code while it holds `_sweep_lock`.
   `_sweep_open_spans()` first, as today, so the caller's own spans ship whole with their
   `span.start` backfilled. Then, when a worker exists and that sweep did not fail, it runs
   `_sweep_registered` for every other registered span with a `hand_in` of
-  `_enqueue(events, count_retired=True)`, under the same guard, and announces the totals and
-  faults it hands back after the lock is released. A sweep that raises, or any `hand_in` fault,
+  ~~`_enqueue(events, count_retired=True)`~~ `_offer(events, count_retired=True)` (revised
+  2026-11-17: the offer never drops, FR-001), under the same guard, and counts and announces the
+  late submissions and faults it hands back after the lock is released. A full queue leaves other
+  threads' events on their spans for the next sweep or the close, and does not change the call's
+  reason, since nothing was lost. When no worker exists, because the open-time build failed, and a
+  registered span holds events past `held`, it builds the worker first, as the own-context sweep
+  does (added 2026-11-17, after diff review frame 2: with no worker the registry sweep was skipped
+  and a `flush()` reported success over another thread's 5 buffered logs). A sweep that raises, or any `hand_in` fault,
   reports `"abandoned"`, as a failed own-context sweep does. The retirement reads are kept here: a
   `flush()` after `shutdown()` hands to a retired worker and is counted as such. This widens
   SPEC-036 FR-001's bound, "the calling context", which `contextvars` forced and the registry
@@ -582,12 +608,19 @@ empty. The pin is removed and its §12 item moved to Resolved.
       the owner's cell (the owner holding `span.start` and 3 logs, of which the reader has seen 1),
       it reads `unaccounted == 2` (revised 2026-11-15: SPEC-088 built the two-pass order, so the
       cell-by-cell order exists only as this mutant) (invariant 2).
-- [ ] A sweep of two open spans into a full queue moves `overflow_lost` by the events of both
-      takes, `dropped` by 2 and `open_spans` down by the same events (invariant 2).
+- [ ] ~~A sweep of two open spans into a full queue moves `overflow_lost` by the events of both
+      takes, `dropped` by 2 and `open_spans` down by the same events~~ A sweep of two open spans
+      into a full queue moves neither `overflow_lost` nor `dropped`, leaves both takes on their
+      spans with `open_spans` unchanged, and every event is delivered at its span's close; with
+      twelve open spans and five free slots it hands in five takes and leaves seven (revised
+      2026-11-17: a sweep that dropped lost 6,000 of 60,000 events with 12,000 spans open)
+      (invariant 2).
 - [ ] With `_hand_in` made to raise for a span's take, `in_span_lost` moves by that take's events,
       `open_spans` moves down by the same, and no other term moves (invariant 2).
-- [ ] A `flush()` whose registry sweep meets a full queue returns counts that include the
-      overflowed events (invariant 2).
+- [ ] ~~A `flush()` whose registry sweep meets a full queue returns counts that include the
+      overflowed events~~ A `flush()` whose registry sweep meets a full queue counts no overflow,
+      is not `"abandoned"` for it, and leaves the other context's events on its span to be
+      delivered at the close (revised 2026-11-17: the sweep no longer drops) (invariant 2).
 - [ ] `tests/test_invariants_model.py` and `tests/model_oracles.py` state each span identity over
       `span.end` events, and every model row passes; with the restatement reverted, ~~a row that
       forces a sweep (a `flush()` from another thread while a span is open) fails~~ a test that
@@ -639,8 +672,10 @@ sweep.
       hold, a mode the build adds; added 2026-11-17) run on the build on 3.12
       and 3.13, and the build adds no statement to the open, the close or `api._log` beyond the
       list above (invariant 4).
-- [ ] With the worker's queue full and `sys.stderr` blocked on the sweep's overflow line, a traced
-      call on another thread closes while that line is still pending, its close waiting on no event
+- [ ] With ~~the worker's queue full and `sys.stderr` blocked on the sweep's overflow line~~
+      `sys.stderr` blocked on the line a sweep writes, the late-submission line of a `flush()` after
+      `shutdown()` (revised 2026-11-17: a sweep no longer overflows, so it writes no overflow
+      line), a traced call on another thread closes while that line is still pending, its close waiting on no event
       the stderr write sets; on the first cut of the prototype it did not close until stderr was
       released (invariants 3 and 4).
 - [ ] Once a worker exists, the open calls no `_lifecycle` function: with `_get_worker` wrapped
@@ -733,7 +768,8 @@ The completion ritual writes the record, and this FR is its checklist.
   a `shutdown()` inside the first traced call now strands that call's later events, counted;
   `continue_trace()` is refused once a sweep has taken from the root span, so a late call's verdict
   depends on timing, with the rejection line's new text; a take whose hand-in fails is counted in
-  `in_span_lost`; `dropped` moves by one per open span a sweep could not hand in; a span's events
+  `in_span_lost`; ~~`dropped` moves by one per open span a sweep could not hand in~~ a sweep that
+  meets a full queue leaves the events on their spans and drops nothing (revised 2026-11-17); a span's events
   can be split across a sink swap; and an empty batch is no longer submitted.
 
 #### Acceptance Criteria:
@@ -788,8 +824,10 @@ _sweep: Sweep | None
 
 # the shapes, private, in decorator.py
 Totals = tuple[int, int]            # (dropped total moved, or 0; submitted_after_shutdown total, or 0)
-HandIn = Callable[[list[dict[str, object]]], Totals]
-SweepResult = tuple[int, list[Totals], list[Exception]]   # events handed in, totals, hand-in faults
+# revised 2026-11-17 (diff review frame 2): a hand-in offers, never drops, and returns None when
+# it put nothing; Totals now types only submit's _enqueue and _announce, in worker.py.
+HandIn = Callable[[list[dict[str, object]]], int | None]   # late puts to count, or None
+SweepResult = tuple[int, int, list[Exception]]   # events handed in, late puts, hand-in faults
 class Sweep(Protocol):              # added 2026-11-17: types Worker's sweep=
     def __call__(self, hand_in: HandIn, *, wait: float | None = None) -> SweepResult | None: ...
 ```
@@ -816,7 +854,9 @@ class Worker:
                                                       # count_retired=True)), unchanged to callers
     def _enqueue(self, events, *, count_retired: bool) -> Totals: ...  # no stderr
     def _announce(self, totals: Totals) -> None: ...  # the throttled lines; no library lock held
-    def _hand_in(self, events) -> Totals: ...         # _enqueue(events, count_retired=False)
+    def _hand_in(self, events) -> int | None: ...     # _offer(events, count_retired=False)
+    def _offer(self, events, *, count_retired, wait=_SWEEP_WAIT) -> int | None: ...  # added
+                                                      # 2026-11-17: put's body, bounded, no drop
     def _run_sweep(self) -> int | None: ...           # _sweep(_hand_in, wait=_SWEEP_WAIT), then
                                                       # the announcements; None when the wait
                                                       # expired (revised 2026-11-17, was -> int)

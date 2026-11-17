@@ -1731,7 +1731,13 @@ interval, and which every close and `flush()` takes. It is an `RLock` entered on
 that calls `flush()` or closes a span on a thread inside a sweep does not wait on its own thread:
 its sweep takes nothing and its close is deferred to the holder. The drain waits for it at most
 `worker._SWEEP_WAIT`, so a thread holding it that then waits on the drain is not waited on in
-turn. A handler on a thread inside any of the other locks still waits. One nesting remains, and it is
+turn, and a sweep takes the queue's mutex for at most the same bound and takes no other lock while
+it holds the hold (SPEC-091's diff review, frame 2), so a handler inside the queue's section on
+another thread that then takes the hold is not waited on either. A handler on a thread inside any of
+the other locks still waits, and a handler inside the queue's own section that closes a span waits
+on that section from its own thread: the close's submit takes the queue's mutex, a plain `Lock`.
+That last hang is the standard library's and predates SPEC-091: on the base `33a44e99` a traced
+close made while its thread holds the worker queue's mutex does not return either. One nesting remains, and it is
   the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
   `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
   `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
@@ -2980,15 +2986,20 @@ and a third copy is a fork with no merge.
   §12's finding-3 deadlock, so no signal handler sweeps. Decision: *An open span's events ship on
   the worker's interval* (`docs/decisions/pipeline/`).
 
-- **The open-span sweep accepts three residuals** (SPEC-091). **A `KeyboardInterrupt` landing
+- **The open-span sweep accepts four residuals** (SPEC-091). **A `KeyboardInterrupt` landing
   just after a successful put** in `flush()`'s registry sweep, or any other asynchronous
-  `BaseException` between the put and `Worker._enqueue`'s return, counts that take twice: once
+  `BaseException` between the put and `Worker._offer`'s return, counts that take twice: once
   queued and once in `in_span_lost`, since the sweep debits a take whose hand-in did not return.
   Nothing after a put that succeeded can raise an `Exception`, so no ordinary fault reaches it.
   **A collector callback or finalizer that runs inside a sweep hold** runs there, so its own
   stderr lines and orphan emits are written while the hold lasts and other closes wait on it: the
   one exception to "nothing is written to stderr under the lock", accepted because the callback's
-  own runtime already extends the hold. The take's exactly-once argument rests on the GIL (each
+  own runtime already extends the hold. **A traced close made while its own thread holds the worker
+  queue's mutex**, as a collector callback inside `put_nowait`'s section could make, waits on that
+  mutex in its own submit and never returns, since `queue.Queue`'s mutex is a plain `Lock`; this
+  predates SPEC-091 (it hangs on the base `33a44e99`), and SPEC-091's sweeps do not join it: they
+  take the mutex for at most `worker._SWEEP_WAIT` and no other lock under the hold (diff review,
+  frame 2). The take's exactly-once argument rests on the GIL (each
   `list` and `dict` operation it uses is one C call with no switch point); on a free-threaded
   build it is unproven, and no free-threaded run was made.
 

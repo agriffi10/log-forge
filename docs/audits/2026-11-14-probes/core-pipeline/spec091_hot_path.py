@@ -84,9 +84,9 @@ def hold() -> None:
                 decorator._open_spans[id(span)] = span
             sink_queue: queue.Queue[object] = queue.Queue()
 
-            def hand_in(batch: list[dict[str, object]]) -> tuple[int, int]:
+            def hand_in(batch: list[dict[str, object]]) -> int:
                 sink_queue.put_nowait(batch)
-                return (0, 0)
+                return 0
 
             t0 = time.perf_counter()
             decorator._sweep_registered(hand_in)

@@ -10,8 +10,10 @@
   `backfill_baggage` iterates a snapshot.
 - **The re-entry guard** (FR-001, revised 2026-11-17): `_sweep_lock` is an `RLock` entered only
   through `_sweep_hold` (`_SweepHold`, `.within(wait)` via `_BoundedHold` and `_NotHeldError`); its
-  exit, `_release_hold`, drains `_deferred_closes` (`_drain_deferred_closes`) before the release
-  and announces after it. The five sites ask `_sweep_held_here()` first.
+  exit, `_release_hold`, swaps the buffers of `_deferred_closes` (`_drain_deferred_closes`) before
+  the release and submits them after it. The five sites ask `_sweep_held_here()` first. No lock but
+  the queue's mutex is taken under the hold, and that one only for at most `_SWEEP_WAIT`
+  (`Worker._offer`).
 - **The worker sweeps** (FR-002, FR-003): `_begin` builds the worker before its credit;
   `Worker(sweep=)`, typed by the protocol `worker._Sweep`; `_run_sweep` and `_hand_in`; the drain's
   own clock with `_SWEEP_WAIT` (0.05 s); one sweep at the head of `_final_drain`; `flush()`'s
@@ -90,12 +92,63 @@ and 160.6 ns. `hold`, 10, 100 and 1,000 spans of ten events: 13.5, 123.2 and 554
 144 read 129.2, 169.0, 139.5 and 176.6 ns. A quiet-machine re-run would make them comparable to
 the spec's. `whole` was not run on the build.
 
+## Diff review, frame 2 (the system frame)
+
+Four findings, each fixed on the branch and each with a test that its mutant reddens:
+
+- **A sweep overflowed the queue once about 10,000 spans were open.** One submission per span,
+  `max_queue` 10,000 submissions, filled in one pass under the hold: `r_many_spans.py 12000 3` read
+  `delivered=54000 expected=60000 dropped=6000 overflow_lost=6000`, where the code before SPEC-091
+  delivered all 60,000. A sweep now offers each take through `Worker._offer`, which never drops: a
+  full queue puts nothing, the take goes back on its span at `held` and the pass stops, crediting
+  nothing. On SPEC-091's build over `33a44e99` the same run reads `delivered=60000 expected=60000
+  dropped=0 overflow_lost=0 unaccounted=0`. FR-001's `dropped` sentence and FR-004 AC-3 and AC-5
+  are revised in place. Tests: `test_a_sweep_into_a_full_queue_leaves_every_take_on_its_span`,
+  `test_a_sweep_stops_at_capacity_and_the_rest_ship_at_their_close` (twelve spans, five free slots)
+  and `test_a_flush_whose_registry_sweep_meets_a_full_queue_leaves_the_events`. Mutants: no restore
+  on a full queue, and no capacity check, each killed.
+- **A deadlock across threads between the hold and the queue's mutex.** The drain held the hold
+  while `put_nowait` took the queue's mutex, and a thread inside that mutex's section that took the
+  hold waited on the drain. `Worker._offer` is `queue.Queue.put`'s body with the mutex acquired for
+  at most `_SWEEP_WAIT`, and on a timeout the take goes back on its span. The worker's `_lock`, a
+  fault's `in_span_lost` debit and a deferred close's submit, the other locks a hold took, now run
+  after the release. Tests: `test_a_sweep_gives_up_on_a_queue_mutex_another_thread_holds`,
+  `test_an_own_sweep_that_cannot_take_the_queue_mutex_puts_the_buffer_back` and
+  `test_a_deferred_close_is_submitted_with_no_hold_held`. Mutants: an unbounded mutex wait (the
+  test reddens, then the deadlocked threads hang its teardown, which is the defect), no restore
+  in the own sweep, and the deferred submit moved under the hold, each killed. The reviewer's
+  `r_mutex_cycle.py` still reports a hang, and its stacks show why: its thread closes a traced span
+  **inside** the queue's mutex, so that close's own submit waits on a mutex its thread already
+  holds, with the hold free. That hang is `queue.Queue`'s and predates SPEC-091 (a traced close
+  inside the queue's mutex does not return on the base `33a44e99` either); it is recorded in
+  `architecture.md` §13.
+- **A skipped sweep was retried on every pass**, so a held hold slowed the drain to about twenty
+  submissions a second: `r_hold_backlog.py 200`'s in-hold `flush()` returned after 11.46 s. A skipped
+  sweep now waits an interval from the end of its attempt; the same run returns `abandoned` in
+  0.05 s. Test: `test_a_skipped_sweep_does_not_slow_the_drain_behind_a_backlog`; its mutant, retry
+  every pass, killed.
+- **`flush()` skipped the registry sweep when the open-time build had failed**, reporting success
+  over another thread's 5 buffered logs (`r_no_worker_flush.py`). It now builds the worker when a
+  registered span holds events, as the own sweep does; the same run delivers the 5 logs before the
+  close. Test: `test_a_flush_with_no_worker_builds_one_for_another_contexts_span`; its mutant killed.
+
+**Decided here, beyond the review's text:** the caller's own sweep in `flush()` keeps SPEC-089
+FR-003 AC-3's overflow on a full queue, dropping and counting its buffer as before, with the count
+now made after the hold; only a busy mutex makes it put the buffer back. Making it never drop too
+would change SPEC-089's criterion, so it was left for the coordinator.
+
+The probes on the fixed build: `spec091_exactly_once.py` three runs, `dup=0 missing=0
+bad_boundary=0 end_not_last=0` with 5,415, 8,134 and 7,681 shipped before their close;
+`p12_kill.py` 50 of 51 and 9 of 9, `SIGTERM` 0 of 15; `spec091_exit.py` 5, 5 and 5 with
+`after_shutdown=1` in the latter two; `spec091_fork.py` no child row.
+
 ## Residuals and known gaps
 
 - **Accepted, in `architecture.md` §13:** an asynchronous `BaseException` between a successful put
-  and `_enqueue`'s return in `flush()`'s registry sweep counts that take twice, queued and in
+  and `_offer`'s return in `flush()`'s registry sweep counts that take twice, queued and in
   `in_span_lost`; a collector callback's own stderr lines and orphan emits inside a hold are
-  written there; the free-threaded case is unproven.
+  written there; a traced close made while its own thread holds the worker queue's mutex never
+  returns, as before SPEC-091; the free-threaded case is unproven.
 - **Known gap:** one instrumented suite run reported a second failure whose name was not captured
   (the instrumentation itself fails `test_stored_name_roster.py`). Three un-instrumented full runs
   and six repeats of the new and changed test files were clean.

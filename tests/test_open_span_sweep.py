@@ -422,14 +422,14 @@ def test_a_worker_sweep_leaves_span_start_for_the_close(mode, monkeypatch) -> No
     """FR-001 AC-6 and AC-9: ``span.start`` ships with ``span.end``, both with late baggage."""
     worker = _quiet(Recorder())
     submissions: list[list[dict[str, Any]]] = []
-    real_put = worker._queue.put_nowait
+    real_put = worker._queue._put
 
-    def put_nowait(item: object) -> None:
+    def put(item: object) -> None:
         if isinstance(item, list):
             submissions.append([dict(e) for e in item])
         real_put(item)
 
-    monkeypatch.setattr(worker._queue, "put_nowait", put_nowait)
+    monkeypatch.setattr(worker._queue, "_put", put)
 
     def body() -> None:
         for i in range(10):
@@ -1335,8 +1335,14 @@ def _full_queue(gate: GatedSink) -> worker_mod.Worker:
     return worker
 
 
-def test_a_sweep_into_a_full_queue_counts_each_take() -> None:
-    """FR-004 AC-3: two takes overflow: their events in overflow_lost, dropped by 2."""
+def test_a_sweep_into_a_full_queue_leaves_every_take_on_its_span() -> None:
+    """FR-004 AC-3 (revised 2026-11-17): a full queue drops nothing; the takes stay on their spans.
+
+    ~~Two takes overflow: their events in overflow_lost, dropped by 2~~ — 12,000 open spans
+    overflowed 6,000 submissions in one pass (``r_many_spans.py``). The first offer finds the
+    queue full, its take goes back on its span at ``held``, and the pass stops: nothing is
+    dropped, ``open_spans`` does not move, and every event is delivered at its span's close.
+    """
     gate = GatedSink()
     worker = _full_queue(gate)
     first, second = Parked("a1", "a2"), Parked("b1", "b2", "b3")
@@ -1344,15 +1350,60 @@ def test_a_sweep_into_a_full_queue_counts_each_take() -> None:
     try:
         result = decorator._sweep_registered(worker._hand_in)
         after = lf.health().events
-        assert result is not None and result[0] == 5
-        assert after.overflow_lost - before.overflow_lost == 5
-        assert worker.dropped - dropped == 2, "one per span whose take met the full queue"
-        assert before.open_spans - after.open_spans == 5
+        assert result is not None and result[0] == 0, result
+        assert worker.dropped == dropped and after.overflow_lost == before.overflow_lost, (
+            "a sweep dropped a take on a full queue"
+        )
+        assert after.open_spans == before.open_spans
+        assert first.span is not None and second.span is not None
+        assert [e["message"] for e in first.span.events] == ["span.start", "a1", "a2"]
+        assert [e["message"] for e in second.span.events] == ["span.start", "b1", "b2", "b3"]
     finally:
         gate.gate.set()
-    first.finish()
-    second.finish()
+    for parked in (first, second):
+        _wait(lambda: worker._queue.qsize() == 0, "room for the close's submission")
+        parked.finish()
     lf.flush(BOUND)
+    got = sorted(str(e["message"]) for e in gate.events if e.get("function") == "parked")
+    assert got == sorted(
+        ["span.start", "a1", "a2", "span.end"] * 1 + ["span.start", "b1", "b2", "b3", "span.end"]
+    )
+
+
+def test_a_sweep_stops_at_capacity_and_the_rest_ship_at_their_close() -> None:
+    """Diff review frame 2, MAJOR 1, scaled down: more open spans than the queue has room for.
+
+    With five free slots and twelve open spans, the sweep hands in five takes, finds the queue
+    full at the sixth, puts that take back and stops. Nothing is dropped, and every one of the
+    twelve spans' events reaches the sink exactly once, the seven left behind at their close.
+    """
+    gate = GatedSink()
+    worker = _quiet(gate, max_queue=5, batch_size=1)
+    gate.gate.clear()
+
+    @lf.trace(name="filler")
+    def filler() -> None:
+        lf.info("fill")
+
+    filler()
+    assert gate.entered.wait(BOUND), "the drain never entered the gated emit"
+    spans = [Parked(f"s{i}-a", f"s{i}-b") for i in range(12)]
+    try:
+        result = decorator._sweep_registered(worker._hand_in)
+        assert result is not None and result[0] == 10, f"five takes of two: {result}"
+        assert worker.dropped == 0 and lf.health().events.overflow_lost == 0, (
+            "the sweep dropped takes past the queue's capacity"
+        )
+        left = [p for p in spans if p.span is not None and len(p.span.events) == 3]
+        assert len(left) == 7, "the seven spans past capacity still hold their logs"
+    finally:
+        gate.gate.set()
+    for parked in spans:
+        _wait(lambda: worker._queue.qsize() == 0, "room for the close's submission")
+        parked.finish()
+    lf.flush(BOUND)
+    got = [e for e in gate.events if e.get("function") == "parked"]
+    assert len(got) == 12 * 4 and not _once(got), f"{len(got)} of 48 parked events delivered"
 
 
 def test_a_hand_in_fault_moves_only_in_span_lost() -> None:
@@ -1376,18 +1427,27 @@ def test_a_hand_in_fault_moves_only_in_span_lost() -> None:
     parked.finish()
 
 
-def test_a_flush_whose_registry_sweep_overflows_counts_it() -> None:
-    """FR-004 AC-5: the overflow the registry sweep causes is in the call's counts."""
+def test_a_flush_whose_registry_sweep_meets_a_full_queue_leaves_the_events() -> None:
+    """FR-004 AC-5 (revised 2026-11-17): the registry sweep stops; nothing is lost or counted.
+
+    ~~The overflow the registry sweep causes is in the call's counts~~. Another context's events
+    stay on its span, the call counts no overflow and is not ``"abandoned"``, since nothing was
+    lost, and the events are delivered at the span's close.
+    """
     gate = GatedSink()
-    _full_queue(gate)
+    worker = _full_queue(gate)
     parked = Parked("a", "b", "c")
     try:
         result = lf.flush(0.3)
-        assert result.overflow_lost == 3, result
+        assert result.overflow_lost == 0 and result.reason != "abandoned", result
+        assert parked.span is not None and len(parked.span.events) == 4, "still on the span"
     finally:
         gate.gate.set()
+    _wait(lambda: worker._queue.qsize() == 0, "room for the close's submission")
     parked.finish()
     lf.flush(BOUND)
+    got = sorted(str(e["message"]) for e in gate.events if e.get("function") == "parked")
+    assert got == sorted(["span.start", "a", "b", "c", "span.end"]), got
 
 
 def test_a_close_with_nothing_buffered_submits_nothing(monkeypatch) -> None:
@@ -1460,18 +1520,24 @@ class _BlockingStream:
 
 
 def test_a_wedged_console_does_not_hold_a_close() -> None:
-    """FR-005 AC-3: a sweep's overflow line blocked on stderr is written outside the hold."""
-    gate = GatedSink()
-    worker = _full_queue(gate)
+    """FR-005 AC-3 (revised 2026-11-17): a sweep's line blocked on stderr holds no close.
+
+    A sweep never overflows now, so the line it writes is the late-submission line: a ``flush()``
+    after ``shutdown()`` sweeps another context's span into the retired worker, and counts and
+    announces that submission once the hold is released. With that line blocked on stderr, a
+    traced call on another thread closes; written under the hold, it did not.
+    """
+    _built(Recorder())
+    lf.shutdown(BOUND)
     parked = Parked("x")
     stream = _BlockingStream()
     original = sys.stderr
     sys.stderr = stream  # type: ignore[assignment]
     closed = threading.Event()
     try:
-        sweeping = threading.Thread(daemon=True, target=worker._run_sweep)
-        sweeping.start()
-        assert stream.writing.wait(BOUND), "the sweep's overflow line was never written"
+        flushing = threading.Thread(daemon=True, target=lambda: lf.flush(1.0))
+        flushing.start()
+        assert stream.writing.wait(BOUND), "the sweep's late-submission line was never written"
 
         @lf.trace(name="closer")
         def closer() -> None:
@@ -1484,15 +1550,13 @@ def test_a_wedged_console_does_not_hold_a_close() -> None:
         closing = threading.Thread(daemon=True, target=close)
         closing.start()
         assert closed.wait(5.0), "a close waited on a sweep whose line was blocked on stderr"
-        assert not stream.release.is_set() and sweeping.is_alive(), "the line was still pending"
+        assert not stream.release.is_set() and flushing.is_alive(), "the line was still pending"
     finally:
         stream.release.set()
         sys.stderr = original
-        gate.gate.set()
-    sweeping.join(BOUND)
+    flushing.join(BOUND)
     closing.join(BOUND)
     parked.finish()
-    lf.flush(BOUND)
 
 
 def test_the_open_calls_no_lifecycle_function_once_a_worker_exists(monkeypatch) -> None:
@@ -1615,14 +1679,14 @@ def test_a_flush_whose_registry_hand_in_fails_reports_abandoned(monkeypatch) -> 
     sink = Recorder()
     worker = _quiet(sink)
     parked = Parked("boom")
-    real_enqueue = worker._enqueue
+    real_offer = worker._offer
 
-    def enqueue(events: list[dict[str, Any]], *, count_retired: bool) -> tuple[int, int]:
+    def offer(events: list[dict[str, Any]], *, count_retired: bool) -> int | None:
         if any(e.get("message") == "boom" for e in events):
             raise RuntimeError("hand-in fault")
-        return real_enqueue(events, count_retired=count_retired)
+        return real_offer(events, count_retired=count_retired)
 
-    monkeypatch.setattr(worker, "_enqueue", enqueue)
+    monkeypatch.setattr(worker, "_offer", offer)
     result = lf.flush(BOUND)
     assert not result and result.reason == "abandoned", (
         f"a flush whose registry sweep lost a take reported {result}"
@@ -1659,3 +1723,198 @@ def test_the_sweep_keeps_its_own_clock_through_a_burst_of_passes() -> None:
         f"the drain swept {sweeps[0]} times over {submissions} passes in {elapsed:.2f}s, "
         f"more than once an interval"
     )
+
+
+def test_a_sweep_gives_up_on_a_queue_mutex_another_thread_holds(monkeypatch) -> None:
+    """Diff review frame 2, MAJOR 3: the drain never waits unboundedly on the queue's mutex.
+
+    Thread A holds the queue's mutex, standing in for a collector callback that runs inside
+    another thread's ``put_nowait``, and takes the sweep hold there, as a close's swap does. The
+    drain holds that hold while it offers a take; an offer that waited on the mutex unboundedly
+    waited on A, and every close in the process hung. The offer gives up within its bound, the
+    take goes back on its span, A gets the hold, and every event, a traced call's made after A
+    lets go included, is delivered once with ``span.end`` last.
+
+    A traced close made inside the mutex itself is a different hang, and not this spec's: its own
+    submit waits on the mutex its thread already holds, since ``queue.Queue``'s mutex is a plain
+    ``Lock``. It hangs on the base ``33a44e99`` too (``architecture.md`` §13).
+    """
+    sink = Recorder()
+    worker = _quiet(sink, flush_interval=0.05)
+    in_hand_in = threading.Event()
+    a_has_mutex = threading.Event()
+    real_hand_in = worker._hand_in
+    spied: list[bool] = []
+
+    def hand_in(events: list[dict[str, Any]]) -> int | None:
+        if not spied:
+            spied.append(True)
+            in_hand_in.set()
+            assert a_has_mutex.wait(BOUND)
+        return real_hand_in(events)
+
+    monkeypatch.setattr(worker, "_hand_in", hand_in)
+    parked = Parked("buffered")
+    closed = threading.Event()
+
+    @lf.trace(name="nested")
+    def nested() -> None:
+        lf.info("nested-close")
+
+    def thread_a() -> None:
+        assert in_hand_in.wait(BOUND)
+        with worker._queue.mutex:
+            a_has_mutex.set()
+            with decorator._sweep_hold:
+                closed.set()
+
+    a = threading.Thread(daemon=True, target=thread_a)
+    a.start()
+    assert closed.wait(5.0), "A waited on the hold while the drain waited on A's queue mutex"
+    assert worker._thread.is_alive()
+    monkeypatch.undo()
+    nested()
+    parked.finish()
+    lf.flush(BOUND)
+    for name, logs in (("parked", ["buffered"]), ("nested", ["nested-close"])):
+        got = sink.messages(name)
+        assert sorted(got) == sorted(["span.start", *logs, "span.end"]), (name, got)
+        assert got[-1] == "span.end", (name, got)
+    assert not _once(sink.events)
+
+
+def test_a_skipped_sweep_does_not_slow_the_drain_behind_a_backlog() -> None:
+    """Diff review frame 2, MAJOR 2: a sweep skipped for a held hold is retried an interval later.
+
+    A thread holds the hold and calls ``flush()`` with 100 submissions queued ahead of its marker.
+    Retrying the sweep on every pass made each pass wait out the sweep's bound, about twenty
+    submissions a second, so the call took seconds; retried once an interval, it returns at once.
+    """
+    gate = GatedSink()
+    worker = _built(gate)
+    gate.gate.clear()
+    worker.flush_interval = 0.05
+
+    @lf.trace(name="one")
+    def one() -> None:
+        lf.info("x")
+
+    one()
+    assert gate.entered.wait(BOUND), "the drain never entered the gated emit"
+    for _ in range(100):
+        one()
+    outcome: dict[str, object] = {}
+
+    def holder() -> None:
+        with decorator._sweep_hold:
+            gate.gate.set()
+            began = time.monotonic()
+            outcome["result"] = lf.flush(10.0)
+            outcome["elapsed"] = time.monotonic() - began
+
+    thread = threading.Thread(daemon=True, target=holder)
+    thread.start()
+    thread.join(BOUND + 5)
+    assert "elapsed" in outcome, "the in-hold flush never returned"
+    assert outcome["elapsed"] < 1.0, f"the drain was slowed behind the held hold: {outcome}"
+
+
+def test_a_flush_with_no_worker_builds_one_for_another_contexts_span(monkeypatch) -> None:
+    """Diff review frame 2, MINOR 4: a failed open-time build leaves the flush to build it.
+
+    The open-time build fails, so no worker exists while another context's span holds 5 logs.
+    The caller's own sweep finds nothing to build one for; the registry sweep then builds it,
+    as the own sweep does, and delivers the 5 logs, where it reported success over them.
+    """
+    sink = Recorder()
+    lf.configure(sink=sink)
+    real = _lifecycle._get_worker
+    failures = [1]
+
+    def flaky() -> worker_mod.Worker:
+        if failures:
+            failures.pop()
+            raise RuntimeError("no thread for you")
+        return real()
+
+    monkeypatch.setattr(_lifecycle, "_get_worker", flaky)
+    parked = Parked(*[f"log{i}" for i in range(5)])
+    assert _lifecycle._state.worker_exists() is None, "the open-time build failed"
+    result = lf.flush(BOUND)
+    assert result, result
+    assert sink.messages("parked") == [f"log{i}" for i in range(5)], sink.messages("parked")
+    parked.finish()
+    lf.flush(BOUND)
+
+
+def test_an_own_sweep_that_cannot_take_the_queue_mutex_puts_the_buffer_back() -> None:
+    """Diff review frame 2, MAJOR 3: the caller's own sweep is bounded on the mutex too.
+
+    With another thread holding the queue's mutex, the offer gives up within its bound: the buffer
+    goes back at the front of the span's list, before a log made afterwards, the sweep reports
+    that it did not deliver, and the close ships everything in order.
+    """
+    sink = Recorder()
+    worker = _quiet(sink)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_mutex() -> None:
+        with worker._queue.mutex:
+            holding.set()
+            release.wait(BOUND)
+
+    holder = threading.Thread(daemon=True, target=hold_mutex)
+    seen: dict[str, object] = {}
+
+    @lf.trace(name="own")
+    def own() -> None:
+        lf.info("before")
+        holder.start()
+        assert holding.wait(BOUND)
+        try:
+            seen["swept"] = decorator._sweep_open_spans()
+        finally:
+            release.set()
+            holder.join(BOUND)
+        lf.info("after")
+        span = context.current_span()
+        assert span is not None
+        seen["left"] = [e["message"] for e in span.events]
+
+    own()
+    lf.flush(BOUND)
+    assert seen["swept"] is False, "a sweep that put nothing reported delivering"
+    assert seen["left"] == ["span.start", "before", "after"], f"the buffer was lost: {seen}"
+    assert sink.messages("own") == ["span.start", "before", "after", "span.end"]
+
+
+def test_a_deferred_close_is_submitted_with_no_hold_held(monkeypatch) -> None:
+    """Diff review frame 2, MAJOR 3: no lock is waited on inside the hold, a deferred close's either.
+
+    The deferred close's buffer is swapped inside the hold, and submitted, which takes the queue's
+    mutex, only once the hold is released.
+    """
+    sink = Recorder()
+    worker = _quiet(sink)
+    held_at_put: list[bool] = []
+    real_put = worker._queue.put_nowait
+
+    def put_nowait(item: object) -> None:
+        held_at_put.append(decorator._sweep_held_here())
+        real_put(item)
+
+    monkeypatch.setattr(worker._queue, "put_nowait", put_nowait)
+
+    @lf.trace(name="nested")
+    def nested() -> None:
+        lf.info("inside")
+
+    with decorator._sweep_hold:
+        nested()
+    assert held_at_put == [False], (
+        f"the deferred close was submitted inside the hold: {held_at_put}"
+    )
+    monkeypatch.undo()
+    lf.flush(BOUND)
+    assert sink.messages("nested") == ["span.start", "inside", "span.end"]
