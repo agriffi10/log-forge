@@ -16,11 +16,12 @@
   resendable* (`docs/decisions/sink-delivery/`); §12's item struck and moved under *Resolved*, and
   the narrower residual filed as a new open item; the JetStream asymmetry's wider reach in
   `docs/invariants.md` and §12's `Nats-Msg-Id` item; `docs/release-notes/v1.2.1.md`, its known gap
-  replaced by a *Fixed* entry and a tenth upgrade exception. The README states neither rule.
-- **Two corrections to the spec at completion**, in its revision history: FR-005 AC1 now states the
-  measured outcome and its bound, and FR-001's exit-drain sentence no longer says the tail behind
-  an abandoned publish is always lost there, since it is delivered if that publish finishes between
-  two rounds.
+  replaced by a *Fixed* entry, a narrower known gap for the residual and a tenth upgrade
+  exception. The README states neither rule.
+- **Two corrections to the spec at completion**, in its revision history: FR-005 AC1 now asks that
+  no run leaves a loss silent, with the bound and the measured rates in FR-005's description rather
+  than as a pass count, and FR-001's exit-drain sentence no longer says the tail behind an abandoned
+  publish is always lost there, since it is delivered if that publish finishes between two rounds.
 
 ## What changed from earlier specs?
 
@@ -32,28 +33,38 @@
 
 ## The probe (FR-005)
 
-`docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 <spans 200> <budget>`
-at `b35ad63a` (the first three 0.2 s runs on each interpreter and both 10 s runs), `00ec9029` or
-`06b7ff41` (the orchestrating session's twelve), whose `src/` differ only in docstring and line
-layout. 3.13.1 is the worktree's `.venv`; 3.12.12 is pyenv's with `PYTHONPATH=src`. Each run:
-acked of 400, `sink.failed`, `deliver` calls, longest `deliver`. The orchestrating session's
-twelve replace an earlier set of twelve it ran at a load average near 140, whose output was not
-kept, so its per-run calls and longest `deliver` could not be recorded.
+`docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 200 <budget>`.
+3.13.1 is the worktree's `.venv`; 3.12.12 is pyenv's with `PYTHONPATH=src`. `src/` is
+behaviourally the same at every commit named: `00ec9029` changes only docstring and line layout,
+and `06b7ff41` and `1823bbe1` change no `src/`. Each run: acked of 400, `sink.failed`, `deliver`
+calls, longest `deliver`. The orchestrating session's twelve replace an earlier set of twelve,
+whose output was not kept.
 
-| Budget | Interpreter | Runs |
-|---|---|---|
-| 0.2 s | 3.13.1, implementer's eight | 361, 42, 10, 0.209 s (one `lost 39 event(s); NATSSink publish_timeout 0.2s` line, 3 abandoned lines, 2.3 s); 400, 3, 8, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 6, 0.200 s; 400, 3, 7, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s |
-| 0.2 s | 3.13.1, orchestrating session's twelve, load averages 16.26, 54.58, 61.66 before and 15.68, 51.96, 60.55 after | 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; each 0.9 s, largest batch 212 to 224 |
-| 0.2 s | 3.12.12 | 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 2, 8, 0.202 s |
-| 10 s | 3.13.1 | 400, 0, 3, 0.492 s |
-| 10 s | 3.12.12 | 400, 0, 4, 0.511 s |
+| Budget | Interpreter, runs | Commit | Runs |
+|---|---|---|---|
+| 0.2 s | 3.13.1, implementer's first three | `b35ad63a`, tree clean | 361, 42, 10, 0.209 s, with three abandoned lines and one `lost 39 event(s); NATSSink publish_timeout 0.2s` line; 400, 3, 8, 0.201 s; 400, 4, 8, 0.201 s |
+| 0.2 s | 3.13.1, implementer's next five | `b35ad63a` by the worktree's reflog, which held it from 09:19 to 09:35, and the runs were at 09:32; whether the tree was clean then was not recorded | 400, 3, 6, 0.200 s; 400, 3, 7, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s |
+| 0.2 s | 3.13.1, orchestrating session's twelve, load averages 16.26, 54.58, 61.66 before and 15.68, 51.96, 60.55 after | `06b7ff41` | 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 2, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s; 400, 3, 6, 0.200 s |
+| 0.2 s | 3.12.12, implementer's three | `b35ad63a`, tree clean | 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 2, 8, 0.202 s |
+| 10 s | 3.13.1 | `b35ad63a`, tree clean | 400, 0, 3, 0.492 s |
+| 10 s | 3.12.12 | `b35ad63a`, tree clean | 400, 0, 4, 0.511 s |
 
 In every run that acked 400, `sink.failed` equalled its `JetStream publish abandoned` lines: the
-unconfirmed publish invariant 2 records, whose ack the probe's fake still delivers. The miss is a
-bound of the fix, not a defect in it: at 0.2 s the four default rounds give 0.8 s against SPEC-090's
-0.5 s batch, and that run's delivery slowed past the margin; the machine's load during it was not
-recorded. It is §12's open item *A JetStream
-`NATSSink` backlog batch whose delivery outlasts the worker's rounds still loses its tail*.
+unconfirmed publish invariant 2 records, whose ack the probe's fake still delivers. The one miss
+here is a bound of the fix, not a defect in it: at 0.2 s the four default rounds give 0.8 s against
+SPEC-090's 0.5 s batch, and that run's delivery slowed past the margin. It is §12's open item *A
+JetStream `NATSSink` backlog batch whose delivery outlasts the worker's rounds still loses its
+tail*.
+
+**The diff review's runs.** Diff review frame 1 ran an instrumented copy of the probe 60 times at
+0.2 s on 3.13.1 at `1823bbe1`, at load averages of 24 to 38; its per-run figures are the
+reviewer's and are not tabled here. 58 acked 400. Run A acked 399 with `sink.failed` 3, three
+abandoned lines and no `publish_timeout` line: the last batch's abandoned publish was still pending
+when the process exited, counted and named as unconfirmed. Run B acked 382 with `sink.failed` 19,
+one abandoned line and `lost 13` and `lost 5` `publish_timeout` lines, its rounds taking 0.237 to
+0.394 s against the 0.2 s budget: CPU starvation, the bound above. Both satisfy FR-005 AC1 as
+revised, since nothing in either was silent. Measured rates, none a threshold: 19 of 20 on
+3.13.1 and 3 of 3 on 3.12.12 here, and 58 of 60 in the review.
 
 ## Verification
 
@@ -67,7 +78,8 @@ recorded. It is §12's open item *A JetStream
   `REJECTED`) failed 28, both FR-001 tests among them; M2 (the line back to `ALWAYS`) failed 29,
   including `landed-beside-the-unattempted-js-injected-worker` (four lines where one is pinned) and,
   which the spec did not predict, all eight matching `emit` cells; M3 (the tail marked sink-counted)
-  failed 24 on `failed`, in the four landed worker cells, the run-out test (`(3,0,0) == (3,2,0)`),
-  the decline test and the `max_retries` cases.
+  failed 24: on `failed` in the four landed worker cells, the run-out test (`(3,0,0) == (3,2,0)`),
+  the decline test and the three `max_retries` cases, and also the seven `_verdict_of` table rows,
+  on the counted set, and the eight `emit` cells of both departure families.
 - Owed to CI: the integration suite, whose conftest needs all nine services, was not run locally;
   CI's integration job is its first run.

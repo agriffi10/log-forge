@@ -36,8 +36,8 @@ little room to, so such a tail is lost there unless it does, counted once and na
 
 **The bound.** A backlog batch is delivered when its delivery fits in `max_retries + 1` rounds, four
 at the default, of one `publish_timeout` each. At a 0.2 s budget that is 0.8 s against SPEC-090's
-0.5 s target, and one probe run in twenty on 3.13.1 outlasted it, losing 39 events
-counted and named. That residual is `architecture.md` §12's open item *A JetStream `NATSSink`
+0.5 s target. One probe run in twenty on 3.13.1 outlasted it, losing 39 events
+counted and named, and so did one of the diff review's sixty, under CPU starvation. That residual is `architecture.md` §12's open item *A JetStream `NATSSink`
 backlog batch whose delivery outlasts the worker's rounds still loses its tail*.
 
 **What stays as it was, and the asymmetry it widens.** A publish that raised stays `REJECTED` in a
