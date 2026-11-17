@@ -7,12 +7,16 @@ The misbehaviour is armed by the first round that begins after the trigger, neve
   transient  that round's first publish takes 1.5 x publish_timeout, ignoring the driver timeout it is handed (the
              shape of the driver's force-flush past 2 MiB into a peer that stopped reading, SPEC-061 FR-001); every
              other publish acks in 1 ms
+  long       that round's first publish takes 15 x publish_timeout, ignoring its timeout; every other acks in 1 ms
   slow       from that round on, every publish takes 1.5 x publish_timeout, ignoring its timeout
   reconnect  from that round on, the client reports itself disconnected until 1 s after the trigger
   dead       from that round on, the client reports itself disconnected
-The trigger is `exit` (the stop: shutdown(timeout) is called once the backlog is queued) or `steady` (a flag set while
-the worker drains the backlog; no shutdown for 6 s, then health() is read, then shutdown(timeout)).
-Usage: python spec104_nats_exit_latch.py <mode> <exit|steady> <spans> <publish_timeout> <shutdown timeout>
+The trigger is `exit` (the stop: shutdown(timeout) is called once the backlog is queued), `steady` (a flag set while
+the worker drains the backlog; no shutdown for 6 s, then health() is read, then shutdown(timeout)), or `cost` (after
+the backlog has drained, the flag is set and 10 spans logged, so the stall lands in their round; 2.5 s later 50 more
+spans are logged, then flush(timeout=5) and shutdown(timeout) are each timed: what a stall costs the calls that wait
+on the drain thread).
+Usage: python spec104_nats_exit_latch.py <mode> <exit|steady|cost> <spans> <publish_timeout> <shutdown timeout>
 """
 import asyncio
 import contextlib
@@ -38,10 +42,10 @@ class JS:
 
     async def publish(self, subject, payload, *, timeout=None):
         kind = CURRENT[0]
-        stall = ARMED[0] is not None and (MODE == "slow" or (MODE == "transient" and not self.c.stalled))
+        stall = ARMED[0] is not None and (MODE == "slow" or (MODE in ("transient", "long") and not self.c.stalled))
         if stall:
             self.c.stalled = True
-            await asyncio.sleep(1.5 * TIMEOUT)
+            await asyncio.sleep((15 if MODE == "long" else 1.5) * TIMEOUT)
         else:
             await asyncio.sleep(0.001)
         ACKS[kind] += 1
@@ -102,13 +106,32 @@ def work():
 for _ in range(SPANS):
     work()
 err = io.StringIO()
+if WHEN == "cost":
+    with contextlib.redirect_stderr(err):
+        time.sleep(1.0)
+        TRIGGER[0] = time.monotonic()
+        for _ in range(10):
+            work()
+        time.sleep(2.5)
+        for _ in range(50):
+            work()
+        t0 = time.monotonic()
+        flushed = lf.flush(timeout=5)
+        flush_took = time.monotonic() - t0
+        t0 = time.monotonic()
+        lf.shutdown(timeout=SHUT)
+        took = time.monotonic() - t0
+    h = lf.health()
+    print(f"{MODE} cost: flush={flush_took:.2f}s flush_ok={bool(flushed)} shutdown={took:.2f}s "
+          f"batch_lost={h.events.batch_lost} sink_lost={h.events.sink_lost} failed_batches={h.failed_batches}")
+    sys.exit(0)
 with contextlib.redirect_stderr(err):
     if WHEN == "steady":
         TRIGGER[0] = time.monotonic()
         time.sleep(6)
         h = lf.health()
         print(f"{MODE} steady, 6 s after the trigger: steady_acked={ACKS['steady']} of {2 * SPANS} "
-              f"batch_lost={h.events.batch_lost} failed_batches={h.failed_batches}")
+              f"batch_lost={h.events.batch_lost} sink_lost={h.events.sink_lost} failed_batches={h.failed_batches}")
     else:
         TRIGGER[0] = time.monotonic()
     t0 = time.monotonic()
@@ -117,4 +140,4 @@ with contextlib.redirect_stderr(err):
 h = lf.health()
 lines = sum(1 for line in err.getvalue().splitlines() if line.startswith("log-foundry"))
 print(f"{MODE} {WHEN}: steady_acked={ACKS['steady']} exit_acked={ACKS['exit']} of {2 * SPANS} "
-      f"batch_lost={h.events.batch_lost} failed_batches={h.failed_batches} took={took:.2f}s lines={lines}")
+      f"batch_lost={h.events.batch_lost} sink_lost={h.events.sink_lost} failed_batches={h.failed_batches} took={took:.2f}s lines={lines}")
