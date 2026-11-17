@@ -98,7 +98,11 @@ wait (`DRIVER_DEADLINE_MARGIN`; before that margin the two tied and every such w
 abandoned, SPEC-061's diff review frame 3); a publish the driver never returns from — a force-flush
 into a peer that stopped reading, or a driver ignoring its own timeout — is abandoned, counted as
 unconfirmed, and never retried. Both mean the same thing — no ack, and the event may have been
-persisted — so the first can duplicate while the second can lose. The closure is `architecture.md` §12's `Nats-Msg-Id` deduplication item, which
+persisted — so the first can duplicate while the second can lose. Since SPEC-102 the first also
+occurs in a round that resends a batch's unattempted tail and publishes nothing: such a round is
+answered whole like any round that publishes nothing, so its raised publish is resent and counted
+once per round it raised in, where before it could happen only in a batch's first round. The
+closure is `architecture.md` §12's `Nats-Msg-Id` deduplication item, which
 makes a retry safe.
 At every shipped site that decides a per-event drop, a `dropped` count is made only by an `emit`
 that returned; one that raised counts none of them, and whoever caught it — the worker, the
@@ -197,7 +201,9 @@ the sink counted it or a refusal line names it, over every engine sink the roste
 and `tests/test_engine_sinks_roster.py` (every engine sink's counts and the derived roster,
 SPEC-074), `tests/test_wrapper_verdicts.py` and `tests/test_multi_engine_children.py` (a wrapper's
 ledger against the bare sink's over real HTTP, SQS and NATS sinks, and an engine child's counts
-under `MultiSink`, SPEC-075), and `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded);
+under `MultiSink`, SPEC-075), `tests/test_sinks_nats_engine_matrix.py` (NATS held to 1.x's ledger as recorded,
+except the eight worker cells SPEC-102 names) and `tests/test_sinks_nats_unattempted.py` (a NATS
+round's unattempted tail resent and counted once, SPEC-102);
 `tests/test_file_sink_deliver.py` (the file sinks' counts once per run, the torn event's
 `UNKNOWN` and the declined-run residue, SPEC-082); `tests/test_stream_sink_deliver.py` (the stream
 sinks' counts once per run, a handed line's `UNKNOWN` or latched `REJECTED`, SPEC-084);

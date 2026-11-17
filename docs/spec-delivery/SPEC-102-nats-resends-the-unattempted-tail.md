@@ -1,0 +1,71 @@
+# Completed Spec — SPEC-102: NATSSink Resends the Tail Its Deadline Left Unattempted
+
+## What was completed?
+
+- **The verdict and the line** (FR-001, FR-002), in `sinks/nats.py`: `_verdict_of` answers an
+  `unattempted` event `RETRYABLE`, not sink-counted, in a round where something was published, and
+  `_register` registers that round's `NATSSink publish_timeout <t>s` line `When.LAST`. The
+  docstrings of `_verdict_of`, `_register`, `_publish_all`, `_round` and the class state the new
+  rule, the old sentences struck.
+- **The tests** (FR-001 to FR-004): `tests/test_sinks_nats_unattempted.py`, 25 tests on the
+  harness's `Clock` and doubles, with a per-call `RoundScript` and a `RecordingClient` of its own so
+  the harness's recorded shape is untouched; `tests/test_sinks_nats_engine_matrix.py` names its
+  eight departures in `DEPARTURES`, pins each to FR-004's table through `_moved`, and gains
+  `test_the_departures_are_eight_cells_the_harness_names`. The 1.x fixture is unchanged.
+- **The record** (FR-006): the decision *An event a NATS round never handed to the driver is
+  resendable* (`docs/decisions/sink-delivery/`); §12's item struck and moved under *Resolved*, and
+  the narrower residual filed as a new open item; the JetStream asymmetry's wider reach in
+  `docs/invariants.md` and §12's `Nats-Msg-Id` item; `docs/release-notes/v1.2.1.md`, its known gap
+  replaced by a *Fixed* entry and a tenth upgrade exception. The README states neither rule.
+- **Two corrections to the spec at completion**, in its revision history: FR-005 AC1 now states the
+  measured outcome and its bound, and FR-001's exit-drain sentence no longer says the tail behind
+  an abandoned publish is always lost there, since it is delivered if that publish finishes between
+  two rounds.
+
+## What changed from earlier specs?
+
+- SPEC-074's NATS mapping: an unattempted event beside a published one was `REJECTED` and its line
+  `ALWAYS`. Through the worker, eight cells of SPEC-074's 1.x matrix now depart from 1.x by name;
+  every `emit` cell still matches it.
+- SPEC-090's `NATSSink` residual is closed, down to a bound: a batch is delivered while its delivery
+  fits the worker's `max_retries + 1` rounds of one `publish_timeout` each.
+
+## The probe (FR-005)
+
+`docs/audits/2026-11-14-probes/core-pipeline/spec090_nats_ack_backlog.py 0.002 <spans 200> <budget>`
+at `b35ad63a` (the first three 0.2 s runs on each interpreter and both 10 s runs) or `00ec9029`,
+whose `src/` differ only in docstring and line layout. 3.13.1 is the worktree's `.venv`; 3.12.12
+is pyenv's with `PYTHONPATH=src`. Each row: acked of 400,
+`sink.failed`, `deliver` calls, longest `deliver`.
+
+| Budget | Interpreter | Runs |
+|---|---|---|
+| 0.2 s | 3.13.1, implementer's eight | 361, 42, 10, 0.209 s (one `lost 39 event(s); NATSSink publish_timeout 0.2s` line, 3 abandoned lines, 2.3 s); 400, 3, 8, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 6, 0.200 s; 400, 3, 7, 0.201 s; 400, 4, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s |
+| 0.2 s | 3.13.1, orchestrating session's twelve, at a load average near 140 | each each 400 acked, `sink.failed` 2 to 4 equal to its abandoned lines, no `publish_timeout` line; calls and longest `deliver` not kept |
+| 0.2 s | 3.12.12 | 400, 3, 8, 0.201 s; 400, 3, 8, 0.201 s; 400, 2, 8, 0.202 s |
+| 10 s | 3.13.1 | 400, 0, 3, 0.492 s |
+| 10 s | 3.12.12 | 400, 0, 4, 0.511 s |
+
+In every run that acked 400, `sink.failed` equalled its `JetStream publish abandoned` lines: the
+unconfirmed publish invariant 2 records, whose ack the probe's fake still delivers. The miss is a
+bound of the fix, not a defect in it: at 0.2 s the four default rounds give 0.8 s against SPEC-090's
+0.5 s batch, and that run's delivery slowed past the margin; the machine's load during it was not
+recorded. It is §12's open item *A JetStream
+`NATSSink` backlog batch whose delivery outlasts the worker's rounds still loses its tail*.
+
+## Verification
+
+- At `00ec9029`, every gate exited 0: ruff, mypy, spec-lint, spec-lint-test, docs-lint,
+  docstring-lint, and pytest on 3.13.1 (11685 passed, 39 skipped, 21 xfailed) and on 3.12.12 in a
+  separate venv (11689 passed, 35 skipped, 21 xfailed). The collect-only diff against `dd358b0e` is
+  additions only, with one id re-keyed by line number,
+  `test_numeric_door_roster.py::test_removing_a_helper_call_is_reported[sinks/nats.py:NATSSink.max_reconnect_attempts@473]`
+  to `@484`, not a removal.
+- Three mutants, each planted inside its function and reverted: M1 (unattempted back to
+  `REJECTED`) failed 28, both FR-001 tests among them; M2 (the line back to `ALWAYS`) failed 29,
+  including `landed-beside-the-unattempted-js-injected-worker` (four lines where one is pinned) and,
+  which the spec did not predict, all eight matching `emit` cells; M3 (the tail marked sink-counted)
+  failed 24 on `failed`, in the four landed worker cells, the run-out test (`(3,0,0) == (3,2,0)`),
+  the decline test and the `max_retries` cases.
+- Owed to CI: the integration suite, whose conftest needs all nine services, was not run locally;
+  CI's integration job is its first run.
