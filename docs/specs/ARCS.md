@@ -550,8 +550,11 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
 
   - **The lifecycle lane**, in order: SPEC-097, SPEC-098, SPEC-101 and SPEC-099. SPEC-105 stays held
     until SPEC-097 lands.
-  - **The sinks lane**, in order: SPEC-092, SPEC-093, then SPEC-094 and SPEC-095, then SPEC-100.
+  - **The sinks lane**, in order: SPEC-092, SPEC-093, then SPEC-094 and SPEC-095 in parallel, then
+    SPEC-100.
   - **Standing alone:** SPEC-104.
+
+  The two lanes and SPEC-104 run at once. The freeze ends when these specs land or Andrew lifts it.
 
   Every other open item in `docs/architecture.md` §12 waits for work Andrew chooses afterwards. The
   rule, with why SPEC-099 and SPEC-105 wait on SPEC-097, is *An arc closes at the specs it names,

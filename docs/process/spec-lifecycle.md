@@ -5,7 +5,7 @@ one authority; `docs/specs/index.yaml` is generated from it (`knowledge-layout.m
 is one edit and a regeneration, never two edits kept in step by hand.
 
 - **Draft** — written, **reviewed by a fresh-context reviewer (`reviewer-contract.md`)** and
-  refined, but **do not build until told.** Specs are often authored well ahead of implementation. A
+  refined, but **do not build until told.** A spec is drafted just in time, once its dependencies have landed (`several-agents.md`). A
   Draft spec sitting in the repo is not a signal to start it. A spec is not Draft-ready while it still
   has unresolved questions (`authoring-a-spec.md`), and a spec that has not been through the gate is not Draft-ready,
   whatever its `spec_status` says. Being told to build an arc is being told to build each of its

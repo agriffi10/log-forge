@@ -84,7 +84,7 @@ has run — are CLAUDE.md's *Review* paragraph; `reviewer-contract.md` carries t
   mid-build is triaged by *kind*, not parked — and the test for the kind is **what the wrong choice
   would cost**: a revert or a follow-up commit, decide; a product outcome the user would have to live
   with, ask:
-  - **Reversible / technical** (naming, file layout, which helper to reuse, an obvious bug fix): just
+  - **Reversible / technical** (naming, file layout, which helper to reuse, an obvious bug fix in your spec's scope): just
     decide in-session and keep moving. If it changes scope or contradicts the spec, **update the spec**
     rather than leaving the divergence implicit.
   - **Product-changing / ambiguous** (anything that alters behavior the user would notice, or a call

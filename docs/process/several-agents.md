@@ -105,16 +105,19 @@ run from its first session. Confirm the queue is installed (the `Q=` line of `.g
 in the main checkout) and run `install.sh` only if it is not, never just to find out (above); then
 brief every session from `docs/templates/multi-agent-briefing.md`, queue section included.
 
-- **Only the orchestrator adds work, and only with Andrew's yes.** A build or fix session starts no
-  other session, writes or revises no spec but its own, and opens no PR but its own. A finding
-  outside its criteria goes into a §12 entry in its own PR or a line in its report, and goes no
-  further. Turning that entry into a spec or a session is the orchestrator's to put to Andrew.
+- **Only the orchestrator adds work, and only with Andrew's yes.** The orchestrator is the session
+  Andrew told to run the arc, or Andrew himself. The rule binds every build or fix session, in an
+  arc or not. Such a session starts no other session, writes or revises no spec but its own, and
+  opens no PR for work outside its own spec or fix. A finding outside its criteria goes into a §12
+  entry in its own PR and stops there. A line in its report is only for what the orchestrator must
+  act on now. Turning a §12 entry into a spec or a session is the orchestrator's to put to Andrew.
+  In this repo the rule overrides any standing instruction to hand new work to a new session.
   An arc closes at the specs it names, never at an empty §12. Why: during the 2026-11-14 audit arc,
   four specs no plan named (SPEC-102 to SPEC-105) grew out of one build, and open §12 items rose
   from 47 to 55. Some of those specs were drafted in parallel against code that then changed under
   them. The decision is *An arc closes at the specs it names, and only its orchestrator adds work*
-  (`docs/decisions/working-rules/`). While a freeze it records holds, its lane order overrides
-  the readiness rule below.
+  (`docs/decisions/working-rules/`). While a freeze it records holds, its lane order replaces the
+  `arc_order` condition of the readiness rule below; that rule's other conditions still hold.
 - **Write a spec just in time.** Draft or revise a spec only when everything it depends on has
   landed, so its premises are measured against the `main` it will build on. Draft one at a time.
 - **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec

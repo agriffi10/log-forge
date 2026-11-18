@@ -32,19 +32,34 @@ Several Draft specs were written ahead of their builds, against code that then m
 Asked on 2026-11-18 whether to adopt a scope freeze with the remaining Draft specs built in lanes,
 Andrew answered "Adopt it".
 
+**The rule.**
+- **Who it binds.** It binds every build or fix session, in an arc or not. The orchestrator is the
+  session Andrew told to run the arc, or Andrew himself.
+- **Where findings go.** A finding outside a session's criteria goes into a §12 entry in its own PR.
+  A line in the session's report is only for what the orchestrator must act on now.
+- **When specs are written.** A spec is drafted or revised only once everything it depends on has
+  landed, and one at a time.
+- **Which instruction wins.** In this repo the rule overrides any standing instruction to hand new
+  work to a new session.
+
 **The scope now fixed.** It covers the nine specs of the arc still Draft that day, plus SPEC-104
 and SPEC-105, which are built alongside the arc and not in it. While the freeze holds, the lanes
-below decide the order, ahead of the readiness rule in `docs/process/several-agents.md`:
+below replace the `arc_order` condition of the readiness rule in
+`docs/process/several-agents.md`; that rule's other conditions still hold. The two lanes and
+SPEC-104 run at once, since their specs name disjoint source files:
 
 - **The lifecycle lane**, in order: SPEC-097, SPEC-098, SPEC-101 and SPEC-099.
   - SPEC-099 comes last although it depends only on Completed specs. SPEC-101's spec review found
     that SPEC-097's prototype makes two of the soak's own tests fail in a serial run. Once the soak
     is live, a red night blocks every merge.
   - SPEC-105 stays held until SPEC-097 lands, because both change the shutdown path in `worker.py`.
-- **The sinks lane**, in order: SPEC-092, SPEC-093, then SPEC-094 and SPEC-095, then SPEC-100.
+    It then joins this lane after SPEC-097, but it resumes only on Andrew's yes, since he held it.
+- **The sinks lane**, in order: SPEC-092, SPEC-093, then SPEC-094 and SPEC-095 in parallel, then
+  SPEC-100.
 - **Standing alone:** SPEC-104.
 
-Every other §12 item waits for work Andrew chooses later.
+The freeze ends when these eleven specs land or Andrew lifts it. Every other §12 item waits for
+work Andrew chooses later.
 
 **What the decision accepts.** A known defect found mid-build waits in §12 instead of being fixed in
 the session that found it, even when that session has the context. The cost is re-reading that
@@ -54,11 +69,12 @@ they will build on.
 **How it is held.** By instruction only:
 - `docs/process/several-agents.md` states the rule.
 - `docs/templates/multi-agent-briefing.md` carries it into every brief.
+- `CLAUDE.md`'s *Running an arc* states the override, in the tier every session loads.
 
 No gate refuses a session that starts another.
 
 **Do NOT build:** a build or fix session that starts another session, drafts a spec other than its
-own, or opens a second PR. Reopening this is Andrew's call.
+own, or opens a PR for work outside its own spec or fix. Reopening this is Andrew's call.
 
 ## History
 
