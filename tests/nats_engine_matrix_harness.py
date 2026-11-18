@@ -54,7 +54,10 @@ class Clock:
     caller's real-time backstop gives up on the loop, and the verdict becomes a wedged loop
     instead of an unconfirmed batch, on both trees alike, so the matrix would compare an
     artifact of the backstop. :func:`run_case` therefore refuses a client whose
-    ``pending_data_size`` is not zero (:func:`_require_drained`).
+    ``pending_data_size`` is not zero (:func:`_require_drained`). Since SPEC-104 a third reader
+    dates an abandoned publish on this clock, so it never ages either: a later round finds it
+    young and waits on the loop until its window ends, one whole budget of real time, before it
+    is refused with the same error and outcome as before, so no recorded case changes.
 
     Attributes:
       base: The real ``monotonic()`` reading taken when the clock was made.

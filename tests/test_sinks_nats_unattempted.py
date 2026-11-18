@@ -297,7 +297,10 @@ def test_a_tail_refused_behind_an_abandoned_publish_is_named_by_the_engine_once(
 
     Event 1's publish is held past the deadline and abandoned, so event 2 is unattempted. Rounds
     two and three are refused before they publish, the run ends on a refused round, and the
-    engine's refusal line names event 2 in place of the ``publish_timeout`` line.
+    engine's refusal line names event 2 in place of the ``publish_timeout`` line. Since SPEC-104
+    each of those rounds first waits out the abandoned publish's window on the loop, and on the
+    harness's frozen clock the publish never ages, so each wait costs one budget of real time
+    before the same refusal.
     """
     run = _run_worker([["ok", "hold"]], 3, monkeypatch)
     assert run.offered == [[0, 1, 2], [2], [2]]
