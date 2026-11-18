@@ -1,0 +1,517 @@
+Output of docs/audits/2026-11-14-probes/sinks/spec092_build_mutants.py, exit 0, run on 2026-11-18
+on macOS with Python 3.13.1 and no extra installed, after the frame-2 diff review's fixes. The commit
+it measured, f611e32b, is the one before this file's; that commit changes only this file and the
+delivery doc's runtime and suite lines, so its src/ and tests/ are the same. Every verdict and
+moved-row list reads as the first run's at 877f8b32; the runtime lines differ, measured at a
+higher load.
+
+SPEC-092 build results at HEAD f611e32b, Python 3.13.1
+
+== HEAD, ledger on
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+  256 rows, 86 red
+
+== source mutant diag-lost-silent: src/log_foundry/_diag.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/diag-lost-silent/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+diag-lost-silent: 89 row(s) moved, 75 of them green before
+    AzureEventHubsSink-refused-always: green -> unannounced
+    CallbackSink-refused-always: green -> unannounced
+    ClickHouseSink-refused-always: green -> unannounced
+    DatadogSink-refused-always: green -> unannounced
+    ElasticsearchSink-partial: green -> unannounced
+    ElasticsearchSink-refused-always: green -> unannounced
+    FileSink-refused-always: green -> unannounced
+    FilteringSink[over-callback]-caller-code-raises: green -> unannounced
+    FilteringSink[over-callback]-refused-always: green -> unannounced
+    FilteringSink[over-http]-refused-always: green -> unannounced
+    FirehoseSink-partial: green -> unannounced
+    FirehoseSink-refused-always: green -> unannounced
+    GooglePubSubSink-never-acknowledged: partition+silent-loss -> partition+silent-loss+unannounced
+    GooglePubSubSink-refused-always: green -> unannounced
+    GooglePubSubSink-refused-once: green -> unannounced
+    GooglePubSubSink-report-indefinite: partition+lost-but-held -> partition+lost-but-held+unannounced
+    HTTPSink-refused-always: green -> unannounced
+    HoneycombSink-no-verdict-shape: green -> unannounced
+    HoneycombSink-partial: green -> unannounced
+    HoneycombSink-refused-always: green -> unannounced
+    KafkaSink-never-acknowledged: partition+silent-loss -> partition+silent-loss+unannounced
+    KafkaSink-refused-always: green -> unannounced
+    KafkaSink-refused-once: green -> unannounced
+    KafkaSink-report-indefinite: partition+lost-but-held -> partition+lost-but-held+unannounced
+    KinesisSink-partial: green -> unannounced
+    KinesisSink-refused-always: green -> unannounced
+    LogstashSink[http]-refused-always: green -> unannounced
+    LogstashSink[tcp]-refused-always: green -> unannounced
+    LogstashSink[udp]-refused-always: green -> unannounced
+    LokiSink-refused-always: green -> unannounced
+    MongoDBSink-no-verdict-shape: green -> unannounced
+    MongoDBSink-partial: green -> unannounced
+    MongoDBSink-refused-always: green -> unannounced
+    MongoDBSink-reply-lost: lost-but-held -> lost-but-held+unannounced
+    MongoDBSink-taken-then-raised: lost-but-held -> lost-but-held+unannounced
+    MultiSink[over-http]-refused-always: green -> unannounced
+    NATSSink[core-injected]-refused-always: green -> unannounced
+    NATSSink[core-injected]-refused-once: green -> unannounced
+    NATSSink[core]-never-acknowledged: green -> unannounced
+    NATSSink[core]-refused-always: green -> unannounced
+    NATSSink[core]-refused-once: green -> unannounced
+    NATSSink[jetstream-injected]-refused-always: green -> unannounced
+    NATSSink[jetstream-injected]-refused-once: green -> unannounced
+    NATSSink[jetstream-injected]-reply-lost: lost-but-held -> lost-but-held+unannounced
+    NATSSink[jetstream]-refused-always: green -> unannounced
+    NATSSink[jetstream]-refused-once: green -> unannounced
+    NATSSink[jetstream]-reply-lost: lost-but-held -> lost-but-held+unannounced
+    NewRelicSink-refused-always: green -> unannounced
+    OTLPSink-refused-always: green -> unannounced
+    OpenSearchSink-partial: green -> unannounced
+    OpenSearchSink-refused-always: green -> unannounced
+    PostgresSink[borrowed]-refused-always: green -> unannounced
+    PostgresSink[borrowed]-reply-lost: lost-but-held -> lost-but-held+unannounced
+    PostgresSink[borrowed]-taken-then-raised: green -> unannounced
+    PostgresSink[owned]-refused-always: green -> unannounced
+    RabbitMQSink[borrowed]-peer-closed: silent-loss -> silent-loss+unannounced
+    RabbitMQSink[borrowed]-refused-always: green -> unannounced
+    RabbitMQSink[borrowed]-refused-once: green -> unannounced
+    RabbitMQSink[borrowed]-taken-then-raised: lost-but-held -> lost-but-held+unannounced
+    RabbitMQSink[owned]-refused-always: green -> unannounced
+    RedisListSink-refused-always: green -> unannounced
+    RedisStreamsSink-refused-always: green -> unannounced
+    RotatingFileSink-refused-always: green -> unannounced
+    SNSSink-partial: green -> unannounced
+    SNSSink-refused-always: green -> unannounced
+    SQLiteSink-refused-always: green -> unannounced
+    SQLiteSink-refused-once: lost-but-held -> lost-but-held+unannounced
+    SQLiteSink-taken-then-raised: lost-but-held -> lost-but-held+unannounced
+    SQLiteSink[autocommit]-autocommit: duplicate+lost-but-held -> duplicate+lost-but-held+unannounced
+    SQSSink[fifo]-partial: green -> unannounced
+    SQSSink[fifo]-refused-always: green -> unannounced
+    SQSSink[standard]-partial: green -> unannounced
+    SQSSink[standard]-refused-always: green -> unannounced
+    SentrySink[http]-refused-always: green -> unannounced
+    SentrySink[sdk]-refused-always: green -> unannounced
+    SentrySink[sdk]-refused-once: green -> unannounced
+    SplunkHECSink-refused-always: green -> unannounced
+    StderrSink-refused-always: green -> unannounced
+    StderrSink-refused-once: green -> unannounced
+    StderrSink-taken-then-raised: green -> unannounced
+    StdoutSink-refused-always: green -> unannounced
+    StdoutSink-refused-once: green -> unannounced
+    StdoutSink-taken-then-raised: green -> unannounced
+    SyslogSink[tcp]-refused-always: green -> unannounced
+    SyslogSink[udp]-refused-always: green -> unannounced
+    TransformSink[over-callback]-caller-code-raises: green -> unannounced
+    TransformSink[over-callback]-refused-always: green -> unannounced
+    TransformSink[over-http]-refused-always: green -> unannounced
+    _FactorySink[over-http]-refused-always: green -> unannounced
+
+== source mutant redis-round-unknown: src/log_foundry/sinks/redis.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/redis-round-unknown/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+redis-round-unknown: 8 row(s) moved, 4 of them green before
+    RedisListSink-refused-always: green -> ambiguous-when-knowable
+    RedisListSink-refused-once: green -> ambiguous-when-knowable
+    RedisListSink-reply-lost: duplicate -> green
+    RedisListSink-taken-then-raised: duplicate -> green
+    RedisStreamsSink-refused-always: green -> ambiguous-when-knowable
+    RedisStreamsSink-refused-once: green -> ambiguous-when-knowable
+    RedisStreamsSink-reply-lost: duplicate -> green
+    RedisStreamsSink-taken-then-raised: duplicate -> green
+
+== source mutant worker-sink-lost-dropped: src/log_foundry/worker.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/worker-sink-lost-dropped/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+worker-sink-lost-dropped: 26 row(s) moved, 22 of them green before
+    ElasticsearchSink-partial: green -> ledger
+    FirehoseSink-partial: green -> ledger
+    HoneycombSink-no-verdict-shape: green -> ledger
+    HoneycombSink-partial: green -> ledger
+    KinesisSink-partial: green -> ledger
+    MongoDBSink-no-verdict-shape: green -> ledger
+    MongoDBSink-partial: green -> ledger
+    MongoDBSink-taken-then-raised: lost-but-held -> lost-but-held+ledger
+    NATSSink[core-injected]-refused-once: green -> ledger
+    NATSSink[core]-never-acknowledged: green -> ledger
+    NATSSink[core]-refused-once: green -> ledger
+    NATSSink[jetstream-injected]-refused-once: green -> ledger
+    NATSSink[jetstream-injected]-reply-lost: lost-but-held -> lost-but-held+ledger
+    NATSSink[jetstream]-refused-once: green -> ledger
+    NATSSink[jetstream]-reply-lost: lost-but-held -> lost-but-held+ledger
+    OpenSearchSink-partial: green -> ledger
+    RabbitMQSink[borrowed]-peer-closed: silent-loss -> silent-loss+ledger
+    SNSSink-partial: green -> ledger
+    SQSSink[fifo]-partial: green -> ledger
+    SQSSink[standard]-partial: green -> ledger
+    StderrSink-refused-always: green -> ledger
+    StderrSink-refused-once: green -> ledger
+    StderrSink-taken-then-raised: green -> ledger
+    StdoutSink-refused-always: green -> ledger
+    StdoutSink-refused-once: green -> ledger
+    StdoutSink-taken-then-raised: green -> ledger
+
+== in-process mutant without:partition
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:partition: 4 row(s) moved, 0 of them green before
+    GooglePubSubSink-never-acknowledged: partition+silent-loss -> silent-loss
+    GooglePubSubSink-report-indefinite: partition+lost-but-held -> lost-but-held
+    KafkaSink-never-acknowledged: partition+silent-loss -> silent-loss
+    KafkaSink-report-indefinite: partition+lost-but-held -> lost-but-held
+
+== in-process mutant without:silent-loss
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:silent-loss: 21 row(s) moved, 0 of them green before
+    ElasticsearchSink-no-verdict-shape: silent-loss -> green
+    FirehoseSink-no-verdict-shape: silent-loss -> green
+    GooglePubSubSink-never-acknowledged: partition+silent-loss -> partition
+    KafkaSink-never-acknowledged: partition+silent-loss -> partition
+    KinesisSink-no-verdict-shape: silent-loss -> green
+    LoggingSink-refused-always: silent-loss -> green
+    LoggingSink-refused-once: silent-loss -> green
+    LogstashSink[tcp]-peer-closed: silent-loss -> green
+    LogstashSink[udp]-peer-closed: silent-loss -> green
+    NATSSink[core-injected]-never-acknowledged: silent-loss -> green
+    NullSink-clean: silent-loss -> green
+    OpenSearchSink-no-verdict-shape: silent-loss -> green
+    RabbitMQSink[borrowed]-peer-closed: silent-loss -> green
+    RabbitMQSink[owned]-peer-closed: silent-loss -> green
+    SNSSink-no-verdict-shape: silent-loss -> green
+    SQSSink[fifo]-no-verdict-shape: silent-loss -> green
+    SQSSink[standard]-no-verdict-shape: silent-loss -> green
+    SentrySink[sdk]-never-acknowledged: silent-loss -> green
+    SentrySink[sdk]-report-indefinite: silent-loss -> green
+    SyslogSink[tcp]-peer-closed: silent-loss -> green
+    SyslogSink[udp]-peer-closed: silent-loss -> green
+
+== in-process mutant without:duplicate
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:duplicate: 55 row(s) moved, 0 of them green before
+    AzureEventHubsSink-reply-lost: duplicate -> green
+    AzureEventHubsSink-taken-then-raised: duplicate -> green
+    CallbackSink-taken-then-raised: duplicate -> green
+    ClickHouseSink-reply-lost: duplicate -> green
+    ClickHouseSink-taken-then-raised: duplicate -> green
+    DatadogSink-reply-lost: duplicate -> green
+    DatadogSink-taken-then-raised: duplicate -> green
+    ElasticsearchSink-reply-lost: duplicate -> green
+    ElasticsearchSink-taken-then-raised: duplicate -> green
+    FilteringSink[over-callback]-taken-then-raised: duplicate -> green
+    FilteringSink[over-http]-reply-lost: duplicate -> green
+    FilteringSink[over-http]-taken-then-raised: duplicate -> green
+    FirehoseSink-reply-lost: duplicate -> green
+    FirehoseSink-taken-then-raised: duplicate -> green
+    HTTPSink-reply-lost: duplicate -> green
+    HTTPSink-taken-then-raised: duplicate -> green
+    HoneycombSink-reply-lost: duplicate -> green
+    HoneycombSink-taken-then-raised: duplicate -> green
+    KinesisSink-reply-lost: duplicate -> green
+    KinesisSink-taken-then-raised: duplicate -> green
+    LogstashSink[http]-reply-lost: duplicate -> green
+    LogstashSink[http]-taken-then-raised: duplicate -> green
+    LogstashSink[tcp]-taken-then-raised: duplicate -> green
+    LokiSink-reply-lost: duplicate -> green
+    LokiSink-taken-then-raised: duplicate -> green
+    MultiSink[over-http]-reply-lost: duplicate -> green
+    MultiSink[over-http]-taken-then-raised: duplicate -> green
+    NewRelicSink-reply-lost: duplicate -> green
+    NewRelicSink-taken-then-raised: duplicate -> green
+    OTLPSink-reply-lost: duplicate -> green
+    OTLPSink-taken-then-raised: duplicate -> green
+    OpenSearchSink-reply-lost: duplicate -> green
+    OpenSearchSink-taken-then-raised: duplicate -> green
+    PostgresSink[autocommit]-autocommit: duplicate -> green
+    PostgresSink[owned]-reply-lost: duplicate -> green
+    RabbitMQSink[owned]-taken-then-raised: duplicate -> green
+    RedisListSink-reply-lost: duplicate -> green
+    RedisListSink-taken-then-raised: duplicate -> green
+    RedisStreamsSink-reply-lost: duplicate -> green
+    RedisStreamsSink-taken-then-raised: duplicate -> green
+    SNSSink-reply-lost: duplicate -> green
+    SNSSink-taken-then-raised: duplicate -> green
+    SQLiteSink[autocommit]-autocommit: duplicate+lost-but-held -> lost-but-held
+    SQSSink[standard]-reply-lost: duplicate -> green
+    SQSSink[standard]-taken-then-raised: duplicate -> green
+    SentrySink[http]-reply-lost: duplicate -> green
+    SentrySink[http]-taken-then-raised: duplicate -> green
+    SplunkHECSink-reply-lost: duplicate -> green
+    SplunkHECSink-taken-then-raised: duplicate -> green
+    SyslogSink[tcp]-taken-then-raised: duplicate -> green
+    TransformSink[over-callback]-taken-then-raised: duplicate -> green
+    TransformSink[over-http]-reply-lost: duplicate -> green
+    TransformSink[over-http]-taken-then-raised: duplicate -> green
+    _FactorySink[over-http]-reply-lost: duplicate -> green
+    _FactorySink[over-http]-taken-then-raised: duplicate -> green
+
+== in-process mutant without:lost-but-held
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:lost-but-held: 11 row(s) moved, 0 of them green before
+    GooglePubSubSink-report-indefinite: partition+lost-but-held -> partition
+    KafkaSink-report-indefinite: partition+lost-but-held -> partition
+    MongoDBSink-reply-lost: lost-but-held -> green
+    MongoDBSink-taken-then-raised: lost-but-held -> green
+    NATSSink[jetstream-injected]-reply-lost: lost-but-held -> green
+    NATSSink[jetstream]-reply-lost: lost-but-held -> green
+    PostgresSink[borrowed]-reply-lost: lost-but-held -> green
+    RabbitMQSink[borrowed]-taken-then-raised: lost-but-held -> green
+    SQLiteSink-refused-once: lost-but-held -> green
+    SQLiteSink-taken-then-raised: lost-but-held -> green
+    SQLiteSink[autocommit]-autocommit: duplicate+lost-but-held -> duplicate
+
+== in-process mutant without:unannounced
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:unannounced: 0 row(s) moved, 0 of them green before
+
+== in-process mutant without:ambiguous-when-knowable
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:ambiguous-when-knowable: 0 row(s) moved, 0 of them green before
+
+== in-process mutant without:ledger
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+without:ledger: 0 row(s) moved, 0 of them green before
+
+== in-process mutant fate_of:rejected-landed
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+fate_of:rejected-landed: 16 row(s) moved, 13 of them green before
+    ElasticsearchSink-partial: green -> partition+silent-loss+ledger
+    HoneycombSink-partial: green -> partition+silent-loss+ledger
+    MongoDBSink-partial: green -> partition+silent-loss+ledger
+    MongoDBSink-taken-then-raised: lost-but-held -> partition+ledger
+    NATSSink[core-injected]-refused-once: green -> partition+silent-loss+ledger
+    NATSSink[core]-refused-once: green -> partition+silent-loss+ledger
+    NATSSink[jetstream-injected]-refused-once: green -> partition+silent-loss+ledger
+    NATSSink[jetstream-injected]-reply-lost: lost-but-held -> partition+ledger
+    NATSSink[jetstream]-refused-once: green -> partition+silent-loss+ledger
+    NATSSink[jetstream]-reply-lost: lost-but-held -> partition+ledger
+    OpenSearchSink-partial: green -> partition+silent-loss+ledger
+    SNSSink-partial: green -> partition+silent-loss+ledger
+    SQSSink[fifo]-partial: green -> partition+silent-loss+ledger
+    SQSSink[standard]-partial: green -> partition+silent-loss+ledger
+    StderrSink-refused-always: green -> partition+silent-loss+ledger
+    StdoutSink-refused-always: green -> partition+silent-loss+ledger
+
+== in-process mutant duplicate:at-least-once
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+duplicate:at-least-once: 143 row(s) moved, 119 of them green before
+    AzureEventHubsSink-clean: green -> duplicate
+    AzureEventHubsSink-refused-once: green -> duplicate
+    CallbackSink-clean: green -> duplicate
+    CallbackSink-refused-once: green -> duplicate
+    ClickHouseSink-clean: green -> duplicate
+    ClickHouseSink-refused-once: green -> duplicate
+    DatadogSink-clean: green -> duplicate
+    DatadogSink-refused-once: green -> duplicate
+    ElasticsearchSink-clean: green -> duplicate
+    ElasticsearchSink-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    ElasticsearchSink-partial: green -> duplicate
+    ElasticsearchSink-refused-once: green -> duplicate
+    FileSink-clean: green -> duplicate
+    FileSink-refused-once: green -> duplicate
+    FileSink-taken-then-raised: green -> duplicate
+    FilteringSink[over-callback]-caller-code-raises: green -> duplicate
+    FilteringSink[over-callback]-clean: green -> duplicate
+    FilteringSink[over-callback]-refused-once: green -> duplicate
+    FilteringSink[over-http]-caller-code-raises: green -> duplicate
+    FilteringSink[over-http]-clean: green -> duplicate
+    FilteringSink[over-http]-refused-once: green -> duplicate
+    FirehoseSink-clean: green -> duplicate
+    FirehoseSink-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    FirehoseSink-partial: green -> duplicate
+    FirehoseSink-refused-once: green -> duplicate
+    GooglePubSubSink-clean: green -> duplicate
+    GooglePubSubSink-refused-once: green -> duplicate
+    GooglePubSubSink-report-indefinite: partition+lost-but-held -> partition+duplicate+lost-but-held
+    HTTPSink-clean: green -> duplicate
+    HTTPSink-refused-once: green -> duplicate
+    HoneycombSink-clean: green -> duplicate
+    HoneycombSink-no-verdict-shape: green -> duplicate
+    HoneycombSink-partial: green -> duplicate
+    HoneycombSink-refused-once: green -> duplicate
+    KafkaSink-clean: green -> duplicate
+    KafkaSink-refused-once: green -> duplicate
+    KafkaSink-report-indefinite: partition+lost-but-held -> partition+duplicate+lost-but-held
+    KinesisSink-clean: green -> duplicate
+    KinesisSink-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    KinesisSink-partial: green -> duplicate
+    KinesisSink-refused-once: green -> duplicate
+    LoggingSink-clean: green -> duplicate
+    LoggingSink-refused-once: silent-loss -> silent-loss+duplicate
+    LoggingSink-taken-then-raised: green -> duplicate
+    LogstashSink[http]-clean: green -> duplicate
+    LogstashSink[http]-refused-once: green -> duplicate
+    LogstashSink[tcp]-clean: green -> duplicate
+    LogstashSink[tcp]-peer-closed: silent-loss -> silent-loss+duplicate
+    LogstashSink[tcp]-refused-once: green -> duplicate
+    LogstashSink[udp]-clean: green -> duplicate
+    LogstashSink[udp]-peer-closed: silent-loss -> silent-loss+duplicate
+    LogstashSink[udp]-refused-once: green -> duplicate
+    LokiSink-clean: green -> duplicate
+    LokiSink-refused-once: green -> duplicate
+    MemorySink-clean: green -> duplicate
+    MongoDBSink-clean: green -> duplicate
+    MongoDBSink-no-verdict-shape: green -> duplicate
+    MongoDBSink-partial: green -> duplicate
+    MongoDBSink-refused-once: green -> duplicate
+    MongoDBSink-reply-lost: lost-but-held -> duplicate+lost-but-held
+    MongoDBSink-taken-then-raised: lost-but-held -> duplicate+lost-but-held
+    MultiSink[over-http]-clean: green -> duplicate
+    MultiSink[over-http]-refused-once: green -> duplicate
+    NATSSink[core-injected]-clean: green -> duplicate
+    NATSSink[core-injected]-refused-once: green -> duplicate
+    NATSSink[core]-clean: green -> duplicate
+    NATSSink[core]-refused-once: green -> duplicate
+    NATSSink[jetstream-injected]-clean: green -> duplicate
+    NATSSink[jetstream-injected]-refused-once: green -> duplicate
+    NATSSink[jetstream-injected]-reply-lost: lost-but-held -> duplicate+lost-but-held
+    NATSSink[jetstream]-clean: green -> duplicate
+    NATSSink[jetstream]-refused-once: green -> duplicate
+    NATSSink[jetstream]-reply-lost: lost-but-held -> duplicate+lost-but-held
+    NewRelicSink-clean: green -> duplicate
+    NewRelicSink-refused-once: green -> duplicate
+    OTLPSink-clean: green -> duplicate
+    OTLPSink-refused-once: green -> duplicate
+    OpenSearchSink-clean: green -> duplicate
+    OpenSearchSink-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    OpenSearchSink-partial: green -> duplicate
+    OpenSearchSink-refused-once: green -> duplicate
+    PostgresSink[borrowed]-clean: green -> duplicate
+    PostgresSink[borrowed]-refused-once: green -> duplicate
+    PostgresSink[borrowed]-reply-lost: lost-but-held -> duplicate+lost-but-held
+    PostgresSink[owned]-clean: green -> duplicate
+    PostgresSink[owned]-refused-once: green -> duplicate
+    PostgresSink[owned]-taken-then-raised: green -> duplicate
+    RabbitMQSink[borrowed]-clean: green -> duplicate
+    RabbitMQSink[borrowed]-peer-closed: silent-loss -> silent-loss+duplicate
+    RabbitMQSink[borrowed]-taken-then-raised: lost-but-held -> duplicate+lost-but-held
+    RabbitMQSink[owned]-clean: green -> duplicate
+    RabbitMQSink[owned]-peer-closed: silent-loss -> silent-loss+duplicate
+    RabbitMQSink[owned]-refused-once: green -> duplicate
+    RedisListSink-clean: green -> duplicate
+    RedisListSink-refused-once: green -> duplicate
+    RedisStreamsSink-clean: green -> duplicate
+    RedisStreamsSink-refused-once: green -> duplicate
+    RotatingFileSink-clean: green -> duplicate
+    RotatingFileSink-refused-once: green -> duplicate
+    RotatingFileSink-taken-then-raised: green -> duplicate
+    SNSSink-clean: green -> duplicate
+    SNSSink-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    SNSSink-partial: green -> duplicate
+    SNSSink-refused-once: green -> duplicate
+    SQLiteSink-clean: green -> duplicate
+    SQLiteSink-refused-once: lost-but-held -> duplicate+lost-but-held
+    SQLiteSink-taken-then-raised: lost-but-held -> duplicate+lost-but-held
+    SQSSink[fifo]-clean: green -> duplicate
+    SQSSink[fifo]-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    SQSSink[fifo]-partial: green -> duplicate
+    SQSSink[fifo]-refused-once: green -> duplicate
+    SQSSink[fifo]-reply-lost: green -> duplicate
+    SQSSink[fifo]-taken-then-raised: green -> duplicate
+    SQSSink[standard]-clean: green -> duplicate
+    SQSSink[standard]-no-verdict-shape: silent-loss -> silent-loss+duplicate
+    SQSSink[standard]-partial: green -> duplicate
+    SQSSink[standard]-refused-once: green -> duplicate
+    SentrySink[http]-clean: green -> duplicate
+    SentrySink[http]-refused-once: green -> duplicate
+    SentrySink[sdk]-clean: green -> duplicate
+    SentrySink[sdk]-refused-once: green -> duplicate
+    SplunkHECSink-clean: green -> duplicate
+    SplunkHECSink-refused-once: green -> duplicate
+    StderrSink-clean: green -> duplicate
+    StderrSink-refused-once: green -> duplicate
+    StderrSink-taken-then-raised: green -> duplicate
+    StdoutSink-clean: green -> duplicate
+    StdoutSink-refused-once: green -> duplicate
+    StdoutSink-taken-then-raised: green -> duplicate
+    SyslogSink[tcp]-clean: green -> duplicate
+    SyslogSink[tcp]-peer-closed: silent-loss -> silent-loss+duplicate
+    SyslogSink[tcp]-refused-once: green -> duplicate
+    SyslogSink[udp]-clean: green -> duplicate
+    SyslogSink[udp]-peer-closed: silent-loss -> silent-loss+duplicate
+    SyslogSink[udp]-refused-once: green -> duplicate
+    TransformSink[over-callback]-caller-code-raises: green -> duplicate
+    TransformSink[over-callback]-clean: green -> duplicate
+    TransformSink[over-callback]-refused-once: green -> duplicate
+    TransformSink[over-http]-caller-code-raises: green -> duplicate
+    TransformSink[over-http]-clean: green -> duplicate
+    TransformSink[over-http]-refused-once: green -> duplicate
+    _FactorySink[over-http]-clean: green -> duplicate
+    _FactorySink[over-http]-refused-once: green -> duplicate
+
+== in-process mutant driver_classes:empty
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+driver_classes:empty: 21 row(s) moved, 2 of them green before
+    AzureEventHubsSink-reply-lost: duplicate -> lost-but-held
+    AzureEventHubsSink-taken-then-raised: duplicate -> lost-but-held
+    ClickHouseSink-reply-lost: duplicate -> lost-but-held
+    ClickHouseSink-taken-then-raised: duplicate -> lost-but-held
+    FirehoseSink-reply-lost: duplicate -> lost-but-held
+    FirehoseSink-taken-then-raised: duplicate -> lost-but-held
+    KinesisSink-reply-lost: duplicate -> lost-but-held
+    KinesisSink-taken-then-raised: duplicate -> lost-but-held
+    PostgresSink[autocommit]-autocommit: duplicate -> lost-but-held
+    PostgresSink[owned]-reply-lost: duplicate -> lost-but-held
+    RabbitMQSink[owned]-taken-then-raised: duplicate -> lost-but-held
+    RedisListSink-reply-lost: duplicate -> lost-but-held
+    RedisListSink-taken-then-raised: duplicate -> lost-but-held
+    RedisStreamsSink-reply-lost: duplicate -> lost-but-held
+    RedisStreamsSink-taken-then-raised: duplicate -> lost-but-held
+    SNSSink-reply-lost: duplicate -> lost-but-held
+    SNSSink-taken-then-raised: duplicate -> lost-but-held
+    SQSSink[fifo]-reply-lost: green -> lost-but-held
+    SQSSink[fifo]-taken-then-raised: green -> lost-but-held
+    SQSSink[standard]-reply-lost: duplicate -> lost-but-held
+    SQSSink[standard]-taken-then-raised: duplicate -> lost-but-held
+
+== FR-005: 6bd0b66e, ledger off (the baseline)
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/t6bd0b66e/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+  86 red
+
+== HEAD, ledger off, against 6bd0b66e (rows a dependency moved)
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+HEAD: 0 row(s) moved, 0 of them green before
+
+== FR-005: a2cd4b36^, ledger off
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/a2cd4b36_/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+a2cd4b36^: 2 row(s) moved, 2 of them green before
+    StderrSink-taken-then-raised: green -> duplicate
+    StdoutSink-taken-then-raised: green -> duplicate
+
+== FR-005: 9b54b370^, ledger off
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/9b54b370_/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+9b54b370^: 4 row(s) moved, 4 of them green before
+    FileSink-refused-once: green -> lost-but-held
+    RotatingFileSink-refused-once: green -> lost-but-held
+    StderrSink-taken-then-raised: green -> duplicate
+    StdoutSink-taken-then-raised: green -> duplicate
+
+== FR-005: a0f44b5f, ledger off
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/a0f44b5f/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec092-build-xa9ld8ww/helpers/conformance_backend.py
+a0f44b5f: 4 row(s) moved, 4 of them green before
+    FileSink-refused-once: green -> lost-but-held
+    RotatingFileSink-refused-once: green -> lost-but-held
+    StderrSink-taken-then-raised: green -> duplicate
+    StdoutSink-taken-then-raised: green -> duplicate
+
+== runtime: pytest tests/test_conformance.py -n 0, three runs
+  exit 0, 1.82 s wall, one-minute load 17.21: 182 passed, 74 xfailed in 1.38s
+  exit 0, 1.80 s wall, one-minute load 17.21: 182 passed, 74 xfailed in 1.32s
+  exit 0, 1.96 s wall, one-minute load 16.79: 182 passed, 74 xfailed in 1.53s
+
+== git diff --exit-code origin/main -- src: exit 0
+
+== criteria
+  all held

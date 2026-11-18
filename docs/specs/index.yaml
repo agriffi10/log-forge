@@ -613,7 +613,7 @@ specs:
   - id: "SPEC-092"
     title: "A Sink Conformance Corpus Keyed on Acknowledgement Class, with an Explicit Ambiguous Outcome"
     description: "Adds one test corpus that runs every shipped sink through the fault scripts of its acknowledgement class against a stateful fake backend, and judges each row by one assertion: what the backend holds, against what the sink and its catcher reported, event by event, with an ambiguous outcome of its own, so that a sink which loses, duplicates or miscounts under a fault fails a test, and every row red today is pinned to the open item that owns it."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-026", "SPEC-041", "SPEC-049", "SPEC-061", "SPEC-069", "SPEC-071", "SPEC-072", "SPEC-073", "SPEC-074", "SPEC-075", "SPEC-079", "SPEC-082", "SPEC-084", "SPEC-085", "SPEC-088", "SPEC-089", "SPEC-090", "SPEC-091"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-092-sink-conformance-corpus.md"

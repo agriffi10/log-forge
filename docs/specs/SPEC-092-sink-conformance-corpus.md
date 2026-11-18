@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-092
 title: "A Sink Conformance Corpus Keyed on Acknowledgement Class, with an Explicit Ambiguous Outcome"
 description: "Adds one test corpus that runs every shipped sink through the fault scripts of its acknowledgement class against a stateful fake backend, and judges each row by one assertion: what the backend holds, against what the sink and its catcher reported, event by event, with an ambiguous outcome of its own, so that a sink which loses, duplicates or miscounts under a fault fails a test, and every row red today is pinned to the open item that owns it."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-026, SPEC-041, SPEC-049, SPEC-061, SPEC-069, SPEC-071, SPEC-072, SPEC-073, SPEC-074, SPEC-075, SPEC-079, SPEC-082, SPEC-084, SPEC-085, SPEC-088, SPEC-089, SPEC-090, SPEC-091]
 arc: audit-2026-11-14
 arc_order: 8
@@ -619,7 +619,9 @@ class Report:
     batch_losses: tuple[tuple[int, int], ...]   # per batch: events lost or ambiguous, its lines
     late_lines: int
     disagreement: str | None               # a run's fates against that run's Delivery
-    ledger: Mapping[str, int] | None       # the row's moves of SPEC-088's terms
+    ledger_moves: Mapping[str, int] | None     # the row's moves of SPEC-088's terms
+    ledger_expected: Mapping[str, int] | None  # the same terms as the worker's path sets them
+    unaccounted: int | None                    # `health().events.unaccounted`; None, ledger off
 
 def fate_of(outcome: object) -> Fate: ...   # the one reading of a round's outcome
 def judge(events: list[str], backend: Backend, report: Report) -> tuple[Check, ...]: ...
@@ -733,9 +735,10 @@ two `autocommit` pins, and RabbitMQ at `publish-without-confirms`.
 
 **The driver branch.** With `driver_classes` answering `()` everywhere, 21 rows moved: the
 `taken-then-raised` and `reply-lost` rows of `SQSSink` (both variants), `SNSSink`, `KinesisSink`,
-`FirehoseSink`, `ClickHouseSink`, `AzureEventHubsSink`, both Redis sinks and both `PostgresSink`
-connection variants, and `RabbitMQSink[owned]-taken-then-raised`, most from `duplicate` to
-`lost-but-held`, since an unrecognised error is refused at once rather than retried.
+`FirehoseSink`, `ClickHouseSink`, `AzureEventHubsSink` and both Redis sinks,
+`PostgresSink[owned]-reply-lost`, `PostgresSink[autocommit]-autocommit` and
+`RabbitMQSink[owned]-taken-then-raised`, most from `duplicate` to `lost-but-held`, since an
+unrecognised error is refused at once rather than retried.
 
 **Cost.** `spec092_run.py` runs all 256 rows in 0.37 to 0.49 s. As 256 parametrized pytest items in
 a scratch copy of the tree, with `tests/conftest.py`'s fixtures, 0.50 to 0.55 s under `-n 0` in
@@ -806,3 +809,17 @@ measured.
   measured, since this spec builds before SPEC-096 in the arc and reads the tree it is built on.
   `spec096_corpus_rows.py` ran every row with both classes' limit at 1,048,576 and at 1,024, and
   no row moved, so no row or total changed.
+- Revised on 2026-11-18 by the build, after the plan review. **`Report`'s `ledger`** became three
+  fields, `ledger_moves`, `ledger_expected` and `unaccounted`, because `judge` cannot derive the
+  expected ledger from per-event fates: for `MultiSink` and `_FactorySink`, which offer no
+  `deliver`, the judged sink is the engine child, while the worker's ledger follows its own `emit`
+  loop (`MultiSink[over-http]-refused-always` has eight lost fates and `delivered=8`). The driver
+  sets the expected terms from the worker's own path, read from `_engine._run`'s `sink` against
+  the worker's sink inside `Worker._emit`, as FR-003's ledger paragraph describes; no verdict
+  moved. **The finding-12 text** in FR-004 departs from its literal words: SPEC-089 had already
+  struck the `FlushResult` closure, so the build struck and rewrote the live **Closed by**
+  sentence ("the acknowledgement fix for these two sinks (SPEC-094) ...") into the decided text,
+  and left SPEC-089's struck text as it stood. **The Evidence's driver-branch sentence** is
+  corrected in place: the two `PostgresSink` rows that move are `[owned]-reply-lost` and
+  `[autocommit]-autocommit`, measured at `6bd0b66e` and at `9ee07a88`, not both connection
+  variants' `taken-then-raised` and `reply-lost`; the count, 21, was right.

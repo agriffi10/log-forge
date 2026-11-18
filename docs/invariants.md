@@ -219,7 +219,13 @@ sinks' counts once per run, a handed line's `UNKNOWN` or latched `REJECTED`, SPE
 holding each term to its exact share, and for an `HTTPSink` behind a scripted opener;
 `tests/test_model_cells.py` that both ledger identities balance, with a batch the worker abandoned
 counted, in every cell whose sink calls back from its own code, except the cells pinned to
-`architecture.md` §12 open items and the cells those pins withhold (SPEC-085).
+`architecture.md` §12 open items and the cells those pins withhold (SPEC-085);
+`tests/test_conformance.py` that every shipped sink, per constructor variant, under each fault of
+its acknowledgement class and on the worker path only, leaves what its fake backend holds matching
+what it reported, event by event for the 41 variants whose judged sink runs the delivery engine
+and per batch for the 12 whose judged sink offers no `deliver`, with a line for every batch that
+lost or left an event ambiguous and SPEC-088's ledger balanced, except the rows pinned to §12
+open items and the permitted departures (SPEC-092).
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
@@ -614,7 +620,12 @@ limit and a real signal on a pipe, SPEC-082), and `tests/test_stream_sink_delive
 `tests/test_stream_sink_partial_write.py` (a stream that raises partway: each event by which call
 raised, no handed line resent, a closed stream and a sustained fault raising from the second
 batch, no event twice under a real file-size limit in three buffering modes, and a dead pipe,
-SPEC-084).
+SPEC-084), and `tests/test_conformance.py` (every shipped sink, per constructor variant and on
+the worker path only, reporting landed only what its fake backend holds and lost only what it does
+not, per event for the 41 variants whose judged sink runs the delivery engine and per batch for
+the 12 that offer no `deliver`, with an outcome it could not know read as ambiguous and refused
+where the call was knowable, except the rows pinned to §12 open items and the permitted
+departures, SPEC-092).
 
 ## 8. An event is safe by construction, once, at assembly
 
