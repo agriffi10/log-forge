@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-104
 title: "NATSSink's Abandoned-Publish Latch Ages, as Its PING Latch Does"
 description: "Makes a NATSSink call that meets a publish abandoned less than one publish_timeout ago wait for it on the loop until that window ends, without cancelling it and without publishing past it, so a stall a little longer than one budget no longer loses a batch, and with SPEC-102's resend no event but the abandoned one, while a longer stall still costs one window in all."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-047, SPEC-061, SPEC-062, SPEC-102]
 ---
 
@@ -180,7 +180,8 @@ where the engine's own waits are zero, a round still waits for the young abandon
       test fail on the order it asserts; this guard is mutation-tested.
 - [ ] After a call that waited and refused, the abandoned task is not cancelled, and the double
       later records it finishing.
-- [ ] A caller thread's `time.thread_time()` across a wait of one window is below 0.05 s.
+- [ ] A caller thread's ~~`time.thread_time()`~~ CPU time, read by `conftest.cpu_window("thread")`,
+      across a wait of one window is below 0.05 s (corrected at completion, 2026-11-18).
 - [ ] With a stall of three `publish_timeout`s, a level call with no active span made in the young
       window returns no later than the window's end plus `CALL_SLACK`, and one made after the
       window's end is refused within `NEXT_BOUND`.
@@ -202,8 +203,9 @@ engine and the worker are untouched, so what changes is only what the sink's rou
 event-level criteria hold with SPEC-102's resend in place, which this spec is built on: without it,
 the stalled round's unattempted tail is counted by the sink rather than resent.
 
-The exit drain's bound stays the one the module docstring states, the `shutdown()` budget plus up
-to two `publish_timeout`s. Each call's wait ends at the window's end, inside the call's own
+The exit drain's bound stays the one ~~the module docstring states~~ the `DEFAULT_PUBLISH_TIMEOUT`
+docstring states and the class docstring restates (corrected at completion, 2026-11-18), the
+`shutdown()` budget plus up to two `publish_timeout`s. Each call's wait ends at the window's end, inside the call's own
 deadline, so every call still spends at most that one deadline plus the backstop's `CALL_SLACK`;
 that sentence is not edited.
 
@@ -214,7 +216,8 @@ that sentence is not edited.
       `health().events.batch_lost` and `health().failed_batches` both read 0.
 - [ ] In that case, with SPEC-102's resend in place, every event but the abandoned publish's reaches
       the double, and `health().events.sink_lost` is at most 1.
-- [ ] Reverting FR-001's age check to "any pending" makes that test fail on `batch_lost`.
+- [ ] Reverting FR-001's age check to "any pending" makes that test, with an exit backlog of more
+      than one exit batch, fail on `batch_lost` (corrected at completion, 2026-11-18).
 - [ ] With the stall triggered in the steady drain, once the backlog has drained and
       `log_foundry.flush()` has returned, `batch_lost` and `failed_batches` both read 0, every event
       but the abandoned publish's has reached the double, and `sink_lost` is at most 1.
@@ -227,7 +230,9 @@ that sentence is not edited.
 - [ ] In every case above the ledger balances, with `health().events.unaccounted` 0, and every
       event refused or lost is counted once and announced.
 - [ ] The diff adds no `_diag` call, no `SinkCounters` field, no `Health` field, no constructor
-      parameter, and no edit to the module docstring's sentence stating the exit bound.
+      parameter, and no edit to the ~~module docstring's~~ sentence stating the exit bound, in the
+      `DEFAULT_PUBLISH_TIMEOUT` docstring and the class docstring (corrected at completion,
+      2026-11-18).
 - [ ] Serves invariants 2, 3, 6 and 11.
 
 ### FR-004: The record states the latch's new rule
@@ -401,3 +406,18 @@ So a stall that outlives the window costs `flush()` the rest of one window, once
   - The Evidence gives observed ranges with run counts, the reviewer's runs as further points, and
     "losses of the same order" for the slow exit.
 - **Rebased onto `e7b437f9`, 2026-11-17.** SPEC-102 landed, so it joins `depends_on` now rather than in Phase 1, and the Sequencing paragraph says it landed.
+- **2026-11-18, completed**, with four corrections found by the build:
+  - FR-003 AC3 cannot hold for an exit backlog that leaves as one exit batch. With SPEC-102's
+    resend, a batch whose abandoned publish counts as landed settles, so under "any pending" its
+    refused tail is `sink_lost`, not `batch_lost`: 200 events gave `batch_lost` 0. The test uses a
+    backlog that leaves as two exit batches, and the defect then loses the second whole
+    (`batch_lost` 100). AC3 now says so.
+  - FR-001 AC1 and FR-002 AC9 cite the matrix's `NEXT_BOUND`, so their tests live in
+    `tests/test_sinks_nats_matrix.py`: the liveness file cannot import from the matrix, which
+    already imports from it.
+  - FR-002 AC8 reads the caller thread's CPU through `conftest.cpu_window("thread")`, which reads
+    `thread_time` with garbage collection paused, because the timing gate refuses a raw
+    `time.thread_time()`.
+  - FR-003's exit-bound sentence is not in the module docstring: it lives in the
+    `DEFAULT_PUBLISH_TIMEOUT` docstring and is restated in the class docstring. The diff edits
+    neither; the description and AC8 now name both.

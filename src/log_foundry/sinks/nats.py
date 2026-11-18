@@ -156,6 +156,16 @@ that deliberately *outlives* every sink wait, because a PONG wait must never be 
 The second half of the rule is for latches: each ages from the start of the call whose budget
 the stall spent, not from when the sink noticed it (:meth:`NATSSink._confirm`), so the latch holds
 for the very next caller and a stall costs one caller one budget.
+
+**One exception, the abandoned-publish latch** (SPEC-104 FR-001): it ages from the instant the
+publish was abandoned, not from the start of the call whose budget it spent. An abandonment happens
+at that call's deadline, so a latch dated from the call's start would already be one window old
+the instant it was armed and would refuse the very next caller at once, which is what lost a whole
+batch to a stall only a little longer than one budget: the worker's rounds of a batch are 0.01 to
+0.04 s apart, and none at the stop. Dated from the abandonment, a call made within one
+``publish_timeout`` of it waits on the loop for that publish until the window ends
+(:meth:`NATSSink._await_stuck`), and only a call made after the window is refused at once, so a
+stall still costs its callers one window in all rather than one budget each.
 """
 
 _LOOP_THREAD_NAME = "log-foundry-nats-loop"
@@ -263,8 +273,10 @@ def _verdict_of(
     definitive non-delivery: :meth:`NATSSink._publish_all` never handed it to the driver, so no
     attempt wrote it and a resend cannot duplicate it, and its cause is a spent budget the next
     round renews, not a refusal every attempt would meet again. That covers the events after a
-    publish abandoned at the deadline too: the abandoned-publish latch refuses every later round
-    ``RETRYABLE`` while that publish is pending, so a resend never overtakes it. Kept free of
+    publish abandoned at the deadline too: ~~the abandoned-publish latch refuses every later round
+    ``RETRYABLE`` while that publish is pending~~ no later round publishes while that publish is
+    pending, since SPEC-104 because each waits for it until its window ends and refuses
+    ``RETRYABLE`` if it is still pending then, so a resend never overtakes it. Kept free of
     registrations so a test can plant a wrong verdict here without also removing the counts.
 
     Args:
@@ -363,9 +375,17 @@ class NATSSink:
 
     **A publish the driver never returns from is abandoned at the deadline, counted, and latches
     the sink** (SPEC-061 FR-001). It is counted where no confirmation will judge it -- the
-    JetStream path, an injected client -- and every later ``emit`` and ``flush`` is refused at
+    JetStream path, an injected client -- and ~~every later ``emit`` and ``flush`` is refused at
     once while it is still pending, since each would only queue behind the same blocked
-    force-flush.
+    force-flush~~ **superseded by SPEC-104 FR-001 and FR-002**: a later round or ``flush`` made
+    within one ``publish_timeout`` of the abandonment waits for that publish on the loop until the
+    window ends, never cancelling it, and goes on with what remains of its own deadline if the
+    publish finished. One that finds it still pending at the window's end, or that is made after
+    the window, is refused, since it would only queue behind the same blocked force-flush; nothing
+    publishes while an abandoned publish is pending. A stall a little longer than one budget then
+    loses no batch, and a longer one costs the callers one window in all rather than one budget
+    each. The wait is work, so it reads no stop signal and a round of the exit drain waits too,
+    and it ends inside its call's own deadline, so the exit bound above stands.
 
     **A JetStream event with no ack is retried or not depending on how the wait ended**, and the
     asymmetry is recorded rather than removed (``docs/invariants.md``, invariant 2). An ack wait
@@ -530,7 +550,7 @@ class NATSSink:
         self._closed = False
         self._owns_client = client is None
         self._abandoned: set[asyncio.Task[Any]] = set()
-        self._stuck: tuple[asyncio.Task[Any], ...] = ()
+        self._stuck: tuple[tuple[asyncio.Task[Any], float], ...] = ()
         self._probe: tuple[asyncio.Task[Any], float, int] | None = None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._serve, name=_LOOP_THREAD_NAME, daemon=True)
@@ -767,8 +787,9 @@ class NATSSink:
           SinkDeliveryError: When none of the events landed, with the engine's message; and, by
             identity, SPEC-061's own error when the sink is closed or closing, in a forked child,
             while either latch holds (an unanswered probe, or a publish abandoned at an earlier
-            deadline and still pending), when the client is disconnected or the probe went
-            unanswered, or when the backstop bound expired and the sink closed itself.
+            deadline, still pending, and either one ``publish_timeout`` old or still pending when
+            this call's wait on it ended, SPEC-104), when the client is disconnected or the probe
+            went unanswered, or when the backstop bound expired and the sink closed itself.
         """
         emit_via_deliver(self, batch)
 
@@ -802,7 +823,12 @@ class NATSSink:
         FIFO. Each refusal SPEC-061 makes before the first publish is a refusal round carrying
         SPEC-061's own ``SinkDeliveryError`` (SPEC-074 FR-001): ``REJECTED`` for a forked child, a
         closed or a closing sink; ``RETRYABLE`` for either latch, a disconnected client and an
-        unanswered probe, each of which a later round can pass. The wedged-loop backstop is a
+        unanswered probe, each of which a later round can pass. Since SPEC-104 the
+        abandoned-publish latch refuses before the lock and under it only once the publish has
+        been pending one ``publish_timeout`` since its abandonment; a round that meets a younger
+        one waits for it on the loop, as the first step of :meth:`_round_on_loop`, and is refused
+        ``RETRYABLE`` with the same error if the window ends with it still pending. The
+        wedged-loop backstop is a
         ``REJECTED`` refusal carrying SPEC-061's error: the sink has just closed itself, so no
         later round can pass — the one refusal marker used after events may have reached the
         transport (SPEC-074 FR-004's adjudication). Otherwise :func:`_verdict_of` maps the
@@ -879,9 +905,10 @@ class NATSSink:
         round with them still unresolved, and the engine counts them then, once, through
         ``unresolved``, since a run in which something was accepted or unknown settles. When the
         run ends on a later round, that round names what it left; if the abandoned-publish latch
-        refused it, the engine's ``refused by NATSSink after others landed`` line names the
-        refused events instead. A detached round, a direct ``deliver`` outside any run, is its
-        own last, so it still writes the line at once.
+        refused it, at once once the window has aged or at the window's end after waiting for the
+        abandoned publish (SPEC-104), the engine's ``refused by NATSSink after others landed`` line
+        names the refused events instead. A detached round, a direct ``deliver`` outside any run,
+        is its own last, so it still writes the line at once.
 
         Args:
           published: The round's publishes.
@@ -950,7 +977,8 @@ class NATSSink:
           ``REJECTED`` with SPEC-061's error in a forked child or while the sink is closing or
           closed; ``RETRYABLE`` with it while the outstanding probe is known to be unanswered
           (the latch, SPEC-061 FR-002) or a publish abandoned at an earlier deadline is still
-          blocked in the driver; else ``None``.
+          blocked in the driver and was abandoned at least ``publish_timeout`` ago (SPEC-104
+          FR-001; a younger one is waited for on the loop instead); else ``None``.
 
         Raises:
           None.
@@ -984,62 +1012,137 @@ class NATSSink:
         Raises:
           SinkDeliveryError: In a forked child, while the sink is closing or closed, while the
             outstanding probe is known to be unanswered, or while a publish abandoned at an
-            earlier deadline is still blocked in the driver.
+            earlier deadline is still blocked in the driver and was abandoned at least
+            ``publish_timeout`` ago.
         """
         refusal = self._refusal_outside_the_lock(prefix)
         if refusal is not None:
             raise refusal[1]
 
     def _stuck_refusal(self, prefix: str) -> SinkDeliveryError | None:
-        """Returns the abandoned-publish latch's refusal, or ``None`` (SPEC-061).
+        """Returns the abandoned-publish latch's refusal, or ``None`` (SPEC-061, aged by SPEC-104).
 
         The second latch, for every client, the sink's own and an injected one alike. A publish
         is abandoned only when the driver did not return from it within the budget, which for a
         core publish means its force-flush into a peer that stopped reading, and for a JetStream
         one the same force-flush or an ack wait that outlived the budget. The next publish would
-        only queue behind the same blocked flush, so it is refused at once instead of spending a
+        only queue behind the same blocked flush, so it is ~~refused at once instead of spending a
         budget of its own; a stall then costs one caller one budget, as the probe's latch makes it
-        for a silent server. Read before the lock and again after it, from one tuple the loop
-        thread replaces whole, so a caller never waits for it; it clears when the abandoned task
-        finishes, which its done callback records.
+        for a silent server~~ **superseded by SPEC-104 FR-001**: refused at once only once the
+        abandoned publish has been pending one ``publish_timeout`` since its abandonment
+        (:meth:`_stuck_aged`). A call that meets a younger one passes this check and waits for it
+        on the loop until that window ends (:meth:`_await_stuck`), so a stall a little longer than
+        one budget no longer refuses every round of a batch in turn, and a stall that outlives the
+        window costs its callers that one window in all, as the probe's latch makes a silent
+        server cost. Read before the lock and again after it, from one tuple the loop thread
+        replaces whole, so this read never waits; it clears when the abandoned task finishes,
+        which its done callback records. The error is :meth:`_stuck_error`'s, the one a wait that
+        ends with the publish still pending refuses with too.
 
         Args:
           prefix: The start of the message, naming what the call would have done.
 
         Returns:
-          The refusal while an abandoned publish has not finished, else ``None``.
+          The refusal while an abandoned publish has not finished and was abandoned at least
+          ``publish_timeout`` ago, else ``None``.
 
         Raises:
           None.
         """
-        if self._publish_stuck():
-            return SinkDeliveryError(
-                f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
-                "is still blocked in the driver"
-            )
+        if self._stuck_aged():
+            return self._stuck_error(prefix)
         return None
 
-    def _refuse_while_stuck(self, prefix: str) -> None:
-        """Raises while a publish abandoned at an earlier deadline is still pending (SPEC-061).
+    def _stuck_error(self, prefix: str) -> SinkDeliveryError:
+        """Builds the abandoned-publish latch's error, the one text every refusal of it carries.
+
+        One builder for the latch's refusal before the lock, under it, and after a wait that ended
+        with the publish still pending (:meth:`_await_stuck`), so the three cannot drift apart.
 
         Args:
           prefix: The start of the message, naming what the call would have done.
 
         Returns:
-          None.
+          The error.
 
         Raises:
-          SinkDeliveryError: While an abandoned publish has not finished.
+          None.
         """
-        stuck = self._stuck_refusal(prefix)
-        if stuck is not None:
-            raise stuck
+        return SinkDeliveryError(
+            f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
+            "is still blocked in the driver"
+        )
+
+    def _stuck_aged(self) -> bool:
+        """Reports whether a pending abandoned publish has been pending one window (SPEC-104).
+
+        One read of ``self._stuck``, a tuple the loop thread replaces whole, so any thread may
+        call it without a lock. Each entry carries the ``time.monotonic()`` instant its publish was
+        abandoned, and the window is ``publish_timeout`` from that instant: dated from the
+        abandonment rather than from the start of the call whose budget the stall spent, because
+        the abandonment happens at that call's deadline and a latch dated from its start would be
+        one window old the instant it was armed (:data:`DRIVER_DEADLINE_MARGIN` states the rule
+        and this exception).
+
+        Args:
+          None.
+
+        Returns:
+          True while an abandoned publish has not finished and was abandoned at least
+          ``publish_timeout`` ago.
+
+        Raises:
+          None.
+        """
+        now = time.monotonic()
+        return any(
+            not task.done() and now - since >= self.publish_timeout
+            for task, since in self._stuck
+        )
+
+    async def _await_stuck(self) -> bool:
+        """Waits on the loop for a pending abandoned publish until its window ends (SPEC-104).
+
+        The first step of :meth:`_round_on_loop` and :meth:`_flush_on_loop`. With nothing pending
+        it returns at once without awaiting, so a healthy call takes no extra trip through the
+        loop. Otherwise it waits with ``asyncio.wait`` on the pending task until the window's end,
+        its abandonment plus ``publish_timeout``, and **never cancels it**: a cancelled driver wait
+        the server may still answer is worse than a late one (SPEC-061). That end always falls
+        inside the calling coroutine's own deadline, because the lock serialises the coroutines and
+        the publish was abandoned before this one started. The wait is work, as the ack wait it
+        continues is, so it reads no stop signal: a round of the exit drain waits too.
+
+        After the wait it re-reads whether the abandoned publish is still pending, and that
+        re-read is what the caller refuses on. **It is the guard whose failure would be silent**:
+        without it a call would publish while the abandoned publish is still in the driver, and
+        SPEC-102's ordering, which the latch keeps, would break with no refusal or line to show
+        it. Written over the whole record, although at most one entry is pending at a time,
+        because nothing publishes while one is.
+
+        Args:
+          None.
+
+        Returns:
+          True when no abandoned publish is pending afterwards, so the call may go on with what
+          remains of its deadline; False when one still is, and the call refuses.
+
+        Raises:
+          None.
+        """
+        pending = [(task, since) for task, since in self._stuck if not task.done()]
+        if not pending:
+            return True
+        end = min(since for _, since in pending) + self.publish_timeout
+        await asyncio.wait({task for task, _ in pending}, timeout=max(0.0, end - time.monotonic()))
+        return not self._publish_stuck()
 
     def _publish_stuck(self) -> bool:
         """Reports whether a publish abandoned at an earlier deadline is still pending.
 
         One read of ``self._stuck``, a tuple the loop thread replaces whole, so any thread may
-        call it without a lock.
+        call it without a lock. Whatever the publish's age: :meth:`close` reads this to skip its
+        round trip, and so does the re-check after :meth:`_await_stuck`'s wait, while the latch's
+        refusal reads :meth:`_stuck_aged` (SPEC-104).
 
         Args:
           None.
@@ -1050,7 +1153,7 @@ class NATSSink:
         Raises:
           None.
         """
-        return any(not task.done() for task in self._stuck)
+        return any(not task.done() for task, _ in self._stuck)
 
     def _refusal_under_the_lock(self, prefix: str) -> tuple[Outcome, SinkDeliveryError] | None:
         """Re-reads the closing flags and the stuck latch once the lock is held (SPEC-061 FR-001).
@@ -1059,14 +1162,20 @@ class NATSSink:
         then published would land after the closer believed the sink quiet. The abandoned-publish
         latch is read again for the same reason: callers that queued on the lock before the
         publish ahead of them was abandoned would otherwise each spend a budget behind it.
+        **Refined by SPEC-104 FR-001**: the latch refuses only once the abandoned publish is one
+        window old. The first caller queued behind the abandoning round takes the lock while the
+        publish is still young, passes this read and waits on the loop until the window ends, so
+        its call takes about ``2 * publish_timeout`` from its own start; every caller queued
+        behind it takes the lock after the window has aged and is refused here, putting nothing
+        on the loop.
 
         Args:
           prefix: The start of the message, naming what the call would have done.
 
         Returns:
           ``REJECTED`` with SPEC-061's error when the sink closed or began closing while the call
-          waited; ``RETRYABLE`` with it while an abandoned publish is still blocked; else
-          ``None``.
+          waited; ``RETRYABLE`` with it while an abandoned publish is still blocked and was
+          abandoned at least ``publish_timeout`` ago; else ``None``.
 
         Raises:
           None.
@@ -1089,7 +1198,8 @@ class NATSSink:
 
         Raises:
           SinkDeliveryError: The sink closed or began closing while the call waited, or a
-            publish abandoned at an earlier deadline is still blocked in the driver.
+            publish abandoned at an earlier deadline is still blocked in the driver and was
+            abandoned at least ``publish_timeout`` ago.
         """
         refusal = self._refusal_under_the_lock(prefix)
         if refusal is not None:
@@ -1097,6 +1207,13 @@ class NATSSink:
 
     async def _round_on_loop(self, batch: list[dict[str, object]]) -> _Report:
         """The coroutine behind one round, run on the loop thread (SPEC-061 FR-002, SPEC-074).
+
+        **Its first step is the wait on a young abandoned publish** (SPEC-104 FR-002,
+        :meth:`_await_stuck`), before the connected flag and the probe. A publish that finishes
+        inside its window lets the round go on with what remains of its one deadline, which may be
+        nothing; one still pending when the window ends refuses the round with the latch's error,
+        nothing published and no counter moved. The PING latch is not read here: it is read
+        before the lock only, and a probe still outstanding is waited on by :meth:`_await_probe`.
 
         For a client the sink connected itself, a publish is made only after the server answers a
         round trip inside the round's one ``publish_timeout`` deadline, in both core and JetStream
@@ -1138,6 +1255,8 @@ class NATSSink:
         """
         deadline = time.monotonic() + self.publish_timeout
         refusal = f"NATSSink published none of {len(batch)} event(s)"
+        if not await self._await_stuck():
+            return _Report(self._stuck_error(refusal))
         if not self._is_connected():
             return _Report(SinkDeliveryError(f"{refusal}: the client is disconnected"))
         probing = self._probing()
@@ -1279,7 +1398,9 @@ class NATSSink:
         :meth:`_confirm` left behind when the driver's pending buffer did not drain by the
         deadline, which is how a stall that shows as a buffer that is not moving, rather than as
         an unanswered PING, arms the latch too. A publish the driver never returned from is the
-        other latch's (:meth:`_refuse_while_stuck`).
+        other latch's (:meth:`_stuck_refusal`), which since SPEC-104 ages from the abandonment
+        rather than from the start of the call whose budget it spent
+        (:data:`DRIVER_DEADLINE_MARGIN`).
 
         Args:
           None.
@@ -1505,12 +1626,15 @@ class NATSSink:
         (:meth:`_drained`) so it confirms the outbound buffer rather than overtaking it, then
         ``client.close()`` as a task cancelled on expiry, then stops the loop. The round trip is
         skipped when the client is injected, has no ``flush``, reports itself disconnected, has a
-        probe latched as unanswered, or has a publish abandoned and still pending (diff review
-        frame 3: the drained wait then spent the whole deadline behind the blocked flush and the
-        close raised about a PING it never sent), and a skipped round trip raises nothing: emits
-        were refused throughout, so nothing uncounted rides on it. One that **ran** and went unanswered raises
-        ``TimeoutError`` after the loop is stopped, keeping the contract that the loop is closed
-        regardless of what the flush raised; the probe's own exception is re-raised the same way.
+        probe latched as unanswered, or has a publish abandoned and still pending, young or old
+        (diff review frame 3: the drained wait then spent the whole deadline behind the blocked
+        flush and the close raised about a PING it never sent), and a skipped round trip raises
+        nothing: ~~emits were refused throughout~~ no emit published past either latch, since a
+        call that meets a young abandoned publish waits for it rather than publishing while it is
+        pending (SPEC-104), so nothing uncounted rides on it. One that **ran** and went unanswered
+        raises ``TimeoutError`` after the loop is stopped, keeping the contract that the loop is
+        closed regardless of what the flush raised; the probe's own exception is re-raised the same
+        way.
         A failure of ``client.close()``, including the ``TypeError`` M8 measured while
         reconnecting, is absorbed rather than raised.
 
@@ -1667,7 +1791,8 @@ class NATSSink:
         the JetStream path, an injected client, a client without ``flush`` -- the abandoned
         publish is counted as unconfirmed here and announced; before frame-2 finding 1 an injected
         core client's was counted nowhere, so a batch of one returned with ``failed`` at zero. An
-        abandoned publish also arms :meth:`_refuse_while_stuck` until it finishes.
+        abandoned publish also arms the abandoned-publish latch (:meth:`_stuck_refusal`) until it
+        finishes, aged from the instant it was abandoned (SPEC-104).
 
         Nothing is counted here (SPEC-074 FR-004): each event's fate is returned — published,
         raised (with the exception's type), abandoned or never attempted — and the round maps
@@ -1724,7 +1849,9 @@ class NATSSink:
         never cancelled (see :meth:`_publish_all`); one that outlives the budget is kept in
         ``self._abandoned`` so it is neither collected mid-flight nor left with an unretrieved
         exception, and is cancelled at close with every other pending task. It is also recorded
-        in ``self._stuck``, the abandoned-publish latch, until its done callback clears it.
+        in ``self._stuck``, the abandoned-publish latch, beside the ``time.monotonic()`` instant it
+        was abandoned, which the latch ages from (SPEC-104 FR-001), until its done callback clears
+        it.
 
         Args:
           target: The client or JetStream context to publish on.
@@ -1749,7 +1876,7 @@ class NATSSink:
         if not done:
             self._abandoned.add(task)
             task.add_done_callback(self._abandoned.discard)
-            self._stuck = (*self._stuck, task)
+            self._stuck = (*self._stuck, (task, time.monotonic()))
             task.add_done_callback(self._unstick)
             return False
         task.result()
@@ -1760,6 +1887,8 @@ class NATSSink:
 
         Replaces the tuple whole rather than mutating it, so a caller thread reading it without a
         lock sees the old tuple or the new one and never a set changing size under its iteration.
+        Each entry is a ``(task, abandoned_at)`` pair since SPEC-104, and the finished task's pair
+        is the one dropped.
 
         Args:
           task: The abandoned publish that finished.
@@ -1770,7 +1899,7 @@ class NATSSink:
         Raises:
           None.
         """
-        self._stuck = tuple(other for other in self._stuck if other is not task)
+        self._stuck = tuple(entry for entry in self._stuck if entry[0] is not task)
 
     def flush(self) -> None:
         """Pushes the client's outbound buffer onto the wire without closing (SPEC-036 FR-002).
@@ -1793,7 +1922,8 @@ class NATSSink:
         sink for good.
 
         Takes the same lock :meth:`emit` does and runs the same guards in the same order, for the
-        reasons recorded there.
+        reasons recorded there, and since SPEC-104 it waits for a young abandoned publish first,
+        as a round does (:meth:`_flush_on_loop`).
 
         Args:
           None.
@@ -1803,8 +1933,9 @@ class NATSSink:
 
         Raises:
           SinkDeliveryError: The sink is closed or closing, this is a forked child, either latch
-            holds, the round trip went unanswered or the client is disconnected, or the backstop
-            bound expired.
+            holds (the abandoned-publish one once its publish is one ``publish_timeout`` old, or
+            when that publish is still pending at the end of this call's wait on it), the round
+            trip went unanswered or the client is disconnected, or the backstop bound expired.
           Exception: Whatever an injected client's driver raises while flushing.
         """
         self._refuse_outside_the_lock("NATSSink cannot flush")
@@ -1822,6 +1953,11 @@ class NATSSink:
     async def _flush_on_loop(self) -> None:
         """The coroutine behind :meth:`flush`, run on the loop thread.
 
+        Its first step, for every client, is :meth:`_await_stuck`, as for a round (SPEC-104
+        FR-002): an abandoned publish still pending when its window ends refuses the flush with
+        the latch's error before anything reaches the driver, and one that finished lets the
+        flush go on under what remains of its deadline.
+
         Args:
           None.
 
@@ -1829,10 +1965,13 @@ class NATSSink:
           None.
 
         Raises:
-          SinkDeliveryError: A probed client is disconnected or did not answer the round trip.
+          SinkDeliveryError: A probed client is disconnected or did not answer the round trip, or
+            an abandoned publish was still pending when its window ended.
           Exception: Whatever an injected client's driver raises while flushing.
         """
         deadline = time.monotonic() + self.publish_timeout
+        if not await self._await_stuck():
+            raise self._stuck_error("NATSSink cannot flush")
         if not self._probing():
             await self._flush_client(deadline)
             return

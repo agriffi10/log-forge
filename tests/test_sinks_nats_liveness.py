@@ -14,6 +14,7 @@ import ast
 import asyncio
 import contextlib
 import gc
+import io
 import logging
 import os
 import pathlib
@@ -24,8 +25,9 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import log_foundry
 import log_foundry.sinks.nats as nats_sink_module
-from conftest import DelayArmedOnUse, run_concurrently
+from conftest import DelayArmedOnUse, cpu_window, run_concurrently
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
     CALL_SLACK,
@@ -34,6 +36,8 @@ from log_foundry.sinks.nats import (
     PROBE_FLUSH_TIMEOUT,
     NATSSink,
 )
+from log_foundry.sinks.verdict import Outcome, Verdict
+from log_foundry.worker import Worker
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -2103,17 +2107,20 @@ def _wait_until(predicate: Callable[[], bool], within: float = 2.0) -> bool:
 
 
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "injected"])
-def test_an_abandoned_publish_refuses_later_callers_at_once_until_it_finishes(
+def test_an_abandoned_publish_holds_later_callers_to_its_window_until_it_finishes(
     monkeypatch, owned: bool
 ) -> None:
-    """Frame-2 finding 1, the latch: a stall behind a blocked force-flush costs one caller.
+    """Frame-2 finding 1, the latch, aged by SPEC-104: a stall costs its callers one window in all.
 
-    Callers already queued on the lock when the publish is abandoned are refused once they get
-    it, without publishing (the check after the lock); a caller arriving while another thread
-    holds the lock is refused without waiting for it (the check before the lock). When the
-    abandoned publish finishes the latch clears and the next emit is accepted. Before this, p9
-    measured eight such callers served one after another, 0.30 s to 2.41 s, every one of them
-    publishing into the same blocked flush.
+    Callers already queued on the lock when the publish is abandoned publish nothing. The first
+    of them to take the lock finds the abandoned publish younger than one ``publish_timeout`` and
+    waits for it on the loop until that window ends, then is refused; every later one takes the
+    lock after the window has aged and is refused there, putting nothing on the loop (the check
+    after the lock). A caller arriving once the window has aged, while another thread holds the
+    lock, is refused without waiting for it (the check before the lock). When the abandoned
+    publish finishes the latch clears and the next emit is accepted. Before SPEC-061, p9 measured
+    eight such callers served one after another, 0.30 s to 2.41 s, every one of them publishing
+    into the same blocked flush.
     """
     if owned:
         sink, fake, _ = _build(monkeypatch, factory=ForceFlushBlockedNATS, publish_timeout=0.3)
@@ -2325,3 +2332,402 @@ def test_the_latch_holds_after_an_undrained_batch_however_late_the_drained_wait_
         f"refused by a reused wait, not the latch: {error}"
     )
     assert later == pings, "the refused call sent no PING of its own"
+
+
+# --- SPEC-104: the abandoned-publish latch ages, and a young one is waited for -----------------
+
+
+STALL_BUDGET = 1.0
+"""The ``publish_timeout`` of a SPEC-104 test whose next call waits on an abandoned publish.
+
+Large enough that the window a young call waits out, one budget at most, is a second: each bound
+these tests set against it is half a defect's wait or a full :data:`CALL_SLACK` past the correct
+one, so no CI stall of a few hundred milliseconds reaches either side.
+"""
+
+YOUNG_BUDGET = 0.5
+"""The ``publish_timeout`` of the young-window refusal test, whose stall is three of it.
+
+Small so the test is quick: its one ceiling is the window's end plus :data:`CALL_SLACK`, two whole
+budgets clear of the correct return, and the defect it guards (no refusal at all) needs no ceiling.
+"""
+
+WINDOW_BUDGET = 2.0
+"""The ``publish_timeout`` of the test that enters three quarters of the way through the window.
+
+That caller is refused at the window's end, at most a quarter budget, 0.5 s, after it enters; a
+caller that waits to its own deadline instead waits the whole budget, 2.0 s. The ceiling is half
+the budget, 1.0 s, so it sits 0.5 s clear of the correct wait and 1.0 s clear of the defect's.
+"""
+
+
+class _WindowJetStream:
+    """The JetStream context of :class:`WindowJetStreamNATS`."""
+
+    def __init__(self, owner: WindowJetStreamNATS) -> None:
+        self._owner = owner
+
+    async def publish(self, subject: str, payload: bytes, *, timeout=None) -> None:  # noqa: ASYNC109
+        await self._owner._publish(payload)
+
+
+class WindowJetStreamNATS:
+    """An injected JetStream-shaped client whose chosen publishes stall, logging every call.
+
+    A publish named in ``stall`` ignores the timeout it is handed, as a driver whose force-flush
+    is blocked does: a number of seconds sleeps that long, and ``"park"`` waits on :attr:`gate`,
+    which is created on the loop by the publish that parks. Every other publish acks at once.
+
+    Attributes:
+      log: ``(event, n, time.monotonic())`` for each ``publish-start``, ``publish-end``,
+        ``publish-cancelled`` and ``flush-start``, in the order the loop ran them; ``n`` is the
+        zero-based publish, or the flush's own count.
+      stall: The zero-based publishes that stall, and how.
+      gate: The event a parked publish waits on, or ``None`` before one parks.
+      published: The payload of every publish that finished.
+    """
+
+    def __init__(self, stall: dict[int, float | str] | None = None) -> None:
+        self.log: list[tuple[str, int, float]] = []
+        self.stall = dict(stall or {})
+        self.gate: asyncio.Event | None = None
+        self.published: list[bytes] = []
+        self.publishes = 0
+        self.flushes = 0
+        self.is_connected = True
+
+    def jetstream(self) -> _WindowJetStream:
+        return _WindowJetStream(self)
+
+    async def _publish(self, payload: bytes) -> None:
+        n = self.publishes
+        self.publishes += 1
+        self.log.append(("publish-start", n, time.monotonic()))
+        how = self.stall.get(n)
+        try:
+            if how == "park":
+                self.gate = asyncio.Event()
+                await self.gate.wait()
+            elif how is not None:
+                await asyncio.sleep(float(how))
+        except asyncio.CancelledError:
+            self.log.append(("publish-cancelled", n, time.monotonic()))
+            raise
+        self.published.append(payload)
+        self.log.append(("publish-end", n, time.monotonic()))
+
+    async def flush(self) -> None:
+        self.log.append(("flush-start", self.flushes, time.monotonic()))
+        self.flushes += 1
+
+    async def close(self) -> None:
+        return None
+
+    def events(self, name: str) -> list[int]:
+        """The ``n`` of every logged ``name``, in order."""
+        return [n for event, n, _ in self.log if event == name]
+
+    def started_inside_the_stall(self) -> list[tuple[str, int, float]]:
+        """Every publish or flush that started between publish 0's start and its end."""
+        names = [(event, n) for event, n, _ in self.log]
+        begin = names.index(("publish-start", 0))
+        end = names.index(("publish-end", 0))
+        return [
+            entry
+            for entry in self.log[begin + 1 : end]
+            if entry[0] in ("publish-start", "flush-start")
+        ]
+
+
+def _window_sink(client: WindowJetStreamNATS, budget: float) -> NATSSink:
+    return NATSSink("logs", client=client, jetstream=True, publish_timeout=budget)
+
+
+def _wait_for_monotonic(instant: float) -> None:
+    """Sleeps the test thread until ``time.monotonic()`` reaches ``instant``."""
+    while time.monotonic() < instant:
+        time.sleep(0.005)
+
+
+def _next_call(sink: NATSSink, kind: str) -> tuple[BaseException | None, Verdict | None]:
+    """Makes one call of ``kind`` and returns what it raised and, for ``deliver``, its verdict."""
+    try:
+        if kind == "emit":
+            sink.emit([{"n": "next"}])
+        elif kind == "deliver":
+            return None, sink.deliver([{"n": "next-0"}, {"n": "next-1"}])
+        else:
+            sink.flush()
+    except BaseException as exc:
+        return exc, None
+    return None, None
+
+
+def _timed_call(
+    sink: NATSSink, kind: str
+) -> tuple[float, tuple[BaseException | None, Verdict | None]]:
+    """Times :func:`_next_call`."""
+    began = time.monotonic()
+    result = _next_call(sink, kind)
+    return time.monotonic() - began, result
+
+
+def test_a_young_abandoned_publish_is_not_refused_before_the_lock_and_an_aged_one_is() -> None:
+    """FR-001 AC2: the check before the lock refuses only once the window has aged.
+
+    The first read is made as the abandoning call returns, which is at or after the abandonment,
+    so the publish is a few milliseconds old; the second is made one budget after that return, so
+    it is at least one budget old.
+    """
+    client = WindowJetStreamNATS(stall={0: "park"})
+    sink = _window_sink(client, STALL_BUDGET)
+    try:
+        sink.emit([{"n": 0}])
+        returned = time.monotonic()
+        young = sink._refusal_outside_the_lock("probe")
+        _wait_for_monotonic(returned + STALL_BUDGET)
+        aged = sink._refusal_outside_the_lock("probe")
+    finally:
+        if client.gate is not None:
+            _open(sink, client.gate)
+        sink.close()
+
+    assert young is None, f"a young abandoned publish was refused before the lock: {young}"
+    assert aged is not None, "an abandoned publish one window old was not refused"
+    outcome, error = aged
+    assert outcome is Outcome.RETRYABLE, outcome
+    assert "abandoned at an earlier" in str(error), error
+
+
+def test_a_caller_that_takes_the_lock_after_the_window_aged_puts_nothing_on_the_loop() -> None:
+    """FR-001 AC3: the check under the lock refuses an aged window before ``_submit``.
+
+    The caller reads the latch before the lock while the publish is young, so it passes and
+    queues behind a holder thread; ``wait_for_waiters`` proves it did. The holder lets go only once
+    the window has aged, so the caller's only refusal is the one under the lock. Mutating
+    ``_refusal_under_the_lock`` to return ``None`` lets the round reach ``_submit``, where its
+    wait finds the window already over and refuses with the same text, so the text alone could
+    not tell the two apart: the ``_submit`` count can.
+    """
+    client = WindowJetStreamNATS(stall={0: "park"})
+    sink = _window_sink(client, STALL_BUDGET)
+    lock = AnnouncingLock()
+    sink._lock = lock  # type: ignore[assignment]
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold() -> None:
+        with sink._lock:
+            holding.set()
+            release.wait(LOCK_HOLD)
+
+    holder = threading.Thread(target=hold)
+    outcome: list[tuple[float, BaseException | None]] = []
+    caller = threading.Thread(target=lambda: outcome.append(_timed(lambda: sink.emit([{"n": 1}]))))
+    submitted: list[object] = []
+    reached_the_loop: list[object] = []
+    try:
+        sink.emit([{"n": 0}])
+        returned = time.monotonic()
+        real_submit = sink._submit
+
+        def counting_submit(coro: Any) -> Any:
+            submitted.append(coro)
+            return real_submit(coro)
+
+        sink._submit = counting_submit  # type: ignore[method-assign]
+        publishes = client.publishes
+        holder.start()
+        assert holding.wait(2.0)
+        caller.start()
+        queued = lock.wait_for_waiters(1)
+        _wait_for_monotonic(returned + STALL_BUDGET)
+        release.set()
+        caller.join(5.0)
+        holder.join(5.0)
+        reached_the_loop = list(submitted)
+    finally:
+        release.set()
+        if client.gate is not None:
+            _open(sink, client.gate)
+        sink.close()
+
+    assert queued, "the caller was refused before the lock, so the check under it went untested"
+    error = outcome[0][1]
+    assert isinstance(error, SinkDeliveryError), error
+    assert "abandoned at an earlier" in str(error), error
+    assert reached_the_loop == [], "a caller refused under the lock reached the loop"
+    assert client.publishes == publishes, "the double logged a call from the refused caller"
+
+
+def test_a_finished_abandoned_publish_leaves_the_record_and_holds_no_later_call() -> None:
+    """FR-001 AC5: once the abandoned publish finishes, the record empties and nothing waits."""
+    client = WindowJetStreamNATS(stall={0: "park"})
+    sink = _window_sink(client, AT_ONCE_BUDGET)
+    try:
+        sink.emit([{"n": 0}])
+        assert client.gate is not None
+        _open(sink, client.gate)
+        cleared = _wait_until(lambda: sink._stuck == ())
+        elapsed, error = _timed(lambda: sink.emit([{"n": 1}]))
+    finally:
+        sink.close()
+
+    assert cleared, "the finished publish was left in the latch's record"
+    assert error is None, error
+    assert elapsed < AT_ONCE_CEILING, f"the next call was held by a finished publish: {elapsed:.3f}s"
+
+
+@pytest.mark.parametrize("kind", ["emit", "deliver", "flush"])
+def test_a_publish_finishing_inside_its_window_is_waited_for(kind: str) -> None:
+    """FR-002 AC1 and AC4's first half: the next call waits the publish out, then goes on.
+
+    Publish 0 takes one and a half budgets, so it is abandoned at the first budget and finishes
+    half a budget before its window ends. The next call, made as the abandoning one returns,
+    finds it young, waits for it on the loop, and proceeds with what remains of its own budget.
+    """
+    client = WindowJetStreamNATS(stall={0: 1.5 * STALL_BUDGET})
+    sink = _window_sink(client, STALL_BUDGET)
+    try:
+        sink.emit([{"n": 0}])
+        elapsed, (error, verdict) = _timed_call(sink, kind)
+        losses = sink.losses()
+    finally:
+        sink.close()
+
+    assert error is None, error
+    assert elapsed <= STALL_BUDGET + CALL_SLACK, f"{elapsed:.2f}s"
+    names = [(event, n) for event, n, _ in client.log]
+    first_after = ("flush-start", 0) if kind == "flush" else ("publish-start", 1)
+    assert names.index(("publish-end", 0)) < names.index(first_after), names
+    if kind == "deliver":
+        assert verdict is not None
+        assert verdict.outcomes == (Outcome.ACCEPTED, Outcome.ACCEPTED), verdict
+    if kind == "emit":
+        assert losses == SinkLosses(dropped=0, failed=1), "the abandoned event alone"
+
+
+@pytest.mark.parametrize("kind", ["emit", "deliver", "flush"])
+def test_a_call_in_the_young_window_of_a_long_stall_is_refused_at_the_windows_end(
+    kind: str,
+) -> None:
+    """FR-002 AC2, AC4's second half and AC7: refused by the window's end, the publish untouched.
+
+    Publish 0 stalls for three budgets. The call made as the abandoning one returns waits until
+    the window ends, at most one budget after that return, and is refused with the latch's error
+    (``deliver`` answers every event ``RETRYABLE``). The abandoned publish is never cancelled: the
+    double later logs it finishing, and logs no cancellation.
+    """
+    client = WindowJetStreamNATS(stall={0: 3 * YOUNG_BUDGET})
+    sink = _window_sink(client, YOUNG_BUDGET)
+    try:
+        sink.emit([{"n": 0}])
+        stalled_returned = time.monotonic()
+        error, verdict = _next_call(sink, kind)
+        young_returned = time.monotonic()
+        finished = _wait_until(lambda: 0 in client.events("publish-end"), within=5.0)
+    finally:
+        sink.close()
+
+    if kind == "deliver":
+        assert error is None, error
+        assert verdict is not None
+        assert verdict.outcomes == (Outcome.RETRYABLE, Outcome.RETRYABLE), verdict
+    else:
+        assert isinstance(error, SinkDeliveryError), error
+        assert "abandoned at an earlier" in str(error), error
+    assert young_returned - stalled_returned <= YOUNG_BUDGET + CALL_SLACK, (
+        f"refused {young_returned - stalled_returned:.2f}s after the abandoning call returned"
+    )
+    assert client.events("publish-start") == [0], "the young call published past the latch"
+    assert finished, "the abandoned publish never finished"
+    assert client.events("publish-cancelled") == [], "the wait cancelled the abandoned publish"
+
+
+def test_a_call_entering_late_in_the_window_is_refused_at_the_windows_end_not_its_own_deadline(
+) -> None:
+    """FR-002 AC3: the wait ends where the window does, not one budget after the caller entered.
+
+    The caller enters three quarters of the way through the window, so the correct wait is a
+    quarter budget at most; one bounded by the caller's own deadline is a whole budget. A caller
+    that enters late, after the window has ended, is refused at once, which only makes it faster.
+    """
+    client = WindowJetStreamNATS(stall={0: "park"})
+    sink = _window_sink(client, WINDOW_BUDGET)
+    try:
+        sink.emit([{"n": 0}])
+        stalled_returned = time.monotonic()
+        _wait_for_monotonic(stalled_returned + 0.75 * WINDOW_BUDGET)
+        elapsed, error = _timed(lambda: sink.emit([{"n": 1}]))
+    finally:
+        if client.gate is not None:
+            _open(sink, client.gate)
+        sink.close()
+
+    assert isinstance(error, SinkDeliveryError), error
+    assert "abandoned at an earlier" in str(error), error
+    assert elapsed < WINDOW_BUDGET / 2, f"waited {elapsed:.2f}s: to its own deadline"
+
+
+@pytest.mark.parametrize("caller", ["worker-round", "orphan-emit", "flush"])
+def test_no_publish_or_flush_starts_while_an_abandoned_publish_is_pending(caller: str) -> None:
+    """FR-002 AC5, AC6 and AC7: no call reaches the driver while the abandoned publish is in it.
+
+    Publish 0 stalls for three budgets. The caller enters half a budget into the window, so a wait
+    that skipped its re-check would still have half a budget of its own to publish or flush in at
+    the window's end. Every path into the sink meets the same rule (invariant 6): a worker's
+    round, a level call with no span on the caller's thread, and ``flush``.
+    """
+    client = WindowJetStreamNATS(stall={0: 3 * STALL_BUDGET})
+    sink = _window_sink(client, STALL_BUDGET)
+    try:
+        sink.emit([{"n": 0}])
+        stalled_returned = time.monotonic()
+        _wait_for_monotonic(stalled_returned + 0.5 * STALL_BUDGET)
+        if caller == "worker-round":
+            worker = Worker(sink, max_retries=0)
+            try:
+                runner = threading.Thread(target=lambda: worker._emit([[{"n": "round"}]]))
+                runner.start()
+                runner.join(10.0)
+            finally:
+                worker.stop()
+        elif caller == "orphan-emit":
+            log_foundry.configure(sink=sink)
+            with contextlib.redirect_stderr(io.StringIO()):
+                log_foundry.info("orphan")
+        else:
+            with contextlib.suppress(SinkDeliveryError):
+                sink.flush()
+        finished = _wait_until(lambda: 0 in client.events("publish-end"), within=5.0)
+    finally:
+        sink.close()
+
+    assert finished, "the abandoned publish never finished"
+    assert client.started_inside_the_stall() == [], client.log
+    assert client.events("publish-cancelled") == []
+
+
+def test_a_wait_of_one_window_is_idle_on_the_callers_thread() -> None:
+    """FR-002 AC8: the caller's thread spends no CPU while the loop waits out the window.
+
+    The floor proves the wait happened: the clock is read before the abandoning call starts, the
+    abandonment is at least one budget after it, and the young call is refused no sooner than the
+    window's end, one budget after that.
+    """
+    client = WindowJetStreamNATS(stall={0: "park"})
+    sink = _window_sink(client, STALL_BUDGET)
+    try:
+        stalled_began = time.monotonic()
+        sink.emit([{"n": 0}])
+        with cpu_window("thread") as cpu:
+            error = _timed(lambda: sink.emit([{"n": 1}]))[1]
+        waited = time.monotonic() - stalled_began
+    finally:
+        if client.gate is not None:
+            _open(sink, client.gate)
+        sink.close()
+
+    assert isinstance(error, SinkDeliveryError) and "abandoned at an earlier" in str(error), error
+    assert waited >= 1.5 * STALL_BUDGET, f"{waited:.2f}s: the young call did not wait"
+    assert cpu.spent < 0.05, f"the caller's thread spent {cpu.spent:.3f}s of CPU waiting"

@@ -613,6 +613,13 @@ the close alone.
   events may have reached the transport (FR-001's marker is defined for a round that handed none). JetStream and an injected client keep
   SPEC-061's behaviour, and a JetStream publish that raised takes the rule below.
 
+  > **Superseded in part by SPEC-104.** `_refuse_while_stuck` had no caller and is deleted; the
+  > latch's refusal is `_stuck_refusal`, and it refuses only once the abandoned publish has been
+  > pending one `publish_timeout` since its abandonment. A round in that window first waits for the
+  > publish on the loop, and is refused `RETRYABLE` with the same error only if it is still pending
+  > when the window ends. The decision: *A driver's liveness flag is not evidence*
+  > (`docs/decisions/sink-lifecycle/`).
+
   After the first publish, the round's outcome follows the one fact 1.x's `emit` acts on: whether
   anything in the round was published. An abandoned publish counts as published, as
   `_emit_on_loop` counts it.
@@ -683,6 +690,11 @@ written and is not rewritten).
       beside a raise; a landed publish beside an unencodable event; a landed publish beside `n - 1`
       unattempted; an abandoned publish; and `_refuse_while_stuck`. Planting one case's verdict as
       the other branch's (`RETRYABLE` for `REJECTED`, or dropping `sink_counted`) reddens it.
+
+      > **Superseded in part by SPEC-104.** `_refuse_while_stuck` is deleted; the latch's refusal
+      > is `_stuck_refusal`, aged one `publish_timeout` from the abandonment (the marker under the
+      > NATS row above).
+
 - [ ] NATS keeps SPEC-069's ledger: one unencodable event among several is `.failed == 1` and
       `losses().dropped == 0`, and `emit` returns; a batch of nothing but unencodable events raises
       `SinkDeliveryError` with `.failed` equal to the batch size. SPEC-069 FR-001's and FR-002's NATS

@@ -6,13 +6,17 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import log_foundry
 import log_foundry.sinks.nats as nats_sink_module
+from conftest import install_worker
 from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
     CALL_SLACK,
@@ -20,6 +24,13 @@ from log_foundry.sinks.nats import (
     DEFAULT_PUBLISH_TIMEOUT,
     NATSSink,
 )
+from log_foundry.sinks.verdict import Outcome
+from log_foundry.worker import Worker
+from test_sinks_nats_liveness import _wait_until
+from test_sinks_nats_matrix import NEXT_BOUND, ORPHAN_BUDGET
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class FakeJetStream:
@@ -199,7 +210,9 @@ class SlowNATS:
 
     ``hold_at`` names one publish (1-based) that first parks on ``held``, which no test sets: the
     publish is in flight at the deadline by construction rather than by a ratio of sleeps to
-    budget -- a ratio a slow runner lands on the wrong side of -- and ``close`` cancels it.
+    budget -- a ratio a slow runner lands on the wrong side of -- and ``close`` cancels it. One
+    test since SPEC-104 does set it, from the loop, so that a later batch meets that abandoned
+    publish young and waits for it to finish.
     """
 
     def __init__(
@@ -352,22 +365,59 @@ def test_a_large_batch_against_a_healthy_server_is_not_truncated() -> None:
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
-def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch() -> None:
+YOUNG_HELD_RELEASE = 0.3
+"""Seconds into a batch's wait on a young abandoned publish at which the stop-signal test frees it.
+
+Inside the one-second budget that test runs at, so the wait ends with the publish finished and the
+batch has the rest of its budget to publish in.
+"""
+
+
+@pytest.mark.parametrize("abandoned", [False, True], ids=["clear", "young-abandoned"])
+def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch(
+    abandoned: bool,
+) -> None:
     # FR-001 AC-5. `_lifecycle.offer_stop_signal` probes by hasattr, so the absence IS the opt-out
     # -- a shutdown shortens a wait and never skips work, and this per-event await is work.
     # The positive half cannot fail today because nothing reads the attribute: it is a regression
     # guard, verified by adding the read and watching it redden, not by passing.
-    client = SlowNATS(per_event=0.0)
-    sink = NATSSink("logs", client=client, jetstream=True)
+    #
+    # SPEC-104 FR-002 AC10: the young-abandoned case first abandons a publish, so the batch meets
+    # it young and waits for it on the loop. That wait is work too and reads no stop signal. The
+    # held publish is freed from inside the batch's own wait, so it is timed from where that wait
+    # began, and the test asserts the batch did meet a pending abandoned publish.
+    client = SlowNATS(per_event=0.0, hold_at=1 if abandoned else None)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=1.0)
     assert not hasattr(sink, "log_foundry_stop_signal")
+    met_pending: list[bool] = []
+    if abandoned:
+        sink.emit([{"n": "abandoned"}])
+        real = sink._await_stuck
+
+        async def release_then_wait() -> bool:
+            met_pending.append(sink._publish_stuck())
+            asyncio.get_running_loop().call_later(YOUNG_HELD_RELEASE, client.held.set)
+            return await real()
+
+        sink._await_stuck = release_then_wait  # type: ignore[method-assign]
 
     signal = threading.Event()
     signal.set()
     sink.log_foundry_stop_signal = signal  # type: ignore[attr-defined]
-    sink.emit([{"n": i} for i in range(20)])
+    refused: SinkDeliveryError | None = None
+    try:
+        sink.emit([{"n": i} for i in range(20)])
+    except SinkDeliveryError as exc:
+        refused = exc
     sink.close()
 
-    assert len(client.published) == 20, "a set stop event must not skip work"
+    if abandoned:
+        assert met_pending == [True], "the batch did not meet a pending abandoned publish"
+        assert len(client.published) == 21, (
+            f"a set stop event must not skip the wait or the work: {refused!r}"
+        )
+    else:
+        assert len(client.published) == 20, f"a set stop event must not skip work: {refused!r}"
 
 
 def test_an_expired_budget_with_nothing_published_books_only_what_it_attempted() -> None:
@@ -776,3 +826,319 @@ def test_servers_alongside_an_injected_client_is_refused() -> None:
         NATSSink("logs", client=FakeNATS(), servers="nats://x:4222", connect_timeout=1.0)
     with pytest.raises(ValueError, match="cannot apply servers to an injected client"):
         NATSSink("logs", client=FakeNATS(), servers="nats://x:4222")
+
+
+# --- SPEC-104 FR-003: through the library, a stall a little over one budget loses no batch -----
+
+
+EXIT_BUDGET = 1.0
+"""The ``publish_timeout`` of the transient-stall tests: the stalled publish takes 1.5 of it."""
+
+EXIT_SPANS = 100
+"""Traced calls the transient-stall tests log at once, two events each, 200 in all.
+
+**Sizing rule: the backlog times the per-publish cost under load fits inside half a budget.** The
+stalled publish ends half a budget before its window does, so the resend round that waited for it
+has that half to publish the rest of the batch in. If it runs out mid-batch it abandons the 1 ms
+publish in flight at its deadline, which is counted as a ``sink_lost`` of its own, and the test's
+"at most one" is then false of correct code. The stalled batch holds :data:`EXIT_BATCH_SIZE`
+submissions, 100 events, so its tail of 99 publishes at the double's 1 ms ack is a fifth of that
+half budget unloaded, which leaves room for load to slow every publish several times over. A
+larger backlog, or a larger first batch, has to be checked against this rule under concurrent load
+before it is used.
+"""
+
+EXIT_BATCH_SIZE = 50
+"""The ``batch_size`` of the exit-stall test, so its backlog leaves as two exit batches of 100.
+
+Two, because with SPEC-102's resend a batch whose abandoned publish counts as landed settles, and
+its refused tail is then ``sink_lost``, not ``batch_lost``: a latch that refused while any
+abandoned publish was pending would lose the single batch of a one-batch backlog with
+``batch_lost`` still 0. The second batch is the one that defect loses whole, so the test fails on
+``batch_lost`` as FR-003 AC3 asks. The first exit batch has no measured rate behind it, so it holds
+exactly ``batch_size`` submissions, and the stalled one is therefore 100 events, inside the sizing
+rule above.
+"""
+
+STEADY_FIRST_SPANS = 25
+"""Traced calls logged in the steady test before its stall begins, which bounds the stalled batch.
+
+The rest, :data:`STEADY_REST_SPANS`, are logged while the drain thread waits on the stall, so the
+batch the stall lands in holds at most these 50 events, well inside the half budget the sizing
+rule above allows, and the later batches each have a whole budget for at most 150.
+"""
+
+STEADY_REST_SPANS = 75
+"""Traced calls the steady test logs while its stall is under way."""
+
+SLOW_BUDGET = 0.5
+"""The ``publish_timeout`` of the slow-exit test, in which every publish after the stop takes 1.5."""
+
+SLOW_SHUTDOWN = 2.0
+"""The ``shutdown()`` budget of the slow-exit test, ``S`` in the exit bound it checks."""
+
+LONG_STALL_SHUTDOWN_CEILING = 1.0
+"""Seconds a ``shutdown()`` made after a long stall's window may take.
+
+Every exit round is refused at once once the window has aged, so the correct exit takes about the
+close alone. A round that instead waited on the abandoned publish for a budget of its own would
+make every exit round cost :data:`test_sinks_nats_matrix.ORPHAN_BUDGET`, 1.5 s, past the ceiling.
+"""
+
+
+class _ExitStallJetStream:
+    """The JetStream context of :class:`ExitStallClient`."""
+
+    def __init__(self, owner: ExitStallClient) -> None:
+        self._owner = owner
+
+    async def publish(self, subject, payload, *, timeout=None) -> None:  # noqa: ASYNC109
+        await self._owner._publish(payload)
+
+
+class ExitStallClient:
+    """An injected JetStream-shaped client in the shape of the SPEC-104 probe's misbehaviour.
+
+    Once :attr:`trigger` reads true, a publish ignores the timeout it is handed and sleeps: in
+    ``transient`` mode the first such publish sleeps 1.5 budgets, in ``long`` mode 15, and in
+    ``slow`` mode every one sleeps 1.5. Every other publish acks after 1 ms.
+
+    Attributes:
+      trigger: Read by each publish; the stop event's ``is_set`` for an exit case, a test's own
+        event's for a steady one.
+      stalls: ``[start, end]`` of every stalled publish, ``end`` ``None`` until it acks.
+      received: The payload of every publish that acked, in order; each event's bytes are its
+        identity, and no two events here serialize alike.
+    """
+
+    def __init__(self, mode: str, budget: float) -> None:
+        self.mode = mode
+        self.budget = budget
+        self.trigger: Callable[[], bool] = lambda: False
+        self.stalls: list[list[float | None]] = []
+        self.received: list[bytes] = []
+        self.is_connected = True
+
+    def jetstream(self) -> _ExitStallJetStream:
+        return _ExitStallJetStream(self)
+
+    async def _publish(self, payload: bytes) -> None:
+        if self.trigger() and (self.mode == "slow" or not self.stalls):
+            entry: list[float | None] = [time.monotonic(), None]
+            self.stalls.append(entry)
+            await asyncio.sleep((15 if self.mode == "long" else 1.5) * self.budget)
+            entry[1] = time.monotonic()
+        else:
+            await asyncio.sleep(0.001)
+        self.received.append(payload)
+
+    async def flush(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+@log_foundry.trace
+def _traced() -> None:
+    return None
+
+
+def _lost_total(err: str) -> int:
+    """The events every ``log-foundry: lost N event(s)`` line in ``err`` names, summed."""
+    return sum(int(match.group(1)) for match in LOST_LINE.finditer(err))
+
+
+LOST_LINE = re.compile(r"^log-foundry: lost (\d+) event\(s\)", re.MULTILINE)
+
+
+def _stall_sink(mode: str, budget: float) -> tuple[ExitStallClient, NATSSink]:
+    client = ExitStallClient(mode, budget)
+    return client, NATSSink("logs", client=client, jetstream=True, publish_timeout=budget)
+
+
+def _assert_no_batch_lost(client: ExitStallClient, health: Any, err: str) -> None:
+    """FR-003's shared outcome for a transient stall: AC1, AC2, AC4 and AC7.
+
+    ``batch_lost`` is asserted first, so the defect AC3 names, a latch that refuses while any
+    abandoned publish is pending, fails here on the lost batch rather than on a later symptom.
+    """
+    events = health.events
+    assert (events.batch_lost, health.failed_batches) == (0, 0), (events, health.failed_batches)
+    assert len(client.stalls) == 1, f"expected one stall, saw {client.stalls}"
+    assert client.stalls[0][1] is not None, "the stalled publish never acked"
+    assert events.sink_lost <= 1, events
+    assert len(set(client.received)) == len(client.received), "an event reached the double twice"
+    assert events.accepted - 1 <= len(client.received) <= events.accepted, (
+        f"{len(client.received)} of {events.accepted} accepted events reached the double"
+    )
+    assert events.unaccounted == 0, events
+    lost = events.batch_lost + events.sink_lost + events.orphan_lost
+    assert _lost_total(err) == lost, f"{lost} events lost, {_lost_total(err)} announced: {err}"
+
+
+def test_a_transient_stall_at_the_stop_loses_no_batch(capsys) -> None:
+    """FR-003 AC1, AC2, AC3 and AC7: the exit drain waits out a stall a little over one budget.
+
+    Nothing drains before the stop, so the whole backlog is the exit drain's, in two batches. The
+    first round's first publish stalls for 1.5 budgets and is abandoned; the resend round meets it
+    young, waits for it, and publishes the rest, and the second batch then has a budget of its
+    own. Reverting the age check to "any pending" refuses every round at once, at the stop's zero
+    backoff, and loses the second batch whole.
+    """
+    client, sink = _stall_sink("transient", EXIT_BUDGET)
+    worker = Worker(sink, batch_size=EXIT_BATCH_SIZE, flush_interval=3_600.0)
+    client.trigger = worker._stop.is_set
+    install_worker(worker)
+    for _ in range(EXIT_SPANS):
+        _traced()
+    stopping = time.monotonic()
+    log_foundry.shutdown(timeout=10)
+    took = time.monotonic() - stopping
+    health = log_foundry.health()
+    err = capsys.readouterr().err
+
+    assert took <= 10, f"shutdown(timeout=10) took {took:.2f}s"
+    assert client.stalls and client.stalls[0][0] is not None and client.stalls[0][0] >= stopping, (
+        "the stall began before the stop, so the exit drain never met it"
+    )
+    _assert_no_batch_lost(client, health, err)
+
+
+def test_a_transient_stall_in_the_steady_drain_loses_no_batch(capsys) -> None:
+    """FR-003 AC4 and AC7: the steady drain's resend round waits out the stall too."""
+    trigger = threading.Event()
+    client, sink = _stall_sink("transient", EXIT_BUDGET)
+    client.trigger = trigger.is_set
+    worker = Worker(sink, batch_size=50, flush_interval=0.05)
+    install_worker(worker)
+    trigger.set()
+    for _ in range(STEADY_FIRST_SPANS):
+        _traced()
+    began = _wait_until(lambda: bool(client.stalls), within=5.0)
+    for _ in range(STEADY_REST_SPANS):
+        _traced()
+    flushed = log_foundry.flush(timeout=10)
+    health = log_foundry.health()
+    err = capsys.readouterr().err
+    log_foundry.shutdown(timeout=10)
+
+    assert began, "the stall never began"
+    _assert_no_batch_lost(client, health, err)
+    assert flushed, flushed
+
+
+def test_a_slow_exit_stays_inside_the_stated_bound(capsys) -> None:
+    """FR-003 AC5 and AC7: every publish after the stop stalls, and the exit bound still holds.
+
+    The bound is the ``shutdown()`` budget plus up to two ``publish_timeout``s, plus the
+    backstop's :data:`~log_foundry.sinks.nats.CALL_SLACK`: each call's wait ends inside its own
+    deadline, so no call costs more than it did before SPEC-104.
+    """
+    client, sink = _stall_sink("slow", SLOW_BUDGET)
+    worker = Worker(sink, batch_size=10_000, flush_interval=3_600.0)
+    client.trigger = worker._stop.is_set
+    install_worker(worker)
+    for _ in range(EXIT_SPANS):
+        _traced()
+    stopping = time.monotonic()
+    log_foundry.shutdown(timeout=SLOW_SHUTDOWN)
+    took = time.monotonic() - stopping
+    health = log_foundry.health()
+    err = capsys.readouterr().err
+
+    assert took <= SLOW_SHUTDOWN + 2 * SLOW_BUDGET + CALL_SLACK, f"{took:.2f}s"
+    assert client.stalls, "no publish stalled after the stop"
+    events = health.events
+    assert events.unaccounted == 0, events
+    lost = events.batch_lost + events.sink_lost + events.orphan_lost
+    assert _lost_total(err) == lost, f"{lost} events lost, {_lost_total(err)} announced: {err}"
+
+
+def test_a_long_stall_costs_one_window_in_all(capsys) -> None:
+    """FR-003 AC6 and AC7: a stall of fifteen budgets costs its callers one window, once.
+
+    Every round and ``flush`` is timed through an instance wrapper; ``deliver`` reaches the
+    round through ``self._round``, so the worker's rounds and the orphan path's are both seen. A
+    call that begins inside the window ends by its end plus ``CALL_SLACK``; one that begins after
+    it is refused before the lock within ``NEXT_BOUND``, with the latch's error or every event
+    ``RETRYABLE``. A ``shutdown()`` made after the window is refused round by round at once.
+    """
+    trigger = threading.Event()
+    client, sink = _stall_sink("long", ORPHAN_BUDGET)
+    client.trigger = trigger.is_set
+    rounds: list[tuple[float, float, Any]] = []
+    flushes: list[tuple[float, float, BaseException | None]] = []
+    real_round = sink._round
+    real_flush = sink.flush
+
+    def timed_round(batch: list[dict[str, object]]) -> Any:
+        began = time.monotonic()
+        verdict = real_round(batch)
+        rounds.append((began, time.monotonic(), verdict))
+        return verdict
+
+    def timed_flush() -> None:
+        began = time.monotonic()
+        try:
+            real_flush()
+        except BaseException as exc:
+            flushes.append((began, time.monotonic(), exc))
+            raise
+        flushes.append((began, time.monotonic(), None))
+
+    sink._round = timed_round  # type: ignore[method-assign]
+    sink.flush = timed_flush  # type: ignore[method-assign]
+    worker = Worker(sink, batch_size=10, flush_interval=0.05)
+    install_worker(worker)
+    trigger.set()
+    for _ in range(5):
+        _traced()
+    assert _wait_until(lambda: bool(client.stalls), within=5.0), "the stall never began"
+    stall_began = client.stalls[0][0]
+    assert stall_began is not None
+    assert _wait_until(
+        lambda: any(r[0] <= stall_began <= r[1] for r in rounds), within=5.0
+    )
+    stalled_end = next(r[1] for r in rounds if r[0] <= stall_began <= r[1])
+    window_end = stalled_end + ORPHAN_BUDGET
+    for _ in range(5):
+        _traced()
+    log_foundry.info("orphan, in the window")
+    log_foundry.flush(timeout=5)
+    while time.monotonic() < window_end:
+        time.sleep(0.005)
+    for _ in range(5):
+        _traced()
+    log_foundry.info("orphan, after the window")
+    log_foundry.flush(timeout=5)
+    stopping = time.monotonic()
+    log_foundry.shutdown(timeout=10)
+    took = time.monotonic() - stopping
+    health = log_foundry.health()
+    err = capsys.readouterr().err
+
+    later = [r for r in rounds if r[0] > stall_began]
+    inside = [r for r in later if r[0] < window_end]
+    after = [r for r in later if r[0] >= window_end]
+    assert inside and after, f"rounds inside the window {len(inside)}, after it {len(after)}"
+    for _began, ended, _verdict in inside:
+        assert ended <= window_end + CALL_SLACK, f"a round ended {ended - window_end:.2f}s late"
+    for began, ended, verdict in after:
+        assert ended - began < NEXT_BOUND, f"a round after the window took {ended - began:.3f}s"
+        assert set(verdict.outcomes) == {Outcome.RETRYABLE}, verdict
+    flushes_after = [f for f in flushes if f[0] >= window_end]
+    assert flushes_after, flushes
+    for began, ended, error in flushes:
+        if began < window_end:
+            assert ended <= window_end + CALL_SLACK, f"a flush ended {ended - window_end:.2f}s late"
+            continue
+        assert ended - began < NEXT_BOUND, f"a flush after the window took {ended - began:.3f}s"
+        assert isinstance(error, SinkDeliveryError), error
+        assert "abandoned at an earlier" in str(error), error
+    assert took <= LONG_STALL_SHUTDOWN_CEILING, f"shutdown(timeout=10) took {took:.2f}s"
+    assert len(client.stalls) == 1 and client.stalls[0][1] is None, client.stalls
+    events = health.events
+    assert events.unaccounted == 0, events
+    lost = events.batch_lost + events.sink_lost + events.orphan_lost
+    assert _lost_total(err) == lost, f"{lost} events lost, {_lost_total(err)} announced: {err}"

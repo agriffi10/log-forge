@@ -8,8 +8,30 @@ degenerate rows. A cell asserts the outcome (a return or the exception type and 
 exact ``losses()`` counts, every announcement line in order, and for a stall the latency of the
 next caller (made while another thread holds the lock, so only the check before the lock can
 refuse it) and of a caller queued on the lock behind the stalled call. The expectations are
-derived from the spec, not read off the code, and the module is gated by mutation: every guard in
-``nats.py``'s wait and latch sites turns at least one cell red on its stated reason.
+derived from the spec, not read off the code, and the module is gated by mutation: every SPEC-061
+guard in ``nats.py``'s wait and latch sites turns at least one cell red on its stated reason.
+
+Since SPEC-104 the abandoned-publish latch ages as the probe's does. The next caller of an
+abandoned-publish cell is made once the window, one ``publish_timeout`` from the abandonment, has
+aged, and must then be refused before the lock by ``emit``, ``deliver`` and ``flush`` alike. A
+caller queued behind the abandoning call waits out the rest of the window on the loop before it
+is refused, so those four cells carry :data:`STUCK_QUEUED_BOUND`. The young-window column
+(``*-emit1-young-window``) makes a call half way through the window, which must be refused before
+the abandoned publish is released; the cells assert that refusal only, not how long the call
+waited, because a call the runner makes late finds less of the window left, and a timing floor
+would then redden correct code.
+
+Of SPEC-104's guards the matrix gates four, each on its stated reason. The age comparison turned to
+``<``, and an age that never reaches the window, leave the aged next caller to queue on the held
+lock ("next caller" about 1.5 s). A wait bounded by the caller's own deadline instead of the
+window's end, and a wait that skips its re-check, both publish once the publish is released or the
+window ends ("young caller not refused: None"). Two more are gated elsewhere and turn no cell red
+here: a latch that refuses while any abandoned publish is pending, and an abandonment dated from
+the start of the call whose budget it spent. Those fail
+``test_sinks_nats_liveness.py::test_a_young_abandoned_publish_is_not_refused_before_the_lock_and_an_aged_one_is``,
+``test_sinks_nats_liveness.py::test_a_publish_finishing_inside_its_window_is_waited_for`` and
+``test_sinks_nats.py``'s ``test_a_transient_stall_at_the_stop_loses_no_batch`` and
+``test_a_transient_stall_in_the_steady_drain_loses_no_batch``, on ``batch_lost``.
 """
 
 from __future__ import annotations
@@ -27,14 +49,17 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import log_foundry
 import log_foundry.sinks.nats as nats_sink_module
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.nats import (
+    CALL_SLACK,
     DEFAULT_CLOSE_TIMEOUT,
     DEFAULT_PUBLISH_TIMEOUT,
     LOOP_JOIN_TIMEOUT,
     NATSSink,
 )
+from log_foundry.sinks.verdict import Outcome
 from test_sinks_nats_liveness import (
     CounterlessFakeNATS,
     FlushlessFakeNATS,
@@ -43,6 +68,7 @@ from test_sinks_nats_liveness import (
     _build,
     _on_loop,
     _timed,
+    _wait_for_monotonic,
     _wait_until,
 )
 
@@ -91,6 +117,38 @@ QUEUED_BOUND = 1.5 * P
 
 It waits out the stalled call, at most ``P``, and is then refused at once; a caller that instead
 spends its own budget takes ``2 * P``. The bound sits half a budget clear of both.
+"""
+
+STUCK_QUEUED_BOUND = 2.5 * P
+"""Seconds a caller queued behind an abandoning call may take, from its own start (SPEC-104).
+
+It waits out the abandoning call, at most ``P``, then finds the abandoned publish younger than one
+window and waits on the loop until that window ends, about ``2 * P`` in all; one that then spent
+its own budget as well would take ``3 * P``. The bound sits half a budget clear of both.
+"""
+
+YOUNG_ENTRY = P / 2
+"""Seconds after the abandoning call returns that a young-window cell makes its next call.
+
+The window ends at most ``P`` after that return, since the abandonment is at or before it, so the
+call meets a publish at most half a window old and waits at most half a budget for its end.
+"""
+
+YOUNG_RELEASE = 0.75 * P
+"""Seconds after the young call's wait begins on the loop that its cell releases the publish.
+
+Armed from inside the wait, so it is measured from where the young coroutine actually started,
+however late the runner made it. The correct wait ends at the window's end, at most half a budget
+after it began, so it refuses first. A wait bounded by the caller's own deadline is still waiting
+here and sees the publish finish, and a wait without its re-check has already gone on to publish;
+both return normally, which is the cell's stated failure.
+"""
+
+ORPHAN_BUDGET = 2 * NEXT_BOUND
+"""The ``publish_timeout`` of the orphan-path test, so its ``NEXT_BOUND`` ceiling is half of it.
+
+A level call made once the window has aged is refused before the lock at once; a round that waited
+to its own deadline instead would take this whole budget, twice the ceiling.
 """
 
 UNATTEMPTED = f"NATSSink publish_timeout {P}s"
@@ -201,6 +259,8 @@ class Cell:
     prelude: bool = False
     next_refused: str | None = None
     queued_refused: bool = False
+    queued_bound: float = QUEUED_BOUND
+    young_refused: str | None = None
     released_accepts: bool = False
     pings: int | None = None
     ceiling: float | None = None
@@ -236,6 +296,17 @@ def _cells() -> dict[str, Cell]:
                 lines=((1, abandoned),),
                 next_refused=stuck,
                 queued_refused=True,
+                queued_bound=STUCK_QUEUED_BOUND,
+                released_accepts=True,
+                **base,
+            )
+            add(
+                f"{stem}-emit1-young-window",
+                call="emit1",
+                fake={"block_at": 0},
+                failed=1,
+                lines=((1, abandoned),),
+                young_refused=stuck,
                 released_accepts=True,
                 **base,
             )
@@ -505,16 +576,28 @@ def _lost_lines(err: str) -> list[str]:
     return [line for line in err.splitlines() if line.startswith("log-foundry: lost ")]
 
 
-def _refused_while_locked(sink: NATSSink) -> tuple[float, BaseException | None]:
-    """Calls ``emit`` while another thread holds the sink's lock, so only a pre-lock check refuses.
+def _refused_while_locked(
+    sink: NATSSink, cell: Cell, returned: float
+) -> dict[str, tuple[float, object]]:
+    """Calls ``emit``, ``deliver`` and ``flush`` while another thread holds the sink's lock.
 
-    Waits for either latch to read held, since the probe a stalled call leaves behind is aged
-    from the start of the call whose budget it spent and holds by the call's return: measured at
-    ``c810333d``, the wait returned within a millisecond on every cell, so its default bound
-    costs nothing and no CI stall can cut it short. A sink whose latch never holds fails the
-    call's own assertion instead, after :data:`HOLD` seconds.
+    Only a check made before the lock can refuse them there. For an abandoned-publish cell it
+    first waits until one ``P`` has passed since the stalled call returned, which is at or after
+    the abandonment, so the window has aged: a wait on the clock alone, which no mutated age
+    comparison can bend (SPEC-104). For a probe cell it waits for the latch to read held, since the
+    probe a stalled call leaves behind is aged from the start of the call whose budget it spent
+    and holds by the call's return: measured at ``c810333d``, the wait returned within a
+    millisecond on every cell, so its default bound costs nothing and no CI stall can cut it
+    short. A sink whose latch never holds fails the calls' own assertions instead, after
+    :data:`HOLD` seconds.
+
+    Returns, per call, its duration and what it raised, or for ``deliver`` its verdict.
     """
-    _wait_until(lambda: sink._latched() or sink._publish_stuck())
+    assert cell.next_refused is not None
+    if "abandoned" in cell.next_refused:
+        _wait_for_monotonic(returned + P)
+    else:
+        _wait_until(lambda: sink._latched() or sink._publish_stuck())
     holding = threading.Event()
     release = threading.Event()
 
@@ -526,11 +609,42 @@ def _refused_while_locked(sink: NATSSink) -> tuple[float, BaseException | None]:
     holder = threading.Thread(target=hold)
     holder.start()
     assert holding.wait(2.0)
+    verdicts: list[object] = []
     try:
-        return _timed(lambda: sink.emit([{"n": "next"}]))
+        emitted = _timed(lambda: sink.emit([{"n": "next"}]))
+        delivered = _timed(lambda: verdicts.append(sink.deliver([{"n": "a"}, {"n": "b"}])))
+        flushed = _timed(sink.flush)
     finally:
         release.set()
         holder.join(5.0)
+    return {
+        "emit": emitted,
+        "deliver": (delivered[0], delivered[1] or (verdicts[0] if verdicts else None)),
+        "flush": flushed,
+    }
+
+
+def _young_call(sink: NATSSink, fake: MatrixFake, returned: float) -> BaseException | None:
+    """Makes the young-window cell's call half way through the window and returns what it raised.
+
+    The release of the abandoned publish is armed on the loop from inside the call's own wait,
+    :data:`YOUNG_RELEASE` after it begins, through an instance wrapper on ``_await_stuck``. A call
+    the runner made late is therefore measured from its own start, and a call refused before it
+    reaches the loop arms nothing, so the cell's release step releases the publish instead.
+    """
+    real = sink._await_stuck
+
+    async def armed() -> bool:
+        assert fake.release is not None
+        asyncio.get_running_loop().call_later(YOUNG_RELEASE, fake.release.set)
+        return await real()
+
+    _wait_for_monotonic(returned + YOUNG_ENTRY)
+    sink._await_stuck = armed  # type: ignore[method-assign]
+    try:
+        return _timed(lambda: sink.emit([{"n": "young"}]))[1]
+    finally:
+        del sink._await_stuck
 
 
 def _close_quietly(sink: NATSSink) -> None:
@@ -559,7 +673,13 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
         waiter = None
         if cell.queued_refused:
             outcome: list[tuple[float, BaseException | None]] = []
-            caller = threading.Thread(target=lambda: outcome.append(_timed(_run(sink, cell.call))))
+            returned_at: list[float] = []
+
+            def stalled() -> None:
+                outcome.append(_timed(_run(sink, cell.call)))
+                returned_at.append(time.monotonic())
+
+            caller = threading.Thread(target=stalled)
             caller.start()
             assert _wait_until(
                 lambda: bool(fake.calls[pings_before:]) or fake.calls.count("publish") > 0
@@ -571,8 +691,10 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
             caller.join(10.0)
             waiter.join(10.0)
             elapsed, error = outcome[0]
+            returned = returned_at[0]
         else:
             elapsed, error = _timed(_run(sink, cell.call))
+            returned = time.monotonic()
         losses = sink.losses()
         pings = fake.calls.count("flush") - pings_before
         cancelled = fake.cancelled_flushes
@@ -598,12 +720,27 @@ def test_matrix_cell(cell_id: str, monkeypatch, capsys) -> None:
         if cell.queued_refused:
             q_elapsed, q_error = queued[0]
             assert isinstance(q_error, SinkDeliveryError), f"{cell_id}: queued {q_error!r}"
-            assert q_elapsed <= QUEUED_BOUND, f"{cell_id}: queued caller {q_elapsed:.2f}s"
+            assert q_elapsed <= cell.queued_bound, f"{cell_id}: queued caller {q_elapsed:.2f}s"
         if cell.next_refused is not None:
-            n_elapsed, n_error = _refused_while_locked(sink)
+            nexts = _refused_while_locked(sink, cell, returned)
+            n_elapsed, n_error = nexts["emit"]
             assert isinstance(n_error, SinkDeliveryError), f"{cell_id}: next {n_error!r}"
             assert re.search(cell.next_refused, str(n_error)), f"{cell_id}: next {n_error}"
             assert n_elapsed < NEXT_BOUND, f"{cell_id}: next caller {n_elapsed:.3f}s"
+            d_elapsed, verdict = nexts["deliver"]
+            outcomes = getattr(verdict, "outcomes", None)
+            assert outcomes == (Outcome.RETRYABLE,) * 2, f"{cell_id}: next deliver {verdict!r}"
+            assert d_elapsed < NEXT_BOUND, f"{cell_id}: next deliver {d_elapsed:.3f}s"
+            f_elapsed, f_error = nexts["flush"]
+            assert isinstance(f_error, SinkDeliveryError), f"{cell_id}: next flush {f_error!r}"
+            assert re.search(cell.next_refused, str(f_error)), f"{cell_id}: next flush {f_error}"
+            assert f_elapsed < NEXT_BOUND, f"{cell_id}: next flush {f_elapsed:.3f}s"
+        if cell.young_refused is not None:
+            young = _young_call(sink, fake, returned)
+            assert isinstance(young, SinkDeliveryError), (
+                f"{cell_id}: young caller not refused: {young!r}"
+            )
+            assert re.search(cell.young_refused, str(young)), f"{cell_id}: young {young}"
         if cell.released_accepts:
 
             async def release() -> None:
@@ -874,9 +1011,49 @@ def test_a_driver_timeout_is_positive_and_strictly_inside_what_remains(remaining
         assert remaining - timeout >= nats_sink_module.DRIVER_DEADLINE_MARGIN - 1e-12
 
 
+def test_matrix_an_orphan_level_call_waits_out_a_young_window_and_is_refused_at_once_after_it(
+    capsys,
+) -> None:
+    """FR-002 AC9 (SPEC-104): the orphan path, on the application's thread, meets the same rule.
+
+    A level call with no span reaches the sink on the caller's own thread. Made in the young
+    window it waits for the window's end and is refused there; made after it, it is refused
+    before the lock at once. Each refused call is one ``orphan_lost``, and the ledger balances.
+    """
+    fake = MatrixFake(block_at=0)
+    sink = NATSSink("logs", client=fake, jetstream=True, publish_timeout=ORPHAN_BUDGET)
+    log_foundry.configure(sink=sink)
+    try:
+        log_foundry.info("abandoning")
+        stalled_returned = time.monotonic()
+        log_foundry.info("young")
+        young_returned = time.monotonic()
+        _wait_for_monotonic(stalled_returned + ORPHAN_BUDGET)
+        aged_elapsed = _timed(lambda: log_foundry.info("aged"))[0]
+        health = log_foundry.health()
+    finally:
+
+        async def release() -> None:
+            if fake.release is not None:
+                fake.release.set()
+
+        _on_loop(sink, release())
+        _close_quietly(sink)
+    capsys.readouterr()
+
+    assert young_returned - stalled_returned <= ORPHAN_BUDGET + CALL_SLACK, (
+        f"the young call returned {young_returned - stalled_returned:.2f}s after the abandoning one"
+    )
+    assert aged_elapsed < NEXT_BOUND, f"the aged call took {aged_elapsed:.3f}s"
+    assert health.orphan_lost == 2, health
+    assert health.events.unaccounted == 0, health.events
+
+
 def _stall_cells() -> list[str]:
-    """The cells whose next or queued caller carries a latency bound (for the module docstring)."""
-    return [k for k, c in CELLS.items() if c.next_refused or c.queued_refused]
+    """The cells whose next, queued or young caller carries a bound (for the module docstring)."""
+    return [
+        k for k, c in CELLS.items() if c.next_refused or c.queued_refused or c.young_refused
+    ]
 
 
 def test_the_matrix_covers_each_axis() -> None:
