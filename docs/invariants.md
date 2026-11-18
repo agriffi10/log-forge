@@ -89,8 +89,11 @@ flight to a server that may yet process them (five of five did after a `docker u
 retry would duplicate them; the next call is refused instead, so the stall is still reported.
 So is a `NATSSink` publish the driver never returned from within the budget, on every path where
 no confirmation will judge it — JetStream, and an injected client of either mode — counted as
-unconfirmed where it is abandoned, with every later call refused while it is still pending
-(SPEC-061 FR-001). That leaves a JetStream asymmetry, recorded rather than removed: an ack wait
+unconfirmed where it is abandoned, ~~with every later call refused while it is still pending~~
+and no later call publishes while it is pending: since SPEC-104 a call made within one
+`publish_timeout` of the abandonment waits for it until that window ends and goes on if it
+finished, and one that finds it still pending then, or that comes after the window, is refused
+(SPEC-061 FR-001, SPEC-104 FR-001 and FR-002). That leaves a JetStream asymmetry, recorded rather than removed: an ack wait
 that expires raises in the driver, is counted as a raised publish, and a batch in which nothing
 else landed goes back to the worker, which retries it (SPEC-047's behaviour) — and every ack wait
 the budget caps does expire, because the sink hands the driver a timeout that ends inside its own
@@ -243,7 +246,8 @@ on the worker's `_stop` or, on the orphan path and in the inline adapter, on the
 prediction is asked before every further round, so on the exit drain an engine run declines a round
 predicted to end past `shutdown()`'s deadline, as the 1.x `emit` loop does. Since SPEC-074 no sink
 module but the engine waits or holds a backoff constant (`pubsub`'s wait on its own futures is not a
-backoff): every SDK, driver and socket sink waits through the engine, and none holds its transport
+backoff, and nor is `NATSSink`'s wait on its own abandoned publish, which ends one `publish_timeout`
+after the abandonment and inside the call's own deadline, SPEC-104): every SDK, driver and socket sink waits through the engine, and none holds its transport
 lock across a wait, so a `close()` during a backoff returns at once and the next round is refused.
 Since SPEC-076 the overlap of a `close()` with a call still inside one sink is bounded too: a
 `SERIAL` guard's close waits for at most the one section holding the transport lock when it
@@ -331,9 +335,14 @@ sink's.
 one before its first publish and one after its last, which on the orphan path is the application's
 own (SPEC-061 FR-003); measured at `71e42dd` against the prototype, a one-event emit went from
 0.04 ms to 0.47 ms and a 500-event emit from 0.90 ms to 1.26 ms, the price of a publish that is
-confirmed rather than believed.
-*Guarded:* `tests/test_api.py` (which path each call takes), `tests/test_sink_concurrency.py`.
-Not measured as a latency bound by any test — listed so the gap is visible.
+confirmed rather than believed. And since SPEC-104 a `NATSSink` level call on the orphan path made
+within one `publish_timeout` of a publish abandoned at an earlier deadline waits for that publish
+until the window ends, so it can block the application's thread for up to one `publish_timeout`
+(10 s at the default), where it was refused at once; that is the price of not losing a batch to a
+stall a little longer than one budget, and a call after the window is still refused at once.
+*Guarded:* `tests/test_api.py` (which path each call takes), `tests/test_sink_concurrency.py`;
+the NATS exception's bound by `tests/test_sinks_nats_matrix.py` (the orphan level call in and
+after a young window). Otherwise not measured as a latency bound by any test — listed so the gap is visible.
 
 ## 5. A sink the library wrote to is closed, once, by one owner, and a close in flight is waited for
 

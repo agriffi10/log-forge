@@ -122,6 +122,14 @@ refused every round and lost~~ which leaves the publish little room to finish be
 the tail behind it is lost unless it does, counted once and named by `lost <n> event(s); refused
 by NATSSink after others landed, SinkDeliveryError` (corrected at completion, 2026-11-17).
 
+> **Superseded in part by SPEC-104.** The latch no longer refuses every later round while the
+> publish is pending. A round made within one `publish_timeout` of the abandonment waits for it on
+> the loop until that window ends, and is refused `RETRYABLE` only if it is still pending then, or
+> once the window has aged; it still never publishes while the publish is pending, so the order
+> above holds. On the exit drain too, a tail behind a publish that finishes inside its window is
+> now delivered. The decision: *A driver's liveness flag is not evidence*
+> (`docs/decisions/sink-lifecycle/`).
+
 #### Acceptance Criteria:
 
 - [ ] In a round where at least one event is `ok` or `abandoned`, `_verdict_of` returns
@@ -193,6 +201,12 @@ stop signal, asked SPEC-062's prediction before it starts, and itself bounded by
 `publish_timeout`. So the worst case per batch is what a stalled server already costs, and the
 exit drain's bound is SPEC-090's as it stands. A round refused by the abandoned-publish latch
 publishes nothing and spends no budget.
+
+> **Superseded in part by SPEC-104.** A round refused once the latch has aged still spends no
+> budget, but a round made in the abandoned publish's first `publish_timeout` waits for it until
+> that window ends, inside the round's own deadline, before it publishes or is refused; the exit
+> drain's bound is unchanged. The decision: *A driver's liveness flag is not evidence*
+> (`docs/decisions/sink-lifecycle/`).
 
 #### Acceptance Criteria:
 

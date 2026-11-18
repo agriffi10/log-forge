@@ -196,6 +196,14 @@ before the publish ahead of them was abandoned. An abandoned injected `flush()` 
 not latch, because an injected flush is a PONG wait, not a write the next publish would queue
 behind.
 
+> **Superseded in part by SPEC-104.** The latch no longer refuses at once while the publish is
+> pending: it is dated at the abandonment, a call made within one `publish_timeout` of it waits for
+> the publish on the loop until that window ends, never cancelling it and never publishing past
+> it, and only a call after the window, or one whose wait ended with the publish still pending, is
+> refused, before the lock and again under it. A stall then costs its callers one window in all
+> rather than one caller one budget. The decision: *A driver's liveness flag is not evidence*
+> (`docs/decisions/sink-lifecycle/`).
+
 `close()` is FR-004's sequence; its tail stops the loop and joins the thread under
 `LOOP_JOIN_TIMEOUT`. Before stopping it cancels every task still pending on the loop and lets the
 cancellations run, so nothing is "destroyed but pending" (today's `close()` emits that warning). A

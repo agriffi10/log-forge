@@ -19,6 +19,11 @@ signature changed and no constructor argument was added.
   refuses every later `emit` and `flush`, on owned and injected clients, while a publish the
   deadline abandoned is still pending. The probe latch is read before the lock; the
   abandoned-publish latch before it and again after it.
+  > **Superseded in part by SPEC-104.** The abandoned-publish latch is dated at the abandonment
+  > and refuses at once only once the publish has been pending one `publish_timeout`; a call in
+  > that window waits for it on the loop until the window ends, never cancelling it and never
+  > publishing past it, and is refused only if it is still pending then. The decision: *A
+  > driver's liveness flag is not evidence* (`docs/decisions/sink-lifecycle/`).
 - **The confirmed-or-counted core batch** (FR-003): after the driver's `pending_data_size` reads
   zero, a fresh PING confirms the batch; unanswered or undrained, the published events are counted
   in `failed`, announced once, and `emit` returns rather than raises.
@@ -29,6 +34,10 @@ signature changed and no constructor argument was added.
   reports by raising is `_driver_timeout(...)`, ending `DRIVER_DEADLINE_MARGIN` (0.05 s) inside the
   sink's own wait, or `PROBE_FLUSH_TIMEOUT`, which deliberately outlives it; every latch ages from
   the start of the call whose budget the stall spent. A test holds the first half on the source from a pinned roster.
+  > **Superseded in part by SPEC-104.** The rule that every latch ages from the start of the call
+  > whose budget the stall spent has one exception: the abandoned-publish latch ages from the
+  > abandonment, since that is its call's deadline. `DRIVER_DEADLINE_MARGIN`'s docstring and the
+  > decision *A driver's liveness flag is not evidence* say why.
 - **Tests**: `tests/test_sinks_nats_liveness.py` (fakes for FR-001 to FR-004 and the fork child,
   79 tests collected at `cc54227`) and `tests/test_sinks_nats_matrix.py`, the wait-and-latch matrix
   gated by mutation (96 tests collected at `cc54227`); `tests/integration/test_nats.py` gains the

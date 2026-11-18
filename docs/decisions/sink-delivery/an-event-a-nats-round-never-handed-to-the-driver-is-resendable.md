@@ -29,10 +29,18 @@ exception costs its chunk, and is provable non-delivery for it*. SPEC-094, a Dra
 settled, answers its definitive reports `REJECTED` because each is a refusal every attempt would
 meet again; this one is a spent
 budget, and the next round brings a fresh one. It covers the events after a publish abandoned at the
-deadline too: the latch refuses every later round `RETRYABLE` before it publishes while that publish
-is pending, so a resend never overtakes it, and the tail is delivered only if the publish finishes
-before the rounds run out. On the exit drain the waits between rounds are zero, which leaves it
-little room to, so such a tail is lost there unless it does, counted once and named.
+deadline too: ~~the latch refuses every later round `RETRYABLE` before it publishes while that
+publish is pending~~ no later round publishes while that publish is pending, so a resend never
+overtakes it, and the tail is delivered only if the publish finishes before the rounds run out.
+~~On the exit drain the waits between rounds are zero, which leaves it little room to, so such a
+tail is lost there unless it does, counted once and named.~~
+
+> **Refined by SPEC-104.** A round made within one `publish_timeout` of the abandonment waits for
+> that publish on the loop until the window ends, and is refused `RETRYABLE` only if it is still
+> pending then, or once the window has aged; so on the exit drain too, where the engine's waits
+> between rounds are zero, a tail behind a publish that finishes inside its window is delivered,
+> and one behind a longer stall is still counted once and named. The latch's rule lives in *A
+> driver's liveness flag is not evidence* (`docs/decisions/sink-lifecycle/`).
 
 **The bound.** A backlog batch is delivered when its delivery fits in `max_retries + 1` rounds, four
 at the default, of one `publish_timeout` each. At a 0.2 s budget that is 0.8 s against SPEC-090's
@@ -64,6 +72,12 @@ published, until the `Nats-Msg-Id` item lands; and do not count an unattempted e
 delivered.
 
 ## History
+
+### 2026-11-18
+
+- **Marked** where it said the latch refuses every later round while the abandoned publish is
+  pending: since SPEC-104 a round in the publish's first window waits for it, so a tail behind a
+  transient stall is delivered on the exit drain too. The rule here, and its order, are unchanged.
 
 ### 2026-11-17
 
