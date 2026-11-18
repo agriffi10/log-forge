@@ -2020,6 +2020,7 @@ close made while its thread holds the worker queue's mutex does not return eithe
   (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
   callback against every public call, with a fork and a signal handler as calls.
 - ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no per-event term**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
+- ~~**The model test's lost-line oracle does not read the two lines the exit drain has written since SPEC-090, so a run whose exit drain abandons more than one batch fails a gating assertion**~~ → **closed by #393**; struck and moved under *Resolved*.
 - **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
   breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
   of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
@@ -2085,7 +2086,7 @@ close made while its thread holds the worker queue's mutex does not return eithe
   56,000 `deliver` and `http` runs, and a pull request's `CI` runs 32 of them on each of two legs.
   The second line is read from the code and not measured: a declined exit batch is counted in
   `failed_batches` (`worker.py:2638-2641`) without a run, so it can also break `invariant 6 (one
-  failed batch per run)`. **Closed by** the oracle reading both lines with their batch and event
+  failed batch per run)`. It was to be closed by the oracle reading both lines with their batch and event
   counts, and holding a declined batch apart from a failed run. SPEC-099's build starts only once
   this item is closed on `main`, because until then its nightly run is red on it every night.
   **Closed by** #393 (`4b7e4b86`): `_WORKER_LOST` is now built by `_worker_lost_shapes()`

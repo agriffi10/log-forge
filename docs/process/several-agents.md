@@ -109,12 +109,12 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   other session, writes or revises no spec but its own, and opens no PR but its own. A finding
   outside its criteria goes into a §12 entry in its own PR or a line in its report, and goes no
   further. Turning that entry into a spec or a session is the orchestrator's to put to Andrew.
-  An arc closes at the specs it names, never at an empty §12. Why: the 2026-11-14 audit arc grew
-  from 7 specs to 21 in four days, while open §12 items rose from 47 to 55. Those numbers come from
-  `git show <ref>:docs/architecture.md` at the audit's merge `5cb0f449` and at `9ee07a88`. Several
-  of the added specs were drafted in parallel against code that then changed under them. The
-  decision is *An arc closes at the specs it names, and only its orchestrator adds work*
-  (`docs/decisions/working-rules/`).
+  An arc closes at the specs it names, never at an empty §12. Why: during the 2026-11-14 audit arc,
+  four specs no plan named (SPEC-102 to SPEC-105) grew out of one build, and open §12 items rose
+  from 47 to 55. Some of those specs were drafted in parallel against code that then changed under
+  them. The decision is *An arc closes at the specs it names, and only its orchestrator adds work*
+  (`docs/decisions/working-rules/`). While a freeze it records holds, its lane order overrides
+  the readiness rule below.
 - **Write a spec just in time.** Draft or revise a spec only when everything it depends on has
   landed, so its premises are measured against the `main` it will build on. Draft one at a time.
 - **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec
