@@ -26,6 +26,13 @@ and never delete or force-push a peer's branch. Rebase onto fresh `origin/main` 
 too* in `docs/process/several-agents.md`: name what you start as your own, remove only that, run
 the integration stack once per machine, and never remove images.
 
+**Your scope is this task alone.**
+- Start no other session, write or revise no spec but your own, and open no PR but your own.
+- A finding outside your criteria goes into a §12 entry in your PR or a line in your report, and
+  stops there.
+- If one would change scope or block you, ask Andrew with the question tool. The rule is *Only the
+  orchestrator adds work* in `docs/process/several-agents.md`.
+
 **Who else is running.** [One line per peer: session, spec, branch. "You are the only one" is also an
 answer, and a useful one.]
 

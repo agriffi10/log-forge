@@ -2020,24 +2020,6 @@ close made while its thread holds the worker queue's mutex does not return eithe
   (`tests/test_lifecycle_races.py:60` holds the idea), followed by a derived matrix of every
   callback against every public call, with a fork and a signal handler as calls.
 - ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no per-event term**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
-- **The model test's lost-line oracle does not read the two lines the exit drain has written
-  since SPEC-090, so a run whose exit drain abandons more than one batch fails a gating assertion**
-  (found while authoring SPEC-099, 2026-11-16; a defect in the test, against invariant 2's oracle).
-  `_WORKER_LOST` (`tests/test_invariants_model.py:1956-1960`) matches `batch abandoned after <n>
-  emit attempts` and `retry declined after ... the next was predicted`. The exit drain also writes
-  `lost <n> event(s); <k> more exit batch(es) abandoned` (`src/log_foundry/worker.py:2667`) and
-  `lost <n> event(s); <k> exit batch(es) declined unattempted; ...` (`:2668-2673`), each one line
-  for several batches, and the pattern matches neither. The first is measured: in two runs whose
-  whole stderr was printed, `deliver-seed790` and `deliver-seed450` at `eda19f32`, the worker had
-  two failed runs and stderr held one `batch abandoned` line and one `1 more exit batch(es)
-  abandoned`, so `invariant 2 (a failed run's events are in its lost line)` failed. Over every run
-  SPEC-099's authoring made, on macOS and in a 4-CPU Linux container, that assertion failed 28 of
-  56,000 `deliver` and `http` runs, and a pull request's `CI` runs 32 of them on each of two legs.
-  The second line is read from the code and not measured: a declined exit batch is counted in
-  `failed_batches` (`worker.py:2638-2641`) without a run, so it can also break `invariant 6 (one
-  failed batch per run)`. **Closed by** the oracle reading both lines with their batch and event
-  counts, and holding a declined batch apart from a failed run. SPEC-099's build starts only once
-  this item is closed on `main`, because until then its nightly run is red on it every night.
 - **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
   breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
   of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
@@ -2087,6 +2069,31 @@ close made while its thread holds the worker queue's mutex does not return eithe
   `docs/process/completion-ritual.md` asks of a volatile number.
 
 ### Resolved
+
+- ~~**The model test's lost-line oracle does not read the two lines the exit drain has written
+  since SPEC-090, so a run whose exit drain abandons more than one batch fails a gating assertion**~~
+  (found while authoring SPEC-099, 2026-11-16; a defect in the test, against invariant 2's oracle).
+  `_WORKER_LOST` (`tests/test_invariants_model.py:1956-1960`) matches `batch abandoned after <n>
+  emit attempts` and `retry declined after ... the next was predicted`. The exit drain also writes
+  `lost <n> event(s); <k> more exit batch(es) abandoned` (`src/log_foundry/worker.py:2667`) and
+  `lost <n> event(s); <k> exit batch(es) declined unattempted; ...` (`:2668-2673`), each one line
+  for several batches, and the pattern matches neither. The first is measured: in two runs whose
+  whole stderr was printed, `deliver-seed790` and `deliver-seed450` at `eda19f32`, the worker had
+  two failed runs and stderr held one `batch abandoned` line and one `1 more exit batch(es)
+  abandoned`, so `invariant 2 (a failed run's events are in its lost line)` failed. Over every run
+  SPEC-099's authoring made, on macOS and in a 4-CPU Linux container, that assertion failed 28 of
+  56,000 `deliver` and `http` runs, and a pull request's `CI` runs 32 of them on each of two legs.
+  The second line is read from the code and not measured: a declined exit batch is counted in
+  `failed_batches` (`worker.py:2638-2641`) without a run, so it can also break `invariant 6 (one
+  failed batch per run)`. **Closed by** the oracle reading both lines with their batch and event
+  counts, and holding a declined batch apart from a failed run. SPEC-099's build starts only once
+  this item is closed on `main`, because until then its nightly run is red on it every night.
+  **Closed by** #393 (`4b7e4b86`): `_WORKER_LOST` is now built by `_worker_lost_shapes()`
+  (`tests/test_invariants_model.py:2110`) from every `_diag.lost("event", …)` in `worker.py`,
+  `_TALLY_WRITER` (`:2079`) names the writer of both exit lines, and
+  `test_an_exit_drain_tally_balances_the_worker_ledger` (`:2342`) holds a declined batch apart from
+  a failed run. Found still listed as open by the 2026-11-18 sweep of §12 and moved here then;
+  SPEC-099's start condition is met.
 
 - ~~**A dead sink whose target is already zero at the stop is handed the exit backlog in
   `batch_size` submissions, and its own per-batch lines are not aggregated**~~ (SPEC-090 FR-001

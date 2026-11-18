@@ -105,6 +105,18 @@ run from its first session. Confirm the queue is installed (the `Q=` line of `.g
 in the main checkout) and run `install.sh` only if it is not, never just to find out (above); then
 brief every session from `docs/templates/multi-agent-briefing.md`, queue section included.
 
+- **Only the orchestrator adds work, and only with Andrew's yes.** A build or fix session starts no
+  other session, writes or revises no spec but its own, and opens no PR but its own. A finding
+  outside its criteria goes into a §12 entry in its own PR or a line in its report, and goes no
+  further. Turning that entry into a spec or a session is the orchestrator's to put to Andrew.
+  An arc closes at the specs it names, never at an empty §12. Why: the 2026-11-14 audit arc grew
+  from 7 specs to 21 in four days, while open §12 items rose from 47 to 55. Those numbers come from
+  `git show <ref>:docs/architecture.md` at the audit's merge `5cb0f449` and at `9ee07a88`. Several
+  of the added specs were drafted in parallel against code that then changed under them. The
+  decision is *An arc closes at the specs it names, and only its orchestrator adds work*
+  (`docs/decisions/working-rules/`).
+- **Write a spec just in time.** Draft or revise a spec only when everything it depends on has
+  landed, so its premises are measured against the `main` it will build on. Draft one at a time.
 - **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec
   is ready when it is `Draft` on `origin/main` (the status a spec takes once reviewed, `spec-lifecycle.md`),
   `spec-lint` reports no failure for it there, every earlier spec in `arc_order` that it is not
