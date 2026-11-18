@@ -530,7 +530,7 @@ class NATSSink:
         self._closed = False
         self._owns_client = client is None
         self._abandoned: set[asyncio.Task[Any]] = set()
-        self._stuck: tuple[asyncio.Task[Any], ...] = ()
+        self._stuck: tuple[tuple[asyncio.Task[Any], float], ...] = ()
         self._probe: tuple[asyncio.Task[Any], float, int] | None = None
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._serve, name=_LOOP_THREAD_NAME, daemon=True)
@@ -1012,12 +1012,92 @@ class NATSSink:
         Raises:
           None.
         """
-        if self._publish_stuck():
-            return SinkDeliveryError(
-                f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
-                "is still blocked in the driver"
-            )
+        if self._stuck_aged():
+            return self._stuck_error(prefix)
         return None
+
+    def _stuck_error(self, prefix: str) -> SinkDeliveryError:
+        """Builds the abandoned-publish latch's error, the one text every refusal of it carries.
+
+        One builder for the latch's refusal before the lock, under it, and after a wait that ended
+        with the publish still pending (:meth:`_await_stuck`), so the three cannot drift apart.
+
+        Args:
+          prefix: The start of the message, naming what the call would have done.
+
+        Returns:
+          The error.
+
+        Raises:
+          None.
+        """
+        return SinkDeliveryError(
+            f"{prefix}: a publish abandoned at an earlier {self.publish_timeout}s deadline "
+            "is still blocked in the driver"
+        )
+
+    def _stuck_aged(self) -> bool:
+        """Reports whether a pending abandoned publish has been pending one window (SPEC-104).
+
+        One read of ``self._stuck``, a tuple the loop thread replaces whole, so any thread may
+        call it without a lock. Each entry carries the ``time.monotonic()`` instant its publish was
+        abandoned, and the window is ``publish_timeout`` from that instant: dated from the
+        abandonment rather than from the start of the call whose budget the stall spent, because
+        the abandonment happens at that call's deadline and a latch dated from its start would be
+        one window old the instant it was armed (:data:`DRIVER_DEADLINE_MARGIN` states the rule
+        and this exception).
+
+        Args:
+          None.
+
+        Returns:
+          True while an abandoned publish has not finished and was abandoned at least
+          ``publish_timeout`` ago.
+
+        Raises:
+          None.
+        """
+        now = time.monotonic()
+        return any(
+            not task.done() and now - since >= self.publish_timeout
+            for task, since in self._stuck
+        )
+
+    async def _await_stuck(self) -> bool:
+        """Waits on the loop for a pending abandoned publish until its window ends (SPEC-104).
+
+        The first step of :meth:`_round_on_loop` and :meth:`_flush_on_loop`. With nothing pending
+        it returns at once without awaiting, so a healthy call takes no extra trip through the
+        loop. Otherwise it waits with ``asyncio.wait`` on the pending task until the window's end,
+        its abandonment plus ``publish_timeout``, and **never cancels it**: a cancelled driver wait
+        the server may still answer is worse than a late one (SPEC-061). That end always falls
+        inside the calling coroutine's own deadline, because the lock serialises the coroutines and
+        the publish was abandoned before this one started. The wait is work, as the ack wait it
+        continues is, so it reads no stop signal: a round of the exit drain waits too.
+
+        After the wait it re-reads whether the abandoned publish is still pending, and that
+        re-read is what the caller refuses on. **It is the guard whose failure would be silent**:
+        without it a call would publish while the abandoned publish is still in the driver, and
+        SPEC-102's ordering, which the latch keeps, would break with no refusal or line to show
+        it. Written over the whole record, although at most one entry is pending at a time,
+        because nothing publishes while one is.
+
+        Args:
+          None.
+
+        Returns:
+          True when no abandoned publish is pending afterwards, so the call may go on with what
+          remains of its deadline; False when one still is, and the call refuses.
+
+        Raises:
+          None.
+        """
+        pending = [(task, since) for task, since in self._stuck if not task.done()]
+        if not pending:
+            return True
+        end = min(since for _, since in pending) + self.publish_timeout
+        await asyncio.wait({task for task, _ in pending}, timeout=max(0.0, end - time.monotonic()))
+        return not self._publish_stuck()
 
     def _refuse_while_stuck(self, prefix: str) -> None:
         """Raises while a publish abandoned at an earlier deadline is still pending (SPEC-061).
@@ -1050,7 +1130,7 @@ class NATSSink:
         Raises:
           None.
         """
-        return any(not task.done() for task in self._stuck)
+        return any(not task.done() for task, _ in self._stuck)
 
     def _refusal_under_the_lock(self, prefix: str) -> tuple[Outcome, SinkDeliveryError] | None:
         """Re-reads the closing flags and the stuck latch once the lock is held (SPEC-061 FR-001).
@@ -1138,6 +1218,8 @@ class NATSSink:
         """
         deadline = time.monotonic() + self.publish_timeout
         refusal = f"NATSSink published none of {len(batch)} event(s)"
+        if not await self._await_stuck():
+            return _Report(self._stuck_error(refusal))
         if not self._is_connected():
             return _Report(SinkDeliveryError(f"{refusal}: the client is disconnected"))
         probing = self._probing()
@@ -1749,7 +1831,7 @@ class NATSSink:
         if not done:
             self._abandoned.add(task)
             task.add_done_callback(self._abandoned.discard)
-            self._stuck = (*self._stuck, task)
+            self._stuck = (*self._stuck, (task, time.monotonic()))
             task.add_done_callback(self._unstick)
             return False
         task.result()
@@ -1770,7 +1852,7 @@ class NATSSink:
         Raises:
           None.
         """
-        self._stuck = tuple(other for other in self._stuck if other is not task)
+        self._stuck = tuple(entry for entry in self._stuck if entry[0] is not task)
 
     def flush(self) -> None:
         """Pushes the client's outbound buffer onto the wire without closing (SPEC-036 FR-002).
@@ -1833,6 +1915,8 @@ class NATSSink:
           Exception: Whatever an injected client's driver raises while flushing.
         """
         deadline = time.monotonic() + self.publish_timeout
+        if not await self._await_stuck():
+            raise self._stuck_error("NATSSink cannot flush")
         if not self._probing():
             await self._flush_client(deadline)
             return

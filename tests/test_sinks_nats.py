@@ -199,7 +199,9 @@ class SlowNATS:
 
     ``hold_at`` names one publish (1-based) that first parks on ``held``, which no test sets: the
     publish is in flight at the deadline by construction rather than by a ratio of sleeps to
-    budget -- a ratio a slow runner lands on the wrong side of -- and ``close`` cancels it.
+    budget -- a ratio a slow runner lands on the wrong side of -- and ``close`` cancels it. One
+    test since SPEC-104 does set it, from the loop, so that a later batch meets that abandoned
+    publish young and waits for it to finish.
     """
 
     def __init__(
@@ -352,14 +354,41 @@ def test_a_large_batch_against_a_healthy_server_is_not_truncated() -> None:
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
 
 
-def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch() -> None:
+YOUNG_HELD_RELEASE = 0.3
+"""Seconds into a batch's wait on a young abandoned publish at which the stop-signal test frees it.
+
+Inside the one-second budget that test runs at, so the wait ends with the publish finished and the
+batch has the rest of its budget to publish in.
+"""
+
+
+@pytest.mark.parametrize("abandoned", [False, True], ids=["clear", "young-abandoned"])
+def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch(
+    abandoned: bool,
+) -> None:
     # FR-001 AC-5. `_lifecycle.offer_stop_signal` probes by hasattr, so the absence IS the opt-out
     # -- a shutdown shortens a wait and never skips work, and this per-event await is work.
     # The positive half cannot fail today because nothing reads the attribute: it is a regression
     # guard, verified by adding the read and watching it redden, not by passing.
-    client = SlowNATS(per_event=0.0)
-    sink = NATSSink("logs", client=client, jetstream=True)
+    #
+    # SPEC-104 FR-002 AC10: the young-abandoned case first abandons a publish, so the batch meets
+    # it young and waits for it on the loop. That wait is work too and reads no stop signal. The
+    # held publish is freed from inside the batch's own wait, so it is timed from where that wait
+    # began, and the test asserts the batch did meet a pending abandoned publish.
+    client = SlowNATS(per_event=0.0, hold_at=1 if abandoned else None)
+    sink = NATSSink("logs", client=client, jetstream=True, publish_timeout=1.0)
     assert not hasattr(sink, "log_foundry_stop_signal")
+    met_pending: list[bool] = []
+    if abandoned:
+        sink.emit([{"n": "abandoned"}])
+        real = sink._await_stuck
+
+        async def release_then_wait() -> bool:
+            met_pending.append(sink._publish_stuck())
+            asyncio.get_running_loop().call_later(YOUNG_HELD_RELEASE, client.held.set)
+            return await real()
+
+        sink._await_stuck = release_then_wait  # type: ignore[method-assign]
 
     signal = threading.Event()
     signal.set()
@@ -367,7 +396,11 @@ def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch
     sink.emit([{"n": i} for i in range(20)])
     sink.close()
 
-    assert len(client.published) == 20, "a set stop event must not skip work"
+    if abandoned:
+        assert met_pending == [True], "the batch did not meet a pending abandoned publish"
+        assert len(client.published) == 21, "a set stop event must not skip the wait or the work"
+    else:
+        assert len(client.published) == 20, "a set stop event must not skip work"
 
 
 def test_an_expired_budget_with_nothing_published_books_only_what_it_attempted() -> None:
