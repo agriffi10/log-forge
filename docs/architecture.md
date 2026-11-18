@@ -2087,8 +2087,8 @@ close made while its thread holds the worker queue's mutex does not return eithe
   never publishing while it is pending, and goes on with what remains of its own deadline if it
   finished; only a call after the window, or one whose wait ended with the publish still pending,
   is refused, before the lock and again under it. The steady drain's cost is bounded by the age:
-  a stall that outlives the window costs its callers that one window in all. Built at `6c4d5956`,
-  FR-003's library-level tests over the probe's shape (one publish taking 1.5 budgets) read
+  a stall that outlives the window costs its callers that one window in all. On SPEC-104's final
+  tree, FR-003's library-level tests over the probe's shape (one publish taking 1.5 budgets) read
   `batch_lost` 0 both at the stop, returning in about 1.8 s with `sink_lost` 1, and in the steady
   drain; with every publish after the stop stalled (`publish_timeout` 0.5 s, `shutdown(timeout=2)`)
   the exit returned in 1.50 s, inside the stated bound. The PING latch was left as it is, and its

@@ -26,6 +26,7 @@ from log_foundry.sinks.nats import (
 )
 from log_foundry.sinks.verdict import Outcome
 from log_foundry.worker import Worker
+from test_sinks_nats_liveness import _wait_until
 from test_sinks_nats_matrix import NEXT_BOUND, ORPHAN_BUDGET
 
 if TYPE_CHECKING:
@@ -840,9 +841,11 @@ EXIT_SPANS = 100
 stalled publish ends half a budget before its window does, so the resend round that waited for it
 has that half to publish the rest of the batch in. If it runs out mid-batch it abandons the 1 ms
 publish in flight at its deadline, which is counted as a ``sink_lost`` of its own, and the test's
-"at most one" is then false of correct code. 200 events at about 1.2 ms each is 0.24 s unloaded,
-half of the 0.5 s; the plan review measured 600 spans at this budget reading ``sink_lost`` 2 to 3
-in 15 runs of 15, and 100 spans reading 1 in 17 of 17, 16 of them with 16 copies running at once.
+"at most one" is then false of correct code. The stalled batch holds :data:`EXIT_BATCH_SIZE`
+submissions, 100 events, so its tail of 99 publishes at the double's 1 ms ack is a fifth of that
+half budget unloaded, which leaves room for load to slow every publish several times over. A
+larger backlog, or a larger first batch, has to be checked against this rule under concurrent load
+before it is used.
 """
 
 EXIT_BATCH_SIZE = 50
@@ -949,15 +952,6 @@ def _lost_total(err: str) -> int:
 LOST_LINE = re.compile(r"^log-foundry: lost (\d+) event\(s\)", re.MULTILINE)
 
 
-def _poll_until(predicate: Callable[[], object], within: float = 5.0) -> bool:
-    end = time.monotonic() + within
-    while time.monotonic() < end:
-        if predicate():
-            return True
-        time.sleep(0.005)
-    return bool(predicate())
-
-
 def _stall_sink(mode: str, budget: float) -> tuple[ExitStallClient, NATSSink]:
     client = ExitStallClient(mode, budget)
     return client, NATSSink("logs", client=client, jetstream=True, publish_timeout=budget)
@@ -1021,7 +1015,7 @@ def test_a_transient_stall_in_the_steady_drain_loses_no_batch(capsys) -> None:
     trigger.set()
     for _ in range(STEADY_FIRST_SPANS):
         _traced()
-    began = _poll_until(lambda: client.stalls)
+    began = _wait_until(lambda: bool(client.stalls), within=5.0)
     for _ in range(STEADY_REST_SPANS):
         _traced()
     flushed = log_foundry.flush(timeout=10)
@@ -1100,10 +1094,12 @@ def test_a_long_stall_costs_one_window_in_all(capsys) -> None:
     trigger.set()
     for _ in range(5):
         _traced()
-    assert _poll_until(lambda: client.stalls), "the stall never began"
+    assert _wait_until(lambda: bool(client.stalls), within=5.0), "the stall never began"
     stall_began = client.stalls[0][0]
     assert stall_began is not None
-    assert _poll_until(lambda: any(r[0] <= stall_began <= r[1] for r in rounds))
+    assert _wait_until(
+        lambda: any(r[0] <= stall_began <= r[1] for r in rounds), within=5.0
+    )
     stalled_end = next(r[1] for r in rounds if r[0] <= stall_began <= r[1])
     window_end = stalled_end + ORPHAN_BUDGET
     for _ in range(5):

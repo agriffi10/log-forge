@@ -50,16 +50,16 @@
 A queued caller takes about `2 * P`, inside `STUCK_QUEUED_BOUND`. The transient exit test
 returned in about 1.8 s with `batch_lost` 0 and `sink_lost` 1; the slow exit (`P` 0.5 s, `S`
 2.0 s) returned in 1.50 s. In three runs of each case the loss lines summed exactly to the
-ledger's losses. All at `6c4d5956`.
+ledger's losses. All measured on SPEC-104's final tree.
 
 ## Verification
 
-- At `6c4d5956`: ruff, mypy, spec-lint, docs-lint and docstring-lint exit 0. pytest exits 0 on
-  3.13.1 in three full runs, and on 3.12.12 in a separate venv. The integration suite run as CI
-  runs it: 34 passed, `test_nats.py` alone 13. The extras unit suite: 12030 passed. The five NATS
-  test files exited 0 five times running under `-n 12`.
-- The collect-only diff against `76d37a6f`, 12028 to 12052 IDs, is additions only, plus three
-  changes: the liveness test renamed to
+- On SPEC-104's final tree: ruff, mypy, spec-lint, docs-lint and docstring-lint exit 0. pytest
+  exits 0 on 3.13.1 in three full runs, and on 3.12.12 in a separate venv. The integration suite
+  run as CI runs it: 34 passed, `test_nats.py` alone 13. The extras unit suite: 12030 passed. The
+  five NATS test files exited 0 five times running under `-n 12`.
+- The collect-only diff against `origin/main` at `1dc174fb`, 12028 to 12052 IDs, is additions
+  only, plus three changes: the liveness test renamed to
   `test_an_abandoned_publish_holds_later_callers_to_its_window_until_it_finishes`, the stop-signal
   test gaining `[clear]` and `[young-abandoned]`, and
   `test_numeric_door_roster.py::test_removing_a_helper_call_is_reported` re-keying

@@ -16,8 +16,8 @@ description: "`is_connected` flips only when the driver's own tasks notice, and 
   whose wait ended with the publish still pending, is refused. The timing rule's dating half gains
   this one exception and the fence says why. Four alternatives were prototyped and rejected, with
   their numbers above. `spec104_nats_exit_latch.py` at `61b942c0`: `transient exit` went from
-  `batch_lost` 1,632 to 1,636 to 0, and `transient steady` from 182 to 202 to 0; built at
-  `6c4d5956`, FR-003's library-level test of the exit case read `batch_lost` 0 and `sink_lost` 1.
+  `batch_lost` 1,632 to 1,636 to 0, and `transient steady` from 182 to 202 to 0; on SPEC-104's
+  final tree, FR-003's library-level test of the exit case read `batch_lost` 0 and `sink_lost` 1.
 
 ### 2026-11-04
 

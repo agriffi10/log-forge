@@ -8,17 +8,30 @@ degenerate rows. A cell asserts the outcome (a return or the exception type and 
 exact ``losses()`` counts, every announcement line in order, and for a stall the latency of the
 next caller (made while another thread holds the lock, so only the check before the lock can
 refuse it) and of a caller queued on the lock behind the stalled call. The expectations are
-derived from the spec, not read off the code, and the module is gated by mutation: every guard in
-``nats.py``'s wait and latch sites turns at least one cell red on its stated reason.
+derived from the spec, not read off the code, and the module is gated by mutation: every SPEC-061
+guard in ``nats.py``'s wait and latch sites turns at least one cell red on its stated reason.
 
 Since SPEC-104 the abandoned-publish latch ages as the probe's does. The next caller of an
 abandoned-publish cell is made once the window, one ``publish_timeout`` from the abandonment, has
 aged, and must then be refused before the lock by ``emit``, ``deliver`` and ``flush`` alike. A
 caller queued behind the abandoning call waits out the rest of the window on the loop before it
 is refused, so those four cells carry :data:`STUCK_QUEUED_BOUND`. The young-window column
-(``*-emit1-young-window``) makes a call half way through the window, which must wait and then be
-refused at the window's end, before the abandoned publish is released: a wait bounded by the
-caller's own deadline, or one that skips its re-check, publishes instead.
+(``*-emit1-young-window``) makes a call half way through the window, which must be refused before
+the abandoned publish is released; the cells assert that refusal only, not how long the call
+waited, because a call the runner makes late finds less of the window left, and a timing floor
+would then redden correct code.
+
+Of SPEC-104's guards the matrix gates four, each on its stated reason. The age comparison turned to
+``<``, and an age that never reaches the window, leave the aged next caller to queue on the held
+lock ("next caller" about 1.5 s). A wait bounded by the caller's own deadline instead of the
+window's end, and a wait that skips its re-check, both publish once the publish is released or the
+window ends ("young caller not refused: None"). Two more are gated elsewhere and turn no cell red
+here: a latch that refuses while any abandoned publish is pending, and an abandonment dated from
+the start of the call whose budget it spent. Those fail
+``test_sinks_nats_liveness.py::test_a_young_abandoned_publish_is_not_refused_before_the_lock_and_an_aged_one_is``,
+``test_sinks_nats_liveness.py::test_a_publish_finishing_inside_its_window_is_waited_for`` and
+``test_sinks_nats.py``'s ``test_a_transient_stall_at_the_stop_loses_no_batch`` and
+``test_a_transient_stall_in_the_steady_drain_loses_no_batch``, on ``batch_lost``.
 """
 
 from __future__ import annotations
@@ -55,6 +68,7 @@ from test_sinks_nats_liveness import (
     _build,
     _on_loop,
     _timed,
+    _wait_for_monotonic,
     _wait_until,
 )
 
@@ -560,12 +574,6 @@ def _run(sink: NATSSink, call: str) -> Callable[[], object]:
 def _lost_lines(err: str) -> list[str]:
     """The announcement lines a run wrote, in order."""
     return [line for line in err.splitlines() if line.startswith("log-foundry: lost ")]
-
-
-def _wait_for_monotonic(instant: float) -> None:
-    """Sleeps the test thread until ``time.monotonic()`` reaches ``instant``."""
-    while time.monotonic() < instant:
-        time.sleep(0.005)
 
 
 def _refused_while_locked(

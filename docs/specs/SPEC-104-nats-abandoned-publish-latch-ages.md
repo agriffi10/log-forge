@@ -406,7 +406,7 @@ So a stall that outlives the window costs `flush()` the rest of one window, once
   - The Evidence gives observed ranges with run counts, the reviewer's runs as further points, and
     "losses of the same order" for the slow exit.
 - **Rebased onto `e7b437f9`, 2026-11-17.** SPEC-102 landed, so it joins `depends_on` now rather than in Phase 1, and the Sequencing paragraph says it landed.
-- **2026-11-18, completed** at `6c4d5956`, with four corrections found by the build:
+- **2026-11-18, completed**, with four corrections found by the build:
   - FR-003 AC3 cannot hold for an exit backlog that leaves as one exit batch. With SPEC-102's
     resend, a batch whose abandoned publish counts as landed settles, so under "any pending" its
     refused tail is `sink_lost`, not `batch_lost`: 200 events gave `batch_lost` 0. The test uses a
