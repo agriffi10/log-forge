@@ -1097,6 +1097,22 @@ def test_lines_of_counts_loss_lines_and_nothing_else(text: str, count: int) -> N
     assert cb.lines_of(text) == count
 
 
+@pytest.mark.parametrize(
+    ("payload", "found"),
+    [
+        ('{"log_id": "c92e0001", "trace_id": "0af7651916cd43dd8448eb211c80319c"}', ["c92e0001"]),
+        ('{"log_id": "c92e0001", "trace_id": "0af76519c92e1234d8448eb211c80319"}', ["c92e0001"]),
+        ('{"log_id": "c92e0001", "span_id": "c92e12345b7ad6b7"}', ["c92e0001"]),
+        ('{"log_id": "c92e0001", "span_id": "00f067aac92e1234"}', ["c92e0001"]),
+        ('["c92e0002", "c92e0001", "c92e0002"]', ["c92e0002", "c92e0001"]),
+    ],
+    ids=["plain", "inside-a-trace-id", "starts-a-span-id", "ends-a-span-id", "first-seen-once"],
+)
+def test_tokens_are_never_read_inside_a_hex_id(payload: str, found: list[str]) -> None:
+    """A `c92e` run inside a random hex trace or span id is not an event's token."""
+    assert cb.tokens(payload) == found
+
+
 # The harness refuses a row it cannot judge (FR-002, FR-003).
 
 

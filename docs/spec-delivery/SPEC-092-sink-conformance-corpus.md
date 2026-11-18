@@ -79,6 +79,16 @@ tests, and with `test_conformance.py` gives 265 passed and 74 expected failures 
 whole suite, at the default `-n 12`, gives 12,243 passed, 39 skipped and 87 expected failures, exit
 0, on both.
 
+**A token found inside a hex id**, fixed after the push. The PR's first `test (py3.12)` run failed
+one row, `SNSSink-reply-lost`, refused as "double ignored its fault". `tokens` read `c92e\d{4}`
+anywhere in a payload, and every payload also carries random hex trace and span ids: measured over
+two million random (trace, span) pairs, about one in 12,000 holds such a run, so about one suite run
+in 45 read a token no event has, and the SNS double then failed to key its entries before applying
+its action. `TOKEN` is now bounded by characters that are not hex digits, and
+`test_tokens_are_never_read_inside_a_hex_id` holds it (the unbounded pattern fails three of its
+five cases). No verdict moved: the runner, re-run at the fix, prints the same verdict set and
+moved-row lists, and the gate file now collects 88 tests (270 passed with the corpus).
+
 **The driver branch** (FR-002): with `driver_classes` answering `()`, 21 rows move, all to
 `lost-but-held`: `taken-then-raised` and `reply-lost` of `SQSSink[standard]`, `SQSSink[fifo]`
 (from green), `SNSSink`, `KinesisSink`, `FirehoseSink`, `ClickHouseSink`, `AzureEventHubsSink`,

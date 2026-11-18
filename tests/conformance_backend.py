@@ -34,8 +34,13 @@ N = 8
 """Events per batch: six level calls inside one traced call, with `span.start` and `span.end`.
 Halves and quarters are whole, so `partial` splits a call 4, 2 and 2."""
 
-TOKEN = re.compile(r"c92e\d{4}")
-"""Every event's `log_id` in a row; the backend counts what it holds by these, never by position."""
+TOKEN = re.compile(r"(?<![0-9a-fA-F])c92e\d{4}(?![0-9a-fA-F])")
+"""Every event's `log_id` in a row; the backend counts what it holds by these, never by position.
+
+A token is bounded by characters that are not hex digits, because every payload also carries random
+hex trace and span ids, and an unbounded `c92e\\d{4}` is found inside one about once in 12,000
+(trace, span) pairs: a row then counts a token no event has, or keys an entry by it, and is
+misjudged or refused at random (PR #411's first `test (py3.12)` run)."""
 
 Action = Literal["ok", "refuse", "partial", "taken-raise", "reply-lost", "noshape", "nack"]
 Fate = Literal["landed", "lost", "ambiguous", "skipped"]
