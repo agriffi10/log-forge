@@ -117,7 +117,9 @@ brief every session from `docs/templates/multi-agent-briefing.md`, queue section
   from 47 to 55. Some of those specs were drafted in parallel against code that then changed under
   them. The decision is *An arc closes at the specs it names, and only its orchestrator adds work*
   (`docs/decisions/working-rules/`). While a freeze it records holds, its lane order replaces the
-  `arc_order` condition of the readiness rule below; that rule's other conditions still hold.
+  `arc_order` condition of the readiness rule below, strictly: a spec starts only once every
+  earlier spec in its lane has landed, independent or not, and a Held spec starts only on Andrew's
+  yes. That rule's other conditions still hold.
 - **Write a spec just in time.** Draft or revise a spec only when everything it depends on has
   landed, so its premises are measured against the `main` it will build on. Draft one at a time.
 - **Start every ready spec, without asking — at the outset and again each time a spec lands.** A spec

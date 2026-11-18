@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "An arc closes at the specs it names, and only its orchestrator adds work"
-description: "a build or fix session starts no other session, writes or revises no spec but its own and opens no PR but its own; a finding outside its criteria goes into a §12 entry or its report and stops there, and only the orchestrator, with Andrew's yes, turns one into a spec or a session. Specs are drafted one at a time, only once their dependencies have landed. Do not let a session's finding become new scope on its own. (Andrew, 2026-11-18)"
+description: "a build or fix session, in an arc or not, starts no other session, writes or revises no spec but its own and opens no PR for work outside its own spec or fix; a finding outside its criteria goes into a §12 entry in its PR and stops there, unfixed. Only the orchestrator, with Andrew's yes, turns one into a spec or a session; specs are drafted one at a time, once their dependencies have landed; this overrides any standing instruction to hand new work to a new session. The 2026-11-18 freeze fixes the audit arc's remaining specs in strict lanes. (Andrew, 2026-11-18)"
 ---
 
 **What happened.** The 2026-11-14 audit planned its work by track
@@ -45,7 +45,8 @@ Andrew answered "Adopt it".
 **The scope now fixed.** It covers the nine specs of the arc still Draft that day, plus SPEC-104
 and SPEC-105, which are built alongside the arc and not in it. While the freeze holds, the lanes
 below replace the `arc_order` condition of the readiness rule in
-`docs/process/several-agents.md`; that rule's other conditions still hold. The two lanes and
+`docs/process/several-agents.md`, strictly: a spec starts only once every earlier spec in its lane
+has landed, independent or not. That rule's other conditions still hold. The two lanes and
 SPEC-104 run at once, since their specs name disjoint source files:
 
 - **The lifecycle lane**, in order: SPEC-097, SPEC-098, SPEC-101 and SPEC-099.
@@ -54,8 +55,8 @@ SPEC-104 run at once, since their specs name disjoint source files:
     is live, a red night blocks every merge.
   - SPEC-105 stays held until SPEC-097 lands, because both change the shutdown path in `worker.py`.
     It then joins this lane after SPEC-097, but it resumes only on Andrew's yes, since he held it.
-- **The sinks lane**, in order: SPEC-092, SPEC-093, then SPEC-094 and SPEC-095 in parallel, then
-  SPEC-100.
+- **The sinks lane**, in order: SPEC-092; then SPEC-093 and SPEC-094 as one build and one PR, as
+  SPEC-094 states, in parallel with SPEC-095; then SPEC-100.
 - **Standing alone:** SPEC-104.
 
 The freeze ends when these eleven specs land or Andrew lifts it. Every other §12 item waits for

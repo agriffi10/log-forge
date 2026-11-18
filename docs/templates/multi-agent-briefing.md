@@ -29,7 +29,8 @@ the integration stack once per machine, and never remove images.
 **Your scope is this task alone.**
 - Start no other session, write or revise no spec but your own, and open no PR for work outside
   your own spec or fix.
-- A finding outside your criteria goes into a §12 entry in your PR and stops there. Report it to the
+- A finding outside your criteria goes into a §12 entry in your PR and stops there, unfixed, even
+  when the fix is small. Report it to the
   orchestrator only if it must act now.
 - If a finding would change scope or block you, escalate as *Escalate, don't improvise* below says.
 - The rule is *Only the orchestrator adds work* in `docs/process/several-agents.md`, and in this
