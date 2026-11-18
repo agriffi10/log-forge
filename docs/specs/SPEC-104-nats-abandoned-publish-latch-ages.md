@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-104
 title: "NATSSink's Abandoned-Publish Latch Ages, as Its PING Latch Does"
 description: "Makes a NATSSink call that meets a publish abandoned less than one publish_timeout ago wait for it on the loop until that window ends, without cancelling it and without publishing past it, so a stall a little longer than one budget no longer loses a batch, and with SPEC-102's resend no event but the abandoned one, while a longer stall still costs one window in all."
-spec_status: Draft
+spec_status: In Progress
 depends_on: [SPEC-047, SPEC-061, SPEC-062, SPEC-102]
 ---
 
