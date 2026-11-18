@@ -1938,6 +1938,12 @@ close made while its thread holds the worker queue's mutex does not return eithe
   declares itself idempotent*, `docs/decisions/sink-delivery/`), and what stays resendable, at the
   accepted cost, is a client exception the sink's retry predicate accepts, caught inside `deliver`
   and answered `RETRYABLE`. The JetStream `Nats-Msg-Id` item above is this item for one sink.
+  `MongoDBSink`'s form of it is a resend that the unique `_id` refuses and that is counted as a
+  rejection although the document landed, as *No shipped sink declares itself idempotent*
+  records; and a borrowed `PostgresSink` or `RabbitMQSink` connection, which the sink may not
+  reopen, leaves the events the backend took counted as lost when the reply was lost with the
+  connection. Both are held by the `reply-counted-lost` pin of `tests/test_conformance.py`
+  (SPEC-092).
 - **An AWS batch reply that names no failure is read as full delivery** (2026-11-14 audit, finding
   14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
   and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads
@@ -1950,9 +1956,14 @@ close made while its thread holds the worker queue's mutex does not return eithe
   (`docs/decisions/sink-delivery/`) reads a keyed reply by what `Failed` names, real AWS names every
   entry, and so this needs a proxy, an emulator or a broken mock. What is open is that a reply which
   is not reply-shaped at all is told apart from success by nothing; the `ElasticsearchSink` item
-  above is the same shape for `_bulk`. **Closed by** deciding whether a reply that carries neither
-  `Failed` nor `Successful`, or neither a count nor records, is unadjudicated, and holding the
-  answer in the conformance corpus.
+  above is the same shape for `_bulk`. ~~**Closed by** deciding whether a reply that carries
+  neither `Failed` nor `Successful`, or neither a count nor records, is unadjudicated, and holding
+  the answer in the conformance corpus.~~ **Decided by Andrew on 2026-11-15.** Asked whether a
+  reply that names no failure should read as delivered, he answered 'Unadjudicated (Recommended)':
+  every event the reply does not name is `UNKNOWN`, counted in `failed` and
+  `dropped_unadjudicated`, announced once as one that may have landed, and never resent. **Closed
+  by** SPEC-093 building that reading, which turns the `reply-without-verdict` rows of
+  `tests/test_conformance.py` green.
 - **`SentrySink`'s SDK backend counts an event the SDK discarded as sent** (2026-11-14 audit,
   finding 11; invariant 2). `SentrySink._capture` ignores what `capture_event` returns
   (`sinks/sentry.py:448-458`), so by the sinks frame's reading sampling, `before_send`, a rate limit
@@ -1983,8 +1994,15 @@ close made while its thread holds the worker queue's mutex does not return eithe
   SPEC-089 added those counts (2026-11-16) and states that such a loss is **in none of them**:
   the event ledger ends where `emit` returns, so a failed delivery report counted afterwards
   shows in `health().sink` and nowhere on a `flush()` result, whose counts read zero over it.
-  **Closed by** the acknowledgement fix for these two sinks (SPEC-094), which has a round wait
-  for the client's report, and by a decision on whether a full client queue is retried.
+  ~~**Closed by** the acknowledgement fix for these two sinks (SPEC-094), which has a round wait
+  for the client's report, and by a decision on whether a full client queue is retried.~~
+  **Decided by Andrew on 2026-11-15 and 2026-11-16.** Asked whether the verdict may come before
+  the client's report, he answered 'Wait for the report (Recommended)': each batch's `emit` waits
+  for the client's delivery reports within the sink's existing timeout, as core NATS confirms.
+  Asked what a truthy `flush()` then means, he answered 'Truthy, counted (Recommended)': every
+  event was acknowledged or counted. **Closed by** SPEC-094 building that, which turns the
+  `verdict-before-refusal` and `verdict-before-indefinite-report` rows of
+  `tests/test_conformance.py` green, and by a decision on whether a full client queue is retried.
 - **An injected autocommit connection breaks the database sinks' all-or-nothing write** (2026-11-14
   audit, finding 15; invariants 2 and 7). `PostgresSink` commits once after every chunk of a batch
   (`sinks/postgres.py:457-468`) and `SQLiteSink` relies on `with self._conn`
@@ -2021,17 +2039,8 @@ close made while its thread holds the worker queue's mutex does not return eithe
   callback against every public call, with a fork and a signal handler as calls.
 - ~~**`NATSSink` leaves the events past a round's deadline unattempted and counts them in no per-event term**~~ → **closed by SPEC-088**; struck and moved under *Resolved*.
 - ~~**The model test's lost-line oracle does not read the two lines the exit drain has written since SPEC-090, so a run whose exit drain abandons more than one batch fails a gating assertion**~~ → **closed by #393**; struck and moved under *Resolved*.
-- **No single fault script exists that every sink must pass** (2026-11-14 audit, finding 22; it
-  breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
-  of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
-  fail whole calls only, it covers the record-building sinks and leaves out the HTTP family, NATS,
-  Sentry and the wrappers, and no double anywhere models "accepted, then the call raised", "peer
-  closed between batches" or "client buffer never acknowledged", or compares what the backend holds
-  with the ledger. The frame judges that findings 1, 5, 11, 12, 14 and 15 would have been caught by
-  one. **Closed by** each sink declaring its acknowledgement class as data, one stateful fake and
-  one fault script per class, and one assertion, that what landed once and what was counted once add
-  up to the batch with a line for each loss, each sink's permitted departures being rows of the
-  table.
+- ~~**No single fault script exists that every sink must pass**~~ → **closed by SPEC-092**; struck and
+  moved under *Resolved*.
 - **CI cannot see a hang, a platform difference or an untested line** (2026-11-14 audit, finding 23;
   no invariant). At `a0f44b5f` the behavioural job runs on `ubuntu-latest` only
   (`.github/workflows/ci.yml:73`), on Python 3.12 and 3.13 (`:95`), with no `timeout-minutes`, no
@@ -2096,6 +2105,26 @@ close made while its thread holds the worker queue's mutex does not return eithe
   a failed run. Found still listed as open by the 2026-11-18 sweep of §12 and moved here then;
   SPEC-099's start condition is met.
 
+- ~~**No single fault script exists that every sink must pass**~~ (2026-11-14 audit, finding 22; it
+  breaks no invariant, and it is why invariants 2 and 7 are guarded sink by sink). The `RIGS` table
+  of `tests/sink_rigs.py` (`:700`) is the closest thing. By the sinks frame's reading its doubles
+  fail whole calls only, it covers the record-building sinks and leaves out the HTTP family, NATS,
+  Sentry and the wrappers, and no double anywhere models "accepted, then the call raised", "peer
+  closed between batches" or "client buffer never acknowledged", or compares what the backend holds
+  with the ledger. The frame judges that findings 1, 5, 11, 12, 14 and 15 would have been caught by
+  one. **Closed by** each sink declaring its acknowledgement class as data, one stateful fake and
+  one fault script per class, and one assertion, that what landed once and what was counted once add
+  up to the batch with a line for each loss, each sink's permitted departures being rows of the
+  table.
+  **Closed by SPEC-092** (2026-11-18): `tests/test_conformance.py` runs every shipped sink, per
+  constructor variant, under the fault scripts of its acknowledgement class (declared in
+  `tests/conformance_classes.py`) against a stateful fake backend, and judges each row by one
+  assertion of seven checks. It drives the worker path only, and judges 41 of the 53 variants
+  event by event and the 12 whose judged sink offers no `deliver` per batch. Of its 256 rows, 74
+  are pinned to the open items that own their defects, 12 are permitted departures quoting their
+  records, and 170 pass. Its `unannounced`
+  check asks for a loss line per batch rather than for the counts the lines name to add up to the
+  events, since the HTTP family names its losses in requests.
 - ~~**A dead sink whose target is already zero at the stop is handed the exit backlog in
   `batch_size` submissions, and its own per-batch lines are not aggregated**~~ (SPEC-090 FR-001
   rule 4 and FR-003; invariants 2 and 11). FR-003 aggregates the worker's abandon and decline
@@ -3935,6 +3964,12 @@ and a third copy is a fork with no merge.
   The decision lives in `docs/decisions/sink-lifecycle/` (*A child forked inside a stop-signal
   setter keeps its mark and the event it was offered, and its shutdown sets that event*).
   (SPEC-083)
+- **A UDP datagram is fire-and-forget: a `sendto` that returned is all `SyslogSink` and
+  `LogstashSink` can know.** With no listener, every datagram is lost and nothing is counted,
+  which §12's finding-1 item already calls inherent to UDP. (SPEC-092)
+- **A caller's callable that keeps events and then raises has them resent.** `CallbackSink` (and a
+  wrapper over it) cannot see what the callable kept; its raise tells the worker that nothing
+  landed (invariant 7), and the worker resends the batch whole. (SPEC-092)
 
 ---
 
