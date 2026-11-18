@@ -845,6 +845,18 @@ half of the 0.5 s; the plan review measured 600 spans at this budget reading ``s
 in 15 runs of 15, and 100 spans reading 1 in 17 of 17, 16 of them with 16 copies running at once.
 """
 
+EXIT_BATCH_SIZE = 50
+"""The ``batch_size`` of the exit-stall test, so its backlog leaves as two exit batches of 100.
+
+Two, because with SPEC-102's resend a batch whose abandoned publish counts as landed settles, and
+its refused tail is then ``sink_lost``, not ``batch_lost``: a latch that refused while any
+abandoned publish was pending would lose the single batch of a one-batch backlog with
+``batch_lost`` still 0. The second batch is the one that defect loses whole, so the test fails on
+``batch_lost`` as FR-003 AC3 asks. The first exit batch has no measured rate behind it, so it holds
+exactly ``batch_size`` submissions, and the stalled one is therefore 100 events, inside the sizing
+rule above.
+"""
+
 STEADY_FIRST_SPANS = 25
 """Traced calls logged in the steady test before its stall begins, which bounds the stalled batch.
 
@@ -974,13 +986,14 @@ def _assert_no_batch_lost(client: ExitStallClient, health: Any, err: str) -> Non
 def test_a_transient_stall_at_the_stop_loses_no_batch(capsys) -> None:
     """FR-003 AC1, AC2, AC3 and AC7: the exit drain waits out a stall a little over one budget.
 
-    Nothing drains before the stop, so the whole backlog is the exit drain's. Its first round's
-    first publish stalls for 1.5 budgets and is abandoned; the resend round meets it young, waits
-    for it, and publishes the rest. Reverting the age check to "any pending" refuses every round
-    at once, at the stop's zero backoff, and loses the batch.
+    Nothing drains before the stop, so the whole backlog is the exit drain's, in two batches. The
+    first round's first publish stalls for 1.5 budgets and is abandoned; the resend round meets it
+    young, waits for it, and publishes the rest, and the second batch then has a budget of its
+    own. Reverting the age check to "any pending" refuses every round at once, at the stop's zero
+    backoff, and loses the second batch whole.
     """
     client, sink = _stall_sink("transient", EXIT_BUDGET)
-    worker = Worker(sink, batch_size=10_000, flush_interval=3_600.0)
+    worker = Worker(sink, batch_size=EXIT_BATCH_SIZE, flush_interval=3_600.0)
     client.trigger = worker._stop.is_set
     install_worker(worker)
     for _ in range(EXIT_SPANS):
