@@ -542,3 +542,21 @@ reasoning as it stood, not a second authority. New narrative states neither (`do
   can meet (second review, seed 29). The last draft is on no branch: the checkout that ran the arc
   keeps it under the local ref `refs/archive/2026-11-14/spec-086-adversarial-generative-draft`,
   which a clone does not hold.
+
+  **The arc's scope was fixed on 2026-11-18.** Four specs that no plan named, SPEC-102 to SPEC-105,
+  grew out of SPEC-090's build, and open §12 items rose from 47 to 55. Andrew adopted a freeze
+  ("Adopt it"). The arc now closes when its nine Draft specs land. SPEC-104 and SPEC-105 carry no
+  `arc:` and are built alongside it. While the freeze holds, these lanes set the order:
+
+  - **The lifecycle lane**, in order: SPEC-097, SPEC-098, SPEC-101 and SPEC-099. SPEC-105 stays held
+    until SPEC-097 lands, and resumes only on Andrew's yes.
+  - **The sinks lane**, in order: SPEC-092; then SPEC-093 and SPEC-094 as one build and one PR, as
+    SPEC-094 states, in parallel with SPEC-095; then SPEC-100.
+  - **Standing alone:** SPEC-104.
+
+  The two lanes and SPEC-104 run at once, and each lane is strict: a spec starts only once every
+  earlier spec in its lane has landed. The freeze ends when these specs land or Andrew lifts it.
+
+  Every other open item in `docs/architecture.md` §12 waits for work Andrew chooses afterwards. The
+  rule, with why SPEC-099 and SPEC-105 wait on SPEC-097, is *An arc closes at the specs it names,
+  and only its orchestrator adds work* (`docs/decisions/working-rules/`).
