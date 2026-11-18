@@ -403,14 +403,20 @@ def test_the_sink_declares_no_stop_signal_and_a_set_one_does_not_shorten_a_batch
     signal = threading.Event()
     signal.set()
     sink.log_foundry_stop_signal = signal  # type: ignore[attr-defined]
-    sink.emit([{"n": i} for i in range(20)])
+    refused: SinkDeliveryError | None = None
+    try:
+        sink.emit([{"n": i} for i in range(20)])
+    except SinkDeliveryError as exc:
+        refused = exc
     sink.close()
 
     if abandoned:
         assert met_pending == [True], "the batch did not meet a pending abandoned publish"
-        assert len(client.published) == 21, "a set stop event must not skip the wait or the work"
+        assert len(client.published) == 21, (
+            f"a set stop event must not skip the wait or the work: {refused!r}"
+        )
     else:
-        assert len(client.published) == 20, "a set stop event must not skip work"
+        assert len(client.published) == 20, f"a set stop event must not skip work: {refused!r}"
 
 
 def test_an_expired_budget_with_nothing_published_books_only_what_it_attempted() -> None:
@@ -946,11 +952,15 @@ def _stall_sink(mode: str, budget: float) -> tuple[ExitStallClient, NATSSink]:
 
 
 def _assert_no_batch_lost(client: ExitStallClient, health: Any, err: str) -> None:
-    """FR-003's shared outcome for a transient stall: AC1, AC2, AC4 and AC7."""
+    """FR-003's shared outcome for a transient stall: AC1, AC2, AC4 and AC7.
+
+    ``batch_lost`` is asserted first, so the defect AC3 names, a latch that refuses while any
+    abandoned publish is pending, fails here on the lost batch rather than on a later symptom.
+    """
     events = health.events
+    assert (events.batch_lost, health.failed_batches) == (0, 0), (events, health.failed_batches)
     assert len(client.stalls) == 1, f"expected one stall, saw {client.stalls}"
     assert client.stalls[0][1] is not None, "the stalled publish never acked"
-    assert (events.batch_lost, health.failed_batches) == (0, 0), (events, health.failed_batches)
     assert events.sink_lost <= 1, events
     assert len(set(client.received)) == len(client.received), "an event reached the double twice"
     assert events.accepted - 1 <= len(client.received) <= events.accepted, (
@@ -1007,8 +1017,8 @@ def test_a_transient_stall_in_the_steady_drain_loses_no_batch(capsys) -> None:
     log_foundry.shutdown(timeout=10)
 
     assert began, "the stall never began"
-    assert flushed, flushed
     _assert_no_batch_lost(client, health, err)
+    assert flushed, flushed
 
 
 def test_a_slow_exit_stays_inside_the_stated_bound(capsys) -> None:

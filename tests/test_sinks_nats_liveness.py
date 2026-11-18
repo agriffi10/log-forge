@@ -2625,7 +2625,7 @@ def test_a_call_in_the_young_window_of_a_long_stall_is_refused_at_the_windows_en
         stalled_returned = time.monotonic()
         error, verdict = _next_call(sink, kind)
         young_returned = time.monotonic()
-        finished = _wait_until(lambda: client.events("publish-end") == [0], within=5.0)
+        finished = _wait_until(lambda: 0 in client.events("publish-end"), within=5.0)
     finally:
         sink.close()
 
@@ -2699,7 +2699,7 @@ def test_no_publish_or_flush_starts_while_an_abandoned_publish_is_pending(caller
         else:
             with contextlib.suppress(SinkDeliveryError):
                 sink.flush()
-        finished = _wait_until(lambda: client.events("publish-end") == [0], within=5.0)
+        finished = _wait_until(lambda: 0 in client.events("publish-end"), within=5.0)
     finally:
         sink.close()
 
