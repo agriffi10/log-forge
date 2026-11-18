@@ -1715,8 +1715,9 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `_round_on_loop` calls `_publish_all` with that much left, and its first publish, healthy, is
   abandoned at the deadline: counted unconfirmed in `sink_lost`, announced on a `lost 1 event(s);
   NATSSink unconfirmed, JetStream publish abandoned` line, and arming a new latch for the next
-  caller. In the review's emulation (an injected JetStream double, a 2.0 s budget, the first
-  publish taking 1.995 budgets; the script was not kept), `sink_lost` read 2 and two such lines
+  caller. In the review's emulation (an injected JetStream double, a 0.4 s budget, the first
+  publish taking 1.995 budgets; `docs/audits/2026-11-14-probes/core-pipeline/`
+  `spec104_nats_twin_paths.py bare steady 1.995`), `sink_lost` read 2 and two such lines
   were written, yet the double received 200 of 200; it happened at 1.98 and 2.0 budgets too.
   Against a real `nats-py` the sliver costs more: `_driver_timeout` hands the driver about half of
   a remainder that small, so the ack wait expires and raises inside it, and the event is resent,
