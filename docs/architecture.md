@@ -1684,6 +1684,49 @@ an item leaves this list when a spec closes it, not because the arc names it.
   real server whose peer stops reading for a little longer than one budget, whether a left-behind
   probe should age from when it was sent rather than from the start of the round, which reverses
   that review's finding, or records the asymmetry here and in invariant 6 as a trade.
+- **A `NATSSink` under `MultiSink`, or under any wrapper that calls its `emit`, gets no resend of
+  the tail a stalled round left unattempted** (found by SPEC-104's second diff review, 2026-11-18;
+  invariants 2 and 6; read at `1dc174fb`). `NATSSink` takes no `max_retries`, so its `emit` runs
+  one round (`emit_via_deliver`, `src/log_foundry/sinks/nats.py:773`; every line cited in this
+  item is at `1dc174fb`), and `MultiSink` never offers `deliver` and calls each child's `emit`
+  (`src/log_foundry/sinks/multi.py:150`). SPEC-102's resend of an event a round's deadline left
+  unattempted runs in the worker's later rounds, so it never reaches this path: the tail behind a
+  publish that outlasted the budget is counted in `failed` and announced on a `NATSSink
+  publish_timeout` line, never resent. SPEC-102 recorded the path as unchanged, in its twin-path
+  paragraph, and no item tracked the loss. Before SPEC-104 the latch hid it, refusing every later
+  round as well. `docs/audits/2026-11-14-probes/core-pipeline/spec104_nats_twin_paths.py multi
+  steady young` and `multi exit young` (an injected JetStream double, a 0.4 s budget, one publish
+  taking 0.6 s, 200 events in 100 spans, `batch_size` 50): at `1dc174fb` the `NATSSink` received 0
+  of 200 in the steady drain and 1 at the stop; on SPEC-104's tree 151 and 102, with `lost 49
+  event(s); NATSSink publish_timeout 0.4s` and `lost 98 event(s); NATSSink publish_timeout 0.4s`,
+  each beside the abandoned publish's own unconfirmed line. The `bare`, `filter` and `transform`
+  runs lost only that publish's own event in both phases. `MultiSink` already runs an engine
+  child's rounds inside its one `emit` (SPEC-075 FR-004); a `NATSSink` child makes one only because
+  it takes no `max_retries`. **Closed by** `NATSSink.emit` running a further round for a tail its
+  round left unattempted, which changes 1.x's one-round `emit` and its one-`publish_timeout` cost,
+  so the closing spec weighs it against the exit drain's prediction; not designed.
+- **A round whose wait for an abandoned publish ends in the last milliseconds of its deadline
+  publishes into the sliver left, so its next healthy publish is abandoned too** (found by
+  SPEC-104's second diff review, 2026-11-18; invariants 2 and 3). Cited by symbol, because
+  SPEC-104's code is not yet on `main` as this is written. `_await_stuck` waits until the abandoned
+  publish finishes or its window ends, and that end falls inside the waiting call's own deadline;
+  SPEC-104 FR-002 accepted that the call then goes on with what remains of that deadline, which
+  may be nothing. So when the publish finishes a few milliseconds before the deadline,
+  `_round_on_loop` calls `_publish_all` with that much left, and its first publish, healthy, is
+  abandoned at the deadline: counted unconfirmed in `sink_lost`, announced on a `lost 1 event(s);
+  NATSSink unconfirmed, JetStream publish abandoned` line, and arming a new latch for the next
+  caller. In the review's emulation (an injected JetStream double, a 2.0 s budget, the first
+  publish taking 1.995 budgets; the script was not kept), `sink_lost` read 2 and two such lines
+  were written, yet the double received 200 of 200; it happened at 1.98 and 2.0 budgets too.
+  Against a real `nats-py` the sliver costs more: `_driver_timeout` hands the driver about half of
+  a remainder that small, so the ack wait expires and raises inside it, and the event is resent,
+  which a server that persisted the first publish stores twice. That is the duplicating half of
+  *A timed-out JetStream publish is not retried, and cannot safely be*, reachable in this shape.
+  **Closed by** a floor before `_publish_all`: a round left with less than a minimum after the wait
+  is refused whole, `RETRYABLE` and nothing published, so the worker resends the batch in its next
+  round rather than publishing into the sliver; the floor's value, and whether `_flush_on_loop`
+  takes it too, are the closing spec's to measure. SPEC-104 did not build it because FR-002
+  accepted the remainder as it is and its scope sends new work here.
 - **A destination that refuses at once during the stop loses the whole exit backlog in
   milliseconds, even when it would be back long before the deadline** (found while measuring the
   item above, 2026-11-17; invariants 2 and 3). The exit drain's waits between rounds are zero for
@@ -2093,8 +2136,10 @@ close made while its thread holds the worker queue's mutex does not return eithe
   drain; with every publish after the stop stalled (`publish_timeout` 0.5 s, `shutdown(timeout=2)`)
   the exit returned in 1.50 s, inside the stated bound. The PING latch was left as it is, and its
   owned-core residual is the open item *An owned core `NATSSink` whose abandoned publish leaves its
-  buffer undrained…*. An orphan-path level call in the window can now block the application's
-  thread for up to one `publish_timeout`, invariant 4's recorded exception. Decision:
+  buffer undrained…*. In the window an orphan-path level call, and `log_foundry.flush()`'s step that
+  runs the live sink's own `flush()` outside its timeout, can now block the application's thread
+  for up to one `publish_timeout`, about two queued behind the abandoning round, and
+  `configure(sink=…)` for its whole swap budget, invariant 4's recorded exception. Decision:
   `docs/decisions/sink-lifecycle/` (*A driver's liveness flag is not evidence*).
 
 - ~~**The model test's lost-line oracle does not read the two lines the exit drain has written

@@ -27,7 +27,10 @@
   (`docs/decisions/sink-lifecycle/`) refined in place, with a marker in *An event a NATS round
   never handed to the driver is resendable* (`docs/decisions/sink-delivery/`); invariants 2, 3 and
   4; §12's item moved under *Resolved*; markers on SPEC-061, SPEC-074, SPEC-102 and SPEC-061's
-  delivery doc; and `docs/release-notes/v1.2.1.md`. The README states neither rule.
+  delivery doc; `docs/release-notes/v1.2.1.md`; and, from the second diff review, the README's
+  sentence that `flush()`'s timeout does not bound the live sink's own `flush()`, and two §12
+  items (*A `NATSSink` under `MultiSink`…* and *A round whose wait for an abandoned publish ends
+  in the last milliseconds…*).
 - **Four corrections to the spec at completion**, in its revision history: FR-003 AC3 needs an
   exit backlog of more than one exit batch; FR-001 AC1's and FR-002 AC9's tests live in the matrix
   file; FR-002 AC8 reads CPU through `conftest.cpu_window("thread")`; and the exit-bound sentence
@@ -37,9 +40,17 @@
 
 - SPEC-061's abandoned-publish latch refused every later call at once while the publish was
   pending. A call made within one `publish_timeout` of the abandonment now waits for it on the
-  loop, so an orphan-path level call can block the application's thread for up to one
-  `publish_timeout` where it was refused at once (invariant 4's new recorded exception), and a
-  caller queued behind the abandoning round takes about `2 * publish_timeout`.
+  loop, so three calls can block the application's thread where they were refused at once
+  (invariant 4's new recorded exception): an orphan-path level call and `log_foundry.flush()`'s
+  sink step, which runs the live sink's `flush()` on the caller's thread outside `flush`'s
+  timeout, each for up to one `publish_timeout`, and about `2 * publish_timeout` when queued
+  behind the abandoning round; and `configure(sink=…)`, whose swap waits on the drain thread's
+  waiting round, for up to its whole `DEFAULT_SWAP_TIMEOUT`. The first two routes past the
+  orphan level call were recorded by the second diff review, not the build; no test holds them.
+- SPEC-102's resend reaches only the paths that call `deliver`: the worker driving the sink, or a
+  `FilteringSink` or `TransformSink` forwarding it. Under `MultiSink`, which calls a child's
+  `emit`, one round and no resend, the stalled round's unattempted tail is still lost, counted and
+  announced (§12, *A `NATSSink` under `MultiSink`…*).
 - SPEC-102's resend order is kept by the wait and its re-check rather than by an immediate refusal.
 - The frozen-clock harness of SPEC-074's matrix (`tests/nats_engine_matrix_harness.py`) dates the
   abandonment on its frozen clock, so the latch never ages there: each refused round now spends
@@ -51,6 +62,14 @@ A queued caller takes about `2 * P`, inside `STUCK_QUEUED_BOUND`. The transient 
 returned in about 1.8 s with `batch_lost` 0 and `sink_lost` 1; the slow exit (`P` 0.5 s, `S`
 2.0 s) returned in 1.50 s. In three runs of each case the loss lines summed exactly to the
 ledger's losses. All measured on SPEC-104's final tree.
+
+The second diff review measured the application-thread routes against `1dc174fb` and SPEC-104's
+tree, with the probes it left in `docs/audits/2026-11-14-probes/core-pipeline/` (`spec104_nats_*`
+but `spec104_nats_exit_latch.py`): `flush(timeout=0.1)` with no worker at the default 10 s budget
+took 0.0 s and 9.951 s, and with a worker at 1 s, 0.102 s and 0.952 s; `configure(sink=…)` at
+10 s took 0.414 s and 5.001 s; an orphan level call queued behind the abandoning round at 1 s took
+0.899 s and 1.902 s. Through `MultiSink`, with a 0.6 s stall against a 0.4 s budget and 200
+events, the `NATSSink` received 0 and 151 in the steady drain, and 1 and 102 at the stop.
 
 ## Verification
 

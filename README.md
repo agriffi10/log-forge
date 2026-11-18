@@ -1511,6 +1511,15 @@ wherever it has reached, which for `SQLiteSink` can be inside `commit()`), and b
 properly needs `close()` itself to be interruptible, which the sink contract does not require.
 If your sink's close can block, give it its own internal timeout.
 
+**Nor does `flush()`'s timeout bound the live sink's own `flush()`**, the step that empties a
+client buffer (*When the worker flushes*). It runs on your thread after the drain, whichever way
+the drain went, so a slow one holds `flush()` past its timeout. A `NATSSink`'s takes up to one
+`publish_timeout` of its own, 10 s by default, plus up to one more when it waits for the sink's
+lock behind a delivery round; while a publish the sink abandoned less than one
+`publish_timeout` ago is still pending, it spends its own share waiting for that publish rather
+than being refused at once. Where the caller has a hard deadline, as a serverless handler does,
+keep `publish_timeout` well inside it.
+
 **What a broken destination can cost you.** There is one drain thread, so a sink's backoff pauses
 *all* log delivery, and it spans `shutdown()`. At the defaults (`max_retries=3`) that is 0.7 s of
 backoff per batch (the socket-backed sinks included, since each round re-sends every frame still

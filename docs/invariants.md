@@ -335,14 +335,23 @@ sink's.
 one before its first publish and one after its last, which on the orphan path is the application's
 own (SPEC-061 FR-003); measured at `71e42dd` against the prototype, a one-event emit went from
 0.04 ms to 0.47 ms and a 500-event emit from 0.90 ms to 1.26 ms, the price of a publish that is
-confirmed rather than believed. And since SPEC-104 a `NATSSink` level call on the orphan path made
-within one `publish_timeout` of a publish abandoned at an earlier deadline waits for that publish
-until the window ends, so it can block the application's thread for up to one `publish_timeout`
-(10 s at the default), where it was refused at once; that is the price of not losing a batch to a
-stall a little longer than one budget, and a call after the window is still refused at once.
+confirmed rather than believed. And since SPEC-104 a `NATSSink` call made within one
+`publish_timeout` of a publish abandoned at an earlier deadline waits for that publish until the
+window ends, where it was refused at once, and three such waits fall on the application's thread.
+A level call on the orphan path, and the step of `log_foundry.flush()` that runs the live sink's
+own `flush()` on the caller's thread after the drain, which `flush`'s timeout does not bound, can
+each block it for up to one `publish_timeout` (10 s at the default), and for about two when the
+call queues on the sink's lock behind the round that abandoned the publish; so a
+`flush(timeout=T)` can overrun T by that much. `configure(sink=…)` waits on the drain thread,
+whose round now waits too, and can spend its whole swap budget (`DEFAULT_SWAP_TIMEOUT`, 5 s).
+That is the price of not losing a batch to a stall a little longer than one budget, and a call
+after the window is still refused at once. Probes:
+`docs/audits/2026-11-14-probes/core-pipeline/spec104_nats_queued_orphan.py`, and
+`spec104_nats_flush_overrun.py` and `spec104_nats_swap_cost.py` beside it.
 *Guarded:* `tests/test_api.py` (which path each call takes), `tests/test_sink_concurrency.py`;
 the NATS exception's bound by `tests/test_sinks_nats_matrix.py` (the orphan level call in and
-after a young window). Otherwise not measured as a latency bound by any test — listed so the gap is visible.
+after a young window); its `flush()` and `configure(sink=…)` routes by no test. Otherwise not
+measured as a latency bound by any test — listed so the gap is visible.
 
 ## 5. A sink the library wrote to is closed, once, by one owner, and a close in flight is waited for
 
