@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "Lifecycle state has one holder, Runtime, and the stored State decides the transitions"
-description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside the four critical sections the calls already take and the fork handler's re-settle, and inside critical sections the calls already take, and the transition table is total over six calls and five states, with one changed cell — a swap during a drain with no live worker declines while the drain still has a take ahead of it. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry (`Runtime._closes`). Three locks remain, not one. The token sets are added under `_lock` and discarded lock-free, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078; arch §9.2)"
+description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside four existing critical sections and the fork handler's re-settle, and the transition table is total over six calls and five states, with one changed cell: a swap with no live worker during a drain with a take ahead declines. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry. Three locks remain, all `RLock`s; a lifecycle call reads `_lock` and the registry's for ownership and never re-enters them. The token sets are discarded lock-free, and a sink change's added lock-free before its config write, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078, SPEC-097; arch §9.2)"
 ---
 
 **One holder.** SPEC-040 put the orphan side's seven globals on one object, `_lifecycle._state`,
@@ -73,6 +73,17 @@ forward a close back into the record on that thread, and a close reached that wa
 carries a declined stop-signal hand takes `_lock` under `_owned_lock` (`_hand_after_close`). Two
 threads can deadlock there; it is recorded in arch §13 as a residual rather than closed.
 
+**`_lock` and the registry's lock are `RLock`s read for ownership** (SPEC-097 FR-004). A signal
+handler or finalizer that interrupted a thread inside one of them and called `shutdown()` waited
+on its own thread for good (`lifecycle/p1b_run.py`: 5, 29 and 32 of 200 fresh processes at
+`ead40798`). `_lifecycle._library_locks()` lists them with `Worker._lock`, the worker queue's
+mutex, `config._config_lock`, `decorator._sweep_lock` and `decorator._loss_lock`, and a
+`shutdown()` or `configure()` made on a thread owning any of them is held on that thread, a
+`flush()` refused, so no lifecycle call re-enters one. A level or traced call made there does
+re-enter, which FR-005's sweep found safe in every section a workload reaches. `_owned_lock` stays
+out of that list, re-entrant by design. The order above is unchanged. `tests/test_lock_oracle.py`
+holds every lock construction to the list or a recorded reason.
+
 **The token sets are discarded without the lock, and that departs from `python.md` §13 on
 purpose.** `_swap_sink` and `_shutdown_worker` each add their `_Operation` to `_swaps_running` or
 `_stops_running` inside a critical section they already have, and discard it in a `finally` with
@@ -85,6 +96,11 @@ carries a decision** — the one changed cell reads `DRAINING` off `_stops_runni
 sound: the token is added before anything the swap could decline over, inside the critical section
 the swap reads it in, and a stale discard can only make a later read see `DRAINING` end late,
 which costs that one swap a decline of a drain already over, never a close under a drain.
+**Since SPEC-097 one add is lock-free too**: a non-re-entrant sink change adds its swap token
+before its config write (`open_command_swap`), outside every lock but `config._sink_lock`, so a
+`shutdown()` meets the change from the write and `configure()`'s pinned counts do not move. It is
+one `set.add` of an identity-hashed object under the GIL, as the discard is; the swap reads the
+same token in its sections as before.
 
 **Rejected:**
 
@@ -109,6 +125,15 @@ the owed record outside `_CloseRegistry.arm`, `take`, `put_back` and `cede`. (SP
 FR-003, SPEC-078 FR-001 to FR-004, SPEC-087 FR-001)
 
 ## History
+
+### 2026-11-18
+
+- **Refined by SPEC-097**: `_lock` and the registry's lock are `RLock`s that a lifecycle call
+  reads for ownership and never re-enters, with four locks outside `Runtime`; a sink change adds
+  its swap token lock-free before its config write, a second lock-free move beside the discard;
+  and `Runtime` gains `_deferred_taker` and `_calls_here`, each with its inventory row and reset
+  in a forked child. The fence says so, and drops a clause it carried twice to stay inside its
+  length cap.
 
 ### 2026-11-15
 

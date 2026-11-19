@@ -418,7 +418,7 @@ def _sweep_registered(hand_in: _HandIn, *, wait: float | None = None) -> _SweepR
     return handed, late, faults
 
 
-_loss_lock = threading.Lock()
+_loss_lock = threading.RLock()
 """Guards the two loss counters, and deliberately not the lifecycle lock (SPEC-036 FR-003 AC-5).
 
 SPEC-028's ordering rule: a counter takes its own lock, because the orphan path runs on arbitrary
@@ -473,6 +473,7 @@ def _open_span(name: str, defaults: dict[str, object] | None) -> Span:
     return span
 
 
+@_lifecycle.runs_held
 def continue_trace(
     traceparent: str | None = None,
     *,
@@ -1638,7 +1639,9 @@ def trace(
                 """Runs the coroutine inside a span, re-raising its exception unchanged.
 
                 Non-swallowing per arch §4: the outcome is recorded and the original
-                exception re-raised. The catch is ``BaseException`` so that
+                exception re-raised. The call runs its thread's held lifecycle calls last,
+                however it ends, as the sync wrapper does (SPEC-097 FR-004). The catch is
+                ``BaseException`` so that
                 ``asyncio.CancelledError`` is recorded as an error end event rather than
                 leaving an unclosed span. ``status`` and ``error`` are deleted in a nested
                 ``finally`` for the reason ``except ... as exc`` auto-deletes its target:
@@ -1654,11 +1657,19 @@ def trace(
                   Whatever the wrapped coroutine returns.
 
                 Raises:
-                  BaseException: Whatever the wrapped coroutine raises, unchanged.
+                  BaseException: Whatever the wrapped coroutine raises, unchanged; on a call
+                    that does not raise, what a held lifecycle call raises (SPEC-097 FR-004).
                 """
-                span, token, scope = _begin(span_name, span_defaults)
+                try:
+                    span, token, scope = _begin(span_name, span_defaults)
+                except BaseException:
+                    if _lifecycle._state._calls_here.waiting:
+                        _lifecycle._run_held_unwinding()
+                    raise
                 status, error = "ok", None
                 try:
+                    if _lifecycle._state._calls_here.waiting:
+                        _lifecycle._run_held()
                     result = await fn(*args, **kwargs)
                 except BaseException as exc:
                     status, error = "error", exc
@@ -1666,8 +1677,17 @@ def trace(
                 finally:
                     try:
                         _end(span, token, scope, status, error)
+                    except BaseException:
+                        if _lifecycle._state._calls_here.waiting:
+                            _lifecycle._run_held_unwinding()
+                        raise
                     finally:
+                        failed = status == "error"
                         del status, error
+                    if failed and _lifecycle._state._calls_here.waiting:
+                        _lifecycle._run_held_unwinding()
+                if _lifecycle._state._calls_here.waiting:
+                    _lifecycle._run_held()
                 return result
 
             return cast("F", async_wrapper)
@@ -1682,6 +1702,19 @@ def trace(
             whose traceback holds this frame, so keeping it past the handler builds a cycle
             only the collector can break, pinning the caller's own frames and locals with it.
 
+            The call runs its thread's held lifecycle calls last, however it ends (SPEC-097
+            FR-004): a ``shutdown()`` or ``configure()`` a signal handler made inside the open's
+            or the close's lock sections was held there. Those held in the open run once it
+            returns, before the function, so a held stop does not wait out the function's whole
+            body; those held in the close run after it. When the open, the function or the close
+            raises, they run as the exception unwinds, through
+            ``_lifecycle._run_held_unwinding``, which absorbs a held call's own exception rather
+            than let it replace the one unwinding, so the function's exception reaches the caller
+            unchanged. On a call that does not raise, a held call's own exception is what the
+            caller gets; raised before the function, it is recorded as the span's error and the
+            function does not run. The handling is inline rather than a wrapper around ``_begin``
+            and ``_end``, which added a frame at which a ``RecursionError`` escaped their guards.
+
             Args:
               *args: Positional arguments forwarded to the wrapped function.
               **kwargs: Keyword arguments forwarded to the wrapped function.
@@ -1690,11 +1723,19 @@ def trace(
               Whatever the wrapped function returns.
 
             Raises:
-              BaseException: Whatever the wrapped function raises, unchanged.
+              BaseException: Whatever the wrapped function raises, unchanged; on a call that
+                does not raise, what a held lifecycle call raises (SPEC-097 FR-004).
             """
-            span, token, scope = _begin(span_name, span_defaults)
+            try:
+                span, token, scope = _begin(span_name, span_defaults)
+            except BaseException:
+                if _lifecycle._state._calls_here.waiting:
+                    _lifecycle._run_held_unwinding()
+                raise
             status, error = "ok", None
             try:
+                if _lifecycle._state._calls_here.waiting:
+                    _lifecycle._run_held()
                 result = fn(*args, **kwargs)
             except BaseException as exc:
                 status, error = "error", exc
@@ -1702,8 +1743,17 @@ def trace(
             finally:
                 try:
                     _end(span, token, scope, status, error)
+                except BaseException:
+                    if _lifecycle._state._calls_here.waiting:
+                        _lifecycle._run_held_unwinding()
+                    raise
                 finally:
+                    failed = status == "error"
                     del status, error
+                if failed and _lifecycle._state._calls_here.waiting:
+                    _lifecycle._run_held_unwinding()
+            if _lifecycle._state._calls_here.waiting:
+                _lifecycle._run_held()
             return result
 
         return cast("F", wrapper)

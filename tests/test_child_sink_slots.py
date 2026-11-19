@@ -56,6 +56,11 @@ _NOT_CHILD_SINK_SLOTS: dict[tuple[str, str], dict[str, str]] = {
         "owed": "the owed-close record: a record of sinks, never a wrapper's child; it seeds "
         "the marking frontier and is never walked as a holder",
     },
+    ("_lifecycle", "_Operation"): {
+        "installing": "the sink a published sink change installs, held only until that change "
+        "ends (SPEC-097 FR-001); never a wrapper's child, and a child drops every operation "
+        "with the token sets in `_clear_after_fork`",
+    },
     ("_lifecycle", "_Keep"): {
         "remaining": "a decision's record of sinks, alive only for that decision's closes "
         "(SPEC-087 FR-002), never a wrapper's child",

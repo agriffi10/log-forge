@@ -337,6 +337,17 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ("_flush_worker", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
+            "SPEC-097 FR-003's refusal, the call's first read: is this thread the drain thread "
+            "of the worker that exists, retired or not. A flush there asks its own thread to "
+            "answer a marker, so it returns `re-entrant` before it sweeps, opens its window or "
+            "queues anything. Existence, not liveness: a retired worker's drain thread can still "
+            "be inside a sink's `emit` during its exit drain, and a flush from there waits on "
+            "itself just the same. Compared by identity with `_thread`, never by name."
+        ),
+    ),
+    ("_flush_worker", "_state.worker_exists()", 1): (
+        EXISTENCE,
+        (
             "the snapshot the existence test below reads. Deliberately the existence question "
             "rather than _live_worker(), and what that buys is the honest verdict, not a "
             "drain: "
@@ -1000,7 +1011,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_close_owed",
-        "worker is not None and worker.holds_unfenced(sink)",
+        "operation.detach or (worker is not None and worker.holds_unfenced(sink))",
         0,
     ): (
         MOMENT,
@@ -1010,7 +1021,8 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "entry (SPEC-078 FR-002). A sink swapped out without a confirmed fence is `GRACED`, "
             "released detached and granted only what is left of the closer grace, because it "
             "already had the swap's whole budget and is far more likely stuck than slow "
-            "(SPEC-050 FR-004); every other is `JOINED`."
+            "(SPEC-050 FR-004); every other is `JOINED`. A `detach` stop takes every sink "
+            "`GRACED` before the worker is asked anything (SPEC-097 FR-002)."
         ),
     ),
     ("_close_owed", "_state._closes.bystanders(mine) if bystander_wait else []", 0): (
@@ -1125,12 +1137,19 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "close that already ended costs no grace."
         ),
     ),
-    ("_close_owed", "_inline_close_choice(taken, worker) if taken else None", 0): (
+    (
+        "_close_owed",
+        "_inline_close_choice(taken, worker) if taken and (not operation.detach) else None",
+        0,
+    ): (
         EXISTENCE,
         (
             "hands the worker over so the choice can ask whether one holds any of these sinks. "
             "Existence rather than liveness on purpose: a retired worker's sink is still the one "
-            "whose close must stay on the calling thread (SPEC-030, and the SPEC-028 objection)."
+            "whose close must stay on the calling thread (SPEC-030, and the SPEC-028 objection). "
+            "A `detach` stop, the one a sink change runs for the stops deferred during it, "
+            "chooses none (SPEC-097 FR-002): every close it takes runs on a closer thread, so no "
+            "`close()` takes `configure()` past its budget."
         ),
     ),
     ("_inline_close_choice", "None if worker is None else worker.sink", 0): (
@@ -1156,6 +1175,40 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
         (
             "the sink the swap must not release out from under a worker that is still draining "
             "into it. It is the same binding as the branch above, read for a different purpose."
+        ),
+    ),
+    ("_library_locks", "_state._worker", 0): (
+        EXISTENCE,
+        (
+            "the worker whose two locks join SPEC-097's ownership oracle: the process worker, "
+            "retired or not, since a retired worker's lock and queue mutex are still taken by "
+            "its exit drain, its health and a flush after shutdown on the thread that asks."
+        ),
+    ),
+    ("_library_locks", "worker is not None", 0): (
+        EXISTENCE,
+        (
+            "is there a worker at all whose locks a lifecycle call could be inside. With none, "
+            "the oracle is the five module and runtime locks."
+        ),
+    ),
+    ("_swap_sink", "not op.withheld", 0): (
+        MOMENT,
+        (
+            "matched by the `held` sentinel inside `withheld`, and kept because over-matching "
+            "demands a classification: it asks no worker anything. It is the record's question "
+            "of the moment - has a stop's `_close_owed` take taken the sink this change installs "
+            "since the config named it (SPEC-097 FR-001) - and, if so, the no-worker branch does "
+            "not arm that sink again."
+        ),
+    ),
+    ("_swap_sink", "not (op.withheld and outcome.verdict == 'declined')", 0): (
+        MOMENT,
+        (
+            "the same `withheld` question after a retarget, read with the verdict the worker "
+            "returned as a value: only a `declined` swap a stop overtook skips its arm (SPEC-097 "
+            "FR-001). On `fenced` and `unfenced` the arm stays, since it is the only one the "
+            "worker's new sink gets."
         ),
     ),
     ("_swap_sink", "worker is None", 0): (

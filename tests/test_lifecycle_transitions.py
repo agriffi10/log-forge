@@ -555,8 +555,10 @@ def test_a_swap_during_a_drain_with_no_live_worker_declines(
 
     At ``fda134a``, with the swap landing between ``Worker.stop`` returning and the take, A's
     close ran on ``log-foundry-sink-close`` and B's on the calling thread; without the swap A
-    closed on the calling thread and B never. The swap now declines at entry: no token, no
-    retarget, no close and no arm.
+    closed on the calling thread and B never. The swap now declines at entry: no token of its own,
+    no retarget, no close and no arm. Since SPEC-097 FR-001 the change publishes its operation
+    once, before its config write, so the one token recorded is that publication; the swap adds
+    none.
     """
     a, b = SlowCloseRec("A"), Rec("B")
     if path == "worker":
@@ -583,7 +585,9 @@ def test_a_swap_during_a_drain_with_no_live_worker_declines(
     log_foundry.shutdown(timeout=5.0)
 
     assert seen["column"] is State.DRAINING, "the premise: the swap landed inside the drain"
-    assert seen["tokens"] == [] and seen["owed"] is False, "the swap declined at entry"
+    tokens = seen["tokens"]
+    assert isinstance(tokens, list) and len(tokens) == 1, f"the swap added a token: {tokens}"
+    assert seen["owed"] is False, "the swap declined at entry"
     assert seen["took"] < 1.0, (
         f"configure(sink=B) took {seen['took']:.2f}s: a swap that did not decline joins A's "
         f"{SlowCloseRec.CLOSE_SECONDS}s close"

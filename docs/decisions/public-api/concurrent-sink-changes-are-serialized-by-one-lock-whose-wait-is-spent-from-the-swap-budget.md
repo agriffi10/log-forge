@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "Concurrent sink changes are serialized by one lock whose wait is spent from the swap budget"
-description: "a `configure()` passing `sink` or `sink_factory` holds `config._sink_lock` from the config write to the end of the swap, so two at once run in sequence and the second wins config and delivery; the wait comes out of that call's one swap budget, and a wait that outlasts it proceeds unserialized with a `pending` line rather than hang or drop the configure. Never re-check the swap's post-retarget decision instead. (fix after SPEC-079)"
+description: "a `configure()` passing `sink` or `sink_factory` holds `config._sink_lock` from the config write to the end of the swap, so two at once run in sequence and the second wins config and delivery; the wait comes out of that call's one swap budget, and a wait that outlasts it proceeds unserialized with a `pending` line rather than hang or drop the configure. A non-re-entrant change is published before that write and, once it releases the lock, runs the stops deferred to it, every close detached, within its budget. Never re-check the swap's post-retarget decision instead. (fix after SPEC-079; SPEC-097)"
 ---
 
 **Two `configure(sink=…)` calls at once are serialized, not reasoned about.** With a live worker,
@@ -55,6 +55,35 @@ sense and waits like any caller, because no library lock is held across those ha
 it, so a thread that forks from inside the call does not release the child's fresh copy and raise
 `RuntimeError` out of `configure()` there (frame-2 review, measured).
 
+**The change is published before its config write, and runs the stops deferred to it**
+(SPEC-097 FR-001, FR-002). Inside the lock, a non-re-entrant change publishes its `_Operation` in
+`_swaps_running` before `_rebind`, lock-free, so a `shutdown()` on another thread meets it from the
+write rather than from the swap's first section, and ends it in the `finally` before the lock is
+released. A `shutdown()` made on the changing thread (a stop-signal setter the retarget runs) or
+on a `log-foundry-` thread while the change is in flight is deferred rather than run under the
+change. It defers only to the change registered as the taker when it published, the first running
+one, and only while that change's `config._change_sink` frame is on its thread's stack, so a stop
+made inside a nested or unwound change defers to the outer one or, with none running, runs as it
+did before SPEC-097. That rule is read from the live stack, never from a slot, because a deferral
+recorded in a slot that only a later statement clears was left stale three rounds running. A
+change that raised left its deadline for the next, unrelated change, which retired the library; a
+stop deferred during a re-entrant change on a library thread went onto a list only the outer
+change took, or none did, and never ran; and an interrupt between a change's registration and its
+end left it registered, so every later `shutdown()` and the exit drain deferred to it and closed
+nothing. Each fix
+reset its slot and the next review found another statement to interrupt; positive provenance from
+the stack ended the class, and `tests/test_change_interrupts.py` now interrupts every line the
+change runs instead of a further review. Once the lock is released, and before `configure()` returns, the change runs one stop for
+every deferred call, its timeout what is left of the latest deferred deadline cut at the end of
+this call's swap budget. That stop closes nothing on the changing thread: every close it takes is
+detached and waited for only within a closer grace the budget bounds, so `configure()` keeps
+invariant 3's bound. Run inline instead, a slow `close()` took `configure()` to 10.01 s and
+15.02 s against a 5 s budget on the spec reviewer's `fr002_bound.py`. A close that outlives the
+wait goes on, counted in `health().closing_sinks`, and the next stop or the exit drain waits for
+it as a bystander. A `configure()` made from a signal handler or finalizer that interrupted the
+library inside one of its lock sections is held after validation and runs when the interrupted call
+returns (SPEC-097 FR-004).
+
 **Rejected: re-checking the post-retarget decision inside `_swap_sink`.** Arming the new sink only
 while it is still the worker's looks local, but an unfenced second swap leaves its displaced sink in
 the record for a later `shutdown()`. A first swap that skipped arming that sink would then leave it
@@ -65,7 +94,10 @@ orphan a sink, while skipping a *release* of a sink the record no longer owes ca
 worker's sink leaves the record only by a take whose taker closes it. A cede, the one route out
 that closes nothing, is made only of a sink the installed graph still holds, in the section that
 arms that graph, and the closer's guard puts back what it passes over, so neither applies to it
-(SPEC-087; `docs/decisions/pipeline/`).
+(SPEC-087; `docs/decisions/pipeline/`). SPEC-097's withhold skips an arm, but not on this ground:
+it skips only the arm of a sink a stop's `_close_owed` take took since the config write, whose
+taker closes it, never on a swap's stale take, so it cannot leave a sink owed by nobody; keyed on
+any take, it did, 3 of 3 (`docs/decisions/pipeline/`, Part 3).
 
 **The lock is outermost and not taken on the orphan path.** `stamp`, `_rebind`, `_ensure_sink` and
 the swap take `_owned_lock`, `_config_lock`, `_state._lock` and the worker's lock beneath it, and
@@ -74,6 +106,17 @@ nothing holding any of those takes it. A `configure()` with neither argument, or
 on `_fork._GLOBAL_PRIMITIVES`, so a child forked while a parent thread held it starts unlocked.
 
 ## History
+
+### 2026-11-18
+
+- **Refined by SPEC-097's diff reviews**: a stop defers only to the change registered as the taker,
+  and only while that change's frame is on its thread's stack; the deadlines live on its
+  operation. The body says why a slot was not enough, and the fence says "deferred to it".
+- **Refined by SPEC-097**: the change is published before its config write and ends before the
+  lock is released; a `shutdown()` made inside it, on its own thread or a `log-foundry-` thread,
+  is deferred and run by the change once the lock is released, every close detached and every wait
+  inside the swap budget; a `configure()` made inside a library lock section is held. The fence
+  says so, and the rejected re-check says why SPEC-097's withhold of an arm is not it.
 
 ### 2026-11-15
 

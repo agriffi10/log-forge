@@ -51,7 +51,15 @@ class FlushResult(_Result):
     """What :func:`log_foundry.flush` returns.
 
     ``reason`` is ``None`` on success. The tokens it can carry today are ``"timed-out"``,
-    ``"retired"``, ``"thread-died"``, ``"queue-full"``, ``"abandoned"`` and ``"sink-flush"``.
+    ``"retired"``, ``"thread-died"``, ``"queue-full"``, ``"abandoned"``, ``"sink-flush"`` and
+    ``"re-entrant"``.
+
+    ``"re-entrant"`` is SPEC-097's (FR-003, FR-004): the call was made where it would wait on
+    itself, so it returned at once having done nothing — on the background drain thread, from a
+    sink's ``emit`` or a ``sink_factory`` the worker built; from a signal handler or a finalizer
+    that interrupted the library inside one of its lock sections, or inside the library's own
+    ``flush()`` wait on its marker; or inside a span sweep's hold, from a collector callback, where
+    it reported ``"abandoned"`` before SPEC-097. Its counts are zero.
 
     ``"sink-flush"`` is the one SPEC-036 added (FR-002 AC-8) and it is worth distinguishing: the
     queue drained cleanly and the **sink's own client buffer** did not, so the events are past

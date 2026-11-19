@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _dist_version
 
-from log_foundry import _fork
+from log_foundry import _fork, _lifecycle
 from log_foundry.api import critical, debug, error, info, set_baggage, warning
 from log_foundry.config import Config, configure, get_config
 from log_foundry.context import (
@@ -39,6 +39,7 @@ except PackageNotFoundError:
 _fork.install()
 
 
+@_lifecycle.runs_held
 def flush(timeout: float | None = 5.0) -> FlushResult:
     """Drains buffered events through the sink without closing it.
 
@@ -82,8 +83,13 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
       registration lock, so a call made while another thread holds it for a first credit or a
       fold waits for that brief section first.
       Falsy carries a ``reason`` naming which outcome occurred: ``"timed-out"``, ``"retired"``,
-      ``"thread-died"``, ``"queue-full"``, ``"abandoned"`` or ``"sink-flush"`` — the last meaning
-      the queue drained but the sink could not empty its own client buffer (SPEC-036 FR-002). It is falsy rather than ``False``:
+      ``"thread-died"``, ``"queue-full"``, ``"abandoned"``, ``"sink-flush"`` or
+      ``"re-entrant"``. ``"sink-flush"`` means the queue drained but the sink could not empty its
+      own client buffer (SPEC-036 FR-002). ``"re-entrant"`` means the call was made where it
+      would wait on itself and returned at once having done nothing: on the background drain
+      thread, from a sink's ``emit`` (SPEC-097 FR-003), or from a signal handler or finalizer
+      that interrupted the library inside one of its lock sections (FR-004). It is falsy rather
+      than ``False``:
       ``if flush():`` is unchanged, but ``flush() is True`` can no longer hold, which is why the
       type had to change before ``1.0.0`` rather than after (SPEC-034 FR-007). Events submitted
       concurrently by another thread may or may not be included, since the caller cannot have
@@ -101,6 +107,7 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
         return _flush_worker(timeout)
 
 
+@_lifecycle.runs_held
 def health() -> Health:
     """Snapshots the background worker's delivery counters (SPEC-017 FR-005).
 
@@ -180,6 +187,7 @@ def health() -> Health:
     return _worker_health()
 
 
+@_lifecycle.runs_held
 def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     """Flushes buffered events and closes the sink, blocking until drained.
 
@@ -212,6 +220,15 @@ def shutdown(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     Called from inside a ``sink_factory``, while the factory runs, an emit on another thread
     that would wait for that build refuses instead, for the length of this call: the wait here can
     be on a drain thread that is itself waiting for the factory (``_lifecycle.yielding``).
+
+    **Called from a sink's own code, it never waits on the call it is inside** (SPEC-097). During
+    a ``shutdown()`` — from a sink's ``close()``, say — it returns at once: the running stop is
+    its effect. During ``configure(sink=...)`` it returns at once and the stop runs when that
+    ``configure()`` finishes, before it returns, within its swap budget; a close that stop starts
+    and that outlives the budget goes on in the background, counted in
+    ``health().closing_sinks``. **Called from a signal handler or finalizer that interrupted the
+    library inside one of its lock sections**, it returns at once and runs when the interrupted
+    call returns, before any later stop; a handler that then calls ``os._exit()`` drains nothing.
 
     Args:
       timeout: Seconds bounding the wait for the background thread and, carved from the same

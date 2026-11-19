@@ -53,10 +53,16 @@ close performed against a sink the drain thread may still be inside — is answe
 discharged close; under one record its build arms its sink and the closer's second pass closes it
 after that worker's drain. Both retirements raise a close count from 1 to 2, and each second close
 follows the delivery it discharges — SPEC-045 FR-002's one close per write-epoch, asserted by the
-sink's event count at each close rather than by the count alone. One case is a genuine redundancy
-and is the accepted trade: a swap the worker **declined** arms the new sink anyway, because
-SPEC-035 FR-003 guarantees a declined sink is owned by somebody, and not arming it was built and
-measured costing that guarantee outright. (SPEC-054 FR-002)
+sink's event count at each close rather than by the count alone. ~~One case is a genuine
+redundancy and is the accepted trade: a swap the worker **declined** arms the new sink anyway~~ —
+reversed by SPEC-097 FR-001 (Andrew, 2026-11-16). A swap the worker declined still arms the new
+sink, because SPEC-035 FR-003 guarantees a declined sink is owned by somebody, and not arming it
+unconditionally was built and measured costing that guarantee outright; what it no longer arms is
+a sink a stop's `_close_owed` take took since the change's config write, which that stop closes,
+so the redundant second close at the same write count is gone. The SPEC-035 FR-003 tests stayed
+green under a withhold keyed on the config write, because the next orphan log re-arms the sink
+(measured at `4cda14ba` and `027b39a5`, before SPEC-097). The withhold and its bounds:
+*A shutdown waits for a swap in flight to decide…*, in this directory. (SPEC-054 FR-002)
 
 **One closer for every exit, and a caller waits on the registry rather than on the record.** Four
 functions closed sinks on one path each; one takes every owed sink nothing `held` says something
@@ -88,6 +94,14 @@ permanently after a declined swap and after any `configure()` on a retired worke
 section's `inherited_sink` open item in the same edit. (SPEC-054 FR-005)
 
 ## History
+
+### 2026-11-18
+
+- **Refined by SPEC-097**: the accepted trade, a declined swap arming a sink already closed so
+  that it is closed twice at one write count, is reversed for a sink a stop's `_close_owed` take
+  closed since the change's config write. A declined swap otherwise still arms, so SPEC-035
+  FR-003's guarantee stands. `tests/test_shutdown_lifecycle.py`'s trade test is rewritten as
+  `test_a_declined_swap_does_not_re_arm_a_sink_a_stop_closed_so_the_trade_is_reversed`.
 
 ### 2026-11-15
 

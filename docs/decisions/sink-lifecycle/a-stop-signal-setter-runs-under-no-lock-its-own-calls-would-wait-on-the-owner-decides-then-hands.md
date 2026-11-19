@@ -115,9 +115,18 @@ sequence.
 a first orphan log then takes the lock twice, which the pinned lock counts refuse; the token does it
 in the one section the call already has.
 
-**Rejected: an `RLock`.** A re-entrant lock would let the setter's call run inside the outer
-section, midway through state that section has not finished deciding; the closed-guard decision in
-this area refuses an `RLock` for a sink's transport lock on the same ground.
+**Rejected: an `RLock` as the way a setter's call gets through.** A re-entrant lock would let the
+setter's call run inside the outer section, midway through state that section has not finished
+deciding; the closed-guard decision in this area refuses an `RLock` for a sink's transport lock on
+the same ground. That ground still holds for setters, and a setter still runs under no library
+lock. SPEC-097 narrows the rejection, not the rule: it made the lifecycle locks `RLock`s so that a
+call can read whether its own thread owns one (FR-004). A `shutdown()`, `configure()` or `flush()`
+made on a thread that owns one is held or refused, never re-entering it. The calls that do
+re-enter are the ones that are not lifecycle calls, made by a signal handler or finalizer that
+interrupted the library inside a section: a level call or a traced call, which FR-005's sweep runs
+in every section its workloads reach with none failing (`spec097_reentry_sweep.py` names the
+sections and those it does not reach; re-run it to count them), and `health()`, which re-enters
+`Worker._lock` and the close registry's lock to read their counters.
 
 **Rejected for the factory: holding the hand under the build lock.** A drain thread blocked on that
 lock, plus a setter calling `shutdown()` or `flush()` with no timeout, joins forever. Publishing the
@@ -150,6 +159,13 @@ own emit loses its event.
   signal handed to the wrapper is forwarded to it as usual.
 
 ## History
+
+### 2026-11-18
+
+- **Refined by SPEC-097**: *Rejected: an `RLock`* is narrowed. A setter still runs under no
+  library lock, and its call still never re-enters one; the lifecycle locks are now `RLock`s read
+  for ownership, a lifecycle call made inside one is held or refused, and only a signal handler's
+  or finalizer's level or traced call re-enters, on FR-005's sweep. The fence is unchanged.
 
 ### 2026-11-13
 

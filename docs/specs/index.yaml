@@ -648,7 +648,7 @@ specs:
   - id: "SPEC-097"
     title: "Lifecycle Commands Take Their Turn, and a Call Made From Inside One Never Waits on It"
     description: "Makes a sink change a command from before its config write, so a shutdown meets it and never has its close undone by it; has a shutdown made from inside a running command merge into it or run when it ends, within the change's budget; refuses a flush made on the drain thread; and has a lifecycle call made on a thread that holds a library lock, a signal handler's, run once that thread lets go, so 94 adversarial cells turn green, no other cell moves, and the signal-handler deadlock is gone."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-054", "SPEC-068", "SPEC-077", "SPEC-078", "SPEC-083", "SPEC-085", "SPEC-086", "SPEC-087", "SPEC-088", "SPEC-089", "SPEC-091"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-097-lifecycle-command-path.md"

@@ -1067,7 +1067,7 @@ def test_the_session_prints_the_worst_margin_line(workers: list[str]) -> None:
     settings cannot rename that run.
     """
     passing = "tests/test_model_cells.py::test_cell[reentrant-emit-orphan-info]"
-    pinned = "tests/test_model_cells.py::test_cell[reentrant-close-orphan-shutdown-none]"
+    pinned = "tests/test_model_cells.py::test_cell[reentrant-close-orphan-configure+info]"
     gating = (
         "tests/test_invariants_model.py::test_the_sequential_driver_holds_the_state_table[seed0]"
     )
@@ -1097,7 +1097,7 @@ def test_the_session_prints_the_worst_margin_line(workers: list[str]) -> None:
     assert "2 passed, 1 xfailed" in result.stdout, result.stdout[-2000:]
     assert len(lines) == 1, result.stdout[-4000:]
     assert "reentrant-emit-orphan-info]" in lines[0]
-    assert "shutdown-none" not in lines[0]
+    assert "configure+info" not in lines[0]
     assert len(gate) == 1, result.stdout[-4000:]
     assert "::test_the_sequential_driver_holds_the_state_table[seed0] (" in gate[0], gate
 
@@ -1136,19 +1136,16 @@ def test_the_table_and_the_pins_hold_these_counts() -> None:
     assert by == {"reentrant": 504, "factory": 112, "forker": 9, "waiter": 12}
     assert len(table) == 637
     assert [pin.name for pin in PINS] == [
-        "drain-flush",
-        "nested-shutdown",
         "orphan-arm-in-close",
-        "installed-closed-twice",
         "fork-mid-swap",
         "orphan-write-after-close",
     ]
     pinned = [cell for cell in table if pin_of(cell) is not None]
     held = [cell for cell in table if withheld(cell)]
-    assert len(pinned) == 12, "SPEC-091 resolved `empty-submission`'s eight cells (was 20)"
-    assert len(held) == 168
-    assert len(table) - len(pinned) - len(held) == 457, "the eight now run unpinned (was 449)"
-    assert len(scheduled()) == 469, "a pinned cell was scheduled too, so the total is unchanged"
+    assert len(pinned) == 3, "SPEC-097 resolved three pins' nine cells (was 12)"
+    assert len(held) == 0, "and with `drain-flush` and `nested-shutdown` gone, nothing is withheld"
+    assert len(table) - len(pinned) - len(held) == 634, "every other cell runs unpinned"
+    assert len(scheduled()) == 637, "every cell is scheduled, a pinned one included"
 
 
 def test_every_cell_id_is_unique_and_spells_its_cell() -> None:
@@ -1221,11 +1218,43 @@ def test_everything_withheld_repeats_a_pinned_operation_or_its_sibling() -> None
         assert reasons, cell_id(cell)
 
 
-def test_a_pins_one_operation_sibling_script_is_scheduled() -> None:
-    """FR-004: the bare sibling runs, as the cell whose finite timeout spends its budget waiting."""
+def test_a_pins_one_operation_sibling_script_is_scheduled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FR-004: the bare sibling runs, as the cell whose finite timeout spends its budget waiting.
+
+    SPEC-097 removed the last two pins that named a sibling, ``drain-flush`` and
+    ``nested-shutdown``, so the rule is held against those two pins as they stood, planted for
+    the length of this test: the withholding is computed from :data:`model_pins.PINS` at each
+    call, and a later pin with a sibling meets the same rule.
+    """
+    planted = (
+        model_pins.Pin(
+            "drain-flush",
+            (
+                Cell("reentrant", "emit", "worker", ("flush-none",)),
+                Cell("reentrant", "swap-emit", "worker", ("flush-none",)),
+                Cell("factory", "factory", "worker", ("flush-none",)),
+            ),
+            frozenset({"HangFound:flush-none@worker._flush_marked"}),
+            "`flush()` called on the drain thread waits on itself",
+            sibling="flush",
+        ),
+        model_pins.Pin(
+            "nested-shutdown",
+            tuple(
+                Cell("reentrant", site, path, ("shutdown-none",))
+                for site in ("close", "swap-close")
+                for path in model_pins.PATHS
+            ),
+            frozenset({"Stalled:shutdown-none"}),
+            "`shutdown()` called from a sink's own `close()` waits out the closer grace",
+            sibling="shutdown",
+        ),
+    )
+    monkeypatch.setattr(model_pins, "PINS", planted)
+    assert not [pin.name for pin in PINS if pin.sibling is not None], "no live pin has a sibling"
     expected = {
         Cell(held.personality, held.site, held.path, (pin.sibling,))
-        for pin in PINS
+        for pin in planted
         if pin.sibling is not None
         for held in pin.cells
         if len(held.script) == 1
@@ -1239,8 +1268,9 @@ def test_a_pins_one_operation_sibling_script_is_scheduled() -> None:
         "reentrant-swap-close-orphan-shutdown",
         "reentrant-swap-close-worker-shutdown",
     }
-    assert not [cell_id(cell) for cell in expected if withheld(cell)]
-    assert expected <= set(scheduled())
+    assert not [cell_id(cell) for cell in expected if model_pins.withheld(cell)]
+    assert expected <= set(model_pins.scheduled())
+    assert len(model_pins.scheduled()) == 469, "the planted pins withhold their 168 cells again"
 
 
 def test_no_pin_expects_a_crash() -> None:

@@ -79,7 +79,11 @@ the repeatable one.
   `shutdown()`.
 - **An unbounded wait by the drain**: a `flush(3.0)` made while holding the lock returned
   `"timed-out"` after 3 s with the drain waiting on it, and `ok=True` with the bound (measured
-  before the per-site check, which now makes that `flush()` report `"abandoned"` in under 1 s).
+  before the per-site check). ~~The per-site check now makes that `flush()` report `"abandoned"`
+  in under 1 s.~~ — superseded by SPEC-097 FR-004 (Andrew, 2026-11-18, "re-entrant"): a public
+  `flush()` made while its thread holds the sweep lock, as any library lock, returns at once with
+  `"re-entrant"`. The drain's bound is unchanged, and `tests/test_open_span_sweep.py` holds it
+  with the marker wait alone, `Worker.flush`, made inside the hold.
 - **A sweep that drops on a full queue** (diff review frame 2): one submission per span into a
   queue of 10,000 submissions, so 12,000 open spans overflowed 6,000 submissions in one pass and
   `r_many_spans.py 12000 3` delivered 54,000 of 60,000, where the code before SPEC-091 delivered
@@ -93,8 +97,10 @@ the repeatable one.
   pass waited out the bound, and a `flush()` made inside a hold with 200 submissions queued ahead
   returned after 11.46 s; retried an interval later, it returns in 0.05 s.
 - **A `SIGTERM` handler that sweeps**: the default disposition skips `atexit`, `p12_kill.py`'s
-  `SIGTERM` loss was of five **closed** spans already queued, and a handler calling `shutdown()`
-  is §12's finding-3 deadlock.
+  `SIGTERM` loss was of five **closed** spans already queued, and ~~a handler calling `shutdown()`
+  is §12's finding-3 deadlock~~ (superseded by SPEC-097: that call no longer deadlocks; made inside
+  a library lock section it is held and runs when the interrupted call returns, so a handler that
+  calls `shutdown()` sweeps through it, and the library still installs no handler of its own).
 
 **Do NOT build** a setting for the sweep's cadence, a sweep that takes `span.start`, rebinds
 `span.events` or drops a take the queue cannot accept, a lock waited on unboundedly inside the
@@ -103,6 +109,15 @@ enters the hold without asking `_sweep_held_here()` first; `tests/test_span_even
 derives the last two from the AST. The residuals the build accepted are in `architecture.md` §13.
 
 ## History
+
+### 2026-11-18
+
+- **Amended** by SPEC-097 FR-004, on Andrew's answer of 2026-11-18 ("re-entrant"): a `flush()`
+  made inside a sweep hold, from a collector callback or a finalizer, is refused at once with
+  the reason `"re-entrant"` rather than sweeping nothing and reporting `"abandoned"`. The sweep
+  lock is one of the locks the command path reads for ownership. The rejected `SIGTERM`-handler
+  sweep's second reason, the finding-3 deadlock, is struck in place: a handler's `shutdown()` no
+  longer deadlocks. Nothing else here changes.
 
 ### 2026-11-17
 

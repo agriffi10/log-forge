@@ -54,8 +54,10 @@ on every call back.
   build, and the join waits on the thread: with no timeout on the join, the process hangs. The
   library cannot see a wait in the caller's code, and refusing every waiter is the rejected design
   above. Recorded under invariant 3.
-- **A factory running on the drain thread** that calls `flush()` waits on its own drain thread,
-  the drain-thread self-wait `docs/decisions/pipeline/` already records.
+- ~~**A factory running on the drain thread** that calls `flush()` waits on its own drain thread,
+  the drain-thread self-wait `docs/decisions/pipeline/` already records.~~ — superseded by
+  SPEC-097 FR-003: a `flush()` made on the live worker's drain thread, a factory the worker built
+  included, returns at once with the reason `"re-entrant"`.
 - **A yield that waits on nothing still refuses.** The yield is keyed to the call, not to whether
   this particular call can wait on the waiter: a factory on the drain thread that calls
   `configure(sink=B)`, which there is re-entrant and waits on nothing, still refuses an orphan log
@@ -75,6 +77,11 @@ factory is not inside `flush()`, `shutdown()` or a sink-changing `configure()`. 
 call that started it.
 
 ## History
+
+### 2026-11-18
+
+- **Marked by SPEC-097**: a factory on the drain thread that calls `flush()` no longer waits on
+  that thread; the call returns `"re-entrant"`. Struck in place; nothing else here changes.
 
 ### 2026-11-12
 

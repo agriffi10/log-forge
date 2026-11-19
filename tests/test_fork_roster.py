@@ -58,6 +58,7 @@ _EXPECTED_ROSTER = (
     ("_lifecycle", "_state._stop"),
     ("_lifecycle", "_state._owned_lock"),
     ("_lifecycle", "_state._closes._lock"),
+    ("_lifecycle", "_state._deferred_lock"),
     ("config", "_config_lock"),
     ("config", "_sink_lock"),
     ("decorator", "_sweep_lock"),
@@ -93,6 +94,7 @@ _PRIMITIVE_HOMES = {
     "_Close": "dropped: _lifecycle._clear_after_fork",
     "_Operation": "dropped: _lifecycle._clear_after_fork",
     "_FlushMarker": "dropped: _lifecycle._rebuild_worker_after_fork",
+    "_CountingQueue": "dropped: _lifecycle._rebuild_worker_after_fork",
 }
 """Every class that assigns a primitive to ``self``, with the one mechanism that handles it.
 

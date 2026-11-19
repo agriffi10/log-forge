@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-097
 title: "Lifecycle Commands Take Their Turn, and a Call Made From Inside One Never Waits on It"
 description: "Makes a sink change a command from before its config write, so a shutdown meets it and never has its close undone by it; has a shutdown made from inside a running command merge into it or run when it ends, within the change's budget; refuses a flush made on the drain thread; and has a lifecycle call made on a thread that holds a library lock, a signal handler's, run once that thread lets go, so 94 adversarial cells turn green, no other cell moves, and the signal-handler deadlock is gone."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-054, SPEC-068, SPEC-077, SPEC-078, SPEC-083, SPEC-085, SPEC-086, SPEC-087, SPEC-088, SPEC-089, SPEC-091]
 arc: audit-2026-11-14
 arc_order: 13
@@ -206,12 +206,25 @@ FR-004's test has found the thread holding no library lock:
 - **Merged.** When a stop is running and the caller is that stop's own thread or a `log-foundry-`
   thread, the call returns at once and does nothing else. The running stop is its effect: it has
   already moved the retirement count, set the stop signal and will close what is owed.
-- **Deferred.** When a sink change is in flight and the caller is the changing thread (the holder of
-  `config._sink_lock`, so a stop-signal setter the change runs) or a `log-foundry-` thread, the call
-  records its own deadline and returns at once. The changing thread runs one stop for every call
-  deferred during its change, after the change has released `config._sink_lock` and before
-  `configure()` returns. That stop's timeout is what is left of the latest deadline among the
-  deferred calls, or none if any was unbounded, cut at the end of the change's swap budget.
+- **Deferred.** When a sink change is registered, under `_deferred_lock`, as the one that will take
+  deferred stops, that change is still running, and the caller is that change's thread (so a
+  stop-signal setter the change runs) or a `log-foundry-` thread, the call records its own deadline
+  on the change's operation and returns at once. A change is running exactly while its
+  `config._change_sink` frame is on its thread's stack, which is read, never recorded in a slot a
+  later statement must clear: an interrupt can land between any two statements, and three rounds
+  of review each found a slot left set that made every later `shutdown()` and the exit drain defer
+  to a change that had already unwound. A registered change that is no longer running reads as no
+  change, and the deadlines deferred to it are dropped with it: its thread took the interrupt, and
+  the next `shutdown()` or the exit drain is the stop that runs. A change registers when it
+  publishes, if no running change is registered, so a change made inside another (a re-entrant
+  `configure(sink=...)` on the changing thread, or one a `log-foundry-` thread starts) takes
+  nothing: a stop made during it defers to the outer change, or with none running runs as today.
+  The registered change runs one stop for every call deferred to it, after the change has released
+  `config._sink_lock` and before `configure()` returns, and only it takes them, found by its own
+  frame in the same section that ends its registration. `_deferred_lock` is one of FR-004's
+  oracle locks, so a signal handler's `shutdown()` landing inside one of its sections is held. That
+  stop's timeout is what is left of the latest deadline among the deferred calls, or none if any
+  was unbounded, cut at the end of the change's swap budget.
 - **Otherwise** the call runs as today.
 
 **A deferred stop closes nothing on the changing thread.** A stop's timeout bounds its drain and its
@@ -256,6 +269,23 @@ caller-visible change and FR-007 names it.
       running (invariants 3 and 5).
 - [ ] A test asserts that a merged call moves no counter: `retirements` and every ledger term read
       the same before and after it (invariant 2).
+- [ ] `tests/test_change_interrupts.py` raises `KeyboardInterrupt` at every line event, one per
+      child, of the eight functions a sink change and its deferral run, the rows derived from the
+      code at run time and the functions each mode reaches asserted, for a `configure(sink=...)`
+      on the main thread whose stop-signal setter defers a `shutdown()` and for the same change
+      made on the drain thread. After each, the interrupted thread owns no library lock,
+      `_sink_lock` is free and `_sink_holder` clear, no deferral is left on a running change, a
+      later unrelated `configure(sink=...)` retires nothing, a later `shutdown()` retires, and
+      every sink given events is closed once by the exit. Four categories are excused, each by a
+      reason derived from the code and asserted, never by a count: a lock left owned on one of
+      its function's `with` lines, whose `__exit__` the interrupt skipped (the same rows hang the
+      child at `c9068a46`); a lock left owned on a line holding an instruction, inside a `with`,
+      that no exception-table entry covers; an interrupt between `_swap_sink`'s `took` of a
+      displaced sink and the `release` that starts its closer, code unchanged from `c9068a46`;
+      and an interrupt on the statements that release `_sink_lock` or clear `_sink_holder`
+      themselves. The branches no row reaches are pinned by named tests the corpus's docstring
+      lists, and a `configure(sink=...)` leaves no reference cycle through its own frame
+      (invariants 3 and 5).
 
 ### FR-003: A `flush()` made on the drain thread returns at once, with the reason `"re-entrant"`
 
@@ -279,8 +309,11 @@ outcomes" and carries the counts SPEC-089 reads on the caller.
 
 - [ ] The three cells pinned `drain-flush` and the 33 cells that pin withholds pass (invariant 3).
 - [ ] A test calls `flush(timeout=None)` from a sink's `emit` on the worker path and asserts it
-      returns in under 0.1 s with `ok` false and `reason == "re-entrant"`, that no submission and no
+      returns in under 0.5 s with `ok` false and `reason == "re-entrant"`, that no submission and no
       marker was queued, and that every ledger term reads as before the call (invariants 2 and 3).
+      (Build, 2026-11-18: this read under 0.1 s. `tests/test_timing_floors.py` refuses any ceiling
+      under its 0.5 s stall allowance, which a CI stall can reach; 0.5 s still tells the refusal
+      from the call it replaces, which waits for ever.)
 - [ ] Every `forker` cell passes except `forker-swap-emit-worker-fork`, which stays at its pin
       (invariant 12).
 - [ ] `FlushResult`'s docstring and `flush()`'s list `"re-entrant"` among the reasons, saying when
@@ -301,7 +334,10 @@ the condition lock of the event a `flush()` waits on for its marker, which the h
 The locks a lifecycle call takes on its own thread become `threading.RLock` (FR-005 says why that is
 safe): `Runtime._lock`, `_CloseRegistry._lock`, `Worker._lock`, the worker queue's `mutex` (with its
 three conditions rebuilt on it), `config._config_lock`, `decorator._sweep_lock` and
-`decorator._loss_lock`. A lifecycle call reads them as an **ownership oracle**, `_is_owned()`, and
+`decorator._loss_lock`. (Build, on `c9068a46`: `_sweep_lock` was already an `RLock`, SPEC-091's,
+so six are converted. The ledger's registration lock and `Runtime._owned_lock`, also taken by
+lifecycle calls, are `RLock`s re-entrant by design, SPEC-089 FR-003 AC-15 and SPEC-081 FR-003, and
+stay out of the oracle; `tests/test_lock_oracle.py` records each lock outside it with its reason.) A lifecycle call reads them as an **ownership oracle**, `_is_owned()`, and
 never re-enters one. A `shutdown()`, a `configure()` (its config write and its sink change) or a
 `flush()` made on a thread that owns any of them, or that is inside its own `flush()`'s wait on its
 marker, takes no lock. A `flush()` returns `FlushResult(ok=False, reason="re-entrant")`. A
@@ -324,11 +360,21 @@ untyped, it erased `configure()`'s signature, and `tests/test_typed_consumer.py`
 reported.
 
 **The order of a held call and a stop.** A stop runs every call held on its thread before it begins,
-and runs the calls held during it before its last close pass, then makes that pass. So a held
-`configure(sink=X)` is never left after the drain it would race: the reviewer's `sig_exit.py`, which
-holds `configure(sink=other)` during `health()` and then exits, left the config naming an unclosed
-`other` with the state `CLOSED` on the first prototype, and reads `config_is_other=True
-other_closes=1 state=CLOSED` now.
+so a held `configure(sink=X)` runs while the worker is still live and is never left after the drain
+it would race: the reviewer's `sig_exit.py`, which holds `configure(sink=other)` during `health()`
+and then exits, left the config naming an unclosed `other` with the state `CLOSED` on the first
+prototype, and reads `config_is_other=True other_closes=1 state=CLOSED` now. The calls held during
+a stop run at the end of the first public call its thread finishes: normally the stop itself, so
+once it is over (at the end of `shutdown()`, and of the exit drain, which binds the stop
+directly); but a sink's own code the stop runs on that thread, an inline `close()` that logs, say,
+makes a public call that runs them while the stop is still in progress (the frame-1 diff
+reviewer's `probe_midstop.py log-in-close`). Every public call that can take a library lock runs
+them at its end, whatever its own path, and also once a traced call's open returns, before the
+function body, so a held stop does not wait out the body. (Build, 2026-11-18: this paragraph said a stop ran the calls held during it "before
+its last close pass, then makes that pass". That pass was built and removed: it is unreachable,
+since the only held call that could arm a sink, a held `configure(sink=...)`, arms nothing when it
+runs after a stop, finding no live worker and nothing owed, and its mutant survived the whole
+suite.)
 
 **Only the flush's own wait is marked.** The first prototype marked the whole of `flush()`, so a
 sink's own `flush()` hook, which the library calls on the caller's thread holding no lock, saw its
@@ -365,8 +411,13 @@ the stop, and the exit drain runs after. FR-007 puts that in the README.
       `retired=True held=0` (invariants 1 and 3).
 - [ ] A test ported from the reviewer's `sig_exit.py` holds `configure(sink=other)` during `health()`
       and exits, and asserts that at the end of the exit the config names `other`, `other` was
-      closed once and the state is `CLOSED`; a second row holds it during a stop and asserts the
-      same (invariant 5).
+      closed once and the state is `CLOSED`; a second row holds it during a stop and asserts that
+      the config names `other`, the state is `CLOSED` and `other` was closed **0** times (invariant
+      5). (Build, Andrew's decision of 2026-11-18: this row read "the same", closed once. A held
+      change that runs after a stop finds no live worker and nothing owed and arms nothing, the
+      no-worker arming rule; at `9ee07a88` a plain `configure(sink=other)` after `shutdown()`, with
+      no writes, leaves `other` unclosed at exit too, measured `other_closes=0 other_writes=0`, so
+      the held change matches existing behaviour.)
 - [ ] The six rows of the reviewer's `inflush.py` (orphan and worker, an inner `flush`, `shutdown`
       and `configure`) read as at `ead40798`: the inner `flush()` truthy, the inner `shutdown()`
       leaving `CLOSED`, the inner `configure()` installing its sink (invariant 6).
@@ -390,7 +441,7 @@ on* (`docs/decisions/sink-lifecycle/`) rejected an `RLock` on exactly that groun
 call, naming `_state._lock` and `_sweep_lock`. A setter still never runs under a library lock, so
 that ground still holds for setters; what the `RLock` admits is a handler's or finalizer's call. The
 alternative is to hold level and traced calls as FR-004 holds lifecycle calls, at a cost on every
-log and every traced call of reading seven locks' ownership. This spec re-enters, on the evidence of
+log and every traced call of reading eight locks' ownership. This spec re-enters, on the evidence of
 `spec097_reentry_sweep.py`, and holds level calls instead if that evidence fails on the built tree.
 
 The sweep derives its sections. It reads every `with` on one of the lifecycle locks from the AST of
@@ -415,11 +466,13 @@ workload to reach those nineteen, or holds level calls.
 
 **Nothing else re-enters a library lock.** A plain lock deadlocks when library code takes it twice
 by mistake; an `RLock` lets that through silently. So the whole suite runs under a re-entry
-recording lock, the spec reviewer's `_reentry.py`, installed in place of each of the seven locks:
+recording lock, the spec reviewer's `_reentry.py`, installed in place of each of the oracle's locks:
 it records the call site whenever a thread that owns the lock acquires it again. At the prototype
 the suite records 0 re-entries, and `spec097_signal_in_section.py` records exactly the 2 its design
 makes, a handler's orphan log re-entering `_state._lock` in `_arm_and_hand` and a handler's traced
-call re-entering the queue's mutex in `Worker.submit`. The reviewer's planted mutant, `with
+call re-entering the queue's mutex in `Worker._enqueue`, where the submit's `put` runs (build,
+2026-11-18: this read `Worker.submit`; the recorder names the frame that acquires). The reviewer's
+planted mutant, `with
 self._lock, self._lock:` in the worker's health snapshot, deadlocks `tests/test_worker.py` at
 `ead40798`; on the prototype that suite passes, and the recorder catches it.
 
@@ -429,7 +482,7 @@ self._lock, self._lock:` in the worker's health snapshot, deadlocks `tests/test_
       one that runs only on the drain thread or in a forked child's repair; if any section fails, or a main-thread section stays unreached, level and traced calls made
       inside a section are held as FR-004 holds lifecycle calls, and the sweep is run again on that
       (invariants 2, 5 and 9).
-- [ ] The suite, run with every one of the seven locks replaced by the re-entry recording lock,
+- [ ] The suite, run with every one of the oracle's locks replaced by the re-entry recording lock,
       records no re-entry outside the tests that port `spec097_signal_in_section.py`, which record
       exactly their two by design (invariant 1).
 - [ ] With `with self._lock, self._lock:` planted in `Worker.health`, that recording run of
@@ -478,8 +531,11 @@ time over what the build changes, not by a list written here:
 grep -l '_swaps_running\|_swaps_to_await\|_await_swap_decisions\|_sink_holder\|signal handler\|declined swap\|re-entrant\|RLock' docs/decisions/*/*.md
 ```
 
-At `ead40798` it returns thirteen files. Five state a behaviour this spec changes and are rewritten
-in place, each with a dated History line: *A shutdown waits for a swap in flight to decide, and a
+At `ead40798` it returns thirteen files, and fourteen on `c9068a46`, where SPEC-091 added *An
+open span's events ship on the worker's interval*, whose line on a `flush()` inside a sweep hold
+the build rewrites in place (Andrew, 2026-11-18, "re-entrant"). Five state a behaviour this spec
+changes and are rewritten in place, each with a dated History line: *A shutdown waits for a swap in
+flight to decide, and a
 swap releases only what the record owes* (a re-entrant or signal-handler stop is merged, deferred or
 held; a stop now meets a change from its config write; the swap withholds), *One lifecycle owner*
 (the declined-swap trade, reversed), *Concurrent sink changes are serialized by one lock whose wait
@@ -525,11 +581,12 @@ The caller-visible changes, for `docs/release-notes/v1.2.1.md`:
 - [ ] The five decisions named above are rewritten in place with a History line dated the day the
       build lands, and the delivery doc lists the search's other files with one line each (serves
       no invariant).
-- [ ] On `docs/invariants.md`, entry 5's recorded exception at lines 350 to 355, that a re-entrant
-      `shutdown()` "from a sink's own code on the drain thread or the changing thread, or a signal
-      handler" landing between a change's retarget and its decision may leave the installed sink
-      open, is struck in place with this spec's number. Entry 3's *Guarded* paragraph at lines 286
-      to 290, that `tests/test_model_cells.py` holds every call a sink makes to its budget plus one
+- [ ] On `docs/invariants.md`, entry 5's recorded exception (lines 350 to 355 at `ead40798`, 368
+      to 372 at `c9068a46`), that a re-entrant `shutdown()` "from a sink's own code on the drain
+      thread or the changing thread, or a signal handler" landing between a change's retarget and
+      its decision may leave the installed sink open, is struck in place with this spec's number.
+      Entry 3's *Guarded* paragraph (lines 286 to 290 at `ead40798`, 307 to 308 at `c9068a46`),
+      that `tests/test_model_cells.py` holds every call a sink makes to its budget plus one
       second "except in the cells pinned", is left in force, and the delivery doc records that the
       three pins it excused here are gone. Entry 3's *Guarded* also names the ports of
       `spec097_signal_in_section.py` and `spec097_held_sweep.py` (serves no invariant).
@@ -543,12 +600,14 @@ The caller-visible changes, for `docs/release-notes/v1.2.1.md`:
 
 ```python
 # src/log_foundry/_lifecycle.py
-class _Operation:                       # a SWAP gains two fields, a STOP one
+class _Operation:                       # a SWAP gains four fields, a STOP one
     installing: Sink | None             # the sink a published change installs; None once it ends
     withheld: bool                      # a _close_owed take took `installing` since the config named it
     detach: bool                        # a STOP deferred to a change's end: every close on a closer thread
+    change: FrameType | None            # the _change_sink frame that published a SWAP; running while on its stack
+    deferred: list[float | None]        # deadlines of stops deferred to this SWAP while it is the taker
 
-_deferred_stops: list[float | None]     # deadlines of stops deferred to the sink change in flight
+_deferred_taker: _Operation | None      # the change that takes deferred stops; counts only while running
 _sections: threading.local              # per thread: .waiting (calls FR-004 holds), .flushing (the marker wait)
 
 def runs_held(fn): ...                  # marks a public call that runs its thread's held calls at its end
@@ -630,6 +689,9 @@ tests/
 ### Phase 4: The record (FR-007)
 
 - Pins, §12, the five decisions, the invariants page, the README, the release notes.
+- (Build: each pin was removed in the phase whose fix turned its cells green, since
+  `model_pins.judge` fails a pinned cell that passes: `installed-closed-twice` in Phase 1, which
+  FR-001's withhold already closed, and `drain-flush` and `nested-shutdown` in Phase 2.)
 
 ---
 
@@ -789,3 +851,70 @@ number here is macOS.
   `retarget` row of the fork-mid-hand test); marking the whole of `flush()` (a sink's own `flush()`
   hook's calls changed); closing a deferred stop's sinks inline (`configure()` past its budget); an
   untyped `runs_held` (`test_the_probe_can_fail` failed).
+- **Andrew's call, 2026-11-18:** a `flush()` made inside a SPEC-091 sweep hold returns
+  `"re-entrant"`, not `"abandoned"`: FR-004 governs for `_sweep_lock`.
+- 2026-11-18, built on `c9068a46` (SPEC-089, SPEC-090, SPEC-091, SPEC-096, SPEC-102 and SPEC-103
+  built), and the Evidence re-measured there. **The cells**, every one of the 637 and the
+  reproduction run with pins and withholding ignored: 98 red at `c9068a46` (56
+  `Stalled:shutdown-none`, 36 `HangFound:flush-none@worker._flush_marked`, 2
+  `CloseBroken:repeat@1`, 2 `CloseBroken:never-closed@1`, 1 `ChildBroken:two-sinks`, the
+  reproduction; SPEC-091 had already resolved `empty-submission`), 4 red on the build, each at its
+  pin's verdict: 94 cells from red to green, none from green to red, no pinned verdict moved.
+  **The probes**: p11 `forced` 0 of 7, every row `[1]`; p3 0.00 s on all six `shutdown` rows; p1b 0
+  of 200 in every mode, three runs; `spec097_signal_in_section.py` all eleven rows exit 0;
+  `spec097_held_sweep.py` no `NO RECIPE` and every fired row `retired=True held=0`, the calls that
+  fire now including `continue_trace` (SPEC-091's sweep hold); `p11_assembly.py` `unaccounted=0`.
+  **Premises that moved**, each recorded where it is used above: `_sweep_lock` was already an
+  `RLock`, so six locks are converted; the ledger's registration lock and `_owned_lock` stay out of
+  the oracle (plan review B1); a level and a traced call run held calls inline at their end, on the
+  exceptional path too (an inline `except BaseException` that runs them and re-raises, without
+  letting a held call's failure replace the exception), since a wrapper frame around `_log`,
+  `_begin` and `_end` let a `RecursionError` escape their guards and `p11_assembly.py` read
+  `unaccounted=2`; `configure()` is held at its entry after validation (plan
+  review M2); `ConsoleWriter._lock` stays a `Lock`, exempt with its reason (M3); and each pin left
+  in the phase that turned its cells green. **FR-005's sweep** reads `failed=0` over every section
+  its three workloads reach (`main`, a `late` one whose first stop builds a late worker, and a
+  `direct` one that drives the hand machinery, the put-back and the overflow count); the sections
+  it does not reach each run only in a forked child's repair or only on the drain thread, except
+  `_ledger.restart`, which the test harness alone calls. The sweep prints both populations, so
+  re-running it counts them rather than this text. **The recorder** records no re-entry over the
+  whole suite (the tests that fail under it each read a lock's type or its fork repair), and
+  records the planted `with self._lock, self._lock:` in `Worker.health`, every record naming
+  `worker.py` and `health`. Its positive half, the signal-in-section rows run under it in process,
+  records exactly the two re-entries the design makes, one each: `orphan-arm/info` at
+  `_lifecycle.py:_arm_and_hand`, and `submit/span` at `worker.py:_enqueue`, every other row none;
+  `tests/test_lock_reentry.py` holds each row to that.
+- 2026-11-18, revised after the second diff review (B1). A stop deferred during a re-entrant sink
+  change, one a sink's drain-thread code or a `log-foundry-` thread made while another change was in
+  flight, was appended to a list only the outer change's end took, or none did, and never ran (the
+  reviewer's `p_reentrant_defer.py`, in both its modes). A stop now defers only to the change
+  registered to take the list (FR-002's Deferred clause), and `p_reentrant_defer.py` reads as the
+  reviewer's base tree does in both modes. The nested change no longer adopts an outer change's
+  published operation either (m1): a swap adopts only the operation that installs its own sink.
+- 2026-11-18, revised after the execution review (frame 3, B1, M1, M2). A `KeyboardInterrupt`
+  landing between a change's registration as the taker and its end, or inside the end's section
+  before it deregistered, left the registration set for good, and every later `shutdown()` and the
+  exit drain deferred to it and closed nothing (the reviewer's `p8_real_sigint.py`, a real
+  `SIGINT`, read `taker_left true`); one landing between the deregistration and the list's take
+  left the list for the next unrelated `configure()`, which retired the library. It was the third
+  round of the same class: a deferral resting on a slot that only a later statement clears. The
+  taker now counts only while its change's frame is on its thread's stack, the deadlines are held
+  on the change's operation, and the change's end finds what it published, and its registration,
+  by that frame (FR-002's Deferred clause). `p8_real_sigint.py` now reads `taker_left false` with
+  the main thread's `shutdown()` retiring. `_deferred_lock` joined FR-004's oracle (M2): a
+  handler's `shutdown(timeout=None)` inside the end's section ran a whole stop there and
+  deadlocked against a drain thread waiting for that lock, and is now held. The interrupt corpus
+  (`tests/test_change_interrupts.py`) replaces the review loop for this class.
+- 2026-11-18, revised after the final execution review. MAJOR 1: `configure(sink=...)` bound its
+  own frame to a local, a reference cycle that kept its frame, its caller's and every superseded
+  sink alive until a garbage collection (`p_cycle.py`, the collector disabled); the frame is now
+  passed inline, each operation drops it at the change's end, and a test with the collector off
+  holds it. MAJOR 2: `_sink_lock` and `_sink_holder` were released in the end section's
+  `finally`, so an interrupt anywhere in that section left them for good and every later
+  `configure(sink=...)` on the thread was read as re-entrant (`p_holder.py`). Each is now released
+  in a `finally` of its own outside the end section, and the acquire is the first statement of
+  the innermost `try`, on one line. Measured with the corpus child on both trees: rows leaving
+  the lock held or the holder set went from 29 of 197 (main thread) and 23 of 137 (drain thread)
+  at `5f538b8b` to 5 of 202 and 5 of 142, every one on the release statements themselves. The
+  corpus now checks both, excuses each owned-lock row only by a derived reason, and names the
+  tests that pin the branches no row reaches.

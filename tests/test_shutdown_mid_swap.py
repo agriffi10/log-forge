@@ -917,14 +917,16 @@ UNFENCED = "could not be confirmed drained"
 
 
 def test_a_setter_shutdown_after_the_reassign_is_declined_not_unfenced() -> None:
-    """A retarget whose new sink's setter shuts down reports ``declined``, counting nothing.
+    """A setter's ``shutdown()`` during a swap counts nothing and closes the displaced sink once.
 
     The live worker on P is retargeted at A, and A's setter, run by the retarget after the
-    reassign, calls ``shutdown()``. That shutdown stops the worker, drains into A and closes P, so
-    the retarget's fence flush answers ``retired`` without trying. At ``9f4d4dfd`` the retarget
-    read that as an unconfirmed drain: ``incomplete_swaps`` went to 1 and a line said P "could
-    not be confirmed drained" and was "left open", though nothing timed out and P was closed.
-    A is still owed, for the exit (invariant 5).
+    reassign, calls ``shutdown()``. At ``9f4d4dfd`` the retarget read the stopped worker as an
+    unconfirmed drain: ``incomplete_swaps`` went to 1 and a line said P "could not be confirmed
+    drained" and was "left open", though nothing timed out and P was closed. Until SPEC-097 that
+    shutdown ran inline under the change, so the retarget declined and A stayed owed for the exit.
+    The setter runs on the changing thread, so since SPEC-097 FR-002 its ``shutdown()`` is
+    deferred to the change's end: the swap completes, and the deferred stop closes P once and
+    takes A too, so nothing is left owed (invariant 5).
     """
 
     def scenario() -> str:
@@ -940,7 +942,7 @@ def test_a_setter_shutdown_after_the_reassign_is_declined_not_unfenced() -> None
         )
 
     child = run_in_child(scenario)
-    assert child.output == ("fired=True incomplete=0 line=False a_owed=True p_closes=1"), (
+    assert child.output == ("fired=True incomplete=0 line=False a_owed=False p_closes=1"), (
         child.output
     )
 
@@ -1075,14 +1077,20 @@ def test_a_retiring_shutdown_that_expires_inside_the_old_sink_leaves_the_swap_un
 
 
 def test_a_setter_shutdown_that_expires_before_the_drain_leaves_stays_unfenced() -> None:
-    """The verdict reads the owed record, not the drain thread's liveness after the setter.
+    """A setter's expiring ``shutdown()`` is deferred, so the swap completes and A is closed once.
 
     The drain thread is inside a 0.6 s ``emit`` on A when B's setter, run after the reassign,
-    calls ``shutdown(timeout=0.3)`` itself: that shutdown expires with the thread inside A and
-    leaves A owed and open. The setter then works on for 0.5 s, by which time the thread has left
-    A and ended, so a liveness read after the setter returns found it dead and reported
-    ``declined``, writing nothing for a sink left owed and open. A is still owed, so the swap is
-    an unconfirmed one: ``unfenced``, one incomplete swap, and the line, which is true.
+    calls ``shutdown(timeout=0.3)`` itself and then works on for 0.5 s. Until SPEC-097 that
+    shutdown ran inline, expired with the thread inside A and left A owed and open, and the
+    verdict, which reads the owed record rather than the drain thread's liveness after the
+    setter, was ``unfenced`` with one incomplete swap and its line. The setter runs on the changing
+    thread, so since SPEC-097 FR-002 its ``shutdown()`` is deferred to the change's end: the swap
+    completes, counting nothing, and the deferred stop closes A once (invariant 5).
+
+    ``drain_ended`` is reported and not asserted. The deferred stop's deadline, the setter's
+    0.3 s, has passed by the time the change ends, so it runs with no time to wait, and whether
+    the drain thread has ended by the read just after ``configure()`` returns is the scheduler's:
+    the spec measured ``False`` on its prototype, and this tree reads ``True``.
     """
 
     def scenario() -> str:
@@ -1138,6 +1146,333 @@ def test_a_setter_shutdown_that_expires_before_the_drain_leaves_stays_unfenced()
         )
 
     child = run_in_child(scenario)
-    assert child.output == (
-        "fired=True drain_ended=True incomplete=1 line=True a_owed=True a_closes=0"
-    ), child.output
+    output = re.sub(r" drain_ended=(True|False)", "", child.output or "")
+    assert output == ("fired=True incomplete=0 line=False a_owed=False a_closes=1"), child.output
+
+
+# -- SPEC-097 FR-001: the change is in flight from before its config write -----------------------
+
+
+class _ParkAtSwapEntry:
+    """Parks the change to ``target`` on its way into ``_swap_sink``: after its config write.
+
+    ``config._swap_live_sink`` imports ``_swap_sink`` from ``_lifecycle`` at call time, so a patch
+    of the module attribute intercepts the change after ``_rebind`` and before any section of the
+    swap, which is the window SPEC-097 FR-001 publishes the change across.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, target: object, nested: Any = None) -> None:
+        self.parked = threading.Event()
+        self.release = threading.Event()
+        real = _lifecycle._swap_sink
+
+        def parked(new_sink: Any, timeout: float | None = 5.0) -> None:
+            if new_sink is target and not self.parked.is_set():
+                self.parked.set()
+                self.release.wait(GATE_WAIT * 3)
+                if nested is not None:
+                    nested()
+            real(new_sink, timeout)
+
+        monkeypatch.setattr(_lifecycle, "_swap_sink", parked)
+
+
+class _ParkStaleOrphan:
+    """Parks one orphan log to ``target`` on the thread named ``stale`` at its owed check.
+
+    The orphan log resolved ``target`` before the config write, so once released after a
+    ``shutdown()`` it writes to ``target`` and arms it again: the one other sink owed when the
+    swap decides, without which a no-worker swap returns early and arms nothing (p11's
+    ``forced``).
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, target: object) -> None:
+        from log_foundry import api
+
+        self.parked = threading.Event()
+        self.release = threading.Event()
+        real = api._note_orphan_emit
+
+        def note(sink: Any) -> None:
+            if sink is target and threading.current_thread().name == "stale":
+                self.parked.set()
+                self.release.wait(GATE_WAIT * 3)
+            real(sink)
+
+        monkeypatch.setattr(api, "_note_orphan_emit", note)
+
+
+def test_a_no_worker_swap_does_not_arm_a_sink_a_concurrent_shutdown_closed_since_the_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001, the no-worker branch: the installed sink is closed once, not twice at one count.
+
+    ``lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py``'s ``forced`` variant in process. The
+    change to S is parked after its config write; an orphan log arms S and writes once; a
+    ``shutdown()`` on this thread takes S and closes it; the change is then released and, with
+    something owed, reaches its no-worker arm. At ``c9068a46`` that arm made S owed again and the
+    last ``shutdown()`` closed it a second time at write count 1. The change was published before
+    its write, so the first ``shutdown()``'s take marked it withheld and the arm is skipped.
+    """
+    a, s = Sink("A"), Sink("S")
+    log_foundry.configure(service="fr001", sink=a)
+    log_foundry.info("a")
+    stale_gate = _ParkStaleOrphan(monkeypatch, a)
+    stale = threading.Thread(target=log_foundry.info, args=("late",), name="stale", daemon=True)
+    stale.start()
+    assert stale_gate.parked.wait(GATE_WAIT), "the stale orphan log reached its owed check"
+    gate = _ParkAtSwapEntry(monkeypatch, s)
+    changer = _start(lambda: log_foundry.configure(service="fr001", sink=s))
+    assert gate.parked.wait(GATE_WAIT), "the change reached the window after its config write"
+    log_foundry.info("s")
+    log_foundry.shutdown(timeout=0.5)
+    assert s.at_close == [(1, "MainThread")], f"the premise: the shutdown closed S once: {s}"
+    stale_gate.release.set()
+    _finish(stale)
+    gate.release.set()
+    _finish(changer)
+    log_foundry.shutdown(timeout=2.0)
+    assert s.at_close == [(1, "MainThread")], f"S was closed again with nothing written: {s}"
+    assert [count for count, _ in a.at_close] == [1, 2], f"A's closes are p11's: {a}"
+
+
+def test_a_nested_change_on_the_changing_thread_leaves_the_outer_change_its_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001, frame-2 review m1: a nested ``configure(sink=X)`` does not take the outer change's op.
+
+    The no-worker window above, with one more step: between its config write and its swap, the
+    changing thread makes a nested ``configure(sink=X)``, as a signal handler there would. The
+    nested swap used to read and clear the thread's published operation although it installs
+    another sink, so the outer swap decided with a fresh operation the stop's take never marked,
+    armed S again, and the last ``shutdown()`` closed it a second time at write count 1 (the
+    frame-2 reviewer's ``p_steal.py nested-sink``, 5 of 5). The nested swap now leaves an operation
+    that is not its own, and S is closed once.
+    """
+    a, s, x = Sink("A"), Sink("S"), Sink("X")
+    log_foundry.configure(service="fr001", sink=a)
+    log_foundry.info("a")
+    stale_gate = _ParkStaleOrphan(monkeypatch, a)
+    stale = threading.Thread(target=log_foundry.info, args=("late",), name="stale", daemon=True)
+    stale.start()
+    assert stale_gate.parked.wait(GATE_WAIT), "the stale orphan log reached its owed check"
+    gate = _ParkAtSwapEntry(monkeypatch, s, nested=lambda: log_foundry.configure(sink=x))
+    changer = _start(lambda: log_foundry.configure(service="fr001", sink=s))
+    assert gate.parked.wait(GATE_WAIT), "the change reached the window after its config write"
+    log_foundry.info("s")
+    log_foundry.shutdown(timeout=0.5)
+    stale_gate.release.set()
+    _finish(stale)
+    gate.release.set()
+    _finish(changer)
+    log_foundry.shutdown(timeout=2.0)
+    assert [count for count, _ in s.at_close] == [1], (
+        f"S was closed again with nothing written: {s}"
+    )
+
+
+def test_a_retarget_answering_declined_does_not_arm_a_sink_a_concurrent_shutdown_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001, the ``declined`` branch: the installed sink is closed once.
+
+    The change to B is inside its retarget's fence flush when an orphan log arms B and a
+    ``shutdown()`` on another thread, whose wait for the change's decision runs out, stops the
+    worker and takes B. The retarget then answers ``declined``; at ``c9068a46`` the change armed B
+    anyway and the exit closed it a second time at one write count (SPEC-054's trade, reversed).
+    """
+    a, b = Sink("A"), Sink("B")
+    _worker_on(a)
+    verdicts: list[str] = []
+    real_retarget = Worker.retarget
+    real_flush = Worker.flush
+    fired: list[bool] = []
+    changing: list[bool] = []
+
+    def flush_then_race(self_: Worker, timeout: float | None = 5.0) -> Any:
+        result = real_flush(self_, timeout)
+        if changing and not fired:
+            fired.append(True)
+            log_foundry.info("to b")
+            stop = _start(lambda: log_foundry.shutdown(timeout=0.3))
+            _finish(stop)
+        return result
+
+    def recording(self_: Worker, new_sink: Any, deadline: float | None = None) -> Any:
+        outcome = real_retarget(self_, new_sink, deadline)
+        if new_sink is b:
+            verdicts.append(outcome.verdict)
+        return outcome
+
+    monkeypatch.setattr(Worker, "flush", flush_then_race)
+    monkeypatch.setattr(Worker, "retarget", recording)
+    changing.append(True)
+    log_foundry.configure(sink=b)
+    assert fired, "the premise: the race ran inside the retarget's first flush"
+    assert verdicts == ["declined"], f"the premise: the retarget declined, read {verdicts}"
+    _lifecycle._close_owed()
+    assert _once(b), f"B was not closed exactly once: {b}"
+
+
+def test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_after_its_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001, the ``fenced`` branch: a withheld change keeps its arm, so B is owed after its write.
+
+    The change to B is parked after its retarget answered ``fenced``: the worker already delivers
+    to B. An orphan log writes to B and arms it, and a concurrent ``shutdown()`` whose wait for the
+    change's decision runs out after its two-second closer grace stops the worker, takes B and
+    closes it, which marks the change withheld. Its timeout leaves the stop time to see the drain
+    thread end, so B is no longer held when it takes. The change is released and still arms B,
+    since on ``fenced`` that arm is the only one the worker's new sink gets: B is owed when
+    ``configure()`` returns, and its last close comes after its last write.
+
+    What this row does not claim: B is closed a second time at the same write count by the exit.
+    That is the stop whose wait for a change in flight ran out (invariant 5's recorded exception),
+    not the window FR-001 closes, and FR-001 keeps the ``fenced`` arm on purpose.
+    """
+    a, b = Sink("A"), Sink("B")
+    _worker_on(a)
+    verdicts: list[str] = []
+    real = Worker.retarget
+    release = threading.Event()
+    parked = threading.Event()
+
+    def parked_after(self_: Worker, new_sink: Any, deadline: float | None = None) -> Any:
+        outcome = real(self_, new_sink, deadline)
+        if new_sink is b:
+            verdicts.append(outcome.verdict)
+            parked.set()
+            release.wait(GATE_WAIT * 3)
+        return outcome
+
+    monkeypatch.setattr(Worker, "retarget", parked_after)
+    swap = _start(lambda: log_foundry.configure(sink=b))
+    assert parked.wait(GATE_WAIT), "the swap reached its window"
+    log_foundry.info("to b")
+    stop = _start(lambda: log_foundry.shutdown(timeout=6.0))
+    _finish(stop)
+    release.set()
+    _finish(swap)
+    assert verdicts == ["fenced"], f"the premise: the retarget answered fenced, read {verdicts}"
+    deadline = time.monotonic() + GATE_WAIT
+    while b.closes == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert b.closes == 1, f"the premise: the stop's take closed B before the change decided: {b}"
+    assert _lifecycle.owes_close(b), f"the withheld fenced change did not arm B: {b}"
+    _lifecycle._close_owed()
+    assert b.at_close[-1][0] == b.events, f"B was written after its last close: {b}"
+
+
+def test_a_stale_take_by_a_second_change_does_not_withhold_the_first_changes_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001's first bound: only a ``_close_owed`` take withholds, never a swap's stale take.
+
+    Two sink changes run unserialized on the worker path. The first, to B, is parked after its
+    config write, holding ``config._sink_lock``, and an orphan log writes to B and arms it. The
+    second, to C, gives up waiting for the lock and proceeds alongside: its stale loop takes B and
+    closes it, then retargets the worker to C. The first change is released and retargets the
+    worker to B. That take was a swap's, not a stop's, so the first change is not withheld and arms
+    B; a traced call writes to B again and the exit closes it after that write, so B's closes
+    enter at ``[1, 2]``. A withhold keyed on any take marked the change here: on ``fenced`` its arm
+    stays regardless, so the mark itself is read, which is what fails for that mutant.
+    """
+    from log_foundry import worker as worker_module
+
+    a, b, c = Sink("A"), Sink("B"), Sink("C")
+    _worker_on(a)
+    published: list[_lifecycle._Operation] = []
+    real_open = _lifecycle.open_command_swap
+
+    def recording(budget: float | None, installing: Any, change: Any) -> _lifecycle._Operation:
+        op = real_open(budget, installing, change)
+        if installing is b:
+            published.append(op)
+        return op
+
+    monkeypatch.setattr(_lifecycle, "open_command_swap", recording)
+    gate = _ParkAtSwapEntry(monkeypatch, b)
+    first = _start(lambda: log_foundry.configure(sink=b))
+    assert gate.parked.wait(GATE_WAIT), "the first change reached its window"
+    log_foundry.info("b once")
+    assert _lifecycle.owes_close(b), "the premise: the orphan log armed B"
+    monkeypatch.setattr(worker_module, "DEFAULT_SWAP_TIMEOUT", 0.2)
+    log_foundry.configure(sink=c)
+    deadline = time.monotonic() + GATE_WAIT
+    while not b.at_close and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert [count for count, _ in b.at_close] == [1], f"the premise: a stale take closed B: {b}"
+    assert published and not published[0].withheld, "a swap's stale take withheld the change"
+    gate.release.set()
+    _finish(first)
+    _traced()
+    log_foundry.shutdown(timeout=5.0)
+    assert b.events > 1, f"the premise: B was written again after its close: {b}"
+    assert [count for count, _ in b.at_close] == [1, b.events], f"B's closes: {b}"
+
+
+def test_a_shutdown_merged_into_a_running_stop_moves_no_counter() -> None:
+    """SPEC-097 FR-002: a ``shutdown()`` from a sink's ``close()`` during a stop is merged.
+
+    It returns at once and does nothing else: the running stop has already moved the retirement
+    count, set the stop signal and will close what is owed. So ``retirements`` and every term of
+    the event ledger read the same just after the inner call as just before it, which a merged
+    call that re-ran any part of a stop would move (invariant 2).
+    """
+
+    def scenario() -> str:
+        class ShutsDownInClose(Sink):
+            reading: str = ""
+
+            def close(self) -> None:
+                before = (_lifecycle._state.retirements, repr(_lifecycle._ledger_snapshot()))
+                started = time.monotonic()
+                log_foundry.shutdown(timeout=None)
+                took = time.monotonic() - started
+                after = (_lifecycle._state.retirements, repr(_lifecycle._ledger_snapshot()))
+                self.reading = f"same={before == after} quick={took < 0.5}"
+                super().close()
+
+        s = ShutsDownInClose("S")
+        log_foundry.configure(service="merged", sink=s)
+        log_foundry.info("one")
+        log_foundry.shutdown(timeout=5.0)
+        return f"{s.reading} closes={s.closes} retirements={_lifecycle._state.retirements}"
+
+    child = run_in_child(scenario)
+    assert child.output == "same=True quick=True closes=1 retirements=1", child.output
+
+
+def test_every_published_change_drops_its_sink_once_its_configure_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-001: a change published before its write references no sink once ``configure()`` returns.
+
+    A published operation that kept ``installing`` would hold every superseded sink alive past its
+    change, which SPEC-081's bounded ownership record refuses; ``close_command_swap`` clears it.
+    Every operation ``configure(sink=...)`` publishes is recorded, on both paths and across a
+    re-entrant-free sequence of changes, and read once each call has returned.
+    """
+    published: list[_lifecycle._Operation] = []
+    real = _lifecycle.open_command_swap
+
+    def recording(budget: float | None, installing: Any, change: Any) -> _lifecycle._Operation:
+        op = real(budget, installing, change)
+        published.append(op)
+        return op
+
+    monkeypatch.setattr(_lifecycle, "open_command_swap", recording)
+    first = Sink("first")
+    log_foundry.configure(service="published", sink=first)
+    log_foundry.info("orphan")
+    log_foundry.configure(sink=Sink("second"))
+    _traced()
+    log_foundry.flush(timeout=5.0)
+    log_foundry.configure(sink=Sink("third"))
+    log_foundry.configure(sink=Sink("fourth"))
+    assert len(published) == 4, published
+    kept = [op for op in published if op.installing is not None]
+    assert not kept, f"{len(kept)} published change(s) still reference a sink after returning"
+    assert all(op.decided.is_set() for op in published)
+    assert not _lifecycle._state._swaps_running

@@ -896,7 +896,7 @@ def test_every_return_in_flush_worker_attaches_the_counts() -> None:
     """FR-003 AC-11: derived from the tree, and the count found is asserted too."""
     source = inspect.getsource(_lifecycle._flush_worker)
     returns = [n for n in ast.walk(ast.parse(textwrap.dedent(source))) if isinstance(n, ast.Return)]
-    assert len(returns) == 4
+    assert len(returns) == 5, "SPEC-097 FR-003's drain-thread refusal is the fifth"
     assert _unwrapped_returns(source, "_flush_worker") == []
 
 

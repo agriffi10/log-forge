@@ -408,7 +408,13 @@ def test_two_overlapping_shutdowns_hold_two_tokens(monkeypatch: pytest.MonkeyPat
 
 
 class _CountingLock:
-    """Wraps the state lock and counts every acquisition, by ``with`` or ``acquire``."""
+    """Wraps the state lock and counts every acquisition, by ``with`` or ``acquire``.
+
+    Since SPEC-097 the state lock is an ``RLock`` that a lifecycle call reads for ownership before
+    it takes anything (``_lifecycle.in_section``), so the double answers ``_is_owned`` from the
+    real lock without counting it: a read of ownership is not an acquisition, and the pinned counts
+    stay the ones measured before the oracle existed.
+    """
 
     def __init__(self, real: Any) -> None:
         self.real = real
@@ -428,8 +434,15 @@ class _CountingLock:
     def release(self) -> None:
         self.real.release()
 
-    def locked(self) -> bool:
-        return bool(self.real.locked())
+    def _is_owned(self) -> bool:
+        """The ownership read SPEC-097's oracle makes: answered by the real lock, never counted."""
+        return bool(self.real._is_owned())
+
+    def _release_save(self) -> Any:
+        return self.real._release_save()
+
+    def _acquire_restore(self, state: Any) -> None:
+        self.real._acquire_restore(state)
 
 
 def _counted(call: Callable[[], object]) -> int:

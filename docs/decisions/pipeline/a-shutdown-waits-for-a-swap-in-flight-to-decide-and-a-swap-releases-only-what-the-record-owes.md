@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A shutdown waits for a swap in flight to decide, and a swap releases only what the record owes"
-description: "a `shutdown()` or the exit drain waits on each swap in flight's `_Operation.decided`, snapshotted in its entry section, within its one closer grace and never on its own thread or a `log-foundry-` thread, before it drains; and a swap's fenced branch releases the displaced sink only while `_CloseRegistry.owes` it, and cedes it instead, closing nothing, when the graph the swap installs still holds it. Never hold or wait on `config._sink_lock` for this. (fix after SPEC-079; SPEC-087)"
+description: "a `shutdown()` or the exit drain waits on each sink change in flight's `_Operation.decided`, published before its config write and snapshotted in its entry section, within its one closer grace, before it drains; one made from inside a running stop or change, or inside a library lock section, never waits: it is merged, deferred or held (SPEC-097). A swap's fenced branch releases the displaced sink only while `_CloseRegistry.owes` it, and cedes it when the installed graph still holds it; a no-worker or `declined` swap does not arm a sink a stop's `_close_owed` take took since its config write. Never hold or wait on `config._sink_lock` for this. (fix after SPEC-079; SPEC-087; SPEC-097)"
 ---
 
 **The defect.** `configure(sink=B)` with a live worker on A retargets the worker (A to B, verdict
@@ -56,6 +56,31 @@ its own entry (SPEC-078 FR-004). The wait sits at the head of each branch — be
 and as the first statement inside the no-worker branch's `try`, so an interrupt there still lowers
 `_shutdown_running`.
 
+**The change is in flight from before its config write** (SPEC-097 FR-001). `config._change_sink`
+writes the new sink to the config before `_swap_sink` reaches its first section, and a shutdown
+landing between the two read no swap in flight. A non-re-entrant change now publishes its
+`_Operation` in `_swaps_running` before `_rebind` (`_lifecycle.open_command_swap`), lock-free as
+the tokens are discarded, so `configure()`'s pinned lock counts do not move, and `_swap_sink`
+decides with that same operation, its budget set from what the wait for `config._sink_lock` left.
+The operation records the sink it installs (`installing`) and drops it when the change ends
+(`close_command_swap`), so a published change never keeps a superseded sink alive.
+
+**Part 3: a swap does not arm a sink a stop closed since its config write** (SPEC-097 FR-001). A
+`_close_owed` take that takes a published change's `installing` marks that change `withheld`, in
+the same section. A withheld change does not arm the sink on the no-worker branch, nor after a
+retarget that answered `declined`; on `fenced` and `unfenced` it arms, because that is the only arm
+the worker's new sink gets. Without it, `p11_swap_arms_a_sink_a_shutdown_closed.py`'s forced
+variant closed the installed sink twice at one write count in 7 of 7 runs at `ead40798`; with it,
+in 0 of 7. **This is not the arm re-check the `_sink_lock` decision rejects**, which can leave a
+sink owed by nobody. The mark is set only by a `_close_owed` take, whose taker closes the sink, and
+never by a swap's stale take: a withhold keyed on any take left a sink written after its last close
+and owed by nobody, measured 3 of 3 by a reviewer at `027b39a5`, and with the stale take not
+marking, that sink's closes enter at `[1, 2]`. The mark is per change, since one global slot is
+overwritten by an unserialized or re-entrant `configure()`, and it is the config write's, since a
+mark taken at the swap's entry left p11 at 3 of 3 double closes. The `declined` half reverses
+SPEC-054's accepted trade (*One lifecycle owner*, in this directory), by Andrew's answer of
+2026-11-16.
+
 **On the no-worker branch the decision is published before the stop-signal hand.** That branch's
 decision is whole when its first section ends — the stale sinks taken, the new sink armed, the
 signal chosen — and the hand after it runs the sink's own setter. Published only after the hand,
@@ -82,18 +107,30 @@ take's critical section (`_Operation.unsettled`, narrowed by `_close_owed`). Wri
 was false on the frame-2 review's reproduction: a swap stuck in its first flush behind a 3 s `emit`
 declined and armed B in time for the same call to close it.
 
-**Re-entrant never waits.** A shutdown on the swap's own thread (a stop-signal setter run by the
-retarget, a signal handler interrupting `configure()`) skips its own token; one on the drain thread
-(a sink's `emit`, which a retarget's flush may be waiting on) waits on no swap. Either wait is on a
-thread an undecided swap may be waiting on, so it would last the whole grace. The rule is written as
-`config._change_sink`'s `log-foundry-` prefix, so it also covers a closer thread, which is harmless
-rather than needed: a swap joins its closers only after it sets `decided`, and a decided swap is
-never in the snapshot.
+**Re-entrant never waits, and since SPEC-097 never runs under the command it is inside.** At
+`_shutdown_worker`'s entry, first (FR-004): a call on a thread that owns one of the library's
+locks, or that is inside its own `flush()`'s wait on its marker, which is what a signal handler or
+a finalizer that interrupted the library is, is held on its thread and runs at the end of the
+public call the thread was in. Then (FR-002): one on a running stop's own thread, or on a
+`log-foundry-` thread while a stop runs, is merged and returns, the running stop being its
+effect; one on the thread of the change registered as the taker of deferred stops (so a
+stop-signal setter the retarget runs) or on a `log-foundry-` thread (a sink's `emit` that a
+retarget's flush waits on, a closer), while that change's frame is still on its thread's stack, is
+deferred to it, and that change runs one stop for every call deferred to it once it has released
+its lock, before `configure()` returns, with every close detached and
+its waits inside the change's swap budget. Until SPEC-097 such a call drained and returned: a
+drain-thread stop took and closed the sink the change installs, which the change then armed again
+(the two `installed-closed-twice` cells), and one nested in a sink's `close()` waited out the
+closer grace on the close it was inside. The snapshot still skips its own thread's token and takes
+none on a `log-foundry-` thread, for a call that reaches it on a thread an undecided swap may be
+waiting on: a setter's `shutdown()` during a change whose wait for the lock ran out, while the
+change holding the lock is the registered taker, is one.
 
 **A retirement after the retarget's reassign is a declined swap once the displaced sink is no
-longer owed.** A re-entrant `shutdown()` from the new sink's stop-signal setter, or a cross-thread
-one that retires the worker before the retarget's fence flush reads the count, makes that flush
-answer `retired` without trying. The verdict turns on the fact the unconfirmed-swap line reports:
+longer owed.** A cross-thread `shutdown()` that retires the worker before the retarget's fence
+flush reads the count makes that flush answer `retired` without trying. (A `shutdown()` from the
+new sink's stop-signal setter did the same until SPEC-097; it is now deferred to the change's end,
+so the swap completes, counting nothing, and the deferred stop closes the displaced sink once.) The verdict turns on the fact the unconfirmed-swap line reports:
 whether the displaced sink is still owed, read after that flush. Not owed, the retiring shutdown
 took it — a take happens only once nothing of the drain can be inside it, and the taker closes it;
 no swap cedes the worker's own sink, and the closer's guard puts back only a sink lying beneath one
@@ -123,18 +160,35 @@ retarget and its decision when it takes — so it waits on exactly that.
 
 **Not covered, recorded.** A swap that starts after the shutdown's entry and retargets a *late*
 worker (one built during a no-worker shutdown) is not in the snapshot. Part 1 keeps the displaced
-sink once; the installed one may be left owed until the exit closes it. Nor is a re-entrant
-shutdown (on the drain thread, on the swap's own thread, or in a signal handler) landing between the
-retarget and the decision: it drains and returns with the installed sink not yet owed, so that sink
-is left open until a later `shutdown()` or the exit closes it, and no line says so; the displaced
-one is still closed once. `invariants.md` §5 records both beside the not-decided fallback, the only
-one of the three that writes a `pending` line. And a `shutdown()` nested in a sink's `close()`, or
-in a signal handler on a thread that is not the swap's, waits its own grace on the same stuck swap,
-so the outer call can spend two graces and the line prints twice (measured 1.01 s at a 0.5 s
-grace); accepted, because invariant 3 still bounds it and a fix needs a thread-local flag in user
-code.
+sink once; the installed one may be left owed until the exit closes it. `invariants.md` §5 records
+it beside the not-decided fallback, the only one of the two that writes a `pending` line. A
+`shutdown()` whose wait for a `fenced` change runs out takes and closes the installed sink before
+the change decides, and the change, which keeps its arm on `fenced`, arms it again, so the exit
+closes it a second time at the same write count; `architecture.md` §12 holds that open. ~~Nor is
+a re-entrant shutdown (on the drain thread, on the swap's own thread, or in a signal handler)
+landing between the retarget and the decision: it drains and returns with the installed sink not
+yet owed~~, and ~~a `shutdown()` nested in a sink's `close()`, or in a signal handler on a thread
+that is not the swap's, waits its own grace on the same stuck swap~~ — struck by SPEC-097: each is
+now merged into the running stop, deferred to the change's end or held on its thread, so none
+drains under the change and none waits on the close it is inside.
 
 ## History
+
+### 2026-11-18
+
+- **Refined by SPEC-097's diff reviews**: a stop defers to the change registered as the taker while
+  its frame is on its thread's stack, not to the holder of `config._sink_lock`; the re-entrant
+  paragraph says so, and
+  `docs/decisions/public-api/concurrent-sink-changes-are-serialized-by-one-lock-whose-wait-is-spent-from-the-swap-budget.md`
+  says why.
+- **Refined by SPEC-097**: a sink change is published before its config write, so a shutdown
+  meets it from there; a no-worker or `declined` swap withholds its arm of a sink a stop's
+  `_close_owed` take closed since that write (Part 3, reversing SPEC-054's trade); and a stop made
+  from inside a running stop or change, or inside a library lock section, is merged, deferred or
+  held at `_shutdown_worker`'s entry rather than draining under the command. The fence says so,
+  the setter case leaves the retirement paragraph, and *Not covered* strikes the re-entrant
+  shutdown and the nested two-grace wait in place, adding the expired-wait `fenced` double close
+  that §12 holds open.
 
 ### 2026-11-15
 

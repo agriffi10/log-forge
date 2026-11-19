@@ -122,11 +122,16 @@ Four findings, each fixed on the branch and each with a test that its mutant red
   holds, with the hold free. That hang is `queue.Queue`'s and predates SPEC-091 (a traced close
   inside the queue's mutex does not return on the base `33a44e99` either); it is recorded in
   `architecture.md` §13.
+  > **Superseded by SPEC-097**: the queue's mutex is an `RLock`, so a traced close made inside it
+  > re-enters it and returns; the §13 residual is struck (`docs/architecture.md` §13).
 - **A skipped sweep was retried on every pass**, so a held hold slowed the drain to about twenty
   submissions a second: `r_hold_backlog.py 200`'s in-hold `flush()` returned after 11.46 s. A skipped
   sweep now waits an interval from the end of its attempt; the same run returns `abandoned` in
   0.05 s. Test: `test_a_skipped_sweep_does_not_slow_the_drain_behind_a_backlog`; its mutant, retry
   every pass, killed.
+  > **Superseded in part by SPEC-097**: a public `flush()` made inside a sweep hold now returns
+  > `"re-entrant"` at once (Andrew, 2026-11-18); the test times the drain's bound with the marker
+  > wait alone (`docs/decisions/pipeline/an-open-spans-events-ship-on-the-workers-interval.md`).
 - **`flush()` skipped the registry sweep when the open-time build had failed**, reporting success
   over another thread's 5 buffered logs (`r_no_worker_flush.py`). It now builds the worker when a
   registered span holds events, as the own sweep does; the same run delivers the 5 logs before the

@@ -116,6 +116,9 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
     "_lifecycle.py": collections.Counter(
         {
             ("_CloseRegistry.in_flight", "self._lock"): 1,
+            ("_merged_or_deferred", "_state._deferred_lock"): 1,
+            ("end_command_swap", "_state._deferred_lock"): 1,
+            ("open_command_swap", "_state._deferred_lock"): 1,
             ("_CloseRegistry._enter", "self._lock"): 1,
             ("_CloseRegistry.finish", "self._lock"): 1,
             ("_clear_after_fork", "_state._closes._lock"): 1,

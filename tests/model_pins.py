@@ -186,44 +186,11 @@ def _cell(personality: str, site: str, path: str, *script: str) -> Cell:
 
 PINS: tuple[Pin, ...] = (
     Pin(
-        "drain-flush",
-        (
-            _cell("reentrant", "emit", "worker", "flush-none"),
-            _cell("reentrant", "swap-emit", "worker", "flush-none"),
-            _cell("factory", "factory", "worker", "flush-none"),
-        ),
-        frozenset({"HangFound:flush-none@worker._flush_marked"}),
-        "`flush()` called on the drain thread waits on itself",
-        sibling="flush",
-    ),
-    Pin(
-        "nested-shutdown",
-        tuple(
-            _cell("reentrant", site, path, "shutdown-none")
-            for site in ("close", "swap-close")
-            for path in PATHS
-        ),
-        frozenset({"Stalled:shutdown-none"}),
-        "`shutdown()` called from a sink's own `close()` waits out the closer grace on that same "
-        "close",
-        sibling="shutdown",
-    ),
-    Pin(
         "orphan-arm-in-close",
         tuple(_cell("reentrant", "close", path, "configure", "info") for path in PATHS),
         frozenset({"CloseBroken:never-closed@1"}),
         "A sink first written by an orphan log made inside a `shutdown()`'s close is not closed "
         "by that `shutdown()`",
-    ),
-    Pin(
-        "installed-closed-twice",
-        (
-            _cell("reentrant", "swap-emit", "worker", "info", "shutdown"),
-            _cell("reentrant", "swap-emit", "worker", "info", "shutdown-none"),
-        ),
-        frozenset({"CloseBroken:repeat@1"}),
-        "A sink a swap installs is closed twice with nothing written between when an orphan log "
-        "armed it and a re-entrant `shutdown()` closed it before the swap decided",
     ),
     Pin(
         "fork-mid-swap",

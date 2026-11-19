@@ -129,5 +129,6 @@ def tracer(frame, event, arg):
 sys.settrace(tracer)
 RECIPES[call]()
 sys.settrace(None)
-waiting = getattr(_lifecycle._sections, "waiting", None) or []
+calls = getattr(_lifecycle, "_sections", None) or _lifecycle._state._calls_here  # the build keeps it on Runtime
+waiting = getattr(calls, "waiting", None) or []
 print(f"fired={fired} took={took} retired={_lifecycle._state.retirements > 0} held={len(waiting)}")

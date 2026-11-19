@@ -123,6 +123,12 @@ class Snapshotting(Plain):
         self.seen.append((event, list(_lifecycle._offers_here())))
 
 
+def _deferred_now() -> int:
+    """How many stops are deferred to the registered sink change now (SPEC-097 FR-002)."""
+    taker = _lifecycle._state._deferred_taker
+    return 0 if taker is None else len(taker.deferred)
+
+
 @log_foundry.trace
 def _traced() -> None:
     """A traced call, whose span close builds the worker."""
@@ -672,3 +678,195 @@ def test_a_forking_thread_that_unwinds_in_the_child_shares_nothing_it_offers_lat
 
     child = run_in_child(work, timeout=30)
     assert child.output == "S=False R=False", child.output
+
+
+# -- SPEC-097 FR-006: a forked child inherits no command ----------------------------------------
+
+
+def test_a_child_forked_from_a_swaps_closer_inherits_no_sink_change_and_shuts_down() -> None:
+    """FR-006: a fork from the displaced sink's ``close()`` on the swap's closer thread.
+
+    The fork lands while the sink change still holds ``config._sink_lock``: the swap joins its
+    closer before it returns. ``config._sink_holder`` names the parent's changing thread, and a
+    ``shutdown()`` from a ``log-foundry-`` thread reads a holder as a change in flight and is
+    deferred to it, so with the holder inherited the child's ``shutdown()`` was deferred to a
+    change whose other half is not in the child, and the child ended ``RUNNING`` with its span
+    undelivered. The closer thread itself calls ``shutdown()`` just before it forks, which the
+    parent defers to the change, so the parent has one deferred stop at the fork. In the child the
+    holder is ``None``, no stop is deferred, and a traced call then ``shutdown()`` leave it
+    ``CLOSED`` with the span delivered.
+    """
+
+    def work() -> str:
+        read_fd, write_fd = os.pipe()
+        parent = os.getpid()
+        forked: list[int] = []
+
+        class ForkOnClose:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                self.messages.extend(event.get("message") for event in batch)
+
+            def close(self) -> None:
+                if forked or threading.current_thread().name != "log-foundry-sink-close":
+                    return
+                holder = config._sink_holder
+                log_foundry.shutdown(timeout=1.0)
+                before = _deferred_now()
+                gc.collect()
+                pid = os.fork()
+                forked.append(pid)
+                if pid != 0:
+                    return
+                signal.alarm(int(GATE * 3))
+                try:
+                    line = (
+                        f"parent_held={holder is not None} parent_deferred={before} "
+                        f"holder={config._sink_holder} "
+                        f"deferred={_deferred_now()} "
+                    )
+
+                    @log_foundry.trace
+                    def child_span() -> None:
+                        log_foundry.info("in the child")
+
+                    child_span()
+                    log_foundry.shutdown(timeout=GATE)
+                    line += (
+                        f"state={_lifecycle._state.state.name} "
+                        f"delivered={'in the child' in installed.messages}"
+                    )
+                except BaseException as exc:
+                    line = f"!{type(exc).__name__}: {exc}"
+                os.write(write_fd, line.encode())
+                os._exit(0)
+
+        from log_foundry import config
+
+        displaced, installed = ForkOnClose(), ForkOnClose()
+        log_foundry.configure(service="fork-from-closer", sink=displaced)  # type: ignore[arg-type]
+
+        @log_foundry.trace
+        def span() -> None:
+            log_foundry.info("x")
+
+        span()
+        log_foundry.flush(timeout=GATE)
+        log_foundry.configure(sink=installed)  # type: ignore[arg-type]
+        if os.getpid() != parent:
+            os._exit(1)
+        os.close(write_fd)
+        if not forked:
+            return "never forked"
+        ready = select.select([read_fd], [], [], GATE * 3)[0]
+        line = os.read(read_fd, 512).decode() if ready else "silent"
+        if not ready:
+            os.kill(forked[0], signal.SIGKILL)
+        os.waitpid(forked[0], 0)
+        return line
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == (
+        "parent_held=True parent_deferred=1 holder=None deferred=0 state=CLOSED delivered=True"
+    ), child.output
+
+
+def test_a_child_forked_on_the_changing_thread_drops_its_published_change() -> None:
+    """FR-006: a fork on the changing thread, after the change is published, leaves no change.
+
+    The fork is made from the change's config write (``config._rebind``), which runs after the
+    change has published its operation and while it holds ``config._sink_lock``, and after a
+    ``log-foundry-`` thread's ``shutdown()`` has been deferred to it. So at the fork the forking
+    thread has a published change, the process has a deferred stop, and the holder is this thread.
+    In the child all three are gone, and a traced call then ``shutdown()`` leave it ``CLOSED``
+    with the span delivered to the sink the child's config names.
+    """
+
+    def work() -> str:
+        read_fd, write_fd = os.pipe()
+        parent = os.getpid()
+        forked: list[int] = []
+
+        class Recording:
+            def __init__(self) -> None:
+                self.messages: list[object] = []
+
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                self.messages.extend(event.get("message") for event in batch)
+
+            def close(self) -> None:
+                return None
+
+        from log_foundry import config
+
+        old, new = Recording(), Recording()
+        log_foundry.configure(service="fork-from-rebind", sink=old)  # type: ignore[arg-type]
+        log_foundry.info("owed")
+        real_rebind = config._rebind
+
+        def rebind_then_fork(**changed: object) -> None:
+            real_rebind(**changed)
+            if forked or changed.get("sink") is not new:
+                return
+            deferring = threading.Thread(
+                target=lambda: log_foundry.shutdown(timeout=1.0), name="log-foundry-test"
+            )
+            deferring.start()
+            deferring.join(GATE)
+            premise = (
+                f"parent_published={_lifecycle._state._calls_here.published is not None} "
+                f"parent_deferred={_deferred_now()} "
+                f"parent_holder={config._sink_holder is not None} "
+            )
+            gc.collect()
+            pid = os.fork()
+            forked.append(pid)
+            if pid != 0:
+                return
+            signal.alarm(int(GATE * 3))
+            try:
+                line = premise + (
+                    f"published={_lifecycle._state._calls_here.published} "
+                    f"deferred={_deferred_now()} "
+                    f"holder={config._sink_holder} "
+                )
+
+                @log_foundry.trace
+                def child_span() -> None:
+                    log_foundry.info("in the child")
+
+                child_span()
+                log_foundry.shutdown(timeout=GATE)
+                line += (
+                    f"state={_lifecycle._state.state.name} "
+                    f"delivered={'in the child' in new.messages}"
+                )
+            except BaseException as exc:
+                line = f"!{type(exc).__name__}: {exc}"
+            os.write(write_fd, line.encode())
+            os._exit(0)
+
+        config._rebind = rebind_then_fork  # type: ignore[assignment]
+        try:
+            log_foundry.configure(sink=new)  # type: ignore[arg-type]
+        finally:
+            config._rebind = real_rebind  # type: ignore[assignment]
+        if os.getpid() != parent:
+            os._exit(1)
+        os.close(write_fd)
+        if not forked:
+            return "never forked"
+        ready = select.select([read_fd], [], [], GATE * 3)[0]
+        line = os.read(read_fd, 512).decode() if ready else "silent"
+        if not ready:
+            os.kill(forked[0], signal.SIGKILL)
+        os.waitpid(forked[0], 0)
+        return line
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == (
+        "parent_published=True parent_deferred=1 parent_holder=True "
+        "published=None deferred=0 holder=None state=CLOSED delivered=True"
+    ), child.output
