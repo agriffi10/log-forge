@@ -647,9 +647,11 @@ def test_each_hold_site_survives_nested_calls_from_a_collector_callback(enter, m
     """FR-001 (added 2026-11-17): at each hold site, on a thread other than the drain's.
 
     A collector callback runs inside the hold and makes a ``flush()``, a ``continue_trace()`` and
-    a traced call. Each returns: the ``flush()`` reports ``"abandoned"``, the ``continue_trace()``
-    is refused, and the traced call's close is deferred to the holder, so every event still
-    reaches the sink exactly once.
+    a traced call. Each returns: the ``flush()`` is refused at once with ``"re-entrant"``, the
+    ``continue_trace()`` is refused, and the traced call's close is deferred to the holder, so
+    every event still reaches the sink exactly once. The ``flush()`` reported ``"abandoned"`` until
+    SPEC-097 FR-004, by Andrew's answer of 2026-11-18: a ``flush()`` made inside any library lock
+    section, the sweep hold included, is refused rather than run.
     """
     sink = Recorder()
     worker = _quiet(sink)
@@ -682,7 +684,7 @@ def test_each_hold_site_survives_nested_calls_from_a_collector_callback(enter, m
         gc.callbacks.remove(callback)
     assert not runner.is_alive(), "a nested call waited on the hold its own thread held"
     assert "flush" in nested, "the collector never ran inside the hold"
-    assert nested["flush"].reason == "abandoned", nested  # type: ignore[attr-defined]
+    assert nested["flush"].reason == "re-entrant", nested  # type: ignore[attr-defined]
     assert nested["continue"].reason == "rejected", nested  # type: ignore[attr-defined]
     lf.flush(BOUND)
     assert sink.messages("nested") == ["span.start", "nested", "span.end"], sink.messages("nested")
@@ -991,10 +993,15 @@ def test_the_exit_drain_sweep_is_not_counted_after_shutdown(capfd) -> None:
 def test_the_drain_does_not_wait_on_a_thread_whose_hold_waits_on_the_drain(monkeypatch) -> None:
     """FR-002 (added 2026-11-17): the drain's wait for the hold is bounded.
 
-    A thread holding the hold calls ``flush(5.0)`` once the drain has tried its sweep. Its own
-    sweep takes nothing, so it reports ``"abandoned"``; the drain skips the sweep and answers its
-    marker, so it returns at once. With the drain's wait unbounded it returned only at its 5 s
+    A thread holding the hold waits on the drain once the drain has tried its sweep: it asks the
+    worker for a marker, ``Worker.flush(5.0)``. The drain skips the sweep and answers the marker,
+    so the wait returns at once. With the drain's wait unbounded it returned only at its 5 s
     deadline, since the drain waited on the holder that waited on the drain.
+
+    The public ``flush()`` made there is refused at once with ``"re-entrant"`` since SPEC-097
+    FR-004 (Andrew, 2026-11-18): the thread is inside a library lock section. Until then it swept
+    nothing and reported ``"abandoned"``, waiting on the drain's marker as this test now does by
+    hand, which is what keeps the drain's bound tested.
     """
     sink = Recorder()
     worker = _built(sink)
@@ -1013,16 +1020,18 @@ def test_the_drain_does_not_wait_on_a_thread_whose_hold_waits_on_the_drain(monke
                     outcome["tried"] = False
                     return
                 time.sleep(0.005)
+            outcome["public"] = lf.flush(5.0)
             began = time.monotonic()
-            outcome["result"] = lf.flush(5.0)
+            outcome["result"] = worker.flush(5.0)
             outcome["elapsed"] = time.monotonic() - began
 
     thread = threading.Thread(daemon=True, target=holder)
     thread.start()
     thread.join(BOUND + 6)
     assert outcome.get("tried", True), "the drain never tried to take the hold"
-    assert outcome["result"].reason == "abandoned", outcome  # type: ignore[attr-defined]
-    assert outcome["elapsed"] < 1.0, f"the holder's flush waited on the drain: {outcome}"
+    assert outcome["public"].reason == "re-entrant", outcome  # type: ignore[attr-defined]
+    assert outcome["result"], outcome
+    assert outcome["elapsed"] < 1.0, f"the holder's wait on the drain was not answered: {outcome}"
 
 
 # ----------------------------------------------------------------------------- FR-003
@@ -1795,9 +1804,13 @@ def test_a_sweep_gives_up_on_a_queue_mutex_another_thread_holds(monkeypatch) -> 
 def test_a_skipped_sweep_does_not_slow_the_drain_behind_a_backlog() -> None:
     """Diff review frame 2, MAJOR 2: a sweep skipped for a held hold is retried an interval later.
 
-    A thread holds the hold and calls ``flush()`` with 100 submissions queued ahead of its marker.
-    Retrying the sweep on every pass made each pass wait out the sweep's bound, about twenty
-    submissions a second, so the call took seconds; retried once an interval, it returns at once.
+    A thread holds the hold and waits on the drain for a marker with 100 submissions queued ahead
+    of it. Retrying the sweep on every pass made each pass wait out the sweep's bound, about twenty
+    submissions a second, so the wait took seconds; retried once an interval, it returns at once.
+
+    The wait is ``Worker.flush``, the marker wait alone, since SPEC-097 FR-004 refuses the public
+    ``flush()`` made inside the hold at once with ``"re-entrant"`` (Andrew, 2026-11-18), which the
+    test also reads. The public call was what made the wait until then.
     """
     gate = GatedSink()
     worker = _built(gate)
@@ -1816,15 +1829,18 @@ def test_a_skipped_sweep_does_not_slow_the_drain_behind_a_backlog() -> None:
 
     def holder() -> None:
         with decorator._sweep_hold:
+            outcome["public"] = lf.flush(10.0)
             gate.gate.set()
             began = time.monotonic()
-            outcome["result"] = lf.flush(10.0)
+            outcome["result"] = worker.flush(10.0)
             outcome["elapsed"] = time.monotonic() - began
 
     thread = threading.Thread(daemon=True, target=holder)
     thread.start()
     thread.join(BOUND + 5)
-    assert "elapsed" in outcome, "the in-hold flush never returned"
+    assert "elapsed" in outcome, "the in-hold wait never returned"
+    assert outcome["public"].reason == "re-entrant", outcome  # type: ignore[attr-defined]
+    assert outcome["result"], outcome
     assert outcome["elapsed"] < 1.0, f"the drain was slowed behind the held hold: {outcome}"
 
 

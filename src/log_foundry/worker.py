@@ -281,7 +281,14 @@ class _CountingQueue(queue.Queue[object]):
     """
 
     def __init__(self, maxsize: int = 0) -> None:
-        """Builds the queue with nothing taken in.
+        """Builds the queue with nothing taken in, its mutex an ``RLock`` (SPEC-097 FR-004).
+
+        ``queue.Queue`` builds a plain ``Lock`` as its mutex and three ``Condition``s on it. The
+        mutex is replaced by an ``RLock`` and the conditions rebuilt on it, before any thread can
+        see the queue, so a lifecycle call can read whether its own thread is inside the queue's
+        section (``_lifecycle.in_section``) and be held there, rather than wait on that thread for
+        good, which a signal handler interrupting a ``put`` did. ``Condition.wait`` on an ``RLock``
+        releases it fully and restores the recursion level, so the waits behave as before.
 
         Args:
           maxsize: The bound, as ``queue.Queue`` takes it.
@@ -294,6 +301,10 @@ class _CountingQueue(queue.Queue[object]):
         """
         self.entered = 0
         super().__init__(maxsize)
+        self.mutex = threading.RLock()  # type: ignore[assignment]
+        self.not_empty = threading.Condition(self.mutex)
+        self.not_full = threading.Condition(self.mutex)
+        self.all_tasks_done = threading.Condition(self.mutex)
 
     def _put(self, item: object) -> None:
         """Counts a submission's events, then queues it.
@@ -918,7 +929,7 @@ class Worker:
         self._handed_at_build = _ledger.handed_unlocked()
         self._taken_markers: list[_FlushMarker] = []
         self._held: list[Sink] = [sink]
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._pending_events = 0
         self._target = 0.0
         self._target_generation = 0

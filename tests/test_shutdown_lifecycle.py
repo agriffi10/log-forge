@@ -533,23 +533,21 @@ def test_an_adopted_swap_still_reports_true_when_its_drain_is_unconfirmed() -> N
 # --- found by independent review of this PR --------------------------------------------------
 
 
-def test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade() -> None:
-    """SPEC-054 FR-002 retires the closed-sink latch, and this is the one place it cost a close.
+def test_a_declined_swap_does_not_re_arm_a_sink_a_stop_closed_so_the_trade_is_reversed() -> None:
+    """SPEC-097 FR-001 reverses SPEC-054's trade: a declined swap no longer re-arms a closed sink.
 
-    ~~The re-arm guard `_note_orphan_emit` carries, which `_adopt_declined_swap` first
-    omitted.~~ — struck (SPEC-021). The scenario is unchanged and all three actors are ordinary:
-    an orphan log arms the sink while a `configure()` is inside the swap's first `flush()`, a
-    `shutdown()` closes it, and the declining swap then arms it again.
+    ~~The redundant close was the accepted trade.~~ — reversed by SPEC-097, by Andrew's answer of
+    2026-11-16. The scenario is SPEC-054's: an orphan log arms B while a ``configure()`` is inside
+    the swap's first ``flush()``, and a ``shutdown()`` closes B before the swap decides. The swap
+    then declines, and SPEC-054 armed B again, so the next take closed it a second time with
+    nothing written between. Now the change is published before its config write, the
+    ``shutdown()``'s take of B marks it withheld, and a declined swap that is withheld does not
+    arm B: B is closed once.
 
-    The latch refused that second arming. It is gone, so B is closed twice — and unlike the other
-    two counts SPEC-054 raised, **nothing was written between the two closes**. It is the case
-    FR-002 enumerates rather than a write-epoch double: *a live target is closed at exit whether
-    or not anything was written since it was installed*, which is the worker path's rule.
-
-    Not arming on a decline was tried, and it costs SPEC-035 FR-003's guarantee that a declined
-    sink is owned by somebody — three tests in this file hold it. So the redundant close is the
-    accepted trade, and `sinks/base.py` asks an implementation for an idempotent `close()` for
-    exactly this.
+    The ``shutdown()`` runs on another thread, joined from inside the flush, so it is a
+    concurrent stop rather than one made on the changing thread, which FR-002 defers to the
+    change's end instead. It waits for the published change to decide within its closer grace,
+    which its one-second timeout bounds, then takes what is owed.
     """
     old = CountingSink("A")
     log_foundry.configure(service="t", sink=old)
@@ -559,6 +557,8 @@ def test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade() -
 
     new = CountingSink("B")
     real_flush = worker.flush
+    real_retarget = worker.retarget
+    verdicts: list[str] = []
 
     def flush_then_arm_and_shut_down(timeout=None):
         result = real_flush(timeout)
@@ -567,16 +567,29 @@ def test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade() -
         assert _lifecycle._state._closes.owed.get(id(new)) is new, (
             "the orphan log must have armed B"
         )
-        log_foundry.shutdown(timeout=30.0)  # closes B and records it closed
+        racer = threading.Thread(target=log_foundry.shutdown, kwargs={"timeout": 1.0})
+        racer.start()
+        racer.join(30.0)
+        assert not racer.is_alive(), "the racing shutdown did not return"
         return result
 
+    def recording_retarget(new_sink, deadline=None):
+        outcome = real_retarget(new_sink, deadline)
+        verdicts.append(outcome.verdict)
+        return outcome
+
     worker.flush = flush_then_arm_and_shut_down
-    log_foundry.configure(service="t", sink=new)  # declines, then must not re-arm B
+    worker.retarget = recording_retarget
+    try:
+        log_foundry.configure(service="t", sink=new)
+    finally:
+        del worker.retarget
 
     _lifecycle._close_owed()
-    assert new.closed == 2, (
-        f"B was closed {new.closed} times: once by the racing shutdown, once as the live target "
-        "the swap installed — the trade this test's docstring records"
+    assert verdicts == ["declined"], f"the premise: the swap declines, read {verdicts}"
+    assert new.closed == 1, (
+        f"B was closed {new.closed} times: the racing shutdown closed it, and a declined swap the "
+        "stop overtook must not arm it again"
     )
 
 

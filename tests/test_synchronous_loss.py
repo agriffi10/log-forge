@@ -166,10 +166,12 @@ def test_the_counter_lock_is_dedicated_and_not_the_worker_lock() -> None:
     """AC-5. SPEC-028's rule: a counter takes its own lock.
 
     `_worker_lock` is held across `Worker(_ensure_sink())` in `_get_worker`, a blocking build a
-    counter increment on an arbitrary application thread must never queue behind.
+    counter increment on an arbitrary application thread must never queue behind. Since SPEC-097
+    FR-004 it is an ``RLock``, so a lifecycle call can read whether its own thread is inside it;
+    it is still its own lock, never the state lock.
     """
     assert decorator._loss_lock is not _lifecycle._state._lock
-    assert isinstance(decorator._loss_lock, type(threading.Lock()))
+    assert isinstance(decorator._loss_lock, type(threading.RLock()))
 
 
 @pytest.mark.ledger_exempt("calls _note_orphan_loss directly")

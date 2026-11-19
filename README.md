@@ -1541,6 +1541,46 @@ docstring states its own worst case.
 explicitly when you need to be certain the tail reached the sink before a fast exit, e.g. at the
 end of a short script. It is idempotent.
 
+**A call made from inside the library never waits on the call it is inside.** A sink's own code,
+and a signal handler or finalizer that interrupts the library, can call `flush()`, `shutdown()` or
+`configure()` while the library is in the middle of something those calls would wait for:
+
+- **A `flush()` made on the background drain thread**, from a sink's `emit` or a `sink_factory`
+  the worker built, returns at once, falsy, with `reason == "re-entrant"`. The drain it would wait
+  for is the thread it is running on.
+- **A `shutdown()` made from a sink's own code while a `shutdown()` is running**, from the sink's
+  `close()` for instance, returns at once: the shutdown already running is its effect.
+- **A `shutdown()` made from a sink's own code while `configure(sink=...)` is changing the sink**,
+  from its stop-signal setter or its `emit` on the drain thread, returns at once, and the shutdown
+  runs when that `configure()` finishes, before it returns, within its swap budget. A close that
+  shutdown starts and that outlives the budget goes on in the background, counted in
+  `health().closing_sinks`, and the next `shutdown()`, or the exit, waits for it for a short
+  grace carved from its own timeout. So a sink that calls `shutdown()` there and then waits for
+  its own backoff to be cut short waits until the change is over. A `configure()` that gave up
+  waiting for another sink change and runs alongside it, as its `pending` line says, takes no
+  shutdown: one from its stop-signal setter runs there and then, and one from the drain thread
+  runs when the other change finishes. If a `KeyboardInterrupt` or `SystemExit` cuts that
+  `configure()` short, the shutdown still runs as the change unwinds, before the exception reaches
+  you. Only an interrupt landing in the library's last step of the change, where it ends it, drops
+  the shutdown, and then it is never left for a later call: the next `shutdown()`, or the exit,
+  runs as it would have.
+- **A signal handler or a finalizer** runs wherever it interrupts the thread, which can be inside
+  one of the library's locks. A `shutdown()` or `configure()` made there returns at once and runs
+  when the interrupted library call returns, before any later `shutdown()`; a `flush()` made there
+  returns `"re-entrant"`. A `configure(sink=...)` held during a `shutdown()` runs once that
+  shutdown is over, as a `configure()` made after `shutdown()` does — or sooner, at the end of a
+  library call your sink's own code makes on that thread while the shutdown runs, such as a
+  `close()` that logs.
+
+That last case matters for a `SIGTERM` handler. One that calls `shutdown()` and then `os._exit()`
+drains nothing when the signal landed inside the library, because it exits before the held
+shutdown runs. Have the handler raise `SystemExit` instead, as `sys.exit()` does: the interrupted
+call unwinds, running the held shutdown as it goes, and the exit drain runs after it. That holds
+in a process's very first log or traced call too, before the library has set up its exit drain:
+the held shutdown still runs as the call unwinds, and since nothing has been written to the sink
+yet, nothing is owed a close. A held call that fails while the call unwinds is reported on
+stderr and never replaces the `SystemExit`.
+
 `flush(timeout=5.0)` returns a **`FlushResult`**, truthy when **the drain that carried your
 events finished and abandoned no batch while the call was outstanding** — the drain it forces
 ran, and so did anything else the worker emitted while it waited its turn. A truthy result is not
@@ -1574,6 +1614,7 @@ Falsy carries a `reason` saying which of these happened, because they need diffe
 | `"queue-full"` | Backpressure — the queue could not even accept the marker. |
 | `"abandoned"` | The drain that would have carried those events did not confirm delivery of them. A broken destination is one cause, but not the only one — an expiring bounded `shutdown()` answers waiting calls pessimistically, and the drain may still deliver afterwards. So this is not by itself evidence that anything was lost: `health()` is what says whether it was. |
 | `"sink-flush"` | The drain finished, but the sink's own `flush()` raised — a client-side buffer that did not go out. Distinct from `"abandoned"`: the drain ran to its end, and what it lost is in the result's counts, which cover only the terms the ledger counts; the client buffer is past them. |
+| `"re-entrant"` | The call was made where it would wait on itself — on the background drain thread, from a sink's `emit` or a `sink_factory` the worker built, or from a signal handler or finalizer that interrupted the library inside one of its locks — so it returned at once having done nothing, and its counts are zero. Call `flush()` from your own code instead. |
 
 ```python
 result = lf.flush(5.0)

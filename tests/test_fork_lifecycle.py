@@ -2570,15 +2570,79 @@ def test_no_module_builds_a_primitive_the_walk_cannot_repair(path: pathlib.Path)
     detected and refused rather than quietly walked past, which is what the docstring above can
     honestly claim to pick up from a later spec.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    found = [
-        f"line {call.lineno}: {ast.unparse(call)}"
-        for call in _primitive_constructions(tree, _UNREPAIRABLE)
-    ]
+    found = _unrepairable(path.name, path.read_text(encoding="utf-8"), _REPLACED_WHOLE)
     assert not found, (
         "the fork walk has no replacement for these, so a child would inherit them dead — "
         "teach `_fresh_primitive` about the type, or use one it knows:\n  " + "\n  ".join(found)
     )
+
+
+_REPLACED_WHOLE: dict[tuple[str, str], str] = {
+    ("worker.py", "_CountingQueue.__init__"): (
+        "the worker queue's three conditions, rebuilt on its RLock mutex (SPEC-097 FR-004). The "
+        "walk never reaches them and needs not: a forked child replaces the whole queue, its "
+        "mutex and conditions with it, in Worker._reinit_after_fork "
+        "(_lifecycle._rebuild_worker_after_fork), as it did for the ones queue.Queue built"
+    ),
+}
+"""Scopes whose unrepairable primitives a child handler replaces with their object, and why."""
+
+
+def _unrepairable(name: str, source: str, exempt: dict[tuple[str, str], str]) -> list[str]:
+    """Every unrepairable primitive built in a module, outside a scope replaced whole.
+
+    Args:
+      name: The module's file name, as the exemptions key it.
+      source: Its source.
+      exempt: ``(file name, Class.method or function) -> reason``.
+
+    Returns:
+      ``line N: <construction>`` per finding.
+    """
+    tree = ast.parse(source)
+    scopes: dict[int, str] = {}
+    for outer in ast.walk(tree):
+        if isinstance(outer, ast.ClassDef):
+            for member in outer.body:
+                if isinstance(member, ast.FunctionDef):
+                    for node in ast.walk(member):
+                        scopes[id(node)] = f"{outer.name}.{member.name}"
+    return [
+        f"line {call.lineno}: {ast.unparse(call)}"
+        for call in _primitive_constructions(tree, _UNREPAIRABLE)
+        if (name, scopes.get(id(call), "")) not in exempt
+    ]
+
+
+_QUEUE_CLASS = (
+    "import threading\n"
+    "class {cls}:\n"
+    "    def __init__(self):\n"
+    "        self.mutex = threading.RLock()\n"
+    "        self.not_empty = threading.Condition(self.mutex)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "cls", "refused"),
+    [
+        ("worker.py", "_CountingQueue", False),
+        ("worker.py", "Other", True),
+        ("x.py", "_CountingQueue", True),
+    ],
+    ids=["the-replaced-queue-is-exempt", "another-class-is-refused", "another-file-is-refused"],
+)
+def test_only_the_queue_a_child_replaces_whole_may_build_a_condition(
+    name: str, cls: str, refused: bool
+) -> None:
+    """SPEC-097 plan review M1: the exemption is one scope in one file, and its neighbours fail.
+
+    The worker queue's conditions are exempt because a child replaces that object whole; the same
+    construction in another class, or in the same class name in another file, is refused for the
+    rule's own reason.
+    """
+    found = _unrepairable(name, _QUEUE_CLASS.format(cls=cls), _REPLACED_WHOLE)
+    assert found == (["line 5: threading.Condition(self.mutex)"] if refused else [])
 
 
 def test_the_fork_module_stores_no_primitive() -> None:

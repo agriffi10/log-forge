@@ -14,6 +14,7 @@ import pathlib
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -775,6 +776,8 @@ def test_the_atexit_path_forwards_a_bounded_timeout(monkeypatch) -> None:
 
     class SpyWorker:
         _epoch = 0  # the count at its build, which the stored state's move reads (SPEC-078)
+        _lock = threading.RLock()  # the two locks SPEC-097's ownership oracle reads
+        _queue = types.SimpleNamespace(mutex=threading.RLock())
 
         def claim_stop(self, deadline: float | None) -> bool:
             return True

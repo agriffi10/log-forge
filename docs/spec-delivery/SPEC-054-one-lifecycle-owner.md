@@ -48,6 +48,9 @@ are unchanged):
   genuine redundancy and the accepted trade: a swap the worker *declined* arms the new sink anyway,
   because SPEC-035 FR-003 guarantees a declined sink is owned by somebody. Not arming it was built
   and measured costing that guarantee outright.
+  > **Superseded in part by SPEC-097**: a declined swap no longer arms a sink a stop's take closed
+  > since the change's config write, so that redundant close is gone; it otherwise still arms. The
+  > decision lives in `docs/decisions/pipeline/one-lifecycle-owner-the-bookkeeping-around-the-two-emit-paths-exists-once.md`.
 - **A worker's build releases nothing.** It armed its sink and released, detached, any other owed
   sink (SPEC-044 FR-002); those now stay owed until the `configure()` that supersedes them, or exit.
 - **A worker-path `shutdown()` no longer pays the grace for an orphan close** it never touched

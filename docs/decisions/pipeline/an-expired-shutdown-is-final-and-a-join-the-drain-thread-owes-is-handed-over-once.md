@@ -52,11 +52,20 @@ still run there, as for any caller.
   budget waiting in silence — a 30.12 s exit with no line and no close.
 - **A later caller extending the recorded deadline.** SPEC-062's race, above.
 
-What stays out: `flush()` and `configure(sink=…)` made on the drain thread, which still wait on
-themselves and need their own decision (`architecture.md` §12), and the after-shutdown submission
-line, which still announces a loss the final drain can deliver (§12).
+What stays out: ~~`flush()` and `configure(sink=…)` made on the drain thread, which still wait on
+themselves and need their own decision (`architecture.md` §12)~~ — superseded by SPEC-097 FR-003:
+a `flush()` made on the live worker's drain thread returns at once with the reason `"re-entrant"`,
+and a `configure(sink=…)` made there already returned at once by `a0f44b5f` (§12, *Resolved*);
+and the after-shutdown submission line, which still announces a loss the final drain can deliver
+(§12).
 
 ## History
+
+### 2026-11-18
+
+- **Marked by SPEC-097**: the drain-thread `flush()` and `configure(sink=…)` no longer stay out as
+  calls that wait on themselves; the first is refused with `"re-entrant"`, and the second already
+  returned at once. Struck in place; nothing else here changes.
 
 ### 2026-11-16
 

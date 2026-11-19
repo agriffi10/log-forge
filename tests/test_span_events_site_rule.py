@@ -276,8 +276,8 @@ def test_a_clear_added_to_api_log_is_named() -> None:
     """FR-001 AC-3's own case: ``span.events.clear()`` in ``api._log`` fails naming the site."""
     sources = _with(
         "api.py",
-        "            span.events.append(event)\n",
-        "            span.events.append(event)\n            span.events.clear()\n",
+        "                span.events.append(event)\n",
+        "                span.events.append(event)\n                span.events.clear()\n",
     )
     assert check_sites(sources) == [Finding(SITE, "api.py:_log")]
 

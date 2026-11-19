@@ -356,7 +356,12 @@ def test_the_terms_are_read_under_the_queues_mutex(monkeypatch) -> None:
 
 
 class _PausingWaiters(collections.deque):  # type: ignore[type-arg]
-    """A condition's waiter deque whose truth, asked once by one thread off the mutex, pauses."""
+    """A condition's waiter deque whose truth, asked once by one thread off the mutex, pauses.
+
+    The reader asks whether it holds the queue's mutex through ``_is_owned``: since SPEC-097 the
+    mutex is an ``RLock``, which has no ``locked()`` before Python 3.14, and the question was
+    always the reader's own hold.
+    """
 
     def __init__(self, items, mutex, asked, go) -> None:  # type: ignore[no-untyped-def]
         super().__init__(items)
@@ -367,7 +372,7 @@ class _PausingWaiters(collections.deque):  # type: ignore[type-arg]
         answer = len(self) > 0
         if threading.current_thread() is self.reader and not self.asked.is_set():
             self.asked.set()
-            if not self.mutex.locked():
+            if not self.mutex._is_owned():
                 self.go.wait(5)
         return answer
 

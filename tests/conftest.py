@@ -461,12 +461,51 @@ def _reset_config():
     _reset_worker()
     yield
     left = _left_spans()
+    commands = _left_commands()
     # Tear down any process worker a test created so its daemon thread / sink don't leak.
     _reset_worker()
     context.reset_context()
     config._config = config.Config()
     if left is not None:
         pytest.fail(left, pytrace=False)
+    if commands is not None:
+        pytest.fail(commands, pytrace=False)
+
+
+def _left_commands() -> str | None:
+    """Names a held call or a deferred stop a test left behind (SPEC-097), or returns ``None``.
+
+    A ``shutdown()`` or ``configure()`` made while the test's thread held a library lock is held
+    until that thread's next public call ends, and a ``shutdown()`` deferred to a sink change runs
+    when that change ends. One left over runs inside a LATER test's first public call: a stale
+    ``shutdown()`` there retires that test's process mid-way, which fails it far from the cause.
+    The reset below clears them, so isolation holds either way, and this names the test that left
+    one, so the cause is fixed rather than masked.
+
+    It also checks the deferral invariant (FR-002): stops are deferred only to the change
+    registered as their taker, on that change's operation, and no change outlives its test, so
+    neither a taker nor ``config._sink_holder`` is left set. A taker whose change has unwound is
+    inert by construction (``_lifecycle._live_taker``), but none is expected in-process: the
+    interrupt corpus (``tests/test_change_interrupts.py``) runs in children. A holder left set
+    makes every later shutdown on that thread read a change in flight.
+    """
+    from log_foundry import _lifecycle, config
+
+    held = _lifecycle._state._calls_here.waiting or []
+    taker = _lifecycle._state._deferred_taker
+    deferred = [] if taker is None else list(taker.deferred)
+    holder = config._sink_holder
+    problems = []
+    if held or deferred:
+        problems.append(
+            f"left {len(held)} held lifecycle call(s) on its thread and {len(deferred)} stop(s) "
+            "deferred to a sink change: a later test's first public call would run them"
+        )
+    if taker is not None:
+        problems.append("left a sink change registered as the taker of deferred stops")
+    if holder is not None:
+        problems.append(f"left config._sink_holder set to thread {holder}")
+    return "the test " + "; ".join(problems) if problems else None
 
 
 def _left_spans() -> str | None:
@@ -645,6 +684,11 @@ def _reset_worker() -> None:
     _lifecycle._state._building_here = threading.local()
     _lifecycle._state._releasing_here = threading.local()
     _lifecycle._state._offering_here = threading.local()
+    _lifecycle._state._calls_here = _lifecycle._CallsHere()
+    _lifecycle._state._deferred_taker = None
+    from log_foundry import config as config_module
+
+    config_module._sink_holder = None
     _lifecycle._state._stale_signals = []
     _lifecycle._state._fork_offers = []
     _lifecycle._state._fork_inherited = 0
@@ -1017,6 +1061,10 @@ def pytest_configure(config) -> None:
     reads as a handful of errors among passes, which is the mistyped soak reporting green that
     the strict parse exists to prevent. A usage error here stops the session before any test,
     under ``-n 0`` and ``-n 12`` alike. The parsers are ``model_oracles``', so the rule has one home.
+
+    With ``LOG_FOUNDRY_REENTRY_RECORD`` set it also installs SPEC-097 FR-005's re-entry recording
+    locks (``tests/_reentry.py``), in the controller and in every xdist worker, which each run
+    this hook; a run without the variable never imports that module.
     """
     del config
     import os
@@ -1028,3 +1076,7 @@ def pytest_configure(config) -> None:
         soak_from(os.environ)
     except ValueError as exc:
         raise pytest.UsageError(str(exc)) from exc
+    if os.environ.get("LOG_FOUNDRY_REENTRY_RECORD"):
+        import _reentry
+
+        _reentry.install()

@@ -361,6 +361,10 @@ class TrackingLock:
         """Whether some thread holds it."""
         return self._real.locked()
 
+    def _is_owned(self) -> bool:
+        """Whether this thread holds it: the ownership read SPEC-097's oracle makes of an RLock."""
+        return self.owner == threading.get_ident()
+
     def __enter__(self) -> bool:
         return self.acquire()
 
@@ -427,16 +431,21 @@ def test_a_failing_repin_is_absorbed_once_and_never_replaces_a_close_error(
 
 
 def test_a_demoted_sinks_last_reference_drops_outside_every_lock() -> None:
-    """AC-10. The demoted list outlives every section, so a finalizer meets no library lock."""
+    """AC-10. The demoted list outlives every section, so a finalizer meets no library lock.
+
+    Each lock is read as held by the finalizing thread, ``_is_owned``: since SPEC-097 the three
+    are ``RLock``s, which have no ``locked()`` before Python 3.14, and the thread a finalizer runs
+    on is the one whose held lock it would wait on.
+    """
     observed: list[tuple[bool, bool, bool, bool]] = []
 
     class Finalized(RecordingSink):
         def __del__(self) -> None:
             observed.append(
                 (
-                    _lifecycle._state._lock.locked(),
-                    config._config_lock.locked(),
-                    _lifecycle._state._closes._lock.locked(),
+                    _lifecycle._state._lock._is_owned(),  # type: ignore[attr-defined]
+                    config._config_lock._is_owned(),  # type: ignore[attr-defined]
+                    _lifecycle._state._closes._lock._is_owned(),  # type: ignore[attr-defined]
                     _lifecycle._state._owned_lock._is_owned(),  # type: ignore[attr-defined]
                 )
             )

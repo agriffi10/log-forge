@@ -1115,8 +1115,8 @@ close it.
   the docstring and the README are brought into agreement, and the pin gains a shipped sink that
   refuses after `close()`.
 - **A sink the library wrote to and never closes, behind a wrapper that leaves its member alone**
-  (invariant 5; no spec yet; SPEC-087 FR-004's fourth shape, held open here as well as stated in
-  §13). A kept sink is closed by the graph that holds it, and for a caller's wrapper that is the
+  (invariant 5; ~~no spec yet~~ SPEC-101, a Draft later in this arc; SPEC-087 FR-004's fourth
+  shape, held open here as well as stated in §13). A kept sink is closed by the graph that holds it, and for a caller's wrapper that is the
   wrapper's own `close()`. A wrapper `Leaves(A)` whose `close()` does not close its member, as the
   holder on whose account the library does not close A, leaves A closed by nobody. It is that
   holder when it is installed over a kept sink — `configure(A)` then `configure(Leaves(A))`, or
@@ -1161,7 +1161,8 @@ close it.
   a sink tolerates, and never two at once. That restructures `_close_owed`'s take and its fan-out,
   so it is not a further patch to the closer. It was first assigned to this arc's lifecycle
   command-path spec; on 2026-11-16 Andrew placed it in a spec of its own, written later in this
-  arc, which SPEC-097, the command-path spec, records as Out of Scope.
+  arc, which SPEC-097, the command-path spec, records as Out of Scope and leaves open: that spec
+  is SPEC-101.
 - **A kept sink a straddling orphan log put back in the record can be handed a stop signal on its
   own** (SPEC-087 FR-004's fifth shape; read from the code and not reproduced). A log with no span
   reads the configured sink and arms it a moment later (`api.py`, `_ensure_sink()` then
@@ -1344,15 +1345,7 @@ close it.
   `_emit` if it fails. `Worker.submit`'s docstring already calls the line over-strong.
   **Closed by** writing that `lost` line only once the final drain has taken the last entry its
   bound admits, or the drain thread is dead.
-- **`flush()` called on the drain thread waits on itself** (SPEC-068 spec review; invariant 3;
-  corrected in place by SPEC-085). A sink's `emit` that calls `flush()` waits on the thread it
-  runs on: measured at `a0f44b5f`, `flush(timeout=2.0)` takes 2.00 s, `flush(timeout=None)` does
-  not return, and a later `shutdown(timeout=5.0)` expires. ~~`configure(sink=…)` called there
-  waits on itself too: a 5.007 s stranded swap.~~ At `a0f44b5f` a `configure(sink=…)` made from
-  `emit` on the drain thread returns in 0.00 s with two announced lines. SPEC-068 FR-006 closed
-  this shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain
-  thread, which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034)~~, and a
-  swap that does not wait on the thread it runs on~~.
+- ~~**`flush()` called on the drain thread waits on itself**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
 - **A `flush()` made inside the event ledger's registration lock waits on a drain that waits on
   that lock, when the sink logs through the library** (SPEC-089's execution-frame review;
   invariant 3). A thread's first credit registers its ledger cell under the registration lock
@@ -1398,99 +1391,8 @@ close it.
   closes it. A `span` from the same place is closed by the same `shutdown()` (each closed once,
   entered at count 1). **Closed by** the shutdown's final pass taking what was armed during its own
   closes, as it does for a worker built there.
-- **A sink a swap installs is closed twice with nothing written between when an orphan log armed it
-  and a re-entrant `shutdown()` closed it before the swap decided** (SPEC-085; invariant 5).
-  Measured at `a0f44b5f`, 2 cells red: the installed sink has one write and closes entered at
-  counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
-  by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
-  the config named it (the item below says why the config write, not the swap's entry, and which
-  takes count). Its two pinned cells retarget a worker that then declines, which SPEC-054 records
-  as an accepted trade; the item below says what closing it reverses.
-- **A sink a swap installs is closed twice with nothing written between when a concurrent
-  `shutdown()` took it before the swap decided** (SPEC-086's soak; invariant 5). This is the item
-  above with the `shutdown()` on another thread instead of inside a sink's code.
-  `configure(sink=S)` writes S to the config before its swap decides (`config._change_sink` calls
-  `_rebind`, then `_swap_live_sink`). In that window an orphan log arms S and writes to it, and a
-  `shutdown()` takes S and closes it. The swap then arms S as the sink it installs, and a later
-  take closes S again at the same write count.
-
-  On the no-worker branch, the swap's config write precedes the shutdown's take of S, and its
-  swap's critical section follows the drain's last take (before it, the swap declines at entry). None of invariant 5's recorded exceptions
-  covers that window. `docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`
-  forces it:
-  - At `9d70f782`, 7 of 7 forced runs closed S at counts 1 and 1. Both controls closed S once in 7
-    of 7: one drops the first `shutdown()`, and the other drops the stale log that keeps the
-    swap from returning early.
-  - It closed S twice on 5 of 5 runs at each of `31dda162`, `624d817f` (#339), `a0f44b5f`
-    (v1.2.0), `5447d26a` and `6bd0b66e`. It is present at every tree measured, so it shipped in
-    1.2.0 and is not a regression. #339's serialized `configure()` does not reach it, because the
-    `shutdown()` does not take that lock.
-  - Unforced, it is the soak's `repeat@<n>` with nothing written between the first close's take
-    and the second close's take. The soak was run over its even seeds alternately at `5447d26a`
-    and `9d70f782`, at loads of 28 to 82. It found 1 such report in 9,000 runs at `5447d26a` and 3
-    in 9,000 at `9d70f782`. In each, the only arm between the two takes was the swap's arm of the
-    sink it installs, traced by caller. At `9d70f782` all 3 arms were on the no-worker branch. At
-    `5447d26a` the one arm, `emit-seed1238`, was after `Worker.retarget`. Of 14 more found at
-    higher load at `9d70f782`, 9 were on the no-worker branch and 5 were after `Worker.retarget`.
-    In every one, the first take was a `shutdown()`'s.
-  - The one other `repeat@<n>` at each commit is not counted here: `emit-seed1582` and
-    `deliver-seed600` each had a write after the first take. At `emit-seed1582` that write made no
-    arm because the swap's arm had already made the sink owed, so the soak's rule, which looks for
-    a writer's arm, reads a close the write owes as unowed. At `deliver-seed600` the writer armed
-    before the take, which is the race of the orphan-log item below. Whether its second close is
-    owed depends on how that item closes. The higher-load set had 4 more like `emit-seed1582`.
-  - SPEC-086's `deliver-seed962` has the same record. It is not #339's double close, as SPEC-086
-    and `check_unowed_repeat`'s docstring call such an arm, because the take ahead of the swap's
-    arm is a `shutdown()`'s, which #339's lock does not cover. The take after it is often a
-    later `configure()`'s stale take, as at `deliver-seed1366` and `http-seed1106`.
-
-  After `Worker.retarget` the same arm is reached only through two windows invariant 5 already
-  records: a `shutdown()` that gave up waiting for the swap's decision, and a swap that retargets a
-  worker built during the shutdown. There the recorded consequence is a sink left open; this is a
-  second consequence, a sink closed twice. It is unforced. Where the retarget declined, it is the
-  redundant close SPEC-054 accepted as a trade. That trade is recorded in
-  `docs/decisions/pipeline/one-lifecycle-owner-the-bookkeeping-around-the-two-emit-paths-exists-once.md`,
-  in SPEC-054 and its delivery doc, in `_swap_sink`'s docstring, and in
-  `tests/test_shutdown_lifecycle.py::test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade`.
-  Its text names a declined swap only, so the no-worker half of this item reverses no recorded
-  decision.
-
-  Three docstrings state as correct or complete what this item disproves:
-  - `_shutdown_worker`'s "the one not covered";
-  - `_swaps_to_await`'s claim that its snapshot holds every swap whose decision may still be ahead;
-  - `_swap_sink`'s no-worker paragraph, which arms the new sink after the drain's last take.
-
-  **Closed by** one of two routes:
-  - **The one lifecycle command path.**
-  - **The swap withholding its arm of the sink it installs** where a `shutdown()` or the exit drain
-    (a `_close_owed` take) has taken that sink since the config named it. This applies on the
-    no-worker branch, and on the branch after `Worker.retarget` only for a `declined` verdict.
-
-  The withhold has three bounds:
-  - **The take must be a `_close_owed` take, not any take.** Through an unserialized pair of
-    `configure()` calls, a second swap's stale loop can take S before the first swap's retarget
-    adopts it, and the worker then writes S. At `027b39a5`, S's closes were `[1, 2]`, which is
-    correct. A withhold keyed on any take left `[1]` with two writes: written after its last close
-    and owed by nobody. A third diff reviewer measured this, 3 of 3.
-  - **On `fenced` and `unfenced`, the swap's arm stays.** It is the only arm the worker's new sink
-    gets.
-  - **The mark is per sink change.** It is published lock-free before `_rebind`, as
-    `_swaps_running` is, because taking `_state._lock` there would add an acquisition to counts
-    that tests pin. One global slot is overwritten by an unserialized or re-entrant `configure()`.
-    It is cleared in `_change_sink`'s `finally`, or it holds a superseded sink strongly, which four
-    SPEC-081 tests in `tests/test_ownership_record.py` refuse. It needs a home in the lifecycle
-    inventory and the fork roster.
-
-  A withhold keyed on the config write was measured on both branches at `4cda14ba` and
-  `027b39a5`, and then removed:
-  - p11 closed S once in 3 of 3 runs.
-  - The whole suite failed only the trade test and the two `installed-closed-twice` pins of the
-    item above, which are `declined`, plus tests that inventory or bound the mutant's own scratch
-    globals. The SPEC-035 FR-003 tests stayed green, because the next orphan log re-arms S.
-  - A mark taken at the swap's entry instead left p11 at 3 of 3 double closes.
-
-  The no-worker half can land alone. The `declined` half reverses SPEC-054's recorded trade: it is
-  a rewrite of that decision file in place, and Andrew's call.
+- ~~**A sink a swap installs is closed twice with nothing written between when an orphan log armed it and a re-entrant `shutdown()` closed it before the swap decided**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
+- ~~**A sink a swap installs is closed twice with nothing written between when a concurrent `shutdown()` took it before the swap decided**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
 - **An orphan log that passed its owed check before a `shutdown()` took its sink writes after the
   close, and the sink is owed nothing** (SPEC-085; invariant 5). Measured at `a0f44b5f` by the
   reproduction in `tests/test_model_cells.py`: `writes=2`, one close entered and returned at count
@@ -1504,8 +1406,15 @@ close it.
   forced runs at `acf5196e`, the unparked control closing at count 2 on 7 of 7. Unforced, it is
   SPEC-086's soak failing the late-write rule at `519-http`, `1335-http` and `1695-http`, measured
   at `5447d26a` while that spec was authored. **Closed by** a mark around the orphan
-  path's delivery call that a closer waits for or that re-arms the sink once the call returns, or
-  by one lifecycle command path.
+  path's delivery call that a closer waits for or that re-arms the sink once the call returns~~, or
+  by one lifecycle command path~~. SPEC-097 built the command path and it does not close this: the
+  orphan path is not a command, and gating it as one would put a wait on the caller's thread for a
+  lifecycle call on another, which invariant 4's outside-a-span half and the ledger's fence
+  (*never add a lock to the accept path*) refuse. Re-arming the sink once the delivery returns was
+  prototyped for SPEC-097 and turned 34 cells red (`CloseBroken:repeat@1` on 26, `repeat@2` on 8),
+  because the re-arm cannot tell a write after the close from one before it, so what closes it is
+  a mark a closer's take consults, which is the inside-emit item's mark. The reproduction stays
+  red at its pin.
 
 - **`KinesisSink`'s limits predate Kinesis's 10 MiB records** (found while authoring SPEC-096,
   2026-11-16, from the live AWS pages and not measured against a stream; invariant 2's
@@ -1752,66 +1661,8 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (`docs/decisions/sink-lifecycle/`) and invariant 3's sentence that a shutdown cuts every backoff
   short. The alternative is to record it as a trade beside *A shutdown shortens a wait; it must
   never skip work*. It shares the exit drain with the dead-sink item above.
-- **`shutdown()` called from a signal handler deadlocks for good when the signal interrupts a
-  library lock section** (2026-11-14 audit, finding 3; invariants 1 and 3). `Runtime._lock` is a
-  plain `threading.Lock` (`_lifecycle.py:1018`) and `_shutdown_worker` takes it at `:5273`, so a
-  handler that runs on a thread already inside one of the library's lock sections waits on its own
-  thread. `docs/audits/2026-11-14-probes/lifecycle/p1a_signal_shutdown_injected.py` raises `SIGTERM`
-  at the first line inside `_flush_live_sink`'s section (`:5688`), patching no library code, and the
-  handler's `shutdown(timeout=2)` never returns. `lifecycle/p1b_run.py`, with a one-shot timer at a
-  random instant and nothing injected, hung 6, 19 and 40 of 200 fresh processes in its three loops
-  in the lifecycle frame's run; those loops spend nearly all their time inside lock sections, so the
-  rate is an upper bound for a real program, and the mechanism does not depend on the rate. The
-  frame found the handler blocked on `Runtime._lock`, the close registry's lock, `Worker._lock` and,
-  by inference, the queue's mutex. SPEC-088 adds the event ledger's registration lock, taken by a
-  thread's first credit, once per pass of every `health()` and `shutdown()` reading, and around
-  `shutdown()`'s once-per-count check, and never with a lifecycle lock held: a worker's build,
-  which runs under `Runtime._lock`, reads the hand-over count without it (`_ledger.handed_unlocked`,
-  SPEC-088's diff review), so the two are never nested in either order. It is an `RLock`,
-  so a handler or a `__del__` that logs or reads on the thread already inside it re-enters rather
-  than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`).
-  SPEC-089 adds `flush()`'s two window reads, taken on the caller's thread as `health()`'s is, so
-  a `flush()` started while another thread is inside the lock's section waits for it, and the
-  drain's reading when it answers a counted marker, which **only tries** the lock: a `flush()` or
-  `shutdown()` made inside the section waits on the drain, so a drain waiting on the lock waited
-  on its own waiter, and `flush(None)` from a collector callback never returned (SPEC-089's second
-  diff review). SPEC-091 adds `decorator._sweep_lock`, which the drain thread now takes every
-interval, and which every close and `flush()` takes. It is an `RLock` entered only through
-`_sweep_hold`, and every site first asks whether its own thread already holds it, so a handler
-that calls `flush()` or closes a span on a thread inside a sweep does not wait on its own thread:
-its sweep takes nothing and its close is deferred to the holder. The drain waits for it at most
-`worker._SWEEP_WAIT`, so a thread holding it that then waits on the drain is not waited on in
-turn, and a sweep takes the queue's mutex for at most the same bound and takes no other lock while
-it holds the hold (SPEC-091's diff review, frame 2), so a handler inside the queue's section on
-another thread that then takes the hold is not waited on either. A handler on a thread inside any of
-the other locks still waits, and a handler inside the queue's own section that closes a span waits
-on that section from its own thread: the close's submit takes the queue's mutex, a plain `Lock`.
-That last hang is the standard library's and predates SPEC-091: on the base `33a44e99` a traced
-close made while its thread holds the worker queue's mutex does not return either. One nesting remains, and it is
-  the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
-  `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
-  `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
-  while the registration lock is held (SPEC-088's second diff review). **The documents promise this caller, and the code breaks the
-  promise.** `docs/invariants.md`, in invariant 5's recorded exceptions, describes what a re-entrant
-  `shutdown()` made from "a signal handler" leaves behind, and
-  `docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md`
-  does the same at lines 71 and 111. Both treat the handler as a caller that returns, and neither
-  says the call can deadlock; §13 records only the finalizer form of this hazard. **Closed by**
-  lifecycle commands serialized through one owner, where a re-entrant caller is queued or refused
-  rather than taking a lock, which Andrew took on 2026-11-14, to be prototyped against the
-  adversarial model test before it is committed to; and by the emit path's queue mutex being covered
-  too; the item *One stable stop signal per sink changes a documented public protocol* names the
-  decisions that path meets. The spec that fixes it makes those two documents true; it does not
-  reword them to match the defect.
-- **`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close**
-  (2026-11-14 audit, finding 20; invariant 3, whose bound still holds).
-  `docs/audits/2026-11-14-probes/lifecycle/p3_reentry_from_close.py`: the nested call returned after
-  2.00 s, which is `DEFAULT_CLOSER_GRACE`, on the orphan path and the worker path and with
-  `timeout=None`, with nothing on stderr, while a `flush()`, a `configure()`, a log and a span made
-  from the same place returned at once. The wait is `_close_owed`'s bystander wait
-  (`_lifecycle.py:4915`, `:4967`) on the close the caller is itself inside. It is a sibling of the
-  drain-thread self-wait item above. **Closed by** the one lifecycle command path of the item above,
-  or by `_close_owed` not treating a close running on the calling thread as one to wait for.
+- ~~**`shutdown()` called from a signal handler deadlocks for good when the signal interrupts a library lock section**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
+- ~~**`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
 - **One stable stop signal per sink changes a documented public protocol, and with the one-owner
   command path it deletes mechanisms that settled decisions fence; neither is specified yet**
   (2026-11-14 audit, the lifecycle frame's structural changes 1 and 2; invariant 10). Andrew took
@@ -1835,6 +1686,118 @@ close made while its thread holds the worker queue's mutex does not return eithe
   break recorded as Andrew's accepted exception to invariant 10. The same spec derives the full list
   of decisions it rewrites by that search, over the mechanisms it deletes, and rewrites each in
   place, dated.
+
+  > SPEC-097 built the one-owner command path without deleting the mechanisms named here; their
+  > deletion is *The command path's deletion half*, below. The stable signal is SPEC-098's.
+- **The command path's deletion half** (SPEC-097, Out of Scope; invariant 5). SPEC-097 built the
+  lifecycle command path beside the mechanisms the 2026-11-14 audit's lifecycle frame expected it
+  to retire, `_await_swap_decisions`, `_take_declines`, `_shutdown_running`, `_late_worker`, and
+  `config._sink_lock` with `_sink_holder`, and deleted none of them: its prototype added the path
+  and did not delete them, so their deletion is unmeasured. SPEC-098 deletes the hand machinery,
+  which is a different set. **Closed by** a lifecycle spec of this arc written after the
+  child-rebuild spec, which deletes them against the adversarial cells and rewrites in place, and
+  dated, every decision that `grep -l "_await_swap_decisions\|_take_declines\|_shutdown_running\|_late_worker\|_sink_holder" docs/decisions/*/*.md`
+  returns over what it deletes.
+- **A `fenced` retarget whose stop's wait ran out re-arms the sink the stop closed, so it is closed
+  a second time at the same write count** (SPEC-097's build; invariant 5, inside its recorded
+  exception for a `shutdown()` that a sink change in flight does not let take its decision). A
+  `shutdown()` on another thread waits within its closer grace for a change in flight to decide.
+  When that wait runs out after the change's retarget answered `fenced`, the stop takes the
+  installed sink, closes it and marks the change withheld, and the change arms it anyway, because
+  on `fenced` that arm is the only one the worker's new sink gets (SPEC-097 FR-001). The exit then
+  closes it again at the same write count. The recorded consequence of that window was a sink left
+  open; this is a second one. `tests/test_shutdown_mid_swap.py`'s
+  `test_a_retarget_answering_fenced_keeps_its_arm_and_closes_the_sink_once_after_its_write` forces
+  it and asserts what holds: the sink is owed when `configure()` returns, and its last close comes
+  after its last write. **Closed by** a `fenced` arm that can tell a sink the worker wrote to after
+  the stop's take, which must be owed again, from one it did not write to, which must not be; a
+  withhold without that test leaves a sink written after its last close owed by nobody, which is
+  why FR-001 keeps the arm.
+- **A signal handler that interrupts `_FactorySink`'s claim read inside `yielding()` and calls
+  `shutdown()` still deadlocks** (SPEC-097's build; invariants 1 and 3; read from the code, not
+  reproduced). `flush()`, `shutdown()` and a sink-changing `configure()` wrap their wait in
+  `_lifecycle.yielding()`, which, on a thread running a `sink_factory`, takes that wrapper's
+  `_build_lock`, a plain `threading.Lock`, for one claim read as the block starts and one as it ends
+  (`_FactorySink._yield_start`, `_yield_end`). `shutdown()` enters `yielding()` before
+  `_shutdown_worker`'s ownership test, so a handler that interrupts the thread inside either read
+  and calls `shutdown()` waits on a lock its own thread holds. The lock is outside the ownership
+  oracle, and `tests/test_lock_oracle.py` records it with this residual as its reason. **Closed by**
+  `_build_lock` joining the oracle as an `RLock` with the ownership test made before `yielding()`,
+  or by `yielding()` not taking it on a thread that already holds it.
+- **`ConsoleWriter._lock` stays a plain lock, so a handler that echoes into a failing stream while
+  inside that section still deadlocks** (SPEC-097's build; invariants 1 and 3; read from the code,
+  not reproduced). The console echo counts a failed write under `ConsoleWriter._lock`, a plain
+  `threading.Lock` (`console.py`). No lifecycle call takes it, so SPEC-097 left it out of the
+  ownership oracle with that reason, recorded in `tests/test_lock_oracle.py`: its section is one
+  counter increment on the echo stream's failure path, and only an echoing level call made inside
+  it waits on it. A signal handler or finalizer that interrupts a thread inside that section and
+  makes a level call whose echo also fails waits on the lock its own thread holds, for good.
+  **Closed by** the lock becoming an `RLock`, re-entered for the one increment, or the count taking
+  no lock.
+- **A handler landing inside an `Event`'s own lock and setting that `Event` waits on its own
+  thread** (SPEC-097's frame-2 diff review, m2; invariants 1 and 3; read from the code, not
+  reproduced). A `threading.Event` holds its internal lock, a plain `Lock`, for the few bytecodes
+  of its own `wait()`, `set()` or `clear()`, never across the wait itself. A signal handler or
+  finalizer that lands in those bytecodes and makes a lifecycle call that sets the same `Event`
+  waits on a lock its own thread holds, for good. The one site enumerated is a `flush()` inside a
+  flush marker's wait, which `_calls_here.flushing` holds (FR-004); no other `Event` is. The
+  ownership oracle exempts `Event` as a category rather than giving each a row, and
+  `EVENT_REASON` in `tests/test_lock_oracle.py` records why and points here. **Closed by** a roster
+  of the `Event`s a lifecycle call sets or waits on, each with the threads that can be inside its
+  lock, and a held call for each one a handler can reach, as the flush marker's is.
+- **An interrupt between `_swap_sink`'s `took` of a displaced sink and the `release` that starts
+  its closer loses that sink's close** (found by SPEC-097's interrupt corpus; invariant 5). The
+  swap marks the sink it displaced as taken (`_Keep.took`) and takes it off the owed record in the
+  arguments of that `release`; a `KeyboardInterrupt` in that span once the take has run leaves the
+  sink off the record with no closer, so the exit never closes it, though it was given events. The code
+  predates SPEC-097, unchanged from `c9068a46`, whose run never reached the window because its
+  stop ran inline first. `tests/test_change_interrupts.py` excuses those rows by a span it derives
+  from `_swap_sink`'s AST, requiring each to fail that one check alone. **Closed by** the take and
+  the closer's start becoming one step an interrupt cannot split, or a take that puts the sink
+  back when its closer never started.
+- **An interrupt on the statements that release `config._sink_lock` or clear `_sink_holder` can
+  leave one of them set** (SPEC-097's final execution review; invariant 5). `_change_sink` releases
+  each in a `finally` of its own, outside the end section, so nothing else leaves either set, and
+  the corpus excuses only rows on those statements, read from the AST. An interrupt on the release
+  itself still leaves the lock held, so every later `configure(sink=...)` waits out its swap
+  budget and runs unserialized with a `pending` line; one on the holder's clear leaves the holder
+  set, so every later `configure(sink=...)` on that thread is read as re-entrant and leaves the
+  sink it displaced open for the exit. A real signal between `acquire` returning and its store
+  into `serialized`, on the same line, would leak the lock too, and no trace event lands there, so
+  the corpus cannot reach it. **Closed by** nothing a Python statement order offers; likely by the
+  lock and the holder being released by a context manager implemented in C, or by the deletion of
+  `_sink_lock` and `_sink_holder` that *The command path's deletion half* above owes.
+- **An interrupt can skip a `with` statement's `__exit__` and leave a library lock owned** (found
+  by SPEC-097's interrupt corpus; invariants 1 and 3). An exception raised on a `with` line as its
+  exit runs, before `__exit__` is called, leaves the lock owned (CPython gh-74174, the reason the
+  corpus cites), and CPython leaves some instructions inside a `with` body in no exception-table
+  range, an inlined comprehension's filter jump on 3.13, so an exception raised there leaves the
+  frame without running `__exit__`. Either way the interrupted thread owns a library lock it will
+  never release: every other thread that takes it waits, and every lifecycle call on that thread
+  reads itself in a section and is held with no section end to run it. The corpus excuses both
+  shapes by reasons it derives, the `with` lines from the AST and the uncovered lines from
+  `dis.Bytecode(...).exception_entries`. **Closed by** a CPython fix for the class, or by stating
+  it in §13 as a constraint of interrupting Python code that holds a lock; no statement order
+  inside the library reaches it.
+- **An audit hook that refuses `sys._getframe` makes `configure(sink=...)` raise outside its
+  documented `Raises:`** (SPEC-097's final execution review; invariant 1). A change identifies
+  itself by its own frame, which `_change_sink` reads with `sys._getframe()`. With a hook raising
+  `RuntimeError` on that event, `configure(sink=...)` raised `RuntimeError` (a probe at
+  `d00bc13c`), leaving the config on the old sink, `_sink_lock` free and no taker registered; a
+  hook refusing `sys._current_frames` would reach `_on_stack` from a `shutdown()` made on another
+  thread while a change is the registered taker (read from the code, not reproduced). **Closed
+  by** the change treating a refused frame read as no frame, so nothing registers and a stop made
+  inside it runs as it did before SPEC-097, or by `configure()`'s and `shutdown()`'s `Raises:`
+  naming the hook's exception.
+- **A stop on a library thread deferred to a blocked first taker runs with timeout 0, its own
+  timeout discarded** (read from `run_deferred_stops` against FR-002's Deferred clause, not
+  reproduced; invariant 3). A `shutdown()` made on a `log-foundry-` thread defers to the
+  registered taker, the first change running, which need not be the change that thread's work
+  belongs to. FR-002 cuts a deferred stop's timeout at the end of the taker's swap budget, so when
+  that change was blocked until past its budget the stop runs with timeout 0 as it ends: its drain
+  and its closes get no wait, as a `shutdown(timeout=0)`'s would. **Closed by** a deferred stop
+  keeping its own deadline once the taker's budget is spent, still with every close detached so
+  `configure()` keeps its bound, or by a stop deferring only to the change its thread serves.
 - **A child forked while a sink change is in flight sends its spans to the old sink and its orphan
   logs to the new one** (2026-11-14 audit, finding 6; invariants 12 and 6). `_clear_after_fork`
   clears the swap token and re-arms the worker's sink (`_lifecycle.py:1749`, `:1764-1766`), and
@@ -2188,6 +2151,216 @@ close made while its thread holds the worker queue's mutex does not return eithe
   records, and 170 pass. Its `unannounced`
   check asks for a loss line per batch rather than for the counts the lines name to add up to the
   events, since the HTTP family names its losses in requests.
+- ~~**A sink a swap installs is closed twice with nothing written between when an orphan log armed it
+  and a re-entrant `shutdown()` closed it before the swap decided**~~ (SPEC-085; invariant 5).
+  Measured at `a0f44b5f`, 2 cells red: the installed sink has one write and closes entered at
+  counts 1 and 1. With `shutdown` alone, no `info` first, it is closed once at count 0. **Closed
+  by** the one lifecycle command path, or by the swap not arming a sink a shutdown has closed since
+  the config named it (the item below says why the config write, not the swap's entry, and which
+  takes count). Its two pinned cells retarget a worker that then declines, which SPEC-054 records
+  as an accepted trade; the item below says what closing it reverses.
+  → **closed by SPEC-097 FR-002**: a `shutdown()` made on a `log-foundry-` thread, or on the
+  changing thread, while the sink change registered as the taker of deferred stops is still
+  running (its frame on its thread's stack) is deferred to it, and the change runs one stop for it
+  once it has released `config._sink_lock`, so the stop no longer takes the installed sink before
+  the change decides. Both cells, `reentrant-swap-emit-worker-info+shutdown` and
+  `...+shutdown-none`, pass with each sink closed once at write count 1, and the
+  `installed-closed-twice` pin is gone.
+- ~~**A sink a swap installs is closed twice with nothing written between when a concurrent
+  `shutdown()` took it before the swap decided**~~ (SPEC-086's soak; invariant 5). This is the item
+  above with the `shutdown()` on another thread instead of inside a sink's code.
+  `configure(sink=S)` writes S to the config before its swap decides (`config._change_sink` calls
+  `_rebind`, then `_swap_live_sink`). In that window an orphan log arms S and writes to it, and a
+  `shutdown()` takes S and closes it. The swap then arms S as the sink it installs, and a later
+  take closes S again at the same write count.
+
+  On the no-worker branch, the swap's config write precedes the shutdown's take of S, and its
+  swap's critical section follows the drain's last take (before it, the swap declines at entry). None of invariant 5's recorded exceptions
+  covers that window. `docs/audits/2026-11-14-probes/lifecycle/p11_swap_arms_a_sink_a_shutdown_closed.py`
+  forces it:
+  - At `9d70f782`, 7 of 7 forced runs closed S at counts 1 and 1. Both controls closed S once in 7
+    of 7: one drops the first `shutdown()`, and the other drops the stale log that keeps the
+    swap from returning early.
+  - It closed S twice on 5 of 5 runs at each of `31dda162`, `624d817f` (#339), `a0f44b5f`
+    (v1.2.0), `5447d26a` and `6bd0b66e`. It is present at every tree measured, so it shipped in
+    1.2.0 and is not a regression. #339's serialized `configure()` does not reach it, because the
+    `shutdown()` does not take that lock.
+  - Unforced, it is the soak's `repeat@<n>` with nothing written between the first close's take
+    and the second close's take. The soak was run over its even seeds alternately at `5447d26a`
+    and `9d70f782`, at loads of 28 to 82. It found 1 such report in 9,000 runs at `5447d26a` and 3
+    in 9,000 at `9d70f782`. In each, the only arm between the two takes was the swap's arm of the
+    sink it installs, traced by caller. At `9d70f782` all 3 arms were on the no-worker branch. At
+    `5447d26a` the one arm, `emit-seed1238`, was after `Worker.retarget`. Of 14 more found at
+    higher load at `9d70f782`, 9 were on the no-worker branch and 5 were after `Worker.retarget`.
+    In every one, the first take was a `shutdown()`'s.
+  - The one other `repeat@<n>` at each commit is not counted here: `emit-seed1582` and
+    `deliver-seed600` each had a write after the first take. At `emit-seed1582` that write made no
+    arm because the swap's arm had already made the sink owed, so the soak's rule, which looks for
+    a writer's arm, reads a close the write owes as unowed. At `deliver-seed600` the writer armed
+    before the take, which is the race of the orphan-log item, still open. Whether its second close is
+    owed depends on how that item closes. The higher-load set had 4 more like `emit-seed1582`.
+  - SPEC-086's `deliver-seed962` has the same record. It is not #339's double close, as SPEC-086
+    and `check_unowed_repeat`'s docstring call such an arm, because the take ahead of the swap's
+    arm is a `shutdown()`'s, which #339's lock does not cover. The take after it is often a
+    later `configure()`'s stale take, as at `deliver-seed1366` and `http-seed1106`.
+
+  After `Worker.retarget` the same arm is reached only through two windows invariant 5 already
+  records: a `shutdown()` that gave up waiting for the swap's decision, and a swap that retargets a
+  worker built during the shutdown. There the recorded consequence is a sink left open; this is a
+  second consequence, a sink closed twice. It is unforced. Where the retarget declined, it is the
+  redundant close SPEC-054 accepted as a trade. That trade is recorded in
+  `docs/decisions/pipeline/one-lifecycle-owner-the-bookkeeping-around-the-two-emit-paths-exists-once.md`,
+  in SPEC-054 and its delivery doc, in `_swap_sink`'s docstring, and in
+  `tests/test_shutdown_lifecycle.py::test_a_declined_swap_re_arms_a_sink_already_closed_and_that_is_the_trade`.
+  Its text names a declined swap only, so the no-worker half of this item reverses no recorded
+  decision.
+
+  Three docstrings state as correct or complete what this item disproves:
+  - `_shutdown_worker`'s "the one not covered";
+  - `_swaps_to_await`'s claim that its snapshot holds every swap whose decision may still be ahead;
+  - `_swap_sink`'s no-worker paragraph, which arms the new sink after the drain's last take.
+
+  **Closed by** one of two routes:
+  - **The one lifecycle command path.**
+  - **The swap withholding its arm of the sink it installs** where a `shutdown()` or the exit drain
+    (a `_close_owed` take) has taken that sink since the config named it. This applies on the
+    no-worker branch, and on the branch after `Worker.retarget` only for a `declined` verdict.
+
+  The withhold has three bounds:
+  - **The take must be a `_close_owed` take, not any take.** Through an unserialized pair of
+    `configure()` calls, a second swap's stale loop can take S before the first swap's retarget
+    adopts it, and the worker then writes S. At `027b39a5`, S's closes were `[1, 2]`, which is
+    correct. A withhold keyed on any take left `[1]` with two writes: written after its last close
+    and owed by nobody. A third diff reviewer measured this, 3 of 3.
+  - **On `fenced` and `unfenced`, the swap's arm stays.** It is the only arm the worker's new sink
+    gets.
+  - **The mark is per sink change.** It is published lock-free before `_rebind`, as
+    `_swaps_running` is, because taking `_state._lock` there would add an acquisition to counts
+    that tests pin. One global slot is overwritten by an unserialized or re-entrant `configure()`.
+    It is cleared in `_change_sink`'s `finally`, or it holds a superseded sink strongly, which four
+    SPEC-081 tests in `tests/test_ownership_record.py` refuse. It needs a home in the lifecycle
+    inventory and the fork roster.
+
+  A withhold keyed on the config write was measured on both branches at `4cda14ba` and
+  `027b39a5`, and then removed:
+  - p11 closed S once in 3 of 3 runs.
+  - The whole suite failed only the trade test and the two `installed-closed-twice` pins of the
+    item above, which are `declined`, plus tests that inventory or bound the mutant's own scratch
+    globals. The SPEC-035 FR-003 tests stayed green, because the next orphan log re-arms S.
+  - A mark taken at the swap's entry instead left p11 at 3 of 3 double closes.
+
+  The no-worker half can land alone. The `declined` half reverses SPEC-054's recorded trade: it is
+  a rewrite of that decision file in place, and Andrew's call.
+  → **closed by SPEC-097 FR-001**, by the second route with its three bounds as written: a
+  non-re-entrant change publishes its operation before `_rebind`, a `_close_owed` take of the sink
+  it installs marks it withheld, and a withheld change does not arm that sink on the no-worker
+  branch or after a `declined` retarget; on `fenced` and `unfenced` it keeps its arm. On the build,
+  `p11_swap_arms_a_sink_a_shutdown_closed.py`'s `forced` variant closes S twice in 0 of 7 runs,
+  every run's closes entering at `[1]`. The `declined` half reverses SPEC-054's trade, by Andrew's
+  answer of 2026-11-16, and the trade test is rewritten as
+  `test_a_declined_swap_does_not_re_arm_a_sink_a_stop_closed_so_the_trade_is_reversed`. A
+  `fenced` retarget reached through an expired wait still closes the installed sink twice; that
+  is the open item *A `fenced` retarget whose stop's wait ran out…*.
+- ~~**`flush()` called on the drain thread waits on itself**~~ (SPEC-068 spec review; invariant 3;
+  corrected in place by SPEC-085). A sink's `emit` that calls `flush()` waits on the thread it
+  runs on: measured at `a0f44b5f`, `flush(timeout=2.0)` takes 2.00 s, `flush(timeout=None)` does
+  not return, and a later `shutdown(timeout=5.0)` expires. ~~`configure(sink=…)` called there
+  waits on itself too: a 5.007 s stranded swap.~~ At `a0f44b5f` a `configure(sink=…)` made from
+  `emit` on the drain thread returns in 0.00 s with two announced lines. SPEC-068 FR-006 closed
+  this shape for `shutdown()` only. **Closed by** a decided answer for a flush made on the drain
+  thread, which needs a new `FlushResult.reason` on a frozen public surface (SPEC-034)~~, and a
+  swap that does not wait on the thread it runs on~~.
+  → **closed by SPEC-097 FR-003**, the decided answer (Andrew, 2026-11-16): a `flush()` made on
+  the live worker's drain thread, compared by identity with its `_thread` rather than by name,
+  returns at once with `ok` false and the new reason `"re-entrant"`, before it sweeps a span,
+  opens its window, queues a marker or flushes a sink's client. `tests/test_reentrant_flush.py`
+  holds `flush(timeout=None)` from a sink's `emit` to returning within 0.5 s with nothing queued
+  and no ledger term moved; the three `drain-flush` cells and the 33 they withheld pass, and the
+  pin is gone.
+- ~~**`shutdown()` called from a signal handler deadlocks for good when the signal interrupts a
+  library lock section**~~ (2026-11-14 audit, finding 3; invariants 1 and 3). `Runtime._lock` is a
+  plain `threading.Lock` (`_lifecycle.py:1018`) and `_shutdown_worker` takes it at `:5273`, so a
+  handler that runs on a thread already inside one of the library's lock sections waits on its own
+  thread. `docs/audits/2026-11-14-probes/lifecycle/p1a_signal_shutdown_injected.py` raises `SIGTERM`
+  at the first line inside `_flush_live_sink`'s section (`:5688`), patching no library code, and the
+  handler's `shutdown(timeout=2)` never returns. `lifecycle/p1b_run.py`, with a one-shot timer at a
+  random instant and nothing injected, hung 6, 19 and 40 of 200 fresh processes in its three loops
+  in the lifecycle frame's run; those loops spend nearly all their time inside lock sections, so the
+  rate is an upper bound for a real program, and the mechanism does not depend on the rate. The
+  frame found the handler blocked on `Runtime._lock`, the close registry's lock, `Worker._lock` and,
+  by inference, the queue's mutex. SPEC-088 adds the event ledger's registration lock, taken by a
+  thread's first credit, once per pass of every `health()` and `shutdown()` reading, and around
+  `shutdown()`'s once-per-count check, and never with a lifecycle lock held: a worker's build,
+  which runs under `Runtime._lock`, reads the hand-over count without it (`_ledger.handed_unlocked`,
+  SPEC-088's diff review), so the two are never nested in either order. It is an `RLock`,
+  so a handler or a `__del__` that logs or reads on the thread already inside it re-enters rather
+  than waiting on itself, which with a plain `Lock` it did (the plan review's `premise_3b`).
+  SPEC-089 adds `flush()`'s two window reads, taken on the caller's thread as `health()`'s is, so
+  a `flush()` started while another thread is inside the lock's section waits for it, and the
+  drain's reading when it answers a counted marker, which **only tries** the lock: a `flush()` or
+  `shutdown()` made inside the section waits on the drain, so a drain waiting on the lock waited
+  on its own waiter, and `flush(None)` from a collector callback never returned (SPEC-089's second
+  diff review). SPEC-091 adds `decorator._sweep_lock`, which the drain thread now takes every
+interval, and which every close and `flush()` takes. It is an `RLock` entered only through
+`_sweep_hold`, and every site first asks whether its own thread already holds it, so a handler
+that calls `flush()` or closes a span on a thread inside a sweep does not wait on its own thread:
+its sweep takes nothing and its close is deferred to the holder. The drain waits for it at most
+`worker._SWEEP_WAIT`, so a thread holding it that then waits on the drain is not waited on in
+turn, and a sweep takes the queue's mutex for at most the same bound and takes no other lock while
+it holds the hold (SPEC-091's diff review, frame 2), so a handler inside the queue's section on
+another thread that then takes the hold is not waited on either. A handler on a thread inside any of
+the other locks still waits, and a handler inside the queue's own section that closes a span waits
+on that section from its own thread: the close's submit takes the queue's mutex, a plain `Lock`.
+That last hang is the standard library's and predates SPEC-091: on the base `33a44e99` a traced
+close made while its thread holds the worker queue's mutex does not return either. One nesting remains, and it is
+  the caller's code that makes it: `_ensure_sink()` runs under `Runtime._lock`, so a
+  `sink_factory` that logs on a thread with no cell yet takes the registration lock while holding
+  `Runtime._lock`; the reverse order needs a `__del__` that makes a lifecycle call, or logs,
+  while the registration lock is held (SPEC-088's second diff review). **The documents promise this caller, and the code breaks the
+  promise.** `docs/invariants.md`, in invariant 5's recorded exceptions, describes what a re-entrant
+  `shutdown()` made from "a signal handler" leaves behind, and
+  `docs/decisions/pipeline/a-shutdown-waits-for-a-swap-in-flight-to-decide-and-a-swap-releases-only-what-the-record-owes.md`
+  does the same at lines 71 and 111. Both treat the handler as a caller that returns, and neither
+  says the call can deadlock; §13 records only the finalizer form of this hazard. **Closed by**
+  lifecycle commands serialized through one owner, where a re-entrant caller is queued or refused
+  rather than taking a lock, which Andrew took on 2026-11-14, to be prototyped against the
+  adversarial model test before it is committed to; and by the emit path's queue mutex being covered
+  too; the item *One stable stop signal per sink changes a documented public protocol* names the
+  decisions that path meets. The spec that fixes it makes those two documents true; it does not
+  reword them to match the defect.
+  → **closed by SPEC-097 FR-004 and FR-005**: the locks a lifecycle call takes on its own thread
+  are `RLock`s read for ownership (`Runtime._lock`, the close registry's, `Worker._lock`, the
+  worker queue's mutex with its conditions rebuilt on it, `config._config_lock`,
+  `decorator._sweep_lock` and `decorator._loss_lock`), and a `shutdown()` or `configure()` made on
+  a thread that owns one, or that is inside its own `flush()`'s wait on its marker, is held there
+  and runs at the end of the public call the thread was in, before any later stop; a `flush()`
+  returns `"re-entrant"`. `p1b_run.py` reads 0 of 200 hung in every mode in three runs, and all
+  eleven rows of `spec097_signal_in_section.py` return, ported as
+  `tests/test_signal_handler_calls.py`. A level or traced call made there re-enters the lock,
+  which `spec097_reentry_sweep.py` runs in every section its three workloads reach, with none
+  failing, and prints the sections it does not reach, each fork-repair or drain-thread only; a
+  run of the suite under the re-entry recorder (`tests/_reentry.py`) records no other re-entry.
+  The queue's mutex is covered: a traced close made while its thread holds it now returns (the
+  probe's `submit/span` row). The two documents this item names are made true: invariant 5's
+  re-entrant exception is struck, and the pipeline decision's re-entrant paragraph rewritten, both
+  dated. A handler that calls `shutdown()` and then `os._exit()` exits before the held stop runs,
+  so nothing is drained, where it hung; the README says so. Three residuals stay open:
+  *A signal handler that interrupts `_FactorySink`'s claim read…*, *`ConsoleWriter._lock`
+  stays a plain lock…* and *A handler landing inside an `Event`'s own lock…*.
+- ~~**`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close**~~
+  (2026-11-14 audit, finding 20; invariant 3, whose bound still holds).
+  `docs/audits/2026-11-14-probes/lifecycle/p3_reentry_from_close.py`: the nested call returned after
+  2.00 s, which is `DEFAULT_CLOSER_GRACE`, on the orphan path and the worker path and with
+  `timeout=None`, with nothing on stderr, while a `flush()`, a `configure()`, a log and a span made
+  from the same place returned at once. The wait is `_close_owed`'s bystander wait
+  (`_lifecycle.py:4915`, `:4967`) on the close the caller is itself inside. It is a sibling of the
+  drain-thread self-wait item above. **Closed by** the one lifecycle command path of the item above,
+  or by `_close_owed` not treating a close running on the calling thread as one to wait for.
+  → **closed by SPEC-097 FR-002**: a `shutdown()` made on a running stop's own thread, or on a
+  `log-foundry-` thread while a stop runs, is merged into that stop and returns at once, the
+  running stop being its effect. `p3_reentry_from_close.py` reads `outer=0.00s` on all six
+  `shutdown` rows, each sink closed once and the state `CLOSED`; the four `nested-shutdown` cells
+  and the 52 they withheld pass, and the pin is gone.
 - ~~**A dead sink whose target is already zero at the stop is handed the exit backlog in
   `batch_size` submissions, and its own per-batch lines are not aggregated**~~ (SPEC-090 FR-001
   rule 4 and FR-003; invariants 2 and 11). FR-003 aggregates the worker's abandon and decline
@@ -3196,11 +3369,14 @@ and a third copy is a fork with no merge.
   is queued or in a batch the sink has not yet accepted. Because the sweep runs on the drain thread
   between emits, a kill that lands while the drain is inside an emit or a retry backoff loses
   everything logged on open spans since the last sweep, for as long as that emit has run. The
-  default `SIGTERM` disposition does not run `atexit`, and a handler that calls `shutdown()` is
-  §12's finding-3 deadlock, so no signal handler sweeps. Decision: *An open span's events ship on
+  default `SIGTERM` disposition does not run `atexit`, and ~~a handler that calls `shutdown()` is
+  §12's finding-3 deadlock, so no signal handler sweeps~~ — superseded by SPEC-097: a handler's
+  `shutdown()` runs, sweep included, at once, or, made inside a library lock section, when the
+  interrupted call returns, and at the latest at the start of the exit drain; a handler that calls
+  `os._exit()` after it exits before a held stop runs. Decision: *An open span's events ship on
   the worker's interval* (`docs/decisions/pipeline/`).
 
-- **The open-span sweep accepts four residuals** (SPEC-091). **A `KeyboardInterrupt` landing
+- **The open-span sweep accepts ~~four~~ three residuals** (SPEC-091; one struck by SPEC-097). **A `KeyboardInterrupt` landing
   just after a successful put** in `flush()`'s registry sweep, or any other asynchronous
   `BaseException` between the put and `Worker._offer`'s return, counts that take twice: once
   queued and once in `in_span_lost`, since the sweep debits a take whose hand-in did not return.
@@ -3208,13 +3384,15 @@ and a third copy is a fork with no merge.
   **A collector callback or finalizer that runs inside a sweep hold** runs there, so its own
   stderr lines and orphan emits are written while the hold lasts and other closes wait on it: the
   one exception to "nothing is written to stderr under the lock", accepted because the callback's
-  own runtime already extends the hold. **A traced close made while its own thread holds the worker
+  own runtime already extends the hold. ~~**A traced close made while its own thread holds the worker
   queue's mutex**, as a collector callback inside `put_nowait`'s section could make, waits on that
   mutex in its own submit and never returns, since `queue.Queue`'s mutex is a plain `Lock`; this
   predates SPEC-091 (it hangs on the base `33a44e99`), and SPEC-091's sweeps do not join it: they
   take the mutex for at most `worker._SWEEP_WAIT` and no other lock under the hold (diff review,
-  frame 2). The take's exactly-once argument rests on the GIL (each
-  `list` and `dict` operation it uses is one C call with no switch point); on a free-threaded
+  frame 2).~~ — superseded by SPEC-097 FR-004: the worker queue's mutex is an `RLock`, so that
+  close's submit re-enters it and returns (`spec097_signal_in_section.py`'s `submit/span` row).
+  The take's exactly-once argument rests on the GIL (each `list` and `dict` operation it uses is
+  one C call with no switch point); on a free-threaded
   build it is unproven, and no free-threaded run was made.
 
 - **An orphan log can wait on the sink lock.** A sink holding mutable transport state serializes

@@ -316,6 +316,21 @@ resumed drain thread through a factory wrapper, and, during a retarget, in the p
 sink's wait to ending within a second of the stop that should cut it, for a wait in `emit` or
 `close` in the parent and in `emit` in a forked child, except in the cells pinned to `architecture.md` §12
 open items and the cells those pins withhold (SPEC-085).
+`tests/test_signal_handler_calls.py` ports `spec097_signal_in_section.py`: each of its eleven rows
+raises `SIGTERM` at the first line run inside a library lock section, in a fresh interpreter
+under a watchdog, and holds the handler's call to returning at once and, once the interrupted call
+has returned, a held `shutdown()` to having run (SPEC-097 FR-004); at `ead40798` nine of them hung.
+The same file ports `spec097_held_sweep.py`
+(`test_every_public_call_that_takes_a_library_lock_runs_the_calls_held_inside_it`): it runs every
+callable in `log_foundry.__all__`, failing on one with no recipe, raises `SIGTERM` at the first
+library line run holding a library lock, and holds every call that fired to having run the
+handler's held `shutdown()` by its own return, so the public calls that must run held calls at
+their end are derived, not listed (SPEC-097 FR-004).
+`tests/test_deferred_stop_bound.py` holds a `configure(sink=…)` whose sink's `emit` calls
+`shutdown()` to its 5 s swap budget plus a second, under a second of CPU, with a slow `close()`
+(SPEC-097 FR-002), and
+`tests/test_reentrant_flush.py` a `flush(timeout=None)` on the drain thread to returning
+`"re-entrant"` within the suite's stall allowance (FR-003).
 `tests/test_invariants_model.py` holds every call its two halves make with a passive sink to
 returning within its own timeout plus one second: in the concurrent half each `info()` and traced
 call (budget zero), `flush()`, `shutdown()` and `configure(sink=…)` from four threads, and in the
@@ -390,11 +405,16 @@ that leaves its member alone leaves a kept sink closed by nobody (§12 holds tha
 sink the swap's read does not reach — beneath a `sink_factory` that has not built, or past the
 read's bound — is released as it was before SPEC-087, every event it then refuses counted and
 announced; a `shutdown()` that a sink change in flight does not let take
-its decision within the closer grace, nor by the call's last take, a sink change that starts after it and retargets a worker
-built during it, or a re-entrant `shutdown()` (from a sink's own code on the drain thread or the
-changing thread, or a signal handler) landing between that change's retarget and its decision, may
+its decision within the closer grace, nor by the call's last take, or a sink change that starts after it and retargets a worker
+built during it, ~~or a re-entrant `shutdown()` (from a sink's own code on the drain thread or the
+changing thread, or a signal handler) landing between that change's retarget and its decision,~~ may
 leave the sink that change installs open until a later `shutdown()` or the exit closes it — only
-the first with a `pending` line (`docs/decisions/pipeline/`); a forked child that cannot tell what
+the first with a `pending` line (`docs/decisions/pipeline/`); the re-entrant `shutdown()` is struck
+by SPEC-097, which merges it into a running stop, defers it to the change's end or holds it until
+the interrupted call returns, so it no longer drains under the change; and where such a
+`shutdown()` gave up waiting on a change whose retarget answered `fenced`, that change arms again
+the installed sink the `shutdown()` closed, which is then closed a second time at the same write
+count (`architecture.md` §12); a forked child that cannot tell what
 it inherited — its heap scan after a tripped marking raised or met a frozen heap, or its walk
 raised — records a sink it is handed with `sink=` that has no record of its own as `_FOREIGN` and
 never closes it, with one `pending` line, while the lazy default, a `sink_factory=` sink and an

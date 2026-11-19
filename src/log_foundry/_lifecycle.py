@@ -7,6 +7,7 @@ import collections
 import contextlib
 import dataclasses
 import enum
+import functools
 import gc
 import os
 import sys
@@ -20,6 +21,7 @@ from log_foundry import _diag, _fork, _sink_arg
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
+    from types import FrameType
 
     from log_foundry.results import FlushResult
     from log_foundry.sinks.base import Sink
@@ -211,6 +213,17 @@ class _Operation:
         take, for the one line that says so.
       publishing_worker: The worker whose unset event made a take of this ``STOP`` decline,
         until the call has stopped it, or ``None``.
+      installing: The sink a ``SWAP`` published before its config write installs, until the
+        change ends (SPEC-097 FR-001); ``None`` for a ``STOP`` and once the change has ended.
+      withheld: Whether a ``_close_owed`` take took ``installing`` since the config named it,
+        so the change does not arm that sink again; written and read under ``_state._lock``.
+      detach: Whether this ``STOP`` runs a sink change's deferred stops (SPEC-097 FR-002), so
+        every close it takes is detached onto a closer thread and none runs inline.
+      change: The ``config._change_sink`` frame that published this ``SWAP`` (SPEC-097 FR-002),
+        until that change ends; ``None`` for every other operation. What it published counts as
+        in flight only while this frame is on its thread's stack (:func:`_on_stack`).
+      deferred: The deadlines of the stops deferred to this change while it is the registered
+        taker (:attr:`Runtime._deferred_taker`), taken by the change's own end.
     """
 
     def __init__(self, kind: _Op, timeout: float | None) -> None:
@@ -237,6 +250,34 @@ class _Operation:
         self.grace_spent = 0.0
         self.unsettled: list[_Operation] = []
         self.publishing_worker: Worker | None = None
+        self.installing: Sink | None = None
+        self.withheld = False
+        self.detach = False
+        self.change: FrameType | None = None
+        self.deferred: list[float | None] = []
+
+
+class _CallsHere(threading.local):
+    """What the calling thread has in flight on the command path (SPEC-097).
+
+    A ``threading.local`` subclass whose defaults live on the class, so a thread that never set
+    one reads it through a plain attribute load, which calls nothing; ``getattr`` with a default
+    would add a call to every wrapped public call (the pattern ``_diag._Window`` uses). It is per
+    OS thread rather than a ``contextvars`` value on purpose: what it records is a call on this
+    thread's stack, a sink change in flight here, and a task or thread the call starts is not
+    inside it.
+
+    Attributes:
+      published: The sink change this thread published before its config write and has not yet
+        handed to :func:`_swap_sink`, or ``None`` (FR-001).
+      waiting: The lifecycle calls held on this thread while it was inside a library lock
+        section, in the order they were made, or ``None`` (FR-004).
+      flushing: How deep this thread is in its own ``flush()``'s wait on its marker (FR-004).
+    """
+
+    published: _Operation | None = None
+    waiting: list[Callable[[], object]] | None = None
+    flushing: int = 0
 
 
 class _Close:
@@ -354,7 +395,7 @@ class _CloseRegistry:
         """
         self.owed: dict[int, Sink] = {}
         self._in_flight: dict[int, _Close] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def arm(self, sink: Sink) -> None:
         """Records that the library owes *sink* a close; the caller holds ``_state._lock``.
@@ -1052,7 +1093,7 @@ class Runtime:
           None.
         """
         self._worker: Worker | None = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._atexit_registered = False
         self._stop = threading.Event()
         self.retirements = 0
@@ -1318,6 +1359,33 @@ class Runtime:
         decline asks :meth:`_take_ahead` under ``_lock`` — and a discard that lagged would make it
         see a drain that had already made its last take, which ``drained`` already answers. A
         forked child empties it in :func:`_clear_after_fork`.
+        """
+        self._deferred_taker: _Operation | None = None
+        """The one sink change registered to take deferred stops (SPEC-097 FR-002).
+
+        Set by :func:`open_command_swap` when no live change is registered, and read only through
+        :func:`_live_taker`, which counts it only while its change's frame is on its thread's
+        stack, so a change an interrupt unwound before its end deregistered it reads as no taker,
+        and the next change replaces it. The deadlines deferred to it are on the operation
+        (:attr:`_Operation.deferred`), so a dead taker's are never taken by another change. A
+        forked child clears it: the change is the parent's.
+        """
+        self._deferred_lock = threading.RLock()
+        """Makes a stop's decision to defer, and a change's end, one section each (SPEC-097 FR-002).
+
+        A leaf: nothing is called under it but list and token-set operations, a read of the
+        threads' stacks and the holder's clear, so it is never held while another library lock is
+        taken. It is in the ownership oracle (:func:`_library_locks`): a signal handler that
+        interrupts one of its sections and calls ``shutdown()`` is held until the interrupted call
+        returns. Outside it, the handler's whole stop ran inside the change's end section and
+        waited on a drain thread that was itself waiting for this lock (the execution review's
+        ``p2_handler_stop.py``).
+        """
+        self._calls_here = _CallsHere()
+        """This thread's command-path state: the sink change it published (SPEC-097).
+
+        A forked child replaces it (:func:`_clear_after_fork`): whatever the forking thread had
+        in flight was the parent's call, and its other half is not in the child (FR-006).
         """
         self._stops_running: set[_Operation] = set()
         """One token per ``_shutdown_worker`` call inside its body; non-empty reads ``DRAINING``.
@@ -1778,6 +1846,14 @@ def _clear_after_fork() -> None:
     rather than a copy, is what lets the share shrink as the forking thread unwinds
     (:func:`offer_stop_signal`), so a child that returns from the setter stops sharing it.
 
+    **A child inherits no command** (SPEC-097 FR-006). The deferred stops would wait for a sink
+    change whose other half, the parent's drain and closers, is not in the child, and the forking
+    thread's command-path state belongs to the parent's call, so both are dropped.
+    ``config._sink_holder`` is reset to ``None`` even when the forking thread was the holder: an
+    inherited holder read as a change in flight, so a forking closer or drain thread's
+    ``shutdown()`` in the child deferred itself to it and the child ended ``RUNNING`` with its span
+    undelivered (two forker cells, ``ChildBroken:state``, on the prototype).
+
     Args:
       None.
 
@@ -1797,6 +1873,11 @@ def _clear_after_fork() -> None:
         _state._late_worker = None
         _state._signal_owed = True
         _state._releasing_here = threading.local()
+        _state._calls_here = _CallsHere()
+        _state._deferred_taker = None
+        from log_foundry import config
+
+        config._sink_holder = None
         offered = getattr(_state._offering_here, "offers", None)
         if offered is None:
             offered = []
@@ -5250,6 +5331,12 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
     call's own closes. The read is made with no lock held and inside the ``try``, so an interrupt
     during it is put back like any other.
 
+    **SPEC-097 adds two things to the take.** A take that takes the sink a published sink change
+    installs marks that change ``withheld`` (FR-001), in the same section, so the change does not
+    arm a sink this stop is closing. And a ``detach`` stop, the one a change runs for the stops
+    deferred during it, takes every sink ``GRACED`` and chooses none to close inline (FR-002), so
+    no ``close()`` runs on the changing thread past its budget.
+
     Args:
       op: The ``STOP`` this closer runs for, whose deadline bounds the grace and which carries the
         call's one ``grace_end``. ``None`` only for a direct call from a test, which gets an
@@ -5285,9 +5372,13 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
         )
         for sink in taken:
             rule = _Rule.JOINED
-            if worker is not None and worker.holds_unfenced(sink):
+            if operation.detach or (worker is not None and worker.holds_unfenced(sink)):
                 rule = _Rule.GRACED
             entries.append((sink, _state._closes.take(sink, rule)))
+        for swap in tuple(_state._swaps_running):
+            installing = swap.installing
+            if installing is not None and any(installing is sink for sink in taken):
+                swap.withheld = True
         keep = _Keep({}, list(_state._closes.owed.values()), {})
         for sink in taken:
             keep.took(sink)
@@ -5309,7 +5400,7 @@ def _close_owed(op: _Operation | None = None, *, bystander_wait: bool = True) ->
             else set()
         )
         taken = [sink for sink in taken if id(sink) not in passed]
-        inline = _inline_close_choice(taken, worker) if taken else None
+        inline = _inline_close_choice(taken, worker) if taken and not operation.detach else None
         for sink, close in entries:
             if sink is inline or id(sink) in passed:
                 continue
@@ -5378,10 +5469,18 @@ def _swaps_to_await() -> list[_Operation]:
     is killed with a large one. The rule is written as ``config._change_sink``'s prefix,
     ``log-foundry-``, so it also covers a closer thread; that half is harmless rather than needed,
     because a swap joins its closers only after it has set ``decided``, and a decided swap is
-    never in the snapshot. **The cost**: a re-entrant shutdown landing between a swap's retarget
-    and its decision drains and returns with the installed sink not yet owed, so that sink is
-    left open until a later ``shutdown()`` or the exit closes it, and no line says so; the
-    displaced one is still closed once, because the swap releases only what the record owes.
+    never in the snapshot.
+
+    **Since SPEC-097 the skips are a backstop, not the path.** A re-entrant ``shutdown()`` rarely
+    reaches this section: :func:`_merged_or_deferred` merges one made on a stop's own thread or a
+    ``log-foundry-`` thread during a stop, and defers one made on the changing thread (the holder
+    of ``config._sink_lock``) or a ``log-foundry-`` thread during a change to that change's end,
+    and :func:`in_section` holds one a signal handler or finalizer made inside a library lock
+    section. The call that still reaches the skip by ``thread`` is a sink's own code on the thread
+    of a change that proceeded without the lock, its wait having outlasted its budget, so it is not
+    the holder. That stop drains and returns with the sink the change installs not yet owed; the
+    change then arms it, so the exit or a later ``shutdown()`` closes it, and no line says so. The
+    displaced sink is still closed once, because the swap releases only what the record owes.
 
     The token set is copied into a tuple first, for :meth:`Runtime._take_ahead`'s reason: its
     discard runs without the lock.
@@ -5486,7 +5585,425 @@ def _announce_unsettled(op: _Operation) -> None:
         )
 
 
-def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
+def _on_stack(frame: FrameType | None, thread: int) -> bool:
+    """Whether a frame is on a thread's stack now: the change it belongs to is still running.
+
+    This is what makes the command path's state about the truth rather than about a slot that a
+    later statement must reset (SPEC-097 FR-002). An interrupt can land between any two
+    statements, so a slot set at a change's start and cleared at its end was left set three ways
+    in three review rounds, and each left every later ``shutdown()`` deferring to a change that
+    had already unwound. A frame is on its thread's stack exactly while its function runs, and the
+    identity of a frame object held here cannot be reused by another call, so a change that
+    another call at the same depth replaced does not read as running.
+
+    Args:
+      frame: The frame, or ``None``, which is on no stack.
+      thread: The ``threading.get_ident()`` of the thread whose stack is read.
+
+    Returns:
+      Whether the frame is that thread's current frame or one of its callers.
+
+    Raises:
+      None.
+    """
+    if frame is None:
+        return False
+    if thread == threading.get_ident():
+        current: FrameType | None = sys._getframe()
+    else:
+        current = sys._current_frames().get(thread)
+    while current is not None:
+        if current is frame:
+            return True
+        current = current.f_back
+    return False
+
+
+def _live_taker() -> _Operation | None:
+    """The registered taker of deferred stops, if its change is still running (SPEC-097 FR-002).
+
+    Called with :attr:`Runtime._deferred_lock` held. A taker whose change is no longer on its
+    thread's stack was unwound by an interrupt before its end deregistered it, and it is dropped
+    here with the deadlines deferred to it: its thread took the interrupt, and the stop a later
+    ``shutdown()`` or the exit drain makes is the one that runs. Read as registered, it made
+    every later ``shutdown()`` defer to it and none run (the execution review's
+    ``p8_real_sigint.py``, a real ``SIGINT`` as the registration's section ended).
+
+    Args:
+      None.
+
+    Returns:
+      The taker, or ``None`` when none is registered or its change has ended.
+
+    Raises:
+      None.
+    """
+    taker = _state._deferred_taker
+    if taker is None or _on_stack(taker.change, taker.thread):
+        return taker
+    _state._deferred_taker = None
+    taker.change = None
+    taker.deferred = []
+    return None
+
+
+def _merged_or_deferred(deadline: float | None) -> bool:
+    """Merges or defers a stop made from inside a running command (SPEC-097 FR-002).
+
+    A call is made from inside a command when it runs on that command's own thread, or on one of
+    the library's ``log-foundry-`` threads while the command is in flight, since the command may
+    be waiting on that thread: a drain, a closer, or a close a stop runs inline.
+
+    - **Merged.** A stop is running and this is its own thread, or a ``log-foundry-`` thread:
+      the running stop has already moved the retirement count, set the stop signal and will close
+      what is owed, so this call does nothing else. Waiting there instead waited out the closer
+      grace on the very close it was inside (2.01 s in ``lifecycle/p3_reentry_from_close.py``).
+    - **Deferred.** A sink change is registered as the taker of deferred stops and is still
+      running (:func:`_live_taker`), and this is that change's thread (a stop-signal setter or an
+      inline close the change runs), or a ``log-foundry-`` thread: the call records its own
+      deadline on the taker (:attr:`_Operation.deferred`) and returns, and the taker runs one
+      stop for every deferred call when it ends (:func:`run_deferred_stops`). A drain-thread stop
+      made during a change used to take and close the sink the change installs, which the change
+      then armed again (the ``installed-closed-twice`` cells).
+    - **Otherwise** the call runs here, as before SPEC-097: with no running taker, during a
+      re-entrant change on a library thread, say, or after an interrupt unwound a change before
+      its end, nothing would ever take a deferral.
+
+    The merge reads are lock-free loads of a token set and a thread's name. The deferral's read of
+    the taker and its append are one section of :attr:`Runtime._deferred_lock`, the lock the
+    taker's end holds while it deregisters and takes its deadlines (:func:`end_command_swap`). So
+    a call either appends before the taker takes them, and the taker runs it, or finds no running
+    taker and runs its own stop here. The routes that each left a deferral nobody took (a change
+    that raised, a holder read outside the lock, a stop deferred to a re-entrant change, and an
+    interrupt between a registration and its change's end) all deferred to state that a later
+    statement had to reset; the taker now counts only while its change is on the stack.
+
+    Args:
+      deadline: The stop's own deadline, from its operation, or ``None`` when unbounded.
+
+    Returns:
+      Whether the stop was merged or deferred, so it must not run here.
+
+    Raises:
+      None.
+    """
+    me = threading.get_ident()
+    library = threading.current_thread().name.startswith("log-foundry-")
+    stops = tuple(_state._stops_running)
+    if any(op.thread == me for op in stops) or (library and stops):
+        return True
+    with _state._deferred_lock:
+        taker = _live_taker()
+        if taker is not None and (taker.thread == me or library):
+            taker.deferred.append(deadline)
+            return True
+    return False
+
+
+def _library_locks() -> list[object]:
+    """Returns the locks a lifecycle call takes on its own thread, the ownership oracle (FR-004).
+
+    Each is a ``threading.RLock``, read through ``_is_owned``, the method ``threading.Condition``
+    uses on a lock that has it: it exists on CPython's C ``RLock`` on every supported version but
+    is not in the type stubs. A lifecycle call reads these and never re-enters one. The worker's two
+    are those of the process worker when there is one. ``tests/test_lock_oracle.py`` holds the list
+    to the source: every lock construction is in it or recorded with the reason it is not.
+
+    Args:
+      None.
+
+    Returns:
+      ``Runtime._lock``, ``_CloseRegistry._lock``, ``Runtime._deferred_lock``,
+      ``config._config_lock``, ``decorator._sweep_lock``, ``decorator._loss_lock``, and the
+      worker's ``_lock`` and queue ``mutex`` when a worker exists.
+
+    Raises:
+      None.
+    """
+    from log_foundry import config, decorator
+
+    locks: list[object] = [
+        _state._lock,
+        _state._closes._lock,
+        _state._deferred_lock,
+        config._config_lock,
+        decorator._sweep_lock,
+        decorator._loss_lock,
+    ]
+    worker = _state._worker
+    if worker is not None:
+        locks += [worker._lock, worker._queue.mutex]
+    return locks
+
+
+def in_section() -> bool:
+    """Whether this thread is inside a library lock section, or its own flush's marker wait (FR-004).
+
+    That is what a signal handler or a finalizer that interrupted the library is: a lifecycle call
+    made there would wait on a lock its own thread holds, or on a marker its own thread is waiting
+    for. The test is decided on the calling thread alone, from locks it owns, which is why it is
+    made before FR-002's test, which reads the sink change's holder.
+
+    Args:
+      None.
+
+    Returns:
+      Whether a ``shutdown()`` or ``configure()`` made here must be held, and a ``flush()``
+      refused.
+
+    Raises:
+      None.
+    """
+    if _state._calls_here.flushing:
+        return True
+    return any(lock._is_owned() for lock in _library_locks())  # type: ignore[attr-defined]
+
+
+def hold(call: Callable[[], object]) -> None:
+    """Records a lifecycle call on this thread, to run once it holds no library lock (FR-004).
+
+    Args:
+      call: The held call, taking no arguments.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    calls = _state._calls_here
+    if calls.waiting is None:
+        calls.waiting = []
+    calls.waiting.append(call)
+
+
+def _run_held() -> bool:
+    """Runs this thread's held calls, in order, once it is inside no library section (FR-004).
+
+    Called at the end of every public call that can take a library lock (:func:`runs_held`) and
+    around a stop. A call held while these run is run too, after them. A held call that raises
+    leaves the ones after it held, for the thread's next public call, and the exception propagates
+    as the call's own would have.
+
+    Args:
+      None.
+
+    Returns:
+      Whether any held call ran.
+
+    Raises:
+      BaseException: What a held call raised.
+    """
+    calls = _state._calls_here
+    ran = False
+    while calls.waiting and not in_section():
+        waiting = calls.waiting
+        calls.waiting = []
+        for index, call in enumerate(waiting):
+            try:
+                call()
+            except BaseException:
+                calls.waiting = waiting[index + 1 :] + (calls.waiting or [])
+                raise
+            ran = True
+    return ran
+
+
+def _run_held_unwinding() -> None:
+    """Runs this thread's held calls while an exception unwinds the call, never replacing it.
+
+    A public call that ends in an exception still runs the calls held inside it, so a signal
+    handler that calls ``shutdown()`` and then raises ``SystemExit`` has its stop run as the
+    interrupted call unwinds, even in a process's first log or traced call, before the exit drain
+    is registered. The exception that is unwinding is the caller's and must reach it unchanged, so
+    one a held call raises here is absorbed and announced instead of replacing it; the calls held
+    after that one stay held for the thread's next public call.
+
+    Args:
+      None.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    try:
+        _run_held()
+    except BaseException as exc:
+        _diag.absorbed(
+            "running a held lifecycle call while the call it interrupted unwound",
+            exc,
+            "the call's own exception propagates",
+        )
+
+
+def runs_held[**P, R](fn: Callable[P, R]) -> Callable[P, R]:
+    """Marks a public call that runs its thread's held calls at its end (SPEC-097 FR-004).
+
+    A ``shutdown()`` or ``configure()`` a handler made inside one of this call's lock sections is
+    held, and runs here, at the end of the public call the thread was in, once it holds no library
+    lock. Typed with a ``ParamSpec``: written untyped, the wrapper erased ``configure()``'s
+    signature, and ``tests/test_typed_consumer.py``'s planted bad calls went unreported. The
+    wrapper adds a frame around the whole call, never between a lock's acquire and the code it
+    guards.
+
+    Args:
+      fn: The public call.
+
+    Returns:
+      The wrapped call, carrying ``__log_foundry_runs_held__``.
+
+    Raises:
+      None.
+    """
+
+    @functools.wraps(fn)
+    def held_runner(*args: P.args, **kwargs: P.kwargs) -> R:
+        """Makes the public call, then runs the calls held on this thread during it.
+
+        Args:
+          *args: The call's positional arguments.
+          **kwargs: The call's keyword arguments.
+
+        Returns:
+          What the call returned.
+
+        Raises:
+          BaseException: What the call raised, unchanged, or what a held call raised once the
+            call returned.
+        """
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException:
+            if _state._calls_here.waiting:
+                _run_held_unwinding()
+            raise
+        if _state._calls_here.waiting:
+            _run_held()
+        return result
+
+    held_runner.__log_foundry_runs_held__ = True  # type: ignore[attr-defined]
+    return held_runner
+
+
+def _run_held_stop(deadline: float | None) -> None:
+    """Runs a ``shutdown()`` that was held, with what is left of its own deadline (FR-004).
+
+    Args:
+      deadline: The held call's deadline, from its operation, or ``None``.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: What the stop raises; see :func:`_shutdown_worker`.
+    """
+    _shutdown_worker(_remaining(deadline))
+
+
+def end_command_swap(op: _Operation | None, change: FrameType) -> list[float | None]:
+    """Ends a sink change and, if it is the registered taker, takes its deferred stops (FR-002).
+
+    One section of :attr:`Runtime._deferred_lock`. It ends the operation the change published
+    (:func:`close_command_swap`) and, when the registered taker is this change, deregisters it
+    and takes the deadlines deferred to it. Both are found by the change's frame (``change``) as
+    well as by the local the change bound its operation to, so an interrupt between the
+    publication and that binding still leaves this call the operation to end and the
+    registration to take: ``op`` is ``None`` there, and reading it alone left the taker
+    registered for good (the execution review's ``p4_sweep.py``, rows 31 and 32).
+    :func:`_merged_or_deferred` appends only to a running taker, under the same lock, so every
+    deferral is taken by the change it was deferred to. An interrupt inside this section leaves
+    only state :func:`_live_taker` reads as ended once the change's frame is gone. The section
+    drops each operation's reference to the frame, which would otherwise keep the change's frame
+    and every sink it named alive for as long as the operation is. ``config._sink_holder`` is
+    cleared by the change's own outer ``finally``, not here, so an interrupt in this section never
+    leaves the holder set.
+
+    Args:
+      op: The change's published operation as the change bound it, or ``None`` when it published
+        none (a re-entrant change) or was interrupted before binding it.
+      change: The change's ``config._change_sink`` frame.
+
+    Returns:
+      The deadlines of the stops deferred to this change, for :func:`run_deferred_stops`; empty
+      when it is not the taker.
+
+    Raises:
+      None.
+    """
+    deadlines: list[float | None] = []
+    with _state._deferred_lock:
+        published = _state._calls_here.published
+        if op is None and published is not None and published.change is change:
+            op = published
+        if op is not None:
+            close_command_swap(op)
+        taker = _state._deferred_taker
+        if taker is not None and taker.change is change:
+            _state._deferred_taker = None
+            taker.change = None
+            deadlines, taker.deferred = taker.deferred, []
+        if op is not None:
+            op.change = None
+    return deadlines
+
+
+def run_deferred_stops(
+    deadlines: list[float | None], until: float | None, *, unwinding: bool = False
+) -> None:
+    """Runs, on the changing thread, one stop for the calls deferred during its change (FR-002).
+
+    Called by ``config._change_sink`` on every exit of a non-re-entrant change, after it has
+    released ``config._sink_lock``, with the deadlines :func:`end_command_swap` took. The stop's
+    timeout is what is left of the latest deadline among the deferred calls, or none if any of them
+    was unbounded, cut at the end of the change's budget (``until``), so ``configure()`` keeps
+    invariant 3's bound. It runs with ``detach``: a stop's timeout bounds its drain and its waits
+    but never a ``close()``, so a deferred stop that closed a slow sink inline took ``configure()``
+    to 10.01 s against a 5 s budget (the spec reviewer's ``fr002_bound.py``). A close that outlives
+    the wait goes on on its closer thread and is counted in ``health().closing_sinks``; the next
+    stop, or the exit drain, waits for it as a bystander.
+
+    **A change that raises still runs them** (``unwinding``): a stop-signal setter that defers a
+    ``shutdown()`` and then raises used to leave the deadline queued for the next, unrelated
+    change, which then retired the library at once. While the change's exception unwinds, one the
+    stop raises is absorbed and announced, never put in its place.
+
+    Args:
+      deadlines: The deferred calls' deadlines, ``None`` for an unbounded one.
+      until: The ``time.monotonic()`` instant the change's budget ends, or ``None``.
+      unwinding: Whether the change is ending in an exception.
+
+    Returns:
+      None.
+
+    Raises:
+      BaseException: What the stop raises, on a change that did not raise; see
+        :func:`_shutdown_worker`.
+    """
+    if not deadlines:
+        return
+    bounded = [deadline for deadline in deadlines if deadline is not None]
+    end = None if len(bounded) < len(deadlines) else max(bounded)
+    if until is not None:
+        end = until if end is None else min(end, until)
+    timeout = None if end is None else max(0.0, end - monotonic())
+    if not unwinding:
+        _shutdown_worker(timeout, detach=True)
+        return
+    try:
+        _shutdown_worker(timeout, detach=True)
+    except BaseException as exc:
+        _diag.absorbed(
+            "running a shutdown() deferred to a sink change that raised",
+            exc,
+            "the change's own exception propagates",
+        )
+
+
+def _shutdown_worker(
+    timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT, *, detach: bool = False
+) -> None:
     """Drains and closes every sink the library owes, backing ``shutdown()`` on both paths.
 
     The ``atexit`` registration binds this function, so the exit path gets the bounded form
@@ -5643,8 +6160,34 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
     :func:`_announce_unsettled`, and only if it had still not decided by then: one that decides
     during the drain has its sink closed by this call.
 
+    **A stop made from inside a running command never waits on it** (SPEC-097 FR-002). At its
+    entry :func:`_merged_or_deferred` decides whether this call runs at all: one made on a stop's
+    own thread, or on a ``log-foundry-`` thread while a stop runs, is merged into that stop and
+    returns at once; one made on the thread changing the sink, or on a ``log-foundry-`` thread
+    while a change is in flight, is deferred to that change's end and returns at once. The change
+    then runs one stop for every call deferred during it with ``detach``, so that stop closes
+    nothing on the changing thread: every close it takes is detached and waited for only within
+    its closer grace, which the change's budget bounds.
+
+    **A stop made inside a library lock section is held** (SPEC-097 FR-004), and that test comes
+    first: a signal handler or a finalizer that interrupted the library on this thread would wait
+    on a lock the thread holds, for good. The call is recorded on the thread with its deadline
+    and returns; it runs, with what is left of that deadline, at the end of the public call the
+    thread was in. A stop runs every call held on its thread before it begins, so a held
+    ``configure(sink=...)`` runs while the worker is still live and its sink is closed by this
+    stop, never left after the drain it would race. The calls held during the stop run at the end
+    of the first public call the stop's thread finishes: normally that is this stop, so they run
+    once it is over, here as well as at the end of ``shutdown()``, because the exit drain binds this
+    function directly; but a sink's own code that the stop runs on its thread, an inline ``close()``
+    that logs, say, makes a public call of its own, and that call runs them while the stop is still
+    in progress. No close pass follows them: the only held call that could arm a sink is a held
+    ``configure(sink=...)``, and run after a stop it finds no live worker and nothing owed and arms
+    nothing, as a plain ``configure(sink=...)`` after ``shutdown()`` does.
+
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
+      detach: Whether this is the stop a sink change runs for the calls deferred during it: it
+        is neither merged nor deferred, and every close it takes runs on a closer thread.
 
     Returns:
       None.
@@ -5658,7 +6201,16 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         (:func:`_close_owed`).
     """
     op = _Operation(_Op.STOP, timeout)
+    if not detach:
+        if in_section():
+            hold(functools.partial(_run_held_stop, op.deadline))
+            return
+        if _merged_or_deferred(op.deadline):
+            return
+        _run_held()
+    op.detach = detach
     claimed = False
+    completed = False
     try:
         with _state._lock:
             _state._stops_running.add(op)
@@ -5714,9 +6266,15 @@ def _shutdown_worker(timeout: float | None = DEFAULT_SHUTDOWN_TIMEOUT) -> None:
         _announce_unsettled(op)
         _state._closes.wait_graced(op, None)
         _check_ledger()
+        completed = True
     finally:
         _state._stops_running.discard(op)
         _pay_marks_after_stop()
+        if not detach and _state._calls_here.waiting:
+            if completed:
+                _run_held()
+            else:
+                _run_held_unwinding()
 
 
 def _check_ledger() -> None:
@@ -5865,6 +6423,77 @@ def _take_declines(op: _Operation, worker: Worker | None) -> bool:
         and worker is not None
         and worker._stop is stop
     )
+
+
+def open_command_swap(budget: float | None, installing: Sink, change: FrameType) -> _Operation:
+    """Publishes a sink change in flight before its config write, taking no state lock (FR-001).
+
+    ``config._change_sink`` writes the new sink to the config before :func:`_swap_sink` reaches
+    its first critical section, and a ``shutdown()`` landing between the two used to read no
+    swap in flight, take the sink an orphan log had just armed, and close it, after which the
+    swap armed it again. Publishing the change's operation here makes that ``shutdown()`` meet it
+    as it meets a swap today: it waits, within its closer grace, for the change to decide, and a
+    ``_close_owed`` take that takes ``installing`` marks the change ``withheld``.
+
+    The token is added by one ``set.add`` with no lock, as every token is discarded, so this adds
+    no acquisition of ``_state._lock`` to ``configure()``'s pinned count
+    (``tests/test_runtime_state.py``). :func:`_swap_sink` takes the same operation from this
+    thread and sets its budget from what the wait for ``config._sink_lock`` left. The operation
+    records the change's frame first and is published on this thread before its token is added,
+    so an interrupt at any point leaves what was published findable by that frame
+    (:func:`end_command_swap`).
+
+    **The change registers as the taker of deferred stops** when no running change is registered
+    (:func:`_live_taker`), in one section of :attr:`Runtime._deferred_lock` (FR-002). A
+    ``shutdown()`` defers only to a running taker (:func:`_merged_or_deferred`), and only the
+    taker's own end takes what was deferred to it. A change that is not the taker (a re-entrant
+    one publishes nothing, and a second, unserialized change finds the first running) has no stop
+    deferred to it: a ``shutdown()`` made there runs as it did before SPEC-097, inline or merged
+    into a running stop.
+
+    Args:
+      budget: The change's swap budget, replaced by :func:`_swap_sink` with what is left of it.
+      installing: The sink the change installs.
+      change: The change's ``config._change_sink`` frame.
+
+    Returns:
+      The operation, already in ``_swaps_running``.
+
+    Raises:
+      None.
+    """
+    op = _Operation(_Op.SWAP, budget)
+    op.installing = installing
+    op.change = change
+    _state._calls_here.published = op
+    _state._swaps_running.add(op)
+    with _state._deferred_lock:
+        if _live_taker() is None:
+            _state._deferred_taker = op
+    return op
+
+
+def close_command_swap(op: _Operation) -> None:
+    """Ends a sink change :func:`open_command_swap` published, and drops its sink (SPEC-097 FR-001).
+
+    Sets the operation's ``decided`` event, so no ``shutdown()`` waits on a change that has
+    returned, discards its token lock-free, and clears ``installing``, so a published operation
+    never keeps a superseded sink alive after its ``configure()`` (SPEC-081 FR-001's bound).
+
+    Args:
+      op: The change's operation.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if _state._calls_here.published is op:
+        _state._calls_here.published = None
+    op.decided.set()
+    _state._swaps_running.discard(op)
+    op.installing = None
 
 
 def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> None:
@@ -6086,6 +6715,13 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
     runs last, after ``decided`` is set, so a waiting ``shutdown()`` is not held by its walk, and
     with no lifecycle lock held — only ``config._sink_lock``, where the caller took it.
 
+    **It adopts only its own published change** (SPEC-097 FR-001): the operation its thread
+    published before the config write is taken, and the thread's slot cleared, only when it
+    installs this very sink. A nested ``configure(sink=X)`` made on the changing thread, by a
+    signal handler that interrupted the change between its write and this call, used to clear the
+    outer change's slot, so the outer swap built a fresh operation, its published one was never
+    the one deciding, and FR-001's double close came back.
+
     Args:
       new_sink: The sink to deliver to from now on.
       timeout: Seconds for the drain and the detached closes, or ``None``.
@@ -6102,6 +6738,11 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
         a lost configure.
     """
     op = _Operation(_Op.SWAP, timeout)
+    published = _state._calls_here.published
+    if published is not None and published.installing is new_sink:
+        _state._calls_here.published = None
+        published.budget, published.deadline = op.budget, op.deadline
+        op = published
     closers: list[threading.Thread] = []
     token: object | None = None
     event: threading.Event | None = None
@@ -6160,7 +6801,8 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
                 if hand:
                     token = _open_hand()
                 _register_exit_handler()
-                _state._closes.arm(new_sink)
+                if not op.withheld:
+                    _state._closes.arm(new_sink)
                 if hand:
                     event = _state.refresh_stop_signal()
         if event is not None:
@@ -6178,7 +6820,8 @@ def _swap_sink(new_sink: Sink, timeout: float | None = DEFAULT_SWAP_TIMEOUT) -> 
             else:
                 with _state._lock:
                     _register_exit_handler()
-                    _state._closes.arm(new_sink)
+                    if not (op.withheld and outcome.verdict == "declined"):
+                        _state._closes.arm(new_sink)
                     previous = outcome.previous
                     fenced_out = (
                         outcome.verdict == "fenced"
@@ -6327,6 +6970,20 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     not read: a persistent fault in the ledger then writes one line per call rather than one
     per read, and the call does not wait on a dying drain for counts it will not report.
 
+    **A call made on the live worker's drain thread is refused at once** (SPEC-097 FR-003): it
+    asks that thread to answer a marker, so it waited on itself, its whole timeout or for ever.
+    It returns ``"re-entrant"`` before it sweeps a span, opens its window, queues a marker or
+    flushes a sink's client, so its window is empty and its counts are zero. The thread is
+    compared by identity with the worker's ``_thread``, not by its name: a forked child's
+    forking thread ran on the parent's drain thread and keeps the name, and a refusal by name
+    left two forker cells ``ChildBroken:state`` on the prototype.
+
+    **So is a call made inside a library lock section, or inside this thread's own wait on a
+    marker** (FR-004): a signal handler or finalizer that interrupted the library there would wait
+    on its own thread. Only the wait on the marker is marked, never the whole call: a sink's own
+    ``flush()`` hook, which :func:`_flush_live_sink` calls on this thread holding no lock, makes
+    its lifecycle calls as it always did.
+
     Args:
       timeout: Seconds to wait for the drain, or ``None`` to wait indefinitely.
 
@@ -6370,6 +7027,9 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     from log_foundry.decorator import _sweep_open_spans
     from log_foundry.results import FlushResult
 
+    current = _state.worker_exists()
+    if (current is not None and current._thread is threading.current_thread()) or in_section():
+        return _with_counts(FlushResult(ok=False, reason="re-entrant"), None, None)
     deadline = None if timeout is None else monotonic() + timeout
     start = _open_window()
     counted = start is not None
@@ -6392,10 +7052,14 @@ def _flush_worker(timeout: float | None = 5.0) -> FlushResult:
     marker: _FlushMarker | None = None
     thread_died = False
     if worker is not None:
+        calls = _state._calls_here
+        calls.flushing += 1
         try:
             drained, marker = worker._flush_marked(timeout, counted=counted)
         except Exception:
             thread_died = True
+        finally:
+            calls.flushing -= 1
     end = _close_window(worker, marker, deadline, start) if counted else None
     sink_drained = _flush_live_sink()
     if not swept:

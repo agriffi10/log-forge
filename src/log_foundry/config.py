@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+import sys
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -59,7 +61,7 @@ class Config:
 
 _config = Config()
 
-_config_lock = threading.Lock()
+_config_lock = threading.RLock()
 """Serializes the read-modify-write that replacing a frozen config now is.
 
 Freezing :class:`Config` turned each field assignment into a whole-object
@@ -269,6 +271,7 @@ def _require_factory(value: object) -> None:
         ) from None
 
 
+@_lifecycle.runs_held
 def configure(
     *,
     service: str | None = None,
@@ -358,6 +361,11 @@ def configure(
     the sink change: the change can wait on a drain thread that is itself waiting for the factory
     (``_lifecycle.yielding``).
 
+    Called from a signal handler or a finalizer that interrupted the library inside one of its
+    lock sections, the call is validated, then held: it returns at once and runs, as made, when the
+    interrupted call returns, before any later stop (SPEC-097 FR-004). Made there it re-entered the
+    lock its own thread held, and a change it made could be undone by the section it interrupted.
+
     Args:
       service: The service name stamped onto every event.
       version: The service version stamped onto every event.
@@ -406,6 +414,24 @@ def configure(
         require_sink(sink, "sink")
     if sink_factory is not None:
         _require_factory(sink_factory)
+    copied = None if defaults is None else dict(defaults)
+    if _lifecycle.in_section():
+        _lifecycle.hold(
+            functools.partial(
+                configure,
+                service=service,
+                version=version,
+                env=env,
+                sink=sink,
+                defaults=copied,
+                max_value_bytes=max_value_bytes,
+                max_stack_bytes=max_stack_bytes,
+                max_keys=max_keys,
+                max_depth=max_depth,
+                sink_factory=sink_factory,
+            )
+        )
+        return
 
     changed: dict[str, object] = {
         name: value
@@ -414,7 +440,7 @@ def configure(
             ("version", version),
             ("env", env),
             ("sink", sink),
-            ("defaults", None if defaults is None else dict(defaults)),
+            ("defaults", copied),
             ("max_value_bytes", max_value_bytes),
             ("max_stack_bytes", max_stack_bytes),
             ("max_keys", max_keys),
@@ -469,6 +495,40 @@ def _change_sink(
     since it cannot know whether the call still holding it will close a sink twice or leave the
     config naming another sink than delivery.
 
+    **A non-re-entrant change is in flight from just before its config write** (SPEC-097 FR-001).
+    It publishes its operation through :func:`_lifecycle.open_command_swap` before
+    :func:`_rebind`, so a ``shutdown()`` landing between the write and the swap's first section
+    meets it as it meets a swap, and the same operation is the one :func:`_lifecycle._swap_sink`
+    decides with. In the innermost ``finally``, before the lock is released, one section
+    (:func:`_lifecycle.end_command_swap`) ends that operation and takes the stops deferred during
+    the change, so no deferral lands after the take. Both calls are given this call's frame,
+    which is what identifies the change: a stop defers to it only while that frame is on its
+    thread's stack, so an interrupt that unwinds the change anywhere, including before
+    ``command`` is bound or inside the end section, leaves no registration a later ``shutdown()``
+    or the exit drain would defer to. The frame is passed inline, never bound to a local: a local
+    holding its own frame is a reference cycle that kept this call's frame, its caller's, and
+    every sink they named alive until a garbage collection, on every ``configure(sink=...)`` (the
+    final execution review's ``p_cycle.py``). Once the lock is released, a non-re-entrant change
+    runs one stop for them (FR-002, :func:`_lifecycle.run_deferred_stops`), within what is left of
+    its budget, before ``configure()`` returns, on every exit: a change that raises runs it too,
+    and a failure of that stop never replaces the change's own exception.
+
+    **The lock and the holder are released by their own ``finally``**, outside the end section,
+    each in a ``finally`` of its own, so neither depends on the end section or the other
+    completing. All three ``try`` headers come before the acquire, which is the first statement of
+    the innermost, and the holder is set in the statement after it, so an interrupt there leaves
+    the ``finally`` a ``serialized`` it can trust. The acquire and its assignment are one line:
+    wrapped over three, the assignment's store ran on a line of its own after the acquire
+    returned, and so did a ``try`` header nested after it, an instruction no exception-table
+    entry covers, and an exception raised by a trace function on either left the lock held
+    (``tests/test_change_interrupts.py``). Released from the end
+    section's ``finally``, an interrupt anywhere in that section left ``_sink_lock`` held or
+    ``_sink_holder`` set for good, and every later
+    ``configure(sink=...)`` on the thread was read as re-entrant, wrote the false re-entrant line
+    and left the sink it displaced open (the final execution review's ``p_holder.py``). An
+    interrupt on the release statement itself, or between the acquire's return and its
+    assignment, is the residual no Python statement order closes.
+
     Args:
       changed: The validated fields :func:`configure` is about to write.
       sink: The sink passed, or ``None`` when only a factory was.
@@ -485,59 +545,80 @@ def _change_sink(
     global _sink_holder
     from log_foundry.worker import DEFAULT_SWAP_TIMEOUT
 
+    if _lifecycle.in_section():
+        _lifecycle.hold(functools.partial(_change_sink, changed, sink, sink_factory))
+        return
     budget = DEFAULT_SWAP_TIMEOUT
     started = time.monotonic()
     unbounded = budget is None or budget > threading.TIMEOUT_MAX
     lock = _sink_lock
     me = threading.get_ident()
     reentrant = _sink_holder == me or threading.current_thread().name.startswith("log-foundry-")
+    wait = -1.0 if reentrant or unbounded or budget is None else max(0.0, budget)
     if reentrant:
-        serialized = lock.acquire(blocking=False)
         _diag.pending(
             "configure(sink=...) was called by a sink's own code, from inside the library, and "
             "swapped without waiting or confirming its drain; the sink it displaced is left "
             "open for the exit to close"
         )
-    else:
-        serialized = lock.acquire(timeout=-1 if unbounded else max(0.0, budget))
-        if not serialized:
-            _diag.pending(
-                "configure(sink=...) could not wait for a concurrent sink change within its swap "
-                "budget and proceeded alongside it; a sink both calls touched may be closed "
-                "twice, and the config may name another sink than the one delivered to"
-            )
-    if serialized:
-        _sink_holder = me
+    command: _lifecycle._Operation | None = None
+    completed = False
+    serialized = False
+    deferred: list[float | None] = []
     try:
-        built = False
-        if sink is not None:
-            changed["sink_factory"] = None
-        elif sink_factory is not None and sink_factory is not _config.sink_factory:
-            from log_foundry.sinks._factory import _FactorySink
+        try:
+            try:
+                serialized = lock.acquire(not reentrant, wait)
+                if serialized:
+                    _sink_holder = me
+                elif not reentrant:
+                    _diag.pending(
+                        "configure(sink=...) could not wait for a concurrent sink change within "
+                        "its swap budget and proceeded alongside it; a sink both calls touched "
+                        "may be closed twice, and the config may name another sink than the one "
+                        "delivered to"
+                    )
+                built = False
+                if sink is not None:
+                    changed["sink_factory"] = None
+                elif sink_factory is not None and sink_factory is not _config.sink_factory:
+                    from log_foundry.sinks._factory import _FactorySink
 
-            sink = _FactorySink(sink_factory)
-            built = True
-            changed["sink"] = sink
-            changed["sink_factory"] = sink_factory
-        if sink is not None:
-            _lifecycle.stamp(sink, built=built)
+                    sink = _FactorySink(sink_factory)
+                    built = True
+                    changed["sink"] = sink
+                    changed["sink_factory"] = sink_factory
+                if sink is not None:
+                    _lifecycle.stamp(sink, built=built)
+                    if not reentrant:
+                        command = _lifecycle.open_command_swap(budget, sink, sys._getframe())
 
-        _rebind(**changed)
+                _rebind(**changed)
 
-        _ensure_sink()
+                _ensure_sink()
 
-        if sink is not None:
-            if reentrant:
-                remaining: float | None = 0.0
-            elif unbounded:
-                remaining = None
-            else:
-                remaining = max(0.0, budget - (time.monotonic() - started))
-            _swap_live_sink(sink, remaining)
+                if sink is not None:
+                    if reentrant:
+                        remaining: float | None = 0.0
+                    elif unbounded:
+                        remaining = None
+                    else:
+                        remaining = max(0.0, budget - (time.monotonic() - started))
+                    _swap_live_sink(sink, remaining)
+                completed = True
+            finally:
+                deferred = _lifecycle.end_command_swap(command, sys._getframe())
+        finally:
+            try:
+                if serialized:
+                    lock.release()
+            finally:
+                if serialized:
+                    _sink_holder = None
     finally:
-        if serialized:
-            _sink_holder = None
-            lock.release()
+        _lifecycle.run_deferred_stops(
+            deferred, None if unbounded else started + budget, unwinding=not completed
+        )
 
 
 def _swap_live_sink(sink: Sink, timeout: float | None) -> None:

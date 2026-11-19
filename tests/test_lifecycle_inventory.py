@@ -871,7 +871,12 @@ def _cr(name: str) -> Key:
 
 
 INVENTORY: dict[Key, Row] = {
-    _c("_lifecycle.py", "Runtime.__init__", "self._lock", "Lock"): Row(
+    _c("_lifecycle.py", "Runtime.__init__", "self._deferred_lock", "RLock"): Row(
+        "Runtime",
+        _R,
+        "a leaf: a stop's deferral and a sink change's end each take it once (SPEC-097 FR-002)",
+    ),
+    _c("_lifecycle.py", "Runtime.__init__", "self._lock", "RLock"): Row(
         "Runtime", _R, "the state lock, held across Worker(_ensure_sink())"
     ),
     _c("_lifecycle.py", "Runtime.__init__", "self._stop", "Event"): Row(
@@ -880,7 +885,7 @@ INVENTORY: dict[Key, Row] = {
     _c("_lifecycle.py", "Runtime.refresh_stop_signal", "self._stop", "Event"): Row(
         "Runtime", _R, "the replacement for a set stop signal, for a later deliverer"
     ),
-    _c("_lifecycle.py", "_CloseRegistry.__init__", "self._lock", "Lock"): Row(
+    _c("_lifecycle.py", "_CloseRegistry.__init__", "self._lock", "RLock"): Row(
         "_CloseRegistry",
         _R,
         "the registry's leaf; _closing_now_lock and _closers_lock merged into it (SPEC-078 FR-001)",
@@ -902,6 +907,21 @@ INVENTORY: dict[Key, Row] = {
         "one per SWAP or STOP call, a shutdown's wait on a swap's decision; the token sets "
         "holding it are emptied by _clear_after_fork",
     ),
+    _c("worker.py", "_CountingQueue.__init__", "self.mutex", "RLock"): Row(
+        "_CountingQueue",
+        _NONE,
+        "the queue's mutex, an RLock so a lifecycle call reads its own thread's hold (SPEC-097); "
+        "a child replaces the whole queue (_rebuild_worker_after_fork)",
+    ),
+    _c("worker.py", "_CountingQueue.__init__", "self.not_empty", "Condition"): Row(
+        "_CountingQueue", _NONE, "queue.Queue's condition, rebuilt on the RLock; replaced with it"
+    ),
+    _c("worker.py", "_CountingQueue.__init__", "self.not_full", "Condition"): Row(
+        "_CountingQueue", _NONE, "queue.Queue's condition, rebuilt on the RLock; replaced with it"
+    ),
+    _c("worker.py", "_CountingQueue.__init__", "self.all_tasks_done", "Condition"): Row(
+        "_CountingQueue", _NONE, "queue.Queue's condition, rebuilt on the RLock; replaced with it"
+    ),
     _c("worker.py", "_FlushMarker.__init__", "self.event", "Event"): Row(
         "_FlushMarker", _NONE, "one per flush() call; it lives in the queue a child replaces"
     ),
@@ -914,10 +934,10 @@ INVENTORY: dict[Key, Row] = {
     _c("worker.py", "Worker.__init__", "self._drain_accounted", "Event"): Row(
         "Worker", _W, "the drain loop's third event: its last debit is made (SPEC-089)"
     ),
-    _c("worker.py", "Worker.__init__", "self._lock", "Lock"): Row(
+    _c("worker.py", "Worker.__init__", "self._lock", "RLock"): Row(
         "Worker", _W, "guards the worker's counters, markers and _stopped"
     ),
-    _c("config.py", "<module>", "_config_lock", "Lock"): Row(
+    _c("config.py", "<module>", "_config_lock", "RLock"): Row(
         "config", _R, "no lifecycle state; guards the config rebinding"
     ),
     _c("config.py", "<module>", "_sink_lock", "Lock"): Row(
@@ -933,7 +953,7 @@ INVENTORY: dict[Key, Row] = {
         "_sweep_hold; re-entrant so a collector callback inside a hold never waits on its own "
         "thread (SPEC-091)",
     ),
-    _c("decorator.py", "<module>", "_loss_lock", "Lock"): Row(
+    _c("decorator.py", "<module>", "_loss_lock", "RLock"): Row(
         "decorator", _R, "no lifecycle state; deliberately not the lifecycle lock"
     ),
     _c("_ledger.py", "_Registry.__init__", "self.lock", "RLock"): Row(
@@ -964,6 +984,9 @@ INVENTORY: dict[Key, Row] = {
         "none", _NONE, "the repair's replacement factory, handed back and never kept"
     ),
     _rt("_lock"): Row("Runtime", _R, "the state lock"),
+    _rt("_deferred_lock"): Row(
+        "Runtime", _R, "a stop's deferral and a sink change's end, one section each (SPEC-097)"
+    ),
     _rt("_worker"): Row("Runtime", _INH, "the process worker; guarded by _lock, read unlocked"),
     _rt("_late_worker"): Row(
         "Runtime",
@@ -1048,6 +1071,16 @@ INVENTORY: dict[Key, Row] = {
         "Runtime",
         _INH,
         "the sinks this thread is handing a signal to; a child forked mid-hand keeps them",
+    ),
+    _rt("_deferred_taker"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "the sink change that takes deferred stops while it runs; a child drops it (SPEC-097)",
+    ),
+    _rt("_calls_here"): Row(
+        "Runtime",
+        ("reset: _lifecycle._clear_after_fork",),
+        "this thread's command-path state; a child drops the parent's call in flight (SPEC-097)",
     ),
     _rt("_offering_here"): Row(
         "Runtime",

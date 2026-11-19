@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from log_foundry import _diag, _ledger, context
+from log_foundry import _diag, _ledger, _lifecycle, context
 from log_foundry._lifecycle import _note_orphan_emit
 from log_foundry.config import _ensure_sink
 from log_foundry.console import ConsoleWriter
@@ -138,6 +138,17 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
     for an abandoned span the orphan reuses the span's trace id, span id, parent id, name and
     defaults, and is counted once, on the orphan path. A span that closed normally is untouched.
 
+    **It runs its thread's held lifecycle calls at its end, however it ends** (SPEC-097 FR-004): a
+    ``shutdown()`` or ``configure()`` a signal handler made inside the orphan path's lock section
+    was held there. The body sits in a ``try`` whose ``except BaseException`` runs them before it
+    re-raises, so a handler that holds ``shutdown()`` and then raises ``SystemExit`` has its stop
+    run as this call unwinds, even in a process's first log, before the exit drain is registered;
+    a held call's own exception on that path is absorbed, never put in place of the one unwinding
+    (``_lifecycle._run_held_unwinding``). It is written inline rather than as a wrapping function:
+    a wrapper adds a frame, and under ``core-pipeline/p11_assembly.py``'s recursion faults a
+    ``RecursionError`` raised at that frame skipped this call's own guards and left events
+    unaccounted.
+
     Args:
       level: The severity label to stamp on the event.
       message: The caller-supplied message text.
@@ -148,82 +159,91 @@ def _log(level: str, message: str, echo: bool, fields: dict[str, object]) -> Non
       None.
 
     Raises:
-      None. A logging call must never hand the application an exception from a destination
-        it never chose to talk to; absorbed faults are reported through ``_diag``.
+      BaseException: Only what a lifecycle call a signal handler or finalizer held inside this
+        call raises when it runs at the call's end (SPEC-097 FR-004), or a ``BaseException`` a
+        sink raised, unchanged. A logging call never hands the application an exception from a
+        destination it never chose to talk to; absorbed faults are reported through ``_diag``.
     """
-    baggage = context._live_baggage()
-    span = context.current_span()
-    event: dict[str, object] | None = None
-    if span is not None and not span.closed:
-        _ledger.cell().span += 1
-        appended = False
-        try:
-            event = build_event(span, level, message, fields=fields, baggage=baggage)
-            span.events.append(event)
-            appended = True
-        except Exception as exc:
-            _note_in_span_loss()
-            _diag.absorbed("building an in-span log", exc, "the event was lost")
-        except BaseException:
-            if not appended:
-                _note_in_span_loss()
-            raise
-    else:
-        cell = _ledger.cell()
-        cell.orphan_open += 1
-        cell.orphan += 1
-        try:
-            orphan = (
-                Span(
-                    trace_id=span.trace_id,
-                    span_id=span.span_id,
-                    parent_span_id=span.parent_span_id,
-                    name=span.name,
-                    start_ts=0.0,
-                    defaults=span.defaults,
-                )
-                if span is not None and span.abandoned
-                else Span(
-                    trace_id=new_trace_id(),
-                    span_id=new_span_id(),
-                    parent_span_id=None,
-                    name=message,
-                    start_ts=0.0,
-                )
-            )
-            event = build_event(orphan, level, message, fields=fields, baggage=baggage)
-            sink = _ensure_sink()
-            _note_orphan_emit(sink)
-            delivery = _engine.run_delivery(
-                sink, [event], worker_retries=None, stop=_engine.stop_signal_of(sink)
-            )
-            if delivery is None:
-                sink.emit([event])
-                cell.delivered += 1
-            elif delivery.failed:
-                _note_orphan_loss()
-                _diag.lost(
-                    "event",
-                    1,
-                    f"orphan log not delivered after {delivery.attempts} delivery round(s)",
-                )
-            else:
-                cell.delivered += delivery.accepted
-                cell.skipped += delivery.skipped
-                cell.sink_lost += 1 - delivery.accepted - delivery.skipped
-        except Exception as exc:
-            _note_orphan_loss()
-            _diag.absorbed("emitting an orphan log", exc, "the event was lost")
-        except BaseException:
-            _note_orphan_loss()
-            raise
-        finally:
-            cell.orphan_open -= 1
     try:
-        if echo and event is not None:
-            _console.write(event)
-    except Exception as exc:
-        _diag.absorbed("echoing to the console", exc)
+        baggage = context._live_baggage()
+        span = context.current_span()
+        event: dict[str, object] | None = None
+        if span is not None and not span.closed:
+            _ledger.cell().span += 1
+            appended = False
+            try:
+                event = build_event(span, level, message, fields=fields, baggage=baggage)
+                span.events.append(event)
+                appended = True
+            except Exception as exc:
+                _note_in_span_loss()
+                _diag.absorbed("building an in-span log", exc, "the event was lost")
+            except BaseException:
+                if not appended:
+                    _note_in_span_loss()
+                raise
+        else:
+            cell = _ledger.cell()
+            cell.orphan_open += 1
+            cell.orphan += 1
+            try:
+                orphan = (
+                    Span(
+                        trace_id=span.trace_id,
+                        span_id=span.span_id,
+                        parent_span_id=span.parent_span_id,
+                        name=span.name,
+                        start_ts=0.0,
+                        defaults=span.defaults,
+                    )
+                    if span is not None and span.abandoned
+                    else Span(
+                        trace_id=new_trace_id(),
+                        span_id=new_span_id(),
+                        parent_span_id=None,
+                        name=message,
+                        start_ts=0.0,
+                    )
+                )
+                event = build_event(orphan, level, message, fields=fields, baggage=baggage)
+                sink = _ensure_sink()
+                _note_orphan_emit(sink)
+                delivery = _engine.run_delivery(
+                    sink, [event], worker_retries=None, stop=_engine.stop_signal_of(sink)
+                )
+                if delivery is None:
+                    sink.emit([event])
+                    cell.delivered += 1
+                elif delivery.failed:
+                    _note_orphan_loss()
+                    _diag.lost(
+                        "event",
+                        1,
+                        f"orphan log not delivered after {delivery.attempts} delivery round(s)",
+                    )
+                else:
+                    cell.delivered += delivery.accepted
+                    cell.skipped += delivery.skipped
+                    cell.sink_lost += 1 - delivery.accepted - delivery.skipped
+            except Exception as exc:
+                _note_orphan_loss()
+                _diag.absorbed("emitting an orphan log", exc, "the event was lost")
+            except BaseException:
+                _note_orphan_loss()
+                raise
+            finally:
+                cell.orphan_open -= 1
+        try:
+            if echo and event is not None:
+                _console.write(event)
+        except Exception as exc:
+            _diag.absorbed("echoing to the console", exc)
+    except BaseException:
+        if _lifecycle._state._calls_here.waiting:
+            _lifecycle._run_held_unwinding()
+        raise
+    if _lifecycle._state._calls_here.waiting:
+        _lifecycle._run_held()
 
 
 def _merge(fields: Mapping[str, object] | None, kv: dict[str, object]) -> dict[str, object]:
@@ -297,7 +317,8 @@ def debug(
       None.
 
     Raises:
-      None.
+      BaseException: Only what a lifecycle call held inside this call raises when it runs at
+        the call's end (SPEC-097 FR-004), or a ``BaseException`` the sink raised.
     """
     _log("DEBUG", message, echo, _merge(fields, kv))
 
@@ -324,7 +345,8 @@ def info(
       None.
 
     Raises:
-      None.
+      BaseException: Only what a lifecycle call held inside this call raises when it runs at
+        the call's end (SPEC-097 FR-004), or a ``BaseException`` the sink raised.
     """
     _log("INFO", message, echo, _merge(fields, kv))
 
@@ -351,7 +373,8 @@ def warning(
       None.
 
     Raises:
-      None.
+      BaseException: Only what a lifecycle call held inside this call raises when it runs at
+        the call's end (SPEC-097 FR-004), or a ``BaseException`` the sink raised.
     """
     _log("WARNING", message, echo, _merge(fields, kv))
 
@@ -378,7 +401,8 @@ def error(
       None.
 
     Raises:
-      None.
+      BaseException: Only what a lifecycle call held inside this call raises when it runs at
+        the call's end (SPEC-097 FR-004), or a ``BaseException`` the sink raised.
     """
     _log("ERROR", message, echo, _merge(fields, kv))
 
@@ -405,6 +429,7 @@ def critical(
       None.
 
     Raises:
-      None.
+      BaseException: Only what a lifecycle call held inside this call raises when it runs at
+        the call's end (SPEC-097 FR-004), or a ``BaseException`` the sink raised.
     """
     _log("CRITICAL", message, echo, _merge(fields, kv))
