@@ -147,7 +147,9 @@ have landed.
   - on a replicated ClickHouse table;
   - on a `MongoDBSink`-style destination that refuses the copy, which no counted sink is;
   - wherever a client that retries internally raised for a call none of whose attempts landed.
-    That is every failed AWS, Event Hubs, Redis and ClickHouse call the sink cannot tell apart.
+    That is every failed AWS, Event Hubs, Redis and ClickHouse call the sink cannot tell apart;
+  - a re-offer the sink refuses unsent, because it was closed during the backoff. The count is
+    taken when the engine offers the event again, so the closed sink's refusal still counts it.
 - **It under-counts** in three ways:
   - **A cleared class that did leave.** It misses a copy only if an exception FR-002 clears did in
     fact leave a request on the wire: a `urllib` `URLError`, a socket that could not connect or was
@@ -348,7 +350,9 @@ docstring carries:
 - [ ] An `HTTPSink` round answered `503` and then `200` counts `resent` equal to the chunk's
       events. One answered `429` and then `200` counts 0 (invariant 7).
 - [ ] A `PostgresSink` transaction whose `executemany` raises `08006` counts 0. One whose `commit()`
-      raises `08006`, `57P01` or `XX000`, or raises with no SQLSTATE, counts every row. One whose
+      raises `08006` or `57P01`, or raises with no SQLSTATE, counts every row. One whose `commit()`
+      raises `XX000` is classified as a call that may have landed, but `_retryable_error` does not
+      retry class `XX`, so the round is `REJECTED`, makes one attempt and counts 0. One whose
       `commit()` raises `40001` counts 0 (invariant 2).
 - [ ] A test derives the engine sinks from the tree. It fails for any sink that is in `EXEMPT` and
       marks in its test, and for any sink that is neither in `EXEMPT` nor marking in one of this
@@ -894,3 +898,8 @@ So the engine does not bound a resend to the de-duplication interval.
 - **Corrected on 2026-11-19 at build start.** FR-004 named the prototype's round wrapper in `runs()`;
   SPEC-092's build delivered it as `conformance_backend.Recorder`, and the text now says so. A
   rename, not a change of scope.
+- **Corrected on 2026-11-19 at build start, decided in session.** FR-002's `PostgresSink` criterion
+  said a `commit()` raising `XX000` counts every row, but `_retryable_error` does not retry class
+  `XX`, so nothing is resent: the criterion now says such a call is classified as one that may have
+  landed and counts 0. *The bound*'s over-count list gains a re-offer the sink refuses unsent
+  because it was closed during the backoff, since the count is taken on the offer, as FR-001 says.

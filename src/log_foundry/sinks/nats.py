@@ -2040,9 +2040,13 @@ def _unlocked(counters: SinkCounters) -> SinkLosses:
       counters: The sink's counters.
 
     Returns:
-      Both totals as a ``SinkLosses``.
+      The totals as a ``SinkLosses``.
 
     Raises:
       None.
     """
-    return SinkLosses(dropped=counters.dropped_events, failed=counters.failed_events)
+    return SinkLosses(
+        dropped=counters.dropped_events,
+        failed=counters.failed_events,
+        resent=counters.resent_events,
+    )

@@ -120,6 +120,7 @@ def test_lost_without_a_detail_omits_the_semicolon(err: _Stderr) -> None:
         lambda: _diag.lost("event", 3, "a detail"),
         lambda: _diag.rejected("unparseable traceparent", "00-bad"),
         lambda: _diag.pending("a detail"),
+        lambda: _diag.resent(3, "a detail"),
     ],
 )
 def test_every_line_is_single_and_prefixed(err: _Stderr, write: Callable[[], None]) -> None:
@@ -671,11 +672,12 @@ def test_the_engines_diagnostics_are_on_the_roster() -> None:
         call.func.attr
         for call in _diag_calls(ast.parse(engine.read_text(encoding="utf-8")))
         if isinstance(call.func, ast.Attribute)
-        and call.func.attr in {"lost", "absorbed", "pending"}
+        and call.func.attr in {"lost", "absorbed", "pending", "resent"}
     )
-    assert writers == ["absorbed", "absorbed", "absorbed", "lost", "lost"], (
-        "the engine writes three absorbed lines and two lost lines — a settled run's loss and, "
-        f"since SPEC-074, a settled run's refused events — as _diag calls: {writers}"
+    assert writers == ["absorbed", "absorbed", "absorbed", "lost", "lost", "resent"], (
+        "the engine writes three absorbed lines, two lost lines — a settled run's loss and, "
+        "since SPEC-074, a settled run's refused events — and, since SPEC-095, one resent line, "
+        f"as _diag calls: {writers}"
     )
 
 
@@ -787,21 +789,22 @@ def test_the_stderr_walker_states_what_it_does_not_catch(source: str) -> None:
     assert _stderr_writes(ast.parse(source)) == []
 
 
-def test_diag_still_has_exactly_the_five_writes_it_documents() -> None:
+def test_diag_still_has_exactly_the_six_writes_it_documents() -> None:
     """A tripwire, separate from the vacuity check above, and deliberately brittle.
 
-    ``_diag``'s own docstring names four writers, one per kind of line: ``absorbed``, ``lost``,
-    ``rejected`` and, since SPEC-068 FR-001, ``pending``, and since SPEC-103 FR-001 a fifth
-    write, ``take_folded``'s, which writes the lines folded at exit. A sixth is fine — it just
-    has to be a decision, taken with the docs in front of you, rather than a quiet sixth spelling
-    of a line the others already write.
+    ``_diag``'s own docstring names five writers, one per kind of line: ``absorbed``, ``lost``,
+    ``rejected``, since SPEC-068 FR-001 ``pending``, and since SPEC-095 FR-001 ``resent``, for
+    events sent again after a send that may have landed them; and since SPEC-103 FR-001 a sixth
+    write, ``take_folded``'s, which writes the lines folded at exit. A seventh is fine — it just
+    has to be a decision, taken with the docs in front of you, rather than a quiet seventh
+    spelling of a line the others already write.
     """
     writes = _stderr_writes(ast.parse((_SRC / "_diag.py").read_text(encoding="utf-8")))
-    assert len(writes) == 5, (
-        f"_diag has {len(writes)} stderr writes, not 5 — if a write was added, update "
+    assert len(writes) == 6, (
+        f"_diag has {len(writes)} stderr writes, not 6 — if a write was added, update "
         f"_diag's docstring to match"
     )
-    assert "Five stderr writes" in (_diag.__doc__ or ""), "the docstring names the five writes"
+    assert "Six stderr writes" in (_diag.__doc__ or ""), "the docstring names the six writes"
 
 
 # -- SPEC-063 FR-004: the announcement names the type's stored name ---------------------------
@@ -915,6 +918,7 @@ def test_each_writer_folds_inside_the_window_and_take_writes_one_line_per_key(
             _diag.lost("event", count, "Sink, refused")
             _diag.absorbed("sending a batch", ConnectionError(), "Sink")
             _diag.pending("Sink, a request may still land")
+            _diag.resent(count, "Sink")
         _diag.lost("event", 7)
 
     _folding(table, write)
@@ -927,6 +931,10 @@ def test_each_writer_folds_inside_the_window_and_take_writes_one_line_per_key(
             f"2 {_TAIL}"
         ),
         f"log-foundry: Sink, a request may still land; 2 {_TAIL}",
+        (
+            "log-foundry: resent 5 event(s) a lost reply may have landed; they may be duplicated; "
+            f"Sink; 2 {_TAIL}"
+        ),
         f"log-foundry: lost 7 event(s); 1 {_TAIL}",
     ]
     assert table.rows == {}, "the take clears the table"

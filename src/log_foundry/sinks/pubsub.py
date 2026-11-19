@@ -187,7 +187,7 @@ class GooglePubSubSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.rejected, failed=self.failed)
+            return SinkLosses(dropped=self.rejected, failed=self.failed, resent=0)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Publishes one message per event, then reaps the futures that have settled (FR-008).

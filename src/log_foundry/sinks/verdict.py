@@ -187,10 +187,13 @@ class SinkCounters:
         exact, each event once and in no other term.
       failed_events: Events attempted and not confirmed; an upper bound, like every sink's
         ``failed``.
+      resent_events: Events the engine offered again after a round that marked them as possibly
+        landed (SPEC-095), committed on a settled run and on a failed one, since the sends
+        happened either way; an upper bound on the copies a destination may hold twice.
     """
 
     def __init__(self) -> None:
-        """Starts both counters at zero with a fresh counter lock.
+        """Starts every counter at zero with a fresh counter lock.
 
         Args:
           None.
@@ -203,11 +206,12 @@ class SinkCounters:
         """
         self.dropped_events = 0
         self.failed_events = 0
+        self.resent_events = 0
         self._counter_lock = threading.Lock()
         _LIVE_COUNTERS.add(self)
 
     def losses(self) -> SinkLosses:
-        """Returns both counters as one snapshot, read under the counter lock.
+        """Returns the counters as one snapshot, read under the counter lock.
 
         Args:
           None.
@@ -221,7 +225,8 @@ class SinkCounters:
         with self._counter_lock:
             dropped = self.dropped_events
             failed = self.failed_events
-        return SinkLosses(dropped=dropped, failed=failed)
+            resent = self.resent_events
+        return SinkLosses(dropped=dropped, failed=failed, resent=resent)
 
 
 def _bound_deliver(sink: object, *, override_rule: bool, skip_none: bool) -> object | None:

@@ -578,7 +578,7 @@ def test_a_forked_child_runs_a_wrapper_while_the_parent_holds_the_shared_lock(ki
         holder.join(5.0)
         own_holder.join(5.0)
     assert child.finished, f"the child {child.ending}, having written {child.output!r}"
-    assert child.output == "False SinkLosses(dropped=1, failed=1) True", child.output
+    assert child.output == "False SinkLosses(dropped=1, failed=1, resent=0) True", child.output
 
 
 def test_the_fork_walk_writes_a_set_only_descriptor_without_running_it() -> None:

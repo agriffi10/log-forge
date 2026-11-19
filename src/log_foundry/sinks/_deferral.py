@@ -231,5 +231,5 @@ def wrapped_losses(inner: SinkLosses | None, own: int) -> SinkLosses | None:
     if not own:
         return inner
     if inner is None:
-        return SinkLosses(dropped=own, failed=0)
-    return SinkLosses(dropped=inner.dropped + own, failed=inner.failed)
+        return SinkLosses(dropped=own, failed=0, resent=0)
+    return SinkLosses(dropped=inner.dropped + own, failed=inner.failed, resent=inner.resent)

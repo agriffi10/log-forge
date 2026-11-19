@@ -485,7 +485,8 @@ def test_marks_outside_any_run_do_nothing() -> None:
     context.final_rejections({0})
     context.refuse(Refused("x"))
     context.sink_counted({0})
-    assert context._marks() == ((), None, ())
+    context.may_have_landed({0})
+    assert context._marks() == _engine._Marks((), None, (), ())
 
 
 # --- frame-2 review: the one-lock commit is all or nothing ----------------------------------------

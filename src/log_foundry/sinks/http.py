@@ -3121,6 +3121,7 @@ class HTTPSink:
             return SinkLosses(
                 dropped=self.dropped_oversized + self._unrenderable,
                 failed=self.failed + self.dropped_unadjudicated,
+                resent=self.log_foundry_counters.resent_events,
             )
 
     def close(self) -> None:
@@ -3158,7 +3159,12 @@ class HTTPSink:
         lines are its own run's, committed when that run ends, so it makes ``max_retries + 1``
         attempts and counts as 1.x did even when called from inside another run's round, waiting
         inside that round. The engine's event totals for it go to a throwaway ``SinkCounters``:
-        a request is not an event.
+        a request is not an event. Its resends of a request that may have landed — a timeout, a
+        lost connection, a ``5xx`` — are the exception (SPEC-095): the engine commits them to this
+        sink's own ``log_foundry_counters.resent_events`` (``resent_into``) and writes their one
+        line, so ``losses().resent`` reports them. ``SentrySink``'s backend sends one event per
+        request, so its count is in events; a third-party subclass on this path counts requests,
+        as ``failed`` does.
 
         A failure **before** any status line that :meth:`_retryable_error` accepts — an
         ``OSError``, a ``URLError``, an ``http.client.HTTPException`` such as ``BadStatusLine``
@@ -3245,6 +3251,7 @@ class HTTPSink:
             worker_retries=0,
             stop=_engine.stop_signal_of(self),
             decline=None,
+            resent_into=self.log_foundry_counters,
         )
         if sent.raised is not None:
             raise sent.raised

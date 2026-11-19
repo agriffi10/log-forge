@@ -78,7 +78,14 @@ EXCLUSIONS: dict[str, str] = {
 NO_EMIT = {"SocketTransport": "a transport, not a structural Sink: deliver and no emit (FR-005)"}
 
 COUNTERS = frozenset(
-    {"failed", "failed_events", "dropped_events", "dropped_oversized", "dropped_unadjudicated"}
+    {
+        "failed",
+        "failed_events",
+        "dropped_events",
+        "resent_events",
+        "dropped_oversized",
+        "dropped_unadjudicated",
+    }
 )
 WRITERS = frozenset({"__init__", "failed", "_counter_lock"})
 """Where a counter store is allowed: construction and the two setters."""
@@ -254,6 +261,11 @@ _PLANTS = {
     "a dropped_oversized store": (
         _GOOD + "\n    def _round(self, batch):\n        self.dropped_oversized += 1\n",
         "_round stores self.dropped_oversized",
+    ),
+    "a resent_events store": (
+        _GOOD
+        + "\n    def _round(self, batch):\n        self.log_foundry_counters.resent_events += 1\n",
+        "_round stores self.log_foundry_counters.resent_events",
     ),
     "a count against failed": (
         _GOOD

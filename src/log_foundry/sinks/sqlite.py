@@ -287,7 +287,7 @@ class SQLiteSink:
         with self._counter_lock:
             if not (self._unencodable or self._failed):
                 return None
-            return SinkLosses(dropped=self._unencodable, failed=self._failed)
+            return SinkLosses(dropped=self._unencodable, failed=self._failed, resent=0)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Inserts every event in one transaction (FR-003).

@@ -61,10 +61,15 @@ class SinkLosses:
         buffer refused, which is backpressure instead; the stderr line names which.
       failed: Delivery was attempted and the destination did not confirm it, so the fix is the
         destination or the network.
+      resent: Events the delivery engine sent again after a send that may have landed them, so
+        each may be held twice at the destination (SPEC-095). Not a loss and an upper bound, as
+        ``failed`` is. Appended with a default of ``0``, so a ``SinkLosses`` built with the two
+        keywords above still builds and still equals one with ``resent=0``.
     """
 
     dropped: int
     failed: int
+    resent: int = 0
 
 
 @runtime_checkable
