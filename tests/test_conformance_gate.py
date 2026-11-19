@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import collections
+import dataclasses
 import inspect
 import pathlib
 import socket
@@ -541,8 +542,8 @@ def test_a_flush_interval_default_that_is_gone_fails_the_row(
 # The assertion (FR-003).
 
 
-def test_the_checks_are_the_seven_of_fr_003_in_order() -> None:
-    """FR-003: a verdict lists the failed checks in this order."""
+def test_the_checks_are_the_eight_of_fr_003_and_spec_095_in_order() -> None:
+    """FR-003, and SPEC-095 FR-004: `resent-when-knowable` follows `ambiguous-when-knowable`."""
     assert tuple(name for name, _ in cb.CHECKS) == (
         "partition",
         "silent-loss",
@@ -550,6 +551,7 @@ def test_the_checks_are_the_seven_of_fr_003_in_order() -> None:
         "lost-but-held",
         "unannounced",
         "ambiguous-when-knowable",
+        "resent-when-knowable",
         "ledger",
     )
 
@@ -637,6 +639,7 @@ def _per_batch(**fields: Any) -> cb.Report:
 
 
 _ONCE = {"e1": 1, "e2": 1}
+_TWICE = {"e1": 2, "e2": 1}
 
 _PER_EVENT_CASES: list[tuple[str, cb.Backend, cb.Report, tuple[str, ...]]] = [
     ("passes", _backend(_ONCE), _per_event(), ()),
@@ -705,6 +708,40 @@ _PER_EVENT_CASES: list[tuple[str, cb.Backend, cb.Report, tuple[str, ...]]] = [
         _per_event(),
         ("silent-loss", "duplicate"),
     ),
+    (
+        "duplicate-counted-passes",
+        _backend(_TWICE, unknowable=("e1",)),
+        _per_event(resent={"e1": 1}, batch_resends=((1, 1),)),
+        (),
+    ),
+    (
+        "duplicate-beyond-its-count",
+        _backend({"e1": 3, "e2": 1}, unknowable=("e1",)),
+        _per_event(resent={"e1": 1}, batch_resends=((1, 1),)),
+        ("duplicate",),
+    ),
+    (
+        "resent-when-knowable",
+        _backend(_TWICE),
+        _per_event(resent={"e1": 1}, batch_resends=((1, 1),)),
+        ("resent-when-knowable",),
+    ),
+    (
+        "unannounced-by-a-silent-resend",
+        _backend(_TWICE, unknowable=("e1",)),
+        _per_event(resent={"e1": 1}, batch_resends=((1, 0),)),
+        ("unannounced",),
+    ),
+    (
+        "partition-by-the-resend-count",
+        _backend(_TWICE, unknowable=("e1",)),
+        _per_event(
+            resent={"e1": 1},
+            batch_resends=((1, 1),),
+            disagreement="reconstructed 1 resend(s) against Delivery 0",
+        ),
+        ("partition",),
+    ),
 ]
 
 _PER_BATCH_CASES: list[tuple[str, cb.Backend, cb.Report, tuple[str, ...]]] = [
@@ -737,6 +774,30 @@ _PER_BATCH_CASES: list[tuple[str, cb.Backend, cb.Report, tuple[str, ...]]] = [
         ("partition", "unannounced"),
     ),
     ("ledger-by-unaccounted", _backend(_ONCE), _per_batch(unaccounted=-1), ("ledger",)),
+    (
+        "duplicate-counted-passes",
+        _backend(_TWICE, unknowable=("e1",)),
+        _per_batch(resent_counted=1, batch_resends=((1, 1),)),
+        (),
+    ),
+    (
+        "duplicate-beyond-its-count",
+        _backend({"e1": 3, "e2": 1}, unknowable=("e1",)),
+        _per_batch(resent_counted=1, batch_resends=((1, 1),)),
+        ("duplicate",),
+    ),
+    (
+        "resent-when-every-call-was-knowable",
+        _backend(_TWICE),
+        _per_batch(resent_counted=1, batch_resends=((1, 1),)),
+        ("resent-when-knowable",),
+    ),
+    (
+        "unannounced-by-a-silent-resend",
+        _backend(_TWICE, unknowable=("e1",)),
+        _per_batch(resent_counted=1, batch_resends=((1, 0),)),
+        ("unannounced",),
+    ),
     (
         "ledger-by-a-term",
         _backend(_ONCE),
@@ -784,6 +845,119 @@ def test_a_check_removed_from_judge_frees_the_row_it_holds(
     assert removed in held, held
     monkeypatch.setattr(cb, "CHECKS", tuple(c for c in cb.CHECKS if c[0] != removed))
     assert cb.run_row(_row(row_id)).verdict == verdict
+
+
+def _round(
+    carried: list[str],
+    outcomes: object,
+    reached: tuple[str, ...] = (),
+    run_id: int = 0,
+    sink: object = "s",
+) -> cb.Round:
+    """A hand-built round: a `Verdict` of `outcomes` when they are a list, else `outcomes` as is.
+
+    Args:
+      carried: The tokens it carried.
+      outcomes: Its outcomes, or a raw result.
+      reached: The tokens it marked.
+      run_id: Its run.
+      sink: Its sink.
+
+    Returns:
+      The round.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks.verdict import Verdict
+
+    result = Verdict(outcomes=tuple(outcomes)) if isinstance(outcomes, list) else outcomes
+    return cb.Round(sink, carried, result, run_id, frozenset(reached))
+
+
+def _resend_cases() -> list[tuple[str, list[cb.Round], dict[str, int]]]:
+    """`resends_from`'s fixture corpus: rounds and the resends they reconstruct to.
+
+    Args:
+      None.
+
+    Returns:
+      `(id, rounds, resends)` triples.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks.verdict import Outcome
+
+    a, r = Outcome.ACCEPTED, Outcome.RETRYABLE
+    return [
+        ("marked-then-offered", [_round(_E, [r, r], ("e1",)), _round(_E, [a, a])], {"e1": 1}),
+        (
+            "marked-twice",
+            [_round(_E, [r, r], ("e1",)), _round(_E, [r, r], ("e1",)), _round(_E, [a, a])],
+            {"e1": 2},
+        ),
+        ("unreadable", [_round(_E, None, ("e1", "e2")), _round(_E, [a, a])], {}),
+        ("too-short", [_round(_E, [r], ("e1", "e2")), _round(_E, [a, a])], {}),
+        ("not-retryable", [_round(_E, [a, r], ("e1",)), _round(_E, [a, a])], {}),
+        (
+            "raised-after-a-marked-round",
+            [
+                _round(_E, [r, r], ("e1",)),
+                _round(_E, ConnectionError("x"), ("e1",)),
+                _round(_E, [a, a]),
+            ],
+            {"e1": 1},
+        ),
+        (
+            "another-run-and-another-sink",
+            [
+                _round(_E, [r, r], ("e1",), run_id=1),
+                _round(_E, [r, r], ("e1",), sink="other"),
+                _round(_E, [a, a]),
+            ],
+            {},
+        ),
+        ("never-offered-again", [_round(_E, [r, a], ("e1",))], {}),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rounds", "resends"),
+    [pytest.param(rounds, resends, id=name) for name, rounds, resends in _resend_cases()],
+)
+def test_resends_from_rebuilds_each_offer_after_a_mark(
+    rounds: list[cb.Round], resends: dict[str, int]
+) -> None:
+    """SPEC-095 FR-004: the reconstruction counts an offer only after a readable `RETRYABLE` mark."""
+    assert cb.resends_from(rounds, "s", 0) == resends
+
+
+@pytest.mark.parametrize(
+    ("resent", "delivered", "found"),
+    [
+        ({"e1": 1}, 0, "reconstructed 1 resend(s) against Delivery 0"),
+        ({}, 1, "reconstructed 0 resend(s) against Delivery 1"),
+        ({"e1": 2, "e2": 1}, 3, None),
+        ({}, 0, None),
+    ],
+    ids=["reconstructed-more", "delivery-more", "agree", "neither"],
+)
+def test_resends_agree_compares_the_reconstruction_with_the_delivery(
+    resent: dict[str, int], delivered: int, found: str | None
+) -> None:
+    """SPEC-095 FR-004: the oracle, on a real `Delivery`, settled and failed alike."""
+    from log_foundry.sinks import _engine
+
+    for failed in (False, True):
+        delivery = dataclasses.replace(_engine._SETTLED_EMPTY, resent=delivered, failed=failed)
+        assert cb.resends_agree(resent, delivery) == found
+
+
+def test_resends_agree_reads_a_delivery_without_the_field_as_zero() -> None:
+    """SPEC-095 FR-004: the corpus still judges a tree that predates `Delivery.resent`."""
+    assert cb.resends_agree({}, object()) is None
+    assert cb.resends_agree({"e1": 1}, object()) == "reconstructed 1 resend(s) against Delivery 0"
 
 
 def test_fate_of_misreading_rejected_is_caught_by_the_delivery_comparison(

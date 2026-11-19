@@ -456,7 +456,7 @@ class MongoClient:
                 errors.append({"index": index, "code": 121, "errmsg": "validation"})
                 continue
             if document["_id"] in self.ids:
-                errors.append({"index": index, "code": 11000, "errmsg": "duplicate key"})
+                errors.append(_duplicate_id(index, document["_id"]))
                 continue
             self.ids.add(document["_id"])
             self.backend.take([token])
@@ -466,6 +466,33 @@ class MongoClient:
         if errors:
             raise _bulk_error({"writeErrors": errors})
         return object()
+
+
+def _duplicate_id(index: int, value: object) -> dict[str, Any]:
+    """A `writeErrors` entry in the server's shape for a duplicate `_id` (SPEC-095).
+
+    MongoDB names the index both in `keyPattern` and in the `errmsg` text, and gives the
+    duplicate value in `keyValue`.
+
+    Args:
+      index: The document's position in the insert.
+      value: Its `_id`.
+
+    Returns:
+      The entry.
+
+    Raises:
+      None.
+    """
+    return {
+        "index": index,
+        "code": 11000,
+        "errmsg": (
+            f"E11000 duplicate key error collection: d.c index: _id_ dup key: {{ _id: {value} }}"
+        ),
+        "keyPattern": {"_id": 1},
+        "keyValue": {"_id": value},
+    }
 
 
 def _bulk_error(details: dict[str, Any]) -> Exception:
@@ -1201,6 +1228,8 @@ class PGCursor:
             self.conn.backend.take(carried)
             return
         self.conn.statements += 1
+        if not self.conn.txn:
+            self.conn.txn_from = len(self.conn.backend.calls) - 1
         if action == "refuse":
             self.conn.backend.apply()
             raise _pg_error("could not serialize access", "40001")
@@ -1242,6 +1271,7 @@ class PGConnection:
         self.broken = False
         self.statements = 0
         self.lose_commit_reply = False
+        self.txn_from = 0
 
     def check(self) -> None:
         """Raises as psycopg does on a closed connection.
@@ -1291,6 +1321,9 @@ class PGConnection:
     def commit(self) -> None:
         """Makes the transaction durable; under `reply-lost`, then drops the connection.
 
+        A lost commit reply leaves every call of the transaction unknowable, not only its first
+        statement, since the commit applied every chunk (SPEC-095).
+
         Args:
           None.
 
@@ -1305,6 +1338,8 @@ class PGConnection:
         self.txn = []
         if self.lose_commit_reply:
             self.lose_commit_reply = False
+            for call in self.backend.calls[self.txn_from :]:
+                call.knowable = False
             self.drop()
             raise _pg_error("server closed the connection unexpectedly", "08006")
 
