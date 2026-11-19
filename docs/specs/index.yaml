@@ -634,7 +634,7 @@ specs:
   - id: "SPEC-095"
     title: "A Resend After a Lost Reply Is Counted, and Its Key Is the Event's Own `log_id`"
     description: "Counts and announces every event the delivery engine sends again after a send that may have landed it, has each shipped sink mark such sends, counting every raise from a client that retries internally, reads a MongoDB duplicate driver-stamped _id on such a resend as delivery, and settles that the event's log_id, already in every body, is the idempotency key and what a sink must prove before it declares itself idempotent, so SPEC-092's 50 reply-resent rows and two MongoDB rows turn green and 19 rows move to new departures."
-    spec_status: "Draft"
+    spec_status: "In Progress"
     depends_on: ["SPEC-072", "SPEC-073", "SPEC-074", "SPEC-075", "SPEC-088", "SPEC-092"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-095-resends-after-a-lost-reply.md"
