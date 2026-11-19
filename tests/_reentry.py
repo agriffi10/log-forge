@@ -29,7 +29,7 @@ _RECORD = os.environ.get("LOG_FOUNDRY_REENTRY_RECORD")
 def _write(line: str) -> None:
     if _RECORD is None:
         return
-    fd = os.open(_RECORD, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    fd = os.open(_RECORD, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         os.write(fd, f"{os.getpid()} {line}\n".encode())
     finally:
