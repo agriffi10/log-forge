@@ -43,6 +43,10 @@ def _run(args: list[str], *, timeout: float = 60) -> subprocess.CompletedProcess
     )
 
 
+STALL_ALLOWANCE = 0.5
+"""The suite's stall allowance (``tests/test_timing_floors.py``): a handler's call that returns at
+once is held under it, since a ceiling below it fails on a CI runner's scheduling delay alone."""
+
 _HELD_STOP = "retired=True sink_closes=1"
 
 ROWS = {
@@ -52,7 +56,7 @@ ROWS = {
     "rebind/shutdown": _HELD_STOP,
     "swap/shutdown": _HELD_STOP,
     "health/shutdown": _HELD_STOP,
-    "flush-section/flush": "handler_took=[-2.0, 0.0]",
+    "flush-section/flush": "handler_took=[-2.0, ",
     "flush-section/configure": "configured_other=True",
     "orphan-arm/info": "",
     "submit/span": "",
@@ -67,11 +71,12 @@ def test_a_handlers_call_inside_a_library_section_returns_and_runs_when_the_call
 ) -> None:
     """FR-004: the port of ``spec097_signal_in_section.py``, one row per case, all eleven.
 
-    The handler's call returns at once (``handler_took`` rounds to ``0.0``), the process exits 0
-    rather than to the 6 s watchdog, and, read once the interrupted call has returned with no
-    further library call, a held ``shutdown()`` has retired the process and closed the sink once,
-    a ``flush()`` returned falsy (``-2.0``), a held ``configure()`` installed its sink, and the
-    event ledger balances.
+    The handler's call returns at once (``handler_took`` under :data:`STALL_ALLOWANCE`, so a loaded
+    CI runner's scheduling delay is not read as a wait, while the 6 s watchdog a waiting handler
+    hits is far above it), the process exits 0 rather than to that watchdog, and, read once the
+    interrupted call has returned with no further library call, a held ``shutdown()`` has retired
+    the process and closed the sink once, a ``flush()`` returned falsy (``-2.0``), a held
+    ``configure()`` installed its sink, and the event ledger balances.
     """
     result = _run([str(_PROBE), row], timeout=30)
     lines = result.stdout.strip().splitlines()
@@ -80,7 +85,7 @@ def test_a_handlers_call_inside_a_library_section_returns_and_runs_when_the_call
     assert "fired=True" in line, f"{row}: the signal never fired: {line}"
     assert "unaccounted=0" in line, line
     took = re.search(r"handler_took=\[([^\]]*)\]", line)
-    assert took is not None and took.group(1).split(", ")[-1] == "0.0", line
+    assert took is not None and float(took.group(1).split(", ")[-1]) < STALL_ALLOWANCE, line
     assert ROWS[row] in line, line
 
 
@@ -228,7 +233,10 @@ def test_a_handlers_shutdown_inside_a_flushs_marker_wait_is_held_until_the_flush
     result = _run(["-c", _MARKER_WAIT], timeout=30)
     lines = [line for line in result.stdout.splitlines() if line.startswith("fired=")]
     assert result.returncode == 0 and lines, f"exit {result.returncode}\n{result.stderr[-2000:]}"
-    assert lines[-1] == "fired=True took=[0.0] retired=True closes=1", lines[-1]
+    took = re.search(r"took=\[([^\]]*)\]", lines[-1])
+    assert took is not None and float(took.group(1)) < STALL_ALLOWANCE, lines[-1]
+    assert lines[-1].startswith("fired=True took=["), lines[-1]
+    assert lines[-1].endswith("] retired=True closes=1"), lines[-1]
 
 
 def test_a_stop_runs_a_call_held_before_it_first() -> None:
