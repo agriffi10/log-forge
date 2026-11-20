@@ -1651,8 +1651,11 @@ def _run(
     is counted too. It goes into ``Delivery.resent`` and into ``resent_events`` on a settled run
     and on a failed one alike, since the sends happened either way, with one ``_diag.resent``
     line, written after the count is committed. ``resent_into`` names other counters to commit
-    it to, in a ``Deferral`` of their own: ``HTTPSink._send`` runs its requests over a throwaway
-    ``SinkCounters`` and has its resends committed to its own ``log_foundry_counters``.
+    it to, among the counts the run's sink registered and so in one ``Deferral`` with whichever
+    share their lock: ``HTTPSink._send`` runs its requests over a throwaway ``SinkCounters`` and
+    has its resends committed to its own ``log_foundry_counters`` beside its own ``failed``, so
+    ``losses()`` never reads one without the other. A commit that raises reports the resends it
+    could not count, as it reports the events.
 
     **The run's context** (SPEC-073 FR-002) is pushed onto :data:`_RUNS` for the whole run and
     popped in a ``finally``, so a round reads its own :func:`run_context` and a run nested inside
@@ -1899,14 +1902,11 @@ def _run(
                     )
         except Exception as fault:
             _uncounted(fault, unconfirmed + dropped, "event(s)")
-        if resent_into is not None and resent:
-            try:
-                with Deferral(resent_into) as own:
-                    own.count("resent_events", resent)
-                    if resend_line is not None:
-                        own.announce(resend_line)
-            except Exception as fault:
+            if resent_into is None and resent:
                 _uncounted(fault, resent, "resend(s)")
+        if resent_into is not None and resent and resend_line is not None:
+            owners = [*owners, (resent_into, {"resent_events": resent})]
+            lines = [resend_line, *lines]
         _commit(owners, lines)
         for one in escaped:
             _diag.absorbed("delivering a batch", one, f"its round's events not confirmed by {name}")

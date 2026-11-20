@@ -1890,17 +1890,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   is out of reach. Asked whether SPEC-095 should add it, Andrew answered "Follow-up spec
   (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
   adds the topic's group and de-duplication ids, drafted as SPEC-100.
-- **When the engine's own commit raises, a run's resends are neither counted nor announced**
-  (found during SPEC-095's build; invariants 2 and 11). `_engine._run` commits a run's
-  `resent_events` and its resend line in the same `Deferral` as its `failed_events` and
-  `dropped_events` (`sinks/_engine.py:1877-1900` at `3da245a9`). If that commit raises, none of
-  them is counted, and the one `absorbed` line `_uncounted` writes names the unconfirmed and
-  dropped events only, so the resends are neither counted nor named. That is how the run's other
-  counts already behave, and SPEC-095 did not change it. Tests plant a raising commit
-  (`tests/test_delivery_engine.py`, `tests/test_run_context.py`), but none in a run that counted
-  a resend, so what such a run announces is unguarded. The separate commit `resent_into` takes for
-  `HTTPSink._send` does name its resends (`:1901-1908`). **Closed by** a test that makes the
-  engine's commit raise in a run that resent, holding what its `absorbed` line names.
+- ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
 - **An AWS batch reply that names no failure is read as full delivery** (2026-11-14 audit, finding
   14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
   and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads
@@ -2037,6 +2027,24 @@ an item leaves this list when a spec closes it, not because the arc names it.
 
 ### Resolved
 
+- ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~
+  (found during SPEC-095's build; invariants 2 and 11). `_engine._run` commits a run's
+  `resent_events` and its resend line in the same `Deferral` as its `failed_events` and
+  `dropped_events` (`sinks/_engine.py:1877-1900` at `3da245a9`). If that commit raises, none of
+  them is counted, and the one `absorbed` line `_uncounted` writes names the unconfirmed and
+  dropped events only, so the resends are neither counted nor named. That is how the run's other
+  counts already behave, and SPEC-095 did not change it. Tests plant a raising commit
+  (`tests/test_delivery_engine.py`, `tests/test_run_context.py`), but none in a run that counted
+  a resend, so what such a run announces is unguarded. The separate commit `resent_into` takes for
+  `HTTPSink._send` does name its resends (`:1901-1908`). **Closed by** a test that makes the
+  engine's commit raise in a run that resent, holding what its `absorbed` line names.
+  → **closed by SPEC-095** (2026-11-20, in its diff review): when the run's own commit
+  raises, `_run` now writes a second `absorbed` line naming the resends it could not count,
+  `N resend(s) not counted`, beside the events' line, as the `resent_into` route already did.
+  The same review moved `_send`'s resends into the commit of its own counts (`HTTPSink` now
+  shares its counters' lock), so that route reports them with the rest of the commit.
+  `tests/test_resend_count.py::test_a_commit_that_raises_reports_the_resends_it_could_not_count`
+  plants a raising commit in a run that resent and holds both lines.
 - ~~**A send whose reply is lost is sent again, and the resend is neither counted nor keyed**~~
   (2026-11-14 audit, finding 5; invariant 7's "no event landed twice"). Every engine adapter maps a
   raised retryable exception to `RETRYABLE` (`sinks/sqs.py:796-797`, `sinks/http.py:3301-3305`,

@@ -116,16 +116,22 @@ def _state_may_have_landed(err: Exception) -> bool:
     Args:
       err: The exception.
 
+    A read of ``sqlstate`` that raises leaves the class unknown, which is read as a call that may
+    have landed: the cautious answer, and the one an absent SQLSTATE gets.
+
     Returns:
-      True when its SQLSTATE is absent or in class ``08``, ``57`` or ``XX``.
+      True when its SQLSTATE is absent, unreadable, or in class ``08``, ``57`` or ``XX``.
 
     Raises:
       None.
     """
-    state = getattr(err, "sqlstate", None)
-    if state is None:
+    try:
+        state = getattr(err, "sqlstate", None)
+        if state is None:
+            return True
+        return _diag.is_a(state, str) and state[:2] in ("08", "57", "XX")
+    except Exception:
         return True
-    return _diag.is_a(state, str) and state[:2] in ("08", "57", "XX")
 
 
 class PostgresSink:

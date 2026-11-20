@@ -7,14 +7,13 @@ import http.client
 import json
 import math
 import re
-import threading
 import unicodedata
 import urllib.error
 import urllib.request
 from base64 import b64encode
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, NoReturn, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Protocol, TypedDict, cast
 from urllib.parse import unquote, unwrap, urlparse
 
 from log_foundry import _diag
@@ -38,6 +37,9 @@ from log_foundry.sinks.base import (
     _own_attribute,
 )
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    import threading
 
 __all__ = [
     "HTTPAuthKwargs",
@@ -2334,8 +2336,45 @@ class HTTPSink:
         self.dropped_oversized = 0
         self._unrenderable = 0
         self.dropped_unadjudicated = 0
-        self._counter_lock = threading.Lock()
         self.log_foundry_counters = SinkCounters()
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes (SPEC-095).
+
+        The sink's own counts — ``failed`` in requests, the drops, ``dropped_unadjudicated`` —
+        and the engine's ``resent_events`` commit under this one lock, in one ``Deferral`` per
+        run, so ``losses()`` never reads one run's resends without that run's ``failed``. With a
+        lock of its own the sink's counts committed after the engine's, and a read between the
+        two saw half the run. Sharing the lock changes no counter and no unit: ``failed`` still
+        counts requests, ``failed_events`` events. Assigning it replaces the counters' lock, as
+        on the other engine sinks, so a fork repair or a counting lock reaches both.
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Runs the delivery engine inline over :meth:`_round`, keeping the 1.x ``emit`` contract.

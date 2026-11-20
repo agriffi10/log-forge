@@ -546,7 +546,7 @@ backend's verdict unmapped. `MultiSink` re-raises only when every child raised, 
 with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice
 — except through a resend after a lost reply (SPEC-095): a `RETRYABLE` event whose previous call
 may have landed it is resent, within the 1.x total of sends (16 at the defaults) and never
-beyond it, so it can land twice, and each such resend is counted in `losses().resent`
+beyond it, so it can land more than once, up to that total, and each such resend is counted in `losses().resent`
 and announced by one `log-foundry: resent <n> event(s)` line per run. The count's exact bound is
 *A resend after a send that may have landed is counted, and its key is the event's `log_id`*
 (`docs/decisions/sink-delivery/`).

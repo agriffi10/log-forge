@@ -50,7 +50,13 @@ def entry(index: int, value: object, shape: str) -> dict[str, Any]:
     Raises:
       KeyError: For an unknown shape.
     """
-    index_name = {"id": "_id_", "log_id": "log_id_1", "errmsg-id": "_id_", "errmsg-other": "x_1"}
+    index_name = {
+        "id": "_id_",
+        "log_id": "log_id_1",
+        "errmsg-id": "_id_",
+        "errmsg-other": "x_1",
+        "hostile-eq": "_id_",
+    }
     found: dict[str, Any] = {
         "index": index,
         "code": 11000,
@@ -62,6 +68,8 @@ def entry(index: int, value: object, shape: str) -> dict[str, Any]:
     if shape == "id":
         found["keyPattern"] = {"_id": 1}
         found["keyValue"] = {"_id": value}
+    elif shape == "hostile-eq":
+        found["keyPattern"] = _HostileEq({"_id": 1})
     elif shape == "log_id":
         found["keyPattern"] = {"log_id": 1}
         found["keyValue"] = {"log_id": value}
@@ -234,6 +242,62 @@ def test_a_caller_set_id_is_never_read_as_landed(pymongo: Any) -> None:
     assert verdicts[-1].outcomes[1] is Outcome.REJECTED
     assert verdicts[-1].outcomes == (Outcome.REJECTED, Outcome.REJECTED)
     assert inner.log_foundry_counters.failed_events == 2
+
+
+class _HostileEq(dict):  # type: ignore[type-arg]
+    """A ``keyPattern`` whose comparison raises."""
+
+    def __eq__(self, other: object) -> bool:
+        raise RuntimeError("eq")
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+class _HostileGet(dict):  # type: ignore[type-arg]
+    """An entry whose ``get`` raises."""
+
+    def get(self, key: object, default: object = None) -> object:
+        raise RuntimeError("get")
+
+
+def test_an_entry_that_raises_when_read_is_not_ours(pymongo: Any) -> None:
+    """AC1's conditions read an entry of any shape: one that raises is simply not ``_id``'s."""
+    from log_foundry.sinks.mongodb import _own_id_again
+
+    assert _own_id_again({"code": 11000, "keyPattern": _HostileEq({"_id": 1})}) is False
+    assert _own_id_again(_HostileGet({"code": 11000})) is False
+
+
+def test_a_resend_refused_with_a_hostile_key_pattern_is_rejected_not_raised(pymongo: Any) -> None:
+    """AC3: the entry cannot be vouched for, so the document is ``REJECTED`` and counted."""
+    collection = Collection(pymongo.NetworkTimeout, lose=1, shape="hostile-eq")
+    sink = _sink(collection)
+    delivery, verdicts = run(sink, 2)
+    assert delivery.raised == 0
+    assert verdicts[-1].outcomes == (Outcome.REJECTED,) * 2
+
+
+@pytest.mark.parametrize(
+    ("message", "ours"),
+    [
+        ("E11000 duplicate key error collection: d.c index: _id_ dup key: { _id: 1 }", True),
+        (
+            (
+                "E11000 duplicate key error collection: d.c index: log_id_1 dup key: "
+                '{ log_id: "a index: _id_ b" }'
+            ),
+            False,
+        ),
+        ("E11000 duplicate key error collection: d.c index: _id_2 dup key: { x: 1 }", False),
+        ("no index named here at all", False),
+    ],
+    ids=["the-id-index", "id-inside-the-key-value", "another-index", "no-index"],
+)
+def test_the_errmsg_is_read_at_the_index_name(pymongo: Any, message: str, ours: bool) -> None:
+    """AC4: the index is the word after the first `` index: ``, never a match anywhere."""
+    from log_foundry.sinks.mongodb import _own_id_again
+
+    assert _own_id_again({"code": 11000, "errmsg": message}) is ours
 
 
 def test_the_reader_needs_code_11000_exactly(pymongo: Any) -> None:

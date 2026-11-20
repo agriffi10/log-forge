@@ -7,7 +7,11 @@
   `Delivery.resent` and, through the commit's `Deferral`, `SinkCounters.resent_events` on a settled
   or failed run, with one `_diag.resent` line. `SinkLosses.resent` is appended with a default of
   `0`, and every `SinkLosses` call in `src/` passes `resent=`. `HTTPSink._send` hands its count to
-  `_run`'s new `resent_into`, which commits it to the sink's own counters.
+  `_run`'s new `resent_into`, which commits it to the sink's own counters in the same commit as the
+  sink's own counts. The HTTP family's `_counter_lock` is now its counters' lock, as the other
+  engine sinks' is, so a `losses()` read never sees a run's resends without its `failed`; no
+  counter and no unit changed. A run whose own commit raises names the resends it could not
+  count as well as the events (2026-11-20, in the diff review).
 - **The marks** (FR-002): `_classify.may_have_landed`, `Called.reached` and
   `_rounds.mark_may_have_landed`; each shipped engine sink marks by the decision's table, and
   `tests/test_resend_marks.py`'s derived roster holds every engine sink to a marking case or an
@@ -25,7 +29,8 @@
   three proofs; History entries on *A client exception costs its chunk…* and on the `_diag`
   decision in `failure-paths/` (five writers, six writes); §12's finding-5 item struck and moved
   under *Resolved*, the "counted as lost" item completed, and two items added (SNS FIFO topics;
-  a raising commit in a run that resent); invariant 7's exception and the *Guarded* lines of
+  a raising commit in a run that resent, closed by this spec's diff review and moved under
+  *Resolved*); invariant 7's exception and the *Guarded* lines of
   invariants 2 and 7; the README; `docs/release-notes/v1.2.1.md`; the `_diag`, `_classify` and
   `_rounds` inventory rows refreshed (no module was added, so no new row).
 

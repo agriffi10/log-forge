@@ -660,6 +660,85 @@ def test_sentry_reports_its_http_backends_resent() -> None:
     assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
 
 
+def _losses_at_the_owner_commit(monkeypatch: pytest.MonkeyPatch, sink: Any) -> list[SinkLosses]:
+    """Records ``sink.losses()`` each time a run reaches its owners' commit, ``_engine._commit``.
+
+    Args:
+      monkeypatch: Where the seam is set.
+      sink: The sink whose ``losses()`` is read.
+
+    Returns:
+      The list the readings are appended to.
+
+    Raises:
+      None.
+    """
+    seen: list[SinkLosses] = []
+    original = _engine._commit
+
+    def commit(owners: Any, lines: Any) -> None:
+        seen.append(sink.losses())
+        original(owners, lines)
+
+    monkeypatch.setattr(_engine, "_commit", commit)
+    return seen
+
+
+def test_an_http_runs_resends_commit_with_its_failed_request(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC1 and AC10: ``losses()`` read between a run's commits never sees half the run.
+
+    Two ``503``s with one resend allowed: one resend counted, and the request abandoned in
+    ``failed``. Both are in one commit, under one lock, so the reading taken at the owners'
+    commit is already the run's final reading.
+    """
+    from log_foundry.sinks.http import HTTPSink
+    from test_http_rounds import Scripted as Opener
+    from test_http_rounds import _status
+
+    sink = HTTPSink("http://h", max_retries=1, opener=Opener(_status(503)))
+    seen = _losses_at_the_owner_commit(monkeypatch, sink)
+    delivery = run(sink, events(2))
+    assert delivery.failed and delivery.resent == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=1, resent=2)
+    assert seen == [sink.losses()]
+    capsys.readouterr()
+
+
+def test_sends_resend_commits_with_its_failed_request(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC11: ``_send``'s resend and its abandoned request reach ``losses()`` together."""
+    from log_foundry.sinks.base import SinkDeliveryError
+    from log_foundry.sinks.http import HTTPSink
+    from test_http_rounds import Scripted as Opener
+    from test_http_rounds import _status
+
+    sink = HTTPSink("http://h", max_retries=1, opener=Opener(_status(503)))
+    seen = _losses_at_the_owner_commit(monkeypatch, sink)
+    with pytest.raises(SinkDeliveryError):
+        sink._send(b"x", content_type="text/plain")
+    assert sink.losses() == SinkLosses(dropped=0, failed=1, resent=1)
+    assert seen == [SinkLosses(dropped=0, failed=0, resent=0)], "nothing before the one commit"
+    capsys.readouterr()
+
+
+def test_a_commit_that_raises_reports_the_resends_it_could_not_count(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC1: a raising run commit names its uncounted resends, as it names its events."""
+    D = Outcome.DROPPED
+    sink = Scripted([marking([R, D], [0]), A])
+    counters = sink.log_foundry_counters
+    del counters.dropped_events
+    delivery = run(sink, events(2))
+    assert delivery.resent == 1 and delivery.dropped == 1
+    err = capsys.readouterr().err
+    assert "1 resend(s) not counted" in err, err
+    assert "1 event(s) not counted" in err, err
+
+
 # --- AC13: the line --------------------------------------------------------------------------
 
 

@@ -108,7 +108,7 @@ SOURCE_MUTANTS = {
     ),
     "resent-into-dropped": (
         "src/log_foundry/sinks/_engine.py",
-        "        if resent_into is not None and resent:",
+        "        if resent_into is not None and resent and resend_line is not None:",
         "        if False:",
     ),
 }

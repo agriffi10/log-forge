@@ -47,8 +47,12 @@ def _own_id_again(entry: object) -> bool:
     """Whether a ``writeErrors`` entry is a duplicate key on the ``_id`` index (SPEC-095 FR-003).
 
     The server names the index in ``keyPattern`` when it sends one, and always in the ``errmsg``
-    text as `` index: _id_ ``; ``keyPattern`` decides when present, so an ``errmsg`` naming
-    ``_id_`` beside another index's pattern is not read as ``_id``.
+    text as `` index: <name> dup key: …``; ``keyPattern`` decides when present, so an ``errmsg``
+    naming ``_id_`` beside another index's pattern is not read as ``_id``. The ``errmsg`` is read
+    at the index name the server writes — the word after the first `` index: `` — never anywhere
+    in the text, since the duplicate key's own value follows it and may contain anything. An entry
+    whose reading raises, through a ``get`` or an ``__eq__`` of its own, is not ours: it stays a
+    rejection, as any entry this cannot vouch for does.
 
     Args:
       entry: One entry, of any shape.
@@ -59,16 +63,22 @@ def _own_id_again(entry: object) -> bool:
     Raises:
       None.
     """
-    if not _diag.is_a(entry, dict):
+    try:
+        if not _diag.is_a(entry, dict):
+            return False
+        code = entry.get("code")
+        if type(code) is not int or code != 11000:
+            return False
+        pattern = entry.get("keyPattern")
+        if pattern is not None:
+            return _diag.is_a(pattern, dict) and pattern == {"_id": 1}
+        message = entry.get("errmsg")
+        if not _diag.is_a(message, str):
+            return False
+        _, found, rest = message.partition(" index: ")
+        return bool(found) and rest.split(" ", 1)[0] == "_id_"
+    except Exception:
         return False
-    code = entry.get("code")
-    if type(code) is not int or code != 11000:
-        return False
-    pattern = entry.get("keyPattern")
-    if pattern is not None:
-        return _diag.is_a(pattern, dict) and pattern == {"_id": 1}
-    message = entry.get("errmsg")
-    return _diag.is_a(message, str) and " index: _id_ " in message
 
 
 def _uri_option_names(uri: str | None) -> set[str]:

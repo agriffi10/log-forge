@@ -78,7 +78,6 @@ _PRIMITIVE_HOMES = {
     "ConsoleWriter": "roster",
     "ClosedGuard": "walk",
     "FilteringSink": "walk",
-    "HTTPSink": "walk",
     "KafkaSink": "walk",
     "MultiSink": "walk",
     "NATSSink": "walk",

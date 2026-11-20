@@ -462,6 +462,38 @@ def test_postgres_marks_by_where_and_sqlstate(
     assert delivery.resent == resent
 
 
+def test_postgres_reads_a_hostile_sqlstate_as_may_have_landed_and_never_raises(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """AC1: a ``sqlstate`` that raises is read as may-have-landed, and the round still settles.
+
+    The predicate already reads such an error as not retryable, so the round is a rejection
+    counted with the sink's own line, as before SPEC-095; the mark's read must not turn it into
+    an exception escaping ``deliver``.
+    """
+    psycopg = standins.install(monkeypatch, standins.PSYCOPG)
+
+    class Hostile(psycopg.OperationalError):  # type: ignore[name-defined,misc]
+        def __init__(self, message: str) -> None:
+            Exception.__init__(self, message)
+
+        @property
+        def sqlstate(self) -> str:
+            raise RuntimeError("sqlstate")
+
+    connection = _PG("commit", Hostile("x"))
+    sink = PostgresSink("t", connection=connection, max_retries=1)
+    called = sink._insert_round([("a",)])
+    assert called.error is not None and called.reached is True and not called.retryable
+    connection.error = Hostile("y")
+    capsys.readouterr()
+    delivery = run_once(sink, n=2)
+    assert delivery.raised == 0 and delivery.rejected == 2 and delivery.resent == 0
+    err = capsys.readouterr().err
+    assert "log-foundry: lost 2 event(s); PostgresSink, 1 attempt(s), Hostile" in err, err
+    assert "absorbed" not in err, err
+
+
 def test_postgres_xx000_at_commit_is_classified_landed_but_never_resent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
