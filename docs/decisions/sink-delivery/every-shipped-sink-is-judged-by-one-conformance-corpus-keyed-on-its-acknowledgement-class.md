@@ -42,7 +42,11 @@ rule).
 **No counter of an ambiguous outcome is added here.** Today the library expresses it as `UNKNOWN`,
 counted among failures; the corpus reads it test-side per event. A library-side count of what may
 have landed or may have duplicated belongs to the spec that adds idempotency keys (finding 5), and
-`fate_of` is the one place it would be read.
+`fate_of` is the one place it would be read. *(Since SPEC-095, 2026-11-20: that spec counts a resend
+after a send that may have landed, in `SinkLosses.resent`, and the corpus reads the count in
+`duplicate`, `unannounced` and `resent-when-knowable` rather than in `fate_of`; see* A resend after
+a send that may have landed is counted, and its key is the event's `log_id`*. An `UNKNOWN` outcome is
+still counted among failures, with no count of its own.)*
 
 **Do NOT** declare an acknowledgement class as a sink attribute; do NOT judge a row by summing the
 counts its loss lines name; do NOT skip or loosen a red row (a non-strict `xfail`, `skip`, or a
@@ -51,6 +55,12 @@ departure with its quoted record; do NOT add a library-side ambiguous count outs
 idempotency-key spec.
 
 ## History
+
+### 2026-11-20
+
+- **Superseded in part** by SPEC-095: the library-side count this entry assigned to finding 5's spec
+  now exists as `SinkLosses.resent`, and the corpus reads it outside `fate_of`. The fence is
+  unchanged, since it still adds no count of an ambiguous (`UNKNOWN`) outcome.
 
 ### 2026-11-18
 

@@ -315,7 +315,7 @@ def withdraw_fold_in_child() -> None:
 def take_folded(table: FoldTable, *, close: bool) -> None:
     """Takes every folded row, clearing the table in place, and writes one line per key.
 
-    The fifth stderr write. The rows are copied and cleared under ``_FOLD_LOCK``, then written
+    The sixth stderr write. The rows are copied and cleared under ``_FOLD_LOCK``, then written
     outside it in first-seen order, each line ending in ``; <k> line(s) folded at exit`` after
     the detail is bounded, so the bound never cuts the tail. A ``lost`` or ``resent`` line sums
     the counts, an ``absorbed`` line counts the failures, a ``pending`` line names its detail.
