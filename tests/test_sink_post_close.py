@@ -325,7 +325,10 @@ def test_a_sink_closed_between_two_rounds_settles_and_counts_the_refused_round_o
     """AC-4: round one lands one event; the close lands in the backoff; round two calls nothing.
 
     The run settles, so no catcher sees it: the refused round's event is counted once in
-    ``failed_events`` with one line, and ``flush()`` is truthy.
+    ``failed_events`` with one line, and ``flush()`` is truthy. ``ClickHouseSink`` marks every
+    retried raise as possibly landed, and the count is taken on the offer, so its re-offer to the
+    closed sink counts one resend, refused unsent: an over-count *The bound* of SPEC-095 names,
+    decided in session at build start. The others' raise is a cleared refusal or a datagram.
     """
     sink, rig, calls = _two_round_sink(name, monkeypatch, tmp_path)
 
@@ -342,7 +345,12 @@ def test_a_sink_closed_between_two_rounds_settles_and_counts_the_refused_round_o
     assert calls["n"] == 2, "the round after the close made a driver call"
     assert rig.delivered() == ["e0"], "an event was offered twice or the wrong one landed"
     assert counters.failed_events == 1
-    lines = [line for line in capsys.readouterr().err.splitlines() if "lost" in line]
+    assert counters.resent_events == (1 if name == "ClickHouseSink" else 0)
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("log-foundry: lost")
+    ]
     assert len(lines) == 1, lines
 
 

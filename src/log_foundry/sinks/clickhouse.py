@@ -16,7 +16,13 @@ from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_positive, require_timeout
-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import (
+    Called,
+    Lost,
+    mark_may_have_landed,
+    mark_sent,
+    raised_line,
+)
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
@@ -316,6 +322,10 @@ class ClickHouseSink:
         calls that carried it. A non-empty round that produced no chunk is a refusal carrying
         1.x's error (SPEC-049 FR-002): it sent nothing.
 
+        A retried raise marks its chunk as possibly landed (SPEC-095 FR-002): clickhouse-connect
+        retries inside the client and raises `OperationalError` whether or not the insert reached
+        the server, so every insert it fails is counted as one that may have landed.
+
         Args:
           batch: The events this round is offered.
 
@@ -350,6 +360,12 @@ class ClickHouseSink:
                     outcome = Outcome.ACCEPTED
                 else:
                     outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                    mark_may_have_landed(
+                        [position for position, _ in chunk],
+                        called.error,
+                        called.retryable,
+                        reached=True,
+                    )
                     kind = _diag.type_name(called.error)
                     lost.add(
                         carried,

@@ -833,14 +833,15 @@ def test_judge_per_batch(backend: cb.Backend, report: cb.Report, verdict: tuple[
     [
         ("partition", "KafkaSink-never-acknowledged", ("silent-loss",)),
         ("silent-loss", "SyslogSink[tcp]-peer-closed", ()),
-        ("duplicate", "HTTPSink-reply-lost", ()),
-        ("lost-but-held", "MongoDBSink-reply-lost", ()),
+        ("duplicate", "PostgresSink[autocommit]-autocommit", ()),
+        ("lost-but-held", "PostgresSink[borrowed]-reply-lost", ()),
+        ("resent-when-knowable", "ClickHouseSink-refused-once", ()),
     ],
 )
 def test_a_check_removed_from_judge_frees_the_row_it_holds(
     monkeypatch: pytest.MonkeyPatch, removed: str, row_id: str, verdict: tuple[str, ...]
 ) -> None:
-    """FR-003: each of the four checks today's code needs is the one holding its named row."""
+    """FR-003 and SPEC-095 FR-004: each of the five checks today's code needs holds its row."""
     held = cb.run_row(_row(row_id)).verdict
     assert removed in held, held
     monkeypatch.setattr(cb, "CHECKS", tuple(c for c in cb.CHECKS if c[0] != removed))
@@ -1021,14 +1022,14 @@ def test_the_corpus_files_hold_no_skip_no_loose_xfail_and_no_ledger_exemption() 
 
 
 def test_the_register_holds_the_totals_of_fr_004() -> None:
-    """FR-004: 12 pins, 7 departures; 256 rows, 74 pinned, 12 departure rows, 170 that must pass."""
-    assert len(cp.PINS) == 12
-    assert len(cp.DEPARTURES) == 7
+    """SPEC-095 FR-004: 11 pins, 12 departures; 256 rows, 22 pinned, 31 departing, 203 pass."""
+    assert len(cp.PINS) == 11
+    assert len(cp.DEPARTURES) == 12
     pinned = [row for pin in cp.PINS for row in pin.rows]
     departing = [row for d in cp.DEPARTURES for row in d.rows]
-    assert len(pinned) == 74
-    assert len(departing) == 12
-    assert len(cc.rows()) - len(pinned) - len(departing) == 170
+    assert len(pinned) == 22
+    assert len(departing) == 31
+    assert len(cc.rows()) - len(pinned) - len(departing) == 203
     assert len({pin.item for pin in cp.PINS}) == 9
 
 
@@ -1244,7 +1245,7 @@ def test_every_pinned_row_and_only_those_carry_the_strict_mark() -> None:
         assert mark.kwargs["strict"] is True, row.id
         assert mark.kwargs["raises"] is PinnedVerdict, row.id
         marked += 1
-    assert marked == 74
+    assert marked == 22
 
 
 @pytest.mark.parametrize(

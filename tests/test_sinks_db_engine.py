@@ -169,11 +169,12 @@ def bulk_error(indices: list[object]) -> Exception:
 
 
 def test_clickhouse_resends_only_the_failed_chunk() -> None:
+    """The one chunk resent is counted: clickhouse-connect retries inside the call (SPEC-095)."""
     script = Script(None, ConnectionError("down"), None)
     sink, _ = build("ClickHouseSink", script, chunk_size=1, max_retries=3)
     sink.emit(events(3))
     assert script.calls == [[0], [1], [2], [1]]
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
 
 
 def test_clickhouse_spends_max_retries_plus_one_per_chunk() -> None:
@@ -309,6 +310,13 @@ def test_postgres_borrowed_broken_line_keeps_its_suffix(capsys: pytest.CaptureFi
 def test_a_close_during_a_backoff_returns_before_the_next_round(
     kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The close is not held up; ClickHouse's refused re-offer is still counted as a resend.
+
+    The count is taken when the engine offers the events again, so a re-offer the sink refuses
+    unsent, because it was closed during the backoff, counts: an over-count *The bound* of
+    SPEC-095 names, decided in session at build start. ``PostgresSink``'s raise came before
+    ``commit()`` in a transaction, which the server rolls back, so it marked nothing.
+    """
     waiting = threading.Event()
     release = threading.Event()
 
@@ -339,7 +347,8 @@ def test_a_close_during_a_backoff_returns_before_the_next_round(
     thread.join(10.0)
     assert len(script.calls) == 1, "the round after the close made no client call"
     assert isinstance(outcome[0], SinkDeliveryError) and "the sink is closed" in str(outcome[0])
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    resent = {"ClickHouseSink": 2, "PostgresSink": 0}[kind]
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=resent)
 
 
 # --- a closed sink refuses ------------------------------------------------------------------------

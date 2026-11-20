@@ -522,12 +522,13 @@ def test_send_reraises_an_unexpected_error_by_identity(capsys: pytest.CaptureFix
     assert capsys.readouterr().err == ""
 
 
-def test_send_returns_the_2xx_payload_and_counts_into_no_event_totals() -> None:
+def test_send_returns_the_2xx_payload_and_counts_only_its_resend() -> None:
+    """``_send``'s run counts no event total; its resend after a ``503`` it counts (SPEC-095)."""
     opener = Scripted(_status(503), FakeResponse(200, b"payload"))
     sink = HTTPSink("http://h", max_retries=1, opener=opener)
     assert sink._send(b"x", content_type="text/plain") == b"payload"
     assert sink.failed == 0
-    assert sink.log_foundry_counters.losses() == SinkLosses(dropped=0, failed=0)
+    assert sink.log_foundry_counters.losses() == SinkLosses(dropped=0, failed=0, resent=1)
 
 
 # --- FR-001 1.17, 1.20: the request builders and SentrySink -----------------------------------
@@ -1543,7 +1544,13 @@ def _script(cls: type[HTTPSink], response: str) -> list[Any]:
 
 
 def _expected(cls: type[HTTPSink], response: str, n: int) -> SinkLosses:
-    """What ``n`` events cost under each response, so the twins cannot agree on nothing."""
+    """What ``n`` events cost under each response, so the twins cannot agree on nothing.
+
+    A ``503`` before a ``200`` is a request that may have landed, so its resend is counted
+    (SPEC-095): one event, since both callers' first request carries one.
+    """
+    if response == "503-then-200":
+        return SinkLosses(dropped=0, failed=0, resent=1)
     readers = {"ElasticsearchSink", "OpenSearchSink", "HoneycombSink", "OTLPSink"}
     if response == "400":
         return SinkLosses(dropped=0, failed=n)
@@ -1566,7 +1573,11 @@ def _formula(sink: Any) -> SinkLosses:
             "dropped_unadjudicated",
         )
     )
-    return SinkLosses(dropped=sink.dropped_oversized + sink._unrenderable, failed=failed)
+    return SinkLosses(
+        dropped=sink.dropped_oversized + sink._unrenderable,
+        failed=failed,
+        resent=sink.log_foundry_counters.resent_events,
+    )
 
 
 @pytest.mark.parametrize("response", _RESPONSES)

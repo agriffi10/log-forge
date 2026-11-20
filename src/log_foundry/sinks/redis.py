@@ -15,7 +15,7 @@ from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_positive
-from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import Lost, mark_may_have_landed, mark_sent, raised_line
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -248,6 +248,10 @@ class _RedisSink:
         ``DROPPED`` with SPEC-069's line. The pipeline is built and executed inside this one call
         and never stored, since ``redis-py`` pipelines must not cross threads: all ``ACCEPTED``
         on ``execute()``, or all ``RETRYABLE`` or ``REJECTED`` as ``_retryable_error`` answers.
+        A retried raise marks the pipeline's events as possibly landed (SPEC-095 FR-002):
+        redis-py retries a command inside the client and raises `ConnectionError` both for a
+        connection it could not open and for one lost after the pipeline was written, so every
+        pipeline it fails is counted as one that may have landed.
         A run that fails counts the run's unencodable events in ``failed`` with the rest and its
         line names them too, as 1.x's ``emit`` counted a failed batch whole
         (:attr:`~log_foundry.sinks._engine.When.FAILED`); a run that settles leaves them
@@ -300,6 +304,7 @@ class _RedisSink:
                 )
                 lost.register()
                 outcome = Outcome.RETRYABLE if retryable else Outcome.REJECTED
+                mark_may_have_landed(positions, err, retryable, reached=True)
             else:
                 outcome = Outcome.ACCEPTED
             for position in positions:

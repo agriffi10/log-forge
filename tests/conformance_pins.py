@@ -24,33 +24,7 @@ if TYPE_CHECKING:
 
     from conformance_backend import Check
 
-_HTTP_FAMILY = (
-    "HTTPSink",
-    "DatadogSink",
-    "SplunkHECSink",
-    "NewRelicSink",
-    "LokiSink",
-    "OTLPSink",
-    "LogstashSink[http]",
-    "SentrySink[http]",
-    "ClickHouseSink",
-    "AzureEventHubsSink",
-    "RedisStreamsSink",
-    "RedisListSink",
-)
-_POSITIONAL = (
-    "KinesisSink",
-    "FirehoseSink",
-    "ElasticsearchSink",
-    "OpenSearchSink",
-    "HoneycombSink",
-)
-_OVER_HTTP = (
-    "FilteringSink[over-http]",
-    "TransformSink[over-http]",
-    "MultiSink[over-http]",
-    "_FactorySink[over-http]",
-)
+_AWS = ("SQSSink[standard]", "SQSSink[fifo]", "SNSSink", "KinesisSink", "FirehoseSink")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -103,7 +77,7 @@ def _each(sinks: Iterable[str], *faults: str) -> tuple[str, ...]:
     return tuple(f"{sink}-{fault}" for sink in sinks for fault in faults)
 
 
-_FINDING_5 = "A send whose reply is lost is sent again, and the resend is neither counted nor keyed"
+_LANDED_THEN_LOST = "An event a send may have landed is counted as lost when no later send lands it"
 _FINDING_12 = (
     "`KafkaSink` and `GooglePubSubSink` give their verdict when the client queues a message, "
     "not when the broker answers"
@@ -112,32 +86,13 @@ _FINDING_15 = "An injected autocommit connection breaks the database sinks' all-
 
 PINS: tuple[Pin, ...] = (
     Pin(
-        name="reply-resent",
-        rows=(
-            *_each(
-                ("SQSSink[standard]", "SNSSink", *_POSITIONAL, *_HTTP_FAMILY, *_OVER_HTTP),
-                "taken-then-raised",
-                "reply-lost",
-            ),
-            "PostgresSink[owned]-reply-lost",
-            *_each(
-                ("SyslogSink[tcp]", "LogstashSink[tcp]", "RabbitMQSink[owned]"),
-                "taken-then-raised",
-            ),
-        ),
-        verdict=("duplicate",),
-        item=_FINDING_5,
-    ),
-    Pin(
         name="reply-counted-lost",
         rows=(
-            "MongoDBSink-taken-then-raised",
-            "MongoDBSink-reply-lost",
             "PostgresSink[borrowed]-reply-lost",
             "RabbitMQSink[borrowed]-taken-then-raised",
         ),
         verdict=("lost-but-held",),
-        item=_FINDING_5,
+        item=_LANDED_THEN_LOST,
     ),
     Pin(
         name="reply-without-verdict",
@@ -212,7 +167,12 @@ PINS: tuple[Pin, ...] = (
         item=_FINDING_15,
     ),
 )
-"""The twelve pins of SPEC-092 FR-004: 74 rows over nine open items."""
+"""The eleven pins after SPEC-095 FR-004: 22 rows over nine open items.
+
+SPEC-092 FR-004 set twelve pins over 74 rows. SPEC-095 removed `reply-resent`, whose 50 rows read
+green once a counted resend may leave a second copy, and moved `MongoDBSink`'s two
+`reply-counted-lost` rows to green, its duplicate `_id` now read as delivery.
+"""
 
 DEPARTURES: tuple[Departure, ...] = (
     Departure(
@@ -282,6 +242,69 @@ DEPARTURES: tuple[Departure, ...] = (
         ),
     ),
     Departure(
+        name="aws-client-retries",
+        rows=_each(_AWS, "refused-once", "refused-always"),
+        verdict=("resent-when-knowable",),
+        record=(
+            "src/log_foundry/sinks/_rounds.py",
+            (
+                "botocore retries a call inside the client, so a raise can follow an attempt that "
+                "landed, and every raise an AWS sink's call makes is counted as one that may have "
+                "landed"
+            ),
+        ),
+    ),
+    Departure(
+        name="firehose-coded-may-land",
+        rows=("FirehoseSink-partial",),
+        verdict=("resent-when-knowable",),
+        record=(
+            "src/log_foundry/sinks/firehose.py",
+            (
+                "AWS says a record coded `ServiceUnavailableException` or `InternalFailure` might "
+                "have completed, so each is counted as one that may have landed"
+            ),
+        ),
+    ),
+    Departure(
+        name="eventhubs-client-retries",
+        rows=_each(("AzureEventHubsSink",), "refused-once", "refused-always"),
+        verdict=("resent-when-knowable",),
+        record=(
+            "src/log_foundry/sinks/eventhubs.py",
+            (
+                "the Event Hubs producer retries a send inside the client, so every send it fails "
+                "is counted as one that may have landed"
+            ),
+        ),
+    ),
+    Departure(
+        name="clickhouse-error-unclassed",
+        rows=_each(("ClickHouseSink",), "refused-once", "refused-always"),
+        verdict=("resent-when-knowable",),
+        record=(
+            "src/log_foundry/sinks/clickhouse.py",
+            (
+                "clickhouse-connect retries inside the client and raises `OperationalError` "
+                "whether or not the insert reached the server, so every insert it fails is "
+                "counted as one that may have landed"
+            ),
+        ),
+    ),
+    Departure(
+        name="redis-client-retries",
+        rows=_each(("RedisStreamsSink", "RedisListSink"), "refused-once", "refused-always"),
+        verdict=("resent-when-knowable",),
+        record=(
+            "src/log_foundry/sinks/redis.py",
+            (
+                "redis-py retries a command inside the client and raises `ConnectionError` both "
+                "for a connection it could not open and for one lost after the pipeline was "
+                "written, so every pipeline it fails is counted as one that may have landed"
+            ),
+        ),
+    ),
+    Departure(
         name="sdk-transport-drop",
         rows=("SentrySink[sdk]-report-indefinite",),
         verdict=("silent-loss",),
@@ -291,7 +314,11 @@ DEPARTURES: tuple[Departure, ...] = (
         ),
     ),
 )
-"""The seven departures of SPEC-092 FR-004: 12 rows."""
+"""The twelve departures: SPEC-092 FR-004's seven over 12 rows, and SPEC-095 FR-004's five over 19.
+
+SPEC-095's five each hold a sink whose every failed call is counted as one that may have landed,
+so a resend after a refusal it could have known is counted too: the upper bound its record states.
+"""
 
 ARCHITECTURE = "docs/architecture.md"
 """The file whose §12 holds every pin's item."""

@@ -13,6 +13,7 @@ from log_foundry.sinks._batch import (
     results_rejected,
     usable_results,
 )
+from log_foundry.sinks._classify import may_have_landed
 from log_foundry.sinks._engine import When, run_context
 from log_foundry.sinks.verdict import Outcome
 
@@ -26,6 +27,7 @@ __all__ = [
     "KeyedReply",
     "Lost",
     "entry_ids",
+    "mark_may_have_landed",
     "mark_sent",
     "raised_line",
     "read_keyed",
@@ -33,6 +35,36 @@ __all__ = [
     "settle_keyed",
     "settle_positional",
 ]
+
+
+def mark_may_have_landed(
+    positions: list[int], error: Exception | None, retryable: bool, reached: bool | None = None
+) -> None:
+    """Marks a raised call's positions as possibly landed, when the engine will resend them.
+
+    Only a ``RETRYABLE`` position may carry the mark (SPEC-095 FR-001), so nothing is marked for
+    a call that did not raise or whose raise the sink's predicate refused. ``reached`` is the
+    sink's own answer, from where the call raised or from a client that retries inside the call;
+    ``None`` asks :func:`~log_foundry.sinks._classify.may_have_landed` of the exception's class.
+
+    Args:
+      positions: The call's positions in the round's batch.
+      error: What the call raised, or ``None``.
+      retryable: Whether the sink's ``_retryable_error`` accepted ``error``.
+      reached: Whether the call may have landed, or ``None`` to ask the class.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    if error is None or not retryable:
+        return
+    if reached is None:
+        reached = may_have_landed(error)
+    if reached:
+        run_context().may_have_landed(positions)
 
 
 def _sends(owner: object) -> dict[int, list[object]]:
@@ -215,11 +247,14 @@ class Called[T](NamedTuple):
       result: The reply, read or raw, when the call returned; ``None`` when it raised.
       error: The exception the call raised, or ``None``.
       retryable: Whether the sink's ``_retryable_error`` accepted ``error``.
+      reached: The sink's own answer to whether the call may have landed (SPEC-095), or ``None``
+        to ask :func:`~log_foundry.sinks._classify.may_have_landed` of ``error``'s class.
     """
 
     result: T | None
     error: Exception | None = None
     retryable: bool = False
+    reached: bool | None = None
 
 
 class KeyedReply(NamedTuple):
@@ -356,6 +391,11 @@ def settle_keyed(
     failing after N attempt(s); abandoned``. Every line names ``name``, the sink's own class name
     as 1.x wrote it, so a subclass's lines read as 1.x's did.
 
+    **A retried raise is marked as possibly landed** (SPEC-095 FR-002): botocore retries a call
+    inside the client, so a raise can follow an attempt that landed, and every raise an AWS
+    sink's call makes is counted as one that may have landed. An entry the reply names as failed
+    is not marked: the reply is the service's word on the attempt it answers.
+
     Args:
       owner: The sink, whose send counts the lines read.
       positions: Each carried entry's position in the round's batch.
@@ -380,6 +420,7 @@ def settle_keyed(
         kind = _diag.type_name(error)
         for position in positions:
             fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
+        mark_may_have_landed(positions, error, retryable, reached=True)
         lost.add(
             carried,
             when=When.LAST if retryable else When.ALWAYS,
@@ -448,6 +489,7 @@ def settle_positional(
     results_key: str,
     fates: list[Outcome],
     lost: Lost,
+    coded_may_land: bool = False,
 ) -> None:
     """Sets one Kinesis or Firehose call's outcomes and registers its lines; both share it.
 
@@ -459,6 +501,10 @@ def settle_positional(
     resent, counted on ``dropped_unadjudicated`` with 1.x's line, so the sub-count keeps its
     meaning and ``.failed`` keeps excluding it. Both are ``ALWAYS``, or ``LAST`` in a run that
     resends an ``UNKNOWN``, as :func:`settle_keyed`'s unread line is.
+
+    A retried raise is marked as possibly landed, as :func:`settle_keyed` marks one (SPEC-095).
+    A coded record is marked only with ``coded_may_land``: Firehose's two codes are the ones
+    after which AWS says the write might have completed, while a Kinesis code refuses the record.
 
     Args:
       owner: The sink, whose send counts the lines read.
@@ -474,6 +520,7 @@ def settle_positional(
       results_key: The reply's per-record field.
       fates: The round's outcomes, updated in place.
       lost: The round's lost events.
+      coded_may_land: Whether a record the reply codes as failed may have landed.
 
     Returns:
       None.
@@ -486,6 +533,7 @@ def settle_positional(
         kind = _diag.type_name(error)
         for position in positions:
             fates[position] = Outcome.RETRYABLE if retryable else Outcome.REJECTED
+        mark_may_have_landed(positions, error, retryable, reached=True)
         lost.add(
             carried,
             when=When.LAST if retryable else When.ALWAYS,
@@ -526,12 +574,16 @@ def settle_positional(
         return
     retry = {id(record) for record in verdict.retry}
     retrying: list[dict[str, object]] = []
+    coded_positions: list[int] = []
     for position, event, record in zip(positions, carried, records, strict=True):
         if id(record) in retry:
             fates[position] = Outcome.RETRYABLE
             retrying.append(event)
+            coded_positions.append(position)
         else:
             fates[position] = Outcome.ACCEPTED
+    if coded_may_land and coded_positions:
+        context.may_have_landed(coded_positions)
     lost.add(
         retrying,
         when=When.LAST,

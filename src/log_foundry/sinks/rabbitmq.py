@@ -8,14 +8,19 @@ from typing import TYPE_CHECKING, Any
 from log_foundry import _diag
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import ReadOnlyCount, refuse_with_injected, store_read_only
-from log_foundry.sinks._classify import TRANSIENT_BUILTINS, driver_classes, is_retryable
+from log_foundry.sinks._classify import (
+    TRANSIENT_BUILTINS,
+    driver_classes,
+    is_retryable,
+    may_have_landed,
+)
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_timeout
-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import Called, Lost, mark_may_have_landed, mark_sent, raised_line
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -347,6 +352,7 @@ class RabbitMQSink:
                     fates[position] = Outcome.ACCEPTED
                     continue
                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                mark_may_have_landed([position], called.error, called.retryable, called.reached)
                 kind = _diag.type_name(called.error)
                 lost.add(
                     [batch[position]],
@@ -417,6 +423,13 @@ class RabbitMQSink:
     def _publish(self, body: bytes) -> Called[None]:
         """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.
 
+        A raise says whether the message may have landed (SPEC-095 FR-002), by class, since pika
+        does not retry inside a publish: one of the errors that leave a publish unconfirmed —
+        ``StreamLostError``, ``ConnectionClosedByBroker``, ``AMQPHeartbeatTimeout`` or
+        ``ConnectionBlockedTimeout`` — may have, and any other pika ``AMQPError``, such as a
+        channel or connection it could not open, did not. An exception outside pika's tree may
+        have, unless :func:`~log_foundry.sinks._classify.may_have_landed` clears it.
+
         Args:
           body: The serialized event.
 
@@ -436,8 +449,37 @@ class RabbitMQSink:
             )
         except Exception as err:
             self._reset()
-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+            return Called(
+                None,
+                error=err,
+                retryable=is_retryable(self._retryable_error, err),
+                reached=self._may_have_landed(err),
+            )
         return Called(None)
+
+    def _may_have_landed(self, err: Exception) -> bool:
+        """Whether a publish that raised ``err`` may have reached the broker (SPEC-095 FR-002).
+
+        Args:
+          err: The exception the publish raised.
+
+        Returns:
+          True for an unconfirmed-publish class of pika's, or for an exception outside pika's
+          tree that :func:`~log_foundry.sinks._classify.may_have_landed` does not clear.
+
+        Raises:
+          None.
+        """
+        if not _diag.is_a(err, driver_classes("pika.exceptions", "AMQPError")):
+            return may_have_landed(err)
+        unconfirmed = driver_classes(
+            "pika.exceptions",
+            "StreamLostError",
+            "ConnectionClosedByBroker",
+            "AMQPHeartbeatTimeout",
+            "ConnectionBlockedTimeout",
+        )
+        return _diag.is_a(err, unconfirmed)
 
     def _retryable_error(self, err: Exception) -> bool:
         """Reports whether a failed publish is worth another attempt (SPEC-070 FR-002).

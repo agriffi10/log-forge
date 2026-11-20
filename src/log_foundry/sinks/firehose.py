@@ -230,6 +230,10 @@ class FirehoseSink:
         one; the rest are chunked with ``chunk_items`` and each chunk sent once through
         :meth:`_send`, its reply settled positionally (:func:`settle_positional`).
 
+        A retried raise is marked as possibly landed, as every AWS sink's is, and so is a coded
+        record (SPEC-095 FR-002): AWS says a record coded `ServiceUnavailableException` or
+        `InternalFailure` might have completed, so each is counted as one that may have landed.
+
         Args:
           batch: The events this round is offered.
 
@@ -269,6 +273,7 @@ class FirehoseSink:
                 results_key="RequestResponses",
                 fates=fates,
                 lost=lost,
+                coded_may_land=True,
             )
         lost.register()
         return Verdict(outcomes=tuple(fates))

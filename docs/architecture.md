@@ -1897,6 +1897,17 @@ an item leaves this list when a spec closes it, not because the arc names it.
   reopen, leaves the events the backend took counted as lost when the reply was lost with the
   connection. Both are held by the `reply-counted-lost` pin of `tests/test_conformance.py`
   (SPEC-092).
+- **An event a send may have landed is counted as lost when no later send lands it** (SPEC-095;
+  invariants 2 and 7). A round that marks an event as possibly landed leaves it `RETRYABLE`, so
+  when no later round lands it the event keeps that last round's fate: the run fails, `flush()`
+  is falsy and the event is counted lost although the destination may hold it. SPEC-095 counts
+  the resends in `losses().resent`, which says how many copies may exist, and leaves the fate as
+  it is. Andrew answered "Lost, flush falsy (Recommended)" on 2026-11-16, which is the decision
+  that keeps this open. The rows `PostgresSink[borrowed]-reply-lost` and
+  `RabbitMQSink[borrowed]-taken-then-raised`, whose borrowed connection the sink may not reopen,
+  are held by the `reply-counted-lost` pin of `tests/test_conformance.py`. **Closed by** the
+  engine reading such an event `UNKNOWN`, at the cost that a destination which times out every
+  reply no longer fails its batches.
 - **An AWS batch reply that names no failure is read as full delivery** (2026-11-14 audit, finding
   14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
   and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads

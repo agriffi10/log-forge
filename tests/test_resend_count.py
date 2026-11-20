@@ -551,6 +551,43 @@ def test_multisink_sums_its_childrens_resent() -> None:
     assert losses == SinkLosses(dropped=0, failed=0, resent=7)
 
 
+# --- AC11: HTTPSink._send and SentrySink ------------------------------------------------------
+
+
+def test_send_counts_its_resend_once_and_writes_the_line_after_counting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC11: a ``TimeoutError`` then a ``200`` adds 1, with one line written after the count."""
+    from log_foundry.sinks.http import HTTPSink
+    from test_http_rounds import Scripted as Opener
+    from test_http_rounds import _ok
+
+    sink = HTTPSink("http://h", max_retries=1, opener=Opener(TimeoutError("timed out"), _ok()))
+    hook = WriteHook(lambda: sink.log_foundry_counters.resent_events)
+    monkeypatch.setattr(sys, "stderr", hook)
+    assert sink._send(b"x", content_type="text/plain") == b""
+    monkeypatch.setattr(sys, "stderr", sys.__stderr__)
+    assert sink.log_foundry_counters.resent_events == 1
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
+    lines = [(text, seen) for text, seen in hook.seen if RESENT_LINE.match(text)]
+    assert [resent_lines(text) for text, _ in lines] == [[1]], hook.seen
+    assert lines[0][1] == 1, "resent_events had moved before the line was written"
+    assert [text for text, _ in hook.seen if text.strip()] == [lines[0][0]]
+
+
+def test_sentry_reports_its_http_backends_resent() -> None:
+    """AC11: ``SentrySink.losses().resent`` is its HTTP backend's count, in events."""
+    from log_foundry.sinks.sentry import SentrySink
+    from test_http_rounds import Scripted as Opener
+    from test_http_rounds import _ok, _status
+
+    opener = Opener(_status(503), _ok())
+    sink = SentrySink("http://k@sentry.local/1", backend="http", max_retries=1, opener=opener)
+    sink.emit([{"log_id": "a", "level": "ERROR", "message": "m"}])
+    assert len(opener.calls) == 2
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
+
+
 # --- AC13: the line --------------------------------------------------------------------------
 
 

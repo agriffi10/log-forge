@@ -19,7 +19,7 @@ from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_timeout
-from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import Lost, mark_sent, raised_line, sends_of
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -41,6 +41,34 @@ DEFAULT_SOCKET_TIMEOUT = 30.0
 worker's single drain thread, which every other sink's delivery is queued behind. It is applied
 only when neither the caller nor the URI's query names one.
 """
+
+
+def _own_id_again(entry: object) -> bool:
+    """Whether a ``writeErrors`` entry is a duplicate key on the ``_id`` index (SPEC-095 FR-003).
+
+    The server names the index in ``keyPattern`` when it sends one, and always in the ``errmsg``
+    text as `` index: _id_ ``; ``keyPattern`` decides when present, so an ``errmsg`` naming
+    ``_id_`` beside another index's pattern is not read as ``_id``.
+
+    Args:
+      entry: One entry, of any shape.
+
+    Returns:
+      True when ``code`` is exactly ``11000`` and the index is ``_id``'s.
+
+    Raises:
+      None.
+    """
+    if not _diag.is_a(entry, dict):
+        return False
+    code = entry.get("code")
+    if type(code) is not int or code != 11000:
+        return False
+    pattern = entry.get("keyPattern")
+    if pattern is not None:
+        return _diag.is_a(pattern, dict) and pattern == {"_id": 1}
+    message = entry.get("errmsg")
+    return _diag.is_a(message, str) and " index: _id_ " in message
 
 
 def _uri_option_names(uri: str | None) -> set[str]:
@@ -429,7 +457,7 @@ class MongoDBSink:
             except Exception as err:
                 details = getattr(err, "details", None)
                 if _diag.is_a(details, dict) and "writeErrors" in details:
-                    self._settle_bulk(details["writeErrors"], positions, fates)
+                    self._settle_bulk(details["writeErrors"], positions, fates, carried)
                 else:
                     retryable = is_retryable(self._retryable_error, err)
                     for position in positions:
@@ -449,17 +477,38 @@ class MongoDBSink:
                 encoded_landed(self, positions)
             return Verdict(outcomes=tuple(fates))
 
-    def _settle_bulk(self, errors: object, positions: list[int], fates: list[Outcome]) -> None:
+    def _settle_bulk(
+        self,
+        errors: object,
+        positions: list[int],
+        fates: list[Outcome],
+        carried: list[dict[str, object]],
+    ) -> None:
         """Reads a ``BulkWriteError``'s ``writeErrors`` by ``index`` through the keyed reader.
 
         A list it cannot pair makes every document ``UNKNOWN`` with one line, ``ALWAYS``, or
         ``LAST`` in a run that resends an ``UNKNOWN`` (``RunContext.resends_unknown``), so a
         document is announced once per run.
 
+        **A duplicate driver-stamped ``_id`` on this run's own resend is delivery** (SPEC-095
+        FR-003). The run keeps each document, with the ``_id`` pymongo stamped into it, across its
+        rounds, so a resend after an ``insert_many`` that raised carries the same ``_id``, and the
+        server refuses the copy because the earlier send stored it. Such an entry reads
+        ``ACCEPTED`` when all four hold: its ``code`` is exactly ``11000``; its index is ``_id``'s
+        (:func:`_own_id_again`); the event the document was built from carries no ``_id``, so the
+        one refused is the driver's and no other event can share it; and an earlier call of this
+        run carried the document (``sends_of`` above 1), which can only be one that raised, since
+        a call that returned settled it. Any other duplicate key is ``REJECTED`` as before —
+        another unique index, a first send, or an ``_id`` the event carried, which a transform
+        may give two events. When nothing is rejected no line is registered, so a run that only
+        met its own copies says nothing. The sink still never marks a resend and declares no
+        idempotence: within a run its resend cannot leave a second copy.
+
         Args:
           errors: The details' ``writeErrors``, of any shape.
           positions: Each inserted document's position in the round's batch, in insert order.
           fates: The round's outcomes, updated in place.
+          carried: The events the documents were built from, in the same order.
 
         Returns:
           None.
@@ -485,14 +534,20 @@ class MongoDBSink:
             return
         landed: list[int] = []
         rejects = 0
-        for position, named in zip(positions, read.failed, strict=True):
-            if named is None:
+        for at, (position, named) in enumerate(zip(positions, read.failed, strict=True)):
+            if named is None or (
+                _own_id_again(named)
+                and "_id" not in carried[at]
+                and sends_of(self, carried[at]) > 1
+            ):
                 fates[position] = Outcome.ACCEPTED
                 landed.append(position)
             else:
                 fates[position] = Outcome.REJECTED
                 rejects += 1
         encoded_landed(self, landed)
+        if not rejects:
+            return
         total = rejects >= len(positions)
         context.announce(
             lambda: _diag.lost(

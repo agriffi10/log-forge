@@ -173,6 +173,7 @@ def _rabbit(plan: dict[int, Exception], **kwargs: Any) -> tuple[RabbitMQSink, AM
 
 
 def test_rabbitmq_resends_only_the_failed_message(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one message resent is counted: a builtin ``ConnectionError`` may have landed (SPEC-095)."""
     sink, connection = _rabbit({1: ConnectionError("dropped")}, max_retries=3)
     resets: list[int] = []
     real = sink._reset
@@ -180,7 +181,7 @@ def test_rabbitmq_resends_only_the_failed_message(monkeypatch: pytest.MonkeyPatc
     sink.emit(events(3))
     assert connection.attempts == [0, 1, 2, 1]
     assert len(resets) == 1
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
 
 
 def test_rabbitmq_refused_message_costs_only_itself() -> None:
@@ -235,11 +236,12 @@ def test_eventhubs_oversize_counts_on_a_settled_run() -> None:
 
 
 def test_eventhubs_resends_only_the_failed_pack() -> None:
+    """The pack's two events are counted resent: the producer retries inside the call (SPEC-095)."""
     producer = Producer([ConnectionError("down")], limit=20)
     sink = AzureEventHubsSink(producer=producer, max_retries=3)
     sink.emit(events(4))
     assert producer.sends == [[0, 1], [2, 3], [0, 1]]
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=2)
 
 
 # --- a close during a backoff ---------------------------------------------------------------------
@@ -249,6 +251,12 @@ def test_eventhubs_resends_only_the_failed_pack() -> None:
 def test_a_close_during_a_backoff_returns_before_the_next_round(
     kind: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The close is not held up, and the refused re-offer is still counted as a resend.
+
+    The count is taken when the engine offers the event again, so a re-offer the sink refuses
+    unsent, because it was closed during the backoff, counts one: an over-count *The bound* of
+    SPEC-095 names, decided in session at build start.
+    """
     waiting = threading.Event()
     release = threading.Event()
 
@@ -284,7 +292,7 @@ def test_a_close_during_a_backoff_returns_before_the_next_round(
     thread.join(10.0)
     assert attempts() == 1, "the round after the close published nothing"
     assert isinstance(outcome[0], SinkDeliveryError) and "closed" in str(outcome[0])
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
 
 
 # --- NATS -----------------------------------------------------------------------------------------

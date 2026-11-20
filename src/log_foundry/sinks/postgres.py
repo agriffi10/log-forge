@@ -23,7 +23,7 @@ from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count, require_positive
-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import Called, Lost, mark_may_have_landed, mark_sent, raised_line
 from log_foundry.sinks.base import SinkDeliveryError
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
@@ -90,6 +90,42 @@ def _refused(message: str) -> bool:
         if start >= 0 and message.find(suffix, start + len(prefix)) >= 0:
             return True
     return False
+
+
+def _in_autocommit(connection: object) -> bool:
+    """Whether a connection is in ``autocommit``: its attribute is exactly ``True``.
+
+    Args:
+      connection: The connection the round uses.
+
+    Returns:
+      True only for ``True``; a read that raises reads as a transaction.
+
+    Raises:
+      None.
+    """
+    try:
+        return getattr(connection, "autocommit", False) is True
+    except Exception:
+        return False
+
+
+def _state_may_have_landed(err: Exception) -> bool:
+    """Whether a raise at commit, or under autocommit, may have left its rows (SPEC-095 FR-002).
+
+    Args:
+      err: The exception.
+
+    Returns:
+      True when its SQLSTATE is absent or in class ``08``, ``57`` or ``XX``.
+
+    Raises:
+      None.
+    """
+    state = getattr(err, "sqlstate", None)
+    if state is None:
+        return True
+    return _diag.is_a(state, str) and state[:2] in ("08", "57", "XX")
 
 
 class PostgresSink:
@@ -421,6 +457,7 @@ class PostgresSink:
                 outcome = Outcome.ACCEPTED
             else:
                 outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                mark_may_have_landed(positions, called.error, called.retryable, called.reached)
                 suffix = (
                     ", borrowed connection is broken and this sink may not reopen it"
                     if not self._owns_connection and self._is_broken()
@@ -445,6 +482,14 @@ class PostgresSink:
     def _insert_round(self, rows: list[tuple[object, ...]]) -> Called[int]:
         """Runs the round's transaction once, with the transport lock already held.
 
+        A raise says whether the rows may have landed (SPEC-095 FR-002), by the stage it raised
+        in and its SQLSTATE; psycopg does not retry. Only a raise from ``commit()``, or from a
+        statement on a connection in ``autocommit`` (read, ``is True``, from the connection
+        actually used, after any reconnect), may have, and only when its SQLSTATE is in class
+        ``08`` (connection exception), ``57`` (operator intervention) or ``XX`` (internal
+        error), or absent. A raise before ``commit()`` in a transaction is rolled back by the
+        server, and one from reconnecting or opening the cursor sent nothing.
+
         Args:
           rows: The encoded rows to insert, known non-empty.
 
@@ -454,18 +499,28 @@ class PostgresSink:
         Raises:
           None. This is an isolation boundary: a driver fault must never crash the worker.
         """
+        sending = False
         try:
             self._reconnect_if_broken()
             chunks = 0
             with self._conn.cursor() as cur:
+                autocommit = _in_autocommit(self._conn)
                 for chunk in chunk_list(rows, self._chunk_size):
                     chunks += 1
+                    sending = autocommit
                     cur.executemany(self._insert_sql, chunk)
+                    sending = False
             if chunks:
+                sending = True
                 self._conn.commit()
         except Exception as err:
             self._rollback()
-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+            return Called(
+                None,
+                error=err,
+                retryable=is_retryable(self._retryable_error, err),
+                reached=sending and _state_may_have_landed(err),
+            )
         return Called(chunks)
 
     def _retryable_error(self, err: Exception) -> bool:

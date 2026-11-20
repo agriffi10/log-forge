@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from log_foundry.sinks.base import Sink, SinkDeliveryError
+from log_foundry.sinks.base import Sink, SinkDeliveryError, SinkLosses
 from log_foundry.sinks.firehose import FirehoseSink
 
 
@@ -187,14 +187,23 @@ def test_emit_does_not_raise_on_an_unadjudicated_chunk() -> None:
     FirehoseSink("stream", client=MalformedFirehose(None)).emit([{"a": 1}])  # no exception
 
 
-def test_well_formed_responses_count_nothing_and_say_nothing(
+def test_well_formed_responses_count_no_loss_and_announce_only_the_resend(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """A coded record resent and landed is no loss, but its resend is counted (SPEC-095).
+
+    AWS says a record coded ``ServiceUnavailableException`` might have completed, so its resend
+    may leave a second copy: it is counted in ``losses().resent`` with the one resend line.
+    """
     body = json.dumps({"a": 1}).encode("utf-8") + b"\n"   # FR-005 delimiter
     sink = FirehoseSink("stream", client=FakeFirehose(fail_once={body}))
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.dropped_unadjudicated == 0
-    assert capsys.readouterr().err == ""
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
+    assert capsys.readouterr().err == (
+        "log-foundry: resent 1 event(s) a lost reply may have landed; they may be duplicated; "
+        "FirehoseSink\n"
+    )
 
 
 # --- SPEC-038 FR-005 / FR-009: the delimiter and the real per-record ceiling --------------

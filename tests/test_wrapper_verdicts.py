@@ -802,7 +802,8 @@ def test_a_dedupe_predicate_over_a_real_http_sink_resends_as_the_emit_path_does(
 
     Asked again on the engine's resend, the dedupe predicate declined its own event: one POST,
     nothing counted, the message gone. The ``emit`` path's worker resend reached the inner
-    sink's engine, which never asks the predicate, and so posted twice.
+    sink's engine, which never asks the predicate, and so posted twice. The ``503`` may have
+    stored the first POST, so the second is counted as a resend (SPEC-095), not as a loss.
     """
     opener = FakeOpener([FakeResponse(503, b""), FakeResponse(200, b"{}")])
     inner = HTTPSink("http://collector/in", opener=opener, max_retries=3)
@@ -810,8 +811,10 @@ def test_a_dedupe_predicate_over_a_real_http_sink_resends_as_the_emit_path_does(
     target = ThirdPartyWrapper(sink) if through_emit else sink
     assert worked(target, [{"message": "payment captured", "level": "INFO"}]) == (0, True)
     assert len(opener.calls) == 2
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
-    assert not [line for line in lines(capsys.readouterr().err) if "lost" in line]
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
+    assert not [
+        line for line in lines(capsys.readouterr().err) if line.startswith("log-foundry: lost")
+    ]
 
 
 def test_a_predicate_cannot_fail_a_forwarded_event_on_its_resend(
