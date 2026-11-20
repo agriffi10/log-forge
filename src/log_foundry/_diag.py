@@ -19,18 +19,19 @@ Four rules, all load-bearing (SPEC-029 FR-004, SPEC-067 FR-001):
 Five writers, one per kind of line (SPEC-068 FR-001, SPEC-095): ``absorbed`` for a failure
 swallowed rather than propagated, ``lost`` for a counted loss, ``rejected`` for an inbound trace
 context refused, ``pending`` for an outcome not yet decided, and ``resent`` for events sent again
-after a send that may have landed them, which are not a loss but may be held twice. The fourth exists because a line written while
-the drain thread is still inside the sink cannot know whether what it describes will be
-delivered, and a ``lost`` line there announced a loss that another line then announced again.
+after a send that may have landed them, which are not a loss but may be held twice. The fourth
+exists because a line written while the drain thread is still inside the sink cannot know whether
+what it describes will be delivered, and a ``lost`` line there announced a loss that another line
+then announced again.
 
 **Six stderr writes: the five writers and the fold's** (SPEC-103 FR-001). From the first
 abandoned exit batch on, the worker opens a fold window around each later exit batch's sink call
-(:func:`fold_into`), and inside it ``lost``, ``absorbed``, ``pending`` and ``resent`` record a row keyed on the
-text their line would carry, without its count, instead of writing it. :func:`take_folded` writes
-one line per key at the end of the exit, or before ``stop()``'s expiry line, each ending in
-``line(s) folded at exit``. ``rejected`` never folds. A ``lost`` call that passes
-``running_total=True`` is written at once, because summing a count that is not an increment — a
-running total or a snapshot — overstates a loss.
+(:func:`fold_into`), and inside it ``lost``, ``absorbed``, ``pending`` and ``resent`` record a
+row keyed on the text their line would carry, without its count, instead of writing it.
+:func:`take_folded` writes one line per key at the end of the exit, or before ``stop()``'s expiry
+line, each ending in ``line(s) folded at exit``. ``rejected`` never folds. A ``lost`` call that
+passes ``running_total=True`` is written at once, because summing a count that is not an
+increment — a running total or a snapshot — overstates a loss.
 The window is a thread-local, not a ``ContextVar``: a ``ContextVar`` would follow
 ``asyncio.to_thread`` into a sink's own thread, whose lines must be written at once, and a forked
 child's withdrawal would reach only the context current at the fork. ``_FOLD_LOCK`` guards the

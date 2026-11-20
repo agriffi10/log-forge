@@ -256,6 +256,18 @@ def test_a_mark_before_a_declined_round_counts_nothing() -> None:
     assert sink.losses().resent == 0
 
 
+def test_a_mark_counts_only_the_offer_after_the_round_that_set_it() -> None:
+    """AC3: marked in round 1, unmarked in round 2, so only round 2's offer counts, not round 3's.
+
+    The rule is the last round that carried the event: a mark is not sticky across a later
+    round that left the event resendable without marking it.
+    """
+    sink = Scripted([marking(R), R, A])
+    delivery = run(sink, events(2), sink_retries=2)
+    assert delivery.attempts == 3 and not delivery.failed
+    assert delivery.resent == 2
+
+
 def test_only_the_marked_events_count() -> None:
     """AC3: a mark names events, not the round: two of three marked count two per resend."""
     sink = Scripted([marking(R, [0, 2]), A])
@@ -318,6 +330,48 @@ def test_a_round_set_aside_leaves_no_mark_standing(second: Any) -> None:
     delivery = run(sink, events(2), sink_retries=2)
     assert delivery.attempts == 3
     assert delivery.resent == 2, "round 2's offer counts; round 3's does not"
+
+
+def _wrapper_run(wrapper: Any, n: int, retries: int = 1) -> _engine.Delivery:
+    """One engine run of a wrapper's ``deliver`` into its counters, with no waits.
+
+    Args:
+      wrapper: A wrapper over an engine sink.
+      n: How many events.
+      retries: The sink retries the run allows.
+
+    Returns:
+      The run's ``Delivery``.
+
+    Raises:
+      BaseException: Whatever the run raises.
+    """
+    return _engine._run(
+        wrapper,
+        wrapper.deliver,
+        wrapper.log_foundry_counters,
+        events(n),
+        sink_retries=retries,
+        worker_retries=0,
+        stop=None,
+        decline=None,
+    )
+
+
+def test_a_wrappers_unreadable_inner_round_leaves_no_mark_standing() -> None:
+    """AC5 through a wrapper: the inner round marks and returns no verdict, so ``delegate``
+    rewinds the call.
+
+    ``FilteringSink`` declines event 0 of 3 and forwards two; the inner sink marks both and answers
+    ``None``. The rewind discards the inner marks, so the wrapper's own verdict, which turns the
+    forwarded events ``UNKNOWN``, is read as given. A mark left standing would sit on positions
+    whose outcome is not ``RETRYABLE`` and fail the whole round as an escaped exception would.
+    """
+    inner = Scripted([_marked_unreadable])
+    wrapper = FilteringSink(inner, predicate=lambda event: event["i"] != 0)
+    delivery = _wrapper_run(wrapper, 3)
+    assert delivery.raised == 0 and delivery.unknown == 2 and delivery.skipped == 1
+    assert delivery.resent == 0
 
 
 # --- AC6: a failed run --------------------------------------------------------------------
@@ -540,6 +594,24 @@ def test_every_losses_reports_its_counters_resent(
     ):
         reported = wrapper.losses()
         assert reported is not None and reported.resent == 3, (variant.id, type(wrapper))
+
+
+def test_a_wrapper_with_drops_of_its_own_still_reports_the_inner_resent(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC10: ``FilteringSink``'s own drop and its inner sink's resend are reported together."""
+
+    def predicate(event: dict[str, object]) -> bool:
+        if event["i"] == 0:
+            raise ValueError("predicate failed")
+        return True
+
+    inner = Scripted([marking(R), A])
+    wrapper = FilteringSink(inner, predicate=predicate)
+    delivery = _wrapper_run(wrapper, 3)
+    assert delivery.resent == 2
+    assert wrapper.losses() == SinkLosses(dropped=1, failed=0, resent=2)
+    capsys.readouterr()
 
 
 def test_multisink_sums_its_childrens_resent() -> None:

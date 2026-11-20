@@ -173,7 +173,7 @@ def _rabbit(plan: dict[int, Exception], **kwargs: Any) -> tuple[RabbitMQSink, AM
 
 
 def test_rabbitmq_resends_only_the_failed_message(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The one message resent is counted: a builtin ``ConnectionError`` may have landed (SPEC-095)."""
+    """The one message resent is counted: a builtin ``ConnectionError`` may have landed."""
     sink, connection = _rabbit({1: ConnectionError("dropped")}, max_retries=3)
     resets: list[int] = []
     real = sink._reset

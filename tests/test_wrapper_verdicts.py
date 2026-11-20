@@ -812,8 +812,9 @@ def test_a_dedupe_predicate_over_a_real_http_sink_resends_as_the_emit_path_does(
     assert worked(target, [{"message": "payment captured", "level": "INFO"}]) == (0, True)
     assert len(opener.calls) == 2
     assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=1)
-    assert not [
-        line for line in lines(capsys.readouterr().err) if line.startswith("log-foundry: lost")
+    assert lines(capsys.readouterr().err) == [
+        "log-foundry: resent 1 event(s) a lost reply may have landed; they may be duplicated; "
+        + ("HTTPSink" if through_emit else "FilteringSink")
     ]
 
 

@@ -842,14 +842,15 @@ class RunContext:
         """Runs a wrapped sink's round for a wrapper, moving its marks into the wrapper's positions.
 
         A round marks positions of the batch it was handed (:meth:`final_rejections`,
-        :meth:`sink_counted`, :meth:`may_have_landed`), and the engine checks each mark against the verdict of the run's
-        own sink. When a wrapper forwards part of its batch, the run's sink is the wrapper and
-        the marked positions are the wrapped sink's, so every mark the call registers is
-        rewritten through ``positions`` before the wrapper builds its verdict (SPEC-075 FR-002):
-        the wrapped sink's index ``i`` becomes ``positions[i]``. An index that is not an exact
-        ``int`` in range of ``positions`` stays invalid — a non-``int`` as given, any other as
-        ``-1`` — so a round the bare sink's engine would fail still fails. Nothing is rewritten
-        when the call raises: the engine then fails the round's events whatever its marks say.
+        :meth:`sink_counted`, :meth:`may_have_landed`), and the engine checks each mark against the
+        verdict of the run's own sink. When a wrapper forwards part of its batch, the run's sink is
+        the wrapper and the marked positions are the wrapped sink's, so every mark the call
+        registers is rewritten through ``positions`` before the wrapper builds its verdict
+        (SPEC-075 FR-002): the wrapped sink's index ``i`` becomes ``positions[i]``. An index that
+        is not an exact ``int`` in range of ``positions`` stays invalid — a non-``int`` as given,
+        any other as ``-1`` — so a round the bare sink's engine would fail still fails. Nothing is
+        rewritten when the call raises: the engine then fails the round's events whatever its
+        marks say.
 
         **A malformed verdict sets the call's registrations aside**, as the engine sets aside a
         bare sink's round whose verdict it cannot read (PR 319): every count, line and mark the
@@ -1367,8 +1368,8 @@ def _read_marks(
 
     A final rejection must name an exact ``int`` index in range whose outcome is ``REJECTED``,
     and a sink-counted or possibly-landed index one whose outcome is ``RETRYABLE``; anything else
-    is a sink bug, which the caller fails as an exception escaping ``deliver``. ``outcomes_of`` stays the one
-    definition of a malformed verdict: this reads only the marks.
+    is a sink bug, which the caller fails as an exception escaping ``deliver``. ``outcomes_of``
+    stays the one definition of a malformed verdict: this reads only the marks.
 
     Args:
       marks: What the round registered.

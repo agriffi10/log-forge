@@ -672,9 +672,10 @@ A few conventions hold across every sink below:
   still land and `health().failed_batches` records the loss. A resend can duplicate an event only
   when the sink cannot tell whether an earlier send landed it — a reply lost to a timeout or a
   dropped connection, which a destination may have stored — and the shipped sinks, `NATSSink`
-  excepted, count each such resend in `health().sink.resent` and say so once per batch on
-  stderr (`log-foundry: resent <n> event(s) a lost reply may have landed; they may be
-  duplicated; <Sink>`). Three
+  excepted, count each such resend their delivery engine makes in `health().sink.resent`, as an
+  upper bound, and say so once per batch on stderr (`log-foundry: resent <n> event(s) a lost
+  reply may have landed; they may be duplicated; <Sink>`). Some copies go uncounted; the
+  `health()` section below says which. Three
   cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
   event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
   landed), and an SQS or SNS sender fault (a byte-identical re-send can only fail again). Within a
@@ -1450,12 +1451,17 @@ counts the attempt *and* hands the batch back to the worker, whose retry may the
 transient outage leaves it non-zero with nothing actually lost. `failed_batches` is the record of a
 batch given up on for good.
 
-`sink.resent` is not a loss. It counts the events a shipped sink sent again after a send that may
-have landed them — a timeout, a dropped connection or a `5xx` after the request left — so each may
-be held twice at the destination, and a consumer can de-duplicate on the event's `log_id`. It is an upper
-bound too: a FIFO queue inside its de-duplication interval, or a client that retried inside the
-call and never landed anything, adds no copy but is counted. An event no later send landed is
-still counted in `sink.failed`.
+`sink.resent` is not a loss. It counts the events a shipped sink's delivery engine sent again after
+a send that may have landed them — a timeout, a dropped connection or a `5xx` after the request
+left — so each may be held twice at the destination, and a consumer can de-duplicate on the
+event's `log_id`. It is an upper bound for those resends: a FIFO queue inside its de-duplication
+interval, or a client that retried inside the call and never landed anything, adds no copy but is
+counted. It does not see every copy, though. A client library's own retries inside a call that
+then returned, an entry a reply names as failed after an earlier attempt inside the same call had
+landed it, the worker resending a whole batch to a sink with no `deliver`, and a `PostgresSink` on
+an autocommit connection resending chunks it had already committed when a later chunk failed can
+each leave a copy that `resent` does not count. An event no later send landed is still counted in
+`sink.failed`.
 
 `stopped_reason` is a type name (e.g. `"SystemExit"`), never the exception's message — a sink's
 error text can carry event data. It reads `None` for a healthy worker, for a process that has never

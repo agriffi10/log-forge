@@ -1,4 +1,4 @@
-"""SPEC-095 FR-003: ``MongoDBSink`` reads a duplicate driver-stamped ``_id`` on its own resend as landed.
+"""SPEC-095 FR-003: ``MongoDBSink`` reads a duplicate driver-stamped ``_id`` on resend as landed.
 
 The run keeps each document, with the ``_id`` the driver stamped into it, across its rounds, so
 a resend after an ``insert_many`` that stored the documents and then raised carries the same

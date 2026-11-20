@@ -930,7 +930,7 @@ def _resend_cases() -> list[tuple[str, list[cb.Round], dict[str, int]]]:
 def test_resends_from_rebuilds_each_offer_after_a_mark(
     rounds: list[cb.Round], resends: dict[str, int]
 ) -> None:
-    """SPEC-095 FR-004: the reconstruction counts an offer only after a readable `RETRYABLE` mark."""
+    """SPEC-095 FR-004: the reconstruction counts an offer only after a readable mark."""
     assert cb.resends_from(rounds, "s", 0) == resends
 
 

@@ -695,7 +695,8 @@ def test_may_have_landed_clears_only_a_request_that_never_left() -> None:
     assert not may_have_landed(StillRefused())
     assert not may_have_landed(gaierror())
     assert not may_have_landed(urllib.error.URLError("x"))
-    assert may_have_landed(urllib.error.HTTPError("u", 503, "m", None, None))  # type: ignore[arg-type]
+    http_error = urllib.error.HTTPError("u", 503, "m", None, None)  # type: ignore[arg-type]
+    assert may_have_landed(http_error)
     assert may_have_landed(TimeoutError())
     assert may_have_landed(http.client.RemoteDisconnected())
     assert may_have_landed(ConnectionResetError())
