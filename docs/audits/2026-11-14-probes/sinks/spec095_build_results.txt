@@ -1,12 +1,12 @@
-SPEC-095 build results at HEAD f0e51c33 against base c67931cd, Python 3.13.1
+SPEC-095 build results at HEAD aa8f3fbf against base c67931cd, Python 3.13.1
 
 == base tree, base corpus
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/base/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-base/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/base/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-base/conformance_backend.py
   256 rows, 86 red
 == head tree, head corpus
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/head/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
   256 rows, 53 red
 
 == FR-004 AC2: base -> head: 71 row(s) moved
@@ -84,15 +84,15 @@ SPEC-095 build results at HEAD f0e51c33 against base c67931cd, Python 3.13.1
   expected: 50 + 2 + 19 = 71
 
 == FR-004 AC3: base tree, head corpus
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/base/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/base/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 corpus change alone: 0 row(s) moved
 
   rows that count a resend at head: 77
 
 == source mutant classify-may-have-landed-true: src/log_foundry/sinks/_classify.py
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/classify-may-have-landed-true/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/classify-may-have-landed-true/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 classify-may-have-landed-true: 34 row(s) moved
     DatadogSink-refused-always: green -> resent-when-knowable
     DatadogSink-refused-once: green -> resent-when-knowable
@@ -130,8 +130,8 @@ classify-may-have-landed-true: 34 row(s) moved
     _FactorySink[over-http]-refused-once: green -> resent-when-knowable
 
 == source mutant context-drops-marks: src/log_foundry/sinks/_engine.py
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/context-drops-marks/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/context-drops-marks/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 context-drops-marks: 69 row(s) moved
     AzureEventHubsSink-refused-always: resent-when-knowable -> green
     AzureEventHubsSink-refused-once: resent-when-knowable -> green
@@ -204,8 +204,8 @@ context-drops-marks: 69 row(s) moved
     _FactorySink[over-http]-taken-then-raised: green -> duplicate
 
 == source mutant diag-resent-silent: src/log_foundry/_diag.py
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/diag-resent-silent/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/diag-resent-silent/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 diag-resent-silent: 77 row(s) moved
     AzureEventHubsSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
     AzureEventHubsSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
@@ -286,8 +286,8 @@ diag-resent-silent: 77 row(s) moved
     _FactorySink[over-http]-taken-then-raised: green -> unannounced
 
 == source mutant delivery-resent-unset: src/log_foundry/sinks/_engine.py
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/delivery-resent-unset/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/delivery-resent-unset/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 delivery-resent-unset: 75 row(s) moved
     AzureEventHubsSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
     AzureEventHubsSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
@@ -366,15 +366,15 @@ delivery-resent-unset: 75 row(s) moved
     _FactorySink[over-http]-taken-then-raised: green -> partition
 
 == source mutant resent-into-dropped: src/log_foundry/sinks/_engine.py
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/resent-into-dropped/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/resent-into-dropped/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 resent-into-dropped: 2 row(s) moved
     SentrySink[http]-reply-lost: green -> duplicate
     SentrySink[http]-taken-then-raised: green -> duplicate
 
 == in-process mutant without:resent-when-knowable
-  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/head/src/log_foundry/__init__.py
-  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/helpers-head/conformance_backend.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/helpers-head/conformance_backend.py
 without:resent-when-knowable: 19 row(s) moved
     AzureEventHubsSink-refused-always: resent-when-knowable -> green
     AzureEventHubsSink-refused-once: resent-when-knowable -> green
@@ -397,11 +397,11 @@ without:resent-when-knowable: 19 row(s) moved
     SQSSink[standard]-refused-once: resent-when-knowable -> green
 
 == FR-003 AC6: the MongoDB conditions, by pytest in an export
-  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/head/src/log_foundry/__init__.py
-  unmutated: exit 0; 2 passed in 0.12s
-  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/mongo-without-condition-3/src/log_foundry/__init__.py
+  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/head/src/log_foundry/__init__.py
+  unmutated: exit 0; 2 passed in 0.09s
+  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/mongo-without-condition-3/src/log_foundry/__init__.py
   mongo-without-condition-3: exit 1; ['FAILED tests/test_sinks_mongodb_resend.py::test_a_caller_set_id_is_never_read_as_landed']
-  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-4bvd6enf/mongo-without-condition-4/src/log_foundry/__init__.py
+  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-i_z_0644/mongo-without-condition-4/src/log_foundry/__init__.py
   mongo-without-condition-4: exit 1; ['FAILED tests/test_sinks_mongodb_resend.py::test_a_first_send_refused_on_id_is_rejected']
 
 ALL CRITERIA HOLD
