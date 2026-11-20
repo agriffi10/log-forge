@@ -9,8 +9,9 @@ description: "`_diag` owns `absorbed`/`lost`/`rejected`, and an exception is nam
 **At exit, a dead sink's repeated lines are folded, still by `_diag` alone** (SPEC-103, invariant
 11). From the first abandoned exit batch on, the worker opens a fold window around each later exit
 batch's sink call: the engine run, or each 1.x `emit`, and nothing else. Inside it, `lost`,
-`absorbed` and `pending` record one row per distinct line text rather than writing it, and
-`take_folded`, `_diag`'s fifth stderr write, writes each row once with its summed count and the
+`absorbed`, `pending` and, since SPEC-095, `resent` record one row per distinct line text rather
+than writing it, and `take_folded`, `_diag`'s sixth stderr write beside its five writers, writes
+each row once with its summed count and the
 tail `; <k> line(s) folded at exit`. That happens where SPEC-090's exit tallies are written, before
 them, or before `stop()`'s expiry line. So a line inside the window is written later than its
 counter moved, which the record-first rule allows. Its count is never lost, and its line is
@@ -33,6 +34,15 @@ replaced growing a dead sink's exit batches is *A backlog drains in larger batch
 is not a setting* (`docs/decisions/pipeline/`).
 
 ## History
+
+### 2026-11-20
+
+- **Refined (SPEC-095).** `_diag` gains a fifth writer, `resent`, for events the delivery engine
+  sent again after a send that may have landed them: `log-foundry: resent <n> event(s) a lost
+  reply may have landed; they may be duplicated; <Sink>`, once per run, not a loss. It folds at
+  exit as `lost` does, summing its counts, so five writers fold or write and `take_folded` is the
+  sixth stderr write, where the SPEC-103 entry below called it the fifth. The fence is unchanged:
+  every line is still `_diag`'s.
 
 ### 2026-11-17
 

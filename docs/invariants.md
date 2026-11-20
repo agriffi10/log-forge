@@ -223,6 +223,11 @@ holding each term to its exact share, and for an `HTTPSink` behind a scripted op
 `tests/test_model_cells.py` that both ledger identities balance, with a batch the worker abandoned
 counted, in every cell whose sink calls back from its own code, except the cells pinned to
 `architecture.md` §12 open items and the cells those pins withhold (SPEC-085);
+`tests/test_resend_count.py` (each resend of an event a send may have landed counted once in
+`resent` on the worker, the orphan path and `emit_via_deliver` and through a wrapper, every
+`SinkLosses` in `src/` built with `resent=`, and no ledger term moved), `tests/test_resend_marks.py` (each shipped sink's marked and unmarked calls, over a
+roster derived from the tree) and `tests/test_sinks_mongodb_resend.py` (a duplicate driver-stamped
+`_id` on `MongoDBSink`'s own resend counted delivered, SPEC-095);
 `tests/test_conformance.py` that every shipped sink, per constructor variant, under each fault of
 its acknowledgement class and on the worker path only, leaves what its fake backend holds matching
 what it reported, event by event for the 41 variants whose judged sink runs the delivery engine
@@ -538,7 +543,13 @@ backend's verdict unmapped. `MultiSink` re-raises only when every child raised, 
 (SPEC-017 FR-004); a child whose engine run settled raises nothing.
 
 *Observable:* with a destination that fails every call, `flush()` is falsy and a counter moved;
-with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice.
+with one that fails some calls, nothing raised, `losses()` is non-zero, and no event landed twice
+— except through a resend after a lost reply (SPEC-095): a `RETRYABLE` event whose previous call
+may have landed it is resent, within the 1.x total of sends (16 at the defaults) and never
+beyond it, so it can land twice, and each such resend is counted in `losses().resent`
+and announced by one `log-foundry: resent <n> event(s)` line per run. The count's exact bound is
+*A resend after a send that may have landed is counted, and its key is the event's `log_id`*
+(`docs/decisions/sink-delivery/`).
 *Recorded exceptions:* an `emit` may return normally having delivered nothing, because what it did
 not deliver was counted — an all-oversized batch, a batch of nothing but events the sink cannot
 encode (an HTTP batch it cannot render, SPEC-058, and since SPEC-069 the same batch on every
@@ -658,8 +669,11 @@ limit and a real signal on a pipe, SPEC-082), and `tests/test_stream_sink_delive
 `tests/test_stream_sink_partial_write.py` (a stream that raises partway: each event by which call
 raised, no handed line resent, a closed stream and a sustained fault raising from the second
 batch, no event twice under a real file-size limit in three buffering modes, and a dead pipe,
-SPEC-084), and `tests/test_conformance.py` (every shipped sink, per constructor variant and on
-the worker path only, reporting landed only what its fake backend holds and lost only what it does
+SPEC-084), and `tests/test_resend_count.py`, `tests/test_resend_marks.py` and
+`tests/test_sinks_mongodb_resend.py` (a resend after a lost reply counted in `resent` and
+announced, the calls each shipped sink marks, and `MongoDBSink`'s duplicate `_id` on its own
+resend read as delivery, SPEC-095), and `tests/test_conformance.py` (every shipped sink, per
+constructor variant and on the worker path only, reporting landed only what its fake backend holds and lost only what it does
 not, per event for the 41 variants whose judged sink runs the delivery engine and per batch for
 the 12 that offer no `deliver`, with an outcome it could not know read as ambiguous and refused
 where the call was knowable, except the rows pinned to §12 open items and the permitted
