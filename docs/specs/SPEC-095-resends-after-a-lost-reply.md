@@ -492,8 +492,9 @@ SPEC-094's where those are on `main`.
 - [ ] With `_diag.resent` writing nothing, in an export of the branch head, every row that counts a
       resend reads `unannounced` (invariant 2).
 - [ ] With `Delivery.resent` never set, in an export of the branch head, every per-event row that
-      counts a resend reads `partition`, and `SentrySink[http]`'s two such rows, judged per batch,
-      read `duplicate` (invariant 2).
+      counts a resend reads `partition`. With `_run` never committing the count it was asked to
+      commit to other counters (`resent_into`, the route `HTTPSink._send` takes),
+      `SentrySink[http]`'s two such rows, judged per batch, read `duplicate` (invariant 2).
 - [ ] With `resent-when-knowable` removed from `judge`, the 19 departure rows read green, which
       fails each departure (invariant 2).
 
@@ -903,3 +904,10 @@ So the engine does not bound a resend to the de-duplication interval.
   `XX`, so nothing is resent: the criterion now says such a call is classified as one that may have
   landed and counts 0. *The bound*'s over-count list gains a re-offer the sink refuses unsent
   because it was closed during the backoff, since the count is taken on the offer, as FR-001 says.
+- **Corrected on 2026-11-20 during the build, decided in session.** The plan review had
+  `HTTPSink._send` hand its resends to the engine, which commits them to the sink's own counters
+  (`_run`'s `resent_into`) before writing the one line, rather than `_send` reading
+  `Delivery.resent` and committing them itself. So `Delivery.resent` no longer feeds
+  `SentrySink[http]`'s count, and FR-004's `Delivery.resent` mutant moves only the per-event rows;
+  the `SentrySink[http]` half of that criterion is now measured with the `resent_into` commit
+  removed instead. A correction of how the criterion is measured, not of what it holds.
