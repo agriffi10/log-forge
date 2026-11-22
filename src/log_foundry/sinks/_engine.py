@@ -1480,7 +1480,11 @@ def _uncounted(fault: Exception, n: int, what: str) -> None:
     _diag.absorbed("counting a delivery", fault, f"{n} {what} not counted")
 
 
-def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[[], None]]) -> None:
+def _commit(
+    owners: list[tuple[_Counted, dict[str, int]]],
+    lines: list[Callable[[], None]],
+    resend: tuple[_Counted, int, Callable[[], None]] | None = None,
+) -> None:
     """Commits a run context's selected counts, one ``Deferral`` per lock, then its lines.
 
     Owners are grouped by the identity of their ``_counter_lock``, read at commit time, so a
@@ -1489,9 +1493,17 @@ def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[
     are written after every count, outside every lock, in registration order, and even when a
     commit raised, since an announced loss is better than a silent one.
 
+    ``resend`` is a run's resends to commit to other counters (``_run``'s ``resent_into``,
+    SPEC-095): the counters, the count and its line. The count joins the group of whichever
+    owners share those counters' lock, so the sink's own counts and its resends commit together.
+    Its line is a count's announcement, not a loss's, so it is written first and only when that
+    commit succeeded; a commit that raised reports the resends apart from the group's other
+    counts, ``N resend(s) not counted``, as ``_run``'s own commit does.
+
     Args:
       owners: Each owner with its counts by name.
       lines: The lines to write.
+      resend: The counters, the resends and their line, or ``None``.
 
     Returns:
       None.
@@ -1499,19 +1511,32 @@ def _commit(owners: list[tuple[_Counted, dict[str, int]]], lines: list[Callable[
     Raises:
       None.
     """
-    for lead, group in _by_lock(owners):
+    entries = list(owners)
+    carried: dict[str, int] | None = None
+    if resend is not None:
+        carried = {"resent_events": resend[1]}
+        entries.append((resend[0], carried))
+    committed = False
+    for lead, group in _by_lock(entries):
+        carries = any(counts is carried for _, counts in group)
         try:
             with Deferral(lead) as ledger:
                 for owner, counts in group:
                     for name, n in counts.items():
                         ledger.count_for(owner, name, n)
         except Exception as fault:
-            total = 0
-            for _, counts in group:
-                total += sum(counts.values())
-            _uncounted(
-                fault, total, f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(lead)))}"
-            )
+            others = [counts for _, counts in group if counts is not carried]
+            if others:
+                total = sum(sum(counts.values()) for counts in others)
+                _uncounted(
+                    fault, total, f"count(s) for {_diag._STR_STR(_diag._STORED_NAME(type(lead)))}"
+                )
+            if carries and resend is not None:
+                _uncounted(fault, resend[1], "resend(s)")
+        else:
+            committed = committed or carries
+    if resend is not None and committed:
+        resend[2]()
     for line in lines:
         line()
 
@@ -1904,10 +1929,10 @@ def _run(
             _uncounted(fault, unconfirmed + dropped, "event(s)")
             if resent_into is None and resent:
                 _uncounted(fault, resent, "resend(s)")
+        resend = None
         if resent_into is not None and resent and resend_line is not None:
-            owners = [*owners, (resent_into, {"resent_events": resent})]
-            lines = [resend_line, *lines]
-        _commit(owners, lines)
+            resend = (resent_into, resent, resend_line)
+        _commit(owners, lines, resend)
         for one in escaped:
             _diag.absorbed("delivering a batch", one, f"its round's events not confirmed by {name}")
         return delivery

@@ -2350,6 +2350,10 @@ class HTTPSink:
         counts requests, ``failed_events`` events. Assigning it replaces the counters' lock, as
         on the other engine sinks, so a fork repair or a counting lock reaches both.
 
+        A subclass of its own must therefore assign it only after ``super().__init__()``, which
+        creates the counters, and must never hold it while calling
+        ``log_foundry_counters.losses()``, which takes the same lock and would wait on itself.
+
         Args:
           None.
 

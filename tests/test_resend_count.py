@@ -17,6 +17,7 @@ import io
 import pathlib
 import re
 import sys
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -676,9 +677,9 @@ def _losses_at_the_owner_commit(monkeypatch: pytest.MonkeyPatch, sink: Any) -> l
     seen: list[SinkLosses] = []
     original = _engine._commit
 
-    def commit(owners: Any, lines: Any) -> None:
+    def commit(owners: Any, lines: Any, *rest: Any) -> None:
         seen.append(sink.losses())
-        original(owners, lines)
+        original(owners, lines, *rest)
 
     monkeypatch.setattr(_engine, "_commit", commit)
     return seen
@@ -724,6 +725,61 @@ def test_sends_resend_commits_with_its_failed_request(
     capsys.readouterr()
 
 
+class _PausingFailed:
+    """A ``failed`` descriptor whose write, inside the engine's commit, then runs a reader.
+
+    The commit writes ``failed`` and then ``resent_events`` under one lock. The reader runs on
+    its own thread between the two writes, for at most ``wait`` seconds: a reader that does not
+    need the lock finishes there and sees the request without its resend; one that does is still
+    blocked when the commit goes on, and reads it whole once it is released.
+    """
+
+    def __init__(self, reader: Callable[[], object], wait: float) -> None:
+        self.reader = reader
+        self.wait = wait
+        self.readings: list[object] = []
+        self.threads: list[threading.Thread] = []
+
+    def __get__(self, obj: Any, owner: Any = None) -> Any:
+        return self if obj is None else obj.__dict__.get("failed", 0)
+
+    def __set__(self, obj: Any, value: int) -> None:
+        obj.__dict__["failed"] = value
+        if value and not self.threads:
+            thread = threading.Thread(target=lambda: self.readings.append(self.reader()))
+            self.threads.append(thread)
+            thread.start()
+            thread.join(self.wait)
+
+
+def test_sentrys_losses_never_reads_its_backends_resend_without_its_failed_request() -> None:
+    """AC11: ``SentrySink.losses()`` read during the backend's commit sees all of it or none.
+
+    The backend's commit holds its one lock while it writes ``failed`` and then ``resent``; a
+    ``losses()`` that reads the two without that lock sees the request without its resend.
+    """
+    from log_foundry.sinks.sentry import SentrySink
+    from test_http_rounds import Scripted as Opener
+    from test_http_rounds import _status
+
+    sink = SentrySink(
+        "http://k@sentry.local/1", backend="http", max_retries=1, opener=Opener(_status(503))
+    )
+    backend = sink._http
+    assert backend is not None
+    pausing = _PausingFailed(sink.losses, wait=0.5)
+    backend.__class__ = type("PausingHTTPSink", (type(backend),), {"failed": pausing})
+    from log_foundry.sinks.base import SinkDeliveryError
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"log_id": "a", "level": "ERROR", "message": "m"}])
+    for thread in pausing.threads:
+        thread.join(10.0)
+    final = sink.losses()
+    assert final.failed == final.resent == 1, final
+    assert pausing.readings == [final], "a read inside the commit saw the request, not its resend"
+
+
 def test_a_commit_that_raises_reports_the_resends_it_could_not_count(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -737,6 +793,30 @@ def test_a_commit_that_raises_reports_the_resends_it_could_not_count(
     err = capsys.readouterr().err
     assert "1 resend(s) not counted" in err, err
     assert "1 event(s) not counted" in err, err
+
+
+def test_sends_raising_commit_reports_its_resends_apart_and_writes_no_resend_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """AC11: on ``_send``'s route, as on the chunk route, a raising commit names its resends.
+
+    The request and the resend are separate counts in separate units, so each is reported on its
+    own, and the resend line, which announces a count, is not written for one never made.
+    """
+    from log_foundry.sinks.base import SinkDeliveryError
+    from log_foundry.sinks.http import HTTPSink
+    from test_http_rounds import Scripted as Opener
+    from test_http_rounds import _status
+
+    sink = HTTPSink("http://h", max_retries=1, opener=Opener(_status(503)))
+    del sink.failed
+    with pytest.raises(SinkDeliveryError):
+        sink._send(b"x", content_type="text/plain")
+    err = capsys.readouterr().err
+    assert sink.log_foundry_counters.resent_events == 0
+    assert "1 resend(s) not counted" in err, err
+    assert "1 count(s) for HTTPSink not counted" in err, err
+    assert resent_lines(err) == [], err
 
 
 # --- AC13: the line --------------------------------------------------------------------------
