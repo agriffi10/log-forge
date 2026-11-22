@@ -427,6 +427,12 @@ def _half_close(peer: Peer) -> None:
 def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
     """The peer closes or resets on its own once it has read ``after`` bytes of the round.
 
+    The close runs on a watcher thread, and the end check waits for that thread before it asks,
+    so the close lands before the check on every run. Left to its own schedule, the watcher can
+    wake after the round's end check on a loaded runner, which turns the row into the
+    reset-after-the-end-check window, uncounted by design: CI read 617 frames lost and none
+    counted that way on the ``rst-no-ack-wait`` row.
+
     Args:
       mode: ``fin`` or ``rst``.
       after: Bytes read before the close.
@@ -449,7 +455,9 @@ def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
             else:
                 peer.fin()
 
-        threading.Thread(target=watch, daemon=True).start()
+        watcher = threading.Thread(target=watch, daemon=True)
+        watcher.start()
+        seams.hooks["before_end"] = lambda: watcher.join(6.0)
 
     return setup
 
