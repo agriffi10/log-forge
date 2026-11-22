@@ -442,6 +442,98 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
     assert child.output == "confirmed=5 failed=0", child.output
 
 
+def test_a_kafka_sink_configured_again_after_a_shutdown_confirms_what_it_produced() -> None:
+    """The Kafka twin of the Pub/Sub test above: no message is counted lost after a reinstall.
+
+    K is handed, held by a caller's wrapper that forwards the signal and leaves K open, and
+    ``shutdown()`` sets K's signal. A round delivered to K then, before any ``configure()``, finds
+    the signal set, so its wait ends after the first 50 ms slice and a report due 0.3 s after the
+    produce reads ``UNKNOWN``: the window the release notes' known gap names. K is then configured
+    again, five orphan logs produce, ``flush()`` runs and a final ``shutdown()`` closes K. Reports
+    arrive 0.3 s after each produce, inside the 1.0 s ``flush_timeout``: with the reinstall's clear
+    each round waits and confirms, ``failed=0`` for the five, and without it each is counted,
+    ``failed=5`` (measured with the clear removed).
+    """
+
+    def work() -> str:
+        from log_foundry.sinks.kafka import KafkaSink
+        from log_foundry.sinks.verdict import Outcome
+
+        delay = 0.3
+
+        class Producer:
+            def __init__(self) -> None:
+                self.held: list[tuple[float, object]] = []
+                self.lock = threading.Lock()
+
+            def produce(
+                self, topic: str, value: object = None, key: object = None, callback: object = None
+            ) -> None:
+                with self.lock:
+                    self.held.append((time.monotonic() + delay, callback))
+
+            def _serve(self) -> int:
+                now = time.monotonic()
+                with self.lock:
+                    due = [cb for at, cb in self.held if at <= now]
+                    self.held = [(at, cb) for at, cb in self.held if at > now]
+                    left = len(self.held)
+                for cb in due:
+                    cb(None, None)  # type: ignore[operator]
+                return left
+
+            def poll(self, timeout: float) -> int:
+                self._serve()
+                return 0
+
+            def flush(self, timeout: float | None = None) -> int:
+                end = time.monotonic() + (timeout if timeout is not None else 1e9)
+                while True:
+                    left = self._serve()
+                    if left == 0 or time.monotonic() >= end:
+                        return left
+                    time.sleep(min(0.005, max(0.0, end - time.monotonic())))
+
+        class Forwarding:
+            def __init__(self, inner: object) -> None:
+                self._inner = inner
+                self._sig: threading.Event | None = None
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:
+                return self._sig
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, sig: threading.Event | None) -> None:
+                self._sig = sig
+                self._inner.log_foundry_stop_signal = sig  # type: ignore[attr-defined]
+
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                self._inner.emit(batch)  # type: ignore[attr-defined]
+
+            def close(self) -> None:
+                pass
+
+        k = KafkaSink("t", producer=Producer(), flush_timeout=1.0)
+        log_foundry.configure(service="kafka", sink=k)
+        log_foundry.info("before")
+        log_foundry.configure(sink=Forwarding(k))  # type: ignore[arg-type]
+        log_foundry.info("via the wrapper")
+        log_foundry.shutdown(timeout=GATE)
+        (late,) = k.deliver([{"message": "late"}]).outcomes
+        log_foundry.configure(sink=k)
+        before = k.failed
+        for index in range(5):
+            log_foundry.info(f"after {index}")
+        log_foundry.flush(timeout=GATE)
+        log_foundry.shutdown(timeout=GATE)
+        late_reads = "unknown" if late is Outcome.UNKNOWN else str(late)
+        return f"late={late_reads} failed={k.failed - before}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == "late=unknown failed=0", child.output
+
+
 @pytest.mark.parametrize(
     "reconfigure", [False, True], ids=["shutdown-then-fork", "and-reconfigure"]
 )

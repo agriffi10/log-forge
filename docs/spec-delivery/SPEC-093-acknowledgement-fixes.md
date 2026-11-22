@@ -34,7 +34,11 @@ Built with SPEC-094 on one branch and landed in one PR.
   the pending release `v1.3.0` without renaming `docs/release-notes/v1.2.1.md` silently ships
   generated notes, and one the second diff review found: a Kinesis or Firehose `{"Records": []}`
   with no failed count, and a `_bulk` `2xx` `{"items": []}`, still read a non-empty chunk as
-  delivered, outside FR-003's criteria and unfixed under the audit scope freeze) and five §13
+  delivered, outside FR-003's criteria and unfixed under the audit scope freeze; and one the
+  rebase review found, present since SPEC-095 and unfixed under the freeze: a `RabbitMQSink`
+  publish whose channel never opened, a `StreamLostError` from `connection.channel()` or
+  `confirm_delivery()`, is counted as a resend that may have landed, `resent=1`, though nothing
+  was published) and five §13
   bullets; four new decisions and two
   refined in `docs/decisions/sink-delivery/`; `invariants.md` 2, 3, 4, 7 and 13; the README; and
   `docs/release-notes/v1.2.1.md`, whose title and opener were rewritten.

@@ -901,3 +901,78 @@ runner exit 0
   whose close() sleeps 5 s and 6.07 s over a GooglePubSubSink at overflow_timeout=6, so the
   section 12 closer-grace item still holds; the reviewer's fork_probe.py direct reads
   kept-in-child=0 took=0.00 with the parent keeping 2.
+
+== the four TCP re-plants with their Linux leg (--docker), at the rebased head cfa42af1
+   Run by the orchestrator, since the Docker daemon was not running for the run above. Each
+   re-plant reddens on Linux as it did before the rebase; 093-peer-state-reads-no-so-error is
+   green on macOS by design and killed on Linux, also as before. Which ack-wait rows fail on
+   macOS depends on when the reset lands, so the macOS sets differ slightly between runs.
+
+SPEC-093/094 build results at HEAD cfa42af1, Python 3.13.1, darwin
+
+== re-plant 093-end-check-counts-fin (src/log_foundry/sinks/_socket.py); imports $T/093-end-check-counts-fin/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[half-close-3-rounds-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[fin-before-end-all-read-ack-wait]
+    2 failed, 39 passed, 9 skipped in 2.56s
+      exit 1
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[half-close-3-rounds-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[half-close-3-rounds-no-ack-wait]
+    2 failed, 48 passed, 1 warning in 4.99s
+
+== re-plant 093-unacked-answers-0 (src/log_foundry/sinks/_socket.py); imports $T/093-unacked-answers-0/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-ack-wait]
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_waits_until_every_byte_is_acknowledged
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_returns_on_a_reset_without_waiting_further
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_gives_up_at_its_bound
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_does_not_wait_where_the_queue_cannot_be_read
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-logstash]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-logstash]
+    10 failed, 31 passed, 9 skipped in 2.62s
+      exit 1
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_waits_until_every_byte_is_acknowledged
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_returns_on_a_reset_without_waiting_further
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_gives_up_at_its_bound
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_does_not_wait_where_the_queue_cannot_be_read
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-logstash]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-logstash]
+    8 failed, 42 passed, 1 warning in 4.60s
+
+== re-plant 093-peer-state-reads-no-so-error (src/log_foundry/sinks/_socket.py); imports $T/093-peer-state-reads-no-so-error/src/log_foundry/__init__.py
+  macOS pytest:
+    41 passed, 9 skipped in 2.53s
+      exit 0
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-no-ack-wait]
+    2 failed, 48 passed, 1 warning in 5.27s
+
+== re-plant 093-reset-errnos-emptied (src/log_foundry/sinks/_socket.py); imports $T/093-reset-errnos-emptied/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-5-frames-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-ack-wait]
+    3 failed, 38 passed, 9 skipped in 3.31s
+      exit 1
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-no-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-no-ack-wait]
+    4 failed, 46 passed, 1 warning in 5.30s
+
+  Linux py3.12, the full suite, by the rebase review: at cfa42af1 and at 295ba803 the same five
+  environmental failures (the typed_consumer test without mypy installed, and two pytest 9.1.1
+  teardown errors among them), and nothing that fails at the head passes at the base.

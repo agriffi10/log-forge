@@ -2015,6 +2015,20 @@ an item leaves this list when a spec closes it, not because the arc names it.
   budget, at the cost of a close that may outlive `shutdown()` on a thread, or corrects
   invariant 3's sentence to name only the swapped-out close, with Andrew's answer on which.
 
+- **A `RabbitMQSink` publish whose channel never opened is counted as a resend that may have
+  landed** (found by SPEC-093/094's rebase review, 2026-11-22; present on `295ba803`, SPEC-095;
+  unfixed under the audit scope freeze; invariants 2 and 7). `_publish` reads a raise from getting
+  the channel (`sinks/rabbitmq.py:504-512` at `cfa42af1`) with `reached=self._may_have_landed(err)`,
+  as SPEC-095's single guard read every raise, so a `StreamLostError` from `connection.channel()`
+  or `confirm_delivery()` marks the event as possibly landed although nothing was published, and
+  its resend is counted in `resent` with a line. The TCP twin never marks a frame whose connection
+  did not open (`SocketTransport._send_one`'s `sending` flag). Measured on a borrowed connection
+  whose first `channel()` raises `StreamLostError`: one publish in all, and
+  `SinkLosses(dropped=0, failed=0, resent=1)` with one resend line, with `confirm` off and on.
+  `resent` is an upper bound by SPEC-095's own record, so this over-counts and loses nothing.
+  **Closed by** reading a raise from getting the channel as not landed (`reached=False`), held by
+  a test whose channel open raises.
+
 ### Resolved
 
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~
