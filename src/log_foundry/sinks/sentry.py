@@ -396,13 +396,21 @@ class SentrySink:
           the minimum level was never meant for Sentry, and reporting a configured filter as
           loss would make the alert idiom fire on every INFO log. What is reported is an
           abandoned envelope and an event whose send raised, on either transport; delivery the
-          SDK accepts and then loses internally is the SDK's to report.
+          SDK accepts and then loses internally is the SDK's to report. ``resent`` is the HTTP
+          backend's count of envelopes sent again after a send that may have landed them
+          (SPEC-095). The backend's ``failed`` and ``resent`` are read together under its one
+          lock, which one commit holds for both, then released before this sink's lock is taken,
+          so the two never tear and no lock nests.
 
         Raises:
           None.
         """
+        http, failed, resent = self._http, 0, 0
+        if http is not None:
+            with http._counter_lock:
+                failed, resent = http.failed, http.log_foundry_counters.resent_events
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=self.failed + self.transport_errors)
+            return SinkLosses(dropped=0, failed=failed + self.transport_errors, resent=resent)
 
     def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool:
         """Sends one event by the backend ``emit`` resolved for this batch.

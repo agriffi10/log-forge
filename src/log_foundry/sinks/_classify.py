@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import socket
 import sys
+import urllib.error
 from typing import TYPE_CHECKING, Any, Final, cast
 
 if TYPE_CHECKING:
@@ -189,3 +191,31 @@ def sender_fault(entry: Mapping[str, object]) -> bool:
         of the chunk, counted once and never resent (SPEC-074 FR-002).
     """
     return bool(entry.get("SenderFault"))
+
+
+def may_have_landed(err: Exception) -> bool:
+    """Whether a call that raised ``err`` may have reached its destination (SPEC-095 FR-002).
+
+    False only for a class that shows the request never left, as the single-attempt transports
+    raise it: a builtin ``ConnectionRefusedError`` (a subclass included, which is still a
+    refusal), a ``socket.gaierror`` (the name never resolved), and a ``urllib.error.URLError``
+    other than an ``HTTPError``, which ``urllib`` raises only around connecting and writing the
+    request (``do_open``). Everything else may have landed: a timeout or a connection dropped
+    after the request was written cannot say whether the destination stored it. A sink that can
+    tell by where the call raised passes its own answer instead. Types are read with
+    ``issubclass(type(err), …)``, as :func:`aws_retryable` reads them, so this module stays a
+    leaf.
+
+    Args:
+      err: The exception the call raised.
+
+    Returns:
+      False only when the request provably never left.
+
+    Raises:
+      None.
+    """
+    kind = type(err)
+    if issubclass(kind, urllib.error.HTTPError):
+        return True
+    return not issubclass(kind, (ConnectionRefusedError, socket.gaierror, urllib.error.URLError))

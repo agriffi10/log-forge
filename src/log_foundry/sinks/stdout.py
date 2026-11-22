@@ -176,7 +176,7 @@ class StdoutSink:
           None.
         """
         found = self.log_foundry_counters.losses()
-        if found.dropped == 0 and found.failed == 0:
+        if found.dropped == 0 and found.failed == 0 and found.resent == 0:
             return None
         return found
 

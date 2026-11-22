@@ -1,0 +1,407 @@
+SPEC-095 build results at HEAD aa8f3fbf against base c67931cd, Python 3.12.12
+
+== base tree, base corpus
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/base/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-base/conformance_backend.py
+  256 rows, 86 red
+== head tree, head corpus
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+  256 rows, 53 red
+
+== FR-004 AC2: base -> head: 71 row(s) moved
+    AzureEventHubsSink-refused-always: green -> resent-when-knowable
+    AzureEventHubsSink-refused-once: green -> resent-when-knowable
+    AzureEventHubsSink-reply-lost: duplicate -> green
+    AzureEventHubsSink-taken-then-raised: duplicate -> green
+    ClickHouseSink-refused-always: green -> resent-when-knowable
+    ClickHouseSink-refused-once: green -> resent-when-knowable
+    ClickHouseSink-reply-lost: duplicate -> green
+    ClickHouseSink-taken-then-raised: duplicate -> green
+    DatadogSink-reply-lost: duplicate -> green
+    DatadogSink-taken-then-raised: duplicate -> green
+    ElasticsearchSink-reply-lost: duplicate -> green
+    ElasticsearchSink-taken-then-raised: duplicate -> green
+    FilteringSink[over-http]-reply-lost: duplicate -> green
+    FilteringSink[over-http]-taken-then-raised: duplicate -> green
+    FirehoseSink-partial: green -> resent-when-knowable
+    FirehoseSink-refused-always: green -> resent-when-knowable
+    FirehoseSink-refused-once: green -> resent-when-knowable
+    FirehoseSink-reply-lost: duplicate -> green
+    FirehoseSink-taken-then-raised: duplicate -> green
+    HTTPSink-reply-lost: duplicate -> green
+    HTTPSink-taken-then-raised: duplicate -> green
+    HoneycombSink-reply-lost: duplicate -> green
+    HoneycombSink-taken-then-raised: duplicate -> green
+    KinesisSink-refused-always: green -> resent-when-knowable
+    KinesisSink-refused-once: green -> resent-when-knowable
+    KinesisSink-reply-lost: duplicate -> green
+    KinesisSink-taken-then-raised: duplicate -> green
+    LogstashSink[http]-reply-lost: duplicate -> green
+    LogstashSink[http]-taken-then-raised: duplicate -> green
+    LogstashSink[tcp]-taken-then-raised: duplicate -> green
+    LokiSink-reply-lost: duplicate -> green
+    LokiSink-taken-then-raised: duplicate -> green
+    MongoDBSink-reply-lost: lost-but-held -> green
+    MongoDBSink-taken-then-raised: lost-but-held -> green
+    MultiSink[over-http]-reply-lost: duplicate -> green
+    MultiSink[over-http]-taken-then-raised: duplicate -> green
+    NewRelicSink-reply-lost: duplicate -> green
+    NewRelicSink-taken-then-raised: duplicate -> green
+    OTLPSink-reply-lost: duplicate -> green
+    OTLPSink-taken-then-raised: duplicate -> green
+    OpenSearchSink-reply-lost: duplicate -> green
+    OpenSearchSink-taken-then-raised: duplicate -> green
+    PostgresSink[owned]-reply-lost: duplicate -> green
+    RabbitMQSink[owned]-taken-then-raised: duplicate -> green
+    RedisListSink-refused-always: green -> resent-when-knowable
+    RedisListSink-refused-once: green -> resent-when-knowable
+    RedisListSink-reply-lost: duplicate -> green
+    RedisListSink-taken-then-raised: duplicate -> green
+    RedisStreamsSink-refused-always: green -> resent-when-knowable
+    RedisStreamsSink-refused-once: green -> resent-when-knowable
+    RedisStreamsSink-reply-lost: duplicate -> green
+    RedisStreamsSink-taken-then-raised: duplicate -> green
+    SNSSink-refused-always: green -> resent-when-knowable
+    SNSSink-refused-once: green -> resent-when-knowable
+    SNSSink-reply-lost: duplicate -> green
+    SNSSink-taken-then-raised: duplicate -> green
+    SQSSink[fifo]-refused-always: green -> resent-when-knowable
+    SQSSink[fifo]-refused-once: green -> resent-when-knowable
+    SQSSink[standard]-refused-always: green -> resent-when-knowable
+    SQSSink[standard]-refused-once: green -> resent-when-knowable
+    SQSSink[standard]-reply-lost: duplicate -> green
+    SQSSink[standard]-taken-then-raised: duplicate -> green
+    SentrySink[http]-reply-lost: duplicate -> green
+    SentrySink[http]-taken-then-raised: duplicate -> green
+    SplunkHECSink-reply-lost: duplicate -> green
+    SplunkHECSink-taken-then-raised: duplicate -> green
+    SyslogSink[tcp]-taken-then-raised: duplicate -> green
+    TransformSink[over-http]-reply-lost: duplicate -> green
+    TransformSink[over-http]-taken-then-raised: duplicate -> green
+    _FactorySink[over-http]-reply-lost: duplicate -> green
+    _FactorySink[over-http]-taken-then-raised: duplicate -> green
+  expected: 50 + 2 + 19 = 71
+
+== FR-004 AC3: base tree, head corpus
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/base/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+corpus change alone: 0 row(s) moved
+
+  rows that count a resend at head: 77
+
+== source mutant classify-may-have-landed-true: src/log_foundry/sinks/_classify.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/classify-may-have-landed-true/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+classify-may-have-landed-true: 34 row(s) moved
+    DatadogSink-refused-always: green -> resent-when-knowable
+    DatadogSink-refused-once: green -> resent-when-knowable
+    ElasticsearchSink-refused-always: green -> resent-when-knowable
+    ElasticsearchSink-refused-once: green -> resent-when-knowable
+    FilteringSink[over-http]-refused-always: green -> resent-when-knowable
+    FilteringSink[over-http]-refused-once: green -> resent-when-knowable
+    HTTPSink-refused-always: green -> resent-when-knowable
+    HTTPSink-refused-once: green -> resent-when-knowable
+    HoneycombSink-refused-always: green -> resent-when-knowable
+    HoneycombSink-refused-once: green -> resent-when-knowable
+    LogstashSink[http]-refused-always: green -> resent-when-knowable
+    LogstashSink[http]-refused-once: green -> resent-when-knowable
+    LogstashSink[tcp]-refused-always: green -> resent-when-knowable
+    LogstashSink[tcp]-refused-once: green -> resent-when-knowable
+    LokiSink-refused-always: green -> resent-when-knowable
+    LokiSink-refused-once: green -> resent-when-knowable
+    MultiSink[over-http]-refused-always: green -> resent-when-knowable
+    MultiSink[over-http]-refused-once: green -> resent-when-knowable
+    NewRelicSink-refused-always: green -> resent-when-knowable
+    NewRelicSink-refused-once: green -> resent-when-knowable
+    OTLPSink-refused-always: green -> resent-when-knowable
+    OTLPSink-refused-once: green -> resent-when-knowable
+    OpenSearchSink-refused-always: green -> resent-when-knowable
+    OpenSearchSink-refused-once: green -> resent-when-knowable
+    SentrySink[http]-refused-always: green -> resent-when-knowable
+    SentrySink[http]-refused-once: green -> resent-when-knowable
+    SplunkHECSink-refused-always: green -> resent-when-knowable
+    SplunkHECSink-refused-once: green -> resent-when-knowable
+    SyslogSink[tcp]-refused-always: green -> resent-when-knowable
+    SyslogSink[tcp]-refused-once: green -> resent-when-knowable
+    TransformSink[over-http]-refused-always: green -> resent-when-knowable
+    TransformSink[over-http]-refused-once: green -> resent-when-knowable
+    _FactorySink[over-http]-refused-always: green -> resent-when-knowable
+    _FactorySink[over-http]-refused-once: green -> resent-when-knowable
+
+== source mutant context-drops-marks: src/log_foundry/sinks/_engine.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/context-drops-marks/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+context-drops-marks: 69 row(s) moved
+    AzureEventHubsSink-refused-always: resent-when-knowable -> green
+    AzureEventHubsSink-refused-once: resent-when-knowable -> green
+    AzureEventHubsSink-reply-lost: green -> duplicate
+    AzureEventHubsSink-taken-then-raised: green -> duplicate
+    ClickHouseSink-refused-always: resent-when-knowable -> green
+    ClickHouseSink-refused-once: resent-when-knowable -> green
+    ClickHouseSink-reply-lost: green -> duplicate
+    ClickHouseSink-taken-then-raised: green -> duplicate
+    DatadogSink-reply-lost: green -> duplicate
+    DatadogSink-taken-then-raised: green -> duplicate
+    ElasticsearchSink-reply-lost: green -> duplicate
+    ElasticsearchSink-taken-then-raised: green -> duplicate
+    FilteringSink[over-http]-reply-lost: green -> duplicate
+    FilteringSink[over-http]-taken-then-raised: green -> duplicate
+    FirehoseSink-partial: resent-when-knowable -> green
+    FirehoseSink-refused-always: resent-when-knowable -> green
+    FirehoseSink-refused-once: resent-when-knowable -> green
+    FirehoseSink-reply-lost: green -> duplicate
+    FirehoseSink-taken-then-raised: green -> duplicate
+    HTTPSink-reply-lost: green -> duplicate
+    HTTPSink-taken-then-raised: green -> duplicate
+    HoneycombSink-reply-lost: green -> duplicate
+    HoneycombSink-taken-then-raised: green -> duplicate
+    KinesisSink-refused-always: resent-when-knowable -> green
+    KinesisSink-refused-once: resent-when-knowable -> green
+    KinesisSink-reply-lost: green -> duplicate
+    KinesisSink-taken-then-raised: green -> duplicate
+    LogstashSink[http]-reply-lost: green -> duplicate
+    LogstashSink[http]-taken-then-raised: green -> duplicate
+    LogstashSink[tcp]-taken-then-raised: green -> duplicate
+    LokiSink-reply-lost: green -> duplicate
+    LokiSink-taken-then-raised: green -> duplicate
+    MultiSink[over-http]-reply-lost: green -> duplicate
+    MultiSink[over-http]-taken-then-raised: green -> duplicate
+    NewRelicSink-reply-lost: green -> duplicate
+    NewRelicSink-taken-then-raised: green -> duplicate
+    OTLPSink-reply-lost: green -> duplicate
+    OTLPSink-taken-then-raised: green -> duplicate
+    OpenSearchSink-reply-lost: green -> duplicate
+    OpenSearchSink-taken-then-raised: green -> duplicate
+    PostgresSink[owned]-reply-lost: green -> duplicate
+    RabbitMQSink[owned]-taken-then-raised: green -> duplicate
+    RedisListSink-refused-always: resent-when-knowable -> green
+    RedisListSink-refused-once: resent-when-knowable -> green
+    RedisListSink-reply-lost: green -> duplicate
+    RedisListSink-taken-then-raised: green -> duplicate
+    RedisStreamsSink-refused-always: resent-when-knowable -> green
+    RedisStreamsSink-refused-once: resent-when-knowable -> green
+    RedisStreamsSink-reply-lost: green -> duplicate
+    RedisStreamsSink-taken-then-raised: green -> duplicate
+    SNSSink-refused-always: resent-when-knowable -> green
+    SNSSink-refused-once: resent-when-knowable -> green
+    SNSSink-reply-lost: green -> duplicate
+    SNSSink-taken-then-raised: green -> duplicate
+    SQSSink[fifo]-refused-always: resent-when-knowable -> green
+    SQSSink[fifo]-refused-once: resent-when-knowable -> green
+    SQSSink[standard]-refused-always: resent-when-knowable -> green
+    SQSSink[standard]-refused-once: resent-when-knowable -> green
+    SQSSink[standard]-reply-lost: green -> duplicate
+    SQSSink[standard]-taken-then-raised: green -> duplicate
+    SentrySink[http]-reply-lost: green -> duplicate
+    SentrySink[http]-taken-then-raised: green -> duplicate
+    SplunkHECSink-reply-lost: green -> duplicate
+    SplunkHECSink-taken-then-raised: green -> duplicate
+    SyslogSink[tcp]-taken-then-raised: green -> duplicate
+    TransformSink[over-http]-reply-lost: green -> duplicate
+    TransformSink[over-http]-taken-then-raised: green -> duplicate
+    _FactorySink[over-http]-reply-lost: green -> duplicate
+    _FactorySink[over-http]-taken-then-raised: green -> duplicate
+
+== source mutant diag-resent-silent: src/log_foundry/_diag.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/diag-resent-silent/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+diag-resent-silent: 77 row(s) moved
+    AzureEventHubsSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    AzureEventHubsSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    AzureEventHubsSink-reply-lost: green -> unannounced
+    AzureEventHubsSink-taken-then-raised: green -> unannounced
+    ClickHouseSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    ClickHouseSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    ClickHouseSink-reply-lost: green -> unannounced
+    ClickHouseSink-taken-then-raised: green -> unannounced
+    DatadogSink-reply-lost: green -> unannounced
+    DatadogSink-taken-then-raised: green -> unannounced
+    ElasticsearchSink-reply-lost: green -> unannounced
+    ElasticsearchSink-taken-then-raised: green -> unannounced
+    FilteringSink[over-http]-reply-lost: green -> unannounced
+    FilteringSink[over-http]-taken-then-raised: green -> unannounced
+    FirehoseSink-partial: resent-when-knowable -> unannounced+resent-when-knowable
+    FirehoseSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    FirehoseSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    FirehoseSink-reply-lost: green -> unannounced
+    FirehoseSink-taken-then-raised: green -> unannounced
+    HTTPSink-reply-lost: green -> unannounced
+    HTTPSink-taken-then-raised: green -> unannounced
+    HoneycombSink-reply-lost: green -> unannounced
+    HoneycombSink-taken-then-raised: green -> unannounced
+    KinesisSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    KinesisSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    KinesisSink-reply-lost: green -> unannounced
+    KinesisSink-taken-then-raised: green -> unannounced
+    LogstashSink[http]-reply-lost: green -> unannounced
+    LogstashSink[http]-taken-then-raised: green -> unannounced
+    LogstashSink[tcp]-peer-closed: silent-loss -> silent-loss+unannounced
+    LogstashSink[tcp]-taken-then-raised: green -> unannounced
+    LokiSink-reply-lost: green -> unannounced
+    LokiSink-taken-then-raised: green -> unannounced
+    MultiSink[over-http]-reply-lost: green -> unannounced
+    MultiSink[over-http]-taken-then-raised: green -> unannounced
+    NewRelicSink-reply-lost: green -> unannounced
+    NewRelicSink-taken-then-raised: green -> unannounced
+    OTLPSink-reply-lost: green -> unannounced
+    OTLPSink-taken-then-raised: green -> unannounced
+    OpenSearchSink-reply-lost: green -> unannounced
+    OpenSearchSink-taken-then-raised: green -> unannounced
+    PostgresSink[borrowed]-reply-lost: lost-but-held -> lost-but-held+unannounced
+    PostgresSink[owned]-reply-lost: green -> unannounced
+    RabbitMQSink[borrowed]-peer-closed: silent-loss -> silent-loss+unannounced
+    RabbitMQSink[borrowed]-taken-then-raised: lost-but-held -> lost-but-held+unannounced
+    RabbitMQSink[owned]-peer-closed: silent-loss -> silent-loss+unannounced
+    RabbitMQSink[owned]-taken-then-raised: green -> unannounced
+    RedisListSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    RedisListSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    RedisListSink-reply-lost: green -> unannounced
+    RedisListSink-taken-then-raised: green -> unannounced
+    RedisStreamsSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    RedisStreamsSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    RedisStreamsSink-reply-lost: green -> unannounced
+    RedisStreamsSink-taken-then-raised: green -> unannounced
+    SNSSink-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    SNSSink-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    SNSSink-reply-lost: green -> unannounced
+    SNSSink-taken-then-raised: green -> unannounced
+    SQSSink[fifo]-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    SQSSink[fifo]-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    SQSSink[fifo]-reply-lost: green -> unannounced
+    SQSSink[fifo]-taken-then-raised: green -> unannounced
+    SQSSink[standard]-refused-always: resent-when-knowable -> unannounced+resent-when-knowable
+    SQSSink[standard]-refused-once: resent-when-knowable -> unannounced+resent-when-knowable
+    SQSSink[standard]-reply-lost: green -> unannounced
+    SQSSink[standard]-taken-then-raised: green -> unannounced
+    SentrySink[http]-reply-lost: green -> unannounced
+    SentrySink[http]-taken-then-raised: green -> unannounced
+    SplunkHECSink-reply-lost: green -> unannounced
+    SplunkHECSink-taken-then-raised: green -> unannounced
+    SyslogSink[tcp]-peer-closed: silent-loss -> silent-loss+unannounced
+    SyslogSink[tcp]-taken-then-raised: green -> unannounced
+    TransformSink[over-http]-reply-lost: green -> unannounced
+    TransformSink[over-http]-taken-then-raised: green -> unannounced
+    _FactorySink[over-http]-reply-lost: green -> unannounced
+    _FactorySink[over-http]-taken-then-raised: green -> unannounced
+
+== source mutant delivery-resent-unset: src/log_foundry/sinks/_engine.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/delivery-resent-unset/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+delivery-resent-unset: 75 row(s) moved
+    AzureEventHubsSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    AzureEventHubsSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    AzureEventHubsSink-reply-lost: green -> partition
+    AzureEventHubsSink-taken-then-raised: green -> partition
+    ClickHouseSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    ClickHouseSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    ClickHouseSink-reply-lost: green -> partition
+    ClickHouseSink-taken-then-raised: green -> partition
+    DatadogSink-reply-lost: green -> partition
+    DatadogSink-taken-then-raised: green -> partition
+    ElasticsearchSink-reply-lost: green -> partition
+    ElasticsearchSink-taken-then-raised: green -> partition
+    FilteringSink[over-http]-reply-lost: green -> partition
+    FilteringSink[over-http]-taken-then-raised: green -> partition
+    FirehoseSink-partial: resent-when-knowable -> partition+resent-when-knowable
+    FirehoseSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    FirehoseSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    FirehoseSink-reply-lost: green -> partition
+    FirehoseSink-taken-then-raised: green -> partition
+    HTTPSink-reply-lost: green -> partition
+    HTTPSink-taken-then-raised: green -> partition
+    HoneycombSink-reply-lost: green -> partition
+    HoneycombSink-taken-then-raised: green -> partition
+    KinesisSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    KinesisSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    KinesisSink-reply-lost: green -> partition
+    KinesisSink-taken-then-raised: green -> partition
+    LogstashSink[http]-reply-lost: green -> partition
+    LogstashSink[http]-taken-then-raised: green -> partition
+    LogstashSink[tcp]-peer-closed: silent-loss -> partition+silent-loss
+    LogstashSink[tcp]-taken-then-raised: green -> partition
+    LokiSink-reply-lost: green -> partition
+    LokiSink-taken-then-raised: green -> partition
+    MultiSink[over-http]-reply-lost: green -> partition
+    MultiSink[over-http]-taken-then-raised: green -> partition
+    NewRelicSink-reply-lost: green -> partition
+    NewRelicSink-taken-then-raised: green -> partition
+    OTLPSink-reply-lost: green -> partition
+    OTLPSink-taken-then-raised: green -> partition
+    OpenSearchSink-reply-lost: green -> partition
+    OpenSearchSink-taken-then-raised: green -> partition
+    PostgresSink[borrowed]-reply-lost: lost-but-held -> partition+lost-but-held
+    PostgresSink[owned]-reply-lost: green -> partition
+    RabbitMQSink[borrowed]-peer-closed: silent-loss -> partition+silent-loss
+    RabbitMQSink[borrowed]-taken-then-raised: lost-but-held -> partition+lost-but-held
+    RabbitMQSink[owned]-peer-closed: silent-loss -> partition+silent-loss
+    RabbitMQSink[owned]-taken-then-raised: green -> partition
+    RedisListSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    RedisListSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    RedisListSink-reply-lost: green -> partition
+    RedisListSink-taken-then-raised: green -> partition
+    RedisStreamsSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    RedisStreamsSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    RedisStreamsSink-reply-lost: green -> partition
+    RedisStreamsSink-taken-then-raised: green -> partition
+    SNSSink-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    SNSSink-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    SNSSink-reply-lost: green -> partition
+    SNSSink-taken-then-raised: green -> partition
+    SQSSink[fifo]-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    SQSSink[fifo]-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    SQSSink[fifo]-reply-lost: green -> partition
+    SQSSink[fifo]-taken-then-raised: green -> partition
+    SQSSink[standard]-refused-always: resent-when-knowable -> partition+resent-when-knowable
+    SQSSink[standard]-refused-once: resent-when-knowable -> partition+resent-when-knowable
+    SQSSink[standard]-reply-lost: green -> partition
+    SQSSink[standard]-taken-then-raised: green -> partition
+    SplunkHECSink-reply-lost: green -> partition
+    SplunkHECSink-taken-then-raised: green -> partition
+    SyslogSink[tcp]-peer-closed: silent-loss -> partition+silent-loss
+    SyslogSink[tcp]-taken-then-raised: green -> partition
+    TransformSink[over-http]-reply-lost: green -> partition
+    TransformSink[over-http]-taken-then-raised: green -> partition
+    _FactorySink[over-http]-reply-lost: green -> partition
+    _FactorySink[over-http]-taken-then-raised: green -> partition
+
+== source mutant resent-into-dropped: src/log_foundry/sinks/_engine.py
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/resent-into-dropped/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+resent-into-dropped: 2 row(s) moved
+    SentrySink[http]-reply-lost: green -> duplicate
+    SentrySink[http]-taken-then-raised: green -> duplicate
+
+== in-process mutant without:resent-when-knowable
+  log_foundry.__file__         = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/head/src/log_foundry/__init__.py
+  conformance_backend.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/helpers-head/conformance_backend.py
+without:resent-when-knowable: 19 row(s) moved
+    AzureEventHubsSink-refused-always: resent-when-knowable -> green
+    AzureEventHubsSink-refused-once: resent-when-knowable -> green
+    ClickHouseSink-refused-always: resent-when-knowable -> green
+    ClickHouseSink-refused-once: resent-when-knowable -> green
+    FirehoseSink-partial: resent-when-knowable -> green
+    FirehoseSink-refused-always: resent-when-knowable -> green
+    FirehoseSink-refused-once: resent-when-knowable -> green
+    KinesisSink-refused-always: resent-when-knowable -> green
+    KinesisSink-refused-once: resent-when-knowable -> green
+    RedisListSink-refused-always: resent-when-knowable -> green
+    RedisListSink-refused-once: resent-when-knowable -> green
+    RedisStreamsSink-refused-always: resent-when-knowable -> green
+    RedisStreamsSink-refused-once: resent-when-knowable -> green
+    SNSSink-refused-always: resent-when-knowable -> green
+    SNSSink-refused-once: resent-when-knowable -> green
+    SQSSink[fifo]-refused-always: resent-when-knowable -> green
+    SQSSink[fifo]-refused-once: resent-when-knowable -> green
+    SQSSink[standard]-refused-always: resent-when-knowable -> green
+    SQSSink[standard]-refused-once: resent-when-knowable -> green
+
+== FR-003 AC6: the MongoDB conditions, by pytest in an export
+  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/head/src/log_foundry/__init__.py
+  unmutated: exit 0; 2 passed in 0.11s
+  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/mongo-without-condition-3/src/log_foundry/__init__.py
+  mongo-without-condition-3: exit 1; ['FAILED tests/test_sinks_mongodb_resend.py::test_a_caller_set_id_is_never_read_as_landed']
+  log_foundry.__file__ = /var/folders/cv/sxd76b7j5vs8mlkns2tw6z5r0000gq/T/spec095-build-dkmkgsio/mongo-without-condition-4/src/log_foundry/__init__.py
+  mongo-without-condition-4: exit 1; ['FAILED tests/test_sinks_mongodb_resend.py::test_a_first_send_refused_on_id_is_rejected']
+
+ALL CRITERIA HOLD

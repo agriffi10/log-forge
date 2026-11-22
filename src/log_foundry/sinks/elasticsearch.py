@@ -229,6 +229,7 @@ class ElasticsearchSink(HTTPSink):
             return SinkLosses(
                 dropped=self.dropped_oversized + self._unrenderable,
                 failed=self.failed + self.item_errors + self.dropped_unadjudicated,
+                resent=self.log_foundry_counters.resent_events,
             )
 
 

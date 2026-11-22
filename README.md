@@ -669,8 +669,13 @@ A few conventions hold across every sink below:
   `.dropped_unadjudicated`, …) and returns, since retrying would re-deliver what already landed.
   A sink that delivered **none** of it raises instead (a sink on the delivery engine, such as the
   HTTP family, reports its run failed), so the worker's bounded retry engages for whatever can
-  still land and `health().failed_batches` records the loss — there is nothing downstream to
-  duplicate. Three
+  still land and `health().failed_batches` records the loss. A resend can duplicate an event only
+  when the sink cannot tell whether an earlier send landed it — a reply lost to a timeout or a
+  dropped connection, which a destination may have stored — and the shipped sinks, `NATSSink`
+  excepted, count each such resend their delivery engine makes in `health().sink.resent`, as an
+  upper bound, and say so once per batch on stderr (`log-foundry: resent <n> event(s) a lost
+  reply may have landed; they may be duplicated; <Sink>`). Some copies go uncounted; the
+  `health()` section below says which. Three
   cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
   event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
   landed), and an SQS or SNS sender fault (a byte-identical re-send can only fail again). Within a
@@ -924,7 +929,7 @@ earlier message, as before.
 | Sink | Import from | Configure |
 |---|---|---|
 | `SQSSink` | `log_foundry.sinks.sqs` | `SQSSink(queue_url, *, max_retries=3, fifo=None, message_group_id=None, message_deduplication_id=None, max_message_bytes=None)` — the headline production path: a durable buffer in front of ELK, absorbing downstream spikes/outages. Standard **and** FIFO queues |
-| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3, max_message_bytes=None)` |
+| `SNSSink` | `log_foundry.sinks.sns` | `SNSSink(topic_arn, *, max_retries=3, max_message_bytes=None)` — standard topics; a FIFO topic is not supported yet, since the sink sends no `MessageGroupId`, which SNS requires there |
 | `KinesisSink` | `log_foundry.sinks.kinesis` | `KinesisSink(stream_name, *, partition_key_field="trace_id", max_retries=3)` |
 | `FirehoseSink` | `log_foundry.sinks.firehose` | `FirehoseSink(delivery_stream, *, max_retries=3)` |
 
@@ -1099,8 +1104,10 @@ loss-reporting apparatus is built on them:
   reshape. A child that cleared the list in place left the next child with nothing, and no error
   anywhere.
 - **Raise when you delivered none of the batch**, after your own retries are spent. That is the
-  signal the worker's bounded retry and `health().failed_batches` depend on, and the one case where
-  a retry cannot duplicate anything: nothing landed downstream. Raise `SinkDeliveryError` (from
+  signal the worker's bounded retry and `health().failed_batches` depend on, and the case where a
+  retry duplicates nothing, provided nothing did land. A request whose reply you lost may have
+  landed, so the worker's retry can deliver it twice, and `resent` does not count that copy.
+  Raise `SinkDeliveryError` (from
   `log_foundry`) or any exception of your own — the contract is that *something* propagates.
 - **Do not raise when you delivered some of it.** The worker retries whole batches, so raising on a
   partial success re-delivers the records that already arrived, and duplicates downstream are worse
@@ -1166,7 +1173,9 @@ class MySink:
 ```
 
 `losses()` is optional and probed by name, so a sink written before it existed keeps working and
-simply contributes nothing to `health().sink`. `emit([])` must be a no-op: an empty batch has not
+simply contributes nothing to `health().sink`. `SinkLosses` also has a `resent` field, which
+defaults to `0`, so a `SinkLosses` built with `dropped=` and `failed=` by keyword, as here, needs
+no change. `emit([])` must be a no-op: an empty batch has not
 failed to deliver.
 
 `log_foundry_stop_signal` is optional in the same way, and is an attribute rather than a method.
@@ -1299,7 +1308,10 @@ class MyBatchSink:
   transient errors inside `deliver` and return `RETRYABLE` instead.
 - **Counted once, by the library.** Never write to `SinkCounters` yourself: the engine adds each
   run's losses at the end of the run, and `losses()` returning `log_foundry_counters.losses()`
-  makes `health().sink` read them.
+  makes `health().sink` read them, `resent` included. `resent` counts the events the engine sent
+  again after a call the sink marked as one that may have landed them; that mark is the shipped
+  sinks' own, so a `deliver` of yours leaves `resent` at `0`, and a `SinkLosses` built by keyword
+  needs no change.
 - **`emit` is still required**, and is what a wrapper calling `inner.emit(batch)` reaches; the
   worker never calls it on a sink that offers `deliver`. Keep it to the three rules above. Make
   it `emit_via_deliver(self, batch)`, as in the example: it runs the same engine inline and keeps
@@ -1405,8 +1417,8 @@ reported. They aggregate different failure populations — one can mean the dest
 data; the other never the destination — the data, or no drain thread at all (SPEC-050) — so a
 single number would hide which fix applies.
 
-`h.sink` is a `SinkLosses`, carrying `dropped` and `failed`, or `None` — `None` when no sink has
-been configured at all, and `None` when the configured sink reports nothing (`losses()` is
+`h.sink` is a `SinkLosses`, carrying `dropped`, `failed` and `resent`, or `None` — `None` when no
+sink has been configured at all, and `None` when the configured sink reports nothing (`losses()` is
 optional, and a sink whose `losses()` raises reports `None` too). It is **not** `None` merely
 because no worker exists: since SPEC-054 it is answered
 from the configuration, so it reports on the orphan path too. Note the two `dropped` fields count
@@ -1438,6 +1450,18 @@ alert on `failed_batches` alone, add `sink.dropped`.
 counts the attempt *and* hands the batch back to the worker, whose retry may then deliver it — so a
 transient outage leaves it non-zero with nothing actually lost. `failed_batches` is the record of a
 batch given up on for good.
+
+`sink.resent` is not a loss. It counts the events a shipped sink's delivery engine sent again after
+a send that may have landed them — a timeout, a dropped connection or a `5xx` after the request
+left — so each may be held twice at the destination, and a consumer can de-duplicate on the
+event's `log_id`. It is an upper bound for those resends: a FIFO queue inside its de-duplication
+interval, or a client that retried inside the call and never landed anything, adds no copy but is
+counted. It does not see every copy, though. A client library's own retries inside a call that
+then returned, an entry a reply names as failed after an earlier attempt inside the same call had
+landed it, the worker resending a whole batch to a sink with no `deliver`, and a `PostgresSink` on
+an autocommit connection resending chunks it had already committed when a later chunk failed can
+each leave a copy that `resent` does not count. An event no later send landed is still counted in
+`sink.failed`.
 
 `stopped_reason` is a type name (e.g. `"SystemExit"`), never the exception's message — a sink's
 error text can carry event data. It reads `None` for a healthy worker, for a process that has never

@@ -7,20 +7,19 @@ import http.client
 import json
 import math
 import re
-import threading
 import unicodedata
 import urllib.error
 import urllib.request
 from base64 import b64encode
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Any, ClassVar, NoReturn, Protocol, TypedDict, cast
+from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Protocol, TypedDict, cast
 from urllib.parse import unquote, unwrap, urlparse
 
 from log_foundry import _diag
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import require_callable
-from log_foundry.sinks._classify import is_retryable
+from log_foundry.sinks._classify import is_retryable, may_have_landed
 from log_foundry.sinks._engine import RunContext, When
 from log_foundry.sinks._retry import (
     exact_seconds,
@@ -38,6 +37,9 @@ from log_foundry.sinks.base import (
     _own_attribute,
 )
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    import threading
 
 __all__ = [
     "HTTPAuthKwargs",
@@ -228,6 +230,9 @@ class _Answer:
       detail: The abandonment detail when the request was counted, else ``""``.
       error: An exception the predicate refused and the caller counts itself
         (``count_unexpected=False``), to be re-raised unchanged.
+      reached: Whether a ``RETRYABLE`` request may have reached the destination (SPEC-095): a
+        retried exception :func:`~log_foundry.sinks._classify.may_have_landed` does not clear,
+        or a retryable status ``>= 500``. A ``429`` is the server's refusal and is not.
     """
 
     outcome: Outcome | None
@@ -235,6 +240,7 @@ class _Answer:
     retry_after: float | None = None
     detail: str = ""
     error: Exception | None = None
+    reached: bool = False
 
 
 @dataclass
@@ -2330,8 +2336,49 @@ class HTTPSink:
         self.dropped_oversized = 0
         self._unrenderable = 0
         self.dropped_unadjudicated = 0
-        self._counter_lock = threading.Lock()
         self.log_foundry_counters = SinkCounters()
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock, which every commit and ``losses()`` read takes (SPEC-095).
+
+        The sink's own counts — ``failed`` in requests, the drops, ``dropped_unadjudicated`` —
+        and the engine's ``resent_events`` commit under this one lock, in one ``Deferral`` per
+        run, so ``losses()`` never reads one run's resends without that run's ``failed``. With a
+        lock of its own the sink's counts committed after the engine's, and a read between the
+        two saw half the run. Sharing the lock changes no counter and no unit: ``failed`` still
+        counts requests, ``failed_events`` events. Assigning it replaces the counters' lock, as
+        on the other engine sinks, so a fork repair or a counting lock reaches both.
+
+        A subclass of its own must therefore assign it only after ``super().__init__()``, which
+        creates the counters, and must never hold it while calling
+        ``log_foundry_counters.losses()``, which takes the same lock and would wait on itself.
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @_counter_lock.setter
+    def _counter_lock(self, lock: threading.Lock) -> None:
+        """Replaces the counters' lock.
+
+        Args:
+          lock: The new lock.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self.log_foundry_counters._counter_lock = lock
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Runs the delivery engine inline over :meth:`_round`, keeping the 1.x ``emit`` contract.
@@ -2522,6 +2569,8 @@ class HTTPSink:
                         outcomes = self._read(answer.payload, chunk)
                     else:
                         outcomes = (answer.outcome,) * len(chunk)
+                        if answer.outcome is Outcome.RETRYABLE and answer.reached:
+                            context.may_have_landed(at for at in where if at is not None)
                         hint = answer.retry_after
                         if (
                             answer.outcome is Outcome.RETRYABLE
@@ -3121,6 +3170,7 @@ class HTTPSink:
             return SinkLosses(
                 dropped=self.dropped_oversized + self._unrenderable,
                 failed=self.failed + self.dropped_unadjudicated,
+                resent=self.log_foundry_counters.resent_events,
             )
 
     def close(self) -> None:
@@ -3158,7 +3208,12 @@ class HTTPSink:
         lines are its own run's, committed when that run ends, so it makes ``max_retries + 1``
         attempts and counts as 1.x did even when called from inside another run's round, waiting
         inside that round. The engine's event totals for it go to a throwaway ``SinkCounters``:
-        a request is not an event.
+        a request is not an event. Its resends of a request that may have landed — a timeout, a
+        lost connection, a ``5xx`` — are the exception (SPEC-095): the engine commits them to this
+        sink's own ``log_foundry_counters.resent_events`` (``resent_into``) and writes their one
+        line, so ``losses().resent`` reports them. ``SentrySink``'s backend sends one event per
+        request, so its count is in events; a third-party subclass on this path counts requests,
+        as ``failed`` does.
 
         A failure **before** any status line that :meth:`_retryable_error` accepts — an
         ``OSError``, a ``URLError``, an ``http.client.HTTPException`` such as ``BadStatusLine``
@@ -3234,6 +3289,8 @@ class HTTPSink:
                 return Verdict(outcomes=(Outcome.REJECTED,))
             sent.answer = answer
             outcome = Outcome.REJECTED if answer.outcome is None else answer.outcome
+            if outcome is Outcome.RETRYABLE and answer.reached:
+                _engine.run_context().may_have_landed([0])
             return Verdict(outcomes=(outcome,), retry_after=answer.retry_after)
 
         _engine._run(
@@ -3245,6 +3302,7 @@ class HTTPSink:
             worker_retries=0,
             stop=_engine.stop_signal_of(self),
             decline=None,
+            resent_into=self.log_foundry_counters,
         )
         if sent.raised is not None:
             raise sent.raised
@@ -3277,6 +3335,14 @@ class HTTPSink:
         any other status                                          ``REJECTED``    ``ALWAYS``
         ========================================================  ==============  ================
 
+        A ``RETRYABLE`` answer carries whether the request may have landed (SPEC-095 FR-002): a
+        retried exception that :func:`~log_foundry.sinks._classify.may_have_landed` does not
+        clear — a timeout, or ``RemoteDisconnected`` from ``getresponse`` — and a ``5xx``, which
+        says the request failed, not that nothing was stored; a gateway's ``502`` or ``504`` is
+        an upstream reply it lost. A ``URLError`` that is not an ``HTTPError``, a refused
+        connection and a ``429`` are not. The caller marks the chunk's events, so the engine
+        counts their resend.
+
         ``failed`` counts the **request**, its line naming the attempts its events have had,
         which is the run's round. A retryable request counts ``LAST``, only when its round is the
         run's last, so a request a later round lands is never counted; one refused for good
@@ -3301,7 +3367,11 @@ class HTTPSink:
         except Exception as err:
             reason = f"connection error, {_diag.type_name(err)} {_diag.errno_of(err)}".rstrip()
             if is_retryable(self._retryable_error, err):
-                return _Answer(Outcome.RETRYABLE, detail=self._give_up(context, reason, When.LAST))
+                return _Answer(
+                    Outcome.RETRYABLE,
+                    detail=self._give_up(context, reason, When.LAST),
+                    reached=may_have_landed(err),
+                )
             if not count_unexpected and not _diag.is_a(err, SinkDeliveryError):
                 return _Answer(Outcome.REJECTED, error=err)
             return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
@@ -3313,7 +3383,9 @@ class HTTPSink:
             return _Answer(Outcome.REJECTED, detail=self._give_up(context, reason, When.ALWAYS))
         if self._retryable_status(status):
             detail = self._give_up(context, f"HTTP {status}", When.LAST)
-            return _Answer(Outcome.RETRYABLE, retry_after=retry_after, detail=detail)
+            return _Answer(
+                Outcome.RETRYABLE, retry_after=retry_after, detail=detail, reached=status >= 500
+            )
         if status == 413 and splittable:
             return _Answer(None, payload=payload)
         return _Answer(

@@ -412,4 +412,4 @@ class LogstashSink:
             return self._http.losses()
         if self._socket is not None:
             return self._socket.losses()
-        return SinkLosses(dropped=0, failed=0)
+        return SinkLosses(dropped=0, failed=0, resent=0)

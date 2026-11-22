@@ -427,7 +427,10 @@ def test_a_failed_run_counts_the_whole_batch_once_and_a_settled_one_drops(
     settled.state.fail_next = 1
     assert through_a_worker(settled) == 0
     assert settled.sink.failed == 0
-    assert read_losses(settled.sink) == SinkLosses(dropped=1, failed=0)
+    resent = 0 if name == "PostgresSink" else 1
+    assert read_losses(settled.sink) == SinkLosses(dropped=1, failed=0, resent=resent), (
+        "redis-py retries inside the call, so its failed pipeline's resend is counted (SPEC-095)"
+    )
     assert settled.delivered() == ["a"]
 
 

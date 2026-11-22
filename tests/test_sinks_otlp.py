@@ -191,11 +191,12 @@ def test_scope_version_is_the_library_version() -> None:
 
 @pytest.mark.parametrize("status", [429, 502, 503, 504])
 def test_otlps_retryable_statuses_are_retried(status: int) -> None:
-    """AC-6, the retried half (invariant 7)."""
+    """AC-6, the retried half (invariant 7); a ``5xx`` resend is counted, a ``429`` one is not."""
     sink, opener = _sink(FakeResponse(status, b""), FakeResponse(200, b""), max_retries=2)
     sink.emit([_event()])
     assert len(opener.calls) == 2
-    assert sink.losses() == SinkLosses(dropped=0, failed=0)
+    resent = 0 if status == 429 else 1
+    assert sink.losses() == SinkLosses(dropped=0, failed=0, resent=resent)
 
 
 @pytest.mark.parametrize("status", [500, 501, 400, 401, 404])

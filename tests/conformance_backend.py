@@ -12,6 +12,13 @@ what the row's `Backend` durably holds. The reading of the library's report is t
 every engine run is captured at `_engine._run` by wrapping the `deliver` callable it is handed,
 and each event's fate is its outcome in the last round of that run that carried it, read by one
 function, `fate_of`. A sink with no `deliver` is read per batch from `Worker._emit`.
+
+**A counted resend** (SPEC-095) is read the same way: the round wrapper also records the
+`may_have_landed` marks each round left on its run's context, `resends_from` rebuilds how many
+times each event was offered again after a round that marked it, and `resends_agree` compares that
+with the run's `Delivery.resent`, on every run, a failed one included. `duplicate` allows one
+extra copy per counted resend, and `resent-when-knowable` refuses a resend counted for an event no
+unknowable call carried, so counting every raise is not a way out.
 """
 
 from __future__ import annotations
@@ -51,6 +58,7 @@ Check = Literal[
     "lost-but-held",
     "unannounced",
     "ambiguous-when-knowable",
+    "resent-when-knowable",
     "ledger",
 ]
 
@@ -333,6 +341,10 @@ class Report:
         `None` with the ledger off.
       ledger_expected: The same four terms as the worker's own path and the fates set them.
       unaccounted: `health().events.unaccounted` at the row's end, or `None` with the ledger off.
+      resent: Per event, the resends the library counted for it (SPEC-095), read per event.
+      batch_resends: Per batch, the resends it counted and the resend lines written inside its
+        own `Worker._emit`.
+      resent_counted: For a row read per batch, how far the sink's `losses().resent` moved.
     """
 
     fates: Mapping[str, Fate] | None
@@ -346,6 +358,9 @@ class Report:
     ledger_moves: Mapping[str, int] | None = None
     ledger_expected: Mapping[str, int] | None = None
     unaccounted: int | None = None
+    resent: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    batch_resends: tuple[tuple[int, int], ...] = ()
+    resent_counted: int = 0
 
 
 LEDGER_TERMS = ("delivered", "skipped", "sink_lost", "batch_lost")
@@ -419,7 +434,9 @@ def _silent_loss(events: list[str], backend: Backend, report: Report) -> bool:
 
 
 def _duplicate(events: list[str], backend: Backend, report: Report) -> bool:
-    """The backend holds an event more than once.
+    """The backend holds an event more times than one plus the resends counted for it.
+
+    Per batch: the extra copies held outnumber the move of the sink's `losses().resent`.
 
     Args:
       events: The row's events.
@@ -432,7 +449,10 @@ def _duplicate(events: list[str], backend: Backend, report: Report) -> bool:
     Raises:
       None.
     """
-    return any(backend.held[t] > 1 for t in events)
+    if report.fates is None:
+        extra = sum(backend.held[t] - 1 for t in events if backend.held[t] > 1)
+        return extra > report.resent_counted
+    return any(backend.held[t] > 1 + report.resent.get(t, 0) for t in events)
 
 
 def _lost_but_held(events: list[str], backend: Backend, report: Report) -> bool:
@@ -456,10 +476,11 @@ def _lost_but_held(events: list[str], backend: Backend, report: Report) -> bool:
 
 
 def _unannounced(events: list[str], backend: Backend, report: Report) -> bool:
-    """A batch's loss or ambiguous event, or a late count, has no loss line of its own.
+    """A batch's loss, ambiguous event or counted resend, or a late count, has no line of its own.
 
     A batch that lost or left ambiguous an event must write a loss line inside its own
-    `Worker._emit`, and a late count one after the last batch.
+    `Worker._emit`, one that counted a resend a resend line there, and a late count a loss line
+    after the last batch.
 
     Args:
       events: The row's events.
@@ -473,6 +494,8 @@ def _unannounced(events: list[str], backend: Backend, report: Report) -> bool:
       None.
     """
     if any(lost and not lines for lost, lines in report.batch_losses):
+        return True
+    if any(resent and not lines for resent, lines in report.batch_resends):
         return True
     return bool(report.late) and not report.late_lines
 
@@ -497,6 +520,30 @@ def _ambiguous_when_knowable(events: list[str], backend: Backend, report: Report
         return False
     unknowable = backend.unknowable()
     return any(report.fates.get(t) == "ambiguous" and t not in unknowable for t in events)
+
+
+def _resent_when_knowable(events: list[str], backend: Backend, report: Report) -> bool:
+    """A resend was counted for an event that no unknowable call carried (SPEC-095).
+
+    Per batch: the sink's `losses().resent` moved and none of the row's calls was unknowable.
+    It is what keeps the count from being a way out: a sink that marked every raise would pass
+    `duplicate` and fail this.
+
+    Args:
+      events: The row's events.
+      backend: What the row's backend holds and saw.
+      report: What the library reported.
+
+    Returns:
+      True when the check fails.
+
+    Raises:
+      None.
+    """
+    unknowable = backend.unknowable()
+    if report.fates is None:
+        return bool(report.resent_counted) and not unknowable
+    return any(report.resent.get(t, 0) and t not in unknowable for t in events)
 
 
 def _ledger(events: list[str], backend: Backend, report: Report) -> bool:
@@ -527,6 +574,7 @@ CHECKS: tuple[tuple[Check, Predicate], ...] = (
     ("lost-but-held", _lost_but_held),
     ("unannounced", _unannounced),
     ("ambiguous-when-knowable", _ambiguous_when_knowable),
+    ("resent-when-knowable", _resent_when_knowable),
     ("ledger", _ledger),
 )
 """The assertion's checks, in the order a verdict lists them, each with the condition that fails
@@ -603,12 +651,16 @@ class Round:
       carried: The `log_id`s the round carried, in order.
       result: Its verdict, or the exception it raised.
       run_id: The run that made it.
+      reached: The `log_id`s the round marked as possibly landed, read from its run's context
+        after `deliver` returned (SPEC-095); an index that is not an exact `int` in range of
+        what it carried is left out.
     """
 
     sink: object
     carried: list[str]
     result: object
     run_id: int
+    reached: frozenset[str] = frozenset()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -632,7 +684,9 @@ class Recorder:
     `_engine._run` is the one function the worker's `run_delivery` and the inline adapter
     `emit_via_deliver` both call, so a run is seen whichever path made it. Nothing the engine
     decides is reimplemented: each round is recorded by wrapping the `deliver` callable the run
-    was handed.
+    was handed. The round's `may_have_landed` marks are read off the run's context when
+    `deliver` returns, through `getattr` with an empty default, so the corpus still runs against
+    a tree that predates them.
 
     Attributes:
       runs: The runs, in the order they committed.
@@ -693,7 +747,11 @@ class Recorder:
                 except BaseException as err:
                     self.rounds.append(Round(sink, carried, err, run_id))
                     raise
-                self.rounds.append(Round(sink, carried, result, run_id))
+                marks = getattr(_engine.run_context()._marks(), "reached", ())
+                reached = frozenset(
+                    carried[i] for i in marks if type(i) is int and 0 <= i < len(carried)
+                )
+                self.rounds.append(Round(sink, carried, result, run_id, reached))
                 return result
 
             delivery = original(sink, recorded, *args, **kwargs)
@@ -738,6 +796,68 @@ def fates_from(rounds: list[Round], owner: object, run_id: int) -> dict[str, Fat
         for token, outcome in zip(one.carried, outcomes, strict=True):
             fates[token] = fate_of(outcome)
     return fates
+
+
+def resends_from(rounds: list[Round], owner: object, run_id: int) -> dict[str, int]:
+    """Per event, how many times one run offered it again after a round that marked it.
+
+    Rebuilt from the rounds, not read from the engine: a round's marks count only when its
+    verdict is one whose outcomes match what it carried, and only for an event whose outcome
+    there is `RETRYABLE`; a round that raised or could not be read leaves nothing marked.
+
+    Args:
+      rounds: The row's rounds.
+      owner: The run's sink.
+      run_id: The run.
+
+    Returns:
+      The resends, by `log_id`, for events resent at least once.
+
+    Raises:
+      None.
+    """
+    from log_foundry.sinks.verdict import Outcome, Verdict
+
+    marked: dict[str, bool] = {}
+    resent: dict[str, int] = {}
+    for one in rounds:
+        if one.sink is not owner or one.run_id != run_id:
+            continue
+        for token in one.carried:
+            if marked.get(token):
+                resent[token] = resent.get(token, 0) + 1
+        outcomes = (
+            getattr(one.result, "outcomes", None) if isinstance(one.result, Verdict) else None
+        )
+        readable = outcomes is not None and len(outcomes) == len(one.carried)
+        for at, token in enumerate(one.carried):
+            marked[token] = (
+                readable
+                and token in one.reached
+                and outcomes is not None
+                and outcomes[at] is Outcome.RETRYABLE
+            )
+    return resent
+
+
+def resends_agree(resent: Mapping[str, int], delivery: Any) -> str | None:
+    """The differential oracle for the resend count: the reconstruction against `Delivery`.
+
+    Asked of every run, a failed one included, since a failed run counts its resends too.
+
+    Args:
+      resent: The run's reconstructed resends.
+      delivery: The run's `Delivery`; a tree that predates the field reads as 0.
+
+    Returns:
+      `None` when the totals agree; otherwise what differs.
+
+    Raises:
+      None.
+    """
+    want = getattr(delivery, "resent", 0)
+    got = sum(resent.values())
+    return None if got == want else f"reconstructed {got} resend(s) against Delivery {want}"
 
 
 def agrees(fates: Mapping[str, Fate], delivery: Any) -> str | None:
@@ -786,7 +906,40 @@ def losses_total(sink: object) -> tuple[int, int]:
     return (value.dropped, value.failed)
 
 
+def resent_total(sink: object) -> int:
+    """`resent` from a sink's `losses()`, or zero when it reports none or predates the field.
+
+    Args:
+      sink: Any sink.
+
+    Returns:
+      The count.
+
+    Raises:
+      None.
+    """
+    reader = getattr(sink, "losses", None)
+    value = reader() if callable(reader) else None
+    return getattr(value, "resent", 0) if value is not None else 0
+
+
 _LOST = re.compile(r"^log-foundry: lost \d+ ")
+_RESENT = re.compile(r"^log-foundry: resent \d+ ")
+
+
+def resent_lines_of(text: str) -> int:
+    """How many resend lines a stretch of stderr holds: lines starting `log-foundry: resent N `.
+
+    Args:
+      text: A stretch of stderr.
+
+    Returns:
+      The number of resend lines.
+
+    Raises:
+      None.
+    """
+    return sum(1 for line in text.splitlines() if _RESENT.match(line))
 
 
 def lines_of(text: str) -> int:
@@ -821,6 +974,8 @@ class Batch:
       losses_after: The sink's `losses()` when it returned.
       lines: Loss lines written inside it.
       text_end: Where stderr stood when it returned.
+      resent_lines: Resend lines written inside it.
+      resent_moved: How far it moved the sink's `losses().resent`.
     """
 
     tokens: list[str]
@@ -831,6 +986,8 @@ class Batch:
     losses_after: tuple[int, int]
     lines: int
     text_end: int
+    resent_lines: int = 0
+    resent_moved: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1040,6 +1197,7 @@ def drive(row: Any, monkeypatch: pytest.MonkeyPatch, *, ledger: bool = True) -> 
             failed = self.failed_batches
             worker_sink = self.sink
             start = losses_total(sink)
+            resent_at = resent_total(sink)
             text_at = len(stderr.getvalue())
             try:
                 original_emit(self, event_lists, **kw)
@@ -1056,6 +1214,8 @@ def drive(row: Any, monkeypatch: pytest.MonkeyPatch, *, ledger: bool = True) -> 
                             after,
                             lines_of(stderr.getvalue()[text_at:]),
                             len(stderr.getvalue()),
+                            resent_lines_of(stderr.getvalue()[text_at:]),
+                            resent_total(sink) - resent_at,
                         )
                     )
 
@@ -1156,6 +1316,9 @@ def _report(
     landed = lost = 0
     disagreement: str | None = None
     batch_losses: list[tuple[int, int]] = []
+    batch_resends: list[tuple[int, int]] = []
+    resent_all: dict[str, int] = {}
+    resent_counted = 0
     per_event = [
         any(run.sink is target for run in recorder.runs[b.runs[0] : b.runs[1]]) for b in handled
     ]
@@ -1168,7 +1331,17 @@ def _report(
         mine = set(batch.tokens)
         if judged and fates is not None:
             found_all: dict[str, Fate] = {}
+            resent_here = 0
             for run in judged:
+                again = {
+                    t: n
+                    for t, n in resends_from(recorder.rounds, target, run.run_id).items()
+                    if t in mine
+                }
+                for token, count in again.items():
+                    resent_all[token] = resent_all.get(token, 0) + count
+                resent_here += sum(again.values())
+                disagreement = disagreement or resends_agree(again, run.delivery)
                 found = {
                     t: f
                     for t, f in fates_from(recorder.rounds, target, run.run_id).items()
@@ -1181,8 +1354,11 @@ def _report(
                 found_all.update(found)
             fates.update(found_all)
             batch_lost = sum(1 for f in found_all.values() if f in ("lost", "ambiguous"))
+            batch_resends.append((resent_here, batch.resent_lines))
         else:
             fates = None
+            batch_resends.append((batch.resent_moved, batch.resent_lines))
+            resent_counted += batch.resent_moved
             if batch.failed_batches:
                 batch_lost = len(batch.tokens)
                 lost += batch_lost
@@ -1207,6 +1383,9 @@ def _report(
         batch_losses=tuple(batch_losses),
         late_lines=lines_of(text[handled[-1].text_end :]) if handled else 0,
         disagreement=disagreement,
+        resent=resent_all,
+        batch_resends=tuple(batch_resends),
+        resent_counted=resent_counted,
     )
 
 

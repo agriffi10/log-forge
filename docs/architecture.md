@@ -1862,41 +1862,35 @@ an item leaves this list when a spec closes it, not because the arc names it.
   listener lost 100 of 100 uncounted, which is inherent to UDP and is not this item. **Closed by**
   the transport noticing that its peer has closed before it writes a batch into the connection, and
   counting what it wrote into a closed one, held by a test double that closes between batches.
-- **A send whose reply is lost is sent again, and the resend is neither counted nor keyed**
-  (2026-11-14 audit, finding 5; invariant 7's "no event landed twice"). Every engine adapter maps a
-  raised retryable exception to `RETRYABLE` (`sinks/sqs.py:796-797`, `sinks/http.py:3301-3305`,
-  `sinks/postgres.py:466-468`). With one reply lost after the destination accepted: 35 messages for
-  25 events on an SQS standard queue (`docs/audits/2026-11-14-probes/sinks/probe_sqs.py`, case D),
-  50 stored for 25 through `HTTPSink` and 50 rows for 25 through `PostgresSink`
-  (`sinks/probe_misc.py`, cases 6 and 1), each with `failed=0` and no line. With every reply lost,
-  through the real worker, each of 10 events landed 16 times while the ledger read `failed=10`
-  (`sinks/probe_aws_more.py`). An SQS FIFO queue with de-duplication took no duplicate. **The
-  duplication is the accepted cost of settled decisions, and none of them is open.** *A client
-  exception costs its chunk, and is provable non-delivery for it* (`docs/decisions/sink-delivery/`)
-  records in its own entry that a read timeout means the reply was lost and a re-send may duplicate,
-  "taken on expected cost" because an unreachable endpoint is the common client exception. That
-  decision was written for finding R2 of `docs/audits/2026-09-02-pre-1.0-audit.md`, a client raising
-  mid-batch, and it is its entry, not either earlier audit, that records the lost-reply cost. For
-  `HTTPSink` and the other engine sinks the resend is the predicate rule of *A sink declares what it
-  retries, and anything else fails at once* (`docs/decisions/sink-delivery/`). Sixteen sends is the
-  1.x total retry budget the engine keeps, by Andrew's decision of 2026-11-04 (`docs/specs/ARCS.md`,
-  *1.2.0 stability redesign*). So what this audit adds is narrow: the resend is uncounted, with
-  `failed=0` and no line when one reply is lost, and it carries no key a destination could
-  de-duplicate on. `README.md:629-632` says of a sink that delivered none that "there is nothing
-  downstream to duplicate", without the cost that decision records. **Closed by** a count of the
-  sends that may have duplicated, and an idempotency key derived from `log_id` wherever the
-  destination can honour one. That direction is the orchestrating session's, made under Andrew's
-  authority of 2026-11-14 and to be confirmed in the spec's review, and it changes neither settled
-  rule: an `UNKNOWN` outcome or an exception escaping `deliver` is never resent (*No shipped sink
-  declares itself idempotent*, `docs/decisions/sink-delivery/`), and what stays resendable, at the
-  accepted cost, is a client exception the sink's retry predicate accepts, caught inside `deliver`
-  and answered `RETRYABLE`. The JetStream `Nats-Msg-Id` item above is this item for one sink.
-  `MongoDBSink`'s form of it is a resend that the unique `_id` refuses and that is counted as a
-  rejection although the document landed, as *No shipped sink declares itself idempotent*
-  records; and a borrowed `PostgresSink` or `RabbitMQSink` connection, which the sink may not
-  reopen, leaves the events the backend took counted as lost when the reply was lost with the
-  connection. Both are held by the `reply-counted-lost` pin of `tests/test_conformance.py`
-  (SPEC-092).
+- ~~**A send whose reply is lost is sent again, and the resend is neither counted nor keyed**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
+- **An event a send may have landed is counted as lost when no later send lands it** (SPEC-095;
+  invariants 2 and 7). A round that marks an event as possibly landed leaves it `RETRYABLE`, so
+  when no later round lands it the event keeps that last round's fate: the run fails, `flush()`
+  is falsy and the event is counted lost although the destination may hold it. SPEC-095 counts
+  the resends in `losses().resent`, which says how many copies may exist, and leaves the fate as
+  it is. The every-reply-lost case, `docs/audits/2026-11-14-probes/sinks/probe_aws_more.py` case 1
+  re-run at `3da245a9`: an `SQSSink` through the real worker whose every call stores its messages
+  and then raises `TimeoutError` holds each of its 10 events 16 times, and reads
+  `SinkLosses(dropped=0, failed=10, resent=150)`, `flush()` falsy with reason `"abandoned"` and
+  `failed_batches=1`, with one resend line and two loss lines. 150 is the extra copies exactly.
+  The two rows `PostgresSink[borrowed]-reply-lost` and
+  `RabbitMQSink[borrowed]-taken-then-raised`, whose borrowed connection the sink may not reopen,
+  are the same shape in the conformance corpus and are held at `lost-but-held` by the
+  `reply-counted-lost` pin of `tests/test_conformance.py`. **The decision that keeps it open:**
+  asked on 2026-11-16 whether such an event should keep its fate or be read `UNKNOWN`, Andrew
+  answered "Lost, flush falsy (Recommended)". **Closed by** the engine reading such an event
+  `UNKNOWN`, at the cost that a destination which times out every reply no longer fails its
+  batches.
+- **`SNSSink` cannot write an SNS FIFO topic** (SPEC-095, Out of Scope; invariant 7). `SNSSink`
+  sends no `MessageGroupId`: each entry is an `Id` and a `Message` alone (`sinks/sns.py:495-501`
+  at `3da245a9`), and SNS refuses a FIFO publish without one:
+  "You must associate a non-empty MessageGroupId with a message. If you do not provide a
+  MessageGroupId, the action fails" (SNS `PublishBatchRequestEntry`, read on 2026-11-16). So every
+  batch to a FIFO topic is refused, and the topic's de-duplication on `MessageDeduplicationId`
+  is out of reach. Asked whether SPEC-095 should add it, Andrew answered "Follow-up spec
+  (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
+  adds the topic's group and de-duplication ids, drafted as SPEC-100.
+- ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
 - **An AWS batch reply that names no failure is read as full delivery** (2026-11-14 audit, finding
   14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
   and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads
@@ -2032,6 +2026,116 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `docs/process/completion-ritual.md` asks of a volatile number.
 
 ### Resolved
+
+- ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~
+  (found during SPEC-095's build; invariants 2 and 11). `_engine._run` commits a run's
+  `resent_events` and its resend line in the same `Deferral` as its `failed_events` and
+  `dropped_events` (`sinks/_engine.py:1877-1900` at `3da245a9`). If that commit raises, none of
+  them is counted, and the one `absorbed` line `_uncounted` writes names the unconfirmed and
+  dropped events only, so the resends are neither counted nor named. That is how the run's other
+  counts already behave, and SPEC-095 did not change it. Tests plant a raising commit
+  (`tests/test_delivery_engine.py`, `tests/test_run_context.py`), but none in a run that counted
+  a resend, so what such a run announces is unguarded. The separate commit `resent_into` takes for
+  `HTTPSink._send` does name its resends (`:1901-1908`). **Closed by** a test that makes the
+  engine's commit raise in a run that resent, holding what its `absorbed` line names.
+  → **closed by SPEC-095** (2026-11-20, in its diff review): when the run's own commit
+  raises, `_run` now writes a second `absorbed` line naming the resends it could not count,
+  `N resend(s) not counted`, beside the events' line, as the `resent_into` route already did.
+  The same review moved `_send`'s resends into the commit of its own counts (`HTTPSink` now
+  shares its counters' lock), so that route reports them with the rest of the commit.
+  `tests/test_resend_count.py::test_a_commit_that_raises_reports_the_resends_it_could_not_count`
+  plants a raising commit in a run that resent and holds both lines.
+- ~~**A send whose reply is lost is sent again, and the resend is neither counted nor keyed**~~
+  (2026-11-14 audit, finding 5; invariant 7's "no event landed twice"). Every engine adapter maps a
+  raised retryable exception to `RETRYABLE` (`sinks/sqs.py:796-797`, `sinks/http.py:3301-3305`,
+  `sinks/postgres.py:466-468`). With one reply lost after the destination accepted: 35 messages for
+  25 events on an SQS standard queue (`docs/audits/2026-11-14-probes/sinks/probe_sqs.py`, case D),
+  50 stored for 25 through `HTTPSink` and 50 rows for 25 through `PostgresSink`
+  (`sinks/probe_misc.py`, cases 6 and 1), each with `failed=0` and no line. With every reply lost,
+  through the real worker, each of 10 events landed 16 times while the ledger read `failed=10`
+  (`sinks/probe_aws_more.py`). An SQS FIFO queue with de-duplication took no duplicate. **The
+  duplication is the accepted cost of settled decisions, and none of them is open.** *A client
+  exception costs its chunk, and is provable non-delivery for it* (`docs/decisions/sink-delivery/`)
+  records in its own entry that a read timeout means the reply was lost and a re-send may duplicate,
+  "taken on expected cost" because an unreachable endpoint is the common client exception. That
+  decision was written for finding R2 of `docs/audits/2026-09-02-pre-1.0-audit.md`, a client raising
+  mid-batch, and it is its entry, not either earlier audit, that records the lost-reply cost. For
+  `HTTPSink` and the other engine sinks the resend is the predicate rule of *A sink declares what it
+  retries, and anything else fails at once* (`docs/decisions/sink-delivery/`). Sixteen sends is the
+  1.x total retry budget the engine keeps, by Andrew's decision of 2026-11-04 (`docs/specs/ARCS.md`,
+  *1.2.0 stability redesign*). So what this audit adds is narrow: the resend is uncounted, with
+  `failed=0` and no line when one reply is lost, and it carries no key a destination could
+  de-duplicate on. `README.md:629-632` says of a sink that delivered none that "there is nothing
+  downstream to duplicate", without the cost that decision records. **Closed by** a count of the
+  sends that may have duplicated, and an idempotency key derived from `log_id` wherever the
+  destination can honour one. That direction is the orchestrating session's, made under Andrew's
+  authority of 2026-11-14 and to be confirmed in the spec's review, and it changes neither settled
+  rule: an `UNKNOWN` outcome or an exception escaping `deliver` is never resent (*No shipped sink
+  declares itself idempotent*, `docs/decisions/sink-delivery/`), and what stays resendable, at the
+  accepted cost, is a client exception the sink's retry predicate accepts, caught inside `deliver`
+  and answered `RETRYABLE`. The JetStream `Nats-Msg-Id` item above is this item for one sink.
+  `MongoDBSink`'s form of it is a resend that the unique `_id` refuses and that is counted as a
+  rejection although the document landed, as *No shipped sink declares itself idempotent*
+  records; and a borrowed `PostgresSink` or `RabbitMQSink` connection, which the sink may not
+  reopen, leaves the events the backend took counted as lost when the reply was lost with the
+  connection. Both are held by the `reply-counted-lost` pin of `tests/test_conformance.py`
+  (SPEC-092).
+  **Closed by SPEC-095** (2026-11-20). The engine counts each offer of an event again after a
+  round that marked it as one a send may have landed, in `SinkCounters.resent_events`,
+  `losses().resent` (so `health().sink.resent`) and `Delivery.resent`, and writes one line per run,
+  `log-foundry: resent <n> event(s) a lost reply may have landed; they may be duplicated; <Sink>`.
+  Each shipped engine sink marks the calls that may have reached its destination, every raise of a
+  client that retries inside the call included, and `MongoDBSink` reads a duplicate driver-stamped
+  `_id` on its own resend as delivery. The resend itself is unchanged. The audit's probes, before
+  (on the prototype's `main` export at `97a03f45`) and after, from SPEC-095's *Evidence*:
+
+  | Probe | Before | After |
+  |---|---|---|
+  | `probe_sqs.py` case D (standard queue, one reply lost) | 35 messages for 25 events, `failed=0`, no line | the same 35, and `resent 10` with one line, which is the 10 extra copies exactly |
+  | `probe_sqs.py` case D' (FIFO, the fake de-duplicating) | 25 held | 25 held, and `resent 10`: an upper bound |
+  | `probe_aws_more.py` case 1 (every reply lost) | each of 10 events held 16 times, `failed=10`, `flush()` falsy | the same, with `SinkLosses(dropped=0, failed=10, resent=150)` and one resend line; 150 is the extra copies exactly |
+  | `probe_misc.py` cases 1 and 6 (PostgreSQL commit reply lost; HTTP connection closed with no status line) | 50 rows or bodies for 25, no line | the same 50, and one resend line each |
+
+  Re-run at `3da245a9`, the four one-reply-lost runs hold the same copies and each now writes one
+  line where it wrote none, and case 1 prints `resent=150` beside one resend line. **The bound, exactly.** `resent` counts the engine's own resends of
+  events whose previous send may have landed.
+
+  - **It over-counts** a resend that adds no copy:
+    - on a FIFO queue inside its 5-minute interval;
+    - on a replicated ClickHouse table;
+    - on a `MongoDBSink`-style destination that refuses the copy, which no counted sink is;
+    - wherever a client that retries internally raised for a call none of whose attempts landed.
+      That is every failed AWS, Event Hubs, Redis and ClickHouse call the sink cannot tell apart;
+    - a re-offer the sink refuses unsent, because it was closed during the backoff. The count is
+      taken when the engine offers the event again, so the closed sink's refusal still counts it.
+  - **It under-counts** in three ways:
+    - **A cleared class that did leave.** It misses a copy only if an exception FR-002 clears did in
+      fact leave a request on the wire: a `urllib` `URLError`, a socket that could not connect or was
+      refused, a pika channel or connection that could not open, or a PostgreSQL error before
+      `COMMIT` or outside classes `08`, `57` and `XX` at it.
+    - **An entry a reply names as failed.** Some resends follow a reply naming an entry as failed
+      after an internal attempt in the same call had landed it. An SQS or SNS `Failed` entry and a
+      Kinesis coded record are not marked, because the reply is the service's word on the attempt it
+      answers, and the sink cannot see an earlier attempt.
+    - **Copies the engine did not make**, listed in *Out of Scope*. The main one is a client's
+      internal retry inside a call that then returned.
+
+  (*Out of Scope* and FR-002 are SPEC-095's.) **The key was narrowed.** This item's direction
+  promised "an idempotency key derived from `log_id` wherever the destination can honour one".
+  SPEC-095 settled that the key is the event's own `log_id`, already carried in every body and, on
+  an SQS FIFO queue, already the `MessageDeduplicationId`, and that no new key goes on the wire: it
+  is not sent as an Elasticsearch or OpenSearch `_id`. That was decided in session on 2026-11-16 by
+  the orchestrating session, because an `_id` would change every document's `_id` from one
+  Elasticsearch generates, add about 44 bytes to each action line, and cost the existing-id check
+  Elastic calls "a costly operation", while the count already accounts for the copy. JetStream's
+  `Nats-Msg-Id` stays with its own item, *A timed-out JetStream publish is not retried, and cannot
+  safely be*. What SPEC-095 left open moved to two items under *Open*: *An event a send may have
+  landed is counted as lost when no later send lands it*, which now owns the borrowed
+  `PostgresSink` and `RabbitMQSink` rows of the `reply-counted-lost` pin, and *`SNSSink` cannot
+  write an SNS FIFO topic*. The 50 rows of the `reply-resent` pin and `MongoDBSink`'s two
+  `reply-counted-lost` rows read green, and the pin `reply-resent` is gone. The decision is *A
+  resend after a send that may have landed is counted, and its key is the event's `log_id`*
+  (`docs/decisions/sink-delivery/`).
 
 - ~~**A `NATSSink` whose abandoned-publish latch is armed refuses every round of the worker's at
   once, so a stall a little longer than one `publish_timeout` loses every batch the drain makes

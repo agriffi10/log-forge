@@ -11,7 +11,7 @@ from log_foundry import _diag
 from log_foundry.sanitize import _int_text
 from log_foundry.sinks import _engine
 from log_foundry.sinks._args import ReadOnlyCount, store_read_only
-from log_foundry.sinks._classify import is_retryable
+from log_foundry.sinks._classify import is_retryable, may_have_landed
 from log_foundry.sinks._encode import encode_round
 from log_foundry.sinks._engine import When, run_context
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
@@ -22,7 +22,7 @@ from log_foundry.sinks._retry import (
     require_positive,
     require_timeout,
 )
-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import Called, Lost, mark_may_have_landed, mark_sent, raised_line
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -407,6 +407,7 @@ class SocketTransport:
                     fates[position] = Outcome.ACCEPTED
                     continue
                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+                mark_may_have_landed([position], called.error, called.retryable, called.reached)
                 kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
                 lost.add(
                     [batch[position]],
@@ -501,6 +502,11 @@ class SocketTransport:
     def _send_one(self, message: bytes) -> Called[None]:
         """Sends one frame once (SPEC-074 FR-005); the engine resends it in a later round.
 
+        A raise says whether the frame may have landed (SPEC-095 FR-002): only a TCP ``sendall``
+        that raised may have, unless :func:`~log_foundry.sinks._classify.may_have_landed` clears
+        its exception. A frame whose connection could not be opened never left, and a UDP
+        datagram whose ``sendto`` raised was not sent.
+
         Args:
           message: The exact bytes to put on the wire.
 
@@ -510,14 +516,22 @@ class SocketTransport:
         Raises:
           None.
         """
+        sending = False
         try:
             if self._transport == "udp":
                 self._socket().sendto(message, (self._host, self._port))
             else:
-                self._socket().sendall(message)
+                sock = self._socket()
+                sending = True
+                sock.sendall(message)
         except Exception as err:
             self._reset()
-            return Called(None, error=err, retryable=is_retryable(self._retryable_error, err))
+            return Called(
+                None,
+                error=err,
+                retryable=is_retryable(self._retryable_error, err),
+                reached=sending and may_have_landed(err),
+            )
         return Called(None)
 
     def _retryable_error(self, err: Exception) -> bool:

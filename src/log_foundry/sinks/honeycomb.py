@@ -394,6 +394,7 @@ class HoneycombSink(HTTPSink):
             return SinkLosses(
                 dropped=self.dropped_oversized + self._unrenderable,
                 failed=self.failed + self.rejected_events + self.dropped_unadjudicated,
+                resent=self.log_foundry_counters.resent_events,
             )
 
 

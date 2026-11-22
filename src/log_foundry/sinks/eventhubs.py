@@ -15,7 +15,13 @@ from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
 from log_foundry.sinks._retry import floor_count
-from log_foundry.sinks._rounds import Called, Lost, mark_sent, raised_line
+from log_foundry.sinks._rounds import (
+    Called,
+    Lost,
+    mark_may_have_landed,
+    mark_sent,
+    raised_line,
+)
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
 
 if TYPE_CHECKING:
@@ -377,6 +383,10 @@ class AzureEventHubsSink:
     ) -> None:
         """Sets one pack's outcomes from its send.
 
+        A retried raise marks the pack as possibly landed (SPEC-095 FR-002): the Event Hubs
+        producer retries a send inside the client, so every send it fails is counted as one that
+        may have landed.
+
         Args:
           batch: The round's events.
           packed: The pack's positions in the round's batch.
@@ -396,6 +406,7 @@ class AzureEventHubsSink:
             outcome = Outcome.ACCEPTED
         else:
             outcome = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
+            mark_may_have_landed(packed, called.error, called.retryable, reached=True)
             kind = _diag.type_name(called.error)
             lost.add(
                 carried,

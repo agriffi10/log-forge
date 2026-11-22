@@ -419,8 +419,10 @@ def test_a_limit_changed_mid_run_reaches_no_round_of_that_run() -> None:
     Both sinks start the run at 1 MiB with a 10-byte and a 300 KiB event; the first request
     lowers ``max_message_bytes`` to 2048 and times out, so a second round follows. At the run's
     1 MiB both events fit one request, so the retry resends the same two, nothing is dropped and
-    no line is written. A sink that re-read the limit in the retry round would drop the 300 KiB
-    event there, as SNSSink did while SQSSink kept the verdict it prepared in round one.
+    no loss line is written. A sink that re-read the limit in the retry round would drop the
+    300 KiB event there, as SNSSink did while SQSSink kept the verdict it prepared in round one.
+    The timeout is a raise botocore may have retried past a landed attempt, so the resend of both
+    events is counted and announced in the one resend line (SPEC-095).
     """
     seen = {}
     for cls in _CLASSES:
@@ -429,11 +431,19 @@ def test_a_limit_changed_mid_run_reaches_no_round_of_that_run() -> None:
         client.sink = sink
         result = cases.run(sink, [event(0, 10), event(1, 300 * KIB)])
         assert sink.max_message_bytes == 2048, "the premise: the first request lowered it"
-        seen[cls.__name__] = (sink.dropped_oversized, _ns(sink), result["lines"])
-        assert sink.dropped_oversized == 0, cls.__name__
-        assert _ns(sink) == [[0, 1], [0, 1]], cls.__name__
-        assert result["lines"] == [], cls.__name__
-        assert sink.losses().failed == 0, cls.__name__
+        name = cls.__name__
+        lines = [line.replace(name, "<sink>") for line in result["lines"]]
+        seen[name] = (sink.dropped_oversized, _ns(sink), lines)
+        assert sink.dropped_oversized == 0, name
+        assert _ns(sink) == [[0, 1], [0, 1]], name
+        assert lines == [
+            (
+                "log-foundry: resent 2 event(s) a lost reply may have landed; they may be "
+                "duplicated; <sink>"
+            )
+        ], name
+        assert sink.losses().failed == 0, name
+        assert sink.losses().resent == 2, name
     assert seen["SQSSink"] == seen["SNSSink"]
 
 

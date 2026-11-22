@@ -241,7 +241,7 @@ class KafkaSink:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.rejected, failed=self.failed)
+            return SinkLosses(dropped=self.rejected, failed=self.failed, resent=0)
 
     def emit(self, batch: list[dict[str, object]]) -> None:
         """Produces one message per event and serves delivery callbacks without blocking.

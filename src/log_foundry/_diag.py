@@ -16,20 +16,22 @@ Four rules, all load-bearing (SPEC-029 FR-004, SPEC-067 FR-001):
   as ``<TypeName>``, read through ``type``'s own descriptor; never a ``repr`` of the value. If
   even that cannot be computed, the line is still written with ``<?>``.
 
-Four writers, one per kind of line (SPEC-068 FR-001): ``absorbed`` for a failure swallowed rather
-than propagated, ``lost`` for a counted loss, ``rejected`` for an inbound trace context refused,
-and ``pending`` for an outcome not yet decided. The fourth exists because a line written while
-the drain thread is still inside the sink cannot know whether what it describes will be
-delivered, and a ``lost`` line there announced a loss that another line then announced again.
+Five writers, one per kind of line (SPEC-068 FR-001, SPEC-095): ``absorbed`` for a failure
+swallowed rather than propagated, ``lost`` for a counted loss, ``rejected`` for an inbound trace
+context refused, ``pending`` for an outcome not yet decided, and ``resent`` for events sent again
+after a send that may have landed them, which are not a loss but may be held twice. The fourth
+exists because a line written while the drain thread is still inside the sink cannot know whether
+what it describes will be delivered, and a ``lost`` line there announced a loss that another line
+then announced again.
 
-**Five stderr writes: the four writers and the fold's** (SPEC-103 FR-001). From the first
+**Six stderr writes: the five writers and the fold's** (SPEC-103 FR-001). From the first
 abandoned exit batch on, the worker opens a fold window around each later exit batch's sink call
-(:func:`fold_into`), and inside it ``lost``, ``absorbed`` and ``pending`` record a row keyed on the
-text their line would carry, without its count, instead of writing it. :func:`take_folded` writes
-one line per key at the end of the exit, or before ``stop()``'s expiry line, each ending in
-``line(s) folded at exit``. ``rejected`` never folds. A ``lost`` call that passes
-``running_total=True`` is written at once, because summing a count that is not an increment — a
-running total or a snapshot — overstates a loss.
+(:func:`fold_into`), and inside it ``lost``, ``absorbed``, ``pending`` and ``resent`` record a
+row keyed on the text their line would carry, without its count, instead of writing it.
+:func:`take_folded` writes one line per key at the end of the exit, or before ``stop()``'s expiry
+line, each ending in ``line(s) folded at exit``. ``rejected`` never folds. A ``lost`` call that
+passes ``running_total=True`` is written at once, because summing a count that is not an
+increment — a running total or a snapshot — overstates a loss.
 The window is a thread-local, not a ``ContextVar``: a ``ContextVar`` would follow
 ``asyncio.to_thread`` into a sink's own thread, whose lines must be written at once, and a forked
 child's withdrawal would reach only the context current at the fork. ``_FOLD_LOCK`` guards the
@@ -63,6 +65,7 @@ __all__ = [
     "lost",
     "pending",
     "rejected",
+    "resent",
     "take_folded",
     "withdraw_fold_in_child",
 ]
@@ -313,10 +316,10 @@ def withdraw_fold_in_child() -> None:
 def take_folded(table: FoldTable, *, close: bool) -> None:
     """Takes every folded row, clearing the table in place, and writes one line per key.
 
-    The fifth stderr write. The rows are copied and cleared under ``_FOLD_LOCK``, then written
+    The sixth stderr write. The rows are copied and cleared under ``_FOLD_LOCK``, then written
     outside it in first-seen order, each line ending in ``; <k> line(s) folded at exit`` after
-    the detail is bounded, so the bound never cuts the tail. A ``lost`` line sums the counts, an
-    ``absorbed`` line counts the failures, a ``pending`` line names its detail.
+    the detail is bounded, so the bound never cuts the tail. A ``lost`` or ``resent`` line sums
+    the counts, an ``absorbed`` line counts the failures, a ``pending`` line names its detail.
 
     **No take waits unboundedly.** With ``close`` — ``stop()``'s take after an expired join — the
     table is marked closed first, by a plain store without the lock, so every later record is
@@ -359,6 +362,8 @@ def take_folded(table: FoldTable, *, close: bool) -> None:
         try:
             if key[0] == "lost":
                 text = f"lost {count} {key[1]}(s){key[2]}"
+            elif key[0] == "resent":
+                text = f"resent {count} {_RESENT_TEXT}{key[1]}"
             elif key[0] == "absorbed":
                 text = f"absorbed {folded} failure(s) while {key[1]} ({key[2]}){key[3]}"
             else:
@@ -481,6 +486,54 @@ def lost(what: str, count: int, detail: str = "", *, running_total: bool = False
                 finally:
                     _FOLD_LOCK.release()
         sys.stderr.write(f"log-foundry: lost {count} {_escape(what)}(s){_suffix(detail)}\n")
+    except Exception:
+        pass
+
+
+_RESENT_TEXT = "event(s) a lost reply may have landed; they may be duplicated"
+"""The fixed text of a :func:`resent` line between its count and its detail."""
+
+
+def resent(count: int, detail: str = "") -> None:
+    """Reports events sent again after a send that may have landed them (SPEC-095 FR-001).
+
+    The line is ``log-foundry: resent <count> event(s) a lost reply may have landed; they may be
+    duplicated; <detail>``. It is not a loss: the events may each be held twice at the
+    destination, and ``losses().resent`` counts them. The engine writes it once per run that
+    resent anything, after committing the count (record first, announce second), with the sink's
+    stored class name as ``detail`` and no value from any event.
+
+    Inside a fold window (SPEC-103) the line is recorded instead, keyed on the rendered detail
+    and its count summed into the row, through the same inline check as :func:`lost`; a count
+    that is not an exact ``int`` is written at once.
+
+    Args:
+      count: How many offers of a possibly-landed event the run made again.
+      detail: The sink's class name. Escaped and truncated to ``_MAX_DETAIL``.
+
+    Returns:
+      None.
+
+    Raises:
+      None on a stream fault; a ``BaseException`` from the write still propagates.
+    """
+    try:
+        table = _FOLD.table
+        if table is not None and type(count) is int:
+            key = ("resent", _suffix(detail))
+            if _FOLD_LOCK.acquire(blocking=False):
+                try:
+                    if not table.closed:
+                        row = table.rows.get(key)
+                        if row is None:
+                            table.rows[key] = [count, 1]
+                        else:
+                            row[0] += count
+                            row[1] += 1
+                        return
+                finally:
+                    _FOLD_LOCK.release()
+        sys.stderr.write(f"log-foundry: resent {count} {_RESENT_TEXT}{_suffix(detail)}\n")
     except Exception:
         pass
 

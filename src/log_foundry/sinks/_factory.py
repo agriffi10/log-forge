@@ -487,7 +487,7 @@ class _FactorySink:
           None.
         """
         inner = self._inner
-        return SinkLosses(dropped=0, failed=0) if inner is None else read_losses(inner)
+        return SinkLosses(dropped=0, failed=0, resent=0) if inner is None else read_losses(inner)
 
     def close(self) -> None:
         """Releases the built sink as the shipped wrappers release theirs; nothing when none.

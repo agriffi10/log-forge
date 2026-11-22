@@ -8,6 +8,16 @@ description: "guarded *inside* `_send`, since an outer guard reports a partial s
 
 ## History
 
+### 2026-11-20
+
+- **The accepted duplicate is counted and announced** (SPEC-095), fence unchanged: the resend this
+  entry accepts on expected cost still happens, and each engine resend of an event whose previous
+  call may have landed is now counted in `losses().resent` and written once per run as
+  `log-foundry: resent <n> event(s) a lost reply may have landed; they may be duplicated; <Sink>`.
+  An AWS sink's every raise is counted, since botocore retries inside the call. The count and its
+  bound are *A resend after a send that may have landed is counted, and its key is the event's
+  `log_id`*.
+
 ### 2026-11-09
 
 - **Restated** by SPEC-074 FR-002 for the engine sinks: the exception makes its chunk `RETRYABLE`, which the engine resends within the run's budget, where it used to feed the SQS and SNS recoverable term and the sink's own loop; one the predicate refuses is `REJECTED` at its first attempt. The guard still sits around the client call inside `_send`.

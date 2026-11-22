@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-095
 title: "A Resend After a Lost Reply Is Counted, and Its Key Is the Event's Own `log_id`"
 description: "Counts and announces every event the delivery engine sends again after a send that may have landed it, has each shipped sink mark such sends, counting every raise from a client that retries internally, reads a MongoDB duplicate driver-stamped _id on such a resend as delivery, and settles that the event's log_id, already in every body, is the idempotency key and what a sink must prove before it declares itself idempotent, so SPEC-092's 50 reply-resent rows and two MongoDB rows turn green and 19 rows move to new departures."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-072, SPEC-073, SPEC-074, SPEC-075, SPEC-088, SPEC-092]
 arc: audit-2026-11-14
 arc_order: 11
@@ -147,7 +147,9 @@ have landed.
   - on a replicated ClickHouse table;
   - on a `MongoDBSink`-style destination that refuses the copy, which no counted sink is;
   - wherever a client that retries internally raised for a call none of whose attempts landed.
-    That is every failed AWS, Event Hubs, Redis and ClickHouse call the sink cannot tell apart.
+    That is every failed AWS, Event Hubs, Redis and ClickHouse call the sink cannot tell apart;
+  - a re-offer the sink refuses unsent, because it was closed during the backoff. The count is
+    taken when the engine offers the event again, so the closed sink's refusal still counts it.
 - **It under-counts** in three ways:
   - **A cleared class that did leave.** It misses a copy only if an exception FR-002 clears did in
     fact leave a request on the wire: a `urllib` `URLError`, a socket that could not connect or was
@@ -348,7 +350,9 @@ docstring carries:
 - [ ] An `HTTPSink` round answered `503` and then `200` counts `resent` equal to the chunk's
       events. One answered `429` and then `200` counts 0 (invariant 7).
 - [ ] A `PostgresSink` transaction whose `executemany` raises `08006` counts 0. One whose `commit()`
-      raises `08006`, `57P01` or `XX000`, or raises with no SQLSTATE, counts every row. One whose
+      raises `08006` or `57P01`, or raises with no SQLSTATE, counts every row. One whose `commit()`
+      raises `XX000` is classified as a call that may have landed, but `_retryable_error` does not
+      retry class `XX`, so the round is `REJECTED`, makes one attempt and counts 0. One whose
       `commit()` raises `40001` counts 0 (invariant 2).
 - [ ] A test derives the engine sinks from the tree. It fails for any sink that is in `EXEMPT` and
       marks in its test, and for any sink that is neither in `EXEMPT` nor marking in one of this
@@ -422,8 +426,8 @@ reads `ACCEPTED`, `_settle_bulk` registers no line. Today it would write
 These are changes to SPEC-092's corpus files as its build delivers them, after SPEC-093's and
 SPEC-094's where those are on `main`.
 
-- **The reconstruction.** The round wrapper in `runs()` also records each round's
-  `may_have_landed` marks, read from the run's context after `deliver` returns. `resends_from`
+- **The reconstruction.** The round wrapper in `conformance_backend.Recorder` (the build's name for
+  the prototype's `runs()`) also records each round's `may_have_landed` marks, read from the run's context after `deliver` returns. `resends_from`
   rebuilds, per event and per run, how many times the run offered the event again after a round
   that marked it.
 - **The oracle.** `agrees` compares that reconstruction with the run's `Delivery.resent`, and a
@@ -488,8 +492,9 @@ SPEC-094's where those are on `main`.
 - [ ] With `_diag.resent` writing nothing, in an export of the branch head, every row that counts a
       resend reads `unannounced` (invariant 2).
 - [ ] With `Delivery.resent` never set, in an export of the branch head, every per-event row that
-      counts a resend reads `partition`, and `SentrySink[http]`'s two such rows, judged per batch,
-      read `duplicate` (invariant 2).
+      counts a resend reads `partition`. With `_run` never committing the count it was asked to
+      commit to other counters (`resent_into`, the route `HTTPSink._send` takes),
+      `SentrySink[http]`'s two such rows, judged per batch, read `duplicate` (invariant 2).
 - [ ] With `resent-when-knowable` removed from `judge`, the 19 departure rows read green, which
       fails each departure (invariant 2).
 
@@ -891,3 +896,18 @@ So the engine does not bound a resend to the de-duplication interval.
       - FR-002 says a per-item refusal inside a `2xx` body, a `5xx` one included, is `REJECTED`
         and never resent.
       - This history counts five choices: two answered by Andrew and three decided in session.
+- **Corrected on 2026-11-19 at build start.** FR-004 named the prototype's round wrapper in `runs()`;
+  SPEC-092's build delivered it as `conformance_backend.Recorder`, and the text now says so. A
+  rename, not a change of scope.
+- **Corrected on 2026-11-19 at build start, decided in session.** FR-002's `PostgresSink` criterion
+  said a `commit()` raising `XX000` counts every row, but `_retryable_error` does not retry class
+  `XX`, so nothing is resent: the criterion now says such a call is classified as one that may have
+  landed and counts 0. *The bound*'s over-count list gains a re-offer the sink refuses unsent
+  because it was closed during the backoff, since the count is taken on the offer, as FR-001 says.
+- **Corrected on 2026-11-20 during the build, decided in session.** The plan review had
+  `HTTPSink._send` hand its resends to the engine, which commits them to the sink's own counters
+  (`_run`'s `resent_into`) before writing the one line, rather than `_send` reading
+  `Delivery.resent` and committing them itself. So `Delivery.resent` no longer feeds
+  `SentrySink[http]`'s count, and FR-004's `Delivery.resent` mutant moves only the per-event rows;
+  the `SentrySink[http]` half of that criterion is now measured with the `resent_into` commit
+  removed instead. A correction of how the criterion is measured, not of what it holds.

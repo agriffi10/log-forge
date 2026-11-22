@@ -301,6 +301,7 @@ class MultiSink:
         return SinkLosses(
             dropped=sum(child.dropped for child in reported),
             failed=sum(child.failed for child in reported) + absorbed,
+            resent=sum(child.resent for child in reported),
         )
 
     def close(self) -> None:
