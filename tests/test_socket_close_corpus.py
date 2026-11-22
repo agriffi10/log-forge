@@ -237,13 +237,27 @@ class Seams:
 
     ``_end_state`` calls ``_peer_state`` itself, so a thread-local marks the end check and the
     pre-check's hooks do not fire inside it.
+
+    Attributes:
+      hooks: The hooks by moment, each run once.
+      end_sock: The socket the end check was last given, set before its ``before_end`` hook.
+      settle: Whether the end check, after its ``before_end`` hook, first waits up to 2 s until
+        :func:`_peer_answer_landed` says the peer's answer to the round has reached the socket.
+        ``ack_wait=False`` reads the connection once and waits for nothing, so a reset still in
+        flight at that read goes uncounted, as SPEC-093 says of the opt-out. On a loaded runner
+        a reset the scenario sent just before the check can still be in flight: CI read 850
+        frames lost and none counted on the ``fin-no-ack-wait`` mid-round row. Settling makes each
+        ``ack_wait=False`` row the promise the opt-out does keep, that a reset which has landed by
+        the end of the round is counted. ``ack_wait=True`` rows do not settle, so they still prove
+        the sink's own wait.
     """
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, settle: bool = False) -> None:
         """Installs the wrappers.
 
         Args:
           monkeypatch: The test's patch, which restores both seams.
+          settle: Whether the end check first waits for the peer's answer to land.
 
         Returns:
           None.
@@ -252,6 +266,8 @@ class Seams:
           None.
         """
         self.hooks: dict[str, Callable[[], None]] = {}
+        self.end_sock: socket.socket | None = None
+        self.settle = settle
         self._peer_state = _socket._peer_state
         self._end_state = _socket._end_state
         self._inside_end = threading.local()
@@ -306,7 +322,10 @@ class Seams:
         Raises:
           None.
         """
+        self.end_sock = sock
         self._fire("before_end")
+        if self.settle:
+            until(lambda: _peer_answer_landed(sock), 2.0)
         self._inside_end.on = True
         try:
             state = self._end_state(sock, *args)
@@ -424,6 +443,39 @@ def _half_close(peer: Peer) -> None:
     peer.conn.shutdown(socket.SHUT_WR)
 
 
+_TCP_INFO = 11
+"""Linux's ``TCP_INFO`` option, whose reply opens with the connection's state byte."""
+
+_TCP_CLOSE = 7
+"""Linux's ``TCP_CLOSE``: a reset has landed, or the connection is otherwise gone."""
+
+
+def _peer_answer_landed(sock: socket.socket) -> bool:
+    """Whether the peer's answer to every byte this end wrote has reached this end's kernel.
+
+    Read through ``TCP_INFO`` and :func:`~log_foundry.sinks._socket._unacked`, never through
+    ``SO_ERROR`` or a peek, both of which clear a pending reset that the end check under test
+    must still find. The answer has landed once a reset has closed the connection, or once the
+    peer has acknowledged every byte, open, half-closed or after its FIN, since a peer that closed
+    with frames unread answers with a reset and never with an acknowledgement. Linux only, as the
+    rows that settle are; an ``OSError`` reads as landed, so the end check runs and decides.
+
+    Args:
+      sock: The sink's held socket.
+
+    Returns:
+      ``True`` once the answer has landed.
+
+    Raises:
+      None.
+    """
+    try:
+        state = sock.getsockopt(socket.IPPROTO_TCP, _TCP_INFO, 8)[0]
+    except OSError:
+        return True
+    return state == _TCP_CLOSE or not _socket._unacked(sock)
+
+
 def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
     """The peer closes or resets on its own once it has read ``after`` bytes of the round.
 
@@ -432,6 +484,9 @@ def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
     wake after the round's end check on a loaded runner, which turns the row into the
     reset-after-the-end-check window, uncounted by design: CI read 617 frames lost and none
     counted that way on the ``rst-no-ack-wait`` row.
+
+    Joining the watcher orders the peer's ``close()``, not the arrival of the reset it sends,
+    which :class:`Seams` settles for the ``ack_wait=False`` rows.
 
     Args:
       mode: ``fin`` or ``rst``.
@@ -540,7 +595,7 @@ def _run(
     Raises:
       None.
     """
-    seams = Seams(monkeypatch)
+    seams = Seams(monkeypatch, settle=not ack_wait)
     srv = Server(on_accept)
     sink = LogstashSink(host="127.0.0.1", port=srv.port, transport="tcp", ack_wait=ack_wait)
     try:

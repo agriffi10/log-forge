@@ -1237,3 +1237,14 @@ check waits on a healthy peer.
     `a17a28a4` on base `c67931cd`, a local commit that is not on the remote after the squash
     merge. Criterion 2 is read against `295ba803`: fourteen shared rows move, this spec's ten
     and SPEC-094's four, and the twelve confirmed rows are new.
+- Revised on 2026-11-22, after `main` went red at the merge commit `62733aa0`. The py3.13 run
+  failed `test_a_close_mid_round_loses_no_frame_it_does_not_count[fin-no-ack-wait]` with 850
+  frames lost and none counted. The peer's `close()` had run before the end check, but its reset
+  was still in flight when `ack_wait=False`'s single read ran, which is the window this spec
+  already leaves uncounted for the opt-out. The corpus test's `ack_wait=False` rows now wait, after
+  each scenario's last action and before the end check, up to 2 s for the peer's answer to land
+  on the sink's socket: a reset closing the connection, or every byte acknowledged, read through
+  `TCP_INFO` and `_unacked` and never through `SO_ERROR` or a peek. FR-001's criterion is unchanged,
+  and those rows now prove the promise the opt-out keeps, that a reset which has landed by the end
+  of the round is counted. The `ack_wait=True` rows do not wait, so they still prove the sink's own
+  wait.
