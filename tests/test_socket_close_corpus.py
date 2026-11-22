@@ -5,7 +5,8 @@ transport, and arranges the peer's close through the transport's two seams: ``_p
 check before a round's first frame, and ``_end_state``, the check after its last. A hook runs the
 close at the seam it names, and the rule must decide on what the kernel shows when it asks. The one
 wait before a check is for a close the scenario sent to land on the connection it closed, read
-without consuming it (:attr:`Seams.await_close`): never for an answer the rule itself waits for. The scenarios and their expected verdicts are
+without consuming it (:attr:`Seams.await_close`): never for an answer the rule itself waits for. The
+scenarios and their expected verdicts are
 FR-001's table, ported from ``docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py``.
 
 A row is right when no frame was lost that the round did not count and, outside the two
@@ -13,8 +14,10 @@ mid-round rows, nothing was counted that arrived. The reset-after-the-end-check 
 residual window FR-006 records: its first round goes uncounted, and only its second round is held.
 The same rows run with ``ack_wait=False`` on Linux, each awaiting its close before the end check,
 since the opt-out leaves a reset in flight at its one read uncounted and a loaded runner can hold
-one in flight; with the close landed, the corpus measured the unwaited check right on loopback. Elsewhere that half is skipped, since on macOS the corpus
-measured it silent on three rows, which is the opt-out's recorded cost. Serves invariants 2, 7 and 11.
+one in flight. The audit corpus measured the unwaited check right on idle loopback, and awaiting
+the close keeps it so on a loaded runner. Elsewhere that half is skipped, since on macOS the corpus
+measured it silent on three rows, which is the opt-out's recorded cost. Serves invariants 2, 7 and
+11.
 """
 
 from __future__ import annotations
@@ -58,7 +61,9 @@ class Peer:
         self.reading = True
         self.done = False
         self.lock = threading.Lock()
-        threading.Thread(target=self._loop, daemon=True).start()
+        self.idle = False
+        self.reader = threading.Thread(target=self._loop, daemon=True)
+        self.reader.start()
 
     def _loop(self) -> None:
         """Reads until stopped, closed or reset.
@@ -75,6 +80,7 @@ class Peer:
         self.conn.settimeout(0.005)
         while not self.done:
             if not self.reading:
+                self.idle = True
                 time.sleep(0.001)
                 continue
             try:
@@ -91,6 +97,12 @@ class Peer:
     def stop_reading(self) -> None:
         """Stops the reader and waits until it is out of its ``recv``, so it takes nothing more.
 
+        A fixed sleep is not enough: a starved reader can still be inside ``recv`` when the
+        scenario closes, the kernel holds the close until that call returns, and meanwhile the
+        round's frames reach a live socket and are acknowledged, so the reset lands after the end
+        check. The execution-frame review measured that under load on the FIN-after-the-pre-check
+        and reset-before-the-end-check rows; the wait is on the reader's own flag.
+
         Args:
           None.
 
@@ -101,10 +113,13 @@ class Peer:
           None.
         """
         self.reading = False
-        time.sleep(0.02)
+        until(lambda: self.idle or not self.reader.is_alive())
 
     def fin(self) -> None:
-        """Closes the connection cleanly.
+        """Closes the connection cleanly, once the reader has left its ``recv``.
+
+        The reader stops within its 5 ms ``recv`` timeout, and joining it first keeps the kernel
+        from holding the close behind a ``recv`` in progress (:meth:`stop_reading`).
 
         Args:
           None.
@@ -116,10 +131,13 @@ class Peer:
           None.
         """
         self.done = True
+        self.reader.join(2.0)
         self.conn.close()
 
     def rst(self) -> None:
         """Closes the connection with a reset, discarding what it had not read.
+
+        It joins the reader before the close, as :meth:`fin` does.
 
         Args:
           None.
@@ -132,6 +150,7 @@ class Peer:
         """
         self.conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         self.done = True
+        self.reader.join(2.0)
         self.conn.close()
 
 
@@ -254,7 +273,10 @@ class Seams:
         ``fin-no-ack-wait`` mid-round row, and the system-frame review reproduced it on
         ``fin-ack-wait`` in 1 of 250 loaded runs. Awaiting makes each such row the promise the
         rule keeps, that a close which has landed by the end of the round is counted. The other
-        ``ack_wait=True`` rows do not await, so they still prove the sink's own wait.
+        ``ack_wait=True`` rows do not await. The FIN-after-the-pre-check rows prove the sink's
+        own wait for the answer to frames written after the close; the reset-before-the-end-check
+        row's frames are acknowledged before its reset, which the hook sends from the sink's
+        thread, so it holds only that the end check reads a reset that has landed by then.
       closed_sock: The socket the first pre-check outside an end check was given: the warm
         connection, which is the one a scenario's peer closes. A write that raised moves the run
         to a new connection, and a later round of the same run, which the engine runs to resend,

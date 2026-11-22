@@ -28,7 +28,8 @@ script is not in the tree, and the `half-close-3-rounds` row of `tests/test_sock
 holds the behaviour in CI). Counting only on a peek that raises was silent
 on Linux, where a FIN followed by the reset our later write draws still peeks as a FIN. Reading
 `SO_ERROR` at once after the round was right on idle Linux loopback and silent under delay, and in
-some runs on a loaded Linux runner, because the reset landed after the check. `docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py` drove the
+some runs on a loaded Linux runner, because the reset landed after the check.
+`docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py` drove the
 real transport through the two seams, with no sleep before any check, on macOS and on Linux on
 loopback and under 1 ms and 10 ms of added delay, and only the rule above was right on every row.
 **A FIN alone is not a loss**, because it is also a legal half-close; a reset, which says the peer

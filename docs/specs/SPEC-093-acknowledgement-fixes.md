@@ -114,7 +114,8 @@ wrong where it had not been run. Counting on a FIN reported a half-closing peer'
 as may-have-landed. Counting only on a peek that raises fell silent on Linux, where a FIN followed by
 the RST our later write draws still peeks as a FIN. Reading `SO_ERROR` at once after the round was
 right on idle Linux loopback, where the RST our frames draw is usually back before the check runs,
-and wrong everywhere else, a loaded Linux runner included (*Revision history*, 2026-11-22): the execution-frame review measured it right in 15 of 20 runs on macOS loopback,
+and wrong everywhere else, a loaded Linux runner included (*Revision history*, 2026-11-22): the
+execution-frame review measured it right in 15 of 20 runs on macOS loopback,
 and silent under 1 ms of `tc netem` delay, because the reset landed after the round's check and the
 next round's check discarded it. So the rule is now the one that
 `spec093_close_corpus.py` shows right when it drives `LogstashSink` in TCP mode, through the real
@@ -277,7 +278,8 @@ FR-006 records the first two windows and the cost in §13.
 - [ ] A new test, `tests/test_socket_close_corpus.py`, runs the table's scenarios against
       `SocketTransport` over loopback TCP in the ordinary `CI / test` job, arranging each through
       the `_peer_state` and `_end_state` seams and never sleeping for a packet to land, except for
-      the close a scenario's peer sent: a row whose peer closes before the end check waits there,
+      the close a scenario's peer sent: a row whose peer's close discards frames before the end
+      check waits there,
       up to 2 s, until that close has landed on the connection it closed, read only through the
       connection's TCP state and its send queue so that no pending reset is consumed. Every such
       row waits with `ack_wait=False`, which leaves a reset in flight at its one read uncounted by
@@ -315,7 +317,7 @@ FR-006 records the first two windows and the cost in §13.
       with `ack_wait=True`, wait at the end check: under the seam test's first case each reads
       `_unacked` four times. With `ack_wait=False` each reads `_peer_state` once and `_unacked`
       never, and the corpus test run with `ack_wait=False` reads every row as the rule does on
-      Linux loopback once the close has landed, on Linux, where it runs (invariants 2 and 10).
+      loopback once the close has landed, on Linux, where it runs (invariants 2 and 10).
 - [ ] `ack_wait="false"`, `ack_wait=0` and `ack_wait=1.0` are refused with `TypeError` naming
       `ack_wait` and the type, on both sinks, before any socket is built. `ack_wait=True` or
       `False` with `transport="udp"` is refused with `ValueError` naming `ack_wait`, and on
@@ -1253,7 +1255,8 @@ check waits on a healthy peer.
   and the reset its `close()` then sent was still in flight at the end check. That is FR-006's
   first window, and it is open in both modes, since the wait stops once every byte is
   acknowledged; the system-frame diff review reproduced it on `fin-ack-wait` too, in 1 of 250
-  loaded runs. A row whose peer closes before the end check now waits there, up to 2 s, until the
+  loaded runs. A row whose peer's close discards frames before the end check now waits there, up
+  to 2 s, until the
   close has landed on the connection it closed, read through the connection's TCP state and its
   send queue and never through `SO_ERROR` or a peek, so no pending reset is consumed: every such
   row with `ack_wait=False`, and the two mid-round rows in both modes. FR-001's second and fifth
@@ -1265,4 +1268,11 @@ check waits on a healthy peer.
   of 4,000 with this one, across `python:3.12-slim` and `python:3.13-slim`. The re-plants of a
   `_peer_state` that reads no `SO_ERROR`, an empty `_RESET_ERRNOS` and an `ack_wait=False` end
   check that never reads still turn the FIN-after-the-pre-check or reset-before-the-end-check
-  rows red under the wait.
+  rows red under the wait. The execution-frame review then found the corpus's peer closing
+  while its reader was still inside `recv`, which the kernel holds until the call returns, so the
+  rows that do not await could see the same shape: 15 of 3,200 closing-row runs failed under
+  `--cpus=2` with 4 burners, against 26 of 3,200 at `62733aa0`. The peer now waits on its reader's
+  own flag to stop reading and joins the reader before it closes, and the same load then passed
+  4,800 of 4,800. Repeated in one process at `--cpus=2` with 8 burners, the closing rows and the
+  residual row failed 12 of 2,400 executions before the peer's fix and none of 4,800 after it,
+  across `python:3.12-slim` and `python:3.13-slim`.
