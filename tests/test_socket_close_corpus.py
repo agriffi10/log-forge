@@ -3,16 +3,18 @@
 Each scenario runs ``LogstashSink`` in TCP mode against a loopback peer, through the real
 transport, and arranges the peer's close through the transport's two seams: ``_peer_state``, the
 check before a round's first frame, and ``_end_state``, the check after its last. A hook runs the
-close at the seam it names, and no check is preceded by a sleep for a packet to land: the rule
-must decide on what the kernel shows when it asks. The scenarios and their expected verdicts are
+close at the seam it names, and no ``ack_wait=True`` check is preceded by a sleep for a packet to
+land: the rule must decide on what the kernel shows when it asks. The scenarios and their expected verdicts are
 FR-001's table, ported from ``docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py``.
 
 A row is right when no frame was lost that the round did not count and, outside the two
 mid-round rows, nothing was counted that arrived. The reset-after-the-end-check row is the
 residual window FR-006 records: its first round goes uncounted, and only its second round is held.
-The same rows run with ``ack_wait=False`` on Linux, where the corpus measured the unwaited check
-right on loopback; elsewhere that half is skipped, since on macOS the corpus measured it silent on
-three rows, which is the opt-out's recorded cost. Serves invariants 2, 7 and 11.
+The same rows run with ``ack_wait=False`` on Linux, each waiting before the end check for the
+peer's answer to land (:class:`Seams`), since the opt-out leaves a reset in flight at its one read
+uncounted and a loaded runner can hold one in flight; with the answer landed, the corpus measured
+the unwaited check right on loopback. Elsewhere that half is skipped, since on macOS the corpus
+measured it silent on three rows, which is the opt-out's recorded cost. Serves invariants 2, 7 and 11.
 """
 
 from __future__ import annotations
@@ -215,7 +217,7 @@ class Server:
 
 
 def until(condition: Callable[[], bool], limit: float = 2.0) -> None:
-    """Waits for a condition the scenario needs, never for a packet the rule must see.
+    """Waits for a condition the scenario needs, or for the answer an ``ack_wait=False`` row settles.
 
     Args:
       condition: The condition.
@@ -240,7 +242,6 @@ class Seams:
 
     Attributes:
       hooks: The hooks by moment, each run once.
-      end_sock: The socket the end check was last given, set before its ``before_end`` hook.
       settle: Whether the end check, after its ``before_end`` hook, first waits up to 2 s until
         :func:`_peer_answer_landed` says the peer's answer to the round has reached the socket.
         ``ack_wait=False`` reads the connection once and waits for nothing, so a reset still in
@@ -248,8 +249,11 @@ class Seams:
         a reset the scenario sent just before the check can still be in flight: CI read 850
         frames lost and none counted on the ``fin-no-ack-wait`` mid-round row. Settling makes each
         ``ack_wait=False`` row the promise the opt-out does keep, that a reset which has landed by
-        the end of the round is counted. ``ack_wait=True`` rows do not settle, so they still prove
-        the sink's own wait.
+        the end of the round is counted, wherever the scenario's own action leaves its answer in
+        flight, as a peer's close on its own thread does. Where every byte was acknowledged
+        before the close, as on the reset-before-the-end-check row, the wait ends at once and the
+        reset, sent from the sink's thread in the hook, is processed there on loopback.
+        ``ack_wait=True`` rows do not settle, so they still prove the sink's own wait.
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch, settle: bool = False) -> None:
@@ -266,7 +270,6 @@ class Seams:
           None.
         """
         self.hooks: dict[str, Callable[[], None]] = {}
-        self.end_sock: socket.socket | None = None
         self.settle = settle
         self._peer_state = _socket._peer_state
         self._end_state = _socket._end_state
@@ -322,7 +325,6 @@ class Seams:
         Raises:
           None.
         """
-        self.end_sock = sock
         self._fire("before_end")
         if self.settle:
             until(lambda: _peer_answer_landed(sock), 2.0)
@@ -457,8 +459,11 @@ def _peer_answer_landed(sock: socket.socket) -> bool:
     ``SO_ERROR`` or a peek, both of which clear a pending reset that the end check under test
     must still find. The answer has landed once a reset has closed the connection, or once the
     peer has acknowledged every byte, open, half-closed or after its FIN, since a peer that closed
-    with frames unread answers with a reset and never with an acknowledgement. Linux only, as the
-    rows that settle are; an ``OSError`` reads as landed, so the end check runs and decides.
+    before frames arrived answers them with a reset and never with an acknowledgement. Bytes
+    acknowledged before a close are not an answer to that close, so a scenario that closes later
+    must send its close before the wait, as the hooks do. Linux only, as the rows that settle are;
+    an ``OSError``, or an ``_unacked`` that cannot read the queue and answers ``None``, reads as
+    landed, so the end check runs and decides.
 
     Args:
       sock: The sink's held socket.
@@ -628,7 +633,7 @@ _ACK_WAIT = [
         id="no-ack-wait",
         marks=pytest.mark.skipif(
             not sys.platform.startswith("linux"),
-            reason="the unwaited check is right on Linux loopback only (SPEC-093 FR-001's corpus)",
+            reason="the unwaited check, once the answer lands, is right on Linux loopback only",
         ),
     ),
 ]

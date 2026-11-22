@@ -113,8 +113,8 @@ earlier rules were chosen by reasoning or by a corpus that slept before each che
 wrong where it had not been run. Counting on a FIN reported a half-closing peer's delivered frames
 as may-have-landed. Counting only on a peek that raises fell silent on Linux, where a FIN followed by
 the RST our later write draws still peeks as a FIN. Reading `SO_ERROR` at once after the round was
-right on Linux loopback, where the RST our frames draw is back before the check runs, and wrong
-everywhere else: the execution-frame review measured it right in 15 of 20 runs on macOS loopback,
+right on idle Linux loopback, where the RST our frames draw is usually back before the check runs,
+and wrong everywhere else, a loaded Linux runner included (*Revision history*, 2026-11-22): the execution-frame review measured it right in 15 of 20 runs on macOS loopback,
 and silent under 1 ms of `tc netem` delay, because the reset landed after the round's check and the
 next round's check discarded it. So the rule is now the one that
 `spec093_close_corpus.py` shows right when it drives `LogstashSink` in TCP mode, through the real
@@ -276,7 +276,12 @@ FR-006 records the first two windows and the cost in §13.
       `tests/test_conformance.py` read green (invariants 2 and 7).
 - [ ] A new test, `tests/test_socket_close_corpus.py`, runs the table's scenarios against
       `SocketTransport` over loopback TCP in the ordinary `CI / test` job, arranging each through
-      the `_peer_state` and `_end_state` seams and never sleeping for a packet to land. It asserts:
+      the `_peer_state` and `_end_state` seams and never sleeping for a packet to land, except that
+      the `ack_wait=False` rows wait, after the scenario's last action and before the end check,
+      for the peer's answer to land, read only through `TCP_INFO` and `SIOCOUTQ` so that no
+      pending reset is consumed: the opt-out leaves a reset in flight at its one read uncounted by
+      design, and those rows hold the promise it keeps, that a reset which has landed is counted.
+      It asserts:
       no `UNKNOWN` and no `lost` line for the clean, half-close and FIN-after-reading rows; every
       frame the peer lost counted once in `failed`, no frame it received counted, and the count
       named on one line, for the FIN-after-the-pre-check rows, at 1 and 5 frames, and the
@@ -307,7 +312,8 @@ FR-006 records the first two windows and the cost in §13.
       with `ack_wait=True`, wait at the end check: under the seam test's first case each reads
       `_unacked` four times. With `ack_wait=False` each reads `_peer_state` once and `_unacked`
       never, and the corpus test run with `ack_wait=False` reads every row as the rule does on
-      Linux loopback, where it runs (invariants 2 and 10).
+      Linux loopback once the peer's answer has landed, on Linux, where it runs (invariants 2
+      and 10).
 - [ ] `ack_wait="false"`, `ack_wait=0` and `ack_wait=1.0` are refused with `TypeError` naming
       `ack_wait` and the type, on both sinks, before any socket is built. `ack_wait=True` or
       `False` with `transport="udp"` is refused with `ValueError` naming `ack_wait`, and on
@@ -1036,7 +1042,9 @@ The candidate's wait never began under delay, because the FIN itself had not lan
 check, so it did no better than the previous revision there.
 
 `ack_wait=False`, the opt-out, run through the same corpus with `--no-ack-wait` at 5 runs a
-scenario, reads as the previous revision's rule, which it is: every row right on Linux loopback; on
+scenario, reads as the previous revision's rule, which it is: every row right on Linux loopback in
+those runs, though not on a loaded runner, where the mid-round rows were silent in some runs
+(*Revision history*, 2026-11-22); on
 macOS, FIN-after-the-pre-check at 1 frame silent in 5 runs, at 5 frames in 1, and
 RST-before-the-end-check in 1; under 10 ms of delay on Linux, both FIN-after-the-pre-check rows,
 RST-before-the-end-check and the reset-after-the-end-check row's second round silent in every run,
@@ -1237,14 +1245,20 @@ check waits on a healthy peer.
     `a17a28a4` on base `c67931cd`, a local commit that is not on the remote after the squash
     merge. Criterion 2 is read against `295ba803`: fourteen shared rows move, this spec's ten
     and SPEC-094's four, and the twelve confirmed rows are new.
-- Revised on 2026-11-22, after `main` went red at the merge commit `62733aa0`. The py3.13 run
+- Revised on 2026-11-22, after `main` went red at the merge commit `62733aa0`. FR-001's second
+  and fifth criteria now say that the corpus test's `ack_wait=False` rows wait for the peer's
+  answer, and the Evidence, the architecture's §13 bullet and the decision record the mid-round
+  rows as silent in some runs on a loaded Linux runner, which the opt-out gives up. The py3.13 run
   failed `test_a_close_mid_round_loses_no_frame_it_does_not_count[fin-no-ack-wait]` with 850
   frames lost and none counted. The peer's `close()` had run before the end check, but its reset
   was still in flight when `ack_wait=False`'s single read ran, which is the window this spec
   already leaves uncounted for the opt-out. The corpus test's `ack_wait=False` rows now wait, after
   each scenario's last action and before the end check, up to 2 s for the peer's answer to land
   on the sink's socket: a reset closing the connection, or every byte acknowledged, read through
-  `TCP_INFO` and `_unacked` and never through `SO_ERROR` or a peek. FR-001's criterion is unchanged,
-  and those rows now prove the promise the opt-out keeps, that a reset which has landed by the end
-  of the round is counted. The `ack_wait=True` rows do not wait, so they still prove the sink's own
+  `TCP_INFO` and `_unacked` and never through `SO_ERROR` or a peek. The rule FR-001 specifies is
+  unchanged, and those rows now prove the promise the opt-out keeps, that a reset which has landed
+  by the end of the round is counted. A Docker `python:3.12-slim` reproduction under load failed
+  the `ack_wait=False` rows in 3 of 60 runs before and none of 180 after, and the diff review's
+  re-plants (no `SO_ERROR` read, `_RESET_ERRNOS` emptied, an end check that never reads) still
+  turned the FIN-after-the-pre-check and reset-before-the-end-check rows red under the wait. The `ack_wait=True` rows do not wait, so they still prove the sink's own
   wait.

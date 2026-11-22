@@ -27,8 +27,8 @@ run.** Counting on a FIN reported a half-closing peer's delivered frames as may-
 script is not in the tree, and the `half-close-3-rounds` row of `tests/test_socket_close_corpus.py`
 holds the behaviour in CI). Counting only on a peek that raises was silent
 on Linux, where a FIN followed by the reset our later write draws still peeks as a FIN. Reading
-`SO_ERROR` at once after the round was right on Linux loopback and silent under delay, because the
-reset landed after the check. `docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py` drove the
+`SO_ERROR` at once after the round was right on idle Linux loopback and silent under delay, and in
+some runs on a loaded Linux runner, because the reset landed after the check. `docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py` drove the
 real transport through the two seams, with no sleep before any check, on macOS and on Linux on
 loopback and under 1 ms and 10 ms of added delay, and only the rule above was right on every row.
 **A FIN alone is not a loss**, because it is also a legal half-close; a reset, which says the peer
@@ -58,7 +58,8 @@ cost: a broker confirm costs a round trip per message, unbounded but by the conn
 wait costs one round trip per round, bounded at 0.25 s. `SyslogSink` and `LogstashSink` each take a
 keyword-only `ack_wait: bool | None = None`; `None` and `True` wait, and `False` reads the peer's state
 once at the end, which keeps the pre-round check, the raise rule and an end check that sees a reset
-already landed, and gives up the rows the corpus measured silent under delay and on macOS loopback.
+already landed, and gives up the rows the corpus measured silent under delay and on macOS loopback,
+and the mid-round rows in some runs on a loaded Linux runner (SPEC-093, 2026-11-22).
 The name says what it controls, the wait for the peer's TCP acknowledgement; `confirm` was not reused,
 because a broker's confirm is an application-level answer and this acknowledgement is the peer
 kernel's, which says nothing about whether the collector kept the bytes. `_socket.require_ack_wait`
