@@ -8,7 +8,12 @@ from typing import TYPE_CHECKING, Unpack
 from log_foundry import _diag, _lifecycle
 from log_foundry.sinks._args import ReadOnlyCount, ReadOnlySeconds
 from log_foundry.sinks._engine import emit_via_deliver
-from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
+from log_foundry.sinks._socket import (
+    DEFAULT_MAX_DATAGRAM_BYTES,
+    SocketTransport,
+    refuse_a_non_bool_ack_wait,
+    require_ack_wait,
+)
 from log_foundry.sinks._wrapper import (
     ForwardedStopSignal,
     copy_budget,
@@ -129,6 +134,7 @@ class LogstashSink:
         timeout: float = 5.0,
         max_retries: int = 3,
         max_datagram_bytes: int | None = None,
+        ack_wait: bool | None = None,
         **http_kwargs: Unpack[HTTPAuthKwargs],
     ) -> None:
         """Selects and builds exactly one backend.
@@ -157,6 +163,12 @@ class LogstashSink:
             than sent, retried and abandoned (SPEC-038 FR-007). ``None`` by default for the reason
             ``transport`` is. Still ignored over TCP, which is a stream — that is a property of the
             transport the caller chose, not an argument the backend cannot use.
+          ack_wait: In TCP socket mode, whether each round ends by waiting, up to 0.25 s, for the
+            peer to acknowledge what it wrote, so frames a closed peer discarded are counted
+            (SPEC-093 FR-001). ``None``, the default, waits; ``False`` checks once without
+            waiting. Unlike ``max_datagram_bytes`` its default is ``None`` in every mode, so a
+            ``bool`` given for UDP or beside ``url=`` is told from the default and refused with
+            ``ValueError``; a value that is not a ``bool`` is a ``TypeError`` in every mode.
           **http_kwargs: Forwarded to :class:`~log_foundry.sinks.http.HTTPSink` in HTTP mode,
             typed as ``HTTPAuthKwargs`` (SPEC-051 FR-005) — every keyword it takes except
             ``body_format``, ``timeout`` and ``max_retries``, each a parameter of this sink's
@@ -167,7 +179,9 @@ class LogstashSink:
           None.
 
         Raises:
-          TypeError: If ``max_retries`` (either mode) or ``port`` (socket mode) is not an ``int``,
+          TypeError: If ``ack_wait`` is neither ``None`` nor a ``bool``, in either mode and before
+            any other argument is judged, or if ``max_retries``
+            (either mode) or ``port`` (socket mode) is not an ``int``,
             or in HTTP mode a forwarded ``max_batch_count`` is not an ``int`` or
             ``max_retry_after`` not an ``int`` or ``float`` (SPEC-066), refused by the backend this
             sink builds.
@@ -185,6 +199,7 @@ class LogstashSink:
             is the wrapped sink's, under its name — a forwarded ``auth`` beside an
             ``Authorization`` header in a forwarded ``headers``, in any case, among them.
         """
+        refuse_a_non_bool_ack_wait(ack_wait, _diag.type_name(self))
         if body_format not in _BODY_FORMATS:
             raise ValueError(
                 f"LogstashSink body_format must be one of {sorted(_BODY_FORMATS)}, "
@@ -195,6 +210,7 @@ class LogstashSink:
             "port": port,
             "transport": transport,
             "max_datagram_bytes": max_datagram_bytes,
+            "ack_wait": ack_wait,
         }
         if url is not None:
             unusable = sorted(n for n, v in socket_only.items() if v is not None)
@@ -217,6 +233,9 @@ class LogstashSink:
                     "HTTP backend"
                 )
             self._http = None
+            wait_for_ack = require_ack_wait(
+                ack_wait, _diag.type_name(self), transport if transport is not None else "tcp"
+            )
             self._socket = SocketTransport(
                 host,
                 port,
@@ -230,6 +249,7 @@ class LogstashSink:
                 ),
                 frame=self._frame,
                 sink_name=_diag.type_name(self),
+                ack_wait=wait_for_ack,
             )
         else:
             raise ValueError("LogstashSink requires either url= (HTTP) or host= + port= (socket)")

@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A closing sink refuses at once; a SERIAL close waits for the one call inside, a CLOSE_ONLY close waits a bounded time"
-description: "a close sets `CLOSING` before it takes the transport lock, so every later caller is refused; a `SERIAL` close then waits for the one section holding the lock and never releases under it, and a `CLOSE_ONLY` close waits at most `CLOSE_OVERLAP_WAIT` (0.5 s) and releases, telling the section it overtook (`released_during`), which `KafkaSink` counts. Never an `RLock`; never a release handed to the call inside. (SPEC-076)"
+description: "a close sets `CLOSING` before it takes the transport lock, so every later caller is refused; a `SERIAL` close then waits for the one section holding the lock and never releases under it, and a `CLOSE_ONLY` close waits at most `CLOSE_OVERLAP_WAIT` (0.5 s) and releases, telling the section it overtook (`released_during`). Never an `RLock`; never a release handed to the call inside. (SPEC-076)"
 ---
 
 **What a close does when it overlaps a call still inside the sink**, for the eleven sinks that
@@ -35,13 +35,19 @@ inside. For Kafka the bound is measured headroom over a local hand-off. For Mong
 chosen: a round against a reachable server finishes well inside it, and a round that outlives it is
 the call the bound exists to stop waiting for. 0.5 s is a quarter of `DEFAULT_CLOSER_GRACE`, which
 leaves room for the release inside a full grace and promises nothing once less remains. A section
-the release overtook reads `released_during` after its `with` block. `KafkaSink` counts every
+the release overtook reads `released_during` after its `with` block. ~~`KafkaSink` counts every
 message that `emit` handed to the producer in `failed`, with the line `lost N message(s);
 KafkaSink, produced while the sink was closing`. That is invariant 2's upper bound, since the
-release's flush may have delivered some. MongoDB and Redis need no flag: the overtaken call meets
+release's flush may have delivered some.~~ MongoDB and Redis need no flag: the overtaken call meets
 a closed client, the engine classifies what it raises like any other round, and the next round is
 refused. `pymongo`'s `InvalidOperation` is `REJECTED` and counted in `.failed`. `redis-py`'s
 `ConnectionError` is `RETRYABLE`, so the catcher counts the batch.
+
+> **Superseded in part by SPEC-094 (2026-11-20):** `KafkaSink` no longer reads `released_during`
+> or counts a hand-off the release overtook. It is a delivery-engine sink whose round waits for its
+> own delivery reports, so a round the release overtook settles each message from its own report
+> table, and a message with no report is `UNKNOWN`, counted once by its round. The decision lives in
+> `docs/decisions/sink-delivery/` (*A client-buffered sink's round waits for its delivery reports*).
 
 **Rejected:**
 
@@ -64,6 +70,13 @@ NOT let a refused section hold a lock or reach the transport; do NOT bound the r
 SPEC-061's and the orphaned-future count. (SPEC-076 FR-001 to FR-003)
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-094: `KafkaSink` is on the delivery engine, so its count of a hand-off the
+  release overtook is gone. The fence no longer says `KafkaSink` counts `released_during`, and the
+  body's sentence stating it is struck with a superseded marker. The `CLOSE_ONLY` rule itself is
+  unchanged.
 
 ### 2026-11-09
 

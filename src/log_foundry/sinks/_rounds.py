@@ -277,10 +277,17 @@ def read_keyed(
     """Reads a keyed batch reply through the keyed reader and the sink's entry predicate.
 
     SQS and SNS share it (SPEC-074 FR-002): the reply's ``Failed`` list is paired with the ids
-    sent by :func:`~log_foundry.sinks._batch.adjudicate_keyed`, a missing ``Failed`` pairs
-    nothing, and a reply that is not a mapping, or a list the reader refuses, is unread. A failed
-    entry the predicate calls permanent — a sender fault — is ``REJECTED``, any other
-    ``RETRYABLE``; an entry the reply does not name is ``ACCEPTED``.
+    sent by :func:`~log_foundry.sinks._batch.adjudicate_keyed`, and a reply that is not a
+    mapping, or a list the reader refuses, is unread. A failed entry the predicate calls
+    permanent — a sender fault — is ``REJECTED``, any other ``RETRYABLE``.
+
+    A reply that names no entry adjudicates none of them (SPEC-093 FR-003, Andrew's decision A
+    of 2026-11-15): one carrying neither ``Failed`` nor ``Successful`` is unread. A
+    ``Successful`` list is read with the same discipline as ``Failed``; an entry it names is
+    ``ACCEPTED``, one named in neither list is ``UNKNOWN``, and one named in both, or a
+    ``Successful`` list the reader refuses, makes the whole reply unread. A reply with a
+    ``Failed`` list and no ``Successful`` reads as 1.x did: an entry it does not name is
+    ``ACCEPTED``, since that is the field the 1.x reader trusts and decision A does not name it.
 
     Args:
       retryable_entry: The sink's ``_retryable_entry``.
@@ -294,16 +301,28 @@ def read_keyed(
       None. A ``BaseException`` from the predicate or the reply still propagates.
     """
     try:
-        failed = cast("dict[str, object]", response).get("Failed", [])
+        reply = cast("dict[str, object]", response)
+        if "Failed" not in reply and "Successful" not in reply:
+            return KeyedReply([], unread=True)
+        failed = reply.get("Failed", [])
         read = adjudicate_keyed(ids, failed, key="Id")
         if read.unadjudicated:
             return KeyedReply([], unread=True)
+        named: list[object] = [None] * len(ids)
+        if "Successful" in reply:
+            landed = adjudicate_keyed(ids, reply["Successful"], key="Id")
+            if landed.unadjudicated:
+                return KeyedReply([], unread=True)
+            named = list(landed.failed)
         outcomes: list[Outcome] = []
         code: object = "unknown"
         found = False
-        for entry in read.failed:
+        for entry, success in zip(read.failed, named, strict=True):
+            if entry is not None and success is not None:
+                return KeyedReply([], unread=True)
             if entry is None:
-                outcomes.append(Outcome.ACCEPTED)
+                listed = success is not None or "Successful" not in reply
+                outcomes.append(Outcome.ACCEPTED if listed else Outcome.UNKNOWN)
             elif retryable_entry(entry):
                 outcomes.append(Outcome.RETRYABLE)
             else:
@@ -382,14 +401,18 @@ def settle_keyed(
 
     A raise makes the call's entries ``RETRYABLE`` (a ``LAST`` line) or ``REJECTED`` (an
     ``ALWAYS`` line) as ``_retryable_error`` answered, the line SPEC-070's ``<Class>, N
-    attempt(s), <Type>``; an unread reply makes them ``UNKNOWN`` with one line, never resent by a
-    shipped sink's run, so ``ALWAYS``, or ``LAST`` in a run whose sink declares itself idempotent
-    and so resends them (``RunContext.resends_unknown``, asked of the run rather than ``owner``,
-    since a delegate forwarding ``deliver`` decides the resend); otherwise each entry takes its
-    reply's outcome, a sender fault marked a final rejection with 1.x's ``rejected as invalid
-    (first code: …); not retried`` line, and an entry still failing a ``LAST`` line ``still
-    failing after N attempt(s); abandoned``. Every line names ``name``, the sink's own class name
-    as 1.x wrote it, so a subclass's lines read as 1.x's did.
+    attempt(s), <Type>``; an unread reply makes them ``UNKNOWN`` with one line ending ``may have
+    landed, not retried``, never resent by a shipped sink's run, so ``ALWAYS``, or ``LAST`` in a
+    run whose sink declares itself idempotent and so resends them (``RunContext.resends_unknown``,
+    asked of the run rather than ``owner``, since a delegate forwarding ``deliver`` decides the
+    resend); otherwise each entry takes its reply's outcome, a sender fault marked a final
+    rejection with 1.x's ``rejected as invalid (first code: …); not retried`` line, an entry the
+    reply named in neither list ``UNKNOWN`` with one ``named neither success nor failure`` line,
+    and an entry still failing a ``LAST`` line ``still failing after N attempt(s); abandoned``.
+    Every ``UNKNOWN`` entry is also counted on ``dropped_unadjudicated`` (SPEC-093 FR-003), a
+    sub-count of ``failed`` on these two sinks, since ``failed`` is the engine's
+    ``failed_events``. Every line names ``name``, the sink's own class name as 1.x wrote it, so a
+    subclass's lines read as 1.x's did.
 
     **A retried raise is marked as possibly landed** (SPEC-095 FR-002): botocore retries a call
     inside the client, so a raise can follow an attempt that landed, and every raise an AWS
@@ -433,28 +456,44 @@ def settle_keyed(
             fates[position] = Outcome.UNKNOWN
         unread = len(positions)
         when = When.LAST if context.resends_unknown(owner) else When.ALWAYS
+        context.count(cast("_Counted", owner), "dropped_unadjudicated", unread, when=when)
         context.announce(
             lambda: _diag.lost(
                 "message",
                 unread,
-                f"{name} could not adjudicate a {call} reply ({unread} entry(ies) sent); not "
-                "retried",
+                f"{name} could not adjudicate a {call} reply ({unread} entry(ies) sent); may "
+                "have landed, not retried",
             ),
             when=when,
         )
         return []
     accepted: list[int] = []
     faults = 0
+    unnamed = 0
     retrying: list[dict[str, object]] = []
     for position, event, outcome in zip(positions, carried, reply.outcomes, strict=True):
         fates[position] = outcome
         if outcome is Outcome.ACCEPTED:
             accepted.append(position)
+        elif outcome is Outcome.UNKNOWN:
+            unnamed += 1
         elif outcome is Outcome.REJECTED:
             faults += 1
             final.append(position)
         else:
             retrying.append(event)
+    if unnamed:
+        when = When.LAST if context.resends_unknown(owner) else When.ALWAYS
+        context.count(cast("_Counted", owner), "dropped_unadjudicated", unnamed, when=when)
+        context.announce(
+            lambda: _diag.lost(
+                "message",
+                unnamed,
+                f"{name}, a {call} reply named neither success nor failure for {unnamed} "
+                "entry(ies); may have landed, not retried",
+            ),
+            when=when,
+        )
     if faults:
         code = reply.code
         context.announce(
@@ -497,7 +536,8 @@ def settle_positional(
     :func:`~log_foundry.sinks._batch.adjudicate_positional` with its failed count, as before
     (SPEC-070 FR-003): a record it codes as failed is ``RETRYABLE`` — the entry predicate of both
     services answers every coded record retryable — the rest ``ACCEPTED``; a reply it cannot
-    adjudicate, or one that is not a mapping, makes the call's records ``UNKNOWN``, never
+    adjudicate, one that is not a mapping, or one that carries neither a failed count nor a
+    per-record array (``absent``, SPEC-093 FR-003), makes the call's records ``UNKNOWN``, never
     resent, counted on ``dropped_unadjudicated`` with 1.x's line, so the sub-count keeps its
     meaning and ``.failed`` keeps excluding it. Both are ``ALWAYS``, or ``LAST`` in a run that
     resends an ``UNKNOWN``, as :func:`settle_keyed`'s unread line is.
@@ -549,7 +589,9 @@ def settle_positional(
         failed_count, raw = ABSENT, object()
     results = usable_results(raw)
     rejected = results_rejected(raw)
-    verdict = adjudicate_positional(records, results, failed_count=failed_count, rejected=rejected)
+    verdict = adjudicate_positional(
+        records, results, failed_count=failed_count, rejected=rejected, absent=raw is None
+    )
     if verdict.unadjudicated:
         coded = sum(1 for result in results if result.get("ErrorCode"))
         returned = (

@@ -333,6 +333,25 @@ def floor_count(value: int, floor: int, name: str, owner: str) -> int:
     return max(exact_int(value, name, owner), floor)
 
 
+def pause_on(stop: threading.Event | None) -> threading.Event | None:
+    """The event a pause between two asks for a report may be cut short by (SPEC-094).
+
+    A stop signal already set would end :func:`wait` at once, so a wait that keeps asking for one
+    slice after the stop would ask in a tight loop, measured burning CPU for the whole slice.
+    Such a pause is waited out in full instead; one not yet set still cuts it short.
+
+    Args:
+      stop: The worker's shutdown event, or ``None``.
+
+    Returns:
+      ``stop`` when it is not set, else ``None``.
+
+    Raises:
+      None.
+    """
+    return None if stop is not None and stop.is_set() else stop
+
+
 def wait_budget(value: float | None, name: str) -> float | None:
     """Returns the wait a public ``timeout`` asks for, or refuses one with no meaning (SPEC-066).
 

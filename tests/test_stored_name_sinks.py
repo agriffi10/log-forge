@@ -67,16 +67,12 @@ _RIG_SILENT = {
     "SQLiteSink": "its rig writes through a real connection that State.error never reaches",
     "StdoutSink": "its rig's stream never raises State.error",
     "StderrSink": "its rig's stream never raises State.error",
-    "GooglePubSubSink": (
-        "every publish() is refused, and a refusal of every event raises before the line is "
-        "announced; its partial refusal is driven directly below"
-    ),
 }
 """Rigs whose emit writes no loss line naming ``State.error``, each with its reason.
 
 The first four never reach a name read here, so their case asserts nothing this change moved.
-``GooglePubSubSink`` does reach one, ``publish()``'s refusal, and its case still asserts that the
-property never ran there.
+``GooglePubSubSink`` left this table at SPEC-094: on the engine, a refusal of every publish ends
+the run with its line, which names the stored name as every other rig's does.
 """
 
 
@@ -162,20 +158,79 @@ def test_a_kafka_encode_raise_whose_class_name_raises_costs_only_its_event(
     assert len(lost) == 1 and lost[0].endswith("encoding raised Nameless"), lost
 
 
+class _NamelessRefusal(Nameless):
+    """A ``KafkaError``-shaped delivery error with a definitive code, named only by its store."""
+
+    def code(self) -> int:
+        """``INVALID_RECORD``, which ``DEFINITIVE_CODES`` holds.
+
+        Args:
+          None.
+
+        Returns:
+          87.
+
+        Raises:
+          None.
+        """
+        return 87
+
+
+class _Reporting(_Producer):
+    """A producer whose ``flush`` serves every report it holds with one error."""
+
+    def __init__(self, error: object) -> None:
+        """Keeps the error each report carries.
+
+        Args:
+          error: The delivery error.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        super().__init__()
+        self.error = error
+
+    def flush(self, timeout: float | None = None) -> int:
+        """Serves every held report with the error.
+
+        Args:
+          timeout: Ignored.
+
+        Returns:
+          0.
+
+        Raises:
+          None.
+        """
+        served, self.callbacks = self.callbacks, []
+        for callback in served:
+            callback(self.error, None)
+        return 0
+
+
 def test_a_kafka_delivery_error_whose_class_name_raises_is_counted_and_named(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """The delivery callback, run on librdkafka's thread, counts the failure and cannot raise."""
+    """A definitive report, read in the round (SPEC-094 FR-001), counts and names its stored name.
+
+    The round reads the report's code and type without running the class's ``__name__``: the
+    message is ``REJECTED``, the run fails, and the line names the stored name and the code.
+    """
     from log_foundry.sinks.kafka import KafkaSink
 
-    producer = _Producer()
-    sink = KafkaSink("topic", producer=producer)
-    sink.emit([ok("a")])
-    producer.callbacks[0](Nameless("SENTINEL"), None)
+    sink = KafkaSink("topic", producer=_Reporting(_NamelessRefusal("SENTINEL")))
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([ok("a")])
     assert _RAN == []
     assert sink.failed == 1
     lost = _lines(capsys.readouterr().err, "log-foundry: lost")
-    assert lost == ["log-foundry: lost 1 message(s); KafkaSink delivery, Nameless"], lost
+    assert lost == [
+        "log-foundry: lost 1 message(s); KafkaSink delivery, _NamelessRefusal code=87"
+    ], lost
 
 
 def test_an_http_auth_unpack_raising_a_nameless_class_is_refused_as_documented() -> None:

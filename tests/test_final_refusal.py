@@ -53,8 +53,12 @@ RETRIES = 3
 
 SINKS = Path(__file__).resolve().parent.parent / "src" / "log_foundry" / "sinks"
 
-EMIT_ONLY = (*sorted(EMIT_ONLY_CLOSED), "GooglePubSubSink")
-"""Every shipped sink with no ``deliver`` that refuses after ``close()``."""
+EMIT_ONLY = tuple(sorted(EMIT_ONLY_CLOSED))
+"""Every shipped sink with no ``deliver`` that refuses after ``close()``.
+
+``GooglePubSubSink`` left at SPEC-094 FR-002, which put it on the delivery engine, where the worker
+reaches it through ``deliver``.
+"""
 
 
 def _batch(n: int = 2) -> list[dict[str, object]]:

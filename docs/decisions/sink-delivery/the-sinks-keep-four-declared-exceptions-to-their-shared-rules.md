@@ -54,6 +54,23 @@ and do not widen a row by hand-listing a class the derivation does not find.
 
 ## History
 
+### 2026-11-22
+
+- **Kept**, rows unchanged, when `GooglePubSubSink.close()` began waiting, up to
+  `overflow_timeout`, on the futures its rounds left `UNKNOWN` (SPEC-094 FR-002, Andrew's "Wait
+  at close (Recommended)"). The close sets the flag and takes those futures in the same
+  `_futures_lock` a round's hand-off reads the flag under, so a close landing mid-round still
+  makes the round's later publishes `UNKNOWN` without raising, and a round settling after it
+  keeps nothing for a close that has already run. The proof test is unchanged and passes.
+
+### 2026-11-20
+
+- **Kept** through SPEC-094, rows unchanged. `GooglePubSubSink` is now a delivery-engine sink, but
+  it keeps its own closed flag and `_futures_lock` rather than the closed guard (SPEC-076 FR-005),
+  and a close that lands mid-round still makes the round's later publishes `UNKNOWN`, counted once
+  and announced on 1.x's line, without raising: the departure row 3 records. The proof test kept its
+  name; its one assertion on the pending list went with the list.
+
 ### 2026-11-08
 
 - **Refined** by SPEC-073, rows unchanged: row 2's `OTLPSink` inherits the engine's rounds and the

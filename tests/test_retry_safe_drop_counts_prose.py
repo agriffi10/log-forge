@@ -40,13 +40,17 @@ _LISTED = [
     ("mongodb.py", "MongoDBSink.emit"),
     ("eventhubs.py", "AzureEventHubsSink._send_batch"),
     ("eventhubs.py", "AzureEventHubsSink.emit"),
-    ("kafka.py", "KafkaSink.emit"),
+    ("kafka.py", "KafkaSink._round"),
     ("kafka.py", "KafkaSink.losses"),
-    ("pubsub.py", "GooglePubSubSink.emit"),
+    ("pubsub.py", "GooglePubSubSink._round"),
     ("syslog.py", "SyslogSink.emit"),
     ("logstash.py", "LogstashSink.emit"),
 ]
-"""Every docstring FR-006 lists as saying when a drop is counted, by sink module and qualname."""
+"""Every docstring FR-006 lists as saying when a drop is counted, by sink module and qualname.
+
+``KafkaSink._round`` and ``GooglePubSubSink._round`` hold the statement each ``emit`` held until
+SPEC-094 made ``emit`` the engine's inline adapter and moved the refusal into the round.
+"""
 
 _RETIRED = [
     ("src/log_foundry/sinks/_socket.py", "Nothing here can fix it"),

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import errno
 import json
+import select
 import socket
-from typing import TYPE_CHECKING
+import struct
+import sys
+import time
+from typing import TYPE_CHECKING, Literal
 
 from log_foundry import _diag
 from log_foundry.sanitize import _int_text
@@ -21,6 +25,7 @@ from log_foundry.sinks._retry import (
     floor_count,
     require_positive,
     require_timeout,
+    wait,
 )
 from log_foundry.sinks._rounds import Called, Lost, mark_may_have_landed, mark_sent, raised_line
 from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
@@ -44,6 +49,28 @@ maximum is 65,527 — a 20-byte discrepancy no real path can reach, since no MTU
 It is the ceiling the *protocol* imposes; a path's real limit is often far lower, which is why
 it is configurable. TCP is a stream and has no such limit, so this bounds nothing there.
 """
+
+_RESET_ERRNOS = frozenset({errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED, errno.ETIMEDOUT})
+"""Pending socket errors that mean the peer reset or abandoned the connection (SPEC-093 FR-001).
+
+Only these: Linux reports a soft ICMP error, such as ``EHOSTUNREACH``, in ``SO_ERROR`` on a
+connection that is still alive, and reading one as a reset would count frames that arrived.
+"""
+
+PeerState = Literal["open", "fin", "reset"]
+"""What :func:`_peer_state` reads of a held TCP connection's peer."""
+
+_RESET_WAIT = 0.25
+"""Seconds the end-of-round check waits for the peer's acknowledgement or a reset (SPEC-093).
+
+It covers a 50 ms round trip under Linux's longest delayed acknowledgement, 200 ms
+(``TCP_DELACK_MAX``), which is how long a peer that never writes back may hold its answer. A
+longer bound would close more of the window a late reset leaves, and would cost every round
+against a peer that neither acknowledges nor resets that much more.
+"""
+
+_RESET_STEP = 0.001
+"""Seconds between two reads of the socket while the end-of-round check waits."""
 
 _PERMANENT_ERRNOS = frozenset({errno.EMSGSIZE})
 """Socket errnos that describe the message rather than the destination (FR-007 AC-3).
@@ -116,6 +143,166 @@ def _make_udp(host: str) -> socket.socket:
     )
 
 
+def _peer_state(sock: socket.socket) -> PeerState:
+    """Reports what a held TCP connection shows of its peer: ``open``, ``fin`` or ``reset``.
+
+    A seam beside :func:`_make_tcp` (SPEC-093 FR-001). A pending socket error (``SO_ERROR``) in
+    :data:`_RESET_ERRNOS` is a reset; any other pending error is not. Reading ``SO_ERROR`` clears
+    it, so this is its only reader in the transport, and a reset it reads is acted on by the
+    caller that read it. Then a zero-timeout readiness test, ``select.select``, falling back to
+    ``select.poll`` where ``select`` refuses a descriptor above ``FD_SETSIZE`` with
+    ``ValueError``, and when readable a one-byte ``MSG_PEEK``: empty is a FIN, data is open. It
+    never uses ``MSG_DONTWAIT``, which on a socket with a timeout waits the whole timeout. An
+    ``OSError`` from any of these is a reset, and any other exception reads as open, so an object
+    that is not a real socket keeps 1.x's behaviour.
+
+    Args:
+      sock: The held socket.
+
+    Returns:
+      ``open``, ``fin`` or ``reset``.
+
+    Raises:
+      None.
+    """
+    try:
+        if sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) in _RESET_ERRNOS:
+            return "reset"
+        try:
+            readable = bool(select.select([sock], [], [], 0)[0])
+        except ValueError:
+            poller = select.poll()
+            poller.register(sock, select.POLLIN)
+            readable = bool(poller.poll(0))
+        if not readable:
+            return "open"
+        return "fin" if sock.recv(1, socket.MSG_PEEK) == b"" else "open"
+    except OSError:
+        return "reset"
+    except Exception:
+        return "open"
+
+
+def _unacked(sock: socket.socket) -> int | None:
+    """Bytes the peer's kernel has not yet acknowledged, or ``None`` where the platform cannot say.
+
+    Linux's ``SIOCOUTQ`` (``TIOCOUTQ``) and macOS's ``SO_NWRITE`` count what the send buffer still
+    holds: written and not yet acknowledged, or not yet sent. ``fcntl`` and ``termios`` are
+    imported here rather than with the module because neither exists on Windows, where the import
+    fails inside the guard and the answer is ``None``, so the end check does not wait there.
+
+    Args:
+      sock: The held socket.
+
+    Returns:
+      The count, or ``None``.
+
+    Raises:
+      None.
+    """
+    try:
+        if sys.platform == "darwin":
+            return int(sock.getsockopt(socket.SOL_SOCKET, 0x1024))
+        import fcntl
+        import termios
+
+        return int(struct.unpack("i", fcntl.ioctl(sock.fileno(), termios.TIOCOUTQ, b"\0" * 4))[0])
+    except Exception:
+        return None
+
+
+def _end_state(sock: socket.socket, wait_for_ack: bool = True) -> PeerState:
+    """Checks a held connection after a round, waiting for the peer to answer what it wrote.
+
+    A seam (SPEC-093 FR-001). A peer that closed before the round's frames reached it answers them
+    with a reset and never with an acknowledgement, and an open or half-closed peer acknowledges
+    them, so waiting until every byte is acknowledged or a reset arrives decides the round on the
+    peer's answer to its own bytes rather than on whatever has landed by the time the check runs.
+    It reads :func:`_peer_state` and returns at once on a reset; otherwise it reads again every
+    :data:`_RESET_STEP` until :func:`_unacked` answers ``0`` or ``None`` or :data:`_RESET_WAIT`
+    has passed, so where the send queue cannot be read it does not wait. The pause is
+    ``_retry.wait``, the helper SPEC-074's only-the-engine-waits gates watch, which is why
+    ``_socket`` is named in their exclusions: this is a wait for the peer's answer to its own
+    frames, not a retry backoff.
+
+    Args:
+      sock: The held socket.
+      wait_for_ack: ``False`` reads :func:`_peer_state` once and waits for nothing, the check a
+        caller who passed ``ack_wait=False`` chose.
+
+    Returns:
+      ``reset`` when a reset arrived first, else what :func:`_peer_state` answers last.
+
+    Raises:
+      None.
+    """
+    if not wait_for_ack:
+        return _peer_state(sock)
+    deadline = time.monotonic() + _RESET_WAIT
+    while True:
+        state = _peer_state(sock)
+        if state == "reset":
+            return state
+        queued = _unacked(sock)
+        if not queued or time.monotonic() >= deadline:
+            return state
+        wait(_RESET_STEP)
+
+
+def refuse_a_non_bool_ack_wait(value: object, owner: str) -> None:
+    """Refuses an ``ack_wait`` that is neither ``None`` nor a ``bool``, whatever the mode (SPEC-093).
+
+    A new argument outside its type is refused as a ``TypeError`` before anything else is judged,
+    so ``LogstashSink(url=..., ack_wait="false")`` names the type rather than the socket-only rule;
+    a ``bool`` beside ``url=`` is still that rule's ``ValueError``.
+
+    Args:
+      value: The argument as passed.
+      owner: The sink's class name, for the message.
+
+    Returns:
+      None.
+
+    Raises:
+      TypeError: If ``value`` is neither ``None`` nor a ``bool``.
+    """
+    if value is not None and not _diag.is_a(value, bool):
+        raise TypeError(f"{owner} ack_wait must be a bool or None, not {_diag.type_name(value)}")
+
+
+def require_ack_wait(value: object, owner: str, transport: object) -> bool:
+    """Judges a sink's ``ack_wait`` argument and answers whether its TCP rounds wait (SPEC-093).
+
+    ``None``, the default, waits, as Andrew chose on 2026-11-16 ("On, opt out"). A ``bool`` is the
+    caller's choice. Anything else is refused rather than read for its truth, because a new
+    keyword has no 1.x caller to keep working and ``"false"`` would otherwise turn the wait on.
+    A ``bool`` on the UDP transport is refused as an argument the chosen backend cannot use, since
+    a datagram has no acknowledgement to wait for; a transport that is neither is left to
+    :class:`SocketTransport` to refuse.
+
+    Args:
+      value: The argument as passed.
+      owner: The sink's class name, for the message.
+      transport: The transport the sink was given.
+
+    Returns:
+      Whether the end-of-round check waits.
+
+    Raises:
+      TypeError: If ``value`` is neither ``None`` nor a ``bool``.
+      ValueError: If ``value`` is a ``bool`` and the transport is UDP.
+    """
+    refuse_a_non_bool_ack_wait(value, owner)
+    if value is None:
+        return True
+    if transport == "udp":
+        raise ValueError(
+            f"{owner} cannot apply ack_wait to the UDP transport, which has no acknowledgement "
+            "to wait for; drop it, or pass transport='tcp'"
+        )
+    return bool(value)
+
+
 def _json_frame(event: dict[str, object]) -> bytes:
     """Frames an event as its UTF-8 JSON text, the transport's default when a caller gives none.
 
@@ -154,7 +341,9 @@ class SocketTransport:
     Attributes:
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports and both
         socket sinks share.
-      failed: Messages not confirmed, ``failed_events``; assignable.
+      failed: Messages not confirmed, ``failed_events``; assignable. Over TCP that includes a
+        frame written to a connection its peer turned out to have closed, counted ``UNKNOWN``
+        (SPEC-093 FR-001).
       dropped_oversized: UDP datagrams discarded before any send for exceeding
         ``max_datagram_bytes``, counted and announced only when ``emit`` returns — on the engine,
         only when the run settles — so a batch the worker retries counts its oversized frame
@@ -163,6 +352,17 @@ class SocketTransport:
 
     It keeps **no** client buffer (SPEC-036 FR-002): a round puts the bytes on the socket before
     it returns, and no client object outlives it holding data.
+
+    A TCP write that returned says only that the kernel took the bytes, so each TCP round checks
+    the connection before its first frame and after its last, waiting at the end for the peer to
+    acknowledge what it wrote, up to :data:`_RESET_WAIT` (SPEC-093 FR-001). A frame written to a
+    connection a later write or a reset shows was closed is ``UNKNOWN``, counted in ``failed``
+    with a may-have-landed line and never sent again. The wait costs a round trip plus the peer's
+    delayed acknowledgement on every round; ``ack_wait=False`` keeps the checks without it. A
+    reset that reaches the sink after the end check, from a peer that acknowledged the frames and
+    then discarded them unread, leaves them reported delivered: the next round's check sees the
+    reset, but that run already settled them, and SPEC-088's ledger lets an event leave through
+    one term only.
     """
 
     max_retries: ReadOnlyCount[int] = ReadOnlyCount()
@@ -178,6 +378,7 @@ class SocketTransport:
         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
         frame: Callable[[dict[str, object]], bytes] | None = None,
         sink_name: str = "SocketTransport",
+        ack_wait: bool = True,
     ) -> None:
         """Configures the destination, framing and retry bound without opening a socket yet.
 
@@ -203,6 +404,9 @@ class SocketTransport:
           frame: The caller's per-event frame function (SPEC-074 FR-005), or ``None`` for an
             event's UTF-8 JSON text.
           sink_name: The class name SPEC-069's encode line names: the sink that built this.
+          ack_wait: Whether a TCP round's end check waits for the peer to acknowledge what the
+            round wrote (SPEC-093 FR-001). ``False`` checks once, at once, as the transport did
+            before the wait; the sink that builds this has judged the value.
 
         Returns:
           None.
@@ -240,6 +444,7 @@ class SocketTransport:
         self._sock: socket.socket | None = None
         self._frame = frame if frame is not None else _json_frame
         self._sink_name = sink_name
+        self._ack_wait = ack_wait
         self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
         self.log_foundry_stop_signal: threading.Event | None = None
@@ -377,6 +582,18 @@ class SocketTransport:
         other ``REJECTED``, each line naming the type and errno as 1.x's did, and the round goes
         on to the next frame.
 
+        Over TCP the round also checks the held connection (SPEC-093 FR-001). Before its first
+        frame, a held connection :func:`_peer_state` does not read ``open`` is replaced, so the
+        round's frames go on a new connection and nothing is counted. The frames written on the
+        current connection since its last check that read ``open`` are unconfirmed; a connection
+        opened inside the round counts as checked when it opened. When a later write raises, the
+        unconfirmed frames become ``UNKNOWN``, while the raising frame keeps the outcome above and
+        so is sent again on a new connection. After the last frame, :func:`_end_state` waits for
+        the peer to acknowledge what the round wrote, or only reads once with ``ack_wait=False``;
+        a ``reset`` makes the unconfirmed frames ``UNKNOWN`` and replaces the connection, and a
+        ``fin`` is left for the next round's first check. Each group of ``UNKNOWN`` frames is
+        announced once (:meth:`_unconfirm`). UDP rounds make no check.
+
         Args:
           batch: The events this round is offered.
 
@@ -400,12 +617,20 @@ class SocketTransport:
             fates = [Outcome.DROPPED] * len(batch)
             pairs = encode_round(self, batch, self._frame, sink=self._sink_name)
             lost = Lost(self)
+            stream = self._transport == "tcp"
+            if stream and self._sock is not None and _peer_state(self._sock) != "open":
+                self._reset()
+            unconfirmed: list[int] = []
             for position, message in self._sendable(pairs, context.drops(self)):
                 mark_sent(self, [batch[position]])
                 called = self._send_one(message)
                 if called.error is None:
                     fates[position] = Outcome.ACCEPTED
+                    if stream:
+                        unconfirmed.append(position)
                     continue
+                self._unconfirm(unconfirmed, fates)
+                unconfirmed = []
                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
                 mark_may_have_landed([position], called.error, called.retryable, called.reached)
                 kind = f"{_diag.type_name(called.error)} {_diag.errno_of(called.error)}".rstrip()
@@ -415,8 +640,44 @@ class SocketTransport:
                     key=kind,
                     line=raised_line("message", "SocketTransport", kind),
                 )
+            held = self._sock
+            if unconfirmed and held is not None and _end_state(held, self._ack_wait) == "reset":
+                self._unconfirm(unconfirmed, fates)
+                self._reset()
             lost.register()
         return Verdict(outcomes=tuple(fates))
+
+    def _unconfirm(self, positions: list[int], fates: list[Outcome]) -> None:
+        """Makes frames written to a connection later found closed ``UNKNOWN``, with one line.
+
+        The frames may have landed: a peer that read some before it closed is indistinguishable
+        here from one that read none, so they are counted as may-have-landed, ``ALWAYS``, and the
+        engine never sends an ``UNKNOWN`` frame again (SPEC-093 FR-001 rule 6).
+
+        Args:
+          positions: The frames written on that connection since its last check.
+          fates: The round's outcomes, updated in place.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not positions:
+            return
+        for position in positions:
+            fates[position] = Outcome.UNKNOWN
+        count = len(positions)
+        run_context().announce(
+            lambda: _diag.lost(
+                "message",
+                count,
+                "SocketTransport, written to a connection its peer closed; may have landed, "
+                "not retried",
+            ),
+            when=When.ALWAYS,
+        )
 
     def _sendable(
         self, messages: list[tuple[int, bytes]], pending: Deferral | _Drops

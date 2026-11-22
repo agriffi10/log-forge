@@ -344,6 +344,14 @@ _WRAPPER_REASON = (
 ENGINE_EXCLUSIONS: dict[str, str] = {
     "HTTPSink": "its classification is SPEC-073's, held by http_engine_findings",
     "NATSSink": "declares no predicate (SPEC-070); a publish that raised takes FR-004's outcome",
+    "KafkaSink": (
+        "declares no predicate (SPEC-094 FR-001): a refused produce() is resent only when nothing "
+        "was handed over, and a delivery report is read by DEFINITIVE_CODES"
+    ),
+    "GooglePubSubSink": (
+        "declares no predicate (SPEC-094 FR-002): a refused publish() is resent only when nothing "
+        "was published, and a future's exception is read by its definitive set"
+    ),
     "SyslogSink": "forwards deliver to its SocketTransport, which is judged instead",
     "FilteringSink": _WRAPPER_REASON,
     "TransformSink": _WRAPPER_REASON,
@@ -1402,7 +1410,8 @@ def _driver_class_calls(root: Path) -> tuple[dict[str, set[str]], list[str]]:
     return found, findings
 
 
-def test_every_driver_classes_call_is_literal_and_the_scan_finds_all_seven_drivers() -> None:
+def test_every_driver_classes_call_is_literal_and_the_scan_finds_all_nine_drivers() -> None:
+    """Seven drivers' predicates, and since SPEC-094 the two modules ``GooglePubSubSink`` reads."""
     found, findings = _driver_class_calls(_SINKS)
     assert findings == []
     assert set(found) == set(standins.TREES), "the stand-ins model every driver a sink reads"
@@ -1647,7 +1656,7 @@ def test_a_failed_count_its_entries_contradict_is_unadjudicated(
         ((0, [None, None]), [2], 0),
         ((_NO_COUNT, [None, None]), [2], 0),
         ((0, None), [2], 0),
-        ((_NO_COUNT, None), [2], 0),
+        ((_NO_COUNT, None), [2], 2),
         ((1, [None, "InternalFailure"]), [2, 1], 0),
         ((True, [None, "InternalFailure"]), [2], 2),
         (("1", [None, "InternalFailure"]), [2], 2),
@@ -1675,7 +1684,11 @@ def test_a_failed_count_its_entries_contradict_is_unadjudicated(
 def test_consistent_replies_read_as_before_and_odd_counts_are_unadjudicated(
     stream: _Stream, first: tuple[object, Any], sent: list[int], unadjudicated: int, monkeypatch
 ) -> None:
-    """FR-003 AC-11, and D6 as the plan review settled it: an explicit ``None`` is not an int."""
+    """FR-003 AC-11, and D6 as the plan review settled it: an explicit ``None`` is not an int.
+
+    ``absent-no-array``, a reply with neither a failed count nor a record array, read as delivered
+    until SPEC-093 FR-003: it names no record, so it adjudicates none of the chunk.
+    """
     count, codes = first
     sink, client = _stream_sink(
         stream, [_reply(stream, count, codes), _reply(stream, 0, [None])], monkeypatch

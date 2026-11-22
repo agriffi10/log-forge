@@ -65,10 +65,12 @@ from log_foundry.sinks.logstash import LogstashSink
 from log_foundry.sinks.loki import LokiSink
 from log_foundry.sinks.newrelic import NewRelicSink
 from log_foundry.sinks.otlp import OTLPSink
+from log_foundry.sinks.rabbitmq import RabbitMQSink
 from log_foundry.sinks.sentry import Backend, SentrySink
 from log_foundry.sinks.sns import SNSSink
 from log_foundry.sinks.splunk import SplunkHECSink
 from log_foundry.sinks.sqs import DedupIdSource, GroupIdSource, SQSSink
+from log_foundry.sinks.syslog import SyslogSink
 
 # FR-001: every public dataclass, by keyword. A positional form is planted in `rejects.py`.
 _HEALTH = Health(queued=0, dropped=0, failed_batches=0, in_span_lost=0)
@@ -322,6 +324,12 @@ def _sinks() -> list[object]:
         SQSSink("https://sqs.invalid/q", max_message_bytes=None),
         SNSSink("arn:aws:sns:us-east-1:0:t", max_message_bytes=262144),
         SNSSink("arn:aws:sns:us-east-1:0:t", max_message_bytes=None),
+        # SPEC-093 FR-001: the TCP acknowledgement wait, a bool or None, on both socket sinks.
+        SyslogSink("syslog.invalid", transport="tcp", ack_wait=False),
+        SyslogSink("syslog.invalid", transport="tcp", ack_wait=None),
+        LogstashSink(host="logstash.invalid", port=5000, ack_wait=True),
+        # SPEC-093 FR-004: publisher confirms, a bool, off by default.
+        RabbitMQSink(exchange="x", routing_key="k", connection=object(), confirm=True),
     ]
 
 

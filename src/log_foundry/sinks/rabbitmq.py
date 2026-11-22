@@ -63,9 +63,22 @@ class RabbitMQSink:
     0.7 s at the defaults, taken with no lock held, so a ``close()`` during one returns at once.
 
     It keeps **no** client buffer (SPEC-036 FR-002): ``basic_publish`` writes the frame
-    before it returns, so nothing is queued locally between emits. This sink does not enable
-    publisher confirms, so "written" is not "acknowledged" — but that is a delivery-guarantee
-    question, not a buffer a flush could empty.
+    before it returns, so nothing is queued locally between emits.
+
+    Publisher confirms are opt-in, ``confirm=True``, as Andrew chose on 2026-11-15 ("Off, opt
+    in"; SPEC-093 FR-004). With `confirm=False`, the default, a publish that returned is all this
+    sink can know: the frame was written, and nothing says a queue took it, so a message routed
+    nowhere or written to a connection that died while idle reads as delivered. With confirms on,
+    every channel the sink opens is put in confirm mode and each publish carries ``mandatory``,
+    so a publish returns only once the broker acked it, a nack or an unroutable return is
+    ``REJECTED``, and a connection lost before the confirm is ``UNKNOWN``, counted with a
+    may-have-landed line and never sent again. Before a round's first publish an owned
+    connection is asked to process its input once, so one that died while idle is replaced
+    before any frame is written. A borrowed connection is not probed before a round, so a
+    publish on one that died while idle reads as a lost confirm: probing it would run the
+    caller's own consumer callbacks on the worker's thread. A confirm costs a broker round trip
+    per message, since a blocking channel cannot pipeline them, and its wait is bounded only by
+    the connection: its heartbeat, ``blocked_connection_timeout`` or a socket error.
 
     Attributes:
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
@@ -85,6 +98,7 @@ class RabbitMQSink:
         blocked_connection_timeout: float | None = None,
         socket_timeout: float | None = None,
         stack_timeout: float | None = None,
+        confirm: bool = False,
     ) -> None:
         """Binds the sink to an exchange and connects if no connection was injected.
 
@@ -107,12 +121,18 @@ class RabbitMQSink:
             finite 10 s default.
           stack_timeout: Seconds for the full connection handshake, or ``None`` to keep the
             driver's finite 15 s default.
+          confirm: Whether to ask the broker to confirm each publish (SPEC-093 FR-004), for an
+            owned and a borrowed connection alike, since the sink opens its own channel and
+            AMQP's ``confirm.select`` is scoped to it. ``False`` by default. A ``bool`` only: any
+            other value is refused rather than read for its truth, since the argument is new and
+            ``"false"`` would otherwise turn confirms on.
 
         Returns:
           None.
 
         Raises:
-          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066).
+          TypeError: If ``max_retries`` is not an ``int`` (SPEC-066), or ``confirm`` is not a
+            ``bool`` (SPEC-093 FR-004).
           ValueError: If a bound cannot bound anything, or if ``url`` or a bound is passed
             alongside ``connection=``, which is already connected and cannot consume it —
             SPEC-043's rule that an argument no backend can use is an error rather than a silent
@@ -120,6 +140,8 @@ class RabbitMQSink:
           ImportError: If the ``amqp`` extra is not installed.
           Exception: Whatever ``pika`` raises when connecting.
         """
+        if not _diag.is_a(confirm, bool):
+            raise TypeError(f"RabbitMQSink confirm must be a bool, not {_diag.type_name(confirm)}")
         bounds = {
             "blocked_connection_timeout": blocked_connection_timeout,
             "socket_timeout": socket_timeout,
@@ -151,6 +173,8 @@ class RabbitMQSink:
         self._owns_connection = connection is None
         self._connection = connection if connection is not None else self._connect()
         self._channel: Any = None
+        self._confirming = False
+        self._confirm = confirm
         self._properties: Any = None
         self.log_foundry_counters = SinkCounters()
         self._guard = ClosedGuard(GuardMode.SERIAL)
@@ -323,6 +347,12 @@ class RabbitMQSink:
         with SPEC-069's line. A publish that raises runs :meth:`_reset`; a retryable one makes
         that message ``RETRYABLE``, any other ``REJECTED``, and the round goes on to the next.
 
+        With ``confirm=True`` (SPEC-093 FR-004) the round first probes an owned connection
+        (:meth:`_probe_owned`). A confirming publish whose connection was lost before the broker
+        answered is ``UNKNOWN``: it may have landed, so it is never sent again, and the round
+        writes one ``ALWAYS`` line, ``lost N message(s); RabbitMQSink, no confirm before the
+        connection was lost (<Type>); may have landed, not retried``.
+
         Args:
           batch: The events this round is offered.
 
@@ -342,8 +372,10 @@ class RabbitMQSink:
                     )
                 )
                 return Verdict.uniform(Outcome.REJECTED, len(batch))
+            self._probe_owned()
             fates = [Outcome.DROPPED] * len(batch)
             lost = Lost(self)
+            unknown: list[str] = []
             name = _diag.type_name(self)
             for position, body in encode_round(self, batch, self._encode, sink=name):
                 mark_sent(self, [batch[position]])
@@ -351,9 +383,13 @@ class RabbitMQSink:
                 if called.error is None:
                     fates[position] = Outcome.ACCEPTED
                     continue
+                kind = _diag.type_name(called.error)
+                if called.result == "unknown":
+                    fates[position] = Outcome.UNKNOWN
+                    unknown.append(kind)
+                    continue
                 fates[position] = Outcome.RETRYABLE if called.retryable else Outcome.REJECTED
                 mark_may_have_landed([position], called.error, called.retryable, called.reached)
-                kind = _diag.type_name(called.error)
                 lost.add(
                     [batch[position]],
                     when=When.LAST if called.retryable else When.ALWAYS,
@@ -361,6 +397,18 @@ class RabbitMQSink:
                     line=raised_line("message", "RabbitMQSink", kind),
                 )
             lost.register()
+            if unknown:
+                count = len(unknown)
+                first = unknown[0]
+                run_context().announce(
+                    lambda: _diag.lost(
+                        "message",
+                        count,
+                        f"RabbitMQSink, no confirm before the connection was lost ({first}); "
+                        "may have landed, not retried",
+                    ),
+                    when=When.ALWAYS,
+                )
         return Verdict(outcomes=tuple(fates))
 
     def _encode(self, event: dict[str, object]) -> bytes:
@@ -420,35 +468,70 @@ class RabbitMQSink:
             _safe_close(self._connection)
             self._connection = None
 
-    def _publish(self, body: bytes) -> Called[None]:
+    def _publish(self, body: bytes) -> Called[str]:
         """Publishes one message once (SPEC-074 FR-004); the engine resends it in a later round.
 
-        A raise says whether the message may have landed (SPEC-095 FR-002), by class, since pika
-        does not retry inside a publish: one of the errors that leave a publish unconfirmed —
-        ``StreamLostError``, ``ConnectionClosedByBroker``, ``AMQPHeartbeatTimeout`` or
-        ``ConnectionBlockedTimeout`` — may have, and any other pika ``AMQPError``, such as a
+        Getting the channel and publishing are guarded apart, so a failure to get a channel,
+        ``confirm_delivery`` raising among them, is read by the predicate as before. On a
+        confirming channel (SPEC-093 FR-004) the publish carries ``mandatory=True`` and returns
+        only once the broker acked it. ``UnroutableError`` and ``NackError`` are the broker's
+        answer, keeping nothing, so they are refusals that keep the channel; a resend would earn
+        the same answer. ``StreamLostError``, ``ConnectionClosedByBroker``,
+        ``AMQPHeartbeatTimeout`` and ``ConnectionBlockedTimeout`` raised while confirming mean
+        the connection went before the confirm, so the frame may have landed: the call is marked
+        ``"unknown"`` and the connection reset. Anything else goes to the predicate.
+
+        Any other raise says whether the message may have landed (SPEC-095 FR-002), by class,
+        since pika does not retry inside a publish: one of the errors that leave a publish
+        unconfirmed — ``StreamLostError``, ``ConnectionClosedByBroker``, ``AMQPHeartbeatTimeout``
+        or ``ConnectionBlockedTimeout`` — may have, and any other pika ``AMQPError``, such as a
         channel or connection it could not open, did not. An exception outside pika's tree may
-        have, unless :func:`~log_foundry.sinks._classify.may_have_landed` clears it.
+        have, unless :func:`~log_foundry.sinks._classify.may_have_landed` clears it. Both
+        guarded calls answer it, as the single guard before SPEC-093 did.
 
         Args:
           body: The serialized event.
 
         Returns:
-          The call, with its exception when it raised, after :meth:`_reset`.
+          The call, with its exception when it raised, after :meth:`_reset`; its result is
+          ``"unknown"`` for a confirming publish whose confirm was lost.
 
         Raises:
           None. This is an isolation boundary: a driver fault must never crash the worker
             (FR-011).
         """
         try:
-            self._active_channel().basic_publish(
+            channel = self._active_channel()
+        except Exception as err:
+            self._reset()
+            return Called(
+                None,
+                error=err,
+                retryable=is_retryable(self._retryable_error, err),
+                reached=self._may_have_landed(err),
+            )
+        try:
+            channel.basic_publish(
                 exchange=self._exchange,
                 routing_key=self._routing_key,
                 body=body,
                 properties=self._persistent_properties(),
+                **({"mandatory": True} if self._confirming else {}),
             )
         except Exception as err:
+            refused = driver_classes("pika.exceptions", "UnroutableError", "NackError")
+            if _diag.is_a(err, refused):
+                return Called(None, error=err, retryable=False)
             self._reset()
+            unconfirmed = driver_classes(
+                "pika.exceptions",
+                "StreamLostError",
+                "ConnectionClosedByBroker",
+                "AMQPHeartbeatTimeout",
+                "ConnectionBlockedTimeout",
+            )
+            if self._confirming and _diag.is_a(err, unconfirmed):
+                return Called("unknown", error=err)
             return Called(
                 None,
                 error=err,
@@ -490,9 +573,9 @@ class RabbitMQSink:
         ``ConnectionOpenAborted`` — and so is ``ChannelWrongStateError``, what a publish on the
         channel a dropped connection left behind raises; :meth:`_reset` has already dropped it, so
         the next attempt reconnects (``pika/exceptions.py``). ``ChannelClosedByBroker`` and
-        ``ProtocolSyntaxError`` fail at once. ``NackError`` and ``UnroutableError`` are not
-        classified: this sink enables neither ``confirm_delivery`` nor ``mandatory``, so pika
-        cannot raise them here.
+        ``ProtocolSyntaxError`` fail at once. ``NackError`` and ``UnroutableError`` never reach
+        this predicate: pika raises them only on a confirming channel (``confirm=True``), and
+        :meth:`_publish` reads each as a broker refusal, ``REJECTED``, before asking it.
 
         Args:
           err: The exception the attempt raised.
@@ -524,8 +607,42 @@ class RabbitMQSink:
         )
         return _diag.is_a(err, retried)
 
+    def _probe_owned(self) -> None:
+        """Asks an owned connection to process its input once, so a dead one is replaced first.
+
+        Only with ``confirm=True`` and an owned connection (SPEC-093 FR-004). A connection that
+        died while idle is found here, before any frame is written, so its round's events stay
+        ``RETRYABLE`` through a reconnect rather than reading as a lost confirm. The method is
+        probed by name, and one that raises resets the connection. A borrowed connection is never
+        probed: ``process_data_events`` dispatches every channel's pending consumer callbacks,
+        which would run the caller's own code on the worker's thread.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        if not (self._confirm and self._owns_connection and self._connection is not None):
+            return
+        probe = getattr(self._connection, "process_data_events", None)
+        if not callable(probe):
+            return
+        try:
+            probe(time_limit=0)
+        except Exception:
+            self._reset()
+
     def _active_channel(self) -> Any:
         """Returns the open channel, reconnecting and reopening as needed.
+
+        With ``confirm=True`` each channel it opens is put in confirm mode before its first
+        publish (SPEC-093 FR-004). ``confirm_delivery`` is probed by name, as ``SentrySink`` probes
+        ``flush``, so a stand-in channel without it publishes unconfirmed, as in 1.x; one that
+        raises closes the channel it was called on before the exception goes on, so none leaks.
 
         Args:
           None.
@@ -539,7 +656,16 @@ class RabbitMQSink:
         if self._connection is None:
             self._connection = self._connect()
         if self._channel is None:
-            self._channel = self._connection.channel()
+            channel = self._connection.channel()
+            confirm = getattr(channel, "confirm_delivery", None) if self._confirm else None
+            if callable(confirm):
+                try:
+                    confirm()
+                except BaseException:
+                    _safe_close(channel)
+                    raise
+            self._confirming = callable(confirm)
+            self._channel = channel
         return self._channel
 
     def _reset(self) -> None:

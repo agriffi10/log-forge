@@ -8,6 +8,11 @@ a ``Deferral`` whose ``with`` encloses the hand-off loop, the reap and the total
 
 Every case runs for both sinks; the worker-driven ones use the real
 ``Worker(sink, batch_size=len(batch), max_retries=3)``.
+
+SPEC-094 put both sinks on the delivery engine, where a refused hand-off beside one that worked is
+a ``DROPPED`` outcome counted only when the run settles, and a round that handed nothing over is
+resent by the engine. The rule this file holds, no refusal counted for a batch that never settled,
+is the same; the cases whose shape the engine changed say so.
 """
 
 from __future__ import annotations
@@ -125,9 +130,11 @@ def test_a_batch_refused_on_every_attempt_counts_no_refusal(name: str, capsys) -
     assert client.calls == 12, "the premise: three hand-offs refused on each of four attempts"
     assert sink.rejected == 0
     assert sink.losses().dropped == 0
-    assert _refusal_lines(err, name) == [], "no refusal line from an emit that raised"
-    assert "lost 3 event(s); batch abandoned after 4 emit attempts" in err, (
-        "the abandon line is the only count"
+    unit = "message" if name == "kafka" else "event"
+    marker = "KafkaSink produce, " if name == "kafka" else "GooglePubSubSink publish, "
+    line = f"log-foundry: lost 3 {unit}(s); {marker}4 attempt(s), {type(error).__name__}"
+    assert [x for x in err.splitlines() if marker in x] == [line], (
+        "the engine's one line for the run's last round, never one per refused attempt"
     )
 
 
@@ -179,6 +186,9 @@ def test_two_refusals_each_name_their_own_exception_type(name: str, capsys) -> N
 def test_a_refusal_followed_by_a_raise_counts_nothing(name: str, capsys) -> None:
     """A raise elsewhere in the same emit — Kafka's ``poll``, Pub/Sub's reap — discards the refusal.
 
+    On the engine, ``poll``'s ``RuntimeError`` fails the round, which the inline adapter raises as
+    ``SinkDeliveryError``; the refusal decided before it is still never counted.
+
     Pub/Sub's raise is the real ``_reap`` → ``_resolve`` path: the accepted publish's future has
     settled to a ``KeyboardInterrupt``, which ``_resolve`` does not catch.
     """
@@ -191,7 +201,7 @@ def test_a_refusal_followed_by_a_raise_counts_nothing(name: str, capsys) -> None
 
         client: Any = PollRaises(lambda call: error if call == 1 else None)
         sink: Any = KafkaSink("logs", producer=client)
-        raised: type[BaseException] = RuntimeError
+        raised: type[BaseException] = SinkDeliveryError
     else:
         client = _RefusingPublisher(
             lambda call: error if call == 1 else None,
@@ -222,8 +232,12 @@ def test_a_closed_sink_raises_and_counts_nothing(name: str, capsys) -> None:
     assert _refusal_lines(capsys.readouterr().err, name) == []
 
 
-def test_the_kafka_delivery_callback_counts_failed_before_emit_returns() -> None:
-    """``failed`` stays immediate: observed from inside ``poll``, where a deferred count reads 0."""
+def test_a_kafka_delivery_report_is_counted_only_when_its_round_settles() -> None:
+    """SPEC-094 FR-001 reverses SPEC-059's immediate ``failed``: nothing counts before the verdict.
+
+    Observed from inside ``poll``, which runs within the round, the report's ``failed`` reads 0;
+    once ``emit`` returns, the one ``UNKNOWN`` message is counted, once.
+    """
     seen: list[int] = []
 
     class Observing(_RefusingProducer):
@@ -234,12 +248,16 @@ def test_the_kafka_delivery_callback_counts_failed_before_emit_returns() -> None
 
     sink.emit([{"i": 0}])
 
-    assert seen == [1], "the callback's failed moved inside emit, before it returned"
+    assert seen == [0], "the report counted nothing inside the round"
     assert sink.losses() == SinkLosses(dropped=0, failed=1)
 
 
-def test_the_pubsub_orphaned_future_counts_failed_before_emit_returns() -> None:
-    """``failed`` for a future a mid-batch close orphaned moves inside emit, as it happens."""
+def test_a_pubsub_orphaned_publish_is_counted_only_when_its_round_settles() -> None:
+    """SPEC-094 FR-002 reverses SPEC-059's immediate ``failed``: the orphan counts at the verdict.
+
+    A close lands after the first publish: both publishes are orphaned, ``UNKNOWN`` in the round,
+    and ``failed`` reads 0 inside the round, observed at the second publish, and 2 after it.
+    """
     seen: list[int] = []
 
     class Closing(_RefusingPublisher):
@@ -257,29 +275,8 @@ def test_the_pubsub_orphaned_future_counts_failed_before_emit_returns() -> None:
 
     sink.emit([{"i": 0}, {"i": 1}])
 
-    assert seen == [1], "the first orphan was counted before the second publish, inside emit"
+    assert seen == [0], "nothing was counted inside the round"
     assert sink.losses() == SinkLosses(dropped=0, failed=2)
-
-
-def test_the_pubsub_reap_counts_failed_before_emit_returns() -> None:
-    """``failed`` from the reap moves inside emit: observed after the real ``_reap`` returns."""
-    sink = GooglePubSubSink(
-        "projects/p/topics/t",
-        client=_RefusingPublisher(_never, lambda _i: PollableFuture(RuntimeError("nack"))),
-    )
-    real = sink._reap
-    seen: list[int] = []
-
-    def observed() -> None:
-        real()
-        seen.append(sink.failed)
-
-    sink._reap = observed  # type: ignore[method-assign]
-
-    sink.emit([{"i": 0}])
-
-    assert seen == [1], "the reap's failed moved inside emit, before it returned"
-    assert sink.losses() == SinkLosses(dropped=0, failed=1)
 
 
 @pytest.mark.parametrize("name", _SINKS)
@@ -305,5 +302,10 @@ def test_a_fanout_absorbs_the_refused_batch(name: str) -> None:
 
     multi.emit(_three())
 
-    assert child.losses() == SinkLosses(dropped=0, failed=0)
-    assert multi.losses() == SinkLosses(dropped=0, failed=3)
+    child_failed = 3
+    assert child.losses() == SinkLosses(dropped=0, failed=child_failed), (
+        "an engine sink's inline adapter counts a failed run's events before it raises"
+    )
+    assert multi.losses() == SinkLosses(dropped=0, failed=3 + child_failed), (
+        "the fan-out's own count of the raise, beside its child's, as for every engine child"
+    )

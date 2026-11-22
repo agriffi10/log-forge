@@ -1,0 +1,477 @@
+Output of spec093_094_build_mutants.py --docker, run on 2026-11-20 from the branch at a44aa37c
+(macOS, Python 3.13.1; Linux rows in Docker python:3.12-slim, Python 3.12.16), each tree a
+`git archive` export under one temporary root, written `$T` below. The first and last lines
+are `uptime`: other sessions shared the machine.
+
+17:15  up 10 days, 52 mins, 1 user, load averages: 18.01 28.66 35.70
+SPEC-093/094 build results at HEAD a44aa37c, Python 3.13.1, darwin
+
+== re-plant 093-end-check-counts-fin (src/log_foundry/sinks/_socket.py); imports $T/093-end-check-counts-fin/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[half-close-3-rounds-ack-wait]
+    1 failed, 37 passed, 9 skipped in 2.68s
+      exit 1
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[half-close-3-rounds-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_a_peer_that_received_everything_draws_no_count_and_no_line[half-close-3-rounds-no-ack-wait]
+    2 failed, 45 passed, 1 warning in 5.03s
+
+== re-plant 093-unacked-answers-0 (src/log_foundry/sinks/_socket.py); imports $T/093-unacked-answers-0/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-5-frames-ack-wait]
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_waits_until_every_byte_is_acknowledged
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_returns_on_a_reset_without_waiting_further
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_gives_up_at_its_bound
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_does_not_wait_where_the_queue_cannot_be_read
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-logstash]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-logstash]
+    10 failed, 28 passed, 9 skipped in 2.46s
+      exit 1
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_waits_until_every_byte_is_acknowledged
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_returns_on_a_reset_without_waiting_further
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_gives_up_at_its_bound
+    FAILED tests/test_socket_ack_check.py::test_the_end_check_does_not_wait_where_the_queue_cannot_be_read
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[default-logstash]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-syslog]
+    FAILED tests/test_socket_ack_check.py::test_both_sinks_wait_at_the_end_check_by_default_and_when_told[true-logstash]
+    8 failed, 39 passed, 1 warning in 4.93s
+
+== re-plant 093-peer-state-reads-no-so-error (src/log_foundry/sinks/_socket.py); imports $T/093-peer-state-reads-no-so-error/src/log_foundry/__init__.py
+  macOS pytest:
+    38 passed, 9 skipped in 2.56s
+      exit 0
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-no-ack-wait]
+    2 failed, 45 passed, 1 warning in 5.31s
+
+== re-plant 093-reset-errnos-emptied (src/log_foundry/sinks/_socket.py); imports $T/093-reset-errnos-emptied/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-5-frames-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-ack-wait]
+    3 failed, 35 passed, 9 skipped in 3.16s
+      exit 1
+  Linux pytest:
+    /w/src/log_foundry/__init__.py
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[fin-after-pre-1-frame-no-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-ack-wait]
+    FAILED tests/test_socket_close_corpus.py::test_frames_a_closed_peer_discarded_are_every_one_counted_on_one_line[rst-before-end-unread-no-ack-wait]
+    4 failed, 43 passed, 1 warning in 5.30s
+
+== re-plant 093-rule-4-removed (src/log_foundry/sinks/_socket.py); imports $T/093-rule-4-removed/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_conformance.py::test_row[SyslogSink[tcp]-peer-closed] - Ass...
+    FAILED tests/test_conformance.py::test_row[LogstashSink[tcp]-peer-closed] - A...
+    2 failed, 208 passed, 58 xfailed in 0.77s
+      exit 1
+
+== re-plant 093-liveness-probe-removed (src/log_foundry/sinks/rabbitmq.py); imports $T/093-liveness-probe-removed/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_conformance.py::test_row[RabbitMQSink[confirmed]-peer-closed]
+    1 failed, 209 passed, 58 xfailed in 0.77s
+      exit 1
+
+== re-plant 093-confirm-delivery-never-called (src/log_foundry/sinks/rabbitmq.py); imports $T/093-confirm-delivery-never-called/src/log_foundry/__init__.py
+  macOS pytest:
+                    failed = self.failed_batches
+                                    self.failed_batches - failed,
+                    failed = self.failed_batches
+                                    self.failed_batches - failed,
+    FAILED tests/test_conformance.py::test_row[RabbitMQSink[confirmed]-reply-lost]
+    FAILED tests/test_conformance.py::test_row[RabbitMQSink[confirmed]-taken-then-raised]
+    FAILED tests/test_conformance.py::test_row[RabbitMQSink[confirmed-borrowed]-reply-lost]
+    FAILED tests/test_conformance.py::test_row[RabbitMQSink[confirmed-borrowed]-taken-then-raised]
+    FAILED tests/test_conformance.py::test_row[RabbitMQSink[confirmed-borrowed]-peer-closed]
+    5 failed, 205 passed, 58 xfailed in 0.79s
+      exit 1
+
+== re-plant 094-kafka-one-blocking-flush (src/log_foundry/sinks/kafka.py); imports $T/094-kafka-one-blocking-flush/src/log_foundry/__init__.py
+  probe spec094_stuck_partition.py:
+    emit 0: 0.51s losses=SinkLosses(dropped=0, failed=1)
+    emit 1: 0.50s losses=SinkLosses(dropped=0, failed=1)
+    emit 2: 0.50s losses=SinkLosses(dropped=0, failed=1)
+    emit 3: 0.50s losses=SinkLosses(dropped=0, failed=1)
+    log-foundry: lost 1 message(s); KafkaSink, no definitive delivery report within 0.5s; may have landed, not retried
+
+== re-plant 094-kafka-first-slice-at-start (src/log_foundry/sinks/kafka.py); imports $T/094-kafka-first-slice-at-start/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_kafka_report_wait.py::test_under_a_set_stop_the_first_slice_still_takes_every_report_inside_it
+    1 failed, 15 passed in 3.07s
+      exit 1
+  probe spec094_first_slice_and_pause.py:
+    kafka stop set, reports by 34 ms: wall 10.9 ms, UNKNOWN 30 of 40
+    kafka flush returns at once, stop=False: wall 0.510 s, cpu 0.001 s, flush calls 10, ['UNKNOWN']
+    kafka flush returns at once, stop=True: wall 0.000 s, cpu 0.000 s, flush calls 1, ['UNKNOWN']
+    pubsub stop set, futures by 30 ms: wall 93.3 ms, UNKNOWN 0 of 1000
+    pubsub result() raises at once, stop=False: wall 0.501 s, cpu 0.001 s, result calls 10, ['UNKNOWN']
+    pubsub result() raises at once, stop=True: wall 0.054 s, cpu 0.000 s, result calls 2, ['UNKNOWN']
+    pubsub future done with TimeoutError, overflow_timeout 5: wall 0.000 s, ['UNKNOWN']
+
+== re-plant 094-kafka-no-pause (src/log_foundry/sinks/kafka.py); imports $T/094-kafka-no-pause/src/log_foundry/__init__.py
+  probe spec094_first_slice_and_pause.py:
+    kafka stop set, reports by 34 ms: wall 35.2 ms, UNKNOWN 0 of 40
+    kafka flush returns at once, stop=False: wall 0.500 s, cpu 0.500 s, flush calls 1607905, ['UNKNOWN']
+    kafka flush returns at once, stop=True: wall 0.050 s, cpu 0.050 s, flush calls 157453, ['UNKNOWN']
+    pubsub stop set, futures by 30 ms: wall 63.4 ms, UNKNOWN 0 of 1000
+    pubsub result() raises at once, stop=False: wall 0.508 s, cpu 0.001 s, result calls 10, ['UNKNOWN']
+    pubsub result() raises at once, stop=True: wall 0.059 s, cpu 0.000 s, result calls 2, ['UNKNOWN']
+    pubsub future done with TimeoutError, overflow_timeout 5: wall 0.000 s, ['UNKNOWN']
+
+== re-plant 094-kafka-pause-on-returns-the-set-stop (src/log_foundry/sinks/kafka.py); imports $T/094-kafka-pause-on-returns-the-set-stop/src/log_foundry/__init__.py
+  probe spec094_first_slice_and_pause.py:
+    kafka stop set, reports by 34 ms: wall 35.2 ms, UNKNOWN 0 of 40
+    kafka flush returns at once, stop=False: wall 0.501 s, cpu 0.000 s, flush calls 10, ['UNKNOWN']
+    kafka flush returns at once, stop=True: wall 0.050 s, cpu 0.050 s, flush calls 96566, ['UNKNOWN']
+    pubsub stop set, futures by 30 ms: wall 68.4 ms, UNKNOWN 0 of 1000
+    pubsub result() raises at once, stop=False: wall 0.503 s, cpu 0.000 s, result calls 10, ['UNKNOWN']
+    pubsub result() raises at once, stop=True: wall 0.054 s, cpu 0.000 s, result calls 2, ['UNKNOWN']
+    pubsub future done with TimeoutError, overflow_timeout 5: wall 0.000 s, ['UNKNOWN']
+
+== re-plant 094-pubsub-first-slice-at-start (src/log_foundry/sinks/pubsub.py); imports $T/094-pubsub-first-slice-at-start/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_pubsub_round_wait.py::test_under_a_set_stop_the_first_slice_takes_every_future_resolving_inside_it
+    1 failed, 10 passed in 1.46s
+      exit 1
+  probe spec094_first_slice_and_pause.py:
+    kafka stop set, reports by 34 ms: wall 34.8 ms, UNKNOWN 0 of 40
+    kafka flush returns at once, stop=False: wall 0.510 s, cpu 0.000 s, flush calls 10, ['UNKNOWN']
+    kafka flush returns at once, stop=True: wall 0.060 s, cpu 0.000 s, flush calls 2, ['UNKNOWN']
+    pubsub stop set, futures by 30 ms: wall 33.2 ms, UNKNOWN 672 of 1000
+    pubsub result() raises at once, stop=False: wall 0.509 s, cpu 0.027 s, result calls 10, ['UNKNOWN']
+    pubsub result() raises at once, stop=True: wall 0.000 s, cpu 0.000 s, result calls 1, ['UNKNOWN']
+    pubsub future done with TimeoutError, overflow_timeout 5: wall 0.000 s, ['UNKNOWN']
+
+== re-plant 094-pubsub-no-pause (src/log_foundry/sinks/pubsub.py); imports $T/094-pubsub-no-pause/src/log_foundry/__init__.py
+  probe spec094_first_slice_and_pause.py:
+    kafka stop set, reports by 34 ms: wall 35.6 ms, UNKNOWN 0 of 40
+    kafka flush returns at once, stop=False: wall 0.507 s, cpu 0.001 s, flush calls 10, ['UNKNOWN']
+    kafka flush returns at once, stop=True: wall 0.060 s, cpu 0.000 s, flush calls 2, ['UNKNOWN']
+    pubsub stop set, futures by 30 ms: wall 90.1 ms, UNKNOWN 0 of 1000
+    pubsub result() raises at once, stop=False: wall 0.500 s, cpu 0.500 s, result calls 1941550, ['UNKNOWN']
+    pubsub result() raises at once, stop=True: wall 0.050 s, cpu 0.050 s, result calls 201775, ['UNKNOWN']
+    pubsub future done with TimeoutError, overflow_timeout 5: wall 0.000 s, ['UNKNOWN']
+
+== re-plant 094-kafka-wait-removed (src/log_foundry/sinks/kafka.py); imports $T/094-kafka-wait-removed/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_conformance.py::test_row[KafkaSink-clean] - AssertionError:...
+    FAILED tests/test_conformance.py::test_row[KafkaSink-refused-once] - Assertio...
+    FAILED tests/test_conformance.py::test_row[KafkaSink-never-acknowledged] - As...
+    3 failed, 207 passed, 58 xfailed in 0.77s
+      exit 1
+
+== re-plant 094-pubsub-double-raises-local-permission-denied (tests/conformance_doubles.py); imports $T/094-pubsub-double-raises-local-permission-denied/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_conformance.py::test_row[GooglePubSubSink-never-acknowledged]
+    1 failed, 209 passed, 58 xfailed in 0.77s
+      exit 1
+
+== verdict comparisons
+  SPEC-093 FR-005 criterion 2, the settlement corpus:
+    log_foundry from $T/main/src/log_foundry/__init__.py; corpus from $T/settlement/tests/conformance_backend.py
+    log_foundry from $T/settlement/src/log_foundry/__init__.py; corpus from $T/settlement/tests/conformance_backend.py
+  main src -> settlement src: 268 shared rows, 22 moved
+      ElasticsearchSink-no-verdict-shape: silent-loss -> green
+      FirehoseSink-no-verdict-shape: silent-loss -> green
+      KinesisSink-no-verdict-shape: silent-loss -> green
+      LogstashSink[tcp]-peer-closed: silent-loss -> green
+      OpenSearchSink-no-verdict-shape: silent-loss -> green
+      RabbitMQSink[confirmed-borrowed]-clean: error:TypeError -> green
+      RabbitMQSink[confirmed-borrowed]-peer-closed: error:TypeError -> ambiguous-when-knowable
+      RabbitMQSink[confirmed-borrowed]-refused-always: error:TypeError -> green
+      RabbitMQSink[confirmed-borrowed]-refused-once: error:TypeError -> green
+      RabbitMQSink[confirmed-borrowed]-reply-lost: error:TypeError -> green
+      RabbitMQSink[confirmed-borrowed]-taken-then-raised: error:TypeError -> green
+      RabbitMQSink[confirmed]-clean: error:TypeError -> green
+      RabbitMQSink[confirmed]-peer-closed: error:TypeError -> green
+      RabbitMQSink[confirmed]-refused-always: error:TypeError -> green
+      RabbitMQSink[confirmed]-refused-once: error:TypeError -> green
+      RabbitMQSink[confirmed]-reply-lost: error:TypeError -> green
+      RabbitMQSink[confirmed]-taken-then-raised: error:TypeError -> green
+      SNSSink-no-verdict-shape: silent-loss -> green
+      SQSSink[fifo]-no-verdict-shape: silent-loss -> green
+      SQSSink[standard]-no-verdict-shape: silent-loss -> green
+      SentrySink[sdk]-never-acknowledged: silent-loss -> green
+      SyslogSink[tcp]-peer-closed: silent-loss -> green
+  SPEC-093 FR-005 criterion 2, SPEC-092's delivered corpus:
+    log_foundry from $T/main/src/log_foundry/__init__.py; corpus from $T/main/tests/conformance_backend.py
+    log_foundry from $T/settlement/src/log_foundry/__init__.py; corpus from $T/main/tests/conformance_backend.py
+  main src -> settlement src: 256 shared rows, 10 moved
+      ElasticsearchSink-no-verdict-shape: silent-loss -> green
+      FirehoseSink-no-verdict-shape: silent-loss -> green
+      KinesisSink-no-verdict-shape: silent-loss -> green
+      LogstashSink[tcp]-peer-closed: silent-loss -> green
+      OpenSearchSink-no-verdict-shape: silent-loss -> green
+      SNSSink-no-verdict-shape: silent-loss -> green
+      SQSSink[fifo]-no-verdict-shape: silent-loss -> green
+      SQSSink[standard]-no-verdict-shape: silent-loss -> green
+      SentrySink[sdk]-never-acknowledged: silent-loss -> green
+      SyslogSink[tcp]-peer-closed: silent-loss -> green
+  SPEC-094 FR-003 criterion 2, HEAD's corpus:
+    log_foundry from $T/settlement/src/log_foundry/__init__.py; corpus from $T/head/tests/conformance_backend.py
+    log_foundry from $T/head/src/log_foundry/__init__.py; corpus from $T/head/tests/conformance_backend.py
+  settlement src -> HEAD src: 268 shared rows, 4 moved
+      GooglePubSubSink-never-acknowledged: partition+silent-loss -> green
+      GooglePubSubSink-report-indefinite: partition+lost-but-held -> green
+      KafkaSink-never-acknowledged: partition+silent-loss -> green
+      KafkaSink-report-indefinite: partition+lost-but-held -> green
+
+== probes against HEAD; imports $T/head/src/log_foundry/__init__.py
+  probe_socket.py:
+    python 3.13.1 darwin
+    SyslogSink tcp, peer closes (fin)            batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    LogstashSink tcp, peer closes (fin)          batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    SyslogSink tcp, peer closes (rst)            batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    LogstashSink tcp, peer closes (rst)          batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    SyslogSink udp (default), no listener        sent=2x50 received=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+  probe_misc.py:
+    1. PostgresSink, commit applied then connection lost once
+       rows_in_table=50 unique=25 duplicate_rows=25 raised=None losses: failed=0 dropped=0 stderr_lines=0
+    2. PostgresSink, injected autocommit connection, chunk 2 of 3 fails once (chunk_size=10)
+       rows_in_table=35 unique=25 duplicate_rows=10 raised=None losses: failed=0 dropped=0 stderr_lines=0
+    3. KafkaSink via worker, broker never acknowledges (25 events)
+       landed=0 flush()=True reason=None failed_batches=0 health.sink=SinkLosses(dropped=0, failed=25) stderr_lines=1
+    4. KafkaSink, local queue full after 10 of 25
+       landed=10 raised=None losses: failed=0 dropped=15 stderr_lines=15 (never retried)
+    5. SentrySink sdk backend, the SDK keeps 1 in 5
+       sdk_kept=5/25 sink.sent=5 raised=None losses: failed=0 dropped=20 stderr_lines=1
+    6. HTTPSink, server stored the body then closed with no status line, once
+       requests=2 stored=50 unique=25 duplicate_copies=25 raised=None losses: failed=0 dropped=0 stderr_lines=0
+    7. SQLiteSink, injected autocommit connection, row 17 refused by the caller's CHECK
+       attempts_raised=4 rows=68 unique=17 max_copies=4 losses: failed=100 dropped=0 stderr_lines=4
+    8. RabbitMQSink signature: (self, *, exchange: 'str', routing_key: 'str', connection: 'Any' = None, url: 'str | None' = None, max_retries: 'int' = 3, blocked_connection_timeout: 'float | None' = None, socket_timeout: 'float | None' = None, stack_timeout: 'float | None' = None, confirm: 'bool' = False) -> 'None'
+  probe_sqs.py:
+    == A transient per-entry Failed on first call of each chunk
+       calls=4 queue_holds=25 unique=25 duplicate_copies=0 missing=0
+       ledger: failed=0 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=0
+    
+    == B persistent per-entry Failed (2 events)
+       calls=6 queue_holds=23 unique=23 duplicate_copies=0 missing=2
+       ledger: failed=2 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=1
+         | log-foundry: lost 2 message(s); SQSSink, still failing after 4 attempt(s); abandoned
+    
+    == C SenderFault=True (2 events)
+       calls=3 queue_holds=23 unique=23 duplicate_copies=0 missing=2
+       ledger: failed=2 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=2
+         | log-foundry: lost 1 message(s); SQSSink, rejected as invalid (first code: InvalidMessageContents); not retried
+         | log-foundry: lost 1 message(s); SQSSink, rejected as invalid (first code: InvalidMessageContents); not retried
+    
+    == D response lost once after the queue accepted (standard queue)
+       calls=4 queue_holds=35 unique=25 duplicate_copies=10 missing=0
+       ledger: failed=0 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=0
+    
+    == D' same, FIFO queue with dedup honoured by the fake
+       calls=5 queue_holds=25 unique=25 duplicate_copies=0 missing=0
+       ledger: failed=0 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=0
+    
+    == E response lost on every call (standard queue)
+       calls=12 queue_holds=100 unique=25 duplicate_copies=75 missing=0
+       ledger: failed=25 dropped=0 raised='delivered none of 25 event(s): rejected 0, unresolved 25, raised 0 after 4 delivery round(s) to SQSSink'
+       uncounted_missing=0  stderr_lines=1
+         | log-foundry: lost 25 message(s); SQSSink, 4 attempt(s), TimeoutError
+    
+    == F1 reply None, queue stored all
+       calls=3 queue_holds=25 unique=25 duplicate_copies=0 missing=0
+       ledger: failed=25 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=3
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 5 message(s); SQSSink could not adjudicate a send_message_batch reply (5 entry(ies) sent); may have landed, not retried
+    
+    == F2 reply Failed='oops', queue stored all
+       calls=3 queue_holds=25 unique=25 duplicate_copies=0 missing=0
+       ledger: failed=25 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=3
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 5 message(s); SQSSink could not adjudicate a send_message_batch reply (5 entry(ies) sent); may have landed, not retried
+    
+    == F3 reply Failed names unknown Id, queue stored all
+       calls=3 queue_holds=25 unique=25 duplicate_copies=0 missing=0
+       ledger: failed=25 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=3
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 5 message(s); SQSSink could not adjudicate a send_message_batch reply (5 entry(ies) sent); may have landed, not retried
+    
+    == G1 reply lists 7 of 10 in Successful and no Failed; queue stored those 7
+       calls=3 queue_holds=19 unique=19 duplicate_copies=0 missing=6
+       ledger: failed=6 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=2
+         | log-foundry: lost 3 message(s); SQSSink, a send_message_batch reply named neither success nor failure for 3 entry(ies); may have landed, not retried
+         | log-foundry: lost 3 message(s); SQSSink, a send_message_batch reply named neither success nor failure for 3 entry(ies); may have landed, not retried
+    
+    == G2 reply {} and the queue stored nothing
+       calls=3 queue_holds=0 unique=0 duplicate_copies=0 missing=25
+       ledger: failed=25 dropped=0 raised=None
+       uncounted_missing=0  stderr_lines=3
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 10 message(s); SQSSink could not adjudicate a send_message_batch reply (10 entry(ies) sent); may have landed, not retried
+         | log-foundry: lost 5 message(s); SQSSink could not adjudicate a send_message_batch reply (5 entry(ies) sent); may have landed, not retried
+    
+    == H every call raises ConnectionError
+       calls=12 queue_holds=0 unique=0 duplicate_copies=0 missing=25
+       ledger: failed=25 dropped=0 raised='delivered none of 25 event(s): rejected 0, unresolved 25, raised 0 after 4 delivery round(s) to SQSSink'
+       uncounted_missing=0  stderr_lines=1
+         | log-foundry: lost 25 message(s); SQSSink, 4 attempt(s), ConnectionError
+  probe_aws_more.py:
+    1. SQSSink via worker, every reply lost after acceptance: events=10 calls=16 queue_holds=160 copies_each=[16] elapsed=3.0s
+       flush()=False reason='abandoned' failed_batches=1 sink=SinkLosses(dropped=0, failed=10)
+       | log-foundry: lost 10 message(s); SQSSink, 16 attempt(s), TimeoutError
+       | log-foundry: lost 10 event(s); batch abandoned after 4 emit attempts
+    2. KinesisSink, reply {} and nothing stored: stored=0/25 raised=None losses: failed=25 dropped=0 stderr_lines=1
+    3. SNSSink, Successful names 7 of each 10 and no Failed: stored=19/25 raised=None losses: failed=6 dropped=0 stderr_lines=2
+  spec094_stuck_partition.py:
+    emit 0: 0.51s losses=SinkLosses(dropped=0, failed=1)
+    emit 1: 0.06s losses=SinkLosses(dropped=0, failed=1)
+    emit 2: 0.05s losses=SinkLosses(dropped=0, failed=1)
+    emit 3: 0.06s losses=SinkLosses(dropped=0, failed=1)
+    log-foundry: lost 1 message(s); KafkaSink, no definitive delivery report within 0.5s; may have landed, not retried
+  spec094_first_slice_and_pause.py:
+    kafka stop set, reports by 34 ms: wall 35.2 ms, UNKNOWN 0 of 40
+    kafka flush returns at once, stop=False: wall 0.510 s, cpu 0.001 s, flush calls 10, ['UNKNOWN']
+    kafka flush returns at once, stop=True: wall 0.058 s, cpu 0.000 s, flush calls 2, ['UNKNOWN']
+    pubsub stop set, futures by 30 ms: wall 95.0 ms, UNKNOWN 0 of 1000
+    pubsub result() raises at once, stop=False: wall 0.501 s, cpu 0.001 s, result calls 11, ['UNKNOWN']
+    pubsub result() raises at once, stop=True: wall 0.059 s, cpu 0.000 s, result calls 2, ['UNKNOWN']
+    pubsub future done with TimeoutError, overflow_timeout 5: wall 0.000 s, ['UNKNOWN']
+  probe_socket.py in python:3.12-slim:
+    /w/src/log_foundry/__init__.py
+    python 3.12.16 linux
+    SyslogSink tcp, peer closes (fin)            batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    LogstashSink tcp, peer closes (fin)          batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    SyslogSink tcp, peer closes (rst)            batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    LogstashSink tcp, peer closes (rst)          batch1 received=10/10  batch2 received=50/50 (copies=50)  missing=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+    SyslogSink udp (default), no listener        sent=2x50 received=0  raised=None  losses: failed=0 dropped=0  stderr_lines=0
+runner exit 0
+17:17  up 10 days, 53 mins, 1 user, load averages: 5.97 21.70 32.26
+
+== integration, run by hand on 2026-11-20 at 1b562822 against tests/integration/docker-compose.yml
+   (started for this run under the default project name, taken down with `down -v` after),
+   with `poetry install --with dev --all-extras`
+
+  LOG_FOUNDRY_INTEGRATION=1 pytest tests/integration -n 0:
+    38 passed, 2 warnings in 25.09s, exit 0; among them, unskipped:
+      test_rabbitmq.py::test_a_confirmed_sink_delivers_a_batch
+      test_rabbitmq.py::test_an_unroutable_confirmed_publish_is_rejected_and_counted
+      test_kafka.py::test_emit_returns_once_the_rounds_messages_are_reported
+      test_kafka.py::test_a_long_linger_does_not_leave_a_rounds_messages_unknown
+      test_pubsub.py::test_emit_returns_once_every_publish_is_resolved
+
+  SPEC-093 FR-004's re-plant, in an export of 1b562822 with
+  `**({"mandatory": True} if self._confirming else {}),` removed from RabbitMQSink._publish,
+  log_foundry from $T/replant-mandatory/src/log_foundry/__init__.py, against the same broker:
+    FAILED tests/integration/test_rabbitmq.py::test_an_unroutable_confirmed_publish_is_rejected_and_counted
+    E       Failed: DID NOT RAISE SinkDeliveryError
+    1 failed, 2 passed in 0.42s
+
+  LOG_FOUNDRY_EXTRAS=1 pytest tests (the extras leg):
+    12744 passed, 18 skipped, 62 xfailed in 149.52s, exit 0
+
+== the first diff review's re-plants, run with --only at 3b074c92
+
+18:15  up 10 days,  1:51, 1 user, load averages: 123.29 53.55 43.47
+SPEC-093/094 build results at HEAD 3b074c92, Python 3.13.1, darwin
+
+== re-plant review-kafka-empty-reading-type-guard-removed (src/log_foundry/sinks/kafka.py); imports $T/review-kafka-empty-reading-type-guard-removed/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_kafka_report_wait.py::test_only_the_int_zero_is_an_empty_reading[false]
+    FAILED tests/test_kafka_report_wait.py::test_only_the_int_zero_is_an_empty_reading[float-zero]
+    2 failed, 1 passed in 0.57s
+      exit 1
+
+== re-plant review-kafka-empty-reading-bool-exclusion-removed (src/log_foundry/sinks/kafka.py); imports $T/review-kafka-empty-reading-bool-exclusion-removed/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_kafka_report_wait.py::test_only_the_int_zero_is_an_empty_reading[false]
+    1 failed, 2 passed in 0.54s
+      exit 1
+
+== re-plant review-kafka-one-blocking-flush-against-the-test (src/log_foundry/sinks/kafka.py); imports $T/review-kafka-one-blocking-flush-against-the-test/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_kafka_report_wait.py::test_one_stuck_message_costs_later_rounds_one_slice_not_the_timeout
+    1 failed in 4.26s
+      exit 1
+runner exit 0
+18:15  up 10 days,  1:51, 1 user, load averages: 102.51 52.39 43.23
+
+== the second diff review's re-plant, run with --only at 9da80820
+   (the table keeps the parent's lock object; the child's 5 s bound expires, so it deadlocked)
+
+10:06  up 11 days, 17:43, 1 user, load averages: 19.98 24.41 14.89
+SPEC-093/094 build results at HEAD 9da80820, Python 3.13.1, darwin
+
+== re-plant review-kafka-table-captures-the-counters-lock (src/log_foundry/sinks/kafka.py); imports $T/review-kafka-table-captures-the-counters-lock/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_kafka_report_wait.py::test_a_late_report_served_in_a_forked_child_never_takes_the_parents_lock
+    1 failed, 1 warning in 5.35s
+      exit 1
+runner exit 0
+10:07  up 11 days, 17:43, 1 user, load averages: 17.13 23.65 14.73
+
+== Andrew's "Wait at close (Recommended)" re-plant, run with --only at cbfa238d
+   (close() back to setting the flag only; read in the tree, the exit test fails on
+   "0 of 7 publishes landed before the process exited" with the round's failed=7 unchanged,
+   and the bounded-close test on its 1.0 s floor)
+
+10:18  up 11 days, 17:55, 1 user, load averages: 15.86 25.00 19.02
+SPEC-093/094 build results at HEAD cbfa238d, Python 3.13.1, darwin
+
+== re-plant wait-at-close-pubsub-close-flag-only (src/log_foundry/sinks/pubsub.py); imports $T/wait-at-close-pubsub-close-flag-only/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_pubsub_round_wait.py::test_a_normal_exit_lands_every_publish_the_exit_drain_left_unconfirmed
+    FAILED tests/test_pubsub_round_wait.py::test_a_close_over_futures_that_never_resolve_is_bounded_and_counts_nothing
+    2 failed in 0.31s
+      exit 1
+runner exit 0
+10:18  up 11 days, 17:55, 1 user, load averages: 15.86 25.00 19.02
+
+  LOG_FOUNDRY_EXTRAS=1 pytest tests (the extras leg) at cbfa238d:
+    12752 passed, 18 skipped, 62 xfailed, 1283 warnings in 158.58s (0:02:38), exit 0
+
+== the execution review's re-plants, run with --only at 7b601fda
+   (the pid check removed: the child's own close waits out the 5 s overflow_timeout; the keep
+   ignoring the close; the keep never pruning resolved futures)
+
+10:46  up 11 days, 18:22, 1 user, load averages: 30.56 52.88 47.04
+SPEC-093/094 build results at HEAD 7b601fda, Python 3.13.1, darwin
+
+== re-plant execution-review-pubsub-pid-check-removed (src/log_foundry/sinks/pubsub.py); imports $T/execution-review-pubsub-pid-check-removed/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_pubsub_round_wait.py::test_a_forked_childs_own_close_waits_on_nothing_its_parent_kept
+    1 failed, 1 warning in 5.32s
+      exit 1
+
+== re-plant execution-review-pubsub-keep-ignores-the-close (src/log_foundry/sinks/pubsub.py); imports $T/execution-review-pubsub-keep-ignores-the-close/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_pubsub_round_wait.py::test_a_round_settling_after_the_close_keeps_nothing
+    1 failed in 0.31s
+      exit 1
+
+== re-plant execution-review-pubsub-keep-never-prunes (src/log_foundry/sinks/pubsub.py); imports $T/execution-review-pubsub-keep-never-prunes/src/log_foundry/__init__.py
+  macOS pytest:
+    FAILED tests/test_pubsub_round_wait.py::test_each_keep_drops_the_futures_already_kept_that_have_resolved
+    1 failed in 0.32s
+      exit 1
+runner exit 0
+10:46  up 11 days, 18:22, 1 user, load averages: 28.42 51.68 46.68
+
+  measured by hand at 7b601fda: shutdown(timeout=1.0) took 5.01 s over a MemorySink whose
+  close() sleeps 5 s, and 6.06 s over a GooglePubSubSink at overflow_timeout=6 whose futures
+  never resolve; the live sink's close runs inline (architecture.md section 12)
+
+  LOG_FOUNDRY_EXTRAS=1 pytest tests (the extras leg) at 7b601fda:
+    12755 passed, 18 skipped, 62 xfailed, 1284 warnings in 143.33s (0:02:23), exit 0

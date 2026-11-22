@@ -10,6 +10,7 @@ from typing import Any, Final, Literal, get_args
 from urllib.parse import urlsplit
 
 from log_foundry import _diag, _lifecycle
+from log_foundry.sinks._deferral import Deferral
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
 from log_foundry.sinks.http import (
@@ -81,7 +82,14 @@ class SentrySink:
     Attributes:
       client: The SDK object this sink captures through, or ``None`` when the HTTP fallback is
         the only backend it can select.
-      sent: Events captured or sent to Sentry.
+      sent: Events the SDK took an id for at capture, or the HTTP fallback sent. An event
+        ``capture_event`` returned ``None`` for is never counted here (SPEC-093 FR-002).
+      discarded: Events the Sentry SDK discarded at capture, its ``capture_event`` returning
+        ``None``: an ignored error, ``before_send`` or an event processor dropping it, the error
+        sample rate, or no transport. Reported by :meth:`losses` as ``dropped``, counted only when
+        ``emit`` returns, with one line per batch. Sampling and ``before_send`` drops are counted
+        here too, as Andrew chose on 2026-11-15, because ``None`` cannot tell them from an SDK that
+        cannot deliver.
       skipped: Events below the minimum level, or without a usable level, that were not sent.
       transport_errors: Events whose send raised something other than an already-counted
         abandonment — an SDK fault, or an exception a caller-injected ``opener`` raises that
@@ -180,6 +188,7 @@ class SentrySink:
         self.sent = 0
         self.skipped = 0
         self.transport_errors = 0
+        self.discarded = 0
         self._counter_lock = threading.Lock()
         self.client: Any = None if backend == "http" else (
             client if client is not None else _import_sdk()
@@ -219,6 +228,13 @@ class SentrySink:
         The backend is chosen once, before the loop, so one batch cannot split across transports
         partway through and so the client is probed once rather than per event.
 
+        An event the SDK discarded at capture (SPEC-093 FR-002) is counted in ``discarded``
+        through this call's ``Deferral``, so the count and its one line, ``lost N event(s);
+        SentrySink, discarded by the Sentry SDK at capture``, land only when it returns. A batch
+        with any discard returns, whatever else befell it: a resend would roll the sampler again
+        and hand ``before_send`` an event it had already dropped. Its failures are counted at
+        capture in ``transport_errors`` (or the HTTP fallback's ``failed``), as in 1.x.
+
         Args:
           batch: The events to consider.
 
@@ -226,28 +242,40 @@ class SentrySink:
           None.
 
         Raises:
-          SinkDeliveryError: If every qualifying event failed to land, which includes the case
-            where no backend can deliver at all (SPEC-043 FR-003). An event below the minimum
-            level is skipped rather than lost, so a batch of nothing but skipped events is a
-            successful emit — there was never anything to deliver.
+          SinkDeliveryError: If every qualifying event failed to land and none was discarded,
+            which includes the case where no backend can deliver at all (SPEC-043 FR-003). An
+            event below the minimum level is skipped rather than lost, so a batch of nothing but
+            skipped events is a successful emit — there was never anything to deliver.
         """
         backend = self._select_backend()
-        attempted = delivered = 0
-        for event in batch:
-            if not self._qualifies(event):
+        attempted = delivered = discarded = 0
+        with Deferral(self) as pending:
+            for event in batch:
+                if not self._qualifies(event):
+                    with self._counter_lock:
+                        self.skipped += 1
+                    continue
+                attempted += 1
+                landed = self._capture(event, backend)
+                if landed is None:
+                    discarded += 1
+                    continue
+                if not landed:
+                    continue
                 with self._counter_lock:
-                    self.skipped += 1
-                continue
-            attempted += 1
-            if not self._capture(event, backend):
-                continue
-            with self._counter_lock:
-                self.sent += 1
-            delivered += 1
-        if attempted and not delivered:
-            raise SinkDeliveryError(
-                f"SentrySink delivered none of {attempted} qualifying event(s)"
-            )
+                    self.sent += 1
+                delivered += 1
+            if discarded:
+                pending.count("discarded", discarded)
+                pending.announce(
+                    lambda: _diag.lost(
+                        "event", discarded, "SentrySink, discarded by the Sentry SDK at capture"
+                    )
+                )
+            if attempted and not delivered and not discarded:
+                raise SinkDeliveryError(
+                    f"SentrySink delivered none of {attempted} qualifying event(s)"
+                )
 
     def flush(self) -> None:
         """Pushes the Sentry SDK's own transport queue, which nothing else here ever does.
@@ -395,12 +423,14 @@ class SentrySink:
           The counters. ``skipped`` is deliberately not reported as ``dropped``: an event below
           the minimum level was never meant for Sentry, and reporting a configured filter as
           loss would make the alert idiom fire on every INFO log. What is reported is an
-          abandoned envelope and an event whose send raised, on either transport; delivery the
-          SDK accepts and then loses internally is the SDK's to report. ``resent`` is the HTTP
-          backend's count of envelopes sent again after a send that may have landed them
-          (SPEC-095). The backend's ``failed`` and ``resent`` are read together under its one
-          lock, which one commit holds for both, then released before this sink's lock is taken,
-          so the two never tear and no lock nests.
+          abandoned envelope and an event whose send raised, on either transport, in ``failed``,
+          and an event the SDK discarded at capture, in ``dropped`` (SPEC-093 FR-002), which
+          includes one sampled out or dropped by ``before_send``; delivery the SDK accepts and
+          then loses internally is the SDK's to report. ``resent`` is the HTTP backend's count
+          of envelopes sent again after a send that may have landed them (SPEC-095). The
+          backend's ``failed`` and ``resent`` are read together under its one lock, which one
+          commit holds for both, then released before this sink's lock is taken, so the two
+          never tear and no lock nests.
 
         Raises:
           None.
@@ -410,9 +440,11 @@ class SentrySink:
             with http._counter_lock:
                 failed, resent = http.failed, http.log_foundry_counters.resent_events
         with self._counter_lock:
-            return SinkLosses(dropped=0, failed=failed + self.transport_errors, resent=resent)
+            return SinkLosses(
+                dropped=self.discarded, failed=failed + self.transport_errors, resent=resent
+            )
 
-    def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool:
+    def _capture(self, event: dict[str, object], backend: _Selected | None) -> bool | None:
         """Sends one event by the backend ``emit`` resolved for this batch.
 
         A ``None`` backend is refused here, before the ``try``, and moves nothing. Letting it fall
@@ -442,7 +474,9 @@ class SentrySink:
           backend: The backend ``emit`` resolved, or ``None`` when nothing can deliver.
 
         Returns:
-          True when it landed, False when it did not.
+          True when it landed, False when it did not, and ``None`` when the SDK's
+          ``capture_event`` returned ``None``, discarding it (SPEC-093 FR-002). Any other return
+          value, ``""`` and ``0`` included, reads as captured, as in 1.x.
 
         Raises:
           None. ``SinkDeliveryError`` is caught separately only because ``HTTPSink._send``
@@ -453,7 +487,8 @@ class SentrySink:
             return False
         try:
             if backend == "sdk":
-                self.client.capture_event(self._sentry_event(event))
+                if self.client.capture_event(self._sentry_event(event)) is None:
+                    return None
             else:
                 self._post_envelope(event)
         except SinkDeliveryError:

@@ -620,14 +620,14 @@ specs:
   - id: "SPEC-093"
     title: "Acknowledgement Fixes: a Write the Sink Cannot Confirm Is Counted, Not Believed"
     description: "Makes the TCP socket sinks, SentrySink's SDK backend, the AWS batch sinks and the _bulk sinks stop reporting as delivered what their backend never confirmed, and gives RabbitMQSink opt-in publisher confirms, so the rows SPEC-092's conformance corpus pins for findings 1, 11 and 14 turn green, RabbitMQ's default unconfirmed publish becomes a recorded departure, and no other row moves."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-070", "SPEC-072", "SPEC-073", "SPEC-074", "SPEC-076", "SPEC-092"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-093-acknowledgement-fixes.md"
   - id: "SPEC-094"
     title: "Client-Buffered Sinks Wait for the Delivery Report, on the Delivery Engine"
     description: "Moves KafkaSink and GooglePubSubSink onto the delivery engine, with each round waiting, within the sink's own timeout and until the stop signal, for the client's report on every message it handed over, so that a rejection no attempt could have written fails the batch, every other report is counted as one that may have landed, and no count arrives after the batch's verdict."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-069", "SPEC-072", "SPEC-074", "SPEC-075", "SPEC-076", "SPEC-092", "SPEC-093"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-094-client-buffered-sinks-wait-for-the-report.md"

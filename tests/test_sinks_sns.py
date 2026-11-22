@@ -113,7 +113,7 @@ class _Raising:
 
     def publish_batch(self, *, TopicArn, PublishBatchRequestEntries):
         self._go([e["Message"] for e in PublishBatchRequestEntries])
-        return {}
+        return {"Successful": [{"Id": e["Id"]} for e in PublishBatchRequestEntries], "Failed": []}
 
 
 def test_a_client_failure_costs_its_chunk_not_the_batch(capsys) -> None:

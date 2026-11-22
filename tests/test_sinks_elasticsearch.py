@@ -198,12 +198,11 @@ def test_a_base_exception_from_the_decoder_propagates_with_nothing_counted(
 
 
 _UNVERIFIED = {
-    "empty-object": b"{}",
     "errors-false": b'{"errors": false}',
     "errors-null": b'{"errors": null}',
     "errors-zero": b'{"errors": 0}',
     "empty-items": b'{"items": []}',
-    "error-document": b'{"error": {"type": "auth"}, "status": 500}',
+    "items-without-errors": b'{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}',
     "items-all-errored": b'{"items": [{"index": {"error": "x"}}, {"index": {"error": "x"}}]}',
 }
 
@@ -212,8 +211,10 @@ _UNVERIFIED = {
 def test_an_object_without_truthy_errors_is_read_as_success_unverified(body, capsys) -> None:
     """Pins what the code does, not that it is right: architecture.md §12 holds the exposure.
 
-    The last two bodies report failure and still count nothing. A change that starts charging
-    them has to decide what an endpoint that omits `errors` costs, with the Astra profile.
+    Each body carries ``errors`` or ``items``. ``items-all-errored`` reports failure and still
+    counts nothing: a change that starts charging it has to decide what an endpoint that omits
+    only ``errors`` costs, with the Astra profile. ``{}`` and an error document, which carry
+    neither key, left this table at SPEC-093 FR-003, below.
     """
     sink = ElasticsearchSink(
         "http://es:9200", index="logs", opener=FakeOpener([FakeResponse(200, body)])
@@ -222,6 +223,33 @@ def test_an_object_without_truthy_errors_is_read_as_success_unverified(body, cap
     assert sink.dropped_unadjudicated == 0
     assert sink.losses() == SinkLosses(dropped=0, failed=0)
     assert capsys.readouterr().err == ""
+
+
+_NO_VERDICT = {
+    "empty-object": b"{}",
+    "error-document": b'{"error": {"type": "auth"}, "status": 500}',
+}
+
+
+@pytest.mark.parametrize("cls", [ElasticsearchSink, OpenSearchSink], ids=lambda c: c.__name__)
+@pytest.mark.parametrize("body", _NO_VERDICT.values(), ids=_NO_VERDICT.keys())
+def test_an_object_with_neither_errors_nor_items_adjudicates_none_of_the_chunk(
+    cls, body, capsys
+) -> None:
+    """SPEC-093 FR-003: a ``2xx`` object naming no verdict is counted, announced and sent once.
+
+    Decision A's principle, that a reply which names no verdict is never counted as delivered,
+    applied to ``_bulk``: it takes the undecodable body's path, so ``dropped_unadjudicated``
+    moves by the chunk, one may-have-landed line names it, and nothing is resent.
+    """
+    opener = FakeOpener([FakeResponse(200, body)])
+    sink = cls("http://es:9200", index="logs", opener=opener)
+    sink.emit([{"a": 1}, {"b": 2}])
+    assert len(opener.calls) == 1
+    assert sink.dropped_unadjudicated == 2
+    [line] = [x for x in capsys.readouterr().err.splitlines() if "lost" in x]
+    assert f"lost 2 event(s); {cls.__name__} could not adjudicate a _bulk response" in line
+    assert "they may have landed; not retried" in line
 
 
 def test_a_short_items_array_and_an_unreadable_body_write_the_same_shape_of_line(capsys) -> None:

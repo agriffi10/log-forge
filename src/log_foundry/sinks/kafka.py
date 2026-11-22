@@ -3,20 +3,171 @@
 from __future__ import annotations
 
 import json
-import threading
-from typing import Any
+import time
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
+from log_foundry.sinks import _engine
 from log_foundry.sinks._args import refuse_with_injected
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._guard import ClosedGuard, GuardMode
 from log_foundry.sinks._refusal import final_refusal
-from log_foundry.sinks._retry import usable_timeout
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import pause_on, usable_timeout, wait
+from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    import threading
+
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["KafkaSink"]
+
+DEFINITIVE_CODES = frozenset({21, 87})
+"""Kafka protocol codes no attempt of the refused message could have escaped (SPEC-094 FR-001).
+
+A client retries a message on its own, and a later attempt's refusal says nothing about an
+earlier one that timed out ``POSSIBLY_PERSISTED``, so a report is ``REJECTED`` only when the
+refusal judges what every attempt carries unchanged. 21, ``INVALID_REQUIRED_ACKS``, judges the
+producer's ``acks``, which is its for life; 87, ``INVALID_RECORD``, judges the record's own key,
+value and headers. Left out: 10 and 18, which judge the batch librdkafka builds again for each
+attempt; 29 and 31, authorization, which can change between attempts; 2, a corruption that can be
+one attempt's; and 17, which could not be shown never to follow a kept attempt. Every other error
+is ``UNKNOWN``. Read from the Kafka protocol and librdkafka v2.16.0's source, not measured.
+"""
+
+_REPORT_SLICE = 0.05
+"""Seconds one pass of the round's report wait flushes for, and the first slice's length."""
+
+
+def _announce_each(prefix: str, kinds: list[str]) -> None:
+    """Writes one ``lost 1 message(s)`` line per entry, ``<prefix>, <kind>``.
+
+    Args:
+      prefix: The line's sink and step, such as ``KafkaSink produce``.
+      kinds: Each message's type name, and code where it has one.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
+    """
+    for kind in kinds:
+        _diag.lost("message", 1, f"{prefix}, {kind}")
+
+
+class _Reports:
+    """One round's delivery reports by position, closed to late reports once the round settles.
+
+    A round's ``flush`` or ``poll`` can serve another round's callbacks, on another thread, so
+    every write and the round's reads and close take one lock (SPEC-094 FR-001): the sink's
+    counters lock, so the table adds no primitive of its own. It is **read from the sink's
+    ``SinkCounters`` at each use, never kept** (invariant 12). A settled table outlives its round
+    inside the callback closure librdkafka holds, which no fork repair walk reaches; the walk
+    rebinds ``SinkCounters._counter_lock`` in a child, so a table that had kept the parent's lock
+    object would take it for a late report the child's close flush or ``flush()`` hook serves,
+    and deadlock there if a parent thread held it at the fork. No section under the lock calls
+    the producer, so a callback served while it is held cannot be one this thread is waiting in.
+    """
+
+    __slots__ = ("_counters", "_reports", "_settled")
+
+    def __init__(self, counters: SinkCounters) -> None:
+        """Starts with no report.
+
+        Args:
+          counters: The sink's counters, whose lock each use reads afresh.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        self._counters = counters
+        self._reports: dict[int, object] = {}
+        self._settled = False
+
+    def callback(self, position: int) -> Any:
+        """Returns the delivery callback for the message at ``position``.
+
+        Args:
+          position: The message's position in the round's batch.
+
+        Returns:
+          The callback.
+
+        Raises:
+          None.
+        """
+
+        def report(err: object, msg: object) -> None:
+            """Records one report; one arriving after the round settled changes nothing.
+
+            Args:
+              err: The delivery error, or ``None``.
+              msg: The message, unused.
+
+            Returns:
+              None.
+
+            Raises:
+              None.
+            """
+            with self._counters._counter_lock:
+                if not self._settled:
+                    self._reports[position] = err
+
+        return report
+
+    def count(self) -> int:
+        """How many reports have arrived.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        with self._counters._counter_lock:
+            return len(self._reports)
+
+    def has_all(self, positions: list[int]) -> bool:
+        """Whether every one of ``positions`` has a report.
+
+        Args:
+          positions: The positions produced this round.
+
+        Returns:
+          The answer.
+
+        Raises:
+          None.
+        """
+        with self._counters._counter_lock:
+            return all(position in self._reports for position in positions)
+
+    def settle(self) -> dict[int, object]:
+        """Closes the table to late reports and returns what it holds.
+
+        Args:
+          None.
+
+        Returns:
+          Each reported position's error, ``None`` for success.
+
+        Raises:
+          None.
+        """
+        with self._counters._counter_lock:
+            self._settled = True
+            return dict(self._reports)
 
 
 def _usable_timeout(value: float) -> float:
@@ -38,10 +189,12 @@ def _usable_timeout(value: float) -> float:
     """
     return usable_timeout(value, DEFAULT_FLUSH_TIMEOUT)
 
-DEFAULT_FLUSH_TIMEOUT = 10.0
-"""Seconds :meth:`KafkaSink.close` waits for the producer to drain (SPEC-038 FR-006).
 
-Ten rather than ``message.timeout.ms``'s five minutes.
+DEFAULT_FLUSH_TIMEOUT = 10.0
+"""Seconds a round waits for its delivery reports, and :meth:`KafkaSink.close` for the producer.
+
+Ten rather than ``message.timeout.ms``'s five minutes (SPEC-038 FR-006); since SPEC-094 FR-001 it
+also bounds each round's wait for its own reports.
 
 It is spent **beside** ``shutdown()``'s budget, not from it: ``Worker.shutdown`` joins the drain
 thread against its deadline and *then* closes the sink inline, with no remaining-budget argument
@@ -55,18 +208,27 @@ class KafkaSink:
     """A :class:`~log_foundry.sinks.base.Sink` that produces events to a Kafka topic.
 
     This is a durable-buffer sink built on ``confluent-kafka``, the optional ``kafka`` extra,
-    imported lazily. ``produce()`` enqueues locally into the producer's internal batch and
-    returns without blocking, while the delivery result arrives asynchronously on a callback
-    serviced by ``poll()`` and ``flush()``.
+    imported lazily. ``produce()`` enqueues locally into the producer's internal batch, and the
+    delivery result arrives on a callback served by ``poll()`` and ``flush()``.
 
-    **Retry (SPEC-041 FR-004).** This sink adds none and needs none: ``produce()`` is a local
-    hand-off that returns without waiting — measured at 0.0001 s for three messages against a
-    dead broker — so it never holds the worker's single drain thread, and librdkafka's own retry
-    is bounded by ``message.timeout.ms`` (five minutes by default). Measured: with that set to
-    1500 ms the delivery callback fired at 2.01 s, and at 4000 ms it fired at 4.01 s. SPEC-027's
-    "cut short by a shutdown" governs a wait *between attempts*, and this sink has none to cut —
-    which is also why it deliberately exposes no ``log_foundry_stop_signal`` attribute, since
-    ``_lifecycle.offer_stop_signal`` probes by ``hasattr`` and that absence is the opt-out.
+    **It waits for the report (SPEC-094 FR-001; Andrew's decision B, 2026-11-15, and "Truthy,
+    counted", 2026-11-16).** It is a delivery-engine sink: each round hands every remaining
+    message to the producer and then waits, within ``flush_timeout`` and until the stop signal,
+    for the reports on that round's own messages, asking ``flush(slice)`` in slices of
+    :data:`_REPORT_SLICE` so one message stuck on a leaderless partition costs a later round one
+    slice rather than the whole timeout. ``flush`` holds librdkafka's flushing mark while it
+    runs, so ``linger.ms`` does not hold back a round. A success is ``ACCEPTED``; an error in
+    :data:`DEFINITIVE_CODES` is ``REJECTED``, so a batch of nothing else fails and ``flush()``
+    reads false; any other error, and no report by the deadline or the stop, is ``UNKNOWN``,
+    counted in ``failed`` with a may-have-landed line and never sent again, with ``flush()``
+    still truthy. A message without a report is ``ACCEPTED`` when ``flush`` read the ``int`` 0,
+    meaning nothing waits, which is how ``delivery.report.only.error`` reads. Nothing is counted
+    after the round's verdict: a report served later changes nothing. It exposes
+    ``log_foundry_stop_signal``, which the engine's wait between rounds and the report wait
+    both read; once the wait's first slice has passed, a set signal ends it. A pause between two
+    asks is never cut short by a signal already set when it began (``_retry.pause_on``), so a
+    round under a set stop does not ask in a tight loop. The sink has no ``max_retries``: through
+    the worker a run has the worker's rounds, the 1.x total of attempts.
 
     **The bound is ``librdkafka``'s, and since SPEC-047 FR-003 it is reachable.** ``message.
     timeout.ms`` is what decides how long an accepted message is retried, five minutes by
@@ -76,22 +238,24 @@ class KafkaSink:
     producer owns delivery, so re-sending duplicates whatever it eventually lands (SPEC-018), and
     a second bound over a five-minute one multiplies the worst case rather than shortening it.
 
-    The worst case (SPEC-027 FR-005) is not a retry loop — this sink has none — but its
-    ``close()``: one ``flush_timeout`` wait, 10 s at the default, spent **beside**
-    ``shutdown()``'s budget rather than from it. ``Worker.shutdown`` joins the drain thread
+    The worst case (SPEC-027 FR-005) is a round against a broker that never answers, one
+    ``flush_timeout`` wait, unless a shutdown cuts it, and an orphan log outside a span holds the
+    caller's thread for the same wait; and its ``close()``: one ``flush_timeout`` wait, 10 s at
+    the default, spent **beside** ``shutdown()``'s budget rather than from it. ``Worker.shutdown`` joins the drain thread
     against its deadline and *then* closes the sink inline with no remaining-budget argument
     (arch §13), so the two add up: measured, ``shutdown(timeout=2.0)`` against a dead broker
     takes 10.01 s.
 
     Attributes:
-      flush_timeout: Seconds :meth:`close` waits for the producer to drain.
-      failed: Messages whose delivery callback reported an error, plus any still queued when
-        that close flush expired — the count ``flush()`` returns — plus those an ``emit`` handed
-        to the producer while the close's release overtook it (SPEC-076 FR-003).
-      rejected: Messages ``produce()`` itself refused — a full local queue, a serialization fault
-        — which never reached the producer's batch at all. Counted only when :meth:`emit`
-        returns, so only when the rest of the batch was handed off: a batch refused whole raises
-        and is counted where the raise is caught (SPEC-059 FR-003).
+      flush_timeout: Seconds a round waits for its reports, and :meth:`close` for the producer.
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      log_foundry_stop_signal: The worker's shutdown event, or ``None``.
+      failed: Messages a definitive report refused or no definitive report settled, once per
+        run, the engine's ``failed_events``; assignable.
+      rejected: Messages ``produce()`` itself refused — a full local queue, a serialization
+        fault — beside a hand-off that worked, and events that could not be encoded, the
+        engine's ``dropped_events``, counted only when the run settles; assignable. A round where
+        nothing was produced is resent by the engine instead.
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport
     lock. ``confluent-kafka`` documents its ``Producer`` as thread-safe, and this sink adds no state
@@ -102,9 +266,9 @@ class KafkaSink:
     its delivery callbacks, so a message produced after it would die with the process —
     accepted, uncounted, and never the subject of a callback. ``emit`` returning normally is
     what made that silent, since the worker then never retried and ``flush()`` reported
-    success. The close itself is guarded the same way (SPEC-076 FR-003): an ``emit`` still
-    producing when a close begins is waited for, for at most ``CLOSE_OVERLAP_WAIT``, and one
-    the release overtook anyway counts what it produced in ``failed``, with a line.
+    success. The close itself is guarded the same way (SPEC-076 FR-003): a round still producing
+    when a close begins is waited for, for at most ``CLOSE_OVERLAP_WAIT``. Every message a round
+    produced was settled by that round, so the close counts nothing.
     """
 
     def __init__(
@@ -124,8 +288,8 @@ class KafkaSink:
           producer: A ``confluent-kafka``-shaped producer, or ``None`` to build one.
           bootstrap_servers: The broker list, required when no producer is injected.
           key_field: The event key used as the message key, or empty for no key.
-          flush_timeout: Seconds :meth:`close` waits for the producer to drain before counting
-            what is left as lost (SPEC-038 FR-006). Unbounded, an unreachable broker held
+          flush_timeout: Seconds a round waits for its own delivery reports (SPEC-094 FR-001),
+            and :meth:`close` for the producer to drain (SPEC-038 FR-006). Unbounded, an unreachable broker held
             process exit for ``message.timeout.ms`` — five minutes by default — despite
             ``shutdown(timeout=30)``. Non-positive or non-finite values fall back to the
             default, as ``Worker._emit`` floors its own retries (SPEC-021): ``0`` reinstates
@@ -171,10 +335,86 @@ class KafkaSink:
         self.producer = producer
         self.key_field = key_field
         self.flush_timeout = _usable_timeout(flush_timeout)
-        self.failed = 0
-        self.rejected = 0
-        self._counter_lock = threading.Lock()
+        self.log_foundry_counters = SinkCounters()
+        self.log_foundry_stop_signal: threading.Event | None = None
         self._guard = ClosedGuard(GuardMode.CLOSE_ONLY)
+
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock.
+
+        Args:
+          None.
+
+        Returns:
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @property
+    def failed(self) -> int:
+        """Messages refused or unconfirmed, the engine's ``failed_events``.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.failed_events = value
+
+    @property
+    def rejected(self) -> int:
+        """Messages that never left the process, the engine's ``dropped_events``.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.dropped_events
+
+    @rejected.setter
+    def rejected(self, value: int) -> None:
+        """Sets the count.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.dropped_events = value
 
     @property
     def _closed(self) -> bool:
@@ -215,70 +455,29 @@ class KafkaSink:
         return self._guard._lock
 
     def losses(self) -> SinkLosses:
-        """Reports refused and undelivered messages (SPEC-026 FR-002).
-
-        A callback failure never makes :meth:`emit` raise, and the reason is ownership rather
-        than timing — ``poll(0)`` runs inside ``emit``, so a callback for a message produced
-        earlier in the same batch can and does fire before it returns. Once the producer has
-        accepted a message it owns delivery, including its own retries, and re-producing it from
-        here would duplicate whatever the producer eventually lands.
+        """Reports the engine's totals (SPEC-094 FR-001).
 
         Args:
           None.
 
         Returns:
-          The counters. Refusals are reported as ``dropped``, since nothing ever left the
-          process, while ``failed`` is the delivery callback's verdict on a message the producer
-          did accept. A refusal is counted and announced only when ``emit`` returns (SPEC-059
-          FR-003), so ``dropped`` holds the refusals of batches whose other messages were handed
-          off. A batch refused whole raised instead and is counted where the raise was caught —
-          the worker's ``failed_batches`` once its retries are spent, ``orphan_lost`` outside a
-          span, or a ``MultiSink``'s own ``failed`` when a sibling delivered — and a retry that
-          hands it off counts nothing. An event :meth:`emit` could not encode is counted in the
-          same ``rejected`` (SPEC-069 FR-001): it never left the process either.
+          The counters: ``rejected`` as ``dropped``, since nothing left the process, a refusal
+          counted and announced only when ``emit`` returns — on the engine, only when the run
+          settles — and
+          ``failed``, each message a definitive report refused or no definitive report settled,
+          counted once per run when its round settles, never later.
 
         Raises:
           None.
         """
-        with self._counter_lock:
-            return SinkLosses(dropped=self.rejected, failed=self.failed, resent=0)
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Produces one message per event and serves delivery callbacks without blocking.
+        """Delivers the batch through the engine inline, the 1.x entry point (SPEC-094 FR-001).
 
-        ``produce()`` is a local hand-off, so what it refuses is the only failure this call can
-        observe (FR-002). A refusal is counted and announced only when ``emit`` returns, through
-        the deferral helper whose ``with`` encloses the produce loop and the total-failure raise
-        (SPEC-059 FR-003). A partial refusal returns, so its count lands then, with one line per
-        refused message naming that message's own exception type, bound as the refusal was
-        decided; the messages that were accepted are already on their way, so it is not retried.
-        When every message was refused the call raises and counts nothing — whoever catches the
-        raise owns the batch, so a batch refused on one attempt and accepted on the next records
-        no loss that never happened. A raise mid-loop (``poll``) discards the refusals too. A
-        delivery callback ``poll(0)`` serves counts ``failed`` immediately, which stays an upper
-        bound this does not defer.
-
-        Every event's body and key are encoded before the first produce (SPEC-069 FR-001). One
-        that cannot be encoded is dropped into ``rejected``, counted and announced only when this
-        call returns, with one line per call; before, the messages ahead of it were already
-        produced when its encode raised, and the worker's retry produced them again. A batch of
-        nothing encodable produces nothing and returns (FR-002), and the total-refusal raise
-        counts the encodable messages only.
-
-        A closed or closing sink refuses the batch before touching the producer (SPEC-032
-        FR-001). Refusing is not a loss this sink absorbed, so it moves no counter here: it
-        is a failure reported to the worker, which records it in
-        ``health().failed_batches``. The produce loop is a ``CLOSE_ONLY`` section of the
-        guard rather than a lock held across it, which would serialize a client
-        ``confluent-kafka`` documents as thread-safe (SPEC-076 FR-003). A close that lands
-        while a call is producing waits for it, for at most ``CLOSE_OVERLAP_WAIT``, so the
-        close's flush walks what it produced. A call the close's release overtook anyway
-        is told so, and the messages it handed to the producer are counted in ``failed``
-        at once, beside :meth:`_on_delivery`'s count, with one line naming the count: the
-        release's flush may have delivered some of them, so it is the upper bound
-        invariant 2 records for ``failed``, and nothing this call accepted goes uncounted.
-        That count is made only when this call returns normally; one that raises leaves
-        its whole batch to its catcher.
+        A failed run's events are counted in ``failed`` before it raises, as every engine
+        sink's adapter does: a run fails when nothing was ``ACCEPTED``, something was
+        ``REJECTED`` and nothing is ``UNKNOWN``.
 
         Args:
           batch: The events to produce.
@@ -287,47 +486,132 @@ class KafkaSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the sink is closed or closing, or when every message was
-            refused so the batch reached nothing — the total failure the worker's retry exists
-            for (SPEC-026 FR-001). Either leaves no refusal counted.
+          SinkDeliveryError: When the run failed, the sink is closed among them.
         """
-        if not batch:
-            return
-        accepted = 0
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-094 FR-001).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          Exception: Within a run, whatever the round's ``poll`` or ``flush`` raises, which the
+            run absorbs as the round's failure; a round run on its own absorbs it here.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Produces every remaining message, then waits for the round's delivery reports.
+
+        A closed or closing sink refuses with 1.x's error. Every event is encoded once per run,
+        an unencodable one ``DROPPED`` with SPEC-069's line. Each encodable event is produced with
+        a callback bound to this round's report table, ``poll(0)`` after each. A ``produce()``
+        that raises beside one that worked is ``DROPPED``, counted in ``rejected`` and named,
+        ``KafkaSink produce, <Type>``, only when the run settles; in a round where nothing was
+        produced, every refused message is ``RETRYABLE`` and the engine resends it after its
+        wait. A refusal or an unencodable event is so counted and announced only when ``emit``
+        returns — on the engine, only when the run settles. Then :meth:`_await_reports` waits, and each produced message takes its outcome:
+        a report with no error ``ACCEPTED``; one in :data:`DEFINITIVE_CODES` ``REJECTED``, one
+        line each, ``KafkaSink delivery, <Type> code=N``; any other ``UNKNOWN``; no report
+        ``ACCEPTED`` when the queue read empty and ``UNKNOWN`` otherwise. The ``UNKNOWN``
+        messages share one ``ALWAYS`` line. The table is then closed, under the lock every write
+        takes, so a report a later ``flush``, ``poll`` or ``close()`` serves, on any thread,
+        changes nothing.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          Exception: Whatever the producer's ``poll`` or ``flush`` raises, which the engine
+            absorbs as the round's failure; a ``produce`` that raises is read as a refusal.
+        """
         with self._guard.enter() as section:
             if not section:
-                raise final_refusal(
-                    self,
-                    f"KafkaSink produced none of {len(batch)} message(s): the sink is closed"
-                )
-            with Deferral(self) as pending:
-                refused: list[str] = []
-                messages = encode_events(
-                    batch, self._encode, pending, sink=_diag.type_name(self), counter="rejected"
-                )
-                if not messages:
-                    return
-                for _, (body, key) in messages:
-                    try:
-                        self.producer.produce(
-                            self.topic, value=body, key=key, callback=self._on_delivery
-                        )
-                    except Exception as err:
-                        refused.append(_diag.type_name(err))
-                        continue
-                    accepted += 1
-                    self.producer.poll(0)
-                if refused:
-                    pending.count("rejected", len(refused))
-                    pending.announce(lambda: self._announce_refused(refused))
-                if not accepted:
-                    raise SinkDeliveryError(
-                        f"KafkaSink produced none of {len(messages)} message(s)"
+                run_context().refuse(
+                    final_refusal(
+                        self,
+                        f"KafkaSink produced none of {len(batch)} message(s): the sink is closed",
                     )
-        if section.released_during and accepted:
-            with self._counter_lock:
-                self.failed += accepted
-            _diag.lost("message", accepted, "KafkaSink, produced while the sink was closing")
+                )
+                return Verdict.uniform(Outcome.REJECTED, len(batch))
+            context = run_context()
+            fates = [Outcome.DROPPED] * len(batch)
+            name = _diag.type_name(self)
+            reports = _Reports(self.log_foundry_counters)
+            produced: list[int] = []
+            refused: list[tuple[int, str]] = []
+            for position, (body, key) in encode_round(self, batch, self._encode, sink=name):
+                mark_sent(self, [batch[position]])
+                try:
+                    self.producer.produce(
+                        self.topic, value=body, key=key, callback=reports.callback(position)
+                    )
+                except Exception as err:
+                    refused.append((position, _diag.type_name(err)))
+                    continue
+                produced.append(position)
+                self.producer.poll(0)
+            lost = Lost(self)
+            if refused and not produced:
+                for position, kind in refused:
+                    fates[position] = Outcome.RETRYABLE
+                    lost.add(
+                        [batch[position]],
+                        when=When.LAST,
+                        key=kind,
+                        line=raised_line("message", "KafkaSink produce", kind),
+                    )
+                lost.register()
+                return Verdict(outcomes=tuple(fates))
+            kinds = [kind for _, kind in refused]
+            if kinds:
+                context.announce(
+                    lambda: _announce_each("KafkaSink produce", kinds), when=When.SETTLED
+                )
+            if not produced:
+                return Verdict(outcomes=tuple(fates))
+            drained = self._await_reports(reports, produced)
+            seen = reports.settle()
+            definitive: list[str] = []
+            unknown = 0
+            for position in produced:
+                if position not in seen:
+                    fates[position] = Outcome.ACCEPTED if drained else Outcome.UNKNOWN
+                    unknown += 0 if drained else 1
+                    continue
+                report = seen[position]
+                if report is None:
+                    fates[position] = Outcome.ACCEPTED
+                elif _is_definitive(report):
+                    fates[position] = Outcome.REJECTED
+                    definitive.append(f"{_diag.type_name(report)}{_code(report)}")
+                else:
+                    fates[position] = Outcome.UNKNOWN
+                    unknown += 1
+            if definitive:
+                context.announce(
+                    lambda: _announce_each("KafkaSink delivery", definitive), when=When.ALWAYS
+                )
+            if unknown:
+                timeout = self.flush_timeout
+                context.announce(
+                    lambda: _diag.lost(
+                        "message",
+                        unknown,
+                        f"KafkaSink, no definitive delivery report within {timeout}s; may have "
+                        "landed, not retried",
+                    ),
+                    when=When.ALWAYS,
+                )
+        return Verdict(outcomes=tuple(fates))
 
     def _encode(self, event: dict[str, object]) -> tuple[bytes, bytes | None]:
         """Encodes one event as its message body and partition key.
@@ -351,26 +635,12 @@ class KafkaSink:
         """
         return json.dumps(event).encode("utf-8"), self._key(event)
 
-    def _announce_refused(self, kinds: list[str]) -> None:
-        """Writes one line per message ``produce()`` refused, naming its exception type (FR-002).
-
-        Called by the calling ``emit``'s deferral after the count is committed, outside the
-        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-003).
-
-        Args:
-          kinds: Each refused message's exception type name, in the order they were refused.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        for kind in kinds:
-            _diag.lost("message", 1, f"KafkaSink produce, {kind}")
-
     def close(self) -> None:
         """Flushes the producer so buffered messages are delivered before exit (FR-002).
+
+        Every message a round produced was settled by that round (SPEC-094 FR-001), so the close
+        counts nothing; its bounded flush still gives a message a round left ``UNKNOWN`` its
+        chance to land.
 
         Idempotent through the guard, whose lock is held *across* the flush rather than only
         around the state, as every other guarded sink holds its own (SPEC-032 FR-001).
@@ -397,17 +667,14 @@ class KafkaSink:
         self._guard.close(self._flush_bounded)
 
     def flush(self) -> None:
-        """Drains the producer's local buffer without closing the sink (SPEC-036 FR-002).
+        """Serves any pending delivery report and returns, without closing the sink (SPEC-036).
 
-        ``emit`` hands to librdkafka and returns; only ``flush()`` drains it. Before this hook
-        existed the buffer was unreachable through ``log_foundry.flush()`` — the whole point of
-        that call in a process about to be frozen — and went out only at ``close()``.
-
-        It **raises** when the producer still holds messages after ``flush_timeout``, which is what
-        makes ``log_foundry.flush()`` report ``reason="sink-flush"`` rather than success. Nothing
-        is counted as lost: unlike the close path those messages are still queued and the next
-        flush or the close may yet deliver them, so booking them against ``failed`` would report a
-        loss that has not happened. The remainder is named in the error instead.
+        It calls ``producer.flush(0)``, which serves pending reports and returns at once, and it
+        does not raise for a remainder (SPEC-094 FR-001): every message a remainder holds was
+        handed over by a round that waited for its report and already counted it. 1.x waited
+        ``flush_timeout`` and raised for a remainder, which made ``log_foundry.flush()`` falsy
+        (``reason="sink-flush"``) over an indefinite report and, at the defaults, overran its 5 s
+        budget; Andrew's "Truthy, counted" answer of 2026-11-16 rules that out.
 
         Refuses after ``close()`` on SPEC-032's rule — the producer has been flushed and
         released — and while one is in flight. The flush is a ``CLOSE_ONLY`` section of
@@ -421,22 +688,62 @@ class KafkaSink:
           None.
 
         Raises:
-          SinkDeliveryError: The sink is closed, or the producer could not be drained inside
-            ``flush_timeout``.
+          SinkDeliveryError: The sink is closed.
           Exception: Whatever the producer raises.
         """
         with self._guard.enter() as section:
             if not section:
                 raise final_refusal(self, "KafkaSink cannot flush: the sink is closed")
-            remaining = self.producer.flush(self.flush_timeout)
-        if type(remaining) is int and remaining > 0:
-            raise SinkDeliveryError(
-                f"KafkaSink flushed within {self.flush_timeout}s with {remaining} "
-                "message(s) still queued"
-            )
+            self.producer.flush(0)
+
+    def _await_reports(self, reports: _Reports, produced: list[int]) -> bool:
+        """Waits until every produced position has a report, the queue drains, or time is up.
+
+        Each pass asks ``flush(slice)``: it serves reports for at most one slice and, while it
+        runs, holds the producer's flushing mark, so ``linger.ms`` does not hold back what is
+        queued, and it returns with the producer's queue length. The wait ends when every
+        produced position has a report, when ``flush`` returned the ``int`` 0 (a ``bool`` is not
+        one, so a stand-in answering ``False`` gives no empty reading), when
+        ``flush_timeout`` has passed, or when the stop signal is set and the first slice, a
+        deadline at the wait's start plus :data:`_REPORT_SLICE`, has passed. A pass that served
+        nothing waits out the rest of its slice through ``_retry.wait``, so a ``flush`` that
+        returns at once does not spin; the pause is cut short by the stop signal unless it was
+        already set when the pause began (``_retry.pause_on``). The signal's attribute is read
+        once per wait, and ``is_set()`` on every pass. ``kafka`` is in the only-the-engine-waits
+        gate's exclusions for this wait, which is not a retry backoff.
+
+        Args:
+          reports: The round's report table.
+          produced: The positions produced this round.
+
+        Returns:
+          Whether the producer's queue read empty, so an unreported message was delivered.
+
+        Raises:
+          Exception: Whatever the producer's ``flush`` raises.
+        """
+        began = time.monotonic()
+        deadline = began + self.flush_timeout
+        first_slice_end = began + _REPORT_SLICE
+        stop = self.log_foundry_stop_signal
+        while True:
+            seen = reports.count()
+            now = time.monotonic()
+            slice_start = now
+            slice_ = max(0.0, min(deadline - now, _REPORT_SLICE))
+            remaining = self.producer.flush(slice_)
+            if reports.has_all(produced):
+                return False
+            if _diag.is_a(remaining, int) and not _diag.is_a(remaining, bool) and remaining == 0:
+                return True
+            now = time.monotonic()
+            if now >= deadline or (now >= first_slice_end and stop is not None and stop.is_set()):
+                return False
+            if reports.count() == seen:
+                wait(slice_ - (now - slice_start), pause_on(stop))
 
     def _flush_bounded(self) -> None:
-        """Flushes the producer within a bound, counting whatever it could not deliver (FR-006).
+        """Flushes the producer within a bound before the close (FR-006); it counts nothing.
 
         ``Producer.flush()`` with no timeout waits for ``message.timeout.ms`` — five minutes by
         default — and ``Worker.shutdown`` closes the live sink **inline and unbounded** (arch
@@ -454,9 +761,9 @@ class KafkaSink:
         than the hang this bound exists to fix, and it is the same mistake FR-001 AC-4a records
         for ``HTTPSink`` — skipping *work* during the exit drain, rather than skipping a *wait*.
 
-        ``flush()`` *returns* the number of messages still queued, which is exactly the count
-        lost at exit — the old call discarded it, so the loss was silent. It is counted into
-        ``failed`` and announced once, with a count rather than one line per message.
+        It counts nothing (SPEC-094 FR-001): every message was settled by the round that
+        produced it, so a count here would land after its batch's verdict. 1.x's "still queued
+        when the close flush expired" count went for that reason.
 
         Args:
           None.
@@ -467,16 +774,7 @@ class KafkaSink:
         Raises:
           Exception: Whatever the producer raises, which ``close``'s caller already handles.
         """
-        remaining = self.producer.flush(self.flush_timeout)
-        if type(remaining) is not int or remaining <= 0:
-            return
-        with self._counter_lock:
-            self.failed += remaining
-        _diag.lost(
-            "message",
-            remaining,
-            f"KafkaSink, still queued when the {self.flush_timeout}s close flush expired",
-        )
+        self.producer.flush(self.flush_timeout)
 
     def _key(self, event: dict[str, object]) -> bytes | None:
         """Derives one message's partition key from the configured field.
@@ -496,29 +794,29 @@ class KafkaSink:
         value = event.get(self.key_field)
         return str(value).encode("utf-8") if value is not None else None
 
-    def _on_delivery(self, err: object, msg: object) -> None:
-        """Counts and logs a delivery failure, as ``confluent-kafka``'s callback (FR-002).
 
-        The error is a ``KafkaError`` rather than an exception, so it goes to
-        :func:`~log_foundry._diag.lost` rather than ``absorbed``. Its ``str`` is a human message
-        that can quote the record, so only the type and the numeric code are written — the code
-        is librdkafka's own enumeration and is what makes a delivery failure diagnosable
-        (SPEC-029 FR-002).
+def _is_definitive(err: object) -> bool:
+    """Reports whether a delivery error says no attempt of the message could have been written.
 
-        Args:
-          err: The delivery error, or ``None`` on success.
-          msg: The message the callback describes, unused.
+    The code is read as :func:`_code` reads it: ``code()`` must return a value
+    ``_diag.is_a(value, int)`` admits, an ``int`` subclass included, compared as the ``int`` it
+    holds; anything else, or a ``code`` that raises, is not definitive.
 
-        Returns:
-          None.
+    Args:
+      err: The delivery error.
 
-        Raises:
-          None.
-        """
-        if err is not None:
-            with self._counter_lock:
-                self.failed += 1
-            _diag.lost("message", 1, f"KafkaSink delivery, {_diag.type_name(err)}{_code(err)}")
+    Returns:
+      True when its code is in :data:`DEFINITIVE_CODES`.
+
+    Raises:
+      None.
+    """
+    try:
+        code = getattr(err, "code", None)
+        value = code() if callable(code) else None
+        return _diag.is_a(value, int) and int(value) in DEFINITIVE_CODES
+    except Exception:
+        return False
 
 
 def _code(err: object) -> str:

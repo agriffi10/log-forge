@@ -179,6 +179,15 @@ class _EveryEntryOpener(FakeOpener):
         return FakeResponse(200, json.dumps([{"status": 202}] * len(entries)).encode())
 
 
+class _BulkOpener(FakeOpener):
+    """An opener answering ``_bulk``: no ``errors``, so every item reads accepted (SPEC-093)."""
+
+    def __call__(self, request: Any, timeout: float | None = None) -> FakeResponse:
+        """Records the request, then answers ``{"errors": false}``."""
+        super().__call__(request, timeout)
+        return FakeResponse(200, b'{"errors": false}')
+
+
 def _http_family() -> list[type[HTTPSink]]:
     """``HTTPSink`` and every shipped subclass."""
     return [HTTPSink, *_shipped_http_subclasses()]
@@ -187,7 +196,13 @@ def _http_family() -> list[type[HTTPSink]]:
 @pytest.mark.parametrize("cls", _http_family(), ids=lambda cls: cls.__name__)
 def test_the_http_family_takes_a_capped_batch_in_predicted_requests(cls: type[HTTPSink]) -> None:
     """FR-004 AC2: 1,000 small events go in the requests the count limit predicts, none lost."""
-    opener = _EveryEntryOpener() if cls.__name__ == "HoneycombSink" else FakeOpener()
+    opener = (
+        _EveryEntryOpener()
+        if cls.__name__ == "HoneycombSink"
+        else _BulkOpener()
+        if cls.__name__ in ("ElasticsearchSink", "OpenSearchSink")
+        else FakeOpener()
+    )
     if cls is HTTPSink:
         sink = HTTPSink("http://x/logs", opener=opener)
     else:

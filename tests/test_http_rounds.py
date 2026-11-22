@@ -990,7 +990,7 @@ def test_an_idempotent_reader_counts_an_unknown_once_per_run(
 
     unreadable = FakeResponse(200, b"not json")
     opener = (
-        Scripted(unreadable, FakeResponse(200, b"{}"))
+        Scripted(unreadable, FakeResponse(200, b'{"errors": false}'))
         if mode == "recovers"
         else Scripted(unreadable)
     )
@@ -1088,7 +1088,7 @@ _SHIM_AT_BASE: dict[tuple[str, str], tuple[bool, dict[str, int], int]] = {
     ("ElasticsearchSink", "errors-without-error-items"): (True, {"dropped_unadjudicated": 2}, 1),
     ("ElasticsearchSink", "short-items"): (True, {"dropped_unadjudicated": 2}, 1),
     ("ElasticsearchSink", "long-items"): (True, {"dropped_unadjudicated": 2}, 1),
-    ("ElasticsearchSink", "no-errors-key"): (True, {}, 0),
+    ("ElasticsearchSink", "no-errors-key"): (True, {"dropped_unadjudicated": 2}, 1),
     ("ElasticsearchSink", "not-an-object"): (True, {"dropped_unadjudicated": 2}, 1),
     ("ElasticsearchSink", "undecodable"): (True, {"dropped_unadjudicated": 2}, 1),
     ("ElasticsearchSink", "empty"): (True, {"dropped_unadjudicated": 2}, 1),
@@ -1129,7 +1129,9 @@ Recorded by calling each reader's ``_handle_response`` at the build's Phase 2 co
 (``caaaba85``), where the readers were still their 1.x code, so the expectation is a
 differential oracle against the old readers, never recomputed from the shims under test. The
 ``ok`` case there used ``{"errors": false}`` with two non-error items; any body without a truthy
-``errors`` reads the same.
+``errors`` reads the same. One entry departs from the oracle on purpose: ``no-errors-key``, a
+``{}`` that 1.x read as success, is unadjudicated since SPEC-093 FR-003, because an object with
+neither ``errors`` nor ``items`` names no verdict.
 """
 
 _COUNTERS = (
@@ -1526,6 +1528,8 @@ def _success(cls: type[HTTPSink]) -> FakeResponse:
     """A ``2xx`` each class reads as one event accepted."""
     if cls.__name__ == "HoneycombSink":
         return FakeResponse(200, b'[{"status": 202}]')
+    if cls.__name__ in ("ElasticsearchSink", "OpenSearchSink"):
+        return FakeResponse(200, b'{"errors": false}')
     return FakeResponse(200, b"{}")
 
 

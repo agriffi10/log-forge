@@ -142,6 +142,7 @@ def adjudicate_positional[T](
     error_key: str = "ErrorCode",
     failed_count: object = _NOT_PASSED,
     rejected: bool = False,
+    absent: bool = False,
 ) -> Adjudication[T]:
     """Pairs a positional batch response against the records it should describe.
 
@@ -174,6 +175,11 @@ def adjudicate_positional[T](
         with ``failed_count``: a present array nobody can read cannot show that nothing is coded,
         so rule 1 cannot hold and the chunk is unadjudicated, whatever the count says. An array
         that is absent is not rejected: a ``0`` count with no array is still delivered.
+      absent: Whether the response carried no per-record array at all. Read only with
+        ``failed_count``: a reply with neither a failed count nor the array names no record, so
+        it adjudicates none of the chunk (SPEC-093 FR-003, Andrew's decision A of 2026-11-15).
+        Left ``False``, a direct caller gets SPEC-070's reading, under which an absent count
+        with no coded entry is delivered.
 
     Returns:
       The records to retry, or the count abandoned as unadjudicated when the arrays disagree.
@@ -183,6 +189,8 @@ def adjudicate_positional[T](
     """
     if failed_count is not _NOT_PASSED:
         if rejected:
+            return Adjudication([], len(records))
+        if absent and failed_count is ABSENT:
             return Adjudication([], len(records))
         return _adjudicate_counted(records, results, error_key, failed_count)
     if len(results) != len(records):

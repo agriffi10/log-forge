@@ -7,10 +7,11 @@ emit(self, batch)`` whose body is the one call ``emit_via_deliver(self, batch)``
 that defines ``deliver``, with no class below it defining ``emit``; its module must neither call
 ``wait`` nor assign a backoff constant; and it may write a counter only in ``__init__``, the
 ``failed`` setter or the ``_counter_lock`` setter, never registering a run-context count against
-``failed``, whose setter takes the lock a commit holds. The floor is 16, exactly the sixteen:
-SPEC-074's thirteen, ``FileSink`` and ``RotatingFileSink`` since SPEC-082, and ``StdoutSink``
+``failed``, whose setter takes the lock a commit holds. The floor is 18, exactly the eighteen:
+SPEC-074's thirteen, ``FileSink`` and ``RotatingFileSink`` since SPEC-082, ``StdoutSink``
 since SPEC-084, whose subclass ``StderrSink`` the check on classes below the one defining
-``deliver`` holds. A runtime half builds each sink over its double and reads what the AST cannot;
+``deliver`` holds, and ``KafkaSink`` and ``GooglePubSubSink`` since SPEC-094, whose modules'
+waits for their own reports the ``WAIT_EXCLUSIONS`` skip passes over. A runtime half builds each sink over its double and reads what the AST cannot;
 the two file sinks have a case of their own there, because their ``losses()`` is ``None`` until
 something is counted (SPEC-069) and they never had a public ``failed`` to keep assignable. The two
 stream sinks share that ``losses()`` rule and have no ``failed`` at all, so they are kept out of
@@ -37,6 +38,7 @@ from log_foundry.sinks.verdict import SinkCounters, read_deliver
 from log_foundry.worker import Worker
 from sink_rigs import RIGS, ok
 from test_fork_lifecycle import _held_by_a_parent_thread, run_in_child
+from test_sink_retry import WAIT_EXCLUSIONS
 
 SINKS = Path(__file__).resolve().parents[1] / "src" / "log_foundry" / "sinks"
 
@@ -58,9 +60,11 @@ ENGINE_SINKS = frozenset(
         "FileSink",
         "RotatingFileSink",
         "StdoutSink",
+        "KafkaSink",
+        "GooglePubSubSink",
     }
 )
-FLOOR = 16
+FLOOR = 18
 
 _WRAPPER_REASON = (
     "SPEC-075's wrapper: its emit is a 1.x body, its losses() is a 1.x formula, and its deliver "
@@ -87,8 +91,14 @@ COUNTERS = frozenset(
         "dropped_unadjudicated",
     }
 )
-WRITERS = frozenset({"__init__", "failed", "_counter_lock"})
-"""Where a counter store is allowed: construction and the two setters."""
+WRITERS = frozenset({"__init__", "failed", "_counter_lock", "rejected"})
+"""Where a counter store is allowed: construction and the setters.
+
+``rejected`` is ``KafkaSink``'s and ``GooglePubSubSink``'s 1.x public counter, kept assignable
+by SPEC-094 as a property
+over the engine's ``dropped_events``; its setter stores what a caller assigns, as ``failed``'s
+does.
+"""
 
 
 def _defines(cls: ast.ClassDef, name: str) -> ast.FunctionDef | None:
@@ -199,7 +209,7 @@ def engine_sink_findings(root: Path, floor: int = FLOOR) -> tuple[set[str], list
         for other, (sub, _, _) in classes.items():
             if name in _bases(sub) and _defines(sub, "emit") is not None:
                 findings.append(f"{where}: {other} defines emit below the class defining deliver")
-        if _waits(tree):
+        if _waits(tree) and module.removesuffix(".py") not in WAIT_EXCLUSIONS:
             findings.append(f"{where}: its module calls wait or assigns a backoff constant")
         findings.extend(f"{where}: {store}" for store in _stores(cls))
     if len(found) < floor:
@@ -207,7 +217,7 @@ def engine_sink_findings(root: Path, floor: int = FLOOR) -> tuple[set[str], list
     return found, findings
 
 
-def test_the_engine_sinks_are_the_sixteen() -> None:
+def test_the_engine_sinks_are_the_eighteen() -> None:
     found, findings = engine_sink_findings(SINKS)
     assert findings == [], "\n".join(findings)
     assert found == ENGINE_SINKS
@@ -221,7 +231,7 @@ def test_removing_a_wrapper_exclusion_reddens_naming_it(
 
     Before SPEC-075 no wrapper defined ``deliver`` and removing the entry changed nothing; now the
     roster finds the class and names its 1.x ``emit``, and with every exclusion in place the
-    population is still exactly the sixteen.
+    population is still exactly the roster.
     """
     monkeypatch.delitem(EXCLUSIONS, wrapper)
     found, findings = engine_sink_findings(SINKS)
@@ -284,17 +294,35 @@ def test_the_roster_names_each_planted_defect(plant: str, tmp_path: Path) -> Non
     assert any("Good" in f and reason in f for f in findings), findings
 
 
+def test_a_waiting_module_the_retry_gate_excludes_is_silent(tmp_path: Path) -> None:
+    """SPEC-093 FR-001: the wait finding skips a module ``WAIT_EXCLUSIONS`` names, so one list.
+
+    ``_socket`` waits for the peer's acknowledgement of its own frames through ``_retry.wait``,
+    and ``tests/test_sink_retry.py`` records why that is not a retry backoff; this gate reads the
+    same list rather than keeping a second. The same source under a name the list does not hold
+    is still named, which ``test_the_roster_names_each_planted_defect``'s ``a wait`` holds.
+    """
+    source = textwrap.dedent(_PLANTS["a wait"][0])
+    (tmp_path / "_socket.py").write_text(source, encoding="utf-8")
+    assert engine_sink_findings(tmp_path, floor=1) == ({"Good"}, [])
+    (tmp_path / "_socket.py").rename(tmp_path / "elsewhere.py")
+    _, findings = engine_sink_findings(tmp_path, floor=1)
+    assert findings == ["elsewhere.py Good: its module calls wait or assigns a backoff constant"]
+
+
 def test_a_conforming_fixture_is_silent(tmp_path: Path) -> None:
     (tmp_path / "m.py").write_text(textwrap.dedent(_GOOD), encoding="utf-8")
     assert engine_sink_findings(tmp_path, floor=1) == ({"Good"}, [])
 
 
-def test_a_tree_of_fifteen_fails_the_floor(tmp_path: Path) -> None:
-    body = "".join(_GOOD.replace("class Good", f"class Good{i}") for i in range(15))
+def test_a_tree_one_under_the_floor_fails_it(tmp_path: Path) -> None:
+    """A tree of ``FLOOR - 1`` conforming sinks is named for falling under the floor."""
+    under = FLOOR - 1
+    body = "".join(_GOOD.replace("class Good", f"class Good{i}") for i in range(under))
     (tmp_path / "m.py").write_text(textwrap.dedent(body), encoding="utf-8")
     found, findings = engine_sink_findings(tmp_path)
-    assert len(found) == 15
-    assert findings == ["the scan found 15 engine sinks, under its floor of 16"]
+    assert len(found) == under
+    assert findings == [f"the scan found {under} engine sinks, under its floor of {FLOOR}"]
 
 
 # --- the runtime half ---------------------------------------------------------------------------
@@ -321,6 +349,8 @@ _RIGGED = (
     "RabbitMQSink",
     "AzureEventHubsSink",
     "SyslogSink",
+    "KafkaSink",
+    "GooglePubSubSink",
 )
 
 

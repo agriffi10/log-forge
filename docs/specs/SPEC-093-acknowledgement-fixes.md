@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-093
 title: "Acknowledgement Fixes: a Write the Sink Cannot Confirm Is Counted, Not Believed"
 description: "Makes the TCP socket sinks, SentrySink's SDK backend, the AWS batch sinks and the _bulk sinks stop reporting as delivered what their backend never confirmed, and gives RabbitMQSink opt-in publisher confirms, so the rows SPEC-092's conformance corpus pins for findings 1, 11 and 14 turn green, RabbitMQ's default unconfirmed publish becomes a recorded departure, and no other row moves."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-070, SPEC-072, SPEC-073, SPEC-074, SPEC-076, SPEC-092]
 arc: audit-2026-11-14
 arc_order: 9
@@ -278,8 +278,12 @@ FR-006 records the first two windows and the cost in §13.
       `SocketTransport` over loopback TCP in the ordinary `CI / test` job, arranging each through
       the `_peer_state` and `_end_state` seams and never sleeping for a packet to land. It asserts:
       no `UNKNOWN` and no `lost` line for the clean, half-close and FIN-after-reading rows; every
-      frame of the round `UNKNOWN`, counted once in `failed` and named on one line for the
-      FIN-after-the-pre-check rows, at 1 and 5 frames, and the reset-before-the-end-check row; for
+      frame the peer lost counted once in `failed`, no frame it received counted, and the count
+      named on one line, for the FIN-after-the-pre-check rows, at 1 and 5 frames, and the
+      reset-before-the-end-check row. (On macOS every frame of the round is written to the dead
+      connection and counted; on Linux at 5 frames the reset makes the second write raise, so the
+      first frame is `UNKNOWN` by rule 4 and the rest go out again on a new connection and
+      arrive.) For
       the reset-after-the-end-check row, the first round uncounted and the second round's frames
       either received or counted; and for the two mid-round rows, no more frames lost than counted
       (invariants 2, 7 and 11).
@@ -499,7 +503,12 @@ socket once and then dispatches every channel's pending consumer callbacks (`:87
 **The rule.**
 
 - **The constructor.** `RabbitMQSink.__init__` gains a keyword-only `confirm: bool = False`, after
-  `stack_timeout`. Andrew chose the default on 2026-11-15 (*Revision history*).
+  `stack_timeout`. Andrew chose the default on 2026-11-15 (*Revision history*). A value that is not
+  a `bool`, judged with `_diag.is_a(value, bool)`, is refused with `TypeError` naming `confirm` and
+  the type, before anything is built. It is not read for its truth, for the reason `ack_wait` is
+  not (FR-001): the argument is new, so no 1.x caller depends on it, and `confirm="false"` would
+  otherwise turn confirms on. That is *A bad argument is floored if it works and refused if it is
+  already broken; a new one is refused* (`docs/decisions/sink-delivery/`).
 - **`confirm=False`** is 1.x exactly: no channel is put in confirm mode, `basic_publish` is called as
   today, no liveness probe runs, and the class docstring says what a returned publish proves.
 - **`confirm=True`, the channel.** `_active_channel` calls `confirm_delivery()` on each channel it
@@ -566,6 +575,9 @@ confirms are opt-in.
       10).
 - [ ] `inspect.signature(RabbitMQSink)` equals the `97a03f45` signature plus a keyword-only `confirm`
       with default `False`, as the last parameter (invariant 10).
+- [ ] `confirm="false"`, `confirm=0` and `confirm=1.0` are refused with `TypeError` naming
+      `confirm` and the type, before any connection is made, for an owned and a borrowed
+      connection alike; `confirm=True` and `confirm=False` are accepted (invariant 13).
 - [ ] **Owed until a green run:** in `integration.yml`, against its real broker, a `confirm=True`
       sink delivers a batch, and a publish with `mandatory` to a routing key no queue is bound to is
       `REJECTED` and counted in `failed` with its line. The same test, with `mandatory=True` removed
@@ -631,7 +643,10 @@ baseline.
   read it once. Measured: with the default flipped to `False` in an export of the prototype, all 268
   rows read as with it on. A variant would add rows that only repeat the TCP rows, so the opt-out's
   cost is held where it shows, in `spec093_close_corpus.py` and `tests/test_socket_close_corpus.py`
-  (FR-001), and recorded in §13 (FR-006). The totals do not move.
+  (FR-001), and recorded in §13 (FR-006). The totals do not move. The corpus's gate still asks
+  that every constructor parameter be a variant's pick or neutral, so `ack_wait` is listed in
+  `NEUTRAL` for `SyslogSink` and `LogstashSink`, with that reason beside it: it changes what the
+  sink can know, and the corpus cannot see the difference.
 - **Totals.** 268 rows: 62 pinned under seven pins, 15 departure rows under nine departures, and 191
   that must pass. SPEC-092's FR-004 asserts its totals as literals, and those literals change to
   these numbers.
@@ -1191,3 +1206,20 @@ check waits on a healthy peer.
     it covers a 50 ms round trip under Linux's 200 ms longest delayed acknowledgement.
   - The corpus gains no variant and no departure, because its fake socket reads alike either way,
     measured with the default flipped. The totals do not move.
+- Corrected on 2026-11-19, during the build, by the orchestrator's ruling on the plan.
+  - **`confirm=` is validated.** FR-004 specified no check on `confirm`, while FR-001 refuses a
+    non-`bool` `ack_wait` on the ground that a new keyword has no 1.x caller and `"false"` would
+    turn its behaviour on. The same ground holds for `confirm`, and the settled fence *A bad
+    argument is floored if it works and refused if it is already broken; a new one is refused*
+    requires it. FR-004 now refuses a non-`bool` with `TypeError` and gains the criterion.
+  - **`ack_wait` is neutral in the corpus.** FR-005 gave `ack_wait` no variant; the corpus's gate
+    requires every parameter to be a pick or neutral, so FR-005 now says it is listed in
+    `NEUTRAL`, and why.
+- Corrected on 2026-11-20, at completion, from the build.
+  - **FR-001's close-corpus criterion held on macOS only as written.** It asked that every frame of
+    the round be `UNKNOWN` on the FIN-after-the-pre-check rows at 1 and 5 frames. On Linux at 5
+    frames the peer's reset reaches the sink before the round's second write, which raises, so
+    rule 4 makes only the first frame `UNKNOWN` and the raising frame and those after it go out
+    again on a new connection and arrive. That is the rule working, and the corpus judges the run
+    right. The criterion now asks what the corpus asks: every frame the peer lost counted once, no
+    frame it received counted, and one line. `tests/test_socket_close_corpus.py` asserts that.

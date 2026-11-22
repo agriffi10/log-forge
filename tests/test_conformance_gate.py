@@ -67,9 +67,9 @@ def _row(row_id: str) -> cc.Row:
 # The declaration (FR-001).
 
 
-def test_the_variants_are_the_53_of_fr_001_each_in_one_of_the_ten_classes() -> None:
-    """FR-001: 53 variants, each naming exactly one of the ten classes, with unique ids."""
-    assert len(cc.VARIANTS) == 53
+def test_the_variants_are_the_55_of_fr_001_and_spec_093_each_in_one_of_the_ten_classes() -> None:
+    """FR-001: 53 variants, and SPEC-093 FR-005's two confirmed RabbitMQ ones, with unique ids."""
+    assert len(cc.VARIANTS) == 55
     assert cc.ACK_CLASSES == (
         "keyed-reply",
         "positional-reply",
@@ -144,7 +144,7 @@ def test_the_parameters_are_the_sources_and_each_is_a_pick_or_neutral() -> None:
     assert cc.coverage_faults(cc.PARAMETERS, cc.VARIANTS, cc.NEUTRAL) == []
     assert set(cc.NEUTRAL) == set(cc.PARAMETERS)
     assert len(cc.PARAMETERS) == 39
-    assert sum(len(names) for names in cc.PARAMETERS.values()) == 170
+    assert sum(len(names) for names in cc.PARAMETERS.values()) == 173
     if "max_message_bytes" in cc.PARAMETERS["SQSSink"]:
         assert "max_message_bytes" in cc.NEUTRAL["SQSSink"]
     if "max_message_bytes" in cc.PARAMETERS["SNSSink"]:
@@ -227,7 +227,7 @@ def _first_rows() -> list[cc.Row]:
 def test_every_builder_builds_the_class_its_entry_names_and_abstract_is_only_a_base() -> None:
     """FR-001: each builder's class has its entry's name; `ABSTRACT` is built only as a base."""
     built = {row.variant.id: cb.run_row(row).built for row in _first_rows()}
-    assert len(built) == 53
+    assert len(built) == 55
     wrong = {vid: cls.__name__ for vid, cls in built.items() if cls.__name__ != vid.split("[")[0]}
     assert not wrong, wrong
     for name in cc.ABSTRACT:
@@ -238,15 +238,16 @@ def test_every_builder_builds_the_class_its_entry_names_and_abstract_is_only_a_b
 # The rows (FR-002).
 
 
-def test_the_corpus_generates_the_256_rows_of_fr_002() -> None:
-    """FR-002: 256 rows, by class as the spec's Evidence counts them.
+def test_the_corpus_generates_the_268_rows_of_fr_002_and_spec_093() -> None:
+    """FR-002: 256 rows, by class as the spec's Evidence counts them, and SPEC-093 FR-005's 12.
 
-    Each variant's faults are its class's less its skips, and no skip names a fault the class does
-    not run.
+    Each variant's faults are its class's, then its `adds`, less its skips, and no skip names a
+    fault the class does not run. The two confirmed RabbitMQ variants each add two faults to
+    `per-event-ack`'s four, which makes `per-event-ack` 20 rows.
     """
     table = cc.rows()
-    assert len(table) == 256
-    assert len({row.id for row in table}) == 256
+    assert len(table) == 268
+    assert len({row.id for row in table}) == 268
     by_class = collections.Counter(row.variant.ack for row in table)
     assert by_class == {
         "keyed-reply": 28,
@@ -255,7 +256,7 @@ def test_the_corpus_generates_the_256_rows_of_fr_002() -> None:
         "transactional": 16,
         "local-write": 16,
         "socket-stream": 28,
-        "per-event-ack": 8,
+        "per-event-ack": 20,
         "client-buffered": 23,
         "in-process": 10,
         "wrapper": 32,
@@ -269,6 +270,7 @@ def test_the_corpus_generates_the_256_rows_of_fr_002() -> None:
             base = (*cc.APPLIES[inner.ack], *cc.APPLIES["wrapper"])
         else:
             base = cc.APPLIES[variant.ack]
+        base = (*base, *variant.adds)
         assert set(variant.skips) <= set(base), f"{variant.id} skips a fault it never runs"
         generated = [row.fault for row in table if row.variant is variant]
         assert generated == [f for f in base if f not in variant.skips], variant.id
@@ -287,7 +289,7 @@ def test_every_clean_row_but_nullsinks_holds_each_event_exactly_once() -> None:
             continue
         assert held == [1] * len(result.events), (row.id, held)
         checked += 1
-    assert checked == 50
+    assert checked == 52
 
 
 def _dial_by_name() -> None:
@@ -831,8 +833,7 @@ def test_judge_per_batch(backend: cb.Backend, report: cb.Report, verdict: tuple[
 @pytest.mark.parametrize(
     ("removed", "row_id", "verdict"),
     [
-        ("partition", "KafkaSink-never-acknowledged", ("silent-loss",)),
-        ("silent-loss", "SyslogSink[tcp]-peer-closed", ()),
+        ("silent-loss", "SyslogSink[udp]-peer-closed", ()),
         ("duplicate", "PostgresSink[autocommit]-autocommit", ()),
         ("lost-but-held", "PostgresSink[borrowed]-reply-lost", ()),
         ("resent-when-knowable", "ClickHouseSink-refused-once", ()),
@@ -841,7 +842,15 @@ def test_judge_per_batch(backend: cb.Backend, report: cb.Report, verdict: tuple[
 def test_a_check_removed_from_judge_frees_the_row_it_holds(
     monkeypatch: pytest.MonkeyPatch, removed: str, row_id: str, verdict: tuple[str, ...]
 ) -> None:
-    """FR-003 and SPEC-095 FR-004: each of the five checks today's code needs holds its row."""
+    """FR-003 and SPEC-095 FR-004: each check today's code needs is the one holding its named row.
+
+    SPEC-092 named four and SPEC-095 added ``resent-when-knowable``. ``partition`` held only the
+    four rows of ``KafkaSink`` and ``GooglePubSubSink`` that SPEC-094 turned green, so no shipped
+    row reads it any more; it stays held by
+    ``test_fate_of_misreading_rejected_is_caught_by_the_delivery_comparison`` and by ``judge``'s
+    standing fixtures. ``silent-loss``'s row moved from the TCP ``SyslogSink``, which SPEC-093
+    turned green, to the UDP one, a departure that still reads it.
+    """
     held = cb.run_row(_row(row_id)).verdict
     assert removed in held, held
     monkeypatch.setattr(cb, "CHECKS", tuple(c for c in cb.CHECKS if c[0] != removed))
@@ -1005,7 +1014,7 @@ def test_duplicate_firing_at_one_copy_turns_every_green_clean_row_red(
         for row in cc.rows()
         if row.fault == "clean" and cp.pin_of(row.id) is None and cp.departure_of(row.id) is None
     ]
-    assert len(green_clean) == 50
+    assert len(green_clean) == 52
     quiet = [row.id for row in green_clean if "duplicate" not in cb.run_row(row).verdict]
     assert not quiet, quiet
 
@@ -1018,19 +1027,92 @@ def test_the_corpus_files_hold_no_skip_no_loose_xfail_and_no_ledger_exemption() 
         assert "mark.ledger_exempt" not in text.replace('"mark.ledger_exempt"', ""), name
 
 
+def _variant(**kwargs: Any) -> cc.Variant:
+    """A `per-event-ack` variant for `adds_faults`'s fixtures.
+
+    Args:
+      **kwargs: Fields beyond the class and names.
+
+    Returns:
+      The variant.
+
+    Raises:
+      None.
+    """
+    fields: dict[str, Any] = {"sink": "S", "variant": "v", "ack": "per-event-ack", "build": "b"}
+    fields.update(kwargs)
+    return cc.Variant(**fields)
+
+
+_ADDS_MISUSE = {
+    "already-runs": (
+        _variant(adds=types.MappingProxyType({"clean": "r"})),
+        "S[v] adds clean, which its class already runs",
+    ),
+    "beside-only": (
+        _variant(only=("clean",), adds=types.MappingProxyType({"peer-closed": "r"})),
+        "S[v] adds peer-closed beside only, which replaces its faults",
+    ),
+    "also-skipped": (
+        _variant(
+            adds=types.MappingProxyType({"peer-closed": "r"}),
+            skips=types.MappingProxyType({"peer-closed": "r"}),
+        ),
+        "S[v] adds peer-closed and also skips it",
+    ),
+    "not-a-fault": (
+        _variant(adds=types.MappingProxyType({"lost-in-the-post": "r"})),
+        "S[v] adds 'lost-in-the-post', which is not a fault",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_ADDS_MISUSE))
+def test_adds_faults_names_each_misuse_of_adds(case: str) -> None:
+    """SPEC-093 FR-005: each misuse of `adds` is one line naming the variant and the fault."""
+    variant, line = _ADDS_MISUSE[case]
+    assert cc.adds_faults([variant]) == [line]
+
+
+def test_adds_faults_is_silent_on_a_well_formed_table() -> None:
+    """A fault its class does not run, with no `only` and no `skips` of it, reads as fine."""
+    variant = _variant(adds=types.MappingProxyType({"peer-closed": "r", "taken-then-raised": "r"}))
+    assert cc.adds_faults([variant]) == []
+    assert cc.faults_of(variant, [variant]) == (
+        "clean",
+        "refused-once",
+        "refused-always",
+        "reply-lost",
+        "peer-closed",
+        "taken-then-raised",
+    )
+
+
+def test_the_variant_table_uses_adds_as_specified() -> None:
+    """`adds_faults` applied to `VARIANTS` yields nothing."""
+    assert cc.adds_faults(cc.VARIANTS) == []
+
+
 # The register (FR-004).
 
 
 def test_the_register_holds_the_totals_of_fr_004() -> None:
-    """SPEC-095 FR-004: 11 pins, 12 departures; 256 rows, 22 pinned, 31 departing, 203 pass."""
-    assert len(cp.PINS) == 11
-    assert len(cp.DEPARTURES) == 12
+    """The totals as SPEC-095, then SPEC-093 and SPEC-094, leave them.
+
+    SPEC-092 FR-004 asserted 12 pins over 74 rows, 7 departures over 12 rows and 170 that must
+    pass, of 256. SPEC-095 FR-004 brought it to 11 pins over 22 rows, 12 departures over 31 and
+    203 that must pass. SPEC-093 FR-005 and SPEC-094 FR-003, landing after it, add twelve rows and
+    remove seven pins over 16 rows, and add two departures over 3: 268 rows, 4 pins over 6 rows
+    and three items, 14 departures over 34 rows, and 228 that must pass.
+    """
+    assert len(cp.PINS) == 4
+    assert len(cp.DEPARTURES) == 14
     pinned = [row for pin in cp.PINS for row in pin.rows]
     departing = [row for d in cp.DEPARTURES for row in d.rows]
-    assert len(pinned) == 22
-    assert len(departing) == 31
-    assert len(cc.rows()) - len(pinned) - len(departing) == 203
-    assert len({pin.item for pin in cp.PINS}) == 9
+    assert len(pinned) == 6
+    assert len(departing) == 34
+    assert len(cc.rows()) - len(pinned) - len(departing) == 228
+    assert len({pin.item for pin in cp.PINS}) == 3
 
 
 def _repository_texts() -> dict[str, str]:
@@ -1245,7 +1327,7 @@ def test_every_pinned_row_and_only_those_carry_the_strict_mark() -> None:
         assert mark.kwargs["strict"] is True, row.id
         assert mark.kwargs["raises"] is PinnedVerdict, row.id
         marked += 1
-    assert marked == 22
+    assert marked == 6
 
 
 @pytest.mark.parametrize(

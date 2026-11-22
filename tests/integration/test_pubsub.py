@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import time
 import uuid
 from typing import TYPE_CHECKING
 
@@ -61,32 +60,29 @@ def test_a_batch_is_published_and_can_be_pulled_back(topic_and_subscription) -> 
     assert sink.losses().failed == 0
 
 
-def test_flush_resolves_the_pending_futures(topic_and_subscription) -> None:
-    publisher, subscriber, topic, subscription = topic_and_subscription
-    # `max_pending` is pinned rather than left to the default, and it is not inert even though
-    # it currently equals it: `_reap` trims the pending list down to this bound at the end of
-    # every `emit`, so a default lowered below the batch size would drain the futures inside
-    # `emit` and make the precondition below vacuous.
-    sink = GooglePubSubSink(topic, client=publisher, max_pending=1000)
+def test_emit_returns_once_every_publish_is_resolved(topic_and_subscription) -> None:
+    """SPEC-094 FR-002: the round waits on its own futures, so none is pending when emit returns.
 
-    # The property under test is that `flush()` RESOLVES the pending futures (SPEC-036 FR-002:
-    # `emit` appends an unresolved future and, before the hook existed, nothing but `close()`
-    # ever called `result()` on one). Asserting only that the messages arrive would stay green
-    # with the flush deleted, since the client publishes on its own 10 ms batch latency anyway.
-    # So the assertion is on the sink's pending list -- which `_reap` and `close` also empty,
-    # but neither of those runs between the emit and the flush below.
-    #
-    # The precondition is retried rather than asserted once. Nothing here holds the futures
-    # open: the client settles them on its own ~10 ms batch latency, so a stall between the
-    # last `publish()` and the assertion could empty the list and fail a correct sink. Emitting
-    # until some are outstanding makes the setup robust without weakening what is asserted.
-    deadline = time.monotonic() + 30.0
-    while not sink._futures and time.monotonic() < deadline:
-        sink.emit([{"n": n} for n in range(20)])
-    assert sink._futures, "precondition: emit must leave unresolved futures for flush to resolve"
+    This replaced SPEC-036's test that ``flush()`` resolved a pending list, a list the round no
+    longer keeps. The client's futures are captured as it hands them out, and every one must be
+    done the moment ``emit`` returns; asserting only that the messages arrive would stay green
+    with the wait deleted, since the client publishes on its own ~10 ms batch latency anyway.
+    """
+    publisher, subscriber, topic, subscription = topic_and_subscription
+    handed: list = []
+
+    class Capturing:
+        def publish(self, topic, data=None, **attrs):
+            future = publisher.publish(topic, data=data, **attrs)
+            handed.append(future)
+            return future
+
+    sink = GooglePubSubSink(topic, client=Capturing())
+    sink.emit([{"n": n} for n in range(20)])
+    assert len(handed) == 20
+    assert all(future.done() for future in handed), "emit returned with publishes still pending"
+    assert sink.losses().failed == 0
 
     sink.flush()
-    assert sink._futures == [], "flush returned with publishes still pending"
-
-    assert pull(subscriber, subscription, 20)
+    assert sorted(message["n"] for message in pull(subscriber, subscription, 20)) == list(range(20))
     sink.close()

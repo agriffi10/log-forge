@@ -212,7 +212,7 @@ class _Raising:
 
     def send_message_batch(self, *, QueueUrl, Entries):
         self._go([e["MessageBody"] for e in Entries])
-        return {}
+        return {"Successful": [{"Id": e["Id"]} for e in Entries], "Failed": []}
 
 
 def test_a_client_failure_costs_its_chunk_not_the_batch(capsys) -> None:

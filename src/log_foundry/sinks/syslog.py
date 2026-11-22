@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from log_foundry import _diag
 from log_foundry.sinks._args import ReadOnlyCount, store_read_only
 from log_foundry.sinks._engine import emit_via_deliver
-from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport
+from log_foundry.sinks._socket import DEFAULT_MAX_DATAGRAM_BYTES, SocketTransport, require_ack_wait
 
 if TYPE_CHECKING:
     import threading
@@ -83,6 +83,7 @@ class SyslogSink:
         timeout: float = 5.0,
         max_retries: int = 3,
         max_datagram_bytes: int = DEFAULT_MAX_DATAGRAM_BYTES,
+        ack_wait: bool | None = None,
     ) -> None:
         """Configures the destination, framing and message identity.
 
@@ -104,17 +105,21 @@ class SyslogSink:
           max_datagram_bytes: The largest UDP datagram to attempt; a frame over it is dropped
             and counted rather than sent, retried and abandoned (SPEC-038 FR-007). Ignored for
             TCP, which is a stream.
+          ack_wait: For TCP, whether each round ends by waiting, up to 0.25 s, for the peer to
+            acknowledge what it wrote, so frames a closed peer discarded are counted (SPEC-093
+            FR-001). ``None``, the default, waits; ``False`` checks once without waiting.
 
         Returns:
           None.
 
         Raises:
           TypeError: If ``port`` or ``max_retries`` is not an ``int`` (SPEC-066), refused by the
-            transport this sink builds.
+            transport this sink builds, or ``ack_wait`` is neither ``None`` nor a ``bool``.
           ValueError: If the facility is not one of the supported keywords, or ``app_name`` is
             empty or contains whitespace, or the transport refuses ``port``, ``timeout`` or
-            ``max_datagram_bytes``.
+            ``max_datagram_bytes``, or ``ack_wait`` is given for UDP.
         """
+        wait_for_ack = require_ack_wait(ack_wait, _diag.type_name(self), transport)
         if facility not in _FACILITY:
             raise ValueError(f"invalid facility {facility!r}; expected one of {sorted(_FACILITY)}")
         if not app_name or any(char.isspace() for char in app_name):
@@ -135,6 +140,7 @@ class SyslogSink:
             max_datagram_bytes=max_datagram_bytes,
             frame=self._frame,
             sink_name=_diag.type_name(self),
+            ack_wait=wait_for_ack,
         )
         store_read_only(self, "max_retries", self._socket.max_retries)
         self.log_foundry_counters = self._socket.log_foundry_counters
