@@ -18,15 +18,21 @@ criteria name a platform and the build records what each platform read.
   `tests/test_socket_ack_check.py`, on macOS and (with `--docker`) Linux.
 - SPEC-093 FR-005: rule 4 removed, the liveness probe removed, `confirm_delivery` never called,
   each through `tests/test_conformance.py`; and the verdict comparison of criterion 2, the
-  settlement commit's corpus and SPEC-092's delivered corpus each against `origin/main`'s `src`
-  and the settlement commit's `src`.
+  settlement commit's corpus and SPEC-092's delivered corpus each against the build's first base's
+  `src` and the settlement commit's `src`. **That comparison needs the settlement commit
+  `a17a28a4`, a local commit of the build on base `c67931cd`, before SPEC-095 landed; it was
+  squashed away before the merge and is not on the remote, so in a clone without it the
+  comparison is skipped with a message.**
 - SPEC-094 FR-001 and FR-002: the per-round wait as one blocking flush, the first slice ending at
   the wait's start, the pause removed and `pause_on` answering the set signal, each read through
   `spec094_stuck_partition.py` and `spec094_first_slice_and_pause.py`, which print wall time, CPU
   time and outcomes.
 - SPEC-094 FR-003: the Kafka wait removed and the Pub/Sub double's local `PermissionDenied`, through
-  `tests/test_conformance.py`; and criterion 2, `HEAD`'s corpus against the settlement commit's
-  `src` and `HEAD`'s.
+  `tests/test_conformance.py`.
+- The rebase onto SPEC-095 and SPEC-098: `origin/main`'s corpus judged against its own `src`, at
+  the commit the build was rebased onto, beside `HEAD`'s corpus against `HEAD`'s `src`, printing
+  every shared row whose verdict moved and every row only one side has. That is SPEC-093 FR-005's
+  and SPEC-094 FR-003's second criteria read on the merged tree.
 - The probes the criteria name, against `HEAD`: `probe_socket.py` (and in Docker), `probe_misc.py`,
   `probe_sqs.py`, `probe_aws_more.py`, `spec094_stuck_partition.py`.
 """
@@ -45,9 +51,11 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[4]
 PROBES = "docs/audits/2026-11-14-probes/sinks"
 SETTLEMENT = "a17a28a4"
-"""SPEC-093's settlement commit: its corpus literals read 268, 62, 15 and 191."""
+"""SPEC-093's settlement commit, local to the build: its corpus read 268, 62, 15 and 191."""
 MAIN = "c67931cd"
-"""`origin/main` when the build began."""
+"""`origin/main` when the build began, before SPEC-095 and SPEC-098 landed."""
+REBASED_ONTO = "295ba803"
+"""`origin/main` when the build was rebased, with SPEC-095 and SPEC-098 landed."""
 
 SOCKET_TESTS = ["tests/test_socket_close_corpus.py", "tests/test_socket_ack_check.py"]
 CORPUS = ["tests/test_conformance.py"]
@@ -389,7 +397,7 @@ def verdicts(tree: pathlib.Path, corpus: pathlib.Path) -> dict[str, list[str]]:
 
 
 def compare(label: str, before: dict[str, list[str]], after: dict[str, list[str]]) -> None:
-    """Prints the shared rows whose verdict differs."""
+    """Prints the shared rows whose verdict differs, then the rows only one side has."""
     shared = sorted(set(before) & set(after))
     moved = [r for r in shared if before[r] != after[r]]
     print(f"  {label}: {len(shared)} shared rows, {len(moved)} moved")
@@ -397,6 +405,23 @@ def compare(label: str, before: dict[str, list[str]], after: dict[str, list[str]
         print(
             f"      {row}: {'+'.join(before[row]) or 'green'} -> {'+'.join(after[row]) or 'green'}"
         )
+    for side, only in (("before", set(before) - set(after)), ("after", set(after) - set(before))):
+        if only:
+            print(f"    {len(only)} row(s) only {side}:")
+        for row in sorted(only):
+            verdict = (before if side == "before" else after)[row]
+            print(f"      {row}: {'+'.join(verdict) or 'green'}")
+
+
+def have(ref: str) -> bool:
+    """Whether this clone holds the commit `ref`."""
+    return (
+        subprocess.run(
+            ["git", "-C", str(ROOT), "cat-file", "-e", f"{ref}^{{commit}}"],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
 
 
 def main() -> int:
@@ -447,23 +472,33 @@ def main() -> int:
                 print(f"  probe {script}:\n    " + probe(tree, script).replace("\n", "\n    "))
         if not wanted or "comparisons" in wanted:
             print("\n== verdict comparisons")
-            settled, main_tree = work / "settlement", work / "main"
-            export(SETTLEMENT, settled)
-            export(MAIN, main_tree)
-            print("  SPEC-093 FR-005 criterion 2, the settlement corpus:")
-            compare(
-                "main src -> settlement src",
-                verdicts(main_tree, settled),
-                verdicts(settled, settled),
-            )
-            print("  SPEC-093 FR-005 criterion 2, SPEC-092's delivered corpus:")
-            compare(
-                "main src -> settlement src",
-                verdicts(main_tree, main_tree),
-                verdicts(settled, main_tree),
-            )
-            print("  SPEC-094 FR-003 criterion 2, HEAD's corpus:")
-            compare("settlement src -> HEAD src", verdicts(settled, base), verdicts(base, base))
+            if have(SETTLEMENT):
+                settled, main_tree = work / "settlement", work / "main"
+                export(SETTLEMENT, settled)
+                export(MAIN, main_tree)
+                print(f"  SPEC-093 FR-005 criterion 2, the settlement corpus, on base {MAIN}:")
+                compare(
+                    "main src -> settlement src",
+                    verdicts(main_tree, settled),
+                    verdicts(settled, settled),
+                )
+                print("  SPEC-093 FR-005 criterion 2, SPEC-092's delivered corpus:")
+                compare(
+                    "main src -> settlement src",
+                    verdicts(main_tree, main_tree),
+                    verdicts(settled, main_tree),
+                )
+            else:
+                print(
+                    f"  skipped: the settlement commit {SETTLEMENT} is not in this clone; it was "
+                    f"a local commit of the SPEC-093/094 build on base {MAIN}, squashed away "
+                    "before the merge, and its comparison is recorded in "
+                    "spec093_094_build_results.txt"
+                )
+            onto = work / "onto"
+            export(REBASED_ONTO, onto)
+            print(f"  The rebase: {REBASED_ONTO}'s corpus and src -> HEAD's corpus and src:")
+            compare(f"{REBASED_ONTO} -> HEAD", verdicts(onto, onto), verdicts(base, base))
         if not wanted or "probes" in wanted:
             print(f"\n== probes against HEAD; imports {imports_from(base)}")
             for script in (
