@@ -1298,7 +1298,8 @@ def test_resume_resets_the_stop_gate_and_replaces_a_set_stop_event() -> None:
         assert worker._exit_deadline is None
         assert worker._stop is not inherited and worker._stop.is_set() is False
         assert worker._stop is _lifecycle._state._stop, "the owner and the worker share it"
-        assert sink.log_foundry_stop_signal is worker._stop, "and the sink was offered it"
+        own = _lifecycle._state._signals[id(sink)][1]
+        assert sink.log_foundry_stop_signal is own, "the sink keeps its own event (SPEC-098)"
     finally:
         worker.stop(2.0)
         worker._thread.join(5.0)

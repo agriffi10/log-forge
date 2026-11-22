@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-098
 title: "One Stable Stop Signal per Sink, Handed Once per Installation"
 description: "Gives every sink the library delivers to one threading.Event of its own, assigned through log_foundry_stop_signal at its first delivery and again only when a configure() installs it anew, set by every stop, cleared by such a configure() when no stop is running, and kept in a forked child by re-initialising it in place, so no fork repair runs sink code and the machinery that chose which event a sink holds is deleted, while a 1.x sink written to the README's protocol keeps working unchanged."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-027, SPEC-033, SPEC-042, SPEC-054, SPEC-079, SPEC-081, SPEC-083, SPEC-085, SPEC-086, SPEC-097]
 arc: audit-2026-11-14
 arc_order: 14
@@ -93,6 +93,13 @@ first hand takes `_owned_lock`. Its callers are every place a sink is first reac
 - the worker build, after its section;
 - the no-worker swap, after the section that arms the sink it installs, and `Worker.retarget` on the
   worker branch;
+- `Worker.retarget`'s same-sink return, `fenced` at once when the sink is already the worker's, so
+  a `configure()` that installs that sink again, and so unhands it, hands it again before it
+  returns;
+- the drain thread's batch, before it emits to the worker's current sink, since a batch another
+  thread queued can reach the sink before the build's or the retarget's offer has landed;
+- `flush()`, for each owed sink before its own `flush`, since a sink the worker build armed may not
+  yet have been offered;
 - the fork resume, which finds the sink already handed and assigns nothing;
 - the factory wrapper, for the sink its factory built.
 
@@ -541,3 +548,9 @@ each test's intent beyond what its source says. A run on Linux.
 - Rejected while prototyping: marking a sink handed before its setter returned, which let another
   thread's log reach the sink holding no event; seeding the fork by the sink table (`orphanwrap.py`'s
   child rows 4.7 s); keeping the signal set through a `configure()` (the `GooglePubSubSink` losses).
+- 2026-11-20, revised during the build: FR-001's offer sites are eight, not five. The plan review
+  added the drain thread's batch (M-1: a span queued by another thread reached a sink whose build
+  setter was still parked, `['none']` at `463894aa`), and the build added `flush()` (D-3a) and
+  `Worker.retarget`'s same-sink `fenced` return (D-3b). Each serves the requirement's "never reached
+  without it": without the first two a sink could be reached before it held its event, and without
+  the third a sink a `configure()` installs again would stay unhanded.

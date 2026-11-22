@@ -125,7 +125,7 @@ _SIGNAL_ROWS = {
     "submit/shutdown": set(),
     "flush-section/flush": set(),
     "flush-section/configure": set(),
-    "orphan-arm/info": {"_lifecycle.py:_arm_and_hand"},
+    "orphan-arm/info": {"_lifecycle.py:_note_orphan_emit"},
     "submit/span": {"worker.py:_enqueue"},
     "flush-section/info": set(),
     "rebind/shutdown": set(),
@@ -154,7 +154,8 @@ def test_a_handlers_level_or_traced_call_re_enters_only_where_designed(
     locks replaced by the recorder. A handler's lifecycle call is held and takes no lock, so it
     records nothing; a handler's level call or traced call is not held and re-enters the lock its
     thread holds, which is FR-005's admitted re-entry. Two rows make one each: the orphan log
-    re-enters ``_state._lock`` in ``_arm_and_hand``, and the traced call's submit re-enters the
+    re-enters ``_state._lock`` in ``_note_orphan_emit`` (``_arm_and_hand`` until SPEC-098), and
+    the traced call's submit re-enters the
     queue's mutex in ``Worker._enqueue``, where its ``put`` runs. Every other row records none.
     """
     record = tmp_path / "reentry.txt"

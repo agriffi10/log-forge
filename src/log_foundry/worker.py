@@ -882,10 +882,11 @@ class Worker:
             refined by SPEC-090 FR-003: the first attempt of the first exit batch is always
             made, and a later exit batch is declined unattempted once one is predicted to end
             after the deadline.
-          offer_signal: ``False`` when the owner hands the sink this worker's ``_stop`` itself,
-            after releasing its lock. The library's own build does: the offer runs the sink's
-            setter, and a setter that logs or calls ``configure()`` waited on the lock the build
-            held (``_lifecycle._get_worker``).
+          offer_signal: ``False`` when the owner offers the sink its stop signal itself, after
+            releasing its lock. The library's own build does: the offer runs the sink's setter,
+            and a setter that logs or calls ``configure()`` waited on the lock the build held
+            (``_lifecycle._get_worker``). The signal offered is the sink's own
+            (``_lifecycle.offer_once``, SPEC-098), never this worker's ``_stop``.
           sweep: The sweep of open spans the drain runs about once a flush interval, or ``None``
             (SPEC-091 FR-002). The library's own build passes ``decorator._sweep_registered`` and
             nothing else passes one, so a worker a test builds by hand sweeps nothing and this
@@ -943,7 +944,7 @@ class Worker:
         self._exit_fold = _diag.FoldTable()
         self._sweep = sweep
         if offer_signal:
-            _lifecycle.offer_stop_signal(sink, self._stop)
+            _lifecycle.offer_once(sink)
         self._thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         self._thread.start()
 
@@ -1010,9 +1011,9 @@ class Worker:
         clears ``_stopped``, ``_join_owed`` and ``_join_taken_over`` and takes its event from
         :meth:`~log_foundry._lifecycle.Runtime.refresh_stop_signal`, the call ``__init__``
         makes: the owner's current event when that is unset, so a worker never stopped keeps the
-        event it had and the identity with the owner and the sink is unchanged, and a fresh one
-        shared with the owner when it is set. It runs before the stop signal is offered, so the
-        sink is handed the new event. The owner's lock is not taken, for the reason
+        event it had and the identity with the owner is unchanged, and a fresh one shared with the
+        owner when it is set. The sink is not handed it: a sink holds its own event (SPEC-098).
+        The owner's lock is not taken, for the reason
         :func:`_lifecycle._rebuild_worker_after_fork` gives. The retired branch keeps all three
         as inherited — a fork does not undo a ``shutdown()`` — and an owed join inherited there is
         harmless: the next ``shutdown()`` in that child takes it over, finds ``_drain_finished``
@@ -1039,26 +1040,20 @@ class Worker:
         describe the thread starting here rather than the one that did not survive the fork;
         retiring **sets** them, because no thread will ever set them and a child forked while a
         ``shutdown()`` was mid-join otherwise inherits them unset with nothing to settle them.
-        Two consequences, both measured: that child paid the whole 30 s budget at exit and with
-        ``shutdown(timeout=None)`` would never exit at all, and — reaching further —
-        ``_lifecycle._will_hand`` reads it as still draining and skips, leaving the sink holding
-        a **set** stop event, so every later backoff returns instantly against a destination
-        that is already refusing (SPEC-033 FR-004). ``_drain_finished`` has no reader on a
+        Measured: that child paid the whole 30 s budget at exit and with
+        ``shutdown(timeout=None)`` would never exit at all. ``_drain_finished`` has no reader on a
         retired worker and is set for the invariant rather than for an observable: settled with
         finished clear is what :attr:`draining` defines as an *abandoned* drain, and a child
         reporting no ``stopped_reason`` must not read that way. ``_drain_accounted`` (SPEC-089)
         follows the other two: cleared for the thread starting here, so a ``flush()`` waiting out
         a dying drain waits on that thread, and set where no thread will run, since nothing is
-        left to debit. The stop signal is re-offered for
-        the sink the fork walk cannot reach: a **third-party** sink is outside its ownership
-        boundary, so it would keep pointing at the pre-fork event while this worker sets a new
-        one — SPEC-027's guarantee broken by the repair meant to preserve it. **Except a sink the
-        forking thread is being offered** (SPEC-083 FR-004), which :func:`_lifecycle.handing_here`
-        reports: this handler runs in the child nested inside that sink's setter call, so offering
-        it here ran the setter inside itself, and a setter holding its own lock hung the child
-        before its first line, on the worker build's hand and on ``retarget``'s (measured at
-        ``53b68203``). That sink keeps the event it holds, which the child's fork handler kept
-        and its ``shutdown()`` sets (``_lifecycle._clear_after_fork``, FR-003).
+        left to debit. The sink is offered its stop signal through ``_lifecycle.offer_once``,
+        which in a child finds it already handed and assigns nothing (SPEC-098 FR-003): the
+        child's seed kept every event the parent made, re-initialised in place, and marked handed
+        a sink the forking thread was being offered, so no setter runs in the repair, including
+        one this handler is nested inside, which hung a setter holding its own lock
+        (SPEC-083 FR-004, measured at ``53b68203``). Only a sink the library never reached,
+        a factory child's adopted wrapper, is offered here for the first time.
 
         **The new thread is only installed once it has started**, which ``__init__`` never had
         to consider: a constructor whose ``start`` raises lets no ``Worker`` escape, while here
@@ -1135,8 +1130,7 @@ class Worker:
         self._drain_finished.clear()
         self._drain_settled.clear()
         self._drain_accounted.clear()
-        if not _lifecycle.handing_here(self.sink):
-            _lifecycle.offer_stop_signal(self.sink, self._stop)
+        _lifecycle.offer_once(self.sink)
         thread = threading.Thread(target=self._run, name="log-foundry-worker", daemon=True)
         try:
             thread.start()
@@ -1893,15 +1887,14 @@ class Worker:
         from that comparison and nowhere else. ``old`` stays among the sinks this thread may be
         inside on every verdict but ``fenced``.
 
-        **The new sink is handed this worker's signal after the reassign, through**
-        :func:`_lifecycle._hand_retargeted`, **which defers into a stop's close.** A swap during
-        a ``shutdown()`` can retarget a late or tail worker onto a sink that stop is closing, and
-        that close is already waiting on the signal the stop set; handing it this worker's unset
-        ``_stop`` made it wait out the sink's whole backoff — measured at ``a8e91fac``, 4.01 s for
-        a ``shutdown(timeout=1)``. So while a stop is running and a close of the sink is in
-        flight, the hand marks that close and is paid when it ends, as a worker build's is.
-        Outside a stop the hand is made at once, here, with no library lock held but
-        ``config._sink_lock``, as it always was.
+        **The new sink is offered its own stop signal after the reassign**
+        (``_lifecycle.offer_once``, SPEC-098), with no library lock held but
+        ``config._sink_lock``, as it always was, and so is a sink already this worker's when the
+        call returns ``fenced`` at once: a ``configure()`` installing it again cleared and
+        unhanded its event, and it is handed again here before the call returns. A sink a stop is
+        closing is handed its own event, which that stop set, so the close is not held by the
+        hand; before SPEC-098 it was handed this worker's unset ``_stop`` and the hand deferred
+        into a mark.
 
         **A first drain that failed stays** ``unfenced`` **even when that shutdown lands after the
         reassign**, deliberately. That drain really was unconfirmed, and the verdict reports the
@@ -1937,27 +1930,30 @@ class Worker:
 
         Raises:
           BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from the new sink's own
-            ``log_foundry_stop_signal`` setter, while it is handed this worker's signal or while a
-            mark that hand made is paid (``_lifecycle._hand_retargeted``);
+            ``log_foundry_stop_signal`` setter, while it is handed its signal;
             ``_lifecycle.offer_stop_signal`` absorbs an ``Exception`` from it.
         """
         with self._lock:
             if _lifecycle_state.retirements > self._epoch:
                 return SwapOutcome(verdict="declined", previous=self.sink)
-            if self.sink is new_sink:
-                return SwapOutcome(verdict="fenced", previous=new_sink)
+            same = self.sink is new_sink
+        if same:
+            _lifecycle.offer_once(new_sink)
+            return SwapOutcome(verdict="fenced", previous=new_sink)
         timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
         drained = self.flush(timeout)
         with self._lock:
             if _lifecycle_state.retirements > self._epoch:
                 return SwapOutcome(verdict="declined", previous=self.sink)
             old = self.sink
-            if old is new_sink:
-                return SwapOutcome(verdict="fenced", previous=new_sink)
-            self.sink = new_sink
-            self._sink_generation += 1
-            self._held = [held for held in self._held if held is not new_sink] + [new_sink]
-        _lifecycle._hand_retargeted(new_sink, self._stop)
+            same = old is new_sink
+            if not same:
+                self.sink = new_sink
+                self._sink_generation += 1
+                self._held = [held for held in self._held if held is not new_sink] + [new_sink]
+        _lifecycle.offer_once(new_sink)
+        if same:
+            return SwapOutcome(verdict="fenced", previous=new_sink)
         remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
         if not drained:
             self._record_incomplete_swap(timeout, old)
@@ -1982,7 +1978,8 @@ class Worker:
         **Liveness, not** ``draining``. After an expired ``shutdown()`` the drain is marked settled
         while the thread is still inside ``emit``, and the closer must treat that as still inside
         so the sink is left open (SPEC-027 FR-004) — the opposite answer from the one the signal
-        refresh needs in the same state, which is why the moment is two predicates rather than one.
+        refresh needed in the same state, which is why the moment was two predicates until SPEC-098
+        deleted the refresh.
 
         Takes no lock, which is arch §9.2's rule for a question. ``_held`` is **rebound** rather
         than mutated in place, so a read is one atomic reference load and the list this iterates
@@ -3297,6 +3294,15 @@ class Worker:
         line counts the batch as it was before the run, so a ``deliver`` that mutates the list it
         was handed cannot change it.
 
+        **The sink holds its stop signal before the batch reaches it** (SPEC-098 FR-001): the
+        batch first offers the worker's current sink its own signal through
+        ``_lifecycle.offer_once``, one lock-free read for a sink already handed. The build and
+        ``retarget`` offer after their sections, with no lock held, so a batch another thread's
+        span queued in between reached the sink first: measured at ``463894aa``, a sink whose
+        build setter was parked was emitted to holding no signal. A first offer here runs the
+        setter on this thread; a setter that waits for a concurrent first offer of the same sink
+        holds this batch until that offer's setter returns.
+
         A failing ``sink.emit`` is retried up to ``max_retries`` times; past that the batch is
         abandoned with a counted warning and draining continues, so a broken sink never crashes
         the worker thread or the app (FR-002, FR-003). The backoff waits on the stop event, so
@@ -3400,12 +3406,13 @@ class Worker:
           with the counter a waiting ``flush()`` is compared against (SPEC-021 FR-001).
 
         Raises:
-          BaseException: Whatever ``sink.emit`` raises that is not an ``Exception``;
-            :meth:`_run` is the guard.
+          BaseException: Whatever ``sink.emit``, or the sink's stop-signal setter at its first
+            offer, raises that is not an ``Exception``; :meth:`_run` is the guard.
         """
         batch = [event for events in event_lists for event in events]
         if not batch:
             return
+        _lifecycle.offer_once(self.sink)
         retries = max(self.max_retries, 0)
         longest = 0.0
         size = len(batch)

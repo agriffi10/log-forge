@@ -10,6 +10,7 @@ import gc
 import sys
 import threading
 import time
+import weakref
 from typing import ClassVar
 
 import pytest
@@ -646,10 +647,10 @@ def _reset_worker() -> None:
     record lock is released, so a finalizer they run meets no lock, and the three once-only
     announcement flags SPEC-081 adds are reset with it.
 
-    SPEC-083 adds the offer record, the stale signals a child keeps, and the offers a child shares
-    between its threads with the count it inherited. Only a forked child writes the last three,
-    and every offer pops its own entry, so all of them are already empty here. They are
-    reset beside the other thread-locals so that each test starts from the same runtime.
+    SPEC-083 adds the offer record; every offer pops its own entry, so it is already empty here,
+    and it is reset beside the other thread-locals so that each test starts from the same
+    runtime. SPEC-098 adds the stop-signal table and the event set, cleared under the record lock
+    with the ownership record and dropped after it is released, for the record's reason.
 
     SPEC-091 adds the open-span registry and the deferred closes. The registry is process-wide,
     so a span a test leaves open, on a parked thread or in a coroutine it never finishes, would
@@ -676,11 +677,8 @@ def _reset_worker() -> None:
     _lifecycle._state._stop = threading.Event()
     _lifecycle._state._shutdown_running = 0
     _lifecycle._state._late_worker = None
-    _lifecycle._state._signal_owed = False
     _lifecycle._state._swaps_running.clear()
     _lifecycle._state._stops_running.clear()
-    _lifecycle._state._hands_running.clear()
-    _lifecycle._state._handing_here = threading.local()
     _lifecycle._state._building_here = threading.local()
     _lifecycle._state._releasing_here = threading.local()
     _lifecycle._state._offering_here = threading.local()
@@ -689,16 +687,16 @@ def _reset_worker() -> None:
     from log_foundry import config as config_module
 
     config_module._sink_holder = None
-    _lifecycle._state._stale_signals = []
-    _lifecycle._state._fork_offers = []
-    _lifecycle._state._fork_inherited = 0
     ledger_check.restart()
     with _lifecycle._state._closes._lock:
         _lifecycle._state._closes._in_flight.clear()
     with _lifecycle._state._owned_lock:
         dropped = dict(_lifecycle._state._owned)
         _lifecycle._state._owned.clear()
-    del dropped
+        signals = dict(_lifecycle._state._signals)
+        _lifecycle._state._signals.clear()
+        _lifecycle._state._signal_events = weakref.WeakSet()
+    del dropped, signals
     _lifecycle._state._marking_failed = False
     _lifecycle._state._capture_announced = False
     _lifecycle._state._stamp_refusal_announced = False

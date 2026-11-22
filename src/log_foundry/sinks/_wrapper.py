@@ -24,7 +24,9 @@ class _Forwards(Protocol):
         """Hands the signal on.
 
         Args:
-          signal: The worker's shutdown event, or ``None``.
+          signal: The wrapper's own stop signal, which it forwards (SPEC-098): set when a
+            shutdown starts, staying set for a delivery after it, and cleared when
+            ``configure()`` installs the sink again; or ``None``.
 
         Returns:
           None.
@@ -91,7 +93,9 @@ class ForwardedStopSignal:
 
         Args:
           obj: The wrapper.
-          value: The worker's shutdown event, or ``None``.
+          value: The wrapper's own stop signal, which it forwards (SPEC-098): set when a
+            shutdown starts, staying set for a delivery after it, and cleared when
+            ``configure()`` installs the sink again; or ``None``.
 
         Returns:
           None.

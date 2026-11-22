@@ -1,8 +1,15 @@
 ---
 type: Decision
 title: "A hand while a stop has a take ahead hands the current signal and never refreshes it"
-description: "while a `shutdown()` still has a take of the owed record ahead of it (`Runtime._take_ahead`), the orphan log's locked branch and `flush()`'s section hand a sink the current stop signal as it is, set or not, and open a hand token only when they publish an arm, a cleared debt or a real refresh (`_refreshes`); the swap's no-worker branch returns before its hand while a take is ahead, and the factory wrapper only relays what it was handed. Never gate it on the whole stop (`_stops_running`), never pay a refusal through a mark or `_signal_owed`. (fix after SPEC-079)"
+description: "**Superseded by SPEC-098**: no hand refreshes a signal any more, because a sink holds one stop signal of its own, set by every stop and cleared only by a `configure()` that installs it again with no stop running; `_refreshes`, the hand tokens and the debt are deleted, and a hand while a take is ahead assigns a sink already handed nothing. The entry below is kept for the defect it measured. (fix after SPEC-079; SPEC-098)"
 ---
+
+> **Superseded by SPEC-098 (2026-11-20).** The defect below was a hand during a stop's take-ahead
+> replacing the set signal with a fresh unset one, which the take's close then waited on. Since
+> SPEC-098 no hand creates or replaces an event: a sink's own event is made at its first
+> delivery, made set when a stop is running, set by every stop's entry, and cleared only by a
+> `configure()` that installs the sink again while no stop runs. `_refreshes`, the hand tokens
+> and the debt this entry names are deleted. `Runtime._take_ahead` stays, for the swap's decline.
 
 **The defect.** `_shutdown_worker` sets the process's stop signal in its entry section and takes
 the owed sinks later: after the swaps it awaits, after `Worker.stop` on the worker branch, and for a
@@ -86,6 +93,11 @@ on a set event whichever hand delivered it
 holds there too.
 
 ## History
+
+### 2026-11-20
+
+- **Superseded** by SPEC-098: with one event per sink, no hand refreshes, so the rule has
+  nothing left to bound; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6).
 
 ### 2026-11-13
 

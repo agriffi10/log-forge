@@ -34,9 +34,11 @@ def wait(delay: float, stop: threading.Event | None = None) -> None:
       delay: Seconds to wait. A finite delay larger than :data:`MAX_WAIT` is capped rather than
         passed through, because both primitives raise ``OverflowError`` past the platform's
         ``time_t`` and "total" has to mean total.
-      stop: The worker's shutdown event when the sink was given one, and ``None`` for a sink
-        used standalone, which then waits exactly as it did before this spec. With no event
-        there is nothing to wait on, so that path falls back to ``time.sleep``.
+      stop: The sink's own stop signal when the library gave it one (SPEC-098): set when a
+        shutdown starts, staying set for a delivery after it, and cleared when ``configure()``
+        installs the sink again. ``None`` for a sink used standalone, which then waits exactly as
+        it did before this spec. With no event there is nothing to wait on, so that path falls
+        back to ``time.sleep``.
 
     Returns:
       None.

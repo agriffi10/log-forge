@@ -102,9 +102,11 @@ class Sink(Protocol):
 
     A fourth is optional in the same way and is an attribute rather than a method:
     ``log_foundry_stop_signal``. A sink that defines it — a plain
-    ``threading.Event | None``, initialised to ``None`` — is handed the worker's shutdown event
-    whenever the library takes ownership of it, and a sink that does not is simply never
-    offered one. **Honouring it is how a retrying sink stays interruptible** (SPEC-027): the
+    ``threading.Event | None``, initialised to ``None`` — is handed an event of its own at its
+    first delivery (SPEC-098): set when a shutdown starts, staying set for a delivery after it,
+    and cleared when ``configure()`` installs the sink again, which hands it again; a wrapper
+    forwards its own to what it wraps. A sink that does not define it is simply never offered
+    one. **Honouring it is how a retrying sink stays interruptible** (SPEC-027): the
     worker owns a single drain thread, so a sink's backoff is a global pause on log delivery
     held across ``shutdown()``, which joins that thread. Pass it to ``sinks/_retry.wait`` — or
     wait on it directly — rather than calling ``time.sleep``, or a shutdown cannot cut the

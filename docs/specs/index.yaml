@@ -655,7 +655,7 @@ specs:
   - id: "SPEC-098"
     title: "One Stable Stop Signal per Sink, Handed Once per Installation"
     description: "Gives every sink the library delivers to one threading.Event of its own, assigned through log_foundry_stop_signal at its first delivery and again only when a configure() installs it anew, set by every stop, cleared by such a configure() when no stop is running, and kept in a forked child by re-initialising it in place, so no fork repair runs sink code and the machinery that chose which event a sink holds is deleted, while a 1.x sink written to the README's protocol keeps working unchanged."
-    spec_status: "Draft"
+    spec_status: "Completed"
     depends_on: ["SPEC-027", "SPEC-033", "SPEC-042", "SPEC-054", "SPEC-079", "SPEC-081", "SPEC-083", "SPEC-085", "SPEC-086", "SPEC-097"]
     arc: "audit-2026-11-14"
     path: "docs/specs/SPEC-098-one-stable-stop-signal-per-sink.md"

@@ -494,10 +494,12 @@ class _BackingOff:
         pass
 
 
-def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff, via: str) -> str:
+def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff, via: str, top: object) -> str:
     """Runs in a child: a log or a flush backs off, then ``shutdown()`` must cut that wait short.
 
     Only the child's first entry backs off, so ``shutdown()`` reaching the sink itself does not.
+    ``own_signal`` is whether the sink still holds the event the library made for ``top``, the
+    configured sink, which the child kept in place (SPEC-098 FR-003).
     """
     no_worker = _lifecycle._state.live_worker() is None
     sink.back_off = True
@@ -513,7 +515,7 @@ def _shutdown_cuts_an_orphan_backoff(sink: _BackingOff, via: str) -> str:
     log_foundry.shutdown(5.0)
     emitter.join(BACKOFF * 0.6)
     elapsed = time.monotonic() - began
-    own = sink.log_foundry_stop_signal is _lifecycle._state._stop
+    own = sink.log_foundry_stop_signal is _lifecycle._state._signals[id(top)][1]
     return (
         f"no_live_worker={no_worker} inside={inside} own_signal={own} "
         f"done={not emitter.is_alive()} cut={elapsed < BACKOFF / 2} elapsed={elapsed:.2f}"
@@ -551,26 +553,36 @@ def test_shutdown_in_a_workerless_child_cuts_short_an_orphan_backoff(
 
     ``own_signal`` is the reason and ``cut`` the consequence: the ceiling is half the backoff
     the defect leaves uncut (``tests/README.md``).
+
+    Since SPEC-098 the sink holds the event the library made for the configured sink, its own or,
+    inside the ``MultiSink``, the wrapper's forwarded one; the child keeps that object in place and
+    its ``shutdown()`` sets it, so no hand is owed in the child at all. In the retired-worker row
+    the parent's ``shutdown()`` already set it, and the child inherits it set (FR-002), so the
+    backoff collapses before the child's ``shutdown()``, which is still the cut the row asserts.
     """
     sink = _BackingOff()
     _KEEP.append(sink)
-    log_foundry.configure(service="orphan-backoff", sink=MultiSink(sink) if wrapped else sink)
+    top: object = MultiSink(sink) if wrapped else sink
+    log_foundry.configure(service="orphan-backoff", sink=top)
     if retired:
         _traced()
         log_foundry.shutdown(5.0)
     log_foundry.info("parent")
     assert (_lifecycle._state.worker_exists() is not None) is retired, "the precondition: a worker"
     assert _lifecycle._state.live_worker() is None, "the precondition: the orphan path"
-    assert sink.log_foundry_stop_signal is _lifecycle._state._stop, "the parent's offer landed"
+    held = sink.log_foundry_stop_signal
+    assert held is _lifecycle._state._signals[id(top)][1], "the parent's offer landed"
 
     def in_child() -> str:
         if depth == 1:
-            return _shutdown_cuts_an_orphan_backoff(sink, via)
-        grandchild = run_in_child(lambda: _shutdown_cuts_an_orphan_backoff(sink, via), timeout=20)
+            return _shutdown_cuts_an_orphan_backoff(sink, via, top)
+        grandchild = run_in_child(
+            lambda: _shutdown_cuts_an_orphan_backoff(sink, via, top), timeout=20
+        )
         return grandchild.output
 
     child = run_in_child(in_child, timeout=25)
     report = child.output
     assert report.startswith("no_live_worker=True inside=True "), f"{child.ending}: {report!r}"
-    assert "own_signal=True" in report, f"the child's sink kept the parent's signal: {report!r}"
+    assert "own_signal=True" in report, f"the child's sink lost its own signal: {report!r}"
     assert "done=True cut=True" in report, f"the backoff was not cut short: {report!r}"

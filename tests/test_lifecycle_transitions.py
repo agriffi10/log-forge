@@ -1074,7 +1074,7 @@ MOVE_BEFORE_A_WRITE = "_state._move() comes before a write of _worker, retiremen
 
 MOVE_SITES = {
     "_get_worker": 1,
-    "_arm_and_hand": 1,
+    "_note_orphan_emit": 1,
     "_shutdown_worker": 2,
     "_clear_after_fork": 1,
 }
@@ -1082,9 +1082,10 @@ MOVE_SITES = {
 
 ``_clear_after_fork`` joined at SPEC-079 (FR-004): a fork landing inside one of the four sections,
 between a field write and its ``_move``, leaves the child's stored state behind its fields, so the
-child's handler re-settles it under the lock the roster replaced. The orphan log's section is
-``_arm_and_hand`` since the stop-signal fix after SPEC-079 moved ``_note_orphan_emit``'s locked
-branch into it, leaving the fast path a condition alone.
+child's handler re-settles it under the lock the roster replaced. The orphan log's section was
+``_arm_and_hand`` from the stop-signal fix after SPEC-079 until SPEC-098 deleted that function and
+put the arm back in ``_note_orphan_emit``, under the lock only when the record does not owe the
+sink.
 """
 
 _WRITES = re.compile(r"^_state\.(_worker|retirements)$")
@@ -1179,7 +1180,7 @@ def _get_worker():
         _state._worker = worker
         _state._closes.arm(sink)
         _state._move()
-def _arm_and_hand(sink):
+def _note_orphan_emit(sink):
     with _state._lock:
         _state._closes.arm(sink)
         _state._move()
@@ -1208,8 +1209,8 @@ def _clear_after_fork():
         ),
         (
             lambda s: s.replace(
-                "        _state._closes.arm(sink)\n        _state._move()\ndef _arm",
-                "        _state._move()\n        _state._closes.arm(sink)\ndef _arm",
+                "        _state._closes.arm(sink)\n        _state._move()\ndef _note",
+                "        _state._move()\n        _state._closes.arm(sink)\ndef _note",
             ),
             MOVE_BEFORE_A_WRITE,
         ),
@@ -1222,9 +1223,9 @@ def _clear_after_fork():
         ),
         (
             lambda s: s.replace(
-                "def _arm_and_hand(sink):\n    with _state._lock:\n        _state._closes.arm(sink)\n"
+                "def _note_orphan_emit(sink):\n    with _state._lock:\n        _state._closes.arm(sink)\n"
                 "        _state._move()\n",
-                "def _arm_and_hand(sink):\n    with _state._lock:\n        _state._closes.arm(sink)\n",
+                "def _note_orphan_emit(sink):\n    with _state._lock:\n        _state._closes.arm(sink)\n",
             ),
             MOVE_MISSING,
         ),

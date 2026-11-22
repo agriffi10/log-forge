@@ -677,7 +677,12 @@ def test_a_sink_that_rejects_the_signal_loses_interruptibility_not_the_emit(caps
 
 
 def test_the_worker_keeps_its_own_signal_on_the_sink_it_owns() -> None:
-    """AC-4. Overwriting it would leave the drain thread serving a full backoff at shutdown."""
+    """AC-4. An orphan emit to the worker's sink assigns it nothing.
+
+    Overwriting the sink's event would leave the drain thread serving a full backoff at
+    shutdown. Since SPEC-098 the sink holds its own event, handed once at the worker's build,
+    which every stop sets; the orphan emit finds it handed and leaves it alone.
+    """
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
 
@@ -691,7 +696,9 @@ def test_the_worker_keeps_its_own_signal_on_the_sink_it_owns() -> None:
 
     log_foundry.info("an orphan emit against the sink the worker owns")
 
-    assert sink.log_foundry_stop_signal is worker._stop, "the worker's event, not the orphan path's"
+    own = _lifecycle._state._signals[id(sink)][1]
+    assert sink.log_foundry_stop_signal is own, "the sink's own event, handed once"
+    assert own is not worker._stop
 
 
 def test_a_sink_adopted_after_a_retired_worker_still_gets_a_signal() -> None:
@@ -716,32 +723,42 @@ def test_a_sink_adopted_after_a_retired_worker_still_gets_a_signal() -> None:
     assert not new.log_foundry_stop_signal.is_set(), "and an unset one"
 
 
-def test_a_sink_emitted_to_after_shutdown_still_backs_off() -> None:
-    """AC-6. Both cases: a newly configured sink, and the same sink logged to again.
+@pytest.mark.parametrize("case", ["newly-configured", "reconfigured", "logged-again"])
+def test_a_sink_emitted_to_after_shutdown_still_backs_off(case: str) -> None:
+    """AC-6, as SPEC-098 FR-002 leaves it: the configured sinks back off, the late log does not.
 
-    An `Event` is set once and never cleared, and `_retry.wait` returns instantly on a set one,
-    so handing a live sink the shutdown's event collapses every backoff to zero — a tight retry
-    loop against exactly the rate-limited destination the backoff exists for. Keying the refresh
-    on *arming* misses the second case, which `FR-001 AC-5` refuses to re-arm.
+    ``newly-configured``: a sink configured after the ``shutdown()`` gets its own event, unset,
+    and backs off. ``reconfigured``: the sink the shutdown set, installed again by
+    ``configure()`` with no stop running, has its event cleared in place and backs off.
+    ``logged-again``: the same sink logged to after the shutdown with no ``configure()`` between
+    keeps its own event, which the shutdown set, so its wait collapses. That case is struck from
+    SPEC-033 FR-004 AC-6 by SPEC-098, Andrew's call of 2026-11-16, for the cost FR-002 records.
+    Each row asserts what ``Event.wait`` returned: ``False`` after a wait that ran out, ``True``
+    for one a set event ended at once.
     """
-    from log_foundry.sinks import _retry as retry
-
-    same, fresh = CountingSink("same"), CountingSink("fresh")
+    same = CountingSink("same")
     log_foundry.configure(service="t", sink=same)
     log_foundry.info("before")
     log_foundry.shutdown()
 
-    log_foundry.info("same sink, after shutdown")  # latched: FR-001 AC-5 refuses to re-arm
-    log_foundry.configure(sink=fresh)
-    log_foundry.info("newly configured sink, after shutdown")
+    sink = same
+    if case == "newly-configured":
+        sink = CountingSink("fresh")
+        log_foundry.configure(sink=sink)
+    elif case == "reconfigured":
+        log_foundry.configure(sink=same)
+    log_foundry.info("after shutdown")
 
-    for label, sink in (("the same sink", same), ("a newly configured sink", fresh)):
-        signal = sink.log_foundry_stop_signal
-        assert isinstance(signal, threading.Event), f"{label} has a signal"
-        assert not signal.is_set(), f"{label}'s signal is unset"
-        start = time.monotonic()
-        retry.wait(0.3, signal)
-        assert time.monotonic() - start >= 0.25, f"{label} still backs off"
+    signal = sink.log_foundry_stop_signal
+    assert isinstance(signal, threading.Event), f"{case}: a signal"
+    assert signal is _lifecycle._state._signals[id(sink)][1], f"{case}: its own"
+    start = time.monotonic()
+    returned = signal.wait(0.3)
+    waited = time.monotonic() - start
+    if case == "logged-again":
+        assert returned is True, f"{case}: the late log's wait collapses, the event being set"
+    else:
+        assert returned is False and waited >= 0.25, f"{case}: still backs off"
 
 
 def test_the_swapped_in_sink_is_offered_a_signal_without_waiting_for_an_emit() -> None:
@@ -852,14 +869,14 @@ def test_a_swap_after_a_retired_worker_hands_off_on_the_orphan_path() -> None:
 
 
 def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
-    """The same rule, for the stop signal: a retired worker's `_stop` is set forever.
+    """A sink a retired worker holds gets a usable signal back from a ``configure()`` (SPEC-098).
 
-    Skipping the offer because that worker *owns* the sink leaves a sink still being emitted to
-    holding a set event, so every backoff collapses to zero — the tight-retry-loop harm FR-004
-    exists to prevent, in a mixed process rather than an orphan-only one.
+    Before SPEC-098 the next orphan log handed such a sink a fresh unset event, since the
+    retired worker's ``_stop`` is set forever. Now the sink holds its own event, which the
+    shutdown set: an orphan log after the shutdown, with no ``configure()`` between, finds it set
+    and its wait collapses (FR-002's accepted cost), and a ``configure()`` that installs the sink
+    again clears it, so the sink backs off again. Each step asserts what ``Event.wait`` returned.
     """
-    from log_foundry.sinks import _retry as retry
-
     sink = CountingSink()
     log_foundry.configure(service="t", sink=sink)
 
@@ -876,10 +893,13 @@ def test_a_sink_a_retired_worker_holds_still_gets_a_usable_signal() -> None:
     log_foundry.info("still logging, against the sink the retired worker holds")
 
     signal = sink.log_foundry_stop_signal
-    assert signal is not None and not signal.is_set(), "a fresh, unset event"
+    assert signal is not None and signal is _lifecycle._state._signals[id(sink)][1]
+    assert signal.wait(0.3) is True, "the late log finds its own event set"
+    log_foundry.configure(sink=sink)
+    log_foundry.info("after the sink is configured again")
+    assert sink.log_foundry_stop_signal is signal, "the same object, cleared in place"
     start = time.monotonic()
-    retry.wait(0.3, signal)
-    assert time.monotonic() - start >= 0.25, "so the sink still backs off"
+    assert signal.wait(0.3) is False and time.monotonic() - start >= 0.25, "it backs off again"
 
 
 def test_the_worker_path_grants_the_closer_grace_exactly_once(monkeypatch) -> None:

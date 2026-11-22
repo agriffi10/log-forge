@@ -64,6 +64,18 @@ holds ``_state._lock`` across an offer, since a setter never runs under a lifecy
 site nests inside no other ``_state._lock`` section; a retarget's hand may hold
 ``config._sink_lock`` around it, the order ``_swap_sink`` already uses. No ``LOCK_COUNTS`` row in
 ``test_runtime_state.py`` moves, because no ordinary path reaches the branch.
+
+**Re-recorded at SPEC-098.** Ten sites leave with the hand machinery: ``_arm_and_hand``'s
+``_state._lock``, ``_settle_signal``'s, ``_hand_out``'s ``handing(sink)``,
+``_CloseRegistry.defer_hand``, ``marked`` and ``unmark``'s leaf, ``_hand_after_close``'s,
+``_pay_marks_after_stop``'s and ``_hand_retargeted``'s ``_state._lock``, and
+``offer_stop_signal``'s. Five enter. ``_note_orphan_emit`` takes ``_state._lock`` to arm a sink the
+record does not owe, the section ``_arm_and_hand`` held. Four take ``_state._owned_lock``, the last
+lock in the order: ``_stable_signal`` to find or create a sink's entry and ``_signal_handed`` to
+mark it, each with no other library lock held, since no caller holds one across an offer;
+``reinstall_signals``, under only ``config._sink_lock``; and ``_set_every_signal``, inside a stop's
+entry section under ``_state._lock``, which is ``_lock`` then ``_owned_lock``, the order the process
+already uses. None calls sink code. The orphan log on an armed, handed sink takes no lock at all.
 """
 
 from __future__ import annotations
@@ -135,26 +147,21 @@ LOCK_SITES_AT_BASE: dict[str, collections.Counter[tuple[str, str]]] = {
             ("_CloseRegistry.wait_graced", "self._lock"): 1,
             ("_CloseRegistry.graced_alive", "self._lock"): 1,
             ("_get_worker", "_state._lock"): 1,
-            ("_arm_and_hand", "_state._lock"): 1,
+            ("_note_orphan_emit", "_state._lock"): 1,
             ("_close_owed", "_state._lock"): 2,
             ("_CloseRegistry.bystanders", "self._lock"): 1,
             ("_shutdown_worker", "_state._lock"): 3,
             ("_swap_sink", "_state._lock"): 2,
             ("_flush_live_sink", "_state._lock"): 1,
-            ("_settle_signal", "_state._lock"): 1,
             ("rearm_if_released", "_state._lock"): 1,
-            ("_hand_out", "handing(sink)"): 1,
-            ("_CloseRegistry.defer_hand", "self._lock"): 1,
-            ("_hand_after_close", "_state._lock"): 1,
-            ("_CloseRegistry.marked", "self._lock"): 1,
-            ("_CloseRegistry.unmark", "self._lock"): 1,
-            ("_pay_marks_after_stop", "_state._lock"): 1,
             ("_repin_record", "_state._owned_lock"): 3,
             ("_close_clock", "_state._owned_lock"): 1,
             ("_settle_close", "_state._owned_lock"): 1,
             ("_CloseRegistry.in_flight_ids", "self._lock"): 1,
-            ("_hand_retargeted", "_state._lock"): 1,
-            ("offer_stop_signal", "_state._lock"): 1,
+            ("_stable_signal", "_state._owned_lock"): 1,
+            ("_signal_handed", "_state._owned_lock"): 1,
+            ("_set_every_signal", "_state._owned_lock"): 1,
+            ("reinstall_signals", "_state._owned_lock"): 1,
         }
     ),
     "worker.py": collections.Counter(
@@ -322,13 +329,15 @@ def test_the_module_scan_sees_an_import_and_ignores_function_bodies() -> None:
 def test_the_fork_opt_out_lists_both_pinning_records() -> None:
     """FR-001 AC-3: both records that pin superseded sinks are opted out, each on its holder.
 
-    SPEC-078 moved the owed record onto the close registry, so ``Runtime._FORK_SKIP`` names only
-    ``_owned`` and ``_CloseRegistry._FORK_SKIP`` names ``owed``: ``_fork._skipped_names`` reads the
+    SPEC-078 moved the owed record onto the close registry, so ``Runtime._FORK_SKIP`` names
+    ``_owned`` and ``_CloseRegistry._FORK_SKIP`` names ``owed``; SPEC-098 adds the stop-signal
+    table and the event set to ``Runtime``'s, which the seed repairs before the walk
+    (``tests/test_fork_roster.py`` holds that declaration). ``_fork._skipped_names`` reads the
     opt-out off the holder of the attribute. The behavioural half — a child of ``configure(A)``,
     ``info()``, ``configure(B)`` runs no hook on A — is
     ``test_lifecycle_races.test_a_forked_child_does_not_hook_a_superseded_sink``.
     """
-    assert _lifecycle.Runtime._FORK_SKIP == ("_owned",)
+    assert _lifecycle.Runtime._FORK_SKIP == ("_owned", "_signals", "_signal_events")
     assert _lifecycle._CloseRegistry._FORK_SKIP == ("owed",)
 
 

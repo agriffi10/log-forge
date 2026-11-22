@@ -590,6 +590,7 @@ def _change_sink(
                     changed["sink_factory"] = sink_factory
                 if sink is not None:
                     _lifecycle.stamp(sink, built=built)
+                    _lifecycle.reinstall_signals(sink)
                     if not reentrant:
                         command = _lifecycle.open_command_swap(budget, sink, sys._getframe())
 

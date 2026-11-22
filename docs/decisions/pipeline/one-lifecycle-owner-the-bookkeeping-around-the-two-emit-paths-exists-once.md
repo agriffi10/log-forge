@@ -4,6 +4,11 @@ title: "One lifecycle owner: the bookkeeping around the two emit paths exists on
 description: "the *emit* paths stay two (arch §9, SPEC-028); what existed twice was the bookkeeping around them, and thirteen twin pairs are now one retirement **count**, one stop event, one owed-close record, one closer and one `Health` assembly. A count rather than a latch, because a latch makes a worker built after a `shutdown()` returned count every event it delivers as stranded. Retiring the closed-sink latch raises three close counts from one to two, each following the delivery it discharges. (SPEC-054; arch §9.2, §12)"
 ---
 
+> **Refined by SPEC-098 (2026-11-20).** *Which stop event a sink holds* is no longer a twin
+> question: every sink holds one of its own, handed by one offer on both emit paths
+> (`_lifecycle.offer_once`), and the one stop event this entry counts is the worker's. The
+> signal refresh named below is deleted.
+
 **One lifecycle owner: the bookkeeping around the two emit paths exists once** — the library delivers events two ways and that stays (arch §9, SPEC-028): a `@trace`d
 call hands its buffer to a worker, a level call with no active span emits on the caller's thread.
 What existed **twice** was the bookkeeping — who owes a sink a close, which stop event a sink
@@ -94,6 +99,10 @@ permanently after a declined swap and after any `configure()` on a retired worke
 section's `inherited_sink` open item in the same edit. (SPEC-054 FR-005)
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-098: a sink's stop signal is its own, handed by one offer; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6).
 
 ### 2026-11-18
 

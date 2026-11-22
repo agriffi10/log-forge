@@ -1,8 +1,17 @@
 ---
 type: Decision
 title: "A hand the worker build or a retarget declines for a close in flight is paid when that close finishes"
-description: "while a stop is running, a worker build whose sink has a close in flight, or a `Worker.retarget` onto such a sink (`_hand_retargeted`), hands it no stop signal and marks that close (`_CloseRegistry.defer_hand`); the entry's discharge hands the current signal, never a refreshed one, where `_will_hand` allows, under no lock (`_hand_after_close`; `put_back` pays after releasing `_state._lock`); a mark whose close outlives the stop is paid by the last stop out or, landing after that stop looked, by its writer (`_pay_marks_after_stop`), and a payment reached inside a hand of that very sink runs when its thread leaves that sink's hand (`handing`). Never settle it through `_signal_owed`, never pay under `_state._lock`, never defer outside a stop. (fix after SPEC-079)"
+description: "**Superseded by SPEC-098**: a sink holds one stop signal of its own, set by every stop, so a worker build or a `Worker.retarget` onto a sink a stop is closing hands it that event, already set, and nothing is declined, marked or paid; `_CloseRegistry.defer_hand`, `marked`, `unmark`, `_Close.hand_owed`, `_hand_after_close`, `_pay_marks_after_stop`, `_pay_a_mark_the_stop_missed` and `_hand_retargeted` are deleted. The entry below is kept for the defects it measured and what it rejected. (fix after SPEC-079; SPEC-098)"
 ---
+
+> **Superseded by SPEC-098 (2026-11-20).** The defect below was a worker build, or a retarget,
+> handing a sink the worker's fresh unset event inside a stop's close of it. Since SPEC-098
+> every sink holds one event of its own, which the stop's entry set, and every hand of it is
+> that same object, so a close is never handed an unset event and the decline, the mark and
+> every payment of it are deleted. A late worker's delivery into the sink after the stop finds
+> that event set, which is the cost SPEC-098 FR-002 accepts (Andrew, 2026-11-16, option 2): the
+> rejection below of *declining without paying* is superseded for that late delivery. The
+> reasoning is kept as the record of what the deleted mechanism did and why.
 
 **The defect.** A no-worker `shutdown()` sets the stop signal and closes the configured sink; a
 sink's `close()` that backs off on its signal is cut short at once. A `@trace` landing inside that
@@ -152,10 +161,12 @@ re-check hands S the current signal as that hand ends; measured identical at `a8
 `ab7f620d`, `a2c32edf` and with this change, with S on the live worker's signal and a 0.3 s backoff waiting 0.3 s,
 and waiting 0.0 s once that re-check is disabled.
 
-**Rejected: declining without paying.** The late worker then delivers into a sink still on the
+**Rejected: declining without paying.** ~~The late worker then delivers into a sink still on the
 shutdown's set signal, so any backoff of the sink's own collapses to nothing — SPEC-033 FR-004's
 tight retry loop — until a later orphan log happens to refresh it, which a process that only
-traces never makes.
+traces never makes.~~ — superseded by SPEC-098 for a late delivery (2026-11-20): a sink's own event
+stays set for a delivery after a stop with no `configure()` between, by Andrew's call of
+2026-11-16, and a `configure()` that installs the sink again clears it.
 
 **Rejected: settling it through `Runtime._signal_owed`.** A debt is paid by the next orphan log or
 `flush()`, and those refresh. Measured: a `flush()` between the late worker's stop and the
@@ -203,6 +214,12 @@ fence names this as its one tokenless publication.
   (`docs/decisions/sink-lifecycle/a-stop-never-takes-while-the-current-signal-is-the-unset-event-of-a-worker-built-since-its-entry.md`).
 
 ## History
+
+### 2026-11-20
+
+- **Superseded** by SPEC-098: one stop signal per sink leaves no hand to decline, so the marks
+  and their payments are deleted; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6). *Rejected: declining without paying* is marked
+  superseded for a late delivery, which now finds the sink's event set by design.
 
 ### 2026-11-13
 

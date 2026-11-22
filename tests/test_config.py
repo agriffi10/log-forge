@@ -295,8 +295,12 @@ def test_a_shutdown_landing_mid_swap_does_not_leak_the_new_sink() -> None:
     assert log_foundry.health().incomplete_swaps == 0, "nothing was swapped, so nothing to report"
 
 
-def test_the_new_sink_is_given_the_workers_stop_signal() -> None:
-    """SPEC-027 FR-002: a sink that cannot see the stop event backs off uninterruptibly."""
+def test_the_new_sink_is_given_its_own_stop_signal() -> None:
+    """SPEC-027 FR-002: a sink that cannot see the stop event backs off uninterruptibly.
+
+    Since SPEC-098 the event is the new sink's own, never the worker's ``_stop``.
+    """
+    from log_foundry import _lifecycle
 
     class SignallingSink(SwapSink):
         log_foundry_stop_signal = None
@@ -306,7 +310,9 @@ def test_the_new_sink_is_given_the_workers_stop_signal() -> None:
 
     config.configure(sink=new)
 
-    assert new.log_foundry_stop_signal is worker._stop
+    held = new.log_foundry_stop_signal
+    assert held is not None and held is _lifecycle._state._signals[id(new)][1]
+    assert held is not worker._stop
 
 
 def test_swapping_to_the_sink_that_is_already_live_is_a_no_op() -> None:

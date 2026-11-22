@@ -4,6 +4,10 @@ title: "A swap keeps the sinks the graph it installs holds, and one decision clo
 description: "a `configure()` reads the graph it installs once, from its argument, and an owed sink in it is ceded, not released: it joins that graph and its holder's forward closes it; every release one decision starts carries a `_Keep`, so a forward skips a sink kept, beneath one still owed, or already closed by that decision. Never leave a kept sink the swap would have released owed as a root (an unfenced or held one stays owed, as before, closed by its own take); never take to close a sink beneath one in use; never re-read the configuration at a release; never keep a stored per-sink count; never defer the displaced graph's release. (SPEC-087)"
 ---
 
+> **Refined by SPEC-098 (2026-11-20).** Of the five readers below that decide by the identity of
+> the worker's top-level sink, `Runtime.in_flight` is deleted with the signal refresh, its one
+> reader; four remain, and the reasoning about a kept sink left owed as a root is unchanged.
+
 **The defect.** `configure(A)` then `configure(MultiSink(A, B))`, or the reverse, closed A at the
 swap while A was a member of the graph just installed, and a sink that has released its transport
 refuses every later event: a shipped `FileSink` kept 1 of 4 orphan events and 2 of 8 span events,
@@ -120,6 +124,10 @@ every member. A new route out of the owed record is a `_CloseRegistry` method, a
 every move keeps one home (SPEC-078 FR-001).
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-098: `Runtime.in_flight`, one of the five readers named, is deleted.
 
 ### 2026-11-15
 

@@ -878,7 +878,8 @@ def test_a_shutdown_does_not_wait_out_a_no_worker_swaps_slow_setter() -> None:
     A sink P is owed through an orphan log, then ``configure(sink=S)`` runs a no-worker swap whose
     first section arms S and whose hand then parks in S's setter. A ``shutdown()`` on the main
     thread snapshots that swap; it must find it decided and go on, closing S while the setter is
-    still parked, and the setter then stores the very event that shutdown set. At ``9f4d4dfd``
+    still parked, and the setter then stores the very event that shutdown set: since SPEC-098,
+    S's own event, created by the hand and set by the shutdown's entry. At ``9f4d4dfd``
     the swap published ``decided`` only after the hand, so the shutdown waited out its whole
     2.00 s closer grace and wrote the not-decided ``pending`` line for a decision taken long
     before. Run in a forked child, so the parked setter cannot outlive the test.
@@ -900,7 +901,8 @@ def test_a_shutdown_does_not_wait_out_a_no_worker_swaps_slow_setter() -> None:
         s.release.set()
         swap.join(GATE_WAIT)
         stored = s.stored
-        current = stored is _lifecycle._state._stop and stored is not None and stored.is_set()
+        own = _lifecycle._state._signals[id(s)][1]
+        current = stored is own and stored is not None and stored.is_set()
         return (
             f"line={NOT_DECIDED in err.getvalue()} quick={elapsed < 1.0} "
             f"closed_while_parked={closed_while_parked} stored_the_set_signal={current}"

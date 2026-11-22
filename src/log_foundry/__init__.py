@@ -98,6 +98,9 @@ def flush(timeout: float | None = 5.0) -> FlushResult:
     Raises:
       TypeError: If ``timeout`` is not an ``int``, a ``float`` or ``None``.
       ValueError: If ``timeout`` is NaN.
+      BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` raised by a sink's own
+        ``log_foundry_stop_signal`` setter when this call is the first to hand that sink its
+        signal; an ``Exception`` from the setter is absorbed and announced.
     """
     from log_foundry._lifecycle import _flush_worker, yielding
     from log_foundry.sinks._retry import wait_budget

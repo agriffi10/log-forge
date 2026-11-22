@@ -845,8 +845,9 @@ def test_every_site_that_clears_the_orphan_record_declares_its_disposition() -> 
             "armed — a worker built on a sink owes it a close whether or not anything is emitted "
             "afterwards, which is the worker path's rule (SPEC-054 FR-002)"
         ),
-        ("_arm_and_hand", "arm", 0): (
-            "armed — the emit that landed owns the close (`_note_orphan_emit`'s locked branch)"
+        ("_note_orphan_emit", "arm", 0): (
+            "armed — the emit that landed owns the close (`_note_orphan_emit`'s locked branch; "
+            "`_arm_and_hand` held it from the stop-signal fix after SPEC-079 until SPEC-098)"
         ),
         ("rearm_if_released", "arm", 0): (
             "armed again — a stop-signal setter released the sink before the emit after its hand "
