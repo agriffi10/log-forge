@@ -337,8 +337,8 @@ SPEC-030, updating `get_config().sink` while every event continued to the sink c
    that destination and are not carried over;
 2. reassigns the worker's sink, which keeps the queue, the drain thread, the counters and the
    `atexit` registration intact (rebuilding the worker would drop what was queued and register a
-   second drain), and hands the new sink the worker's stop signal (§9, SPEC-027) — or, while a
-   `shutdown()` is closing that sink, once that close is over (`docs/decisions/sink-lifecycle/`);
+   second drain), and hands the new sink its own stop signal (§9, SPEC-027, SPEC-098), a sink
+   already handed being assigned nothing;
 3. drains once more — a fence, not a delivery: it proves the drain thread is not still inside the
    old sink's `emit`, the one way `close()` could be called under a writer (SPEC-028);
 4. closes the previous sink — except a sink the new one still holds (SPEC-087). The swap reads
@@ -677,8 +677,8 @@ decorated call ends, or the worker's interval sweep takes from an open span
 - **A sink's backoff pauses the single drain thread** (SPEC-027). There is one drain thread by
   design, so a sink sleeping between attempts is not making a local decision — it is a global
   pause on log delivery, and it spans `shutdown()`, which joins that thread from `atexit`. Every
-  sink therefore waits on the worker's stop event rather than `time.sleep`, so a shutdown cuts an
-  in-progress backoff short; a server-supplied `Retry-After` is clamped (it is advice from a
+  sink therefore waits on its own stop signal rather than `time.sleep`, an event every stop sets
+  (SPEC-098), so a shutdown cuts an in-progress backoff short; a server-supplied `Retry-After` is clamped (it is advice from a
   destination, not an instruction the application must obey); and `shutdown()` itself takes a
   timeout, because a sink blocked *in* a network call can still hold the thread. Each retrying
   sink's docstring states its worst-case total delay.
@@ -687,14 +687,16 @@ decorated call ends, or the worker's interval sweep takes from an open span
   was the only caller, so an orphan-only process handed its sink nothing and the guarantee above
   was simply false there — a backoff on an application thread ran to completion through
   `shutdown()` and interpreter exit, and the inline close at exit could sit behind it via the
-  emit lock. The orphan path now offers its own event, skipped only for a sink a **live worker
-  owns**: overwriting the worker's event there would leave its drain thread serving a full
-  backoff across the join, which is the pause this rule exists to remove, while skipping merely
-  because a worker *exists* would strand a sink adopted after that worker retired. The event is
-  replaced with a fresh one whenever it is already set — an `Event` never clears, and a sink
-  still holding the shutdown's event has every subsequent backoff collapse to zero, which
-  against a rate-limited destination is a tight retry loop. The contract is "cut short *by a
-  shutdown*", not "never wait again".
+  emit lock. ~~The orphan path now offers its own event, skipped only for a sink a live worker
+  owns, and the event is replaced with a fresh one whenever it is already set~~ — superseded by
+  SPEC-098: **every sink the library delivers to holds one event of its own**, assigned at its
+  first delivery on whichever path reaches it first (`_lifecycle.offer_once`), set by every stop,
+  and cleared in place by a `configure()` that installs the sink again with no stop running. A
+  delivery after a stop with no `configure()` between finds it set, so that sink's own waits
+  collapse while every attempt is still made: the cost Andrew accepted on 2026-11-16 (option 2),
+  which supersedes SPEC-033 FR-004 AC-6's "the same sink logged to again". A sink installed again
+  backs off as before. The worker's own retry and its drain loop wait on the worker's stop event,
+  which no sink is handed.
 - **"Retries with backoff on failure" means: on a failure the sink reports.** The worker can
   only retry what reaches it as an exception, so the guarantee is conditional on §8's
   raise-on-total-failure rule. A sink that swallows its own total failure gets no retry, no
@@ -865,33 +867,35 @@ decorator and the span machinery and reaches the worker only through `_lifecycle
 |---|---|---|
 | **Existence** | `_state.worker_exists()` | is there anything to do, or a worker to build |
 | **Liveness** | `_state.live_worker()` — the worker while its `_epoch` is the current retirement count | who **performs** an action; a retired worker performs nothing. Reading the count to *report* it is the same question, not a fourth |
-| **Moment** | `_state.in_flight(sink)` for the signal refresh, `_state.held(sink)` for the close; `worker.claim_stop(deadline)` for the stop | is anything using this sink **now**, or is a stop already under way. Two predicates in one category, because an abandoned drain answers them oppositely; `claim_stop` is the same question asked as a transition |
+| **Moment** | `_state.held(sink)` for the close; `worker.claim_stop(deadline)` for the stop | is anything using this sink **now**, or is a stop already under way; `claim_stop` is the same question asked as a transition. ~~`_state.in_flight(sink)` for the signal refresh~~ — deleted by SPEC-098 with the refresh, its one reader; it and `held` were two predicates because an abandoned drain answers them oppositely |
 
 **None of the three takes the lifecycle lock.** Several guards ask a question with it already
-held (`_get_worker`'s inner check, `_close_owed`, `_swap_sink`, and `_will_hand` through all
-of its callers), so a non-reentrant acquire inside a question would deadlock them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
+held (`_get_worker`'s inner check, `_close_owed` and `_swap_sink`), so a non-reentrant acquire
+inside a question would deadlock them; and `_get_worker`'s outer check is deliberately unlocked on the `@trace` hot path. Each
 read is a single atomic reference load, and a caller needing consistency across two reads takes
-the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span. The two
-moment predicates do take a leaf lock — the close registry's, `_state._closes._lock`, since
+the lock itself. The added call costs ~6.6 ns, measured, against an ~18.6 µs span. The moment
+predicate `held` does take a leaf lock — the close registry's, `_state._closes._lock`, since
 SPEC-078 merged `_closing_now_lock` and `_closers_lock` into it — which is the order the shipped
-code already established: the signal refresh (`_offer_orphan_signal` then, `_will_hand` now)
-reached that lock under the lifecycle lock before SPEC-054 folded the read into the question,
-and nothing acquires the lifecycle lock beneath it.
+code already established: the signal refresh (`_offer_orphan_signal`, then `_will_hand` until
+SPEC-098 deleted it) reached that lock under the lifecycle lock before SPEC-054 folded the read
+into the question, and nothing acquires the lifecycle lock beneath it.
 
 **No sink's stop-signal setter runs under a library lock a call from inside it would wait on**
 (fix after SPEC-079; `docs/decisions/sink-lifecycle/`). The setter is the sink's own code, and
 one calling back into the library on the same thread hung the process wherever the hand ran under
-the lifecycle lock, the sweep lock or the factory wrapper's build lock. Each path now decides under
-the lock and hands after releasing it, with a hand token covering what the deciding section
-published, so no orphan log and no `flush()` reaches a sink that section armed before the sink
-holds its signal. The drain thread is the exception: it can emit a batch to a just-built worker's
-sink before the build's hand lands, which the decision records under *What is left*. The factory
-call itself runs under no lock either, and a factory inside `flush()`, `shutdown()` or a
-sink-changing `configure()` makes the emits waiting on its build refuse rather than wait, because
-that call can be waiting on a drain thread that is one of them. One section publishes with no
-token: during a stop, a worker build whose sink has a close in flight marks that close instead of
-handing, and the close's discharge pays the hand with the current signal, so the close keeps the
-signal the shutdown set (`docs/decisions/sink-lifecycle/`).
+the lifecycle lock, the sweep lock or the factory wrapper's build lock. Each path arms under the
+lock and offers after releasing it (`_lifecycle.offer_once`, SPEC-098): a sink holds one event of
+its own, assigned once per installation and marked handed only when a setter given it has
+returned, so any thread that reaches a sink before then (an orphan log, a `flush()`, the drain
+thread's next batch) offers it the same event itself, and no sink is reached before it holds its
+event. ~~A hand token covered what a deciding section published, and the drain thread could emit
+before a build's hand landed~~ — both gone with SPEC-098. A first hand takes `_owned_lock` only to
+find or create the sink's entry. The factory call itself runs under no lock either, and a factory
+inside `flush()`, `shutdown()` or a sink-changing `configure()` makes the emits waiting on its
+build refuse rather than wait, because that call can be waiting on a drain thread that is one of
+them. ~~During a stop, a worker build whose sink has a close in flight marks that close instead
+of handing~~ — gone with SPEC-098: the build hands the sink its own event, which that stop set,
+so the close keeps a set signal (`docs/decisions/sink-lifecycle/`).
 
 **The close registry holds every owed close and every close in flight** (SPEC-078 FR-001).
 `Runtime._closes`, a `_CloseRegistry`, replaced `_owed`, `_closing_now`, `_closers` and the
@@ -1163,22 +1167,7 @@ close it.
   command-path spec; on 2026-11-16 Andrew placed it in a spec of its own, written later in this
   arc, which SPEC-097, the command-path spec, records as Out of Scope and leaves open: that spec
   is SPEC-101.
-- **A kept sink a straddling orphan log put back in the record can be handed a stop signal on its
-  own** (SPEC-087 FR-004's fifth shape; read from the code and not reproduced). A log with no span
-  reads the configured sink and arms it a moment later (`api.py`, `_ensure_sink()` then
-  `_note_orphan_emit`); a swap that keeps that sink and runs between the two leaves it a root in
-  the record again. `rearm_if_released` is a second route back, arming the sink an emit is about
-  to write to when a stop-signal setter released it. SPEC-087's guard covers the two places a sink is taken to be closed, the
-  closer's take and the swap's stale take. `Runtime.in_flight`, which decides whether a sink is
-  handed a refreshed stop signal, still decides by identity, so such a sink can be handed one
-  directly while the worker drains into it through its wrapper. Nothing is closed in this shape;
-  it is about which object holds the signal. The sequence that would reproduce it: the straddle,
-  then a `shutdown()`, then a further log with no span while a worker built since is draining.
-  **Closed by** one stable stop signal per sink (the item *One stable stop signal per sink changes
-  a documented public protocol*, below), which retires the refreshed hands this shape rides on.
-  That closure is by construction: the shape was never reproduced and names no observable, so no
-  measurement shows it closed (SPEC-098; the spec reviewer's `straddle.py` read
-  `shutdown_took=0.00s` both at `ead40798` and on SPEC-098's prototype).
+- ~~**A kept sink a straddling orphan log put back in the record can be handed a stop signal on its own**~~ → **closed by SPEC-098**; struck and moved under *Resolved*.
 - **Whether the predicate roster still earns its weight** (SPEC-040 FR-005 AC-1).
   `tests/test_worker_predicate_roster.py` polices what is now **three** methods, and roughly half
   of it is the seam lint guarding the prose in its own data table rather than the rule. The case
@@ -1663,38 +1652,75 @@ an item leaves this list when a spec closes it, not because the arc names it.
   never skip work*. It shares the exit drain with the dead-sink item above.
 - ~~**`shutdown()` called from a signal handler deadlocks for good when the signal interrupts a library lock section**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
 - ~~**`shutdown()` called from a sink's own `close()` waits out the closer grace on that same close**~~ → **closed by SPEC-097**; struck and moved under *Resolved*.
-- **One stable stop signal per sink changes a documented public protocol, and with the one-owner
-  command path it deletes mechanisms that settled decisions fence; neither is specified yet**
-  (2026-11-14 audit, the lifecycle frame's structural changes 1 and 2; invariant 10). Andrew took
-  both directions on 2026-11-14, and the protocol change was stated to him when he did. Today the
-  library assigns `log_foundry_stop_signal` onto a sink, and `README.md` documents that to a sink's
-  author: the 1.0.0 upgrade note at `:80`, and the protocol at `:1116-1156`, which says the
-  attribute "may be assigned more than once, from more than one thread at the same moment" and gives
-  a wrapper the forwarding property that relies on it. Invariant 10 promises that a consumer written
-  against the frozen surface runs against every later release of the same major, and a signal handed
-  once is a different protocol for a 1.x sink written to that text. The decisions the two directions
-  meet are found by searching the register for the mechanisms the lifecycle frame says they delete,
-  not by listing them here:
-  `grep -l "_await_swap_decisions\|_take_declines\|_shutdown_running\|_sink_lock\|_hand_out\|_settle_signal\|_hand_retargeted\|_fork_offers" docs/decisions/*/*.md`
-  returns nine files at `f78693fc`, in `pipeline/`, `public-api/` and `sink-lifecycle/`. As examples
-  only: *Concurrent sink changes are serialized by one lock whose wait is spent from the swap
-  budget* (`docs/decisions/public-api/`) is one of the nine; and *Lifecycle state has one holder,
-  Runtime, and the stored State decides the transitions* (`docs/decisions/pipeline/`), whose fence
-  says "Three locks remain, not one", is met too and is not among them, which is why the search has
-  to be run over what the spec actually deletes. **Closed by** a spec that settles which of two
-  things the stable signal is, and says so: a form that keeps every 1.x sink working unchanged, or a
-  break recorded as Andrew's accepted exception to invariant 10. The same spec derives the full list
-  of decisions it rewrites by that search, over the mechanisms it deletes, and rewrites each in
-  place, dated.
-
-  > SPEC-097 built the one-owner command path without deleting the mechanisms named here; their
-  > deletion is *The command path's deletion half*, below. The stable signal is SPEC-098's.
+- ~~**One stable stop signal per sink changes a documented public protocol, and with the one-owner command path it deletes mechanisms that settled decisions fence; neither is specified yet**~~ → **closed by SPEC-098** for the stable signal; struck and moved under *Resolved*.
+- **Five sink modules' docstrings still describe a sink's stop signal as the worker's own event**
+  (SPEC-098's build; invariant 10's text, not its behaviour). `logstash.py`, `filtering.py`,
+  `multi.py`, `transform.py` and `sentry.py` say in their forwarding docstrings and `Args:` that
+  the signal is the worker's own shutdown event; since SPEC-098 it is the wrapper's own event, which
+  every stop sets. The sites are `logstash.py:109,368`, `filtering.py:73,381`, `multi.py:169,195`,
+  `transform.py:165,497` and `sentry.py:338,361`. SPEC-098 rewrote the helpers' docstrings
+  (`sinks/_wrapper.py`, `sinks/_retry.py`, `sinks/base.py`) and left these five alone because two
+  sessions of the sinks lane were editing those modules (scope freeze, plan ruling on §2.6). Two
+  more sites outside the files SPEC-098 touches say the same of the fork repair:
+  `_fork.py:632-633` (`_fresh_primitive`) and `_fork.py:793-794` (`_Repair`), which say a sink's
+  `log_foundry_stop_signal` *is* the worker's `_stop`; since SPEC-098 it is the sink's own event,
+  kept in the walk's memo by the stop-signal seed. **Closed by** a one-line rewrite of each, in
+  the sinks lane or after it.
+- **A reinstall's clear can cut the interruption of a close still running from an expired stop**
+  (SPEC-098's plan review, Minor 3; invariant 3; reasoned from the code, not measured). SPEC-044
+  FR-003 refused to replace a signal while a close of the sink was in flight, so the close kept the
+  event its stop set. A `configure()` that installs a sink again clears that sink's own event in
+  place whenever no stop is running, and a stop that expired with its close of that sink still
+  running on a closer thread is no longer running, so the clear can unset the event that close is
+  waiting on, and the close then waits out its backoff. **Closed by** a measurement of the shape
+  (an expired `shutdown()` whose close backs off on its signal, then `configure()` of that sink),
+  and, if it reproduces, a clear that skips a sink whose close is in flight
+  (`_CloseRegistry.in_flight`) as the refresh did.
+- **A child forked while a different parent thread is inside a sink's first setter call can run
+  that setter in its fork repair** (SPEC-098's plan review, Minor 4; invariants 3 and 12; reasoned,
+  not measured). The seed marks handed only the offers on the forking thread's own record. A sink
+  another parent thread was offering for the first time at the fork is unhanded in the child, so
+  `Worker._reinit_after_fork`'s `offer_once` runs its setter inside the fork repair, which is sink
+  code there; a setter whose lock that parent thread held hangs the child. **A second window opens
+  the same way** (SPEC-098's first diff review, m-3; measured): a fork between a `configure()`'s
+  `reinstall_signals`, which clears and unhands the sink it installs again, and the offer the same
+  `configure()` then makes. The child inherits that sink unhanded, and the resume's `offer_once`
+  runs its setter inside the fork repair. The reviewer's `fork_after_reinstall.py`, which calls
+  `reinstall_signals` on the worker's sink and forks, reads `child: setter ran inside the fork
+  repair` and `setter calls in child=1` on SPEC-098's branch. **Closed by** the seed
+  marking every table entry whose sink is being offered on any thread at the fork, which needs a
+  process-wide record of offers in flight, or by the resume not offering a sink at all; for the
+  second window, by the resume treating an entry unhanded by a reinstall as handed in the child.
+- **A sink a `sink_factory` returns again, configured after a `shutdown()`, keeps the set event**
+  (SPEC-098's second diff review, MINOR-4; invariant 3; a change from `c67931cd`, measured). A
+  `configure(sink_factory=f)` installs a new `_FactorySink`, and `reinstall_signals` runs on that
+  wrapper before the factory has built anything, so its graph does not reach the sink `f` will
+  return. When `f` returns a sink it built before, one a `shutdown()` set the event of, the
+  wrapper's `_hand` finds that sink already handed and assigns nothing, so it keeps the set event:
+  its backoffs collapse though a `configure()` installed it again. The reviewer's
+  `p_factory_singleton.py factory` reads `set=True waited=[0.0]` on SPEC-098's branch, against
+  `set=False waited=[1.01]` at `c67931cd`; the `direct` and `multi` routes, where the sink itself or a
+  `MultiSink` holding it is configured, read as at `c67931cd`. **Closed by** the factory's build
+  clearing the event of the sink it built when no stop is running, as `reinstall_signals` does for
+  a sink `configure()` names.
+- **Two comprehensions in `_swap_sink` iterate the live owed record** (SPEC-098's first diff
+  review, m-7; invariant 5; read from the code, not reproduced). `_lifecycle.py:5945` (the first
+  section's `_Keep` remaining list) and `:6007` (the second `_Keep`'s, on the fenced branch) read
+  `_state._closes.owed.values()` directly rather than a snapshot. Neither calls `held()` or any other
+  function that enters a lock section, so no signal handler can land inside the comprehension and
+  arm a sink, which is what made the three `held()` comprehensions SPEC-098 fixed raise; the shape
+  predates SPEC-098. **Closed by** reading a snapshot there too, as the other reads now do, if a
+  later change puts a call inside either.
 - **The command path's deletion half** (SPEC-097, Out of Scope; invariant 5). SPEC-097 built the
   lifecycle command path beside the mechanisms the 2026-11-14 audit's lifecycle frame expected it
   to retire, `_await_swap_decisions`, `_take_declines`, `_shutdown_running`, `_late_worker`, and
   `config._sink_lock` with `_sink_holder`, and deleted none of them: its prototype added the path
   and did not delete them, so their deletion is unmeasured. SPEC-098 deletes the hand machinery,
-  which is a different set. **Closed by** a lifecycle spec of this arc written after the
+  which is a different set. It also removed `_take_declines`' stated reason: no hand delivers the
+  worker's unset event to a sink a stop's take is about to close, since each sink holds its own
+  event, which the stop set. What remains is the stop of a worker built since the stop's entry
+  before the take, so deleting it is now a simplification for that spec to measure, not a
+  correctness question. **Closed by** a lifecycle spec of this arc written after the
   child-rebuild spec, which deletes them against the adversarial cells and rewrites in place, and
   dated, every decision that `grep -l "_await_swap_decisions\|_take_declines\|_shutdown_running\|_late_worker\|_sink_holder" docs/decisions/*/*.md`
   returns over what it deletes.
@@ -1740,7 +1766,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   of its own `wait()`, `set()` or `clear()`, never across the wait itself. A signal handler or
   finalizer that lands in those bytecodes and makes a lifecycle call that sets the same `Event`
   waits on a lock its own thread holds, for good. The one site enumerated is a `flush()` inside a
-  flush marker's wait, which `_calls_here.flushing` holds (FR-004); no other `Event` is. The
+  flush marker's wait, which `_calls_here.flushing` holds (FR-004); no other `Event` is. Since
+  SPEC-098 a stop's entry sets every sink's own event, so a handler landing inside a sink's backoff
+  wait on its event and calling `shutdown()` has the same shape; it had it before too, on
+  `_state._stop`, which was then the sink's signal, so this is not a new class. The
   ownership oracle exempts `Event` as a category rather than giving each a row, and
   `EVENT_REASON` in `tests/test_lock_oracle.py` records why and points here. **Closed by** a roster
   of the `Event`s a lifecycle call sets or waits on, each with the threads that can be inside its
@@ -1819,20 +1848,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   frame rates it unlikely; what it shows is that the premise is checked only for the setter case
   SPEC-083 closed. **Closed by** the child rebuilding from its configuration, as in the item above,
   or by the fork handler recording that the forking thread is inside a `shutdown()`.
-- **A second `shutdown()` made from a stop-signal setter during a forked child's fork repair
-  waits on a drain thread the repair has not started** (found while authoring SPEC-086,
-  2026-11-15; invariants 3 and 12). In the child, `Worker._reinit_after_fork` clears the worker's
-  drain events and hands the inherited sink its stop signal (`worker.py:602-605`) before it starts
-  the child's drain thread (`:606`), and a setter is the sink's own code.
-  `docs/audits/2026-11-14-probes/lifecycle/p9_second_stop_in_fork_repair.py`, with nothing patched,
-  at `5447d26a`: a setter that calls `shutdown()` once there returns at once; one that calls
-  `shutdown(timeout=3.0)` and then `shutdown(timeout=None)` never leaves the repair, and the stack
-  the child wrote when asked is `stop < _shutdown_worker < shutdown <` the setter `<
-  offer_stop_signal < _reinit_after_fork < _rebuild_worker_after_fork < _reinit_after_fork`, the
-  wait being `Worker.stop`'s on `_drain_settled` (`:1424`); with a finite second timeout the child
-  leaves the repair after 3.0 s, its whole budget; and the same two calls from a setter in a
-  process that never forked take 0.0 s. A spec review confirmed all four rows on its own build.
-  **Closed by** the probe's two-stop rows returning as its `outside` row does.
+- ~~**A second `shutdown()` made from a stop-signal setter during a forked child's fork repair waits on a drain thread the repair has not started**~~ → **closed by SPEC-098**; struck and moved under *Resolved*.
 - **A child forked while another thread of the parent is writing to `sys.stderr` hangs on its
   first diagnostic** (found while authoring SPEC-086, 2026-11-15; invariant 12's observable, "never
   hangs on a parent's lock"). The library announces a loss by writing to `sys.stderr`
@@ -2136,7 +2152,76 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `reply-counted-lost` rows read green, and the pin `reply-resent` is gone. The decision is *A
   resend after a send that may have landed is counted, and its key is the event's `log_id`*
   (`docs/decisions/sink-delivery/`).
+- ~~**One stable stop signal per sink changes a documented public protocol, and with the one-owner
+  command path it deletes mechanisms that settled decisions fence; neither is specified yet**~~
+  (2026-11-14 audit, the lifecycle frame's structural changes 1 and 2; invariant 10). Andrew took
+  both directions on 2026-11-14, and the protocol change was stated to him when he did. Today the
+  library assigns `log_foundry_stop_signal` onto a sink, and `README.md` documents that to a sink's
+  author: the 1.0.0 upgrade note at `:80`, and the protocol at `:1116-1156`, which says the
+  attribute "may be assigned more than once, from more than one thread at the same moment" and gives
+  a wrapper the forwarding property that relies on it. Invariant 10 promises that a consumer written
+  against the frozen surface runs against every later release of the same major, and a signal handed
+  once is a different protocol for a 1.x sink written to that text. The decisions the two directions
+  meet are found by searching the register for the mechanisms the lifecycle frame says they delete,
+  not by listing them here:
+  `grep -l "_await_swap_decisions\|_take_declines\|_shutdown_running\|_sink_lock\|_hand_out\|_settle_signal\|_hand_retargeted\|_fork_offers" docs/decisions/*/*.md`
+  returns nine files at `f78693fc`, in `pipeline/`, `public-api/` and `sink-lifecycle/`. As examples
+  only: *Concurrent sink changes are serialized by one lock whose wait is spent from the swap
+  budget* (`docs/decisions/public-api/`) is one of the nine; and *Lifecycle state has one holder,
+  Runtime, and the stored State decides the transitions* (`docs/decisions/pipeline/`), whose fence
+  says "Three locks remain, not one", is met too and is not among them, which is why the search has
+  to be run over what the spec actually deletes. **Closed by** a spec that settles which of two
+  things the stable signal is, and says so: a form that keeps every 1.x sink working unchanged, or a
+  break recorded as Andrew's accepted exception to invariant 10. The same spec derives the full list
+  of decisions it rewrites by that search, over the mechanisms it deletes, and rewrites each in
+  place, dated.
 
+  > SPEC-097 built the one-owner command path without deleting the mechanisms named here; their
+  > deletion is *The command path's deletion half*, below. The stable signal is SPEC-098's.
+  → **closed by SPEC-098** for its first half: the stable signal keeps the README's protocol,
+  its name, its type and "set when a shutdown starts", so a 1.x sink works unchanged and
+  invariant 10 takes no recorded exception; the README now says the event is the sink's own, stays
+  set for a delivery after a stop and is cleared when `configure()` installs the sink again. The
+  decisions the hand machinery's deletion met were found by SPEC-098 FR-005's search and each
+  rewritten, superseded or listed with why it stays. The one-owner command path's half is
+  SPEC-097's, and its deletion half stays open as *The command path's deletion half*.
+- ~~**A kept sink a straddling orphan log put back in the record can be handed a stop signal on its
+  own**~~ (SPEC-087 FR-004's fifth shape; read from the code and not reproduced). A log with no span
+  reads the configured sink and arms it a moment later (`api.py`, `_ensure_sink()` then
+  `_note_orphan_emit`); a swap that keeps that sink and runs between the two leaves it a root in
+  the record again. `rearm_if_released` is a second route back, arming the sink an emit is about
+  to write to when a stop-signal setter released it. SPEC-087's guard covers the two places a sink is taken to be closed, the
+  closer's take and the swap's stale take. `Runtime.in_flight`, which decides whether a sink is
+  handed a refreshed stop signal, still decides by identity, so such a sink can be handed one
+  directly while the worker drains into it through its wrapper. Nothing is closed in this shape;
+  it is about which object holds the signal. The sequence that would reproduce it: the straddle,
+  then a `shutdown()`, then a further log with no span while a worker built since is draining.
+  **Closed by** one stable stop signal per sink (the item *One stable stop signal per sink changes
+  a documented public protocol*, below), which retires the refreshed hands this shape rides on.
+  That closure is by construction: the shape was never reproduced and names no observable, so no
+  measurement shows it closed (SPEC-098; the spec reviewer's `straddle.py` read
+  `shutdown_took=0.00s` both at `ead40798` and on SPEC-098's prototype).
+  → **closed by SPEC-098**, by construction and never reproduced: no hand of a refreshed signal
+  exists any more, so a sink put back in the record holds the one event it was handed, and a later
+  hand assigns it nothing. The shape named no observable, so no measurement shows it closed.
+- ~~**A second `shutdown()` made from a stop-signal setter during a forked child's fork repair
+  waits on a drain thread the repair has not started**~~ (found while authoring SPEC-086,
+  2026-11-15; invariants 3 and 12). In the child, `Worker._reinit_after_fork` clears the worker's
+  drain events and hands the inherited sink its stop signal (`worker.py:602-605`) before it starts
+  the child's drain thread (`:606`), and a setter is the sink's own code.
+  `docs/audits/2026-11-14-probes/lifecycle/p9_second_stop_in_fork_repair.py`, with nothing patched,
+  at `5447d26a`: a setter that calls `shutdown()` once there returns at once; one that calls
+  `shutdown(timeout=3.0)` and then `shutdown(timeout=None)` never leaves the repair, and the stack
+  the child wrote when asked is `stop < _shutdown_worker < shutdown <` the setter `<
+  offer_stop_signal < _reinit_after_fork < _rebuild_worker_after_fork < _reinit_after_fork`, the
+  wait being `Worker.stop`'s on `_drain_settled` (`:1424`); with a finite second timeout the child
+  leaves the repair after 3.0 s, its whole budget; and the same two calls from a setter in a
+  process that never forked take 0.0 s. A spec review confirmed all four rows on its own build.
+  **Closed by** the probe's two-stop rows returning as its `outside` row does.
+  → **closed by SPEC-098**: no setter runs in the repair, since the child's seed keeps every
+  event the library made and the sink is already handed, so `Worker._reinit_after_fork`'s offer
+  assigns nothing. `p9_second_stop_in_fork_repair.py`'s three child rows read `repair returned`
+  with the setter's calls empty (`[]`), and `tests/test_stable_stop_signal.py` ports them.
 - ~~**A `NATSSink` whose abandoned-publish latch is armed refuses every round of the worker's at
   once, so a stall a little longer than one `publish_timeout` loses every batch the drain makes
   during it, and at the stop the whole backlog**~~ (found by SPEC-102's spec reviewer, 2026-11-17,
@@ -4100,12 +4185,13 @@ and a third copy is a fork with no merge.
      the thread holds. This was already possible for a sink never handed over; SPEC-081 widens it
      to superseded ones. It is narrow: no shipped sink defines `__del__`, and a plain third-party
      sink's `close()` takes no library lock. The library's own reference drops inside those
-     sections are not audited for the same effect. A finalizer under `_owned_lock` itself can
+     sections are not audited for the same effect. ~~A finalizer under `_owned_lock` itself can
      still deadlock two threads: one that forwards a close whose entry carries a stop-signal hand
      a worker build declined reaches `_hand_after_close`, which takes `_state._lock` with
      `_owned_lock` held, the reverse of the `_state._lock` then `_owned_lock` that `_swap_sink`'s
      first section takes through `releasable`. It needs that declined-hand mark on the very sink
-     being finalized.
+     being finalized.~~ — struck by SPEC-098, which deleted the declined-hand mark and
+     `_hand_after_close`, so no close's discharge takes `_state._lock` with `_owned_lock` held.
   8. **Another library's at-fork handlers run before the pin.** An
      `os.register_at_fork(after_in_child=…)` handler registered before log-foundry's runs first.
      If it drops the child's last reference to an inherited sink whose entry was weak, that sink
@@ -4310,6 +4396,14 @@ and a third copy is a fork with no merge.
     the control hangs too: with no fork inside a hand at all, one thread inside a locked setter and
     another thread forking also hangs the child. That is the generic hazard of forking while
     another thread holds a lock the caller's code owns, which no record can close.
+
+  > **Superseded in part by SPEC-098.** The offer record stays, but the child now keeps every
+  > event the library made, re-initialised in place before the walk, not only the forking thread's
+  > offered ones, and the seed marks handed each sink the forking thread was being offered. The
+  > signal debt, the inherited record (`_fork_offers`, `_fork_inherited`) and `_stale_signals` are
+  > deleted, so the sentences above naming them describe the mechanism before SPEC-098. The three
+  > limits were measured against that mechanism and have not been re-measured. A different parent thread
+  > inside a first setter at the fork is a §12 item.
 
   The decision lives in `docs/decisions/sink-lifecycle/` (*A child forked inside a stop-signal
   setter keeps its mark and the event it was offered, and its shutdown sets that event*).

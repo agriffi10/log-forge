@@ -1,8 +1,18 @@
 ---
 type: Decision
 title: "A stop-signal setter runs under no lock its own calls would wait on: the owner decides, then hands"
-description: "the library never runs a sink's `log_foundry_stop_signal` setter, or the `hasattr` probe before it, under a lock a call from inside the setter would wait on: the owner decides under `_state._lock`, opens a hand token before the section publishes an arm, a refreshed `_stop` or a cleared debt, hands after releasing, and re-checks lock-free that the sink holds the current signal. One section publishes with no token: a worker build that, during a stop, defers its hand to a close of its sink in flight, since `_will_hand` refuses that sink to every thread a token would redirect. The factory wrapper hands what it built under no lock. Never hand inside a lifecycle critical section, never publish before the token but there, never open a token for a hand that published nothing. (fix after SPEC-079)"
+description: "the library never runs a sink's `log_foundry_stop_signal` setter, or the `hasattr` probe before it, under a lock a call from inside the setter would wait on: each delivery path arms under `_state._lock` and offers after releasing it (`offer_once`), a first offer taking `_owned_lock` only to find or create the sink's own event and releasing it before the setter; a sink is marked handed only once its setter returns, so any thread reaching it before then, the drain thread's batch included, offers it the same event itself. The factory wrapper offers what it built under no lock. Never hand inside a lifecycle critical section, never mark a sink handed before its setter returns. (fix after SPEC-079; SPEC-098)"
 ---
+
+> **Rewritten by SPEC-098 (2026-11-20).** The owner no longer decides which event to hand: every
+> sink holds one of its own, so the hand tokens, the settle loop, the signal debt and the
+> worker build's deferral this entry describes are deleted, and each path arms under the lock
+> and offers after it (`_lifecycle.offer_once`). What a token did, keeping another thread from
+> reaching a sink a section had armed before the sink held its signal, the handed mark now does:
+> it is made only when a setter given the sink's event has returned, so another thread offers
+> the sink the same event itself. The drain thread, which this entry's *What is left* named as
+> able to emit before a build's hand landed, offers before each batch since SPEC-098. The rule
+> that no setter runs under a lifecycle lock is unchanged, and the measurements below stand.
 
 **A setter is the sink's own code, and the library ran it under its own locks.** The orphan log,
 the post-fork signal debt, `flush()`, the no-worker swap and the worker build offered the signal
@@ -159,6 +169,12 @@ own emit loses its event.
   signal handed to the wrapper is forwarded to it as usual.
 
 ## History
+
+### 2026-11-20
+
+- **Rewritten** by SPEC-098: one stop signal per sink replaces the decision of which event to
+  hand; the tokens, the settle, the debt and the build's deferral are deleted, the handed mark
+  waits for the setter's return, and the drain thread offers before a batch; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6).
 
 ### 2026-11-18
 

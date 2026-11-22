@@ -73,20 +73,17 @@ class _FactorySink:
     (:meth:`_yield_start`). The lock is never held across a delivery.
 
     **The hand runs after the lock is released**, and the built sink is published as
-    :attr:`_inner` only after it holds the stop signal this wrapper was offered. The hand runs the
-    built sink's setter, its own code: held under the build lock, a setter that logged waited on
-    its own thread, and one that called ``shutdown()`` or ``flush()`` with no timeout joined a
-    drain thread blocked on that lock, forever. So every thread that finds a sink pending but not
-    yet published hands it the signal itself before using it — duplicate hands of one signal are
-    harmless — except the thread already handing it (``_lifecycle.handing_here``), which is a
-    setter emitting to its own sink and is delivered to the pending sink as is. Later emits read
-    :attr:`_inner` without the lock. After publishing, the hand reads the wrapper's signal again
-    and hands the built sink any newer one, because a signal forwarded while :attr:`_inner` was
-    still unpublished reached nothing; the forwarder stores before it reads :attr:`_inner` and the
-    hand publishes before it reads the signal, so one of the two sees the other. The re-reads
-    stop after ``_lifecycle._SETTLE_ROUNDS``, which only a setter that changes the wrapper's
-    signal on every hand can reach; the next signal handed to the wrapper is forwarded to the
-    published sink as usual. Anything that released the wrapper before the hand ended — a setter
+    :attr:`_inner` only after it holds a stop signal. The hand runs the built sink's setter, its
+    own code: held under the build lock, a setter that logged waited on its own thread, and one
+    that called ``shutdown()`` or ``flush()`` with no timeout joined a drain thread blocked on
+    that lock, forever. So every thread that finds a sink pending but not yet published offers it
+    its signal itself before using it, through ``_lifecycle.offer_once``, which hands the built
+    sink **its own** event (SPEC-098), once: a sink already handed costs one read, and the thread
+    already offering it, a setter emitting to its own sink, is not offered it again and is
+    delivered to the pending sink as is. Later emits read :attr:`_inner` without the lock. The
+    built sink does not hold the wrapper's event, so a signal forwarded to the wrapper later, by
+    :meth:`_forward_stop_signal`, offers the built sink nothing new; every stop sets both events.
+    Anything that released the wrapper before the hand ended — a setter
     swapping the sink or shutting down, or a ``configure(sink=...)`` on another thread while the
     factory was still running, when there was nothing built yet to release — leaves the wrapper
     armed again (``_lifecycle.rearm_if_released``), because the emit that follows writes to the
@@ -135,8 +132,8 @@ class _FactorySink:
     walk through :attr:`_inner`.
 
     Attributes:
-      log_foundry_stop_signal: The worker's shutdown event, stored where the engine reads it and
-        forwarded to the built sink once there is one.
+      log_foundry_stop_signal: This wrapper's own stop signal, stored where the engine reads it;
+        the built sink is offered its own (SPEC-098).
     """
 
     log_foundry_stop_signal = ForwardedStopSignal()
@@ -201,8 +198,7 @@ class _FactorySink:
         built = self._pending
         if built is None:
             built = self._make()
-        if not _lifecycle.handing_here(built):
-            self._hand(built, owed=owed, seen=seen)
+        self._hand(built, owed=owed, seen=seen)
         return built
 
     def _make(self) -> Sink:
@@ -406,7 +402,7 @@ class _FactorySink:
                 claim.wake.clear()
 
     def _hand(self, built: Sink, *, owed: bool, seen: int) -> None:
-        """Hands the built sink this wrapper's stop signal, with no lock held, then publishes it.
+        """Offers the built sink its own stop signal, with no lock held, then publishes it.
 
         Args:
           built: The pending sink.
@@ -419,19 +415,13 @@ class _FactorySink:
           None.
 
         Raises:
-          None.
+          BaseException: A ``KeyboardInterrupt`` or ``SystemExit`` from the built sink's
+            stop-signal setter, at its first offer (SPEC-098); ``_lifecycle.offer_stop_signal``
+            absorbs an ``Exception`` from it, and the built sink is then left unpublished, so the
+            next emit builds nothing and offers it again.
         """
-        with _lifecycle.handing(built):
-            handed = vars(self).get("log_foundry_stop_signal")
-            if handed is not None:
-                _lifecycle.offer_stop_signal(built, handed)
-            self._inner = built
-            for _ in range(_lifecycle._SETTLE_ROUNDS - 1):
-                now = vars(self).get("log_foundry_stop_signal")
-                if now is handed or now is None:
-                    break
-                _lifecycle.offer_stop_signal(built, now)
-                handed = now
+        _lifecycle.offer_once(built)
+        self._inner = built
         if owed or self._releases != seen:
             _lifecycle.rearm_if_released(self)
 
@@ -520,13 +510,15 @@ class _FactorySink:
             _lifecycle.release(inner, owner=self)
 
     def _forward_stop_signal(self, signal: threading.Event | None) -> None:
-        """Hands the worker's stop signal to the built sink, when there is one.
+        """Offers the built sink its own stop signal, when there is one and a signal arrived.
 
         Called by :class:`~log_foundry.sinks._wrapper.ForwardedStopSignal` after it stored the
-        signal in this wrapper's ``__dict__``; a sink built later is handed it at its build.
+        signal in this wrapper's ``__dict__``; a sink built later is offered at its build. The
+        built sink is offered **its own** event, not *signal* (``_lifecycle.offer_stop_signal``,
+        SPEC-098), so a sink already handed is assigned nothing.
 
         Args:
-          signal: The worker's shutdown event, or ``None``.
+          signal: This wrapper's stop signal, or ``None``.
 
         Returns:
           None.

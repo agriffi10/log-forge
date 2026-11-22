@@ -765,6 +765,13 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
     holds a sink only weakly, the collector can finalize that sink on a thread inside a record
     section, and a finalizer forwarding a close into a library wrapper re-enters `releasable` on
     that same thread, which hung on a `Lock` (`tests/test_ownership_record.py` holds both shapes).
+
+    **SPEC-098 puts the stop-signal table under the same lock**, and the helpers its sections call
+    are walked like ``_entry_for``: ``_referent`` reads an entry's weak reference, ``_new_signal``
+    makes a library event and sets it while a stop runs, and ``_no_stop_running`` reads the stop
+    tokens. The new work is reads and writes of the table and the event set, and ``set`` and
+    ``clear`` of events the library made, whose own condition is a leaf private to each event; no
+    sink code runs and no library lock is taken.
     """
     import ast
     import pathlib
@@ -786,7 +793,12 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
     walk(tree, False)
     helpers = 0
     for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name == "_entry_for":
+        if isinstance(node, ast.FunctionDef) and node.name in (
+            "_entry_for",
+            "_referent",
+            "_new_signal",
+            "_no_stop_running",
+        ):
             walk(node, True)
             helpers += 1
         if isinstance(node, ast.ClassDef) and node.name == "_Entry":
@@ -794,7 +806,7 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
                 if isinstance(method, ast.FunctionDef) and method.name in ("__init__", "referent"):
                     walk(method, True)
                     helpers += 1
-    assert helpers == 3, "the helpers the record sections call were found"
+    assert helpers == 6, "the helpers the record sections call were found"
     permitted = {
         "_state._owned.get",
         "_state._owned.items",
@@ -808,6 +820,18 @@ def test_the_record_lock_is_last_in_the_process_order() -> None:
         "enumerate",
         "list",
         "id",
+        "_state._signals.get",
+        "_state._signals.items",
+        "_state._signal_events.add",
+        "_referent",
+        "_new_signal",
+        "_no_stop_running",
+        "threading.Event",
+        "event.set",
+        "entry[1].clear",
+        "seen.add",
+        "ref",
+        "type",
     }
     assert set(under_lock) <= permitted, (
         f"new work under the record lock: {sorted(set(under_lock) - permitted)}. It is the last "

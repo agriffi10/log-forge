@@ -239,8 +239,11 @@ open items and the permitted departures (SPEC-092).
 
 `flush(timeout)`, `shutdown(timeout)` and `configure(sink=…)` return within their budget, and a
 bound is measured in CPU as well as wall clock, so a busy-spin cannot pass as a wait (SPEC-038).
-Every backoff waits on the worker's stop event, never `time.sleep`, so a shutdown cuts it short
-(SPEC-027). A shutdown shortens a wait; it never skips work (SPEC-038): what the exit drain
+A sink's backoff waits on its own stop signal, never `time.sleep`: one event per sink, set by
+every stop and cleared by a `configure()` that installs the sink again with no stop running, so a
+shutdown cuts it short (SPEC-027, SPEC-098); a delivery after a stop with no `configure()` between
+finds it set, and its waits collapse while every attempt is still made. The worker's own retry
+waits on the worker's stop event. A shutdown shortens a wait; it never skips work (SPEC-038): what the exit drain
 declines, a retry or a later exit batch predicted to end past `shutdown()`'s deadline, is not work
 the process gets, and the first attempt of the exit drain's first batch is always made (*The exit
 drain declines a retry, or a later batch, predicted to end past the shutdown deadline*,
@@ -272,9 +275,11 @@ declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in
 a thread of its own which logs, and joins it with no timeout, hangs: the thread's first emit waits
 on the build the factory is running, and the library cannot see a wait in the caller's code
 (`docs/decisions/sink-lifecycle/`). A child forked from inside a sink's stop-signal setter has its
-backoff on the event that sink holds cut short by its `shutdown()` (SPEC-083). However, a setter
-that forks before it stores the event leaves that wait uncut. After the child's `shutdown()`, that
-sink keeps the set event, so its later backoffs do not wait. A grandchild forked by another
+backoff on the event that sink holds cut short by its `shutdown()` (SPEC-083; since SPEC-098 the
+child keeps every event the library made, re-initialised in place, and its stop sets them all).
+However, a setter that forks before it stores the event leaves that wait uncut. After the child's
+`shutdown()`, that sink keeps the set event, as every sink does after a stop, so its later
+backoffs do not wait until a `configure()` installs it again. A grandchild forked by another
 thread of such a child, while a lock-holding setter is still running, hangs on its first log. That
 is the generic hazard of forking while another thread holds a lock the caller's code owns
 (`architecture.md` §13).
@@ -305,12 +310,15 @@ under `shutdown(timeout=1)`), and the same close when a `configure(sink=…)` re
 the sink inside it (`a8e91fac`: 4.01 s); it holds the shutdown's take to that signal when an orphan
 log or a `flush()` lands between the stop setting the signal and the take
 (`test_a_hand_before_the_take_leaves_the_close_the_shutdowns_signal`, `a8e91fac`: 4.00 s to 4.01 s
-on all four of its rows), and to a set signal when a worker built since the stop's entry published
-its own unset one and a hand delivered it to the sink
+on all four of its rows), and to a set signal when a worker is built since the stop's entry
 (`test_a_stop_never_closes_on_the_unset_event_of_a_worker_built_since_its_entry`, `864d71e5`:
-4.0 s on its settle, `flush()` and tail rows, 1.01 s for each of two stops); and
-`tests/test_lock_held_discharges.py` holds the
-shape that keeps the hand the build or the retarget defers from being paid under the state lock.
+4.0 s on its settle, `flush()` and tail rows, 1.01 s for each of two stops). Since SPEC-098 each
+of those closes runs on the sink's own event, which the stop's entry set, and no hand gives the
+sink another; the readings above are the defects those rows were written against.
+`tests/test_stable_stop_signal.py` holds SPEC-098's promises: one hand per installation, every
+stop setting every event, a first delivery during a stop made set, a `configure()`'s clear unable
+to race a stop's set, the late delivery's collapsed wait and the reconfigured sink's full one, a
+child keeping its events and running no setter, and the README's sinks cut short.
 `tests/test_fork_mid_hand.py` holds a child forked inside a setter to a wait cut short by its
 `shutdown()`, on the orphan path, inside a `FilteringSink`, on the worker build and on
 `Worker.retarget`, and holds a setter that holds its own lock to never being run again inside
@@ -503,7 +511,8 @@ and the wrapped sink to the bare one on rounds, requests, `losses()` and `failed
 signal — the orphan log, `flush()`, the no-worker swap, the worker build, a sweep's build, the
 factory wrapper's build and `Worker.retarget` — to returning when the setter calls back into the
 library, and holds `flush()` to the orphan log's rule that no sink is reached before it holds
-its signal.
+its signal; `tests/test_stable_stop_signal.py` holds the drain thread to the same rule, a batch
+offering the sink its own event before it emits (SPEC-098).
 
 ## 7. A sink that delivered nothing raises; one that delivered something reports
 
@@ -858,8 +867,10 @@ the closed guard driven through `configure()`, SPEC-076), `tests/test_fork_roste
 `tests/test_fork_child_state.py` (SPEC-079),
 `tests/test_sink_ownership.py`, `tests/test_ownership_record.py` and
 `tests/test_fork_heap_marking.py` (SPEC-081),
-`tests/test_fork_mid_hand.py` (a child forked inside a stop-signal setter: the handler re-initialises
-the events it keeps and runs no sink code, SPEC-083),
+`tests/test_fork_mid_hand.py` (a child forked inside a stop-signal setter: the seed re-initialises
+every event the library made in place, marks the sink being offered handed and runs no sink code,
+SPEC-083, SPEC-098), `tests/test_stable_stop_signal.py` (a child keeps its sinks' events and runs
+no setter, including a member holding a released wrapper's event, SPEC-098),
 `tests/test_sinks_nats_liveness.py` (the `NATSSink` child, under a real `os.fork`),
 `tests/test_sinks_sqlite_fork.py` (the `SQLiteSink` child, under a real `os.fork` and through a
 child's interpreter exit),

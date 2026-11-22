@@ -185,11 +185,19 @@ def test_wait_ignores_an_unusable_delay(delay: float, monkeypatch) -> None:
     wait(delay, threading.Event())
 
 
+def _own(sink: object) -> object:
+    """The stop signal the library made for ``sink``, its own (SPEC-098), or ``None``."""
+    entry = _lifecycle._state._signals.get(id(sink))
+    return None if entry is None else entry[1]
+
+
 def test_the_worker_hands_the_sink_its_stop_signal() -> None:
+    """Since SPEC-098 the sink is handed its own event, not the worker's ``_stop``."""
     sink = HTTPSink("http://x", opener=FakeOpener())
     worker = Worker(sink, batch_size=1)
     try:
-        assert sink.log_foundry_stop_signal is worker._stop
+        assert sink.log_foundry_stop_signal is _own(sink)
+        assert sink.log_foundry_stop_signal is not worker._stop
     finally:
         worker.stop()
 
@@ -478,7 +486,8 @@ def test_the_worker_reaches_every_retrying_sink(monkeypatch) -> None:
     for sink in _one_of_each_retrying_sink(monkeypatch):
         worker = Worker(sink, batch_size=1)
         try:
-            assert sink.log_foundry_stop_signal is worker._stop, type(sink).__name__
+            held = sink.log_foundry_stop_signal
+            assert held is not None and held is _own(sink), type(sink).__name__
         finally:
             worker.stop()
 
@@ -504,7 +513,8 @@ def test_the_socket_backed_sinks_pass_the_signal_to_their_transport(monkeypatch)
     ):
         worker = Worker(sink, batch_size=1)
         try:
-            assert backend(sink).log_foundry_stop_signal is worker._stop, type(sink).__name__
+            held = backend(sink).log_foundry_stop_signal
+            assert held is not None and held is _own(sink), type(sink).__name__
         finally:
             worker.stop()
 
@@ -515,7 +525,8 @@ def test_sentry_forwards_to_its_http_fallback() -> None:
     sink = SentrySink("http://k@sentry.local/1", backend="http", opener=FakeOpener())
     worker = Worker(sink, batch_size=1)
     try:
-        assert sink._http is not None and sink._http.log_foundry_stop_signal is worker._stop
+        held = None if sink._http is None else sink._http.log_foundry_stop_signal
+        assert held is not None and held is _own(sink)
     finally:
         worker.stop()
 
@@ -635,10 +646,12 @@ def test_a_wrapper_forwards_the_signal_to_what_actually_waits(monkeypatch) -> No
         inner.log_foundry_stop_signal = None
         worker = Worker(wrapper, batch_size=1)
         try:
+            own = _own(wrapper)
+            assert own is not None, type(wrapper).__name__
             for leaf in leaves:
-                assert leaf.log_foundry_stop_signal is worker._stop, type(wrapper).__name__
+                assert leaf.log_foundry_stop_signal is own, type(wrapper).__name__
             if inner in leaves:
-                assert stop_signal_of(inner) is worker._stop, (
+                assert stop_signal_of(inner) is own, (
                     "and the engine, which waits for SyslogSink, reads it there (SPEC-074)"
                 )
         finally:
@@ -658,9 +671,11 @@ def test_a_child_that_refuses_the_signal_does_not_stop_its_siblings(capsys) -> N
         def close(self) -> None: ...
 
     willing = HTTPSink("http://x", opener=FakeOpener())
-    worker = Worker(MultiSink(Stubborn(), willing), batch_size=1)
+    multi = MultiSink(Stubborn(), willing)
+    worker = Worker(multi, batch_size=1)
     try:
-        assert willing.log_foundry_stop_signal is worker._stop, "the sibling still got it"
+        own = _own(multi)
+        assert own is not None and willing.log_foundry_stop_signal is own, "the sibling got it"
     finally:
         worker.stop()
     assert "handing a MultiSink child its stop signal" in capsys.readouterr().err

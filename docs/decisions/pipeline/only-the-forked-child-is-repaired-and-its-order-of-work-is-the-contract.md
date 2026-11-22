@@ -1,8 +1,14 @@
 ---
 type: Decision
 title: "Only the forked *child* is repaired, and its order of work is the contract"
-description: "`_diag`'s exit fold window withdrawn first, taking no lock, then the inherited ownership record pinned, then the global-lock roster, then one walk from the runtime's roots, then inherited buffers, then the registered handlers — a lock re-initialised after a handler that takes it is a handler that hangs. `before` does not run for a C-level fork at all, and the repair is never wrapped in `gc.disable()`. (SPEC-039, SPEC-079, SPEC-081; arch §9, §13)"
+description: "`_diag`'s exit fold window withdrawn first, taking no lock, then the inherited ownership record pinned, then the global-lock roster, then one walk from the runtime's roots, whose first step re-initialises every stop signal the library made in place (SPEC-098), then inherited buffers, then the registered handlers — a lock re-initialised after a handler that takes it is a handler that hangs. `before` does not run for a C-level fork at all, and the repair is never wrapped in `gc.disable()`. (SPEC-039, SPEC-079, SPEC-081, SPEC-098; arch §9, §13)"
 ---
+
+> **Refined by SPEC-098 (2026-11-20).** The walk now opens with the stop-signal seed
+> (`_seed_signals_after_fork`): every event the library made is re-initialised in place and
+> entered in the walk's memo as its own replacement, so the walk leaves each where it is, and a
+> raise there is announced rather than skipping the walk. It runs before any handler, so no
+> handler meets an event the parent held.
 
 **Only the forked *child* is repaired, and its order of work is the contract** — `_diag`'s exit fold window withdrawn first, then the inherited ownership record pinned, then the package's global locks and events from one roster, then one walk from the runtime's roots, then inherited buffers, then the registered handlers, because a lock re-initialised after a handler that takes it is a handler that hangs on the child's only thread. `before` does not run for a C-level fork at all (uWSGI calls `PyOS_AfterFork_Child` only), so the child handler must be sufficient regardless.
 
@@ -21,6 +27,11 @@ a lock a parent thread held; the roster then replaces `_diag._FOLD_LOCK`. It is 
 handler rather than a second `os.register_at_fork` registration, because the package holds to one.
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-098: the stop-signal seed is the walk's first step, before any sink is
+  reached.
 
 ### 2026-11-17
 

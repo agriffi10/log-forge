@@ -86,7 +86,7 @@ declare them would read as stale and a field added to it later would need no row
 STATE_CLASS = "Runtime"
 MODULE_STATE_FILE = "_lifecycle.py"
 WALKABLE = frozenset({"Lock", "RLock", "Event"})
-TOKEN_SETS = ("_swaps_running", "_stops_running", "_hands_running")
+TOKEN_SETS = ("_swaps_running", "_stops_running")
 TOKEN_SETS_CHILD = ("reset: _lifecycle._clear_after_fork",)
 REPAIR_ITSELF = ("_fork", "_reinit_after_fork")
 CHILD_VALUE = re.compile(r"^(walk|roster|inherited|none|reset: [A-Za-z_][\w]*\.[A-Za-z_]\w*)$")
@@ -896,6 +896,12 @@ INVENTORY: dict[Key, Row] = {
         "guards the ownership record, last in the order; moved in SPEC-077, re-entrant since "
         "SPEC-081 so a finalizer forwarding a close cannot hang on it",
     ),
+    _c("_lifecycle.py", "_new_signal", "event", "Event"): Row(
+        "none",
+        ("reset: _lifecycle._walk_after_fork",),
+        "a sink's own stop signal, kept in _signals and _signal_events; the seed re-initialises "
+        "it in place before the walk (SPEC-098 FR-003)",
+    ),
     _c("_lifecycle.py", "_Close.__init__", "self.event", "Event"): Row(
         "_Close",
         _NONE,
@@ -1008,12 +1014,6 @@ INVENTORY: dict[Key, Row] = {
         ("reset: _lifecycle._clear_after_fork",),
         "no-worker shutdown depth; no such call survives a fork (SPEC-079 FR-004)",
     ),
-    _rt("_signal_owed"): Row(
-        "Runtime",
-        ("reset: _lifecycle._clear_after_fork",),
-        "an owed sink may hold another signal (a fork, or a hand that could not settle); handed on "
-        "the next log or flush",
-    ),
     _rt("_stop"): Row(
         "Runtime",
         ("roster", _REBUILD),
@@ -1062,16 +1062,6 @@ INVENTORY: dict[Key, Row] = {
     ),
     _rt("_swaps_running"): Row("Runtime", TOKEN_SETS_CHILD, "swap tokens, observer-only"),
     _rt("_stops_running"): Row("Runtime", TOKEN_SETS_CHILD, "stop tokens, observer-only"),
-    _rt("_hands_running"): Row(
-        "Runtime",
-        TOKEN_SETS_CHILD,
-        "hand tokens; non-empty sends every orphan emit to the locked branch",
-    ),
-    _rt("_handing_here"): Row(
-        "Runtime",
-        _INH,
-        "the sinks this thread is handing a signal to; a child forked mid-hand keeps them",
-    ),
     _rt("_deferred_taker"): Row(
         "Runtime",
         ("reset: _lifecycle._clear_after_fork",),
@@ -1087,20 +1077,17 @@ INVENTORY: dict[Key, Row] = {
         _INH,
         "the stop signals this thread is offering; a child forked mid-offer keeps them (SPEC-083)",
     ),
-    _rt("_stale_signals"): Row(
+    _rt("_signals"): Row(
         "Runtime",
-        ("reset: _lifecycle._clear_after_fork",),
-        "the forking thread's offered events, re-initialised; set by a child's shutdown (SPEC-083)",
+        _INH,
+        "each sink's own stop signal, keyed by id (SPEC-098); a child keeps it as it stands, its "
+        "events re-initialised in place by the seed; opted out of the walk by _FORK_SKIP",
     ),
-    _rt("_fork_offers"): Row(
+    _rt("_signal_events"): Row(
         "Runtime",
-        ("reset: _lifecycle._clear_after_fork",),
-        "the forking thread's live offer record, shared with a child's other threads (SPEC-083)",
-    ),
-    _rt("_fork_inherited"): Row(
-        "Runtime",
-        ("reset: _lifecycle._clear_after_fork",),
-        "how many of those offers the child inherited and is still inside (SPEC-083)",
+        ("reset: _lifecycle._walk_after_fork",),
+        "every stop signal the library made (SPEC-098); the seed re-initialises each in place and "
+        "rebuilds the set before the walk",
     ),
     _rt("_releasing_here"): Row(
         "Runtime",

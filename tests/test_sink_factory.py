@@ -706,15 +706,20 @@ def _signalled_factory() -> tuple[Any, list[_SignalledSink]]:
     return factory, built
 
 
-def test_the_built_sink_is_handed_the_workers_stop_signal() -> None:
-    """FR-006: what the factory built holds the worker's ``_stop`` after the first ``@trace``."""
+def test_the_built_sink_is_handed_its_own_stop_signal() -> None:
+    """FR-006: what the factory built holds a stop signal after the first ``@trace``.
+
+    Since SPEC-098 it is the built sink's own event, which every stop sets, not the worker's.
+    """
     factory, built = _signalled_factory()
     log_foundry.configure(service="factory", sink_factory=factory)
     _traced()
     log_foundry.flush(timeout=5.0)
     worker = _lifecycle._state.worker_exists()
     assert worker is not None and built
-    assert vars(built[0]).get("log_foundry_stop_signal") is worker._stop
+    held = vars(built[0]).get("log_foundry_stop_signal")
+    assert held is not None and held is _lifecycle._state._signals[id(built[0])][1]
+    assert held is not worker._stop
 
 
 def _child_of_a_traced_factory(

@@ -1,8 +1,16 @@
 ---
 type: Decision
 title: "A stop never takes while the current signal is the unset event of a worker built since its entry"
-description: "a `shutdown()`'s take of the owed record declines while `_state._stop` is the unset event of the worker built since the stop began (`_take_declines`), records it (`_Operation.publishing_worker`), and the stop then claims, retires if still live, and sets that worker's event in its one existing section, takes again at once, joins the worker and runs a final pass; no section marks the call drained while that worker is still to be stopped. Never forbid the build's publication, never hand each taken sink a set event at its close instead, never key the decline on the `_late_worker` slot. (fix after SPEC-079)"
+description: "a `shutdown()`'s take of the owed record declines while `_state._stop` is the unset event of the worker built since the stop began (`_take_declines`), records it (`_Operation.publishing_worker`), and the stop then claims, retires if still live, and sets that worker's event in its one existing section, takes again at once, joins the worker and runs a final pass, so a worker built in a stop's tail is stopped by that stop. Since SPEC-098 no hand delivers that event to a sink, so this guards the worker's stop, not a close. Never forbid the build's publication, never key the decline on the `_late_worker` slot. (fix after SPEC-079; SPEC-098)"
 ---
+
+> **Rewritten by SPEC-098 (2026-11-20).** The reason below was that a hand of "the current
+> signal" could deliver the late worker's unset event to a sink the take was about to close.
+> Since SPEC-098 every sink holds its own event, which the stop's entry set, and no hand delivers
+> the worker's event to any sink, so that reason is gone. The decline stays: it still makes a
+> stop stop a worker built since its entry before it takes, rather than leave that worker live
+> after the stop returns. Whether it is still needed is for the spec that deletes the command
+> path's other half to measure (`architecture.md` §12, *The command path's deletion half*).
 
 **The defect.** A worker built after a stop's entry publishes its own unset `_stop` as the
 current signal, and any hand of "the current signal" can deliver it to a sink the stop is about to
@@ -158,6 +166,11 @@ today, since every refresh is gated off while a take is ahead. The token-set ter
 every parent-process route; its job is the fork exclusion above.
 
 ## History
+
+### 2026-11-20
+
+- **Rewritten** by SPEC-098: no hand delivers the worker's event to a sink any more, so the
+  decline's first reason is gone and it is kept for the worker's stop alone; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6).
 
 ### 2026-11-13
 

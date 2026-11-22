@@ -1484,21 +1484,25 @@ def test_a_lock_that_was_never_held_is_replaced_too() -> None:
 
 
 def test_two_holders_of_one_event_still_share_it_in_the_child() -> None:
-    """FR-003 AC-4. The ``log_foundry_stop_signal`` / ``Worker._stop`` pair, named.
+    """FR-003 AC-4. The ``log_foundry_stop_signal`` / stop-signal-table pair, named.
 
-    A sink's stop signal **is** the worker's ``_stop`` (SPEC-027). Two fresh events would leave
-    the worker setting one and the sink waiting on the other, so a shutdown would stop cutting a
-    backoff short — a fork fix that silently un-fixes an earlier spec. ``HTTPSink`` is the sink
-    here because it carries the attribute and needs no network to construct one.
+    Until SPEC-098 a sink's stop signal **was** the worker's ``_stop`` (SPEC-027), and the walk's
+    memo kept the two one object. Since SPEC-098 the pair is the sink's attribute and the sink's
+    own event in the library's table, which every stop sets: two objects in the child would
+    leave the stop setting one and the sink waiting on the other, so a shutdown would stop
+    cutting a backoff short. The child's seed keeps the event in place, so the attribute, the
+    table entry and the parent's object are one. ``HTTPSink`` is the sink here because it
+    carries the attribute and needs no network to construct one.
     """
     sink = HTTPSink("http://127.0.0.1:1/ingest", opener=lambda *a, **k: None)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
     _lifecycle._state._worker = worker
-    assert sink.log_foundry_stop_signal is worker._stop
+    own = _lifecycle._state._signals[id(sink)][1]
+    assert sink.log_foundry_stop_signal is own
 
     def compare() -> str:
-        live = _lifecycle._state._worker
-        return f"{sink.log_foundry_stop_signal is live._stop},{live._stop is not None}"
+        held = sink.log_foundry_stop_signal
+        return f"{held is _lifecycle._state._signals[id(sink)][1]},{held is own}"
 
     child = run_in_child(compare)
     assert child.output == "True,True", child.output
@@ -1945,6 +1949,13 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     **And the shutdown is a real one** (SPEC-068), for the reason the exit-budget test above
     gives: a direct ``worker.stop()`` never moves the retirement count, so its child was resumed
     rather than retired and this test passed through the FR-005 defect, not the retired branch.
+
+    **Since SPEC-098** the sink holds its own event, which the parent's shutdown set, and the
+    child inherits it set: its orphan log, a delivery after that stop with no ``configure()``
+    between, finds it set, which is the cost SPEC-098 FR-002 accepts, and the draining read no
+    longer decides anything about the signal. A ``configure()`` that installs the sink again in
+    the child clears that same object, so its backoffs wait again; that is the row's second half.
+    The ``draining`` half still holds the retired branch to settled drain events.
     """
 
     class _SignalGateSink:
@@ -1989,7 +2000,11 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
     def report() -> str:
         log_foundry.info("an orphan log in a retired child")
         live = sink.log_foundry_stop_signal
-        return f"{_lifecycle._state._worker.draining},{live is not None and live.is_set()}"
+        late = live is not None and live.is_set()
+        log_foundry.configure(sink=sink)
+        again = sink.log_foundry_stop_signal
+        cleared = again is live and again is not None and not again.is_set()
+        return f"{_lifecycle._state._worker.draining},{late},{cleared}"
 
     try:
         child = run_in_child(report, timeout=6)
@@ -1997,18 +2012,18 @@ def test_a_retired_childs_sink_is_not_left_backing_off_at_zero(tmp_path: pathlib
         gate.release.set()
         shutting_down.join(10.0)
 
-    assert child.output == "False,False", child.output
+    assert child.output == "False,True,True", child.output
 
 
 def test_a_third_party_sink_is_handed_the_childs_own_stop_signal() -> None:
-    """FR-002 with SPEC-027: the rebuild re-offers, because the walk cannot reach every holder.
+    """FR-002 with SPEC-027: a third-party sink keeps its own event in the child, which is set.
 
-    A sink's ``log_foundry_stop_signal`` **is** the worker's ``_stop``, and FR-003's memo keeps
-    that pairing for a sink the traversal enters. A **third-party** sink is outside its
-    ownership boundary, so its attribute keeps pointing at the pre-fork event while the worker
-    gets a fresh one — the shutdown would then set an event nothing waits on, and the sink's
-    backoff would never be cut short. That is SPEC-027's guarantee broken by the repair meant to
-    preserve it, in the one sink shape the walk is deliberately blind to.
+    Before SPEC-098 a sink's ``log_foundry_stop_signal`` **was** the worker's ``_stop``, and the
+    worker's rebuild re-offered it, because a **third-party** sink is outside the walk's ownership
+    boundary and would keep pointing at the pre-fork event while the worker got a fresh one. Since
+    SPEC-098 the event is the sink's own and the child's seed re-initialises that very object
+    before the walk, whatever holds it, so the third-party sink keeps it, unset, its setter runs
+    no more, and the child's ``shutdown()`` sets it.
     """
 
     class _ForeignSink:
@@ -2025,15 +2040,18 @@ def test_a_third_party_sink_is_handed_the_childs_own_stop_signal() -> None:
     log_foundry.configure(service="fork", version="0", env="test", sink=sink)
     worker = Worker(sink, batch_size=1, flush_interval=0.01)
     _lifecycle._state._worker = worker
-    assert sink.log_foundry_stop_signal is worker._stop
+    own = _lifecycle._state._signals[id(sink)][1]
+    assert sink.log_foundry_stop_signal is own
 
     def report() -> str:
-        live = _lifecycle._state._worker
         signal_now = sink.log_foundry_stop_signal
-        return f"{signal_now is live._stop},{signal_now is not None and not signal_now.is_set()}"
+        kept = signal_now is own and signal_now is not None and not signal_now.is_set()
+        log_foundry.shutdown(timeout=2.0)
+        return f"{kept},{signal_now is not None and signal_now.is_set()}"
 
     child = run_in_child(report, timeout=6)
     assert child.output == "True,True", child.output
+    assert not own.is_set(), "the child's shutdown set the parent's event"
 
 
 def test_the_rebuilt_worker_is_the_same_object(tmp_path: pathlib.Path) -> None:
@@ -2506,6 +2524,58 @@ def _assignment_targets(tree: ast.AST, call: ast.Call) -> list[ast.expr]:
     return []
 
 
+_SEEDED: dict[tuple[str, str], str] = {("_lifecycle.py", "_new_signal"): "_seed_signals_after_fork"}
+"""Constructions a child repairs before the walk, by ``(module, function)``, with the seeder.
+
+SPEC-098 FR-003: a sink's own stop signal is built into a local and kept in the stop-signal table
+and the event set, which the walk does not descend (``Runtime._FORK_SKIP``); the seeder named here
+re-initialises every such event in place before the walk instead. The declaration is checked
+against the source by :func:`test_a_seeded_construction_is_reinitialised_by_its_seeder`.
+"""
+
+
+def _seeded_calls(path: pathlib.Path, tree: ast.AST) -> set[int]:
+    """The ids of the primitive constructions inside a function :data:`_SEEDED` declares."""
+    seeded = {name for module, name in _SEEDED if module == path.name}
+    spans = [
+        (node.lineno, node.end_lineno or node.lineno)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name in seeded
+    ]
+    return {
+        id(call)
+        for call in _primitive_constructions(tree)
+        if any(first <= call.lineno <= last for first, last in spans)
+    }
+
+
+def test_a_seeded_construction_is_reinitialised_by_its_seeder() -> None:
+    """SPEC-098 FR-003 AC-6: each declared seeded construction exists, and its seeder repairs it.
+
+    The function must build a primitive, and its seeder must be defined in the same module, call
+    ``_at_fork_reinit`` and read ``_signal_events``, the set every such event is added to. A
+    declaration that outlived its function, or a seeder that stopped re-initialising, would
+    otherwise excuse a construction nothing repairs.
+    """
+    for (module, function), seeder in _SEEDED.items():
+        tree = ast.parse((_SRC / module).read_text(encoding="utf-8"))
+        defs = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        assert function in defs and _seeded_calls(_SRC / module, tree), (module, function)
+        assert seeder in defs, (module, seeder)
+        calls = {
+            node.func.attr
+            for node in ast.walk(defs[seeder])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        reads = {
+            node.attr
+            for node in ast.walk(defs[seeder])
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+        }
+        assert "_at_fork_reinit" in calls, (module, seeder, "calls no _at_fork_reinit")
+        assert "_signal_events" in reads, (module, seeder, "reads no _signal_events")
+
+
 @pytest.mark.parametrize("path", _MODULES, ids=lambda p: p.relative_to(_SRC).as_posix())
 def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) -> None:
     """FR-003 AC-3. Completeness is proved by the shape rather than claimed by a roster.
@@ -2536,14 +2606,18 @@ def test_every_lock_is_assigned_where_the_walk_can_reach_it(path: pathlib.Path) 
 
     ``_fork.py`` is the one file out of scope, and the test below is what makes that an
     exclusion rather than a hole: it mints the replacements and stores none of them, so it has
-    nothing for a child to inherit.
+    nothing for a child to inherit. A construction :data:`_SEEDED` declares is excused too: a
+    sink's own stop signal (SPEC-098), which a seed repairs before the walk.
     """
     if path.name == "_fork.py":
         pytest.skip("the module that mints replacements; test_the_fork_module_stores_no_primitive")
     tree = ast.parse(path.read_text(encoding="utf-8"))
     stores = _namespace_stores(tree)
     offenders: list[str] = []
+    seeded = _seeded_calls(path, tree)
     for call in _primitive_constructions(tree):
+        if id(call) in seeded:
+            continue
         targets = _assignment_targets(tree, call)
         if not targets:
             offenders.append(f"line {call.lineno}: not assigned to anything")

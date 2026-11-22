@@ -380,9 +380,15 @@ post-`shutdown()` logging is a supported path (SPEC-030), so these are live sink
 - [ ] AC-6: A sink emitted to **after** `shutdown()` holds an unset event and still backs off — a
       test measures that its retry wait is not collapsed to zero. Two cases, because the rule is
       keyed on the sink rather than on the record: a **newly configured** sink (FR-001 AC-6), and
-      the **same** sink logged to again, which FR-001 AC-5 refuses to re-arm and which an
+      ~~the **same** sink logged to again, which FR-001 AC-5 refuses to re-arm and which an
       arming-keyed rule would therefore miss. The second is a regression test against today's
-      behaviour, where that sink has no signal at all and backs off correctly.
+      behaviour, where that sink has no signal at all and backs off correctly.~~ — the second case
+      is struck by SPEC-098 (Andrew's call of 2026-11-16, option 2): a sink holds one stop signal
+      of its own, which every stop sets and which stays set for a delivery after the stop with no
+      `configure()` between, so the same sink logged to again backs off not at all; installed again
+      by `configure()`, it backs off as before. The first case, a newly configured sink, still
+      holds. `tests/test_orphan_sink_handoff.py::test_a_sink_emitted_to_after_shutdown_still_backs_off`
+      asserts all three since SPEC-098.
 - [ ] AC-7: The offer is made on the swap too, so the sink adopted by FR-002 receives one without
       waiting for the next emit.
 - [ ] AC-8: The probe and the absorbed failure are the shared helper of FR-005, not a second copy of

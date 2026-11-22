@@ -541,7 +541,11 @@ def test_the_stop_signal_attribute_is_namespaced_everywhere() -> None:
 
 
 def test_a_sink_offering_the_namespaced_attribute_is_handed_the_event() -> None:
-    """FR-006 AC-1's contract, exercised: define the attribute and the library fills it in."""
+    """FR-006 AC-1's contract, exercised: define the attribute and the library fills it in.
+
+    Since SPEC-098 (FR-004 AC-1) it fills in the sink's own event, not the one the caller passed,
+    and a sink that declines the attribute is untouched.
+    """
     from log_foundry import _lifecycle as lifecycle
 
     class Offering:
@@ -560,7 +564,9 @@ def test_a_sink_offering_the_namespaced_attribute_is_handed_the_event() -> None:
     lifecycle.offer_stop_signal(offering, stop)
     lifecycle.offer_stop_signal(bare, stop)
 
-    assert offering.log_foundry_stop_signal is stop
+    held = offering.log_foundry_stop_signal
+    assert isinstance(held, threading.Event) and held is not stop
+    assert held is lifecycle._state._signals[id(offering)][1]
     assert not hasattr(bare, "log_foundry_stop_signal"), "a sink that declines must not gain one"
 
 

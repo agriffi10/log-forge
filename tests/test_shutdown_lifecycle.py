@@ -1,12 +1,9 @@
 """SPEC-035 — the shutdown paths SPEC-033 regressed, and the idempotent call that never waited."""
 
-import ast
-import inspect
 import re
 import textwrap
 import threading
 import time
-import types
 
 import pytest
 
@@ -76,46 +73,19 @@ def _trace_once() -> None:
 # --- FR-001: the stop signal is offered on ownership, not liveness ---------------------------
 
 
-def test_the_offer_does_not_consult_liveness() -> None:
-    """AC-1. ``_live_worker()`` returns None the instant ``retired`` latches, which is *entry* to
-    ``shutdown``, so consulting it here un-skips the offer for the whole of the drain.
-
-    Walked as an AST rather than grepped: both function names appear in this function's own
-    docstring explaining the distinction, so a substring check over ``getsource`` asserts the
-    prose and would fail against a correct implementation.
-    """
-
-    def called(function: types.FunctionType) -> set[str]:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
-        return {
-            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name | ast.Attribute)
-        }
-
-    moment = called(_lifecycle._may_replace)
-    assert "in_flight" in moment, "_may_replace must ask the moment predicate"
-    for decision in (_lifecycle._will_hand, _lifecycle._settle_signal):
-        assert "_may_replace" in called(decision), (
-            f"{decision.__name__} must ask the moment test, _may_replace"
-        )
-    for function in (_lifecycle._may_replace, _lifecycle._will_hand, _lifecycle._settle_signal):
-        assert not called(function) & {"_live_worker", "live_worker", "in_flight"} - (
-            {"in_flight"} if function is _lifecycle._may_replace else set()
-        ), f"{function.__name__} must key on the moment through _may_replace, not on liveness"
-
-
 def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
-    """AC-2. The drain thread is about to wait on ``worker._stop``; an orphan log must not
-    replace it with a fresh unset event."""
+    """AC-2. The sink is about to wait on its signal; an orphan log must not replace it.
+
+    Since SPEC-098 the signal is the sink's own event, handed once at the worker's build and set
+    by the shutdown's entry, and the orphan log during the drain assigns nothing.
+    """
     sink = BackoffSink()
     log_foundry.configure(service="t", sink=sink)
     _trace_once()
     worker = _lifecycle._state._worker
     assert worker is not None
-    assert sink.log_foundry_stop_signal is worker._stop, (
-        "the worker owns this sink's signal to begin with"
-    )
+    own = _lifecycle._state._signals[id(sink)][1]
+    assert sink.log_foundry_stop_signal is own, "the sink holds its own event to begin with"
 
     shutting_down = threading.Thread(target=lambda: log_foundry.shutdown(timeout=3.0))
     try:
@@ -126,8 +96,8 @@ def test_an_orphan_log_during_the_drain_leaves_the_stop_signal_alone() -> None:
 
         log_foundry.info("an orphan log while the drain is in flight")
 
-        assert sink.log_foundry_stop_signal is worker._stop, (
-            "an orphan log replaced the signal the drain thread is about to wait on"
+        assert sink.log_foundry_stop_signal is own, (
+            "an orphan log replaced the signal the sink is about to wait on"
         )
     finally:
         sink.may_wait.set()
@@ -162,8 +132,8 @@ def test_an_orphan_log_during_the_drain_does_not_strand_the_backoff() -> None:
 
     assert not shutting_down.is_alive(), "shutdown never returned"
     assert sink.cut_short is True, "the sink's backoff ran to its full length"
-    assert sink.signal_when_waiting is worker._stop, (
-        "the sink waited on a signal the shutdown does not set"
+    assert sink.signal_when_waiting is _lifecycle._state._signals[id(sink)][1], (
+        "the sink waited on a signal other than its own, which the shutdown sets"
     )
     assert log_foundry.health().stopped_reason is None, (
         "the shutdown expired, which is SPEC-027's global pause reintroduced"

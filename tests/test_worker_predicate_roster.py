@@ -751,28 +751,6 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "and take the module's count from 46 to 45 with nothing red."
         ),
     ),
-    ("Runtime.in_flight", "self._worker", 0): (
-        MOMENT,
-        (
-            "the snapshot the question below reads, inside the question rather than at its "
-            "caller (SPEC-040 FR-002). It is on the roster because rebinding is how a guard "
-            "changes category without its text changing - swapping this for live_worker() would "
-            "strip the drain thread of the event it is about to wait on, which is the SPEC-035 "
-            "FR-001 revert."
-        ),
-    ),
-    ("Runtime.in_flight", "worker is not None and worker.sink is sink and worker.draining", 0): (
-        MOMENT,
-        (
-            "the moment, for the signal refresh. It reads `draining`, so an abandoned drain "
-            "counts as **over** and the sink gets a fresh event rather than SPEC-033 FR-004's "
-            "tight retry loop - the opposite answer from `held` in the same state, which is why "
-            "the category carries two predicates. The identity term is what stops an orphan log "
-            "to sink Y being skipped because a live worker is draining into sink X. Was "
-            "`worker_owns_now`, an ownership-and-moment conjunction; with one owed-close record "
-            "there is no ownership question left for a site to get wrong (SPEC-054 FR-002/FR-004)."
-        ),
-    ),
     ("Runtime.held", "self._worker", 0): (
         MOMENT,
         "the snapshot the question below reads, for `in_flight`'s reason.",
@@ -846,106 +824,6 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "signal through that join."
         ),
     ),
-    ("_will_hand", "not handing_here(sink) and _may_replace(sink)", 0): (
-        MOMENT,
-        (
-            "the decision: the moment test through `_may_replace`, joined with `handing_here`, "
-            "which asks nothing about the worker and skips a sink this thread is already handing."
-        ),
-    ),
-    ("_may_replace", "not _state.in_flight(sink)", 0): (
-        MOMENT,
-        (
-            "the one site the refresh predicate exists for, moved here from "
-            "`_offer_orphan_signal` when the hand left the lock, by way of `_will_hand`, into "
-            "this helper, which `_settle_signal` shares. Bare liveness un-skips for the "
-            "whole drain and hands the drain thread a fresh event nobody will set; a bare identity "
-            "check skips for a worker whose shutdown has finished, leaving a live sink on a set "
-            "event that never clears. Both measured (SPEC-035 FR-001)."
-        ),
-    ),
-    ("_may_replace", "_state.worker_exists()", 0): (
-        EXISTENCE,
-        (
-            "is there a worker whose own event the sink might be handed. Existence, not "
-            "liveness: the row below compares that worker's event with the process signal, and a "
-            "retired worker's event is set or replaced, so the comparison fails for it anyway."
-        ),
-    ),
-    (
-        "_may_replace",
-        (
-            "owner is not None and owner.sink is sink and (owner._stop is stop) and "
-            "(not stop.is_set()) and (not _state._closes.in_flight(sink))"
-        ),
-        0,
-    ): (
-        MOMENT,
-        (
-            "the one exception to the skip above: handing a sink the very unset event its "
-            "draining worker holds replaces nothing, and a worker build hands its sink after its "
-            "section, so a log on another thread meeting the build's token hands that same event "
-            "rather than emitting to a sink with none. Identity and unset together are what make "
-            "it no replacement; a close in flight keeps the skip (SPEC-044 FR-003)."
-        ),
-    ),
-    ("_settle_signal", "not _may_replace(sink)", 0): (
-        MOMENT,
-        (
-            "the re-check's bail-out, the decision's own moment test: a bare `in_flight` here "
-            "returned whenever a fresh worker drained into the sink, leaving a late hand's set "
-            "event on it for good (SPEC-033 FR-004), measured as a 0.5 s backoff waiting 0.000 s."
-        ),
-    ),
-    ("_owed_candidates", "_will_hand(sink)", 0): (
-        MOMENT,
-        (
-            "the signal debt's filter over the owed record, the refresh predicate through "
-            "`_will_hand`: a sink a resumed worker is draining into keeps the event its rebuild "
-            "handed it, one whose close is in flight keeps the one the close waits on."
-        ),
-    ),
-    ("_arm_and_hand", "_owed_candidates()", 0): (
-        MOMENT,
-        (
-            "the signal debt decided in the orphan log's section, through `_owed_candidates`, "
-            "which files the predicate it asks."
-        ),
-    ),
-    ("_arm_and_hand", "_will_hand(sink) and (not any((owed is sink for owed in hands)))", 0): (
-        MOMENT,
-        (
-            "whether this log hands its own sink the signal: the refresh predicate through "
-            "`_will_hand`, joined with a dedupe against the debt's list, which asks nothing about "
-            "the worker."
-        ),
-    ),
-    ("_flush_live_sink", "_owed_candidates()", 0): (
-        MOMENT,
-        (
-            "the flush's half of the twin (invariant 6): the same debt the orphan log decides, "
-            "through the same function."
-        ),
-    ),
-    (
-        "_flush_live_sink",
-        "not any((handed is sink for handed in hands)) and _will_hand(sink)",
-        0,
-    ): (
-        MOMENT,
-        (
-            "while another thread's hand token is open, each owed sink the refresh predicate "
-            "accepts is handed the signal before its own flush runs, since that thread may be "
-            "mid-hand on it. The dedupe asks nothing about the worker."
-        ),
-    ),
-    ("_swap_sink", "_will_hand(new_sink)", 0): (
-        MOMENT,
-        (
-            "the no-worker swap's hand to the sink it arms: the refresh predicate through "
-            "`_will_hand`, asked in the first section, handed after it."
-        ),
-    ),
     ("_close_owed", "_state.worker_exists()", 0): (
         EXISTENCE,
         (
@@ -957,7 +835,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     (
         "_close_owed",
         (
-            "[] if declined else [sink for sink in _state._closes.owed.values() if not "
+            "[] if declined else [sink for sink in list(_state._closes.owed.values()) if not "
             "_state.held(sink)]"
         ),
         0,
@@ -1051,67 +929,6 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
             "the last participant removes the entry, and only if it is still the one it was "
             "handed - a fork's clear followed by the forking thread's late discharge must remove "
             "nothing (SPEC-054 FR-003). Filed by the `in_flight` token's over-match."
-        ),
-    ),
-    ("_CloseRegistry.defer_hand", "self._in_flight.get(id(sink))", 0): (
-        MOMENT,
-        (
-            "the close half of the moment, asked by the worker build during a stop: is a close of "
-            "this sink running, so the build marks it and hands nothing, and the close's "
-            "discharge pays the hand (fix after SPEC-079). One leaf acquisition for the check and "
-            "the mark, so no hand is lost between the build and the discharge."
-        ),
-    ),
-    ("_hand_after_close", "not _will_hand(sink)", 0): (
-        MOMENT,
-        (
-            "whether the discharge of a close pays the hand the build declined on it: the refresh "
-            "predicate through `_will_hand`, so the payment hands the current signal only where "
-            "nothing in flight relies on the one the sink holds."
-        ),
-    ),
-    ("_CloseRegistry.unmark", "self._in_flight.get(id(sink))", 0): (
-        MOMENT,
-        (
-            "the close half of the moment, asked when the last stop ends: is a close of the live "
-            "worker's sink still in flight with a mark on it, so the stop pays the hand and the "
-            "close's discharge, finding the mark gone, pays nothing."
-        ),
-    ),
-    ("_pay_marks_after_stop", "_state._stops_running or not _state._closes.marked()", 0): (
-        MOMENT,
-        (
-            "the lock-free gate before the stop-end payment: a stop still running, or no mark in "
-            "flight, means nothing to pay, and the pinned shutdown counts keep their numbers."
-        ),
-    ),
-    ("_pay_marks_after_stop", "_state.live_worker()", 0): (
-        LIVENESS,
-        (
-            "who delivers once the last stop has ended: only a live worker's sink is handed the "
-            "worker's signal there; a retired worker delivers nothing and needs none."
-        ),
-    ),
-    ("_pay_marks_after_stop", "worker is None", 0): (
-        LIVENESS,
-        "no live worker, so no deliverer to hand a signal for; the mark is left to the discharge.",
-    ),
-    ("_pay_marks_after_stop", "worker.sink", 0): (
-        LIVENESS,
-        "the sink the live worker delivers to, which is the one whose mark the stop may pay.",
-    ),
-    (
-        "_pay_marks_after_stop",
-        "worker._stop is not stop or stop.is_set() or (not worker.draining)",
-        0,
-    ): (
-        MOMENT,
-        (
-            "the payment's worker terms: every one of _will_hand's but the close-in-flight "
-            "refusal, which no stop needs once none is running - the worker drains into the sink "
-            "and holds the current, unset signal. The this-thread term follows on its own: a "
-            "payment reached inside a hand of this very sink is owed to that hand's exit rather "
-            "than refused, and the mark is consumed only after it."
         ),
     ),
     ("_CloseRegistry.in_flight", "id(sink) in self._in_flight", 0): (
@@ -1257,7 +1074,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     ),
     (
         "_swap_sink",
-        "[sink for sink in _state._closes.owed.values() if sink is old or _state.held(sink)]",
+        "[sink for sink in list(_state._closes.owed.values()) if sink is old or _state.held(sink)]",
         0,
     ): (
         MOMENT,
@@ -1274,7 +1091,7 @@ ROSTER: dict[tuple[str, str, int], tuple[str, str]] = {
     (
         "_swap_sink",
         (
-            "[sink for sink in _state._closes.owed.values() if kept.get(id(sink)) is sink and "
+            "[sink for sink in list(_state._closes.owed.values()) if kept.get(id(sink)) is sink and "
             "sink is not new_sink and (fenced_out if sink is previous else not _state.held(sink))]"
         ),
         0,
@@ -1761,8 +1578,18 @@ stays in scope rather than being dropped: it still reaches the worker through
 new home would go green while covering strictly less than it did — the vacuous case FR-004 names.
 """
 
-_SITE_FLOOR = {"log_foundry._lifecycle": 106, "log_foundry.decorator": 16}
+_SITE_FLOOR = {"log_foundry._lifecycle": 90, "log_foundry.decorator": 16}
 """The floor each walked module must still meet, by name.
+
+**Lowered at SPEC-098, 106 -> 90, to the count `_per_module_sites()` measured on its branch.**
+SPEC-098 deleted the stop-signal hand machinery, and with it 21 filed sites, each a row removed
+above: `Runtime.in_flight` (two, deleted with its one reader), `_CloseRegistry.defer_hand` and
+`unmark`, `_arm_and_hand` (two), `_flush_live_sink`'s debt and token reads (two),
+`_hand_after_close`, `_may_replace` (three), `_owed_candidates`, `_pay_marks_after_stop` (five),
+`_settle_signal`, `_swap_sink`'s `_will_hand` and `_will_hand` itself. That is 106 + 5 sites added
+since the last raise (111 measured at `c67931cd`), less 21. The new stop-signal helpers ask no worker question; their locals were
+named `entry` rather than `held`, which the sentinel vocabulary matches. A lowered floor is the
+deletion's, recorded here, not a shrink the floor failed to catch.
 
 **Raised at SPEC-091's diff review, frame 2, 104 -> 106 and 15 -> 16, to the counts
 `_per_module_sites()` measured.** `_flush_worker` gains the build its registry sweep needs when the

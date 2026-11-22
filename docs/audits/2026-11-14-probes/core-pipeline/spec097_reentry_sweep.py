@@ -3,7 +3,8 @@ call landing inside every library lock section a workload's main thread enters.
 
 Usage: spec097_reentry_sweep.py                    enumerate, then one child per section
        spec097_reentry_sweep.py enumerate <w> [u]  print workload w's sections (u: and unreached)
-       spec097_reentry_sweep.py fire <w> <k>       one child: interrupt workload w's k-th section
+       spec097_reentry_sweep.py fire <w> <site>    one child: interrupt workload w at <site>
+                                                   (``file:function:line``; ``-`` fires nothing)
 
 Run with ``PYTHONPATH=<tree>/src`` against a tree carrying the command path: it reads
 ``_lifecycle.in_section()``. A **section** is either the first statement inside a ``with`` on one
@@ -33,6 +34,13 @@ ends with the ledger balanced (``unaccounted == 0``), each sink closed as often 
 child of the same workload that fires nothing, no span current, and the handler's three calls
 made. A hang is the 15 s watchdog's exit 1. ``enumerate`` with ``u`` also prints, after a ``--``
 line, every AST section the workload did not reach.
+
+Revised in SPEC-098's second diff review: a child fires on the section's identity
+(``file:function:line``, as ``enumerate`` prints it), not on its index in the order the child
+reaches sections. That order depends on thread scheduling, so the k-th section of the enumerating
+run was sometimes not the k-th of the child's, and the child fired elsewhere or nowhere: the review
+read ``failed=1`` on 3 of 7 runs, always ``_settle_close`` with ``fired=False``. A section a child
+does not reach at all still reads ``fired=False``. The run now exits 1 when any section fails.
 """
 
 import concurrent.futures
@@ -61,13 +69,13 @@ if MODE == "all":
         out = run("enumerate", workload, "u").stdout.splitlines()
         unreached_by.append({line[7:] for line in out if line.startswith("UNSEEN ")})
         reached_everywhere.update(listing)
-        control = run("fire", workload, "-1").stdout.split()
+        control = run("fire", workload, "-").stdout.split()
         controls[workload] = next(word for word in control if word.startswith("closes="))
         print(f"control {workload} (nothing fired): {' '.join(control)}")
 
         def one(k: int, workload: str = workload, listing: list[str] = listing) -> tuple:
             try:
-                r = run("fire", workload, str(k), timeout=40)
+                r = run("fire", workload, listing[k], timeout=40)
             except subprocess.TimeoutExpired:
                 return workload, listing[k], "timeout", ""
             last = (r.stdout.strip().splitlines() or ["(nothing)"])[-1]
@@ -84,7 +92,7 @@ if MODE == "all":
     print(f"sections={len(rows)} failed={bad} ast_sections_not_reached={len(unreached)}")
     for site in unreached:
         print(f"not reached {site}")
-    sys.exit(0)
+    sys.exit(1 if bad else 0)
 
 WORKLOAD = sys.argv[2]
 faulthandler.dump_traceback_later(15, exit=True, file=open(os.devnull, "w"))
@@ -96,7 +104,7 @@ import threading  # noqa: E402
 import log_foundry  # noqa: E402
 from log_foundry import _ledger, _lifecycle, api, decorator, worker  # noqa: E402
 
-TARGET = int(sys.argv[3]) if MODE == "fire" else -1
+TARGET = sys.argv[3] if MODE == "fire" and sys.argv[3] != "-" else None
 
 
 class Sink:
@@ -256,33 +264,26 @@ def late_workload() -> None:
 def direct_workload() -> None:
     """Drives the main-thread sections no public sequence here reaches, each in a valid state.
 
-    They are the hand machinery SPEC-098 deletes, which runs on the main thread until it does,
-    ``_close_owed``'s put-back after a fault, the overflow count a sweep's hand-in makes, and the
-    loss read nothing calls. Each is reached by calling it as the library does, so the question the
-    sweep asks of it, whether a handler's calls re-entering its lock leave the process sound, is
-    the same as on a public path.
+    They are ``_close_owed``'s put-back after a fault, the overflow count a sweep's hand-in makes,
+    the loss read nothing calls, and ``rearm_if_released``'s locked arm. Each is reached by calling
+    it as the library does, so the question the sweep asks of it, whether a handler's calls
+    re-entering its lock leave the process sound, is the same as on a public path.
+
+    Revised while building SPEC-098: this workload called the hand machinery SPEC-098 deletes
+    (``_hand_retargeted``, ``defer_hand``, ``unmark``, ``_pay_marks_after_stop``,
+    ``_hand_after_close`` and ``_settle_signal``) and now calls none of it. The stop-signal
+    sections that replace it, the ``_owned_lock`` sections of a first hand, a ``configure()``'s
+    reinstall clear and a stop's set, are reached by the ``main`` workload's public calls.
     """
-    from log_foundry._lifecycle import _Op, _Operation, _Rule
+    from log_foundry._lifecycle import _Rule
 
     log_foundry.configure(service="sweep", sink=A)
     work()
     log_foundry.flush(timeout=2)
     state = _lifecycle._state
     live = state._worker
-    stop = _Operation(_Op.STOP, 1.0)
-    state._stops_running.add(stop)
-    try:
-        _lifecycle._hand_retargeted(B, state._stop)
-    finally:
-        state._stops_running.discard(stop)
     closing = state._closes.register(B, _Rule.GRACED)
-    state._closes.defer_hand(B)
-    state._closes.unmark(B)
-    state._closes.defer_hand(B)
-    _lifecycle._pay_marks_after_stop()
     state._closes.finish(B, closing)
-    _lifecycle._hand_after_close(B)
-    _lifecycle._settle_signal(B, threading.Event())
     _lifecycle.rearm_if_released(B)
     if live is not None:
         live._count_overflow(0)
@@ -373,7 +374,7 @@ def tracer(frame, event, arg):  # type: ignore[no-untyped-def]
         if key is not None and inside:
             if key not in sites:
                 sites.append(key)
-                if len(sites) - 1 == TARGET:
+                if key == TARGET:
                     state["fired"] = True
                     sys.settrace(None)
                     signal.raise_signal(signal.SIGTERM)
@@ -398,7 +399,7 @@ if ledger.unaccounted:
 closes = "closes=" + ",".join(str(sink.closes) for sink in SINKS)
 if log_foundry.current_trace_context() is not None:
     problems.append("a span is still current")
-if TARGET >= 0 and handled != ["done"]:
+if TARGET is not None and handled != ["done"]:
     problems.append(f"handler={handled} fired={state['fired']}")
 print(
     "ok" if not problems else "BROKEN " + "; ".join(problems),

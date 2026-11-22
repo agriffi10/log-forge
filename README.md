@@ -80,6 +80,9 @@ pip install 'log-foundry>=1,<2'   # pin to the frozen API above
 >   injects through `client=`** rather than the old `sdk` keyword, with no alias, and the sink attribute the
 >   library assigns for interruptible backoff is **`log_foundry_stop_signal`**, not
 >   `stop_signal` — a prefixed name cannot silently overwrite one your own sink already uses.
+>   Since 1.2.1 that event is its own, one per sink:
+>   it is set when a shutdown starts,
+>   stays set for a delivery after it, and is cleared when `configure()` installs it again.
 >
 > Those are the three changes of *shape*, and not the three most likely to reach you:
 > `log_foundry.sinks.util` was deleted with no alias — the `MemorySink`, `NullSink` and
@@ -1179,9 +1182,16 @@ no change. `emit([])` must be a no-op: an empty batch has not
 failed to deliver.
 
 `log_foundry_stop_signal` is optional in the same way, and is an attribute rather than a method.
-Declare it as a plain `threading.Event | None` initialised to `None` and the library assigns the
-worker's shutdown event to it; leave it out and you are simply never offered one. **Honour it in
-your retry backoff** — pass it to `Event.wait(timeout)` instead of calling `time.sleep`:
+Declare it as a plain `threading.Event | None` initialised to `None` and the library assigns your
+sink an event of its own the first time it delivers to it; leave it out and you are simply never
+offered one. The event is set when a shutdown starts. It stays set for a delivery after it, so a
+sink the library reaches after `shutdown()` with no `configure()` between backs off not at all,
+though every attempt is still made; it is cleared when `configure()` installs it again, and
+the sink is then assigned it again. A `sink_factory` that returns a sink it built before is the
+exception in 1.2.1: the `configure()` that installs the factory cannot reach a sink not yet built,
+so such a sink keeps an event a `shutdown()` set. A forked child keeps the same object, and its own
+`shutdown()` sets the child's copy. **Honour it in your retry backoff** — pass it to
+`Event.wait(timeout)` instead of calling `time.sleep`:
 
 ```python
         if self.log_foundry_stop_signal is not None:
@@ -1192,7 +1202,10 @@ your retry backoff** — pass it to `Event.wait(timeout)` instead of calling `ti
 
 The library assigns it with none of its locks held that a call from your setter would wait on,
 so a setter of yours may log or call `configure()`, `flush()` or `shutdown()`. It may be assigned more than once, from more than one
-thread at the same moment, so keep the setter safe to run that way.
+thread at the same moment, so keep the setter safe to run that way: two threads reaching your
+sink's first delivery together may both assign it, the same object, and each `configure()` that
+installs it again assigns it again. A sink that sets the attribute to `None` itself is handed its
+event again only when a `configure()` installs it again.
 
 There is one drain thread, so your backoff pauses *all* log delivery, and it is held across
 `shutdown()` — which joins that thread. A sink that sleeps through a 30-second backoff holds

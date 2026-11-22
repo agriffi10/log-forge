@@ -4,6 +4,12 @@ title: "Lifecycle state has one holder, Runtime, and the stored State decides th
 description: "the lifecycle bookkeeping lives on `_lifecycle._state`, a `Runtime`, with no module-level alias; its settled `State` is stored in `_current`, written only by `_move` inside four existing critical sections and the fork handler's re-settle, and the transition table is total over six calls and five states, with one changed cell: a swap with no live worker during a drain with a take ahead declines. `CLOSED` keeps its arrows. Every owed and in-flight close lives in one registry. Three locks remain, all `RLock`s; a lifecycle call reads `_lock` and the registry's for ownership and never re-enters them. The token sets are discarded lock-free, and a sink change's added lock-free before its config write, a bounded exception to `python.md` §13. (SPEC-077, SPEC-078, SPEC-097; arch §9.2)"
 ---
 
+> **Refined by SPEC-098 (2026-11-20).** `Runtime` also holds each sink's own stop signal
+> (`_signals`) and the set of every event the library made (`_signal_events`), guarded by
+> `_owned_lock` and opted out of the fork walk. `in_flight` is deleted with the signal refresh,
+> and so is `_hand_after_close`, the one path below that took `_lock` under `_owned_lock`. The
+> orphan log's arming section is `_note_orphan_emit` again, not `_arm_and_hand`.
+
 **One holder.** SPEC-040 put the orphan side's seven globals on one object, `_lifecycle._state`,
 and SPEC-054 merged the twin bookkeeping (*One lifecycle owner*). Seven more names still sat at
 module scope in `_lifecycle.py`, each with its own lock where it had one. SPEC-077 renamed
@@ -125,6 +131,11 @@ the owed record outside `_CloseRegistry.arm`, `take`, `put_back` and `cede`. (SP
 FR-003, SPEC-078 FR-001 to FR-004, SPEC-087 FR-001)
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-098: two fields join `Runtime` and the stop-signal hand machinery leaves
+  it; `_move`'s orphan site is back in `_note_orphan_emit`; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6).
 
 ### 2026-11-18
 

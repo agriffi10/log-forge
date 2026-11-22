@@ -1,8 +1,17 @@
 ---
 type: Decision
 title: "A child forked inside a stop-signal setter keeps its mark and the event it was offered, and its shutdown sets that event"
-description: "`offer_stop_signal` records each offer on the offering thread (`Runtime._offering_here`); a forked child keeps the forking thread's offered events, exact `threading.Event` only and re-initialised, and its `shutdown()` sets them where it sets its own signal; `handing_here` also reads the offer record and, from any thread of a child, the forking thread's inherited offers (`_fork_offers[:_fork_inherited]`); the resumed worker's fork-handler hand skips a sink it reports; the stop-end payment asks the `handing` mark alone. Never reset either mark in a child, never hand an offered sink from the fork handler, keep no per-sink history of hands. (SPEC-083)"
+description: "`offer_stop_signal` records each offer on the offering thread (`Runtime._offering_here`), and a thread inside an offer of a sink does not offer it again; a forked child keeps every stop signal the library made, re-initialised in place before its repair walk (`_seed_signals_after_fork`), marks handed each sink the forking thread was being offered, and its `shutdown()` sets every event, the child's copies; no setter runs in the repair or at the child's first delivery. Never reset the offer record in a child, never offer a sink from the fork handler that is still on it, keep no per-sink history of hands. (SPEC-083; SPEC-098)"
 ---
+
+> **Rewritten by SPEC-098 (2026-11-20).** The child keeps every event the library made, not only
+> the forking thread's offered ones: the seed re-initialises each in place before the walk and
+> enters it in the walk's memo, so whatever holds it keeps the same object. The per-thread
+> `handing` mark, `handing_here`, `_stale_signals`, `_fork_offers` and `_fork_inherited` are
+> deleted. What they kept, that no thread of a child runs a setter the forking thread is still
+> inside, the seed keeps by marking those sinks handed in the child's table, read from the
+> forking thread's offer record at the fork. A different parent thread inside a first setter at
+> the fork is not covered (`architecture.md` §12). The measurements below stand.
 
 **The defect.** A sink's `log_foundry_stop_signal` setter is the sink's own code, and it can
 start a process. If it does, for example with a fork-context `multiprocessing.Process` whose child
@@ -129,6 +138,12 @@ signal debt, and that debt is owed again if another thread paid it first. A `shu
 that point is still cut short by the set.
 
 ## History
+
+### 2026-11-20
+
+- **Rewritten** by SPEC-098: the child keeps every event in place and its stop sets them all;
+  the sinks the forking thread was being offered are marked handed by the seed instead of being
+  read through a shared offer record; a hand ran on both paths before it, the orphan log's and the worker's (the build and `Worker.retarget`), and one offer now serves both (invariant 6), and a resumed worker in the child offers nothing.
 
 ### 2026-11-13
 

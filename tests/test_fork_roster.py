@@ -9,7 +9,8 @@ it complete, so this file holds it from both sides, and each side catches what t
   at sinks, a ``Worker``, classes and modules, which are the walk's to reach. A primitive found
   as an attribute on that path must be a roster value; one found inside a container fails, since
   neither the roster nor the walk reaches it, unless the container is declared emptied in the
-  child by a named handler.
+  child by a named handler, or declared seeded before the walk by a named seeder and opted out
+  of the walk by its holder's ``_FORK_SKIP`` (SPEC-098 FR-003 AC-6).
 - **The static half** is an AST scan of ``src/``: every class that assigns a ``Lock``, ``RLock`` or
   ``Event`` to ``self`` is declared in :data:`_PRIMITIVE_HOMES` with one home, which catches a new
   lock-holding class while no instance of it exists.
@@ -51,6 +52,7 @@ UNROSTERED = "a package global primitive is not on the roster"
 STALE_PAIR = "a roster pair resolves to nothing"
 CONTAINED = "a primitive inside a container is reached by neither the roster nor the walk"
 UNDECLARED_CLASS = "a class assigns a primitive to self and has no _PRIMITIVE_HOMES entry"
+UNSKIPPED = "a container the child seeds is not in its holder's _FORK_SKIP"
 STALE_HOME = "a _PRIMITIVE_HOMES entry names no class that assigns a primitive to self"
 
 _EXPECTED_ROSTER = (
@@ -70,6 +72,18 @@ _EXPECTED_ROSTER = (
 
 _EMPTIED_IN_CHILD = {"_lifecycle._state._closes._in_flight": "_clear_after_fork"}
 """Containers holding primitives that a child handler empties, so nothing needs to reach them."""
+
+_SKIPPED_IN_CHILD = {
+    "_lifecycle._state._signals": "_seed_signals_after_fork",
+    "_lifecycle._state._signal_events": "_seed_signals_after_fork",
+}
+"""Containers holding primitives that a child seeds before its walk, with the seeder (SPEC-098).
+
+The stop-signal table and the event set hold every sink's own event; the seed re-initialises
+each in place before the walk, and the walk must not descend into either, so each must also be
+named in its holder's ``_FORK_SKIP``. The live half does not descend into a declared site, and
+refuses one its holder does not opt out (:data:`UNSKIPPED`).
+"""
 
 _PRIMITIVE_HOMES = {
     "Runtime": "roster",
@@ -144,11 +158,20 @@ def live_findings(
     modules: dict[str, types.ModuleType],
     roster: tuple[tuple[str, str], ...],
     emptied: dict[str, str],
+    *,
+    skipped: dict[str, str] = _SKIPPED_IN_CHILD,
 ) -> list[tuple[str, str]]:
     """The live half's refusals over ``modules`` against ``roster``, each ``(reason, site)``."""
     attribute: dict[int, str] = {}
     findings: list[tuple[str, str]] = []
     emptied_ids = {id(_resolve(modules, *site.split(".", 1))) for site in emptied}
+    for site in skipped:
+        module, path = site.split(".", 1)
+        holder_path, _, name = path.rpartition(".")
+        holder = _resolve(modules, module, holder_path)
+        if name not in _fork._skipped_names(holder):
+            findings.append((UNSKIPPED, site))
+        emptied_ids.add(id(_resolve(modules, module, path)))
     seen: set[int] = set()
     stack: list[tuple[str, object, bool]] = []
     for short, module in modules.items():
@@ -292,6 +315,35 @@ _P_SOURCE = (
 )
 
 
+def _handed_sink() -> MemorySink:
+    """A sink the library has handed its own stop signal, so the table holds a live event."""
+    sink = MemorySink()
+    _lifecycle.offer_stop_signal(sink, threading.Event())  # type: ignore[arg-type]
+    return sink
+
+
+def _with_fork_skip(names: tuple[str, ...]) -> list[tuple[str, str]]:
+    """The live half with ``Runtime._FORK_SKIP`` replaced by ``names``, restored after."""
+    keep = _handed_sink()
+    saved = _lifecycle.Runtime._FORK_SKIP
+    _lifecycle.Runtime._FORK_SKIP = names  # type: ignore[assignment]
+    try:
+        return live_findings(_package_modules(), _EXPECTED_ROSTER, _EMPTIED_IN_CHILD)
+    finally:
+        _lifecycle.Runtime._FORK_SKIP = saved  # type: ignore[assignment]
+        del keep
+
+
+def _undeclared_signals() -> str:
+    """With no seeded declaration, a handed sink's event in the table is a contained primitive."""
+    keep = _handed_sink()
+    findings = live_findings(_package_modules(), _EXPECTED_ROSTER, _EMPTIED_IN_CHILD, skipped={})
+    del keep
+    reasons = {reason for reason, _site in findings}
+    sited = all("._signals[" in site or "._signal_events" in site for _r, site in findings)
+    return "contained" if findings and reasons == {CONTAINED} and sited else repr(findings)
+
+
 @pytest.mark.parametrize(
     ("case", "build", "expected"),
     [
@@ -326,6 +378,26 @@ _P_SOURCE = (
                 _EMPTIED_IN_CHILD,
             ),
             [(STALE_PAIR, "_lifecycle._state._gone")],
+        ),
+        (
+            "the-signal-table-not-opted-out",
+            lambda: _with_fork_skip(("_owned", "_signal_events")),
+            [(UNSKIPPED, "_lifecycle._state._signals")],
+        ),
+        (
+            "the-event-set-not-opted-out",
+            lambda: _with_fork_skip(("_owned", "_signals")),
+            [(UNSKIPPED, "_lifecycle._state._signal_events")],
+        ),
+        (
+            "both-opted-out",
+            lambda: _with_fork_skip(("_owned", "_signals", "_signal_events")),
+            [],
+        ),
+        (
+            "the-signal-table-undeclared",
+            lambda: _undeclared_signals(),
+            "contained",
         ),
         (
             "a-class-with-no-home",
@@ -560,10 +632,13 @@ def test_without_its_entry_the_child_blocks(
 
 
 def test_the_sinks_and_the_workers_stop_signal_are_the_rosters_in_the_child() -> None:
-    """FR-002: a sink's stop signal, the worker's ``_stop`` and ``_state._stop`` are one object.
+    """FR-002: the worker's ``_stop`` is the roster's in the child; the sink keeps its own.
 
-    The roster replaces ``_state._stop`` first and the walk then reaches the worker and the sink,
-    all through one memo, so the three stay one ``Event`` in the child (SPEC-027).
+    The roster replaces ``_state._stop`` first and the walk then reaches the worker through one
+    memo, so the worker's event and ``_state._stop`` stay one ``Event`` in the child. Until
+    SPEC-098 the sink's signal was that same event (SPEC-027). Since then it is the sink's own,
+    which the child's seed keeps in place: the same object as in the parent, entered in the memo
+    as its own replacement so the walk leaves it there.
     """
     from log_foundry.sinks.multi import MultiSink
 
@@ -578,13 +653,15 @@ def test_the_sinks_and_the_workers_stop_signal_are_the_rosters_in_the_child() ->
     worker = _lifecycle._state.worker_exists()
     assert worker is not None
     old = _lifecycle._state._stop
-    assert sink.log_foundry_stop_signal is worker._stop is old, "the precondition, in the parent"
+    own = _lifecycle._state._signals[id(sink)][1]
+    assert worker._stop is old, "the precondition, in the parent"
+    assert sink.log_foundry_stop_signal is own and own is not old, "and the sink's own event"
 
     def read() -> str:
         live = _lifecycle._state.worker_exists()
         assert live is not None
         stop = _lifecycle._state._stop
-        return f"{stop is not old},{live._stop is stop},{sink.log_foundry_stop_signal is stop}"
+        return f"{stop is not old},{live._stop is stop},{sink.log_foundry_stop_signal is own}"
 
     child = run_in_child(read)
     assert child.output == "True,True,True", child.output
