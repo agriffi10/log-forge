@@ -59,7 +59,8 @@ wait costs one round trip per round, bounded at 0.25 s. `SyslogSink` and `Logsta
 keyword-only `ack_wait: bool | None = None`; `None` and `True` wait, and `False` reads the peer's state
 once at the end, which keeps the pre-round check, the raise rule and an end check that sees a reset
 already landed, and gives up the rows the corpus measured silent under delay and on macOS loopback,
-and the mid-round rows in some runs on a loaded Linux runner (SPEC-093, 2026-11-22).
+and the mid-round rows in some runs on a loaded Linux runner, which the wait gives up there too,
+as a reset after the end check (SPEC-093, 2026-11-22).
 The name says what it controls, the wait for the peer's TCP acknowledgement; `confirm` was not reused,
 because a broker's confirm is an application-level answer and this acknowledgement is the peer
 kernel's, which says nothing about whether the collector kept the bytes. `_socket.require_ack_wait`

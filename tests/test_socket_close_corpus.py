@@ -3,17 +3,17 @@
 Each scenario runs ``LogstashSink`` in TCP mode against a loopback peer, through the real
 transport, and arranges the peer's close through the transport's two seams: ``_peer_state``, the
 check before a round's first frame, and ``_end_state``, the check after its last. A hook runs the
-close at the seam it names, and no ``ack_wait=True`` check is preceded by a sleep for a packet to
-land: the rule must decide on what the kernel shows when it asks. The scenarios and their expected verdicts are
+close at the seam it names, and the rule must decide on what the kernel shows when it asks. The one
+wait before a check is for a close the scenario sent to land on the connection it closed, read
+without consuming it (:attr:`Seams.await_close`): never for an answer the rule itself waits for. The scenarios and their expected verdicts are
 FR-001's table, ported from ``docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py``.
 
 A row is right when no frame was lost that the round did not count and, outside the two
 mid-round rows, nothing was counted that arrived. The reset-after-the-end-check row is the
 residual window FR-006 records: its first round goes uncounted, and only its second round is held.
-The same rows run with ``ack_wait=False`` on Linux, each waiting before the end check for the
-peer's answer to land (:class:`Seams`), since the opt-out leaves a reset in flight at its one read
-uncounted and a loaded runner can hold one in flight; with the answer landed, the corpus measured
-the unwaited check right on loopback. Elsewhere that half is skipped, since on macOS the corpus
+The same rows run with ``ack_wait=False`` on Linux, each awaiting its close before the end check,
+since the opt-out leaves a reset in flight at its one read uncounted and a loaded runner can hold
+one in flight; with the close landed, the corpus measured the unwaited check right on loopback. Elsewhere that half is skipped, since on macOS the corpus
 measured it silent on three rows, which is the opt-out's recorded cost. Serves invariants 2, 7 and 11.
 """
 
@@ -217,7 +217,7 @@ class Server:
 
 
 def until(condition: Callable[[], bool], limit: float = 2.0) -> None:
-    """Waits for a condition the scenario needs, or for the answer an ``ack_wait=False`` row settles.
+    """Waits for a condition the scenario needs, or for a close the scenario sent to land.
 
     Args:
       condition: The condition.
@@ -242,26 +242,31 @@ class Seams:
 
     Attributes:
       hooks: The hooks by moment, each run once.
-      settle: Whether the end check, after its ``before_end`` hook, first waits up to 2 s until
-        :func:`_peer_answer_landed` says the peer's answer to the round has reached the socket.
-        ``ack_wait=False`` reads the connection once and waits for nothing, so a reset still in
-        flight at that read goes uncounted, as SPEC-093 says of the opt-out. On a loaded runner
-        a reset the scenario sent just before the check can still be in flight: CI read 850
-        frames lost and none counted on the ``fin-no-ack-wait`` mid-round row. Settling makes each
-        ``ack_wait=False`` row the promise the opt-out does keep, that a reset which has landed by
-        the end of the round is counted, wherever the scenario's own action leaves its answer in
-        flight, as a peer's close on its own thread does. Where every byte was acknowledged
-        before the close, as on the reset-before-the-end-check row, the wait ends at once and the
-        reset, sent from the sink's thread in the hook, is processed there on loopback.
-        ``ack_wait=True`` rows do not settle, so they still prove the sink's own wait.
+      ack_wait: The sink's ``ack_wait``, which a scenario reads to decide whether to await.
+      await_close: Whether the end check, after its ``before_end`` hook, first waits up to 2 s
+        until :func:`_close_landed` says the peer's close has reached the round's connection. A
+        scenario whose peer closes before the end check sets it: for ``ack_wait=False``, which
+        reads the connection once and leaves a reset still in flight at that read uncounted, as
+        SPEC-093 says of the opt-out; and on the mid-round rows in both modes, since a peer's
+        kernel acknowledges frames its reader has not taken, so a round whose every frame was
+        acknowledged and then reset can have the reset in flight at the check, the window FR-006
+        records for both modes. CI read 850 frames lost and none counted that way on the
+        ``fin-no-ack-wait`` mid-round row, and the system-frame review reproduced it on
+        ``fin-ack-wait`` in 1 of 250 loaded runs. Awaiting makes each such row the promise the
+        rule keeps, that a close which has landed by the end of the round is counted. The other
+        ``ack_wait=True`` rows do not await, so they still prove the sink's own wait.
+      closed_sock: The socket the first pre-check outside an end check was given: the warm
+        connection, which is the one a scenario's peer closes. A write that raised moves the run
+        to a new connection, and a later round of the same run, which the engine runs to resend,
+        checks that one; neither replaces it, so only the closed connection is awaited.
     """
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, settle: bool = False) -> None:
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, ack_wait: bool = True) -> None:
         """Installs the wrappers.
 
         Args:
           monkeypatch: The test's patch, which restores both seams.
-          settle: Whether the end check first waits for the peer's answer to land.
+          ack_wait: The sink's ``ack_wait``.
 
         Returns:
           None.
@@ -270,7 +275,9 @@ class Seams:
           None.
         """
         self.hooks: dict[str, Callable[[], None]] = {}
-        self.settle = settle
+        self.ack_wait = ack_wait
+        self.await_close = False
+        self.closed_sock: socket.socket | None = None
         self._peer_state = _socket._peer_state
         self._end_state = _socket._end_state
         self._inside_end = threading.local()
@@ -307,6 +314,8 @@ class Seams:
         """
         if getattr(self._inside_end, "on", False):
             return self._peer_state(sock)
+        if self.closed_sock is None:
+            self.closed_sock = sock
         self._fire("before_pre")
         state = self._peer_state(sock)
         self._fire("after_pre")
@@ -326,8 +335,8 @@ class Seams:
           None.
         """
         self._fire("before_end")
-        if self.settle:
-            until(lambda: _peer_answer_landed(sock), 2.0)
+        if self.await_close:
+            until(lambda: _close_landed(sock, self.closed_sock), 2.0)
         self._inside_end.on = True
         try:
             state = self._end_state(sock, *args)
@@ -371,6 +380,7 @@ def _fin_after_pre(seams: Seams, srv: Server) -> None:
         _cur(srv).fin()
 
     seams.hooks["after_pre"] = hook
+    seams.await_close = not seams.ack_wait
 
 
 def _rst_before_end(seams: Seams, srv: Server) -> None:
@@ -388,6 +398,7 @@ def _rst_before_end(seams: Seams, srv: Server) -> None:
     """
     _cur(srv).stop_reading()
     seams.hooks["before_end"] = lambda: _cur(srv).rst()
+    seams.await_close = not seams.ack_wait
 
 
 def _fin_before_end_read_all(n: int) -> Callable[[Seams, Server], None]:
@@ -445,40 +456,45 @@ def _half_close(peer: Peer) -> None:
     peer.conn.shutdown(socket.SHUT_WR)
 
 
-_TCP_INFO = 11
-"""Linux's ``TCP_INFO`` option, whose reply opens with the connection's state byte."""
+_TCP_STATE = (0x106, 0, 5) if sys.platform == "darwin" else (11, 7, 8)
+"""``TCP_INFO`` (``TCP_CONNECTION_INFO`` on macOS), then its state byte's close and close-wait.
 
-_TCP_CLOSE = 7
-"""Linux's ``TCP_CLOSE``: a reset has landed, or the connection is otherwise gone."""
+The reply to that option opens with the connection's state: ``TCP_CLOSE`` and ``TCP_CLOSE_WAIT``
+on Linux, ``TCPS_CLOSED`` and ``TCPS_CLOSE_WAIT`` on macOS.
+"""
 
 
-def _peer_answer_landed(sock: socket.socket) -> bool:
-    """Whether the peer's answer to every byte this end wrote has reached this end's kernel.
+def _close_landed(sock: socket.socket, closed: socket.socket | None) -> bool:
+    """Whether the close the scenario's peer sent has reached the connection it closed.
 
-    Read through ``TCP_INFO`` and :func:`~log_foundry.sinks._socket._unacked`, never through
-    ``SO_ERROR`` or a peek, both of which clear a pending reset that the end check under test
-    must still find. The answer has landed once a reset has closed the connection, or once the
-    peer has acknowledged every byte, open, half-closed or after its FIN, since a peer that closed
-    before frames arrived answers them with a reset and never with an acknowledgement. Bytes
-    acknowledged before a close are not an answer to that close, so a scenario that closes later
-    must send its close before the wait, as the hooks do. Linux only, as the rows that settle are;
-    an ``OSError``, or an ``_unacked`` that cannot read the queue and answers ``None``, reads as
-    landed, so the end check runs and decides.
+    Read through the connection's TCP state and :func:`~log_foundry.sinks._socket._unacked`,
+    never through ``SO_ERROR`` or a peek, both of which clear a pending reset that the end check
+    under test must still find. The close has landed once a reset has closed the connection, or
+    once its FIN has and every byte is acknowledged, since a peer that closed before frames
+    arrived answers them with a reset and never with an acknowledgement. An acknowledgement alone
+    is not the answer: the peer's kernel acknowledges frames its reader has not taken, before it
+    closes. A held socket that is not the closed connection lands at once, since a write that
+    raised moved the run and the raise rule decided it; so does an ``OSError``, or an
+    ``_unacked`` that answers ``None``, and the end check then runs and decides.
 
     Args:
-      sock: The sink's held socket.
+      sock: The socket the end check was given.
+      closed: The connection the peer closed.
 
     Returns:
-      ``True`` once the answer has landed.
+      ``True`` once the close has landed.
 
     Raises:
       None.
     """
+    if sock is not closed:
+        return True
+    option, close, close_wait = _TCP_STATE
     try:
-        state = sock.getsockopt(socket.IPPROTO_TCP, _TCP_INFO, 8)[0]
+        state = sock.getsockopt(socket.IPPROTO_TCP, option, 8)[0]
     except OSError:
         return True
-    return state == _TCP_CLOSE or not _socket._unacked(sock)
+    return state == close or (state == close_wait and not _socket._unacked(sock))
 
 
 def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
@@ -490,8 +506,9 @@ def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
     reset-after-the-end-check window, uncounted by design: CI read 617 frames lost and none
     counted that way on the ``rst-no-ack-wait`` row.
 
-    Joining the watcher orders the peer's ``close()``, not the arrival of the reset it sends,
-    which :class:`Seams` settles for the ``ack_wait=False`` rows.
+    Joining the watcher orders the peer's ``close()``, not the arrival of what it sends, so the
+    row also sets :attr:`Seams.await_close` in both modes, and the end check reads the close once
+    it has landed.
 
     Args:
       mode: ``fin`` or ``rst``.
@@ -518,6 +535,7 @@ def _mid_round(mode: str, after: int) -> Callable[[Seams, Server], None]:
         watcher = threading.Thread(target=watch, daemon=True)
         watcher.start()
         seams.hooks["before_end"] = lambda: watcher.join(6.0)
+        seams.await_close = True
 
     return setup
 
@@ -600,7 +618,7 @@ def _run(
     Raises:
       None.
     """
-    seams = Seams(monkeypatch, settle=not ack_wait)
+    seams = Seams(monkeypatch, ack_wait)
     srv = Server(on_accept)
     sink = LogstashSink(host="127.0.0.1", port=srv.port, transport="tcp", ack_wait=ack_wait)
     try:
@@ -633,7 +651,7 @@ _ACK_WAIT = [
         id="no-ack-wait",
         marks=pytest.mark.skipif(
             not sys.platform.startswith("linux"),
-            reason="the unwaited check, once the answer lands, is right on Linux loopback only",
+            reason="the unwaited check, once the close lands, is right on Linux loopback only",
         ),
     ),
 ]
