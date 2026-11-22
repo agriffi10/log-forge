@@ -4619,7 +4619,10 @@ and a third copy is a fork with no merge.
   flight at the check goes uncounted; `ack_wait=False` makes every platform behave so, and the
   corpus measured what that gives up: the FIN-after-the-pre-check rows, the reset-before-the-end-check
   row and the reset-after-the-end-check row's second round silent under 10 ms of delay, and the
-  FIN-after-the-pre-check and reset-before-the-end-check rows silent in some runs on macOS loopback. The 0.25 s bound was decided in session, not by Andrew:
+  FIN-after-the-pre-check and reset-before-the-end-check rows silent in some runs on macOS loopback,
+  and the mid-round rows silent in some runs on a loaded Linux runner, which the wait gives up
+  there too, since a reset of frames the peer's kernel acknowledged can land after the end check.
+  The 0.25 s bound was decided in session, not by Andrew:
   it covers a 50 ms round trip under Linux's longest delayed acknowledgement, and a longer one would
   close more of the window above at that much more cost a round against a silent peer. (SPEC-093)
 - **A FIN alone is not read as a loss, because it is also a legal half-close.** A peer that shuts
