@@ -637,10 +637,10 @@ def test_a_forked_child_starts_with_what_it_holds(capsys, monkeypatch) -> None:
 
     The worker's ``flush_interval`` default is raised to an hour before the library builds it, so
     SPEC-091's sweep of an open span cannot run between the span's events and the fork: the
-    drain's first sweep is due a whole interval after it starts. Any stall longer than the default
-    1 s between the drain's start and the fork lets a sweep ship one of the span's events first,
-    such as ``run_in_child``'s collection of the parent's garbage before it forks, which in a full
-    suite can take that long, or a starved runner; the child then held
+    drain's first sweep is due a whole interval after it starts. At the default 1 s, a sweep that
+    falls due after the span's log and before the fork ships that event first, and a stall there
+    makes one likely: ``run_in_child``'s collection of the parent's garbage before it forks, which
+    in a full suite can take that long, or a starved runner. The child then held
     ``accepted=1 open_spans=1``: CI read that on ``5170b023``'s py3.13 run, and stretching the
     collection past 1 s reproduces it.
     """
