@@ -121,7 +121,10 @@ hand-offs `KafkaSink` and `GooglePubSubSink` see refused, and `HTTPSink._drop_re
 (SPEC-059), and the encode step every record-building sink runs before its first bulk call,
 `sinks/_encode.encode_events`, whose count lands in `_unencodable` (or `rejected` for `KafkaSink`
 and `GooglePubSubSink`, and on `SocketTransport` for `SyslogSink` and socket-mode `LogstashSink`)
-(SPEC-069). On the delivery engine the commit is the run's (SPEC-073): the HTTP family's drop
+(SPEC-069). Since SPEC-094 `KafkaSink` and `GooglePubSubSink` are on the delivery engine: a refused
+hand-off beside one that worked is `DROPPED` and counted in `rejected`, now an assignable property
+over `dropped_events`, only when the run settles, and a round in which every hand-off was refused
+is `RETRYABLE`, resent by the engine rather than raised to the worker. On the delivery engine the commit is the run's (SPEC-073): the HTTP family's drop
 sites — `HTTPSink._items`, `_drop_refused` and a chunk whose request could not be built — register
 on the engine's **run context** as `SETTLED`, committed by `_engine._commit` only when the run
 settles, so a run that fails counts none of them and its catcher owns the batch. A counter some
@@ -196,6 +199,15 @@ once per worker attempt. `MultiSink` offers no `deliver`: an engine child's `emi
 which commits a failed run's events into the child's `failed_events` before raising, and
 `MultiSink`'s absorbed count takes them again — the recorded upper bound on `failed`, never a
 second count in `dropped`.
+**A sink counts what its backend did not confirm** (SPEC-093, SPEC-094). A TCP frame written to a
+connection its peer closed, an SQS, SNS, Kinesis, Firehose or `_bulk` reply entry that names no
+verdict, a `confirm=True` `RabbitMQSink` publish whose confirm was lost, and a `KafkaSink` or
+`GooglePubSubSink` message with no definitive report when its round's wait ended are `UNKNOWN`,
+counted once per run in `failed` and announced as may-have-landed, never resent; on `SQSSink` and
+`SNSSink` such an entry is also in `dropped_unadjudicated`, there a sub-count of `failed`. An event
+the Sentry SDK discarded at capture is counted in `SentrySink.discarded`, reported as `dropped`,
+through the `emit`'s `Deferral`. A Kafka or Pub/Sub report that arrives after its round settled moves
+no counter, so nothing about a batch is counted after its verdict.
 *Guarded:* `tests/test_worker.py`, `tests/test_sink_losses.py`, `tests/test_deferral.py`,
 `tests/test_encode.py` and `tests/test_sinks_encode.py` (the encode step over a roster derived from
 the tree, SPEC-069), `tests/test_classify.py` (every retry loop counts once at the attempt that
@@ -230,10 +242,15 @@ roster derived from the tree) and `tests/test_sinks_mongodb_resend.py` (a duplic
 `_id` on `MongoDBSink`'s own resend counted delivered, SPEC-095);
 `tests/test_conformance.py` that every shipped sink, per constructor variant, under each fault of
 its acknowledgement class and on the worker path only, leaves what its fake backend holds matching
-what it reported, event by event for the 41 variants whose judged sink runs the delivery engine
-and per batch for the 12 whose judged sink offers no `deliver`, with a line for every batch that
+what it reported, event by event for the variants whose judged sink runs the delivery engine
+(41 of 53 at SPEC-092, 45 of 55 since SPEC-093 and SPEC-094) and per batch for those whose judged
+sink offers no `deliver`, with a line for every batch that
 lost or left an event ambiguous and SPEC-088's ledger balanced, except the rows pinned to §12
-open items and the permitted departures (SPEC-092).
+open items and the permitted departures (SPEC-092); `tests/test_socket_close_corpus.py` and
+`tests/test_socket_ack_check.py` (a TCP round's checks and its end-of-round wait),
+`tests/test_sentry_discard.py`, `tests/test_reply_names_no_event.py` and
+`tests/test_rabbitmq_confirm.py` (SPEC-093), and `tests/test_kafka_report_wait.py` and
+`tests/test_pubsub_round_wait.py` (each round's wait for its own reports, SPEC-094).
 
 ## 3. A wait is bounded by the caller's timeout, and is idle while it waits
 
@@ -254,7 +271,8 @@ on the worker's `_stop` or, on the orphan path and in the inline adapter, on the
 prediction is asked before every further round, so on the exit drain an engine run declines a round
 predicted to end past `shutdown()`'s deadline, as the 1.x `emit` loop does. Since SPEC-074 no sink
 module but the engine waits or holds a backoff constant (`pubsub`'s wait on its own futures is not a
-backoff, and nor is `NATSSink`'s wait on its own abandoned publish, which ends one `publish_timeout`
+backoff, nor since SPEC-094 is `kafka`'s on its own delivery reports or since SPEC-093 `_socket`'s on
+the peer's acknowledgement of its own frames, and nor is `NATSSink`'s wait on its own abandoned publish, which ends one `publish_timeout`
 after the abandonment and inside the call's own deadline, SPEC-104): every SDK, driver and socket sink waits through the engine, and none holds its transport
 lock across a wait, so a `close()` during a backoff returns at once and the next round is refused.
 Since SPEC-076 the overlap of a `close()` with a call still inside one sink is bounded too: a
@@ -268,6 +286,14 @@ the release itself is as unbounded as the driver's, and a `SERIAL` close's wait 
 section is bounded only by that driver call's own timeout, where it has one (SPEC-076); what
 bounds the exit is `DEFAULT_CLOSER_GRACE`, carved from the shutdown budget
 (`architecture.md` §13). A sink blocked *inside* a network call holds the thread for that call.
+`GooglePubSubSink.close()` waits up to `overflow_timeout`, not cut short by the stop signal, on
+the publishes its rounds left `UNKNOWN`, so a normal exit against a server that never answers
+pays that one bounded wait (SPEC-094 FR-002, Andrew's "Wait at close (Recommended)",
+2026-11-22; held to the bound by `tests/test_pubsub_round_wait.py`). Because the live sink's
+close runs inline, an explicit `shutdown(timeout=t)` over such a server can return up to
+`overflow_timeout` past `t`, the shape of 1.x's close and of `KafkaSink.close()`'s
+`flush(flush_timeout)` (measured: `shutdown(timeout=1.0)` took 6.06 s at `overflow_timeout=6`;
+`architecture.md` §12, the closer-grace item).
 An engine run whose stop event's `wait` raises announces it once and sleeps the rest of its waits,
 each still capped, rather than letting the exception out or skipping a wait; and an engine sink that
 declares no `log_foundry_stop_signal` sleeps its waits on the orphan path and in the adapter, as a
@@ -376,9 +402,19 @@ That is the price of not losing a batch to a stall a little longer than one budg
 after the window is still refused at once. Probes:
 `docs/audits/2026-11-14-probes/core-pipeline/spec104_nats_queued_orphan.py`, and
 `spec104_nats_flush_overrun.py` and `spec104_nats_swap_cost.py` beside it.
+Since SPEC-094 a `KafkaSink` or `GooglePubSubSink` round waits for the client's reports on its own
+messages, so an `emit` costs a broker round trip on the calling thread, which on the orphan path is
+the application's own, beside core `NATSSink`'s; against a broker that never answers, a level call
+outside any span holds the caller's thread for the sink's whole timeout, `flush_timeout` (10 s by
+default) or `overflow_timeout` (30 s), measured at 0.50 s for a 0.5 s timeout on SPEC-094's
+prototype (`architecture.md` §13). Since SPEC-093 a TCP `SyslogSink` or `LogstashSink` round waits
+up to 0.25 s for the peer's acknowledgement, on the caller's thread on the orphan path, unless
+`ack_wait=False`.
 *Guarded:* `tests/test_api.py` (which path each call takes), `tests/test_sink_concurrency.py`;
 the NATS exception's bound by `tests/test_sinks_nats_matrix.py` (the orphan level call in and
-after a young window); its `flush()` and `configure(sink=…)` routes by no test. Otherwise not
+after a young window); its `flush()` and `configure(sink=…)` routes by no test; the Kafka and
+Pub/Sub waits' bound by `tests/test_kafka_report_wait.py` and `tests/test_pubsub_round_wait.py`,
+on the sink, not on the caller's thread. Otherwise not
 measured as a latency bound by any test — listed so the gap is visible.
 
 ## 5. A sink the library wrote to is closed, once, by one owner, and a close in flight is waited for
@@ -497,6 +533,15 @@ it; on the same batch and inner behaviour the two forward the same events and en
 `losses().dropped` and catcher term (`failed`, the upper bound, is reached by different counts).
 `MultiSink` is not a twin of anything here: it offers no `deliver` and calls each child's `emit`.
 
+**A known difference, not a twin: a full client queue** (SPEC-094). `KafkaSink` and
+`GooglePubSubSink` are on the same engine and wait for their reports under the same rule, but their
+clients report a full queue differently. librdkafka refuses the `produce()` call, which `KafkaSink`
+keeps reading as 1.x did: `DROPPED`, counted in `rejected`, beside a hand-off that worked, and resent
+when nothing was handed over. google-cloud-pubsub returns a future carrying `FlowControlLimitError`,
+which `GooglePubSubSink` reads as `REJECTED` in the round, so a batch of nothing else fails. Whether
+a full queue should be retried is open in `architecture.md` §12 (*Whether a full client queue is
+retried*).
+
 *Observable:* a probe run against one twin and its sibling produces the same ledger.
 *Guarded:* `tests/test_worker_predicate_roster.py` derives the guard sites from the AST rather
 than a hand list; `tests/test_invariants_model.py` drives both delivery paths in one run and
@@ -570,7 +615,8 @@ batch of one failure and otherwise deliberate drops, an SQS batch of an id failu
 or unencodable event (SPEC-058, SPEC-069), and an SQS or SNS batch rejected wholly as sender faults
 (SPEC-016 for SQS, SPEC-070 FR-003 for SNS). Nothing in such a batch is helped by a retry, which is
 the test this page's rule turns on. So a `_bulk` server answering every POST with a `2xx` the sink
-cannot adjudicate — a body it cannot read or that is not an object, or a truthy `errors` with a
+cannot adjudicate — a body it cannot read or that is not an object, since SPEC-093 an object
+carrying neither `errors` nor `items`, or a truthy `errors` with a
 short `items` array — leaves `flush()` truthy and `failed_batches` at zero, with the loss in
 `health().sink`: the events may have landed, so a retry could duplicate them. A Honeycomb batch
 `200` the sink cannot adjudicate — a body it cannot read, not an array of objects, the wrong length,
@@ -590,6 +636,15 @@ the worker calls the family's `deliver` and a `REJECTED` event is final. A core
 flight to a server that may yet process them, and the next call is refused by the probe or its
 latch, so a sustained stall is still reported as failed batches and only the one batch that
 straddles its onset is counted rather than raised.
+Since SPEC-093 a `SentrySink` batch with at least one event the Sentry SDK discarded at capture and
+none sent returns rather than raising, its discards counted in `discarded` (reported as `dropped`)
+and its failures in `transport_errors`, because a resend would roll the sampler again and hand
+`before_send` an event it had already dropped; a batch of nothing but failures still raises. And
+since SPEC-094 a `KafkaSink` or `GooglePubSubSink` batch whose reports are indefinite — an error
+outside the sink's definitive set, authorization and size refusals among them, or no report by the
+round's deadline or stop — settles with its messages `UNKNOWN`, counted in `failed`, and
+`flush()` stays truthy, by Andrew's "Truthy, counted" answer of 2026-11-16: a truthy `flush()` means
+every event was acknowledged or counted. Only a batch whose every report is definitive fails.
 The recorded exception extends to `deliver` (SPEC-072 FR-004): a run whose verdict marks an event
 `UNKNOWN`, or whose verdict cannot be read — not a `Verdict`, outcomes that are not exact `Outcome`
 members, the wrong length, or a field that raises when read — settles even when nothing else was
@@ -683,10 +738,13 @@ SPEC-084), and `tests/test_resend_count.py`, `tests/test_resend_marks.py` and
 announced, the calls each shipped sink marks, and `MongoDBSink`'s duplicate `_id` on its own
 resend read as delivery, SPEC-095), and `tests/test_conformance.py` (every shipped sink, per
 constructor variant and on the worker path only, reporting landed only what its fake backend holds and lost only what it does
-not, per event for the 41 variants whose judged sink runs the delivery engine and per batch for
-the 12 that offer no `deliver`, with an outcome it could not know read as ambiguous and refused
+not, per event for the variants whose judged sink runs the delivery engine (41 of 53 at SPEC-092,
+45 of 55 since SPEC-093 and SPEC-094) and per batch for those that offer no `deliver`, with an
+outcome it could not know read as ambiguous and refused
 where the call was knowable, except the rows pinned to §12 open items and the permitted
-departures, SPEC-092).
+departures, SPEC-092), and `tests/test_sentry_discard.py` (a batch with a discard and nothing sent
+returns, SPEC-093), `tests/test_kafka_report_wait.py` and `tests/test_pubsub_round_wait.py` (a
+definitive refusal fails the batch and an indefinite one settles counted, SPEC-094).
 
 ## 8. An event is safe by construction, once, at assembly
 
@@ -909,6 +967,9 @@ is accepted (SPEC-079 FR-005): only exactly one of a closed list of builtin type
 user class that never gains an `emit` loses its batches counted and announced. A sink graph that
 loops back through a package wrapper is refused where it is formed, but four loops the static walk
 cannot see are accepted and recurse (`architecture.md` §13, the sink-loop item).
+`GooglePubSubSink`'s `max_pending` is accepted, validated and floored and, since SPEC-094, bounds
+nothing, because each round gives every future its verdict and none awaits one between emits; it is
+frozen 1.x surface, so it is kept rather than refused, and its docstring says it has no effect.
 *Guarded:* `tests/test_sentry_backend.py`, `tests/test_sinks_nats.py`, the per-sink construction
 tests; `tests/test_config.py` for the stamps and, since SPEC-065, the four payload ceilings (a
 non-`int` refused, an `int` subclass stored exact); `tests/test_decorator_sync.py` for what
@@ -926,6 +987,8 @@ which derives the `int` doors from the AST and fails naming one left unjudged (S
 `tests/test_type_doors.py` for a value lying about its type at every argument door, the HTTP
 sinks' `auth` and the seven callable arguments, and `tests/test_type_door_roster.py`, which derives
 the doors from the AST and fails naming one that asks the value rather than its type;
+`tests/test_socket_ack_check.py` and `tests/test_rabbitmq_confirm.py` for `ack_wait` and `confirm`
+refused when not a `bool`, and `ack_wait` for UDP or beside `url=` (SPEC-093);
 `tests/test_sinks_args.py` for the build options refused beside an injected client, and
 `tests/test_injected_client_roster.py`, which derives each constructor's build options and fails
 naming one ignored beside it; `tests/test_extras_sites.py` for a missing extra refused at the

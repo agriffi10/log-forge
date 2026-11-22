@@ -367,18 +367,24 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
 
     ``spec097_pubsub_after_shutdown.py`` scaled down: P is handed, held by a caller's wrapper that
     forwards the signal and leaves P open, ``shutdown()`` sets P's signal, then P is configured
-    again, five orphan logs publish, ``flush()`` runs and a final ``shutdown()`` closes P. Futures
-    confirm after 0.6 s against an ``overflow_timeout`` of 0.4 s, the band where a set signal ended
-    the flush and overflow passes at once and the close bound counted every publish lost: before
-    the reinstall clear, ``failed=7``. Only the counts are asserted; ``flush()``'s verdict is the
-    sinks lane's to change (SPEC-093/094), and the probe's full reading is in the delivery doc.
+    again, five orphan logs publish, ``flush()`` runs and a final ``shutdown()`` closes P.
+
+    Since SPEC-094 each orphan log's round waits for its own future, up to ``overflow_timeout``,
+    and a set signal ends that wait after its first 50 ms slice, reading the publish ``UNKNOWN``
+    and counting it in ``failed``. So futures confirm after 0.3 s, inside the 1.0 s
+    ``overflow_timeout`` and past the first slice: with the reinstall's clear each round waits
+    and confirms, ``failed=0``, and without it each of the five is counted, ``failed=5``
+    (measured with the clear removed). The two logs before the first ``shutdown()`` confirm in
+    their own rounds, before ``confirmed`` is emptied, so five are confirmed after it. Before
+    SPEC-094 the band was a 0.6 s confirm against a 0.4 s ``overflow_timeout``, which SPEC-094
+    reads as unconfirmed whatever the signal says. Only the counts are asserted.
     """
 
     def work() -> str:
         from log_foundry.sinks.pubsub import GooglePubSubSink
 
         confirmed: list[int] = []
-        confirm_after = 0.6
+        confirm_after = 0.3
 
         class Future:
             def __init__(self) -> None:
@@ -418,7 +424,7 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
             def close(self) -> None:
                 pass
 
-        p = GooglePubSubSink("projects/p/topics/t", client=Publisher(), overflow_timeout=0.4)
+        p = GooglePubSubSink("projects/p/topics/t", client=Publisher(), overflow_timeout=1.0)
         log_foundry.configure(service="pubsub", sink=p)
         log_foundry.info("before")
         log_foundry.configure(sink=Forwarding(p))  # type: ignore[arg-type]
@@ -433,7 +439,99 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
         return f"confirmed={len(confirmed)} failed={p.failed}"
 
     child = run_in_child(work, timeout=30)
-    assert child.output == "confirmed=7 failed=0", child.output
+    assert child.output == "confirmed=5 failed=0", child.output
+
+
+def test_a_kafka_sink_configured_again_after_a_shutdown_confirms_what_it_produced() -> None:
+    """The Kafka twin of the Pub/Sub test above: no message is counted lost after a reinstall.
+
+    K is handed, held by a caller's wrapper that forwards the signal and leaves K open, and
+    ``shutdown()`` sets K's signal. A round delivered to K then, before any ``configure()``, finds
+    the signal set, so its wait ends after the first 50 ms slice and a report due 0.3 s after the
+    produce reads ``UNKNOWN``: the window the release notes' known gap names. K is then configured
+    again, five orphan logs produce, ``flush()`` runs and a final ``shutdown()`` closes K. Reports
+    arrive 0.3 s after each produce, inside the 1.0 s ``flush_timeout``: with the reinstall's clear
+    each round waits and confirms, ``failed=0`` for the five, and without it each is counted,
+    ``failed=5`` (measured with the clear removed).
+    """
+
+    def work() -> str:
+        from log_foundry.sinks.kafka import KafkaSink
+        from log_foundry.sinks.verdict import Outcome
+
+        delay = 0.3
+
+        class Producer:
+            def __init__(self) -> None:
+                self.held: list[tuple[float, object]] = []
+                self.lock = threading.Lock()
+
+            def produce(
+                self, topic: str, value: object = None, key: object = None, callback: object = None
+            ) -> None:
+                with self.lock:
+                    self.held.append((time.monotonic() + delay, callback))
+
+            def _serve(self) -> int:
+                now = time.monotonic()
+                with self.lock:
+                    due = [cb for at, cb in self.held if at <= now]
+                    self.held = [(at, cb) for at, cb in self.held if at > now]
+                    left = len(self.held)
+                for cb in due:
+                    cb(None, None)  # type: ignore[operator]
+                return left
+
+            def poll(self, timeout: float) -> int:
+                self._serve()
+                return 0
+
+            def flush(self, timeout: float | None = None) -> int:
+                end = time.monotonic() + (timeout if timeout is not None else 1e9)
+                while True:
+                    left = self._serve()
+                    if left == 0 or time.monotonic() >= end:
+                        return left
+                    time.sleep(min(0.005, max(0.0, end - time.monotonic())))
+
+        class Forwarding:
+            def __init__(self, inner: object) -> None:
+                self._inner = inner
+                self._sig: threading.Event | None = None
+
+            @property
+            def log_foundry_stop_signal(self) -> threading.Event | None:
+                return self._sig
+
+            @log_foundry_stop_signal.setter
+            def log_foundry_stop_signal(self, sig: threading.Event | None) -> None:
+                self._sig = sig
+                self._inner.log_foundry_stop_signal = sig  # type: ignore[attr-defined]
+
+            def emit(self, batch: list[dict[str, object]]) -> None:
+                self._inner.emit(batch)  # type: ignore[attr-defined]
+
+            def close(self) -> None:
+                pass
+
+        k = KafkaSink("t", producer=Producer(), flush_timeout=1.0)
+        log_foundry.configure(service="kafka", sink=k)
+        log_foundry.info("before")
+        log_foundry.configure(sink=Forwarding(k))  # type: ignore[arg-type]
+        log_foundry.info("via the wrapper")
+        log_foundry.shutdown(timeout=GATE)
+        (late,) = k.deliver([{"message": "late"}]).outcomes
+        log_foundry.configure(sink=k)
+        before = k.failed
+        for index in range(5):
+            log_foundry.info(f"after {index}")
+        log_foundry.flush(timeout=GATE)
+        log_foundry.shutdown(timeout=GATE)
+        late_reads = "unknown" if late is Outcome.UNKNOWN else str(late)
+        return f"late={late_reads} failed={k.failed - before}"
+
+    child = run_in_child(work, timeout=30)
+    assert child.output == "late=unknown failed=0", child.output
 
 
 @pytest.mark.parametrize(

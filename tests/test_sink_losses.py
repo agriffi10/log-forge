@@ -805,10 +805,11 @@ def test_sentry_transport_errors_are_isolated_per_event() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        def capture_event(self, event: dict) -> None:
+        def capture_event(self, event: dict) -> str:
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("transport down")
+            return "an-event-id"
 
     flaky = FlakySDK()
     sink = SentrySink(client=flaky)
@@ -1142,16 +1143,17 @@ def test_kafka_raises_only_when_every_produce_was_refused() -> None:
         def poll(self, _timeout) -> None:
             pass
 
-        def flush(self) -> None:
-            pass
+        def flush(self, timeout: float | None = None) -> int:
+            return 0
 
     refusing = Producer(refuse_from=0)
     sink = KafkaSink("t", producer=refusing)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"b": 2}])
     assert refusing.calls == 2, "the premise: both messages were offered and refused"
-    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
-        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    assert sink.losses() == SinkLosses(dropped=0, failed=2), (
+        "on the engine (SPEC-094 FR-001) the inline adapter counts a failed run's events in "
+        "failed before it raises, as every engine sink's does"
     )
 
     partial = KafkaSink("t", producer=Producer(refuse_from=1))
@@ -1171,15 +1173,20 @@ def test_pubsub_raises_only_when_every_publish_was_refused() -> None:
             self.calls += 1
             if self.calls > self._refuse_from:
                 raise RuntimeError("no credentials")
-            return object()
+            from concurrent.futures import Future
+
+            future: Future[str] = Future()
+            future.set_result("id")
+            return future
 
     refusing = Client(refuse_from=0)
     sink = GooglePubSubSink("t", client=refusing)
     with pytest.raises(SinkDeliveryError):
         sink.emit([{"a": 1}, {"b": 2}])
     assert refusing.calls == 2, "the premise: both events were offered and refused"
-    assert sink.losses() == SinkLosses(dropped=0, failed=0), (
-        "a raising emit counts nothing (SPEC-059 FR-003); whoever catches the raise owns the batch"
+    assert sink.losses() == SinkLosses(dropped=0, failed=2), (
+        "on the engine (SPEC-094 FR-002) the inline adapter counts a failed run's events in "
+        "failed before it raises, as every engine sink's does"
     )
 
     partial = GooglePubSubSink("t", client=Client(refuse_from=1))

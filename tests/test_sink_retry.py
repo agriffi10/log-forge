@@ -282,6 +282,10 @@ WAIT_EXCLUSIONS: dict[str, str] = {
     "_engine": "the delivery engine, the one module that waits between delivery rounds",
     "_retry": "defines wait itself",
     "pubsub": "waits on its own futures while resolving them, which is not a retry backoff",
+    "_socket": (
+        "it waits for the peer's acknowledgement of its own frames, which is not a retry backoff"
+    ),
+    "kafka": "it waits on its own delivery reports, which is not a retry backoff",
 }
 """The modules :func:`_waiting_modules` may find, each with its reason (SPEC-074 FR-006)."""
 

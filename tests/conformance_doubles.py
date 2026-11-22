@@ -82,6 +82,21 @@ DRIVERS: dict[str, dict[str, tuple[str, ...]]] = {
         "StreamLostError": ("AMQPConnectionError",),
         "ConnectionWrongStateError": ("AMQPConnectionError",),
         "ChannelWrongStateError": ("AMQPError",),
+        "UnroutableError": ("AMQPError",),
+        "NackError": ("AMQPError",),
+        "ChannelClosedByBroker": ("AMQPError",),
+    },
+    "google.api_core.exceptions": {
+        "GoogleAPIError": (),
+        "GoogleAPICallError": ("GoogleAPIError",),
+        "ClientError": ("GoogleAPICallError",),
+        "BadRequest": ("ClientError",),
+        "InvalidArgument": ("BadRequest",),
+        "Forbidden": ("ClientError",),
+        "PermissionDenied": ("Forbidden",),
+        "ServerError": ("GoogleAPICallError",),
+        "GatewayTimeout": ("ServerError",),
+        "DeadlineExceeded": ("GatewayTimeout",),
     },
     "psycopg.errors": {"Error": (), "OperationalError": ("Error",)},
     "redis.exceptions": {
@@ -1783,7 +1798,14 @@ class UDPSocket:
 
 
 class RabbitChannel:
-    """`basic_publish` writes a frame to its connection's socket; no confirm is asked for."""
+    """`basic_publish` writes a frame to its connection's socket; with confirms on, it waits.
+
+    A channel `confirm_delivery` put in confirm mode (SPEC-093 FR-005) answers as pika's does:
+    a refusal raises `ChannelWrongStateError` before anything is taken, a frame taken and then
+    lost raises `StreamLostError`, and a write to the generation-0 connection after `peer-closed`
+    raises `StreamLostError` without taking anything, marked knowable, since the connection was
+    dead before the frame was written. An unconfirmed channel behaves as SPEC-092's did.
+    """
 
     def __init__(self, conn: RabbitConnection) -> None:
         """Keeps its connection.
@@ -1798,17 +1820,41 @@ class RabbitChannel:
           None.
         """
         self.conn = conn
+        self.confirming = False
+
+    def confirm_delivery(self) -> None:
+        """Puts the channel in confirm mode, refused on a lost connection as pika refuses it.
+
+        Args:
+          None.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: pika's `ChannelWrongStateError` on a lost connection.
+        """
+        if self.conn.broken:
+            raise driver_error("pika.exceptions", "ChannelWrongStateError", "Channel is closed")
+        self.confirming = True
 
     def basic_publish(
-        self, *, exchange: str, routing_key: str, body: bytes, properties: Any
+        self,
+        *,
+        exchange: str,
+        routing_key: str,
+        body: bytes,
+        properties: Any,
+        mandatory: bool = False,
     ) -> None:
-        """One publish: a frame written to the connection's socket, which nothing confirms.
+        """One publish: a frame written to the connection's socket, confirmed when confirming.
 
         Args:
           exchange: The exchange.
           routing_key: The routing key.
           body: The message.
           properties: Ignored.
+          mandatory: Ignored: the double routes every message.
 
         Returns:
           None.
@@ -1822,7 +1868,10 @@ class RabbitChannel:
         carried = tokens(body)
         backend = conn.backend
         if backend.peer_closed and conn.generation == 0:
-            backend.decide(carried, knowable=False)
+            backend.decide(carried, knowable=self.confirming)
+            if self.confirming:
+                conn.broken = True
+                raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
             conn.blind += 1
             if conn.blind > 3:
                 conn.broken = True
@@ -1832,9 +1881,11 @@ class RabbitChannel:
         if action == "refuse":
             backend.apply()
             conn.broken = True
+            if self.confirming:
+                raise driver_error("pika.exceptions", "ChannelWrongStateError", "Channel is closed")
             raise driver_error("pika.exceptions", "AMQPConnectionError", "connection refused")
         backend.take(carried)
-        if action == "taken-raise":
+        if action == "taken-raise" or (self.confirming and action == "reply-lost"):
             backend.apply()
             conn.broken = True
             raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
@@ -1888,6 +1939,25 @@ class RabbitConnection:
           None.
         """
         return not self.broken
+
+    def process_data_events(self, time_limit: float = 0) -> None:
+        """Reads the socket once: a connection whose peer closed is found dead here.
+
+        Args:
+          time_limit: Ignored.
+
+        Returns:
+          None.
+
+        Raises:
+          Exception: pika's `StreamLostError` on a lost connection, or on the generation-0
+            connection once the peer has closed, which this marks broken.
+        """
+        if self.broken:
+            raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
+        if self.backend.peer_closed and self.generation == 0:
+            self.broken = True
+            raise driver_error("pika.exceptions", "StreamLostError", "Stream connection lost")
 
     def channel(self) -> RabbitChannel:
         """A channel, refused on a lost connection.
@@ -2221,19 +2291,12 @@ class KafkaProducer:
         return len(self.queue)
 
 
-class InvalidArgument(Exception):
-    """Stands in for `google.api_core.exceptions.InvalidArgument`: definitive, not stored."""
-
-
-class DeadlineExceeded(Exception):
-    """Stands in for `google.api_core.exceptions.DeadlineExceeded`: the server may have stored it."""
-
-
 class PermissionDenied(Exception):
-    """Stands in for `google.api_core.exceptions.PermissionDenied`, which no fault raises.
+    """A local stand-in for `google.api_core.exceptions.PermissionDenied`, which no fault raises.
 
-    Kept because SPEC-094 FR-003 plants it again as a mutant, to show the definitive set is read
-    by class.
+    The double raises the stub module's `InvalidArgument` and `DeadlineExceeded` (SPEC-094 FR-003),
+    installed through `DRIVERS` with google-api-core's hierarchy. This local class is kept because
+    SPEC-094 FR-003 plants it again as a mutant, to show the definitive set is read by class.
     """
 
 
@@ -2291,9 +2354,13 @@ class PubSubFuture:
             if self.settled or fault == "report-indefinite":
                 self.backend.take(self.carried)
         if self.refused:
-            raise InvalidArgument("the topic refused the publish")
+            raise driver_error(
+                "google.api_core.exceptions", "InvalidArgument", "the topic refused the publish"
+            )
         if fault == "report-indefinite":
-            raise DeadlineExceeded("the publish deadline passed")
+            raise driver_error(
+                "google.api_core.exceptions", "DeadlineExceeded", "the publish deadline passed"
+            )
         return "id"
 
     def exception(self, timeout: float | None = None) -> BaseException | None:
@@ -2861,7 +2928,9 @@ def _rabbitmq(variant: Variant, backend: Backend, monkeypatch: pytest.MonkeyPatc
     """`RabbitMQSink`, owning its connection on a `url` pick, borrowing one on `connection`.
 
     A `url` pick builds through the stub `pika.BlockingConnection`, a new connection each time;
-    a `connection` pick hands it one, which its `_reset` keeps.
+    a `connection` pick hands it one, which its `_reset` keeps. `confirm` is passed only when a
+    variant picks it, so the default variants build with the 1.x arguments and the corpus still
+    runs against a tree whose `RabbitMQSink` has no `confirm`.
 
     Args:
       variant: The row's variant.
@@ -2875,6 +2944,7 @@ def _rabbitmq(variant: Variant, backend: Backend, monkeypatch: pytest.MonkeyPatc
       None.
     """
     cls = _sink_class("rabbitmq.RabbitMQSink")
+    confirm = {"confirm": True} if variant.picks.get("confirm") else {}
     if "url" in variant.picks:
         generations = itertools.count()
         monkeypatch.setattr(
@@ -2883,9 +2953,9 @@ def _rabbitmq(variant: Variant, backend: Backend, monkeypatch: pytest.MonkeyPatc
             lambda params: RabbitConnection(backend, next(generations)),
             raising=False,
         )
-        sink = cls(exchange="x", routing_key="k", url=str(variant.picks["url"]))
+        sink = cls(exchange="x", routing_key="k", url=str(variant.picks["url"]), **confirm)
         return sink, sink
-    sink = cls(exchange="x", routing_key="k", connection=RabbitConnection(backend))
+    sink = cls(exchange="x", routing_key="k", connection=RabbitConnection(backend), **confirm)
     return sink, sink
 
 

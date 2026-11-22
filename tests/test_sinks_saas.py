@@ -115,8 +115,9 @@ class FakeSentrySDK:
     def __init__(self) -> None:
         self.events: list = []
 
-    def capture_event(self, event: dict) -> None:
+    def capture_event(self, event: dict) -> str:
         self.events.append(event)
+        return "an-event-id"
 
 
 def test_sentry_sdk_path_with_level_gating() -> None:

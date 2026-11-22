@@ -56,6 +56,8 @@ _i = SplunkHECSink("u", "tok", nonsense=1)     # want: Unexpected keyword argume
 _j = DatadogSink("k", body_format="ndjson")    # want: Unexpected keyword argument "body_format" for "DatadogSink"
 _l = OTLPSink("u", body_format="ndjson")       # want: Unexpected keyword argument "body_format" for "OTLPSink"
 _k = LogstashSink(host="h", port=1, unknown=2) # want: Unexpected keyword argument "unknown" for "LogstashSink"
+# SPEC-093 FR-001: `ack_wait` is a bool or None, never a string read for its truth.
+_n = LogstashSink(host="h", port=1, ack_wait="false")  # want: Argument "ack_wait" to "LogstashSink" has incompatible type "str"
 
 # SPEC-079 FR-005: a factory is a zero-argument callable returning a sink. The one-argument
 # factory is a `def`, not a lambda: an unannotated lambda adds mypy's own "Cannot infer type of

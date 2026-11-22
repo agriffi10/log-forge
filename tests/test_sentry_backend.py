@@ -34,8 +34,9 @@ class BareClient:
     def __init__(self) -> None:
         self.events: list = []
 
-    def capture_event(self, event: dict) -> None:
+    def capture_event(self, event: dict) -> str:
         self.events.append(event)
+        return "an-event-id"
 
 
 class InactiveClient(BareClient):
@@ -83,8 +84,9 @@ class FakeModule:
     def get_client(self):
         return self._client
 
-    def capture_event(self, event: dict) -> None:
+    def capture_event(self, event: dict) -> str:
         self.events.append(event)
+        return "an-event-id"
 
 
 def _fallback(**kwargs) -> tuple[SentrySink, FakeOpener]:

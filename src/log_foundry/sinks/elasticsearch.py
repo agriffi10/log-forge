@@ -156,10 +156,12 @@ class ElasticsearchSink(HTTPSink):
         too (SPEC-018): a length disagreement is evidence the arrays do not describe each other,
         not an invitation to read the overlap. An aligned array marks each item with an error
         ``REJECTED`` — counted on ``item_errors`` and announced, whatever status it carries,
-        never resent — and every other item ``ACCEPTED``. A body with no truthy ``errors`` is
-        all ``ACCEPTED``, unverified: this sink does not check it is ``_bulk``-shaped, so ``{}``
-        and an error document pass, since charging an absent key would charge every success
-        from an endpoint that omits it (``docs/architecture.md`` §12).
+        never resent — and every other item ``ACCEPTED``. A body with no truthy ``errors`` beside
+        ``items``, or ``{"errors": false}``, is all ``ACCEPTED``, unverified, since charging an
+        absent key would charge every success from an endpoint that omits only ``errors``
+        (``docs/architecture.md`` §12). An object with neither ``errors`` nor ``items`` — ``{}``,
+        or an error document — names no verdict, so it adjudicates none of the chunk (SPEC-093
+        FR-003).
 
         Every other body is given up on through ``HTTPSink._unadjudicated``, its events
         ``UNKNOWN``: a body that could not be read off the connection (``_read_failed``, asked
@@ -188,7 +190,7 @@ class ElasticsearchSink(HTTPSink):
             data = json.loads(payload)
         except Exception:
             return self._unadjudicated(items, _detail(sent))
-        if not _diag.is_a(data, dict):
+        if not _diag.is_a(data, dict) or ("errors" not in data and "items" not in data):
             return self._unadjudicated(items, _detail(sent))
         if not data.get("errors"):
             return (Outcome.ACCEPTED,) * sent

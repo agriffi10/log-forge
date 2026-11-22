@@ -1,7 +1,7 @@
 ---
 type: Decision
 title: "A 2xx _bulk response with no readable verdict is counted, never retried"
-description: "an unreadable, undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object without a truthy `errors` still reads as success, unverified."
+description: "an unreadable, undecodable or non-object 2xx `_bulk` body settles its chunk: no raise, no retry, but `sent` goes to `dropped_unadjudicated` with a may-have-landed line. An object with `errors` absent or false beside `items` still reads as success, unverified; one with neither key is counted (SPEC-093)."
 ---
 
 **A 2xx `_bulk` response with no readable verdict is counted, never retried** — when
@@ -28,12 +28,20 @@ destination answered every POST with an unreadable 200. Counting changes no retr
 counted branch returns the same `False` the silent one did, and `failed` is a documented upper
 bound, so counting a body that did land is allowed.
 
-**Not decided here: an object without a truthy `errors` key.** It is read as success, unverified,
-and the sink does not check that it is `_bulk`-shaped, so `{"error": {...}, "status": 500}` and an
-`items` array of errors with no `errors` flag both count nothing. Routing an absent key to
-unadjudicated would charge every success from an endpoint that omits it, which Astra's
-OpenSearch-compatible `_bulk` appears to do by its source. It belongs with the Astra profile;
-`docs/architecture.md` §12 records the exposure.
+**An object with neither `errors` nor `items` is counted** (SPEC-093 FR-003). It cannot have
+adjudicated any item, so `_outcomes` gives it up through `HTTPSink._unadjudicated`, the route an
+undecodable body takes: `{}` and an error document such as `{"error": {...}, "status": 500}` go to
+`dropped_unadjudicated` with a may-have-landed line, never resent. This applies decision A's principle,
+that a reply which names no verdict is never counted as delivered (*A batch reply that names no event
+adjudicates none of it*), and was decided in session. ~~It is read as success, unverified, and the sink
+does not check that it is `_bulk`-shaped, so `{"error": {...}, "status": 500}` and an `items` array of
+errors with no `errors` flag both count nothing.~~
+
+**Not decided here: an object with `errors` absent or false beside `items`.** It still reads as
+success, unverified, and so does `{"errors": false}`, so an `items` array of errors with no `errors`
+flag counts nothing. Routing an absent key to unadjudicated would charge every success from an
+endpoint that omits it, which Astra's OpenSearch-compatible `_bulk` appears to do by its source. It
+belongs with the Astra profile; `docs/architecture.md` §12 records the exposure.
 
 **OTLP reads the same shape differently, on purpose** — ~~SPEC-056 FR-004 settles an unreadable 2xx
 OTLP body without a count~~, because a protobuf response is legal there. Do NOT copy either reading
@@ -46,6 +54,13 @@ into the other sink.
 > difference left is row 4 of *The sinks keep four declared exceptions to their shared rules*.
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-093 FR-003: a `2xx` object carrying neither `errors` nor `items` is counted on
+  `dropped_unadjudicated` and never resent, where it read as success. The fence's last sentence now
+  reads that an object with `errors` absent or false beside `items` still reads as success,
+  unverified, and one with neither key is counted.
 
 ### 2026-11-07
 

@@ -3,7 +3,7 @@ type: Spec
 id: SPEC-094
 title: "Client-Buffered Sinks Wait for the Delivery Report, on the Delivery Engine"
 description: "Moves KafkaSink and GooglePubSubSink onto the delivery engine, with each round waiting, within the sink's own timeout and until the stop signal, for the client's report on every message it handed over, so that a rejection no attempt could have written fails the batch, every other report is counted as one that may have landed, and no count arrives after the batch's verdict."
-spec_status: Draft
+spec_status: Completed
 depends_on: [SPEC-069, SPEC-072, SPEC-074, SPEC-075, SPEC-076, SPEC-092, SPEC-093]
 arc: audit-2026-11-14
 arc_order: 10
@@ -206,8 +206,11 @@ the counters. The class docstring now says the sink exposes `log_foundry_stop_si
   The round's `UNKNOWN` messages share one line: `lost N message(s); KafkaSink, no definitive delivery
   report within <flush_timeout>s; may have landed, not retried`.
 - **Late reports.** The report table is closed when the round reads it, so a report served later, by
-  another round's `flush` or `poll`, or by `close()`, changes nothing. The table takes no lock, because a write
-  after the round read it lands in a table nothing reads.
+  another round's `flush` or `poll`, or by `close()`, changes nothing. A round's `flush` can serve
+  another round's callbacks on another thread, so every write, the round's reads and the close
+  take one lock, the sink's counters lock. The table reads that lock from the sink's
+  `SinkCounters` at each use and never keeps it, because a settled table lives on in the callback
+  librdkafka holds, which no fork repair reaches, and the repair rebinds the lock in a child.
 - **The `flush()` hook.** It refuses when the sink is closed, as today. Otherwise it calls
   `producer.flush(0)`, which serves any pending report and returns at once, and it returns without
   raising for a remainder, because every message a remainder holds was already counted by its round.
@@ -274,9 +277,9 @@ compared as the `int` it holds.
 - [ ] `probe_misc.py` case 3 against the branch reads `flush()=True`, `failed_batches=0`, `failed=25`
       and one line, with no count after `flush()` returned (invariants 2 and 11).
 - [ ] `spec094_stuck_partition.py`, re-run as a test: with one message never reported and every other
-      reported at the next poll, `flush_timeout=0.5`, the first emit returns in no less than 0.5 s
-      and within 1.5 s, and each of the next three returns within 0.2 s with no new `failed` count.
-      The same test, with the round calling `flush(flush_timeout)` instead, takes 0.5 s for each
+      reported at the next poll, `flush_timeout=1.0`, the first emit returns in no less than 1.0 s
+      and within 2.0 s, and each of the next three returns within 0.5 s with no new `failed` count.
+      The same test, with the round calling `flush(flush_timeout)` instead, takes 1.0 s for each
       emit, which shows it reads the per-round wait (invariants 2 and 3).
 - [ ] A report served after its round settled, by a later round's poll or by `close()`, moves no
       counter and writes no line (invariant 2).
@@ -363,11 +366,27 @@ their shared rules* keeps row 3.
   publish retry (`transports/base.py:179-197`) can end in one of them after a `DeadlineExceeded`
   attempt the server kept. A batch whose RPC failed after its retries carries that RPC's
   `GoogleAPIError` on every future (`publisher/_batch/thread.py:344-371`).
-- **What goes.** Nothing is outstanding between emits, so `_reap`, `_await_overflow`,
-  `_resolve_within`, `_drain_pending`, `_resolve` and the pending list's use go. `max_pending` is still
-  accepted and validated, because it is frozen surface, and it has no effect, which its docstring
-  says. FR-004 records it in invariant 13's exceptions and in the bad-argument decision. `flush()`
-  refuses when closed and otherwise returns, since nothing is in flight. `close()` sets the flag.
+- **What goes.** Every future has its verdict when its round returns, so nothing awaits one
+  between emits, and `_reap`, `_await_overflow`, `_resolve_within`, `_drain_pending`, `_resolve`
+  and the pending list's use go. `max_pending` is still accepted and validated, because it is
+  frozen surface, and it has no effect, which its docstring says. FR-004 records it in invariant
+  13's exceptions and in the bad-argument decision. `flush()` refuses when closed and otherwise
+  returns, since no verdict is outstanding.
+- **`close()` waits for the unconfirmed** (Andrew's "Wait at close (Recommended)", 2026-11-22).
+  A round keeps, under `_futures_lock`, the futures it left `UNKNOWN`, and only those, dropping
+  at each keep the ones already kept that have resolved; a future whose `result` takes no
+  `timeout` is not kept, and one whose `done()` raises is not waited on. `close()` sets the flag
+  and takes the kept
+  futures under `_futures_lock`, then waits on them outside it under one deadline of
+  `overflow_timeout`, **not** cut short by the stop signal. The wait counts nothing and writes
+  no line: each verdict was given and counted by its round (SPEC-088's one-term ledger). A second
+  `close()` waits on nothing, a round settling after the close keeps nothing, and a list kept under
+  another pid, a parent's inherited through `os.fork()`, is dropped, so a child's own `close()`
+  waits on nothing its parent kept (invariant 12). The reason is
+  the exit: the exit drain runs with the stop signal set, so a round reads a publish still in
+  flight after its first 0.05 s slice as `UNKNOWN`, while google-cloud-pubsub's daemon commit
+  thread is still sending it; a process that exits on that verdict ends the send. Measured with
+  the second diff review's stand-in at 0.2 s latency, flag-only landed none of seven.
 
 **A caller sees:**
 - a round trip per batch;
@@ -379,6 +398,9 @@ their shared rules* keeps row 3.
   `FlowControlLimitError`;
 - a future type without a `timeout` reading as `UNKNOWN` at once, where 1.x waited on it, unbounded,
   at `close()`;
+- `close()` waiting up to `overflow_timeout`, whatever the stop signal says, for the publishes its
+  rounds left `UNKNOWN`, so a normal exit lets the client finish sending them, counting nothing,
+  and an exit against a server that never answers takes up to that much longer;
 - a wrapper around the sink offering `deliver`;
 - the adapter counting a failed run's events in `failed` before it raises.
 
@@ -402,13 +424,22 @@ their shared rules* keeps row 3.
       with the stop signal unset and with it set before the round. The same test, with the pause
       removed, uses CPU time within 0.1 s of its wall time (invariant 3).
 - [ ] A future that is done and whose `result` raises `TimeoutError` reads `UNKNOWN`, its line
-      naming `TimeoutError`, and the `emit` returns within 0.1 s with `overflow_timeout=5`
-      (invariants 3 and 7).
+      naming `TimeoutError`, and the `emit` returns within 1.0 s with `overflow_timeout=5`, so it
+      never waited on the deadline; the build's probe measures how much sooner (invariants 3 and
+      7).
 - [ ] A close landing mid-round makes the later publishes `UNKNOWN` without raising, and
       `test_a_close_landing_mid_batch_counts_the_rest_unconfirmed_and_does_not_raise` passes
       (invariant 7).
 - [ ] `GooglePubSubSink.__init__`'s signature is unchanged, and `max_pending` still refuses a non-`int`
       with `TypeError` (invariants 10 and 13).
+- [ ] A process that logs five events inside one `@trace` span, seven with the span's own, and
+      exits normally, against a stand-in client whose daemon threads take 0.2 s to send, lands
+      seven of seven, and the `failed` its exit drain's round counted, seven, is unchanged by
+      `close()`. With `close()` back to setting the flag only, in an export of the branch head,
+      the test fails (invariants 2 and 7).
+- [ ] `close()` over futures that never resolve, after a round under a set stop signal, returns in
+      no less than `overflow_timeout` (1.0 s) and within 1.5 s, changes no counter, writes no
+      line, and a second `close()` returns within 0.5 s (invariants 3 and 7).
 
 ### FR-003: The corpus holds the reports the two sinks now wait for
 
@@ -427,15 +458,16 @@ These are changes to SPEC-092's files as its build delivers them, after SPEC-093
   this change, because the sink reads no class.
 - **Pins.** `verdict-before-refusal` and `verdict-before-indefinite-report` are removed, because their
   four rows read green.
-- **Totals**, after SPEC-093's: 268 rows, 58 pinned under five pins, 15 departure rows and 195 that
-  must pass.
+- **Totals**, after SPEC-095's, which landed first, and SPEC-093's: 268 rows, 6 pinned under four
+  pins, 34 departure rows under fourteen departures and 228 that must pass. Before SPEC-095
+  landed they read 268 rows, 58 pinned under five pins, 15 departure rows and 195 that must pass.
 
 #### Acceptance Criteria:
 
-- [ ] The corpus's literals read 268 rows, 58 pinned, 15 departure rows and 195 that must pass
+- [ ] The corpus's literals read 268 rows, 6 pinned, 34 departure rows and 228 that must pass
       (invariants 2 and 7).
-- [ ] Against SPEC-093's verdicts, only the four rows of FR-001 and FR-002 change (invariants 2
-      and 7).
+- [ ] Against the corpus and `src` of the `origin/main` the build lands on (`295ba803`), only the
+      four rows of FR-001 and FR-002 change beyond SPEC-093's ten (invariants 2 and 7).
 - [ ] With `KafkaSink._round`'s wait removed, so that no report is waited for, in an export of the
       branch head, `KafkaSink-never-acknowledged` and `KafkaSink-clean` read
       `ambiguous-when-knowable` (invariant 2).
@@ -462,7 +494,8 @@ These are the completion ritual's edits, made on the pushed branch.
     and that a full Pub/Sub queue arrives as a `FlowControlLimitError` future and is `REJECTED`.
   - The item "**`GooglePubSubSink.close()`'s bound does not cover an unboundable future**"
     (`architecture.md:1222-1232` at `97a03f45`) is struck as closed by SPEC-094. Such a future is now
-    `UNKNOWN` in its round, counted, and never waited on at `close()`.
+    `UNKNOWN` in its round, counted, and never waited on at `close()`, which waits under
+    `overflow_timeout` only on kept futures whose `result` takes a `timeout`.
 - **§13 gains five bullets.**
   - "**A client-buffered sink's batch costs a broker round trip.**" It carries the measured figures
     at batch 10 and at 1,000, and the real broker's figures, which do not grow with `linger.ms`.
@@ -875,3 +908,44 @@ at or above `flush_timeout`, or a set stop, read every delivered message as `UNK
     `InvalidArgument` stays definitive on "no attempt wrote it", not on the message's own bytes,
     since the refusal lands on the whole client batch. The corpus's Kafka double and SPEC-092's
     example now use 87.
+- Corrected on 2026-11-20, at completion, from the build.
+  - **FR-002's ceiling for a future resolved with a `TimeoutError` is 1.0 s, not 0.1 s.** The
+    repository's timing-floor gate, `tests/test_timing_floors.py`, refuses a test ceiling under
+    its 0.5 s stall allowance, because a CI stall can reach one. The test asserts 1.0 s against an
+    `overflow_timeout` of 5 s, which still shows the round never waited on the deadline, and the
+    build's probe, `docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`, measured
+    the `emit` at 0.000 s. FR-001's stuck-partition criterion kept its 0.2 s ceiling at
+    completion; the first diff review corrected it below.
+- Corrected again on 2026-11-20, by the first diff review's ruling.
+  - **FR-001's stuck-partition criterion uses `flush_timeout=1.0`, with 0.5 s for the later
+    emits.** Its 0.2 s ceiling sat under the timing-floor gate's 0.5 s stall allowance, which a CI
+    stall can reach. With a 1.0 s timeout the later emits' ceiling is the allowance itself, the
+    first emit is bounded at 1.0 s to 2.0 s, and the one-blocking-flush re-plant, which costs every
+    emit the whole timeout, still fails it.
+  - **The report table takes a lock.** The previous text said it took none, relying on a dict's
+    atomic store across threads; a round's `flush` can serve another round's callbacks on another
+    thread, so every write, the round's reads and the close now take the sink's counters lock.
+- Corrected on 2026-11-22, by the second diff review's ruling.
+  - **The report table reads the counters lock at each use.** The 2026-11-20 correction had the
+    table keep the lock object it was handed, on the reasoning that a fork's repair walk reaches
+    that lock. It reaches it through the sink's `SinkCounters`, and rebinds it there in a child;
+    a settled table is reachable only through the callback closure librdkafka holds, so it kept
+    the parent's lock, and a late report a child's close flush or `flush()` hook served would
+    block on it if a parent thread held it at the fork (invariant 12). The table now holds the
+    `SinkCounters` and reads `_counter_lock` at each use, as 1.x's `_on_delivery` read it
+    through the sink on every call.
+  - **`GooglePubSubSink.close()` waits for the unconfirmed: Andrew, 2026-11-22, "Wait at close
+    (Recommended)".** The second diff review found that a normal exit lost every publish still in
+    flight: the exit drain's round reads it `UNKNOWN` after its first slice under the set stop
+    signal, and `close()`, which only set the flag, let the process end the client's daemon
+    sending thread. FR-002's *What goes* bullet, its `close()` sentence and *A caller sees* are
+    corrected in place, and two criteria are added: the exit delivery, and the bound on the
+    close's wait.
+  - **The kept list is dropped in a forked child**, by the execution review's ruling: it records
+    the pid that kept it, so a caller's direct `close()` in a child no longer waits
+    `overflow_timeout` on futures only the parent's client threads resolve (invariant 12).
+- Corrected on 2026-11-22, when the build was rebased onto SPEC-095 and SPEC-098.
+  - **FR-003's totals are the merged tree's**: 268 rows, 6 pinned under four pins, 34 departure
+    rows under fourteen departures and 228 that must pass, since SPEC-095 landed first. Its
+    second criterion is read against `295ba803`: of the fourteen shared rows that move, these
+    four are this spec's and the other ten SPEC-093's.

@@ -508,10 +508,14 @@ def _class(path: pathlib.Path, name: str) -> ast.ClassDef:
 
 @pytest.mark.parametrize(
     ("module", "cls"),
-    [("kafka", "KafkaSink"), ("pubsub", "GooglePubSubSink"), ("multi", "MultiSink")],
+    [("multi", "MultiSink")],
 )
-def test_kafka_pubsub_and_multi_never_offer_deliver(module: str, cls: str) -> None:
-    """FR-003 AC7: neither member is defined or assigned, and the probe says ``None``."""
+def test_multi_never_offers_deliver(module: str, cls: str) -> None:
+    """FR-003 AC7: neither member is defined or assigned, and the probe says ``None``.
+
+    ``KafkaSink`` and ``GooglePubSubSink`` left this list at SPEC-094, which put both on the
+    delivery engine.
+    """
     import importlib
 
     node = _class(_SRC / "sinks" / f"{module}.py", cls)

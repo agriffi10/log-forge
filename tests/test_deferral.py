@@ -233,9 +233,8 @@ DEFERRING_SITES: dict[str, dict[str, tuple[str, ...]]] = {
     "sinks/transform.py": {"TransformSink": ("emit",)},
     "sinks/filtering.py": {"FilteringSink": ("emit",)},
     "sinks/multi.py": {"MultiSink": ("emit",)},
-    "sinks/kafka.py": {"KafkaSink": ("emit",)},
-    "sinks/pubsub.py": {"GooglePubSubSink": ("emit",)},
     "sinks/sqlite.py": {"SQLiteSink": ("emit",)},
+    "sinks/sentry.py": {"SentrySink": ("emit",)},
     "sinks/_engine.py": {MODULE_LEVEL: ("_run", "_commit")},
 }
 """The functions in each site that decide a per-event drop, by module, class and name.
@@ -250,7 +249,10 @@ list: ``HTTPSink`` counts through the delivery engine's run context, whose one c
 :func:`run_context_count_findings` holds. Its two immediate ``failed`` stores went with it.
 ``SocketTransport`` was the one entry without an ``emit``, its ledger entered by
 ``SyslogSink.emit`` and ``LogstashSink.emit`` and handed to ``send_all``, until SPEC-074 put it on
-the engine and deleted ``send_all``.
+the engine and deleted ``send_all``. SPEC-094 took ``sinks/kafka.py`` and ``sinks/pubsub.py``
+off it, putting both sinks on the engine. SPEC-093 FR-002 put ``sinks/sentry.py`` on the list:
+``SentrySink.emit`` enters a ``Deferral`` for ``discarded``, an event the SDK dropped at capture,
+so that count lands only when ``emit`` returns.
 
 A class or function named here and missing from its module is a finding, not a skip: a rename
 would otherwise shrink the guard as silently as a deletion. The other direction is held too: a
@@ -261,13 +263,9 @@ old immediate stores unchecked.
 
 IMMEDIATE: dict[tuple[str, str], frozenset[str]] = {
     ("MultiSink", "emit"): frozenset({"failed"}),
-    ("KafkaSink", "emit"): frozenset({"failed"}),
-    ("GooglePubSubSink", "emit"): frozenset({"failed"}),
-    ("GooglePubSubSink", "_resolve"): frozenset({"failed"}),
-    ("GooglePubSubSink", "_drain_pending"): frozenset({"failed"}),
-    ("GooglePubSubSink", "_reap"): frozenset({"_futures"}),
-    ("GooglePubSubSink", "_await_overflow"): frozenset({"_futures"}),
     ("SQLiteSink", "emit"): frozenset({"_failed"}),
+    ("SentrySink", "emit"): frozenset({"sent", "skipped"}),
+    ("SentrySink", "_capture"): frozenset({"transport_errors"}),
 }
 """The stores the spec keeps immediate on purpose, keyed by the method making them; the only ones.
 
@@ -280,27 +278,24 @@ counts as it happens rather than through the ``Deferral``:
 
 - ``MultiSink.emit`` / ``failed``: child *calls* that raised, outside ``losses()``; FR-007 keeps
   it moving per call exactly as before.
-- ``GooglePubSubSink.emit`` / ``failed``: a future orphaned by a close landing mid-batch; it was
-  handed to the client and may land, so it is unconfirmed — the same upper bound.
-- ``GooglePubSubSink._resolve`` / ``failed``: a future that resolved to an error; the same upper
-  bound.
-- ``GooglePubSubSink._drain_pending`` / ``failed``: futures still in flight when the close bound
-  expired; the same upper bound.
-- ``GooglePubSubSink._reap`` and ``GooglePubSubSink._await_overflow`` / ``_futures``: the
-  pending list, rebound as futures settle or are put back; state, not a count.
 - ``SQLiteSink.emit`` / ``_failed``: a batch whose insert raised a driver error, counted before
   the raise (SPEC-069 FR-004); an upper bound, the recorded exception of invariant 2, never a
   ``dropped`` counter. The file sinks held the same entry, and four more for the handle, the
   tracked size, the time trigger and the once-per-outage flag, until SPEC-082 put them on the
   delivery engine: they left this table with ``sinks/file.py``'s place in the roster above, as
   each of SPEC-074's sinks did.
+- ``SentrySink.emit`` / ``sent`` and ``skipped``: neither is a loss. ``sent`` counts what the SDK
+  took an id for or the fallback sent, and ``skipped`` an event below ``min_level``, which
+  ``losses()`` deliberately leaves out; both count as they happen, as in 1.x. Only ``discarded``
+  goes through the ``Deferral`` (SPEC-093 FR-002).
+- ``SentrySink._capture`` / ``transport_errors``: an event whose capture raised, counted at
+  capture as in 1.x, including in a batch that returns because it also discarded (SPEC-093
+  FR-002); it feeds ``failed``, the same upper bound.
 
-- ``KafkaSink.emit`` / ``failed``: the messages a call handed to the producer while the close's
-  release overtook it (SPEC-076 FR-003), counted beside ``_on_delivery``'s and only when the call
-  returns normally; the release's flush may have delivered some, so the same upper bound.
-
-``KafkaSink``'s delivery callback needs no entry: its ``failed`` is in ``_on_delivery``, passed to
-``produce`` uncalled, which the gate does not follow (see :func:`deferral_findings`).
+``KafkaSink`` and ``GooglePubSubSink`` left this table and the roster at SPEC-094, which put both
+on the delivery engine: their rounds count nothing themselves, their refusals are ``DROPPED``
+outcomes the engine commits when the run settles, and the delivery callback, the overtaken-call
+count, the reap, the overflow wait and the close's resolution are gone.
 """
 
 
@@ -1412,13 +1407,18 @@ DROPPED_FLOOR = frozenset(
     {
         "dropped_oversized",
         "_unrenderable",
-        "rejected",
         "_dropped",
         "_unencodable",
         "dropped_events",
+        "discarded",
     }
 )
 """Counters the derivation must find over the tree; a floor, not the set.
+
+``discarded`` is ``SentrySink``'s (SPEC-093 FR-002), named so the derivation is shown to reach
+the counter that criterion holds to a commit. ``rejected`` left the floor at SPEC-094: on
+``KafkaSink`` and ``GooglePubSubSink`` it is now a property over the engine's ``dropped_events``,
+which the floor still names, so no class stores a counter of that name.
 
 A new counter needs no edit here, because the set is derived. ``_id_failed`` left it with
 SPEC-074, which deleted ``SQSSink``'s counter: an id-callable drop is a ``DROPPED`` outcome the
@@ -1700,6 +1700,8 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
         if not isinstance(cls, ast.ClassDef):
             continue
         for name, fn in _scan_roots(cls):
+            if name in ASSIGNABLE_DROPPED and _is_setter(fn):
+                continue
             for path, line in _self_stores(fn, _outside_nested_methods):
                 if path == "<dynamic>":
                     what = "stores through setattr(self, ...) with a computed name, which may be "
@@ -1715,6 +1717,29 @@ def dropped_store_findings(where: str, source: str, counters: set[str]) -> list[
     for fn in _code_roots(tree):
         findings.extend(_foreign_findings(where, _code_name(fn), fn, counters, skip_self=False))
     return [text for _, text in sorted(findings, key=lambda finding: finding[0])]
+
+
+def _is_setter(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> bool:
+    """Whether ``fn`` is a property setter, decorated ``@<name>.setter``."""
+    return isinstance(fn, ast.FunctionDef) and any(
+        isinstance(d, ast.Attribute) and d.attr == "setter" for d in fn.decorator_list
+    )
+
+
+def assignable_dropped_findings(sources: dict[str, str]) -> list[str]:
+    """One line per :data:`ASSIGNABLE_DROPPED` entry that names no setter in its module."""
+    lines: list[str] = []
+    for name, where in ASSIGNABLE_DROPPED.items():
+        cls_name, attr = name.split(".")
+        cls = _class(ast.parse(sources[where]), cls_name)
+        setters = [
+            fn
+            for fn in (cls.body if cls is not None else [])
+            if isinstance(fn, ast.FunctionDef) and fn.name == attr and _is_setter(fn)
+        ]
+        if not setters:
+            lines.append(f"ASSIGNABLE_DROPPED names {name}, which {where} defines no setter for")
+    return lines
 
 
 def _foreign_findings(
@@ -1785,6 +1810,20 @@ def _foreign_findings(
     return found
 
 
+ASSIGNABLE_DROPPED: dict[str, str] = {
+    "KafkaSink.rejected": "sinks/kafka.py",
+    "GooglePubSubSink.rejected": "sinks/pubsub.py",
+}
+"""Property setters that store a dropped counter because a caller assigns them, with their module.
+
+SPEC-094 put ``KafkaSink`` and ``GooglePubSubSink`` on the delivery engine and kept each one's
+1.x public ``rejected`` assignable,
+as a property over the engine's ``dropped_events``. Its setter stores that counter when a caller
+assigns ``sink.rejected = n``, which is the caller's act, not a count the sink makes, so the
+store check passes over it by name. :func:`assignable_dropped_findings` holds each entry to a
+setter that exists, so a renamed property cannot leave its exemption behind.
+"""
+
 _THROUGH_THE_LEDGER = " through the calling emit's Deferral"
 """The close every store finding shares: where the count belongs instead."""
 
@@ -1821,47 +1860,50 @@ def test_every_dropped_counter_is_written_only_by_a_deferral_commit() -> None:
     )
     excused = {attr for attrs in IMMEDIATE.values() for attr in attrs} & counters
     assert not excused, f"IMMEDIATE excuses a store to a dropped counter: {sorted(excused)}"
+    assert assignable_dropped_findings(sources) == []
     findings: list[str] = []
     for where, source in sources.items():
         findings.extend(dropped_store_findings(where, source, counters))
     assert findings == [], "\n".join(findings)
 
 
-def _plant_in_on_delivery(source: str) -> tuple[str, int]:
-    """``sinks/kafka.py`` with ``self.rejected += 1`` planted first in ``_on_delivery``'s body.
+def _plant_in_sentry_flush(source: str) -> tuple[str, int]:
+    """``sinks/sentry.py`` with ``self.discarded += 1`` planted first in ``flush``'s body.
 
-    The line goes after the docstring, at the body's own indentation, and its number is read
-    from the parsed tree rather than written as a literal, so an edit above the method moves the
-    expectation with it.
+    ``SentrySink.flush`` is not reached from ``emit``, the site the roster lists, so the site
+    check does not follow it. The line goes after the docstring, at the body's own indentation,
+    and its number is read from the parsed tree rather than written as a literal, so an edit
+    above the method moves the expectation with it. Until SPEC-094 the plant went in
+    ``KafkaSink._on_delivery``, which SPEC-094 deleted with the rest of Kafka's immediate counts.
     """
-    kafka = _class(ast.parse(source), "KafkaSink")
-    assert kafka is not None, "KafkaSink is gone from sinks/kafka.py"
-    method = _methods(kafka).get("_on_delivery")
-    assert method is not None and len(method.body) > 1, "KafkaSink._on_delivery has moved"
+    sentry = _class(ast.parse(source), "SentrySink")
+    assert sentry is not None, "SentrySink is gone from sinks/sentry.py"
+    method = _methods(sentry).get("flush")
+    assert method is not None and len(method.body) > 1, "SentrySink.flush has moved"
     first = method.body[1]
     lines = source.splitlines(keepends=True)
-    lines.insert(first.lineno - 1, " " * first.col_offset + "self.rejected += 1\n")
+    lines.insert(first.lineno - 1, " " * first.col_offset + "self.discarded += 1\n")
     return "".join(lines), first.lineno
 
 
-def test_a_rejected_store_planted_in_an_unreached_kafka_method_is_named() -> None:
+def test_a_dropped_store_planted_in_an_unreached_method_is_named() -> None:
     """The gap this check closes: a store the roster never reaches is still a finding.
 
-    ``_on_delivery`` is handed to ``produce`` uncalled, so the site check does not follow it and
-    stays silent over the plant; the counter check names the module, the line, the class, the
-    method and the stored path.
+    ``SentrySink.flush`` is not reached from the listed ``emit``, so the site check stays silent
+    over the plant; the counter check names the module, the line, the class, the method and the
+    stored path.
     """
     sources = _tree_sources()
-    planted, line = _plant_in_on_delivery(sources["sinks/kafka.py"])
+    planted, line = _plant_in_sentry_flush(sources["sinks/sentry.py"])
     named = (
-        f"sinks/kafka.py:{line}: KafkaSink._on_delivery stores self.rejected, which a losses() "
+        f"sinks/sentry.py:{line}: SentrySink.flush stores self.discarded, which a losses() "
         f"reports as dropped; count it through the calling emit's Deferral"
     )
 
-    assert dropped_store_findings("sinks/kafka.py", planted, _tree_counters(sources)) == [named]
+    assert dropped_store_findings("sinks/sentry.py", planted, _tree_counters(sources)) == [named]
     assert (
         deferral_findings(
-            "sinks/kafka.py", planted, DEFERRING_SITES["sinks/kafka.py"], IMMEDIATE, set()
+            "sinks/sentry.py", planted, DEFERRING_SITES["sinks/sentry.py"], IMMEDIATE, set()
         )
         == []
     ), "the premise: the site check does not reach the plant"
@@ -2653,4 +2695,36 @@ def test_a_deferral_planted_in_transform_deliver_is_named() -> None:
             f"sinks/transform.py:{line}: Deferral(...) built outside a `with` item in an emit; "
             f"one call's pending drops must stay local to that call"
         )
+    ]
+
+
+def test_an_assignable_dropped_setter_is_exempt_only_by_name_and_only_as_a_setter() -> None:
+    """SPEC-094: the exemption reaches the listed setter, and nothing else in the class.
+
+    A store of ``dropped_events`` planted in ``KafkaSink._round`` is still a finding, and an entry
+    naming a setter that does not exist is reported as stale.
+    """
+    sources = _tree_sources()
+    kafka = sources["sinks/kafka.py"]
+    anchor = "            context = run_context()\n            fates = [Outcome.DROPPED]"
+    assert kafka.count(anchor) == 1, "KafkaSink._round has moved"
+    planted = kafka.replace(
+        anchor,
+        "            self.log_foundry_counters.dropped_events += 1\n" + anchor,
+    )
+    findings = dropped_store_findings("sinks/kafka.py", planted, _tree_counters(sources))
+    assert len(findings) == 1 and "KafkaSink._round stores" in findings[0], findings
+    assert dropped_store_findings("sinks/kafka.py", kafka, _tree_counters(sources)) == []
+    getter = "        return self.log_foundry_counters.dropped_events\n"
+    assert kafka.count(getter) == 1, "KafkaSink.rejected's getter has moved"
+    in_getter = kafka.replace(
+        getter, "        self.log_foundry_counters.dropped_events += 1\n" + getter
+    )
+    findings = dropped_store_findings("sinks/kafka.py", in_getter, _tree_counters(sources))
+    assert len(findings) == 1 and "KafkaSink.rejected stores" in findings[0], (
+        "the getter of the same name is not the exempt setter"
+    )
+    stale = dict(sources, **{"sinks/kafka.py": kafka.replace("@rejected.setter", "@staticmethod")})
+    assert assignable_dropped_findings(stale) == [
+        "ASSIGNABLE_DROPPED names KafkaSink.rejected, which sinks/kafka.py defines no setter for"
     ]

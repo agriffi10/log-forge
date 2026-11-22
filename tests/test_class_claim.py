@@ -102,7 +102,6 @@ _RIG_SILENT = {
     "SQLiteSink": "its rig writes through a real connection that State.error never reaches",
     "StdoutSink": "its rig's stream never raises State.error",
     "StderrSink": "its rig's stream never raises State.error",
-    "GooglePubSubSink": "every publish() is refused, which raises before a line is announced",
 }
 """Rigs whose emit writes no loss line naming ``State.error``, each with its reason."""
 

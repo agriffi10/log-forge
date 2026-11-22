@@ -61,8 +61,18 @@ REDIS = "redis.exceptions"
 PIKA = "pika.exceptions"
 AZURE = "azure.eventhub.exceptions"
 PSYCOPG = "psycopg.errors"
+API_CORE = "google.api_core.exceptions"
+PUBSUB_PUBLISHER = "google.cloud.pubsub_v1.publisher.exceptions"
 
 TREES: dict[str, dict[str, tuple[str, ...]]] = {
+    API_CORE: {
+        "GoogleAPIError": (),
+        "GoogleAPICallError": ("GoogleAPIError",),
+        "ClientError": ("GoogleAPICallError",),
+        "BadRequest": ("ClientError",),
+        "InvalidArgument": ("BadRequest",),
+    },
+    PUBSUB_PUBLISHER: {"FlowControlLimitError": ()},
     BOTOCORE: {
         "BotoCoreError": (),
         "ConnectionError": ("BotoCoreError",),
@@ -131,6 +141,8 @@ TREES: dict[str, dict[str, tuple[str, ...]]] = {
         "ChannelWrongStateError": ("AMQPChannelError",),
         "ChannelClosed": ("AMQPChannelError",),
         "ChannelClosedByBroker": ("ChannelClosed",),
+        "UnroutableError": ("AMQPChannelError",),
+        "NackError": ("AMQPChannelError",),
         "ProtocolSyntaxError": ("AMQPError",),
     },
     AZURE: {

@@ -129,6 +129,7 @@ class Variant:
       wraps: A wrapper's inner variant, `"HTTPSink"` or `"CallbackSink"`.
       skips: The faults its class runs that this variant does not, each with its reason.
       only: The faults a variant that exists for one fault runs, in place of its class's.
+      adds: The faults it runs beyond its class's, each with its reason (SPEC-093 FR-005).
     """
 
     sink: str
@@ -139,6 +140,7 @@ class Variant:
     wraps: str | None = None
     skips: Mapping[Fault, str] = MappingProxyType({})
     only: tuple[Fault, ...] = ()
+    adds: Mapping[Fault, str] = MappingProxyType({})
 
     @property
     def id(self) -> str:
@@ -166,6 +168,7 @@ def _v(
     wraps: str | None = None,
     skips: Mapping[Fault, str] | None = None,
     only: tuple[Fault, ...] = (),
+    adds: Mapping[Fault, str] | None = None,
 ) -> Variant:
     """A `Variant` with its mappings frozen.
 
@@ -178,6 +181,7 @@ def _v(
       wraps: A wrapper's inner variant.
       skips: The faults it does not run, with reasons.
       only: The faults it runs in place of its class's.
+      adds: The faults it runs beyond its class's, with reasons.
 
     Returns:
       The variant.
@@ -194,6 +198,7 @@ def _v(
         wraps=wraps,
         skips=MappingProxyType(dict(skips or {})),
         only=only,
+        adds=MappingProxyType(dict(adds or {})),
     )
 
 
@@ -204,6 +209,10 @@ _NO_FAILURE = "an append to an in-process list has no failure to script"
 _CALLS_NOTHING = "it calls nothing"
 _PING_IS_THE_CASE = "its never-acknowledged is a PING never answered, which is this case"
 _NO_CALLER_CODE = "it runs no caller code"
+_CONFIRMED_ADDS: Mapping[Fault, str] = {
+    "taken-then-raised": "a confirmed publish writes its frame before it waits",
+    "peer-closed": "a connection is held between batches",
+}
 
 VARIANTS: tuple[Variant, ...] = (
     _v("SQSSink", "standard", "keyed-reply", "sqs", picks={"fifo": False}),
@@ -297,6 +306,22 @@ VARIANTS: tuple[Variant, ...] = (
     ),
     _v("RabbitMQSink", "owned", "socket-stream", "rabbitmq", picks={"url": "amqp://h/"}),
     _v("RabbitMQSink", "borrowed", "socket-stream", "rabbitmq", picks={"connection": "borrowed"}),
+    _v(
+        "RabbitMQSink",
+        "confirmed",
+        "per-event-ack",
+        "rabbitmq",
+        picks={"url": "amqp://h/", "confirm": True},
+        adds=_CONFIRMED_ADDS,
+    ),
+    _v(
+        "RabbitMQSink",
+        "confirmed-borrowed",
+        "per-event-ack",
+        "rabbitmq",
+        picks={"connection": "borrowed", "confirm": True},
+        adds=_CONFIRMED_ADDS,
+    ),
     _v(
         "NATSSink",
         "jetstream",
@@ -472,6 +497,7 @@ PARAMETERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "timeout",
             "max_retries",
             "max_datagram_bytes",
+            "ack_wait",
             "**http_kwargs",
         ),
         "LokiSink": ("url", "labels", "**http_kwargs"),
@@ -519,6 +545,7 @@ PARAMETERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "blocked_connection_timeout",
             "socket_timeout",
             "stack_timeout",
+            "confirm",
         ),
         "RedisListSink": ("key", "client", "url", "max_retries", "maxlen"),
         "RedisStreamsSink": ("stream", "client", "url", "max_retries", "maxlen"),
@@ -547,6 +574,7 @@ PARAMETERS: Mapping[str, tuple[str, ...]] = MappingProxyType(
             "timeout",
             "max_retries",
             "max_datagram_bytes",
+            "ack_wait",
         ),
         "TransformSink": ("inner", "fn"),
         "_FactorySink": ("factory",),
@@ -611,6 +639,7 @@ NEUTRAL: Mapping[str, frozenset[str]] = MappingProxyType(
         "LogstashSink": frozenset(
             {
                 "**http_kwargs",
+                "ack_wait",
                 "body_format",
                 "max_datagram_bytes",
                 "max_retries",
@@ -686,6 +715,7 @@ NEUTRAL: Mapping[str, frozenset[str]] = MappingProxyType(
         "StdoutSink": frozenset({"stream"}),
         "SyslogSink": frozenset(
             {
+                "ack_wait",
                 "app_name",
                 "facility",
                 "host",
@@ -702,7 +732,11 @@ NEUTRAL: Mapping[str, frozenset[str]] = MappingProxyType(
 """Per class, the parameters that never change what the sink can know, each named here as a
 verdict rather than derived, so a parameter a sink gains fails the parameter test until someone
 decides whether it makes a variant. `max_message_bytes` is neutral for `SQSSink` and `SNSSink`: a
-size limit changes which events are sent, never what the sink can know about one it sent. An
+size limit changes which events are sent, never what the sink can know about one it sent. `ack_wait`
+is neutral for `SyslogSink` and `LogstashSink` for another reason: it does change what a TCP sink can
+know, but the corpus's fake socket cannot be polled and has no send queue to read, so both settings
+read it alike (SPEC-093 FR-005, measured with the default flipped); its effect is held by
+`tests/test_socket_close_corpus.py` instead. An
 injected `client`, `opener` or `producer` is neutral too, except where it selects a variant, as
 NATS' `client` beside `servers` does."""
 
@@ -727,7 +761,7 @@ def variant_named(name: str, variants: Iterable[Variant] = VARIANTS) -> Variant:
 
 
 def faults_of(variant: Variant, variants: Iterable[Variant] = VARIANTS) -> tuple[Fault, ...]:
-    """The faults a variant runs, in order: `only`, or else its class's, then less `skips`.
+    """The faults a variant runs, in order: `only` or else its class's, then `adds`, less `skips`.
 
     A wrapper's class's faults are its inner variant's class's, then `APPLIES["wrapper"]`.
 
@@ -749,6 +783,7 @@ def faults_of(variant: Variant, variants: Iterable[Variant] = VARIANTS) -> tuple
         base = (*APPLIES[inner.ack], *APPLIES["wrapper"])
     else:
         base = APPLIES[variant.ack]
+    base = (*base, *variant.adds)
     return tuple(fault for fault in base if fault not in variant.skips)
 
 
@@ -960,4 +995,40 @@ def coverage_faults(
             f"{name}: the parameter {p} is both a variant's pick and in NEUTRAL"
             for p in sorted(picked & calm)
         ]
+    return lines
+
+
+def adds_faults(variants: Iterable[Variant]) -> list[str]:
+    """One line per misuse of `adds`, naming the variant and the fault; empty when there is none.
+
+    A fault in `adds` must be one its class does not already run, on a variant that does not set
+    `only`, and not one its `skips` removes again, and it must be a `Fault` at all (SPEC-093
+    FR-005). Each of those would make `adds` say something `faults_of` does not do.
+
+    Args:
+      variants: The variant table.
+
+    Returns:
+      The failure lines.
+
+    Raises:
+      None.
+    """
+    table = tuple(variants)
+    lines: list[str] = []
+    for variant in table:
+        if variant.ack == "wrapper":
+            inner = next((v for v in table if v.id == variant.wraps), None)
+            runs = (*APPLIES[inner.ack], *APPLIES["wrapper"]) if inner is not None else ()
+        else:
+            runs = APPLIES[variant.ack]
+        for fault in variant.adds:
+            if fault not in FAULTS:
+                lines.append(f"{variant.id} adds {fault!r}, which is not a fault")
+            elif variant.only:
+                lines.append(f"{variant.id} adds {fault} beside only, which replaces its faults")
+            elif fault in runs:
+                lines.append(f"{variant.id} adds {fault}, which its class already runs")
+            if fault in variant.skips:
+                lines.append(f"{variant.id} adds {fault} and also skips it")
     return lines

@@ -50,10 +50,12 @@ ENGINE_CLOSED: dict[str, Callable[[int], str]] = {
     ),
     "FileSink": lambda n: f"FileSink wrote none of {n} event(s): the sink is closed",
     "RotatingFileSink": lambda n: f"RotatingFileSink wrote none of {n} event(s): the sink is closed",
+    "KafkaSink": lambda n: f"KafkaSink produced none of {n} message(s): the sink is closed",
 }
 """Each engine adopter's closed message, fda134a's text (``SocketTransport`` counts the batch, as
 SPEC-074 made it). ``NATSSink`` keeps its own closed state (SPEC-061) and answers the same way.
-The two file sinks joined from ``EMIT_ONLY_CLOSED`` when SPEC-082 put them on the engine, their
+``KafkaSink`` joined from ``EMIT_ONLY_CLOSED`` when SPEC-094 put it on the engine, its 1.x text
+unchanged. The two file sinks joined from ``EMIT_ONLY_CLOSED`` when SPEC-082 put them on the engine, their
 1.x text unchanged."""
 
 ENGINE_CLOSING: dict[str, Callable[[int], str]] = {
@@ -64,7 +66,6 @@ ENGINE_CLOSING: dict[str, Callable[[int], str]] = {
 
 EMIT_ONLY_CLOSED: dict[str, Callable[[int], str]] = {
     "SQLiteSink": lambda n: f"SQLiteSink inserted none of {n} event(s): the sink is closed",
-    "KafkaSink": lambda n: f"KafkaSink produced none of {n} message(s): the sink is closed",
 }
 """Each emit-only adopter's 1.x refusal, raised from ``emit``."""
 

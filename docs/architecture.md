@@ -587,9 +587,14 @@ know about spans or context.
 **An explicit `flush()` drains three places, not one** (SPEC-036): the worker's queue, the events
 still buffered on **open** spans (FR-001; ~~in the calling context~~ every open span in the
 process since SPEC-091, below), and whatever the sink is holding
-in its own **client** (FR-002 — `KafkaSink` hands to librdkafka, `GooglePubSubSink` to an
-unresolved future, `SentrySink` to the SDK's background transport, `LoggingSink` to a handler
-chain). The third runs **after** the queue drain, because the queue's events have to reach the
+in its own **client** (FR-002 — `KafkaSink` hands to librdkafka, ~~`GooglePubSubSink` to an
+unresolved future,~~ `SentrySink` to the SDK's background transport, `LoggingSink` to a handler
+chain). *Corrected 2026-11-20 (SPEC-094):* `KafkaSink` and `GooglePubSubSink` now wait, in each
+round, for the client's reports on the messages the round handed over, so `GooglePubSubSink` holds
+no future awaiting a verdict between emits and its `flush()` only refuses when closed (*corrected
+2026-11-22:* it keeps the futures its rounds left `UNKNOWN`, already counted, for `close()` to
+wait on up to `overflow_timeout`), and `KafkaSink`'s serves any
+pending report with `flush(0)` and never raises for a remainder, which its rounds already counted. The third runs **after** the queue drain, because the queue's events have to reach the
 client buffer before it is emptied, and it is an optional `flush()` probed by `sinks.base.flush_sink`
 — which **propagates** a failure where `read_losses` swallows one, since a swallowed flush failure
 is a sink the worker believes. A wrapper sink forwards it, or a buffering child is unreachable
@@ -669,7 +674,9 @@ decorated call ends, or the worker's interval sweep takes from an open span
   as shareable (`AzureEventHubsSink`) all take one. The sinks whose client documents its own
   thread-safety — `MongoDBSink`, the boto3 four, the Redis pair, `KafkaSink`, `SentrySink`,
   `GooglePubSubSink` — take no *transport* lock, and say why; several still guard a small piece
-  of their own state (Mongo's close flag, Pub/Sub's pending-futures list). A lint (`test_every_driver_backed_sink_records_a_concurrency_decision`) fails
+  of their own state (Mongo's close flag, ~~Pub/Sub's pending-futures list~~ Pub/Sub's closed flag,
+under `_futures_lock`, since SPEC-094 removed the list, *corrected 2026-11-20*, and with it the
+futures its rounds left unconfirmed, kept for `close()` to wait on, *corrected 2026-11-22*). A lint (`test_every_driver_backed_sink_records_a_concurrency_decision`) fails
   any driver-backed sink that neither locks nor records a reason, because the first pass at this
   worked from a hand-written roster and missed three sinks — one of which could hang an
   application thread permanently. That is the SPEC-027 roster lesson, repeated once and now
@@ -711,7 +718,10 @@ decorated call ends, or the worker's interval sweep takes from an open span
   into the worker's own counters because `dropped` at the queue and `dropped` at the sink count
   different things. The sink's is what never reached the wire — usually an event that can never
   fit, but for the sinks whose client owns a local buffer (`KafkaSink`, `GooglePubSubSink`) also
-  what that buffer refused, which is backpressure one layer further out.
+  what that buffer refused, which is backpressure one layer further out. *Corrected 2026-11-20
+  (SPEC-094):* that holds for a hand-off the client refused by raising; a full Pub/Sub client queue
+  instead sets `FlowControlLimitError` on the message's future, which `GooglePubSubSink` counts in
+  `failed` as a definitive refusal (§12, *Whether a full client queue is retried*).
 - **A forked child repairs itself, in a fixed order, and only the child** (SPEC-039). `fork`
   copies the memory and leaves the threads behind, so a child inherits a worker whose drain
   thread does not exist and locks held by threads that do not exist — measured, the child's
@@ -1244,17 +1254,7 @@ close it.
   deterministic one such as nats-py's `MaxPayloadError` or `OutboundBufferLimitError` included, it
   is an over-count of `failed` only, which the event ledger counts once (invariant 2's NATS
   exception). The header closes the first; the second is 1.x's own per-call count.
-- **`GooglePubSubSink.close()`'s bound does not cover an unboundable future** (SPEC-048 FR-004).
-  A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
-  it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
-  going to succeed. A client handing out futures that are both unboundable *and* slow therefore
-  holds `close()` for its own deadline, once per future: measured 27.0 s for nine against a 3 s
-  stand-in, where the bounded path took 2.0 s for sixty. Strictly better than before SPEC-048,
-  where **every** future took that path, and unreachable through `google-cloud-pubsub`'s own
-  future, which accepts a timeout — but `client=` is a frozen public parameter. **Closed by**
-  resolving them on a joinable thread, which bounds the close at the cost of a thread that may
-  outlive it; waiting on a future is a read and causes no delivery, so SPEC-036's rule forbids
-  *counting* them, not abandoning the wait.
+- ~~**`GooglePubSubSink.close()`'s bound does not cover an unboundable future**~~ → **closed by SPEC-094**; struck and moved under *Resolved*.
 - **A `RotatingFileSink` whose rotation keeps failing retries it once per event** (SPEC-048
   FR-006). The absorbed failure re-seeds `_size` from a file already over `max_bytes`, so the size
   trigger stays true and every later event attempts a close, a rename, a reopen and a `getsize` on
@@ -1293,15 +1293,19 @@ close it.
   drain thread. `send_receive_timeout=` is forwarded to `get_client` only when given. **Closed by** a
   library default, if a deployment shows 300 s per attempt is the wrong side of the line — the
   decision `psycopg`'s `connect_timeout` took in SPEC-041.
-- **`ElasticsearchSink` reads a `2xx` object without a truthy `errors` as success, unverified.** It
-  does not check that the object is `_bulk`-shaped, so a server answering every POST with
-  `{"error": {"type": "auth"}, "status": 500}`, or with
-  `{"items": [{"index": {"error": "x"}}, {"index": {"error": "x"}}]}`, leaves `flush()` truthy,
+- **`ElasticsearchSink` reads a `2xx` object with `items` and no truthy `errors` as success,
+  unverified.** *Rewritten 2026-11-20 by SPEC-093:* ~~a `2xx` object without a truthy `errors`~~ an
+  object carrying neither `errors` nor `items`, `{}` or an error document such as
+  `{"error": {"type": "auth"}, "status": 500}`, is counted on `dropped_unadjudicated` since SPEC-093
+  and never resent (*A batch reply that names no event adjudicates none of it*,
+  `docs/decisions/sink-delivery/`). What stays is an object with `items` and `errors` absent or
+  false: the sink does not check that it is `_bulk`-shaped, so a server answering every POST with
+  `{"items": [{"index": {"error": "x"}}, {"index": {"error": "x"}}]}` leaves `flush()` truthy,
   `failed_batches` at zero, `health().sink` at `failed=0` and stderr empty (reproduced at
-  `6399298`). Undecodable and non-object bodies are counted; this residue is not, because routing
-  an absent `errors` to `dropped_unadjudicated` would charge every success from an endpoint that
-  omits the key. **Closed by** deciding it with the Astra `_bulk` profile spec, which is where an
-  endpoint's response shape gets settled.
+  `6399298`). Undecodable and non-object bodies, and objects with neither key, are counted; this
+  residue is not, because routing an absent `errors` to `dropped_unadjudicated` would charge every
+  success from an endpoint that omits the key. **Closed by** deciding it with the Astra `_bulk`
+  profile spec, which is where an endpoint's response shape gets settled.
 
 - **`NATSSink`'s float timeouts are forwarded to the driver unchecked** (SPEC-066, found while
   closing the int doors; invariant 13). `connect_timeout`, `reconnect_time_wait` and
@@ -1865,19 +1869,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   concurrent prototype, and none once the run replaced `sys.stderr`. **Closed by** a recorded
   constraint beside that hazard in §13, or by a diagnostic write in a forked child that does not
   wait on the stream lock it inherited; the probe's `library` row reading 0 is the second.
-- **A TCP `SyslogSink` or `LogstashSink` counts a frame as accepted when `sendall` returns, so
-  frames written after the peer closed vanish uncounted** (2026-11-14 audit, finding 1; invariants 2
-  and 7). `SocketTransport._send_one` calls `sendall` (`sinks/_socket.py:517`) and the round marks
-  the frame `ACCEPTED` (`:406-407`); the class documents `failed` as "Messages not confirmed" and
-  nothing is ever confirmed. `docs/audits/2026-11-14-probes/sinks/probe_socket.py`: a first batch
-  lands, the listener closes the accepted connection, and of a second batch of 50 the collector
-  received 38 from `SyslogSink` and 36 from `LogstashSink` in the sinks frame's run, with
-  `failed=0`, no raise and no stderr line. The size of the loss depends on timing and was never
-  zero, between 2 and 25 of 50 across the runs the audit records, and the silence was the same in
-  every one; a peer that reset instead lost nothing. The default UDP transport to a port with no
-  listener lost 100 of 100 uncounted, which is inherent to UDP and is not this item. **Closed by**
-  the transport noticing that its peer has closed before it writes a batch into the connection, and
-  counting what it wrote into a closed one, held by a test double that closes between batches.
+- ~~**A TCP `SyslogSink` or `LogstashSink` counts a frame as accepted when `sendall` returns, so frames written after the peer closed vanish uncounted**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
 - ~~**A send whose reply is lost is sent again, and the resend is neither counted nor keyed**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
 - **An event a send may have landed is counted as lost when no later send lands it** (SPEC-095;
   invariants 2 and 7). A round that marks an event as possibly landed leaves it `RETRYABLE`, so
@@ -1907,65 +1899,21 @@ an item leaves this list when a spec closes it, not because the arc names it.
   (Recommended)" on 2026-11-16. **Closed by** the follow-up spec of the 2026-11-14 audit arc that
   adds the topic's group and de-duplication ids, drafted as SPEC-100.
 - ~~**When the engine's own commit raises, a run's resends are neither counted nor announced**~~ → **closed by SPEC-095**; struck and moved under *Resolved*.
-- **An AWS batch reply that names no failure is read as full delivery** (2026-11-14 audit, finding
-  14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
-  and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads
-  a Kinesis or Firehose reply with no failed count and no coded record as delivered
-  (`sinks/_batch.py:216-217`). `docs/audits/2026-11-14-probes/sinks/probe_sqs.py`, cases G1 and G2,
-  and `sinks/probe_aws_more.py`: a reply listing 7 of each 10 in `Successful` left 6 of 25 SQS
-  messages and 6 of 25 SNS messages missing, and a reply of `{}` left 25 of 25 SQS messages and 25
-  of 25 Kinesis records missing, with nothing counted or written in any of the four. **Bounded by a
-  settled decision:** *A positional response adjudicates all of a chunk or none of it*
-  (`docs/decisions/sink-delivery/`) reads a keyed reply by what `Failed` names, real AWS names every
-  entry, and so this needs a proxy, an emulator or a broken mock. What is open is that a reply which
-  is not reply-shaped at all is told apart from success by nothing; the `ElasticsearchSink` item
-  above is the same shape for `_bulk`. ~~**Closed by** deciding whether a reply that carries
-  neither `Failed` nor `Successful`, or neither a count nor records, is unadjudicated, and holding
-  the answer in the conformance corpus.~~ **Decided by Andrew on 2026-11-15.** Asked whether a
-  reply that names no failure should read as delivered, he answered 'Unadjudicated (Recommended)':
-  every event the reply does not name is `UNKNOWN`, counted in `failed` and
-  `dropped_unadjudicated`, announced once as one that may have landed, and never resent. **Closed
-  by** SPEC-093 building that reading, which turns the `reply-without-verdict` rows of
-  `tests/test_conformance.py` green.
-- **`SentrySink`'s SDK backend counts an event the SDK discarded as sent** (2026-11-14 audit,
-  finding 11; invariant 2). `SentrySink._capture` ignores what `capture_event` returns
-  (`sinks/sentry.py:448-458`), so by the sinks frame's reading sampling, `before_send`, a rate limit
-  and the SDK's bounded queue all read as delivery.
-  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, case 5: with a stand-in SDK keeping 1 event
-  in 5, `sent` read 25 and `losses()` read nothing lost while 5 were kept. The class documents
-  `sent` as "Events captured or sent to Sentry" (`:84`). The audit used a stand-in and did not read
-  what the real SDK returns for an event it discards. **Closed by** reading the installed SDK for
-  what it reports about a discarded event and counting on that, or, if it reports nothing, by
-  `sent`'s docstring saying what the count does not prove.
-- **`KafkaSink` and `GooglePubSubSink` give their verdict when the client queues a message, not when
-  the broker answers** (2026-11-14 audit, finding 12; invariant 7's observable). `KafkaSink.emit`
-  returns once `produce()` has queued each message (`sinks/kafka.py:312-318`), and its `flush`
-  raises only for messages still queued (`:431-436`).
-  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, case 3: with every delivery report an error,
-  0 of 25 landed and `health().sink.failed` read 25 with 25 lines, so the loss is counted, yet
-  `flush()` returned `ok=True` and `failed_batches` stayed 0. Case 4: with the client's queue full
-  after 10 of 25, the other 15 were counted `dropped` and never retried, although a full queue is
-  the transient case. `GooglePubSubSink` has the same shape by reading (`sinks/pubsub.py:268-275`)
-  and was not run. A truthy `flush()` over a counted loss stands here on the same divided record as
-  for the engine sinks, and on the same answer: on 2026-11-15 Andrew chose "Keep truthy, add
-  counts", closure (b) of the `flush()` item above, so `flush()` stays truthy here as well.
-  ~~**Closed by** the choice the `flush()` item above puts to Andrew, which covers this case with
-  the engine's and names what each option reverses, and by a decision on whether a full client
-  queue is retried.~~ ~~**Closed by** the spec that adds the loss counts to `FlushResult`, once it
-  states whether a loss a sink counts after `emit` has returned, as a failed delivery report is
-  here, is among those counts, and by a decision on whether a full client queue is retried.~~
-  SPEC-089 added those counts (2026-11-16) and states that such a loss is **in none of them**:
-  the event ledger ends where `emit` returns, so a failed delivery report counted afterwards
-  shows in `health().sink` and nowhere on a `flush()` result, whose counts read zero over it.
-  ~~**Closed by** the acknowledgement fix for these two sinks (SPEC-094), which has a round wait
-  for the client's report, and by a decision on whether a full client queue is retried.~~
-  **Decided by Andrew on 2026-11-15 and 2026-11-16.** Asked whether the verdict may come before
-  the client's report, he answered 'Wait for the report (Recommended)': each batch's `emit` waits
-  for the client's delivery reports within the sink's existing timeout, as core NATS confirms.
-  Asked what a truthy `flush()` then means, he answered 'Truthy, counted (Recommended)': every
-  event was acknowledged or counted. **Closed by** SPEC-094 building that, which turns the
-  `verdict-before-refusal` and `verdict-before-indefinite-report` rows of
-  `tests/test_conformance.py` green, and by a decision on whether a full client queue is retried.
+- ~~**An AWS batch reply that names no failure is read as full delivery**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
+- ~~**`SentrySink`'s SDK backend counts an event the SDK discarded as sent**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
+- ~~**`KafkaSink` and `GooglePubSubSink` give their verdict when the client queues a message, not when the broker answers**~~ → **closed by SPEC-094**; struck and moved under *Resolved*.
+- **Whether a full client queue is retried** (2026-11-14 audit, finding 12's remaining clause;
+  invariants 2 and 6). `KafkaSink` keeps 1.x's reading of a `produce()` that raises, a full local
+  queue's `BufferError` among them: in a round where another message was produced, the refused one is
+  `DROPPED`, counted in `rejected` and named when the run settles, and never retried; in a round
+  where nothing was produced, the engine resends it. `docs/audits/2026-11-14-probes/sinks/probe_misc.py`,
+  case 4, at `a44aa37c`: with the client's queue full after 10 of 25, 10 landed and the other 15
+  were counted `dropped` with 15 lines and never retried, although a full queue is the transient
+  case. A full Pub/Sub queue is not that case: the client returns a future carrying
+  `FlowControlLimitError`, which `GooglePubSubSink` reads as `REJECTED` in its round (SPEC-094), so
+  a batch of nothing else fails and the worker counts it. The two sinks therefore read a full client
+  queue differently, because their clients report it differently, which invariant 6 records.
+  **Closed by** a decision on whether a full client queue is retried, applied to both sinks.
 - **An injected autocommit connection breaks the database sinks' all-or-nothing write** (2026-11-14
   audit, finding 15; invariants 2 and 7). `PostgresSink` commits once after every chunk of a batch
   (`sinks/postgres.py:457-468`) and `SQLiteSink` relies on `with self._conn`
@@ -1976,13 +1924,7 @@ an item leaves this list when a spec closes it, not because the arc names it.
   read 100. An unlikely configuration. **Closed by** refusing a connection in autocommit mode where
   it is handed over (invariant 13), or by a recorded exception that says the sinks do not support
   one.
-- **`RabbitMQSink` publishes without confirms, so an unroutable message or one written to a dead
-  socket reads as accepted** (2026-11-14 audit, the sinks frame's unranked item, read and not run;
-  invariant 2). `basic_publish` returning is the verdict (`sinks/rabbitmq.py:429`), with neither
-  publisher confirms nor `mandatory`, and the class docstring says that "written" is not
-  "acknowledged" (`:60-62`). There is no probe, because no driver extra was installed for the audit.
-  **Closed by** publisher confirms, measured against a real broker by the integration suite, with a
-  decision on whether they are the default.
+- ~~**`RabbitMQSink` publishes without confirms, so an unroutable message or one written to a dead socket reads as accepted**~~ → **closed by SPEC-093**; struck and moved under *Resolved*.
 - **The one generative test cannot find the lifecycle defects it is cited as guarding** (2026-11-14
   audit, finding 21; it breaks no invariant, and invariants 1, 2, 5, 6 and 12 name it under
   *Guarded*). `tests/test_invariants_model.py` drives a passive sink: `Recorder` holds its
@@ -2040,6 +1982,52 @@ an item leaves this list when a spec closes it, not because the arc names it.
   by** the arc's CI track timing the step when it edits those files, which is what verifying it
   takes, and then anchoring each number to a commit or deleting it, as
   `docs/process/completion-ritual.md` asks of a volatile number.
+- **Tagging the pending release `v1.3.0` without renaming its notes file silently ships generated
+  notes** (found by SPEC-093's completion ritual, 2026-11-20; unfixed under the audit scope
+  freeze). `release.yml` reads curated notes from `docs/release-notes/${GITHUB_REF_NAME}.md`, by the
+  exact tag name, and falls back to `--generate-notes` with only a workflow warning when that file
+  is missing. The pending notes are `docs/release-notes/v1.2.1.md`, and since SPEC-093 and SPEC-094
+  add keyword arguments their opener says the release may be numbered 1.2.1 or 1.3.0. Tagged
+  `v1.3.0` with the file unrenamed, the release gets a changelog built from commit subjects and a
+  green job. **Closed by** renaming the file to the chosen tag in the commit that is tagged, or by
+  `release.yml` refusing a tag whose curated notes are missing when a pending notes file exists.
+- **Reply shapes beside decision A's still read as full delivery** (found by SPEC-093's second diff
+  review, 2026-11-22; unfixed under the audit scope freeze). SPEC-093 FR-003 made a reply that
+  names no event adjudicate none of it, and kept "every other combination" as before. Two of those
+  name no event either. A Kinesis or Firehose reply of `{"Records": []}` with no failed count, for
+  a chunk that is not empty, reads every record `ACCEPTED`: `absent` is only `raw is None`, so the
+  empty array falls through to `_batch.py:226-227`, where an absent count with nothing coded is
+  delivered (measured: three records, all `ACCEPTED`, nothing counted). A `_bulk` `2xx` of
+  `{"items": []}` passes `elasticsearch.py:193`'s neither-key test and reads all `ACCEPTED` at
+  `:195`. Both are what only a proxy, an emulator or a broken stand-in returns, as decision A's
+  shapes are. **Closed by** a spec that extends decision A's reading to an empty per-record array
+  for a non-empty chunk, on both readers, with Andrew's answer on whether it is in scope.
+
+- **`DEFAULT_CLOSER_GRACE` does not bound the live sink's close** (found by SPEC-094's execution
+  review, 2026-11-22; present before it, unfixed under the audit scope freeze; invariant 3).
+  Invariant 3's recorded exceptions say what bounds the exit is `DEFAULT_CLOSER_GRACE`, carved
+  from the shutdown budget. The grace bounds only a swapped-out sink's close, which runs on a
+  daemon closer thread; the live sink's close runs inline on the thread that called
+  `shutdown()`, so a slow one holds `shutdown(timeout=t)` past `t` for as long as it takes.
+  Measured: a `MemorySink` subclass sleeping 5 s in `close()` made `shutdown(timeout=1.0)` take
+  5.01 s, and a `GooglePubSubSink` at `overflow_timeout=6` against futures that never resolve
+  took 6.06 s. **Closed by** a spec that either bounds the live sink's close by the shutdown
+  budget, at the cost of a close that may outlive `shutdown()` on a thread, or corrects
+  invariant 3's sentence to name only the swapped-out close, with Andrew's answer on which.
+
+- **A `RabbitMQSink` publish whose channel never opened is counted as a resend that may have
+  landed** (found by SPEC-093/094's rebase review, 2026-11-22; present on `295ba803`, SPEC-095;
+  unfixed under the audit scope freeze; invariants 2 and 7). `_publish` reads a raise from getting
+  the channel (`sinks/rabbitmq.py:504-512` at `cfa42af1`) with `reached=self._may_have_landed(err)`,
+  as SPEC-095's single guard read every raise, so a `StreamLostError` from `connection.channel()`
+  or `confirm_delivery()` marks the event as possibly landed although nothing was published, and
+  its resend is counted in `resent` with a line. The TCP twin never marks a frame whose connection
+  did not open (`SocketTransport._send_one`'s `sending` flag). Measured on a borrowed connection
+  whose first `channel()` raises `StreamLostError`: one publish in all, and
+  `SinkLosses(dropped=0, failed=0, resent=1)` with one resend line, with `confirm` off and on.
+  `resent` is an upper bound by SPEC-095's own record, so this over-counts and loses nothing.
+  **Closed by** reading a raise from getting the channel as not landed (`reached=False`), held by
+  a test whose channel open raises.
 
 ### Resolved
 
@@ -2152,6 +2140,10 @@ an item leaves this list when a spec closes it, not because the arc names it.
   `reply-counted-lost` rows read green, and the pin `reply-resent` is gone. The decision is *A
   resend after a send that may have landed is counted, and its key is the event's `log_id`*
   (`docs/decisions/sink-delivery/`).
+  *Added 2026-11-20 by SPEC-093, kept on the rebase onto SPEC-095:* a `confirm=True`
+  `RabbitMQSink` publish whose confirm was lost is `UNKNOWN` and is not resent, so the confirmed
+  variants' rows of this shape are green; the default `RabbitMQSink` keeps the resend, which
+  SPEC-095 counts.
 - ~~**One stable stop signal per sink changes a documented public protocol, and with the one-owner
   command path it deletes mechanisms that settled decisions fence; neither is specified yet**~~
   (2026-11-14 audit, the lifecycle frame's structural changes 1 and 2; invariant 10). Andrew took
@@ -2222,6 +2214,172 @@ an item leaves this list when a spec closes it, not because the arc names it.
   event the library made and the sink is already handed, so `Worker._reinit_after_fork`'s offer
   assigns nothing. `p9_second_stop_in_fork_repair.py`'s three child rows read `repair returned`
   with the setter's calls empty (`[]`), and `tests/test_stable_stop_signal.py` ports them.
+- ~~**A TCP `SyslogSink` or `LogstashSink` counts a frame as accepted when `sendall` returns, so
+  frames written after the peer closed vanish uncounted**~~ (2026-11-14 audit, finding 1; invariants 2
+  and 7). `SocketTransport._send_one` calls `sendall` (`sinks/_socket.py:517`) and the round marks
+  the frame `ACCEPTED` (`:406-407`); the class documents `failed` as "Messages not confirmed" and
+  nothing is ever confirmed. `docs/audits/2026-11-14-probes/sinks/probe_socket.py`: a first batch
+  lands, the listener closes the accepted connection, and of a second batch of 50 the collector
+  received 38 from `SyslogSink` and 36 from `LogstashSink` in the sinks frame's run, with
+  `failed=0`, no raise and no stderr line. The size of the loss depends on timing and was never
+  zero, between 2 and 25 of 50 across the runs the audit records, and the silence was the same in
+  every one; a peer that reset instead lost nothing. The default UDP transport to a port with no
+  listener lost 100 of 100 uncounted, which is inherent to UDP and is not this item. **Closed by**
+  the transport noticing that its peer has closed before it writes a batch into the connection, and
+  counting what it wrote into a closed one, held by a test double that closes between batches.
+  **Closed by SPEC-093** (2026-11-20): a TCP round replaces a held connection that is not open
+  before its first frame, makes every frame written since the last open check `UNKNOWN` when a
+  later write raises or the end check reads a reset, and ends waiting up to 0.25 s for the peer to
+  acknowledge what it wrote (`ack_wait=False` keeps the checks without the wait). Each such group is
+  counted once in `failed` and announced on one line, `SocketTransport, written to a connection its
+  peer closed; may have landed, not retried`, never resent. `probe_socket.py`: before, the counts
+  above, and 49 of 50 received with `failed=0` in Docker `python:3.12-slim` at `97a03f45`; after,
+  at `a44aa37c`, `batch2 received=50/50`, `failed=0` and no line for both sinks under FIN and RST,
+  on macOS and in that image (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`). The residual windows, a reset that reaches the sink after the
+  end check and a round trip longer than the bound, and the wait's cost are in §13. Decision:
+  `docs/decisions/sink-delivery/` (*A TCP socket round counts what it wrote to a connection its
+  peer closed, and waits for the peer's acknowledgement unless told not to*).
+
+- ~~**An AWS batch reply that names no failure is read as full delivery**~~ (2026-11-14 audit, finding
+  14; invariant 2). `_rounds.read_keyed` reads an entry that `Failed` does not name as `ACCEPTED`
+  and never reads `Successful` (`sinks/_rounds.py:262-271`), and `_batch._adjudicate_counted` reads
+  a Kinesis or Firehose reply with no failed count and no coded record as delivered
+  (`sinks/_batch.py:216-217`). `docs/audits/2026-11-14-probes/sinks/probe_sqs.py`, cases G1 and G2,
+  and `sinks/probe_aws_more.py`: a reply listing 7 of each 10 in `Successful` left 6 of 25 SQS
+  messages and 6 of 25 SNS messages missing, and a reply of `{}` left 25 of 25 SQS messages and 25
+  of 25 Kinesis records missing, with nothing counted or written in any of the four. **Bounded by a
+  settled decision:** *A positional response adjudicates all of a chunk or none of it*
+  (`docs/decisions/sink-delivery/`) reads a keyed reply by what `Failed` names, real AWS names every
+  entry, and so this needs a proxy, an emulator or a broken mock. What is open is that a reply which
+  is not reply-shaped at all is told apart from success by nothing; the `ElasticsearchSink` item
+  above is the same shape for `_bulk`. ~~**Closed by** deciding whether a reply that carries
+  neither `Failed` nor `Successful`, or neither a count nor records, is unadjudicated, and holding
+  the answer in the conformance corpus.~~ **Decided by Andrew on 2026-11-15.** Asked whether a
+  reply that names no failure should read as delivered, he answered 'Unadjudicated (Recommended)':
+  every event the reply does not name is `UNKNOWN`, counted in `failed` and
+  `dropped_unadjudicated`, announced once as one that may have landed, and never resent. **Closed
+  by** SPEC-093 building that reading, which turns the `reply-without-verdict` rows of
+  `tests/test_conformance.py` green.
+  **Closed by SPEC-093** (2026-11-20): an SQS or SNS reply with neither `Failed` nor `Successful`,
+  and a Kinesis or Firehose reply with no failed count and no record array, adjudicate none of
+  their chunk, and in a keyed reply that lists `Successful` an entry named in neither list is
+  `UNKNOWN`; each such entry is counted in `failed` and on `dropped_unadjudicated` (a sub-count of
+  `failed` on `SQSSink` and `SNSSink`, outside it on `KinesisSink` and `FirehoseSink`) and announced
+  as one that may have landed, never resent. A `Failed`-only reply reads as before. The `_bulk`
+  object with neither `errors` nor `items` takes the same reading. Before, the counts above; after,
+  at `a44aa37c`, `probe_sqs.py` G1 read `failed=6`, `uncounted_missing=0` and G2 `failed=25`,
+  `uncounted_missing=0`, its lines ending `may have landed, not retried`, and `probe_aws_more.py`
+  read `failed=25` with one line for the Kinesis `{}` and `failed=6` for SNS (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`). The
+  `no-verdict-shape` rows of the seven sinks read green and the `reply-without-verdict` and
+  `bulk-without-errors` pins are gone. Decision: `docs/decisions/sink-delivery/` (*A batch reply
+  that names no event adjudicates none of it*).
+
+- ~~**`SentrySink`'s SDK backend counts an event the SDK discarded as sent**~~ (2026-11-14 audit,
+  finding 11; invariant 2). `SentrySink._capture` ignores what `capture_event` returns
+  (`sinks/sentry.py:448-458`), so by the sinks frame's reading sampling, `before_send`, a rate limit
+  and the SDK's bounded queue all read as delivery.
+  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, case 5: with a stand-in SDK keeping 1 event
+  in 5, `sent` read 25 and `losses()` read nothing lost while 5 were kept. The class documents
+  `sent` as "Events captured or sent to Sentry" (`:84`). The audit used a stand-in and did not read
+  what the real SDK returns for an event it discards. **Closed by** reading the installed SDK for
+  what it reports about a discarded event and counting on that, or, if it reports nothing, by
+  `sent`'s docstring saying what the count does not prove.
+  **Closed by SPEC-093** (2026-11-20), on Andrew's answer of 2026-11-15, "Dropped, with a line
+  (Recommended)": the SDK documents `capture_event` as returning `None` for an event it discarded,
+  and the sink now counts such an event in `discarded`, reported as `losses().dropped`, with one
+  line per `emit`, `SentrySink, discarded by the Sentry SDK at capture`. Sampling and `before_send`
+  drops count too, since both return `None`. A batch with a discard returns. What the SDK loses
+  after returning an id stays the `sdk-transport-drop` departure. `probe_misc.py` case 5: before,
+  `sent` 25 and nothing lost while 5 were kept; after, at `a44aa37c`, `sink.sent=5`,
+  `losses: failed=0 dropped=20` and one line (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`). Decision: `docs/decisions/sink-delivery/`
+  (*An event the Sentry SDK discards at capture is counted as dropped, with a line*).
+
+- ~~**`RabbitMQSink` publishes without confirms, so an unroutable message or one written to a dead
+  socket reads as accepted**~~ (2026-11-14 audit, the sinks frame's unranked item, read and not run;
+  invariant 2). `basic_publish` returning is the verdict (`sinks/rabbitmq.py:429`), with neither
+  publisher confirms nor `mandatory`, and the class docstring says that "written" is not
+  "acknowledged" (`:60-62`). There is no probe, because no driver extra was installed for the audit.
+  **Closed by** publisher confirms, measured against a real broker by the integration suite, with a
+  decision on whether they are the default.
+  **Closed by SPEC-093** (2026-11-20), on Andrew's answer of 2026-11-15, "Off, opt in":
+  `RabbitMQSink(confirm=True)` puts each channel it opens in confirm mode and passes `mandatory`, so
+  a returned publish is `ACCEPTED`, `UnroutableError` and `NackError` are `REJECTED`, and a
+  connection lost before the confirm is `UNKNOWN`, counted and never resent; an owned connection is
+  probed before each round. The default, `confirm=False`, still publishes unconfirmed, and its
+  `peer-closed` rows are the corpus's `publish-unconfirmed` departure; a borrowed confirmed
+  connection is not probed, the `confirm-borrowed-unprobed` departure. Before, there was no probe;
+  after, `tests/integration/test_rabbitmq.py` against the compose broker, run by hand at
+  `1b562822`, passed `test_a_confirmed_sink_delivers_a_batch` and
+  `test_an_unroutable_confirmed_publish_is_rejected_and_counted`, and the second went red ("DID NOT
+  RAISE SinkDeliveryError") with `mandatory` removed from the publish (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`). **Owed:** the same
+  tests green on the pull request's own `integration.yml` run. Decision:
+  `docs/decisions/sink-delivery/` (*`RabbitMQSink` asks the broker to confirm only when told to,
+  and a lost confirm is unknown*).
+
+- ~~**`KafkaSink` and `GooglePubSubSink` give their verdict when the client queues a message, not when
+  the broker answers**~~ (2026-11-14 audit, finding 12; invariant 7's observable). `KafkaSink.emit`
+  returns once `produce()` has queued each message (`sinks/kafka.py:312-318`), and its `flush`
+  raises only for messages still queued (`:431-436`).
+  `docs/audits/2026-11-14-probes/sinks/probe_misc.py`, case 3: with every delivery report an error,
+  0 of 25 landed and `health().sink.failed` read 25 with 25 lines, so the loss is counted, yet
+  `flush()` returned `ok=True` and `failed_batches` stayed 0. Case 4: with the client's queue full
+  after 10 of 25, the other 15 were counted `dropped` and never retried, although a full queue is
+  the transient case. `GooglePubSubSink` has the same shape by reading (`sinks/pubsub.py:268-275`)
+  and was not run. A truthy `flush()` over a counted loss stands here on the same divided record as
+  for the engine sinks, and on the same answer: on 2026-11-15 Andrew chose "Keep truthy, add
+  counts", closure (b) of the `flush()` item above, so `flush()` stays truthy here as well.
+  ~~**Closed by** the choice the `flush()` item above puts to Andrew, which covers this case with
+  the engine's and names what each option reverses, and by a decision on whether a full client
+  queue is retried.~~ ~~**Closed by** the spec that adds the loss counts to `FlushResult`, once it
+  states whether a loss a sink counts after `emit` has returned, as a failed delivery report is
+  here, is among those counts, and by a decision on whether a full client queue is retried.~~
+  SPEC-089 added those counts (2026-11-16) and states that such a loss is **in none of them**:
+  the event ledger ends where `emit` returns, so a failed delivery report counted afterwards
+  shows in `health().sink` and nowhere on a `flush()` result, whose counts read zero over it.
+  ~~**Closed by** the acknowledgement fix for these two sinks (SPEC-094), which has a round wait
+  for the client's report, and by a decision on whether a full client queue is retried.~~
+  **Decided by Andrew on 2026-11-15 and 2026-11-16.** Asked whether the verdict may come before
+  the client's report, he answered 'Wait for the report (Recommended)': each batch's `emit` waits
+  for the client's delivery reports within the sink's existing timeout, as core NATS confirms.
+  Asked what a truthy `flush()` then means, he answered 'Truthy, counted (Recommended)': every
+  event was acknowledged or counted. **Closed by** SPEC-094 building that, which turns the
+  `verdict-before-refusal` and `verdict-before-indefinite-report` rows of
+  `tests/test_conformance.py` green, and by a decision on whether a full client queue is retried.
+  **Its verdict half is closed by SPEC-094** (2026-11-20): `KafkaSink` and `GooglePubSubSink` are
+  delivery-engine sinks whose round hands every message to the client and then waits, within
+  `flush_timeout` or `overflow_timeout` and until the stop signal, for the reports on that round's
+  messages; a definitive refusal is `REJECTED` and fails a batch of nothing else, every other report
+  and no report is `UNKNOWN`, counted and announced once by the round, and nothing is counted after
+  the verdict. `probe_misc.py` case 3, through the worker: before, `flush()=True`,
+  `failed_batches=0` and `failed=25` with 25 lines, counted after the verdict; after, at
+  `a44aa37c`, `flush()=True`, `failed_batches=0`, `failed=25` and one line, counted by the round
+  (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`). The `verdict-before-refusal` and `verdict-before-indefinite-report` pins are gone. Its
+  remaining clause, whether a full client queue is retried, is the open item *Whether a full
+  client queue is retried*. Decision: `docs/decisions/sink-delivery/` (*A client-buffered sink's
+  round waits for its delivery reports, and a truthy `flush()` means every event was acknowledged or
+  counted*).
+
+- ~~**`GooglePubSubSink.close()`'s bound does not cover an unboundable future**~~ (SPEC-048 FR-004).
+  A future whose `result()` takes no `timeout` is resolved unbounded, because that is the only wait
+  it accepts and SPEC-036 measured that counting it instead invents loss on publishes that were
+  going to succeed. A client handing out futures that are both unboundable *and* slow therefore
+  holds `close()` for its own deadline, once per future: measured 27.0 s for nine against a 3 s
+  stand-in, where the bounded path took 2.0 s for sixty. Strictly better than before SPEC-048,
+  where **every** future took that path, and unreachable through `google-cloud-pubsub`'s own
+  future, which accepts a timeout — but `client=` is a frozen public parameter. **Closed by**
+  resolving them on a joinable thread, which bounds the close at the cost of a thread that may
+  outlive it; waiting on a future is a read and causes no delivery, so SPEC-036's rule forbids
+  *counting* them, not abandoning the wait.
+  **Closed by SPEC-094** (2026-11-20): `GooglePubSubSink` is a delivery-engine sink whose round
+  waits on its own futures under `overflow_timeout`, so ~~nothing is outstanding for `close()` to
+  resolve, and `close()` now only marks the sink closed~~ nothing awaits a verdict at `close()`,
+  which marks the sink closed and waits, up to `overflow_timeout` and counting nothing, on the
+  futures its rounds left `UNKNOWN` (*corrected 2026-11-22*, Andrew's "Wait at close
+  (Recommended)"). A future whose `result()` takes no `timeout` is `UNKNOWN` in its round at
+  once, counted in `failed` and announced as one that may have landed, and never waited on at
+  all, at `close()` included. Decision: `docs/decisions/sink-delivery/` (*A
+  client-buffered sink's round waits for its delivery reports*).
+
 - ~~**A `NATSSink` whose abandoned-publish latch is armed refuses every round of the worker's at
   once, so a stall a little longer than one `publish_timeout` loses every batch the drain makes
   during it, and at the stop the whole backlog**~~ (found by SPEC-102's spec reviewer, 2026-11-17,
@@ -3815,7 +3973,11 @@ and a third copy is a fork with no merge.
   until killed. Daemon alone loses the opposite case: a close that is slow but *succeeding* is
   killed at exit, and for a sink whose `close()` **is** its delivery (`KafkaSink.close()` flushes
   the producer) that is its whole buffer — measured, the same swap kept those events under a
-  non-daemon thread and lost them under a daemon.
+  non-daemon thread and lost them under a daemon. *Corrected 2026-11-20 (SPEC-094):* a
+  `KafkaSink` round now waits for its own delivery reports before its verdict, so what its close
+  still flushes is only the messages a round left `UNKNOWN` when its wait ended, already counted
+  as may-have-landed; a close killed at exit loses their remaining chance to land, not uncounted
+  events.
 
   So the flag is not the mechanism; **the capped grace is.** `shutdown()` drains and closes the
   live sink, then joins any outstanding closer for `DEFAULT_CLOSER_GRACE`, carved from its own
@@ -3941,8 +4103,15 @@ and a third copy is a fork with no merge.
   reach.
 
   - **A third-party client that buffers across `emit`.** `KafkaSink`'s producer holds a local
-    batch and `GooglePubSubSink` holds unresolved futures, so a fork mid-batch there can still
-    duplicate what the parent had queued or strand it in a child that never resolves it. This is
+    batch and ~~`GooglePubSubSink` holds unresolved futures~~ the publisher client behind
+    `GooglePubSubSink` holds its own batches, so a fork mid-batch there can still
+    duplicate what the parent had queued or strand it in a child that never resolves it.
+    *Corrected 2026-11-20 (SPEC-094):* the sink itself holds no future awaiting a verdict between
+    emits, since each round waits on its own (*corrected 2026-11-22:* it keeps the ones a round
+    left `UNKNOWN` for `close()` to wait on, and a child never waits on the parent's: the library
+    never closes an inherited sink that has no `reacquire_after_fork()`, and a caller's own
+    `close()` in the child drops a list kept under another pid, so it returns at once); what the client still holds is publishes a round handed over and
+    stopped waiting on, already counted as may-have-landed, or a round in flight at the fork. This is
     a *different* hazard from the shared handle below — that one is the caller's object, this is
     a buffer nobody in this process can address — and the `reacquire_after_fork()` hook
     cannot help, because there is no descriptor to redirect.
@@ -4132,7 +4301,15 @@ and a third copy is a fork with no merge.
   `GooglePubSubSink` and `NATSSink` — while `SQLiteSink` and `PostgresSink` do not, because both
   commit inside `emit`, so nothing is outstanding once one returns and the commit in their `close`
   is belt and braces rather than a buffer. That qualifies what this roster measured from the close
-  bodies alone. Its own population sweep then found three more: `SentrySink`, `LoggingSink`, and
+  bodies alone. *Corrected 2026-11-20 (SPEC-094):* both sinks now wait, each round, for the
+  client's reports on that round's messages, so a refused `KafkaSink` close leaves undelivered only
+  messages a round already counted as may-have-landed, and ~~`GooglePubSubSink.close()` only marks
+  the sink closed, so refusing it costs nothing~~ `GooglePubSubSink.close()` marks the sink closed
+  and waits, up to `overflow_timeout`, on the publishes its rounds left unconfirmed, so refusing it
+  costs only sends a round already counted as may-have-landed (*corrected 2026-11-22*, Andrew's
+  "Wait at close (Recommended)"). Of their flush-without-release hooks, `KafkaSink`'s
+  serves pending reports with `flush(0)` and returns, and `GooglePubSubSink`'s has no verdict outstanding
+  to wait for and only refuses when the sink is closed. Its own population sweep then found three more: `SentrySink`, `LoggingSink`, and
   the three wrapper sinks, which forwarded no flush at all.
 
 - **The bounded ownership record leaves nine residuals** (SPEC-081). The record pins a sink
@@ -4410,10 +4587,109 @@ and a third copy is a fork with no merge.
   (SPEC-083)
 - **A UDP datagram is fire-and-forget: a `sendto` that returned is all `SyslogSink` and
   `LogstashSink` can know.** With no listener, every datagram is lost and nothing is counted,
-  which §12's finding-1 item already calls inherent to UDP. (SPEC-092)
+  which §12's finding-1 item, resolved by SPEC-093 for TCP only, calls inherent to UDP. (SPEC-092)
 - **A caller's callable that keeps events and then raises has them resent.** `CallbackSink` (and a
   wrapper over it) cannot see what the callable kept; its raise tells the worker that nothing
   landed (invariant 7), and the worker resends the batch whole. (SPEC-092)
+- **A TCP peer that acknowledges a round's frames and then resets, after the end-of-round check,
+  leaves them reported delivered.** The peer's kernel acknowledged the frames and the peer then
+  closed with them unread, so the end check read the acknowledgement and the round settled them
+  `ACCEPTED`; under delay this includes a reset sent just before the check and still in flight. In
+  SPEC-093's close corpus (`docs/audits/2026-11-14-probes/sinks/spec093_close_corpus.py`, on its
+  prototype at `97a03f45`) the reset-after-the-end-check row's first round went uncounted in every
+  run, on macOS and on Linux, on loopback and under 1 ms and 10 ms of delay. A round trip longer than
+  `_RESET_WAIT` opens the same window, since the check returns before the answer. Its size is what
+  the peer's kernel acknowledged and its reader had not taken, at most the peer's receive buffer:
+  on an idle loopback connection at default sizes, 817 frames of 157 bytes on Linux and 1,220 to
+  1,227 on macOS, and up to about 6 MB on Linux and 4 MB on macOS under receive autotuning. The next
+  round's check reads the reset and replaces the connection, and does not count the previous round's
+  frames: that run already settled them, and SPEC-088's ledger has every event leave through one term
+  only, so a later count would put them in `delivered` and in `sink_lost` both. Decision:
+  `docs/decisions/sink-delivery/` (*A TCP socket round counts what it wrote to a connection its peer
+  closed, and waits for the peer's acknowledgement unless told not to*). (SPEC-093)
+- **Every TCP round waits for the peer to acknowledge its last frame, up to 0.25 s.** A peer that
+  closed before the frames reached it answers with a reset and never an acknowledgement, so the end
+  check waits for one or the other. A Logstash or syslog collector never writes back, so it
+  acknowledges on its delayed-acknowledgement timer, which Linux starts at 40 ms and lets grow to
+  200 ms. The close corpus's clean round took a median of 0.5 ms on macOS and 0.6 ms on Linux
+  loopback, 7.9 ms with 1 ms of delay each way and 44.2 ms with 10 ms, the rest over the round trip
+  being that timer (on SPEC-093's prototype at `97a03f45`). A peer that neither acknowledges nor
+  resets, such as one whose host vanished, costs every round the whole 0.25 s. Where `_unacked`
+  cannot read the send queue, Windows among them, the check does not wait, and a reset still in
+  flight at the check goes uncounted; `ack_wait=False` makes every platform behave so, and the
+  corpus measured what that gives up: the FIN-after-the-pre-check rows, the reset-before-the-end-check
+  row and the reset-after-the-end-check row's second round silent under 10 ms of delay, and the
+  FIN-after-the-pre-check and reset-before-the-end-check rows silent in some runs on macOS loopback. The 0.25 s bound was decided in session, not by Andrew:
+  it covers a 50 ms round trip under Linux's longest delayed acknowledgement, and a longer one would
+  close more of the window above at that much more cost a round against a silent peer. (SPEC-093)
+- **A FIN alone is not read as a loss, because it is also a legal half-close.** A peer that shuts
+  down its write side and goes on reading receives every frame, so a check that counted a FIN would
+  report delivered frames as may-have-landed: under such a check `halfclose.py` read `failed=60` for
+  60 frames that all arrived (SPEC-093's authoring measurement; the script is not in the tree, so
+  it cannot be re-run here, and the `half-close-3-rounds` row of `tests/test_socket_close_corpus.py`
+  holds the behaviour in CI). The close corpus's half-close and FIN-after-reading rows, in which
+  every frame arrived after a FIN, read silent under the specified rule in every run. A false count
+  is the safe direction for a may-have-landed line, but a half-closing collector would draw one on
+  every batch. A reset, read through `SO_ERROR` or a peek that raises, is what shows the peer
+  discarded data; a held connection that reads as a FIN is replaced before the next round instead.
+  (SPEC-093)
+- **A confirmed `RabbitMQSink` publish costs a broker round trip.** A blocking channel cannot
+  pipeline confirms, so `confirm=True` waits for each message's confirm before the next. With a
+  fake channel that sleeps one round trip per confirmed publish,
+  `docs/audits/2026-11-14-probes/sinks/spec093_rabbitmq_confirm_cost.py` measured one `emit` of 1,000
+  events at 0.25 s with a 0.2 ms round trip, 1.12 s with 1 ms and 5.42 s with 5 ms, against 2 to
+  14 ms unconfirmed, about 4,000, 900 and 180 events a second. At 5 ms one 1,000-event batch outlasts
+  `log_foundry.flush()`'s 5 s default. That is why confirms are opt-in, Andrew's "Off, opt in" of
+  2026-11-15. (SPEC-093)
+- **A confirm wait is bounded only by the connection.** pika's confirm wait has no timeout of its
+  own: it ends with the confirm, or when the connection closes, on its heartbeat, on
+  `blocked_connection_timeout` (30 s by default for an owned connection) or on a socket error. A
+  connection lost there makes the publish `UNKNOWN`. It is an instance of invariant 3's sink blocked
+  inside a network call. (SPEC-093)
+- **A client-buffered sink's batch costs a broker round trip.** `KafkaSink` and `GooglePubSubSink`
+  wait for their round's reports before the verdict. With a fake client that acknowledges each
+  message a set time after the hand-off, `docs/audits/2026-11-14-probes/sinks/spec094_report_wait_cost.py`
+  measured the median `emit` on SPEC-094's prototype: at a 5 ms acknowledgement, 5.17 ms for 10
+  events and 8.05 ms for 1,000 to Kafka, and 6.30 ms and 8.02 ms to Pub/Sub, against about 0.02 ms
+  and 1.2 to 1.4 ms without the wait at `97a03f45`. Against the Kafka 3.9.1 image the integration
+  suite pins, with confluent-kafka's bundled librdkafka 2.16.0, a `deliver` of ten messages took
+  0.4 to 4.5 ms whatever `linger.ms` was, at 5, 100, 1,000 and 3,000 ms, because each pass of the
+  wait holds librdkafka's flushing mark, under which queued messages go at once. Under a backlog
+  SPEC-090's batching raises the batch size toward its cap of 1,000, where the round trip costs
+  least per event. (SPEC-094)
+- **With one Kafka partition stuck, each later `KafkaSink` round pays one 50 ms slice.** The round
+  asks in slices of `flush(0.05)`, which returns early only once the producer's queue is empty, so
+  with one message stuck every later round's last pass runs its full slice. `spec094_stuck_partition.py`,
+  one message never reported and `flush_timeout=0.5`, at `a44aa37c`: the first `emit` 0.51 s and the
+  next three 0.06, 0.05 and 0.06 s, the stuck message counted once; with the round making one
+  blocking `flush(flush_timeout)` instead, every `emit` took 0.50 to 0.51 s (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`). Only the stuck partition's
+  own messages wait the timeout. (SPEC-094)
+- **Against a broker that never answers, a `KafkaSink` or `GooglePubSubSink` batch holds the drain
+  thread for the sink's timeout, and an orphan log holds the caller's thread for it.** Each round
+  waits up to `flush_timeout` (10 s by default) or `overflow_timeout` (30 s by default) for its
+  reports and then counts its messages `UNKNOWN`. On SPEC-094's prototype, with a 0.5 s timeout and
+  a client that never reports, one `emit` took 500.3 ms for `KafkaSink` and 502.9 ms for
+  `GooglePubSubSink`, against 0.02 ms before, and an `info()` outside any span held the caller's
+  thread for 0.50 s, invariant 4's recorded exception. A shutdown's stop signal cuts the wait after
+  its first 50 ms slice. (SPEC-094)
+- **A `KafkaSink` with `delivery.report.only.error` and a stuck partition reads its unreported
+  successes as `UNKNOWN`.** Such a producer sends no report for a success, so a round reads an
+  unreported message as `ACCEPTED` only once the producer's queue reads empty. With another message
+  stuck the queue never reads empty, so the round waits its timeout and counts its unreported
+  messages as may-have-landed, although they landed. (SPEC-094)
+- **On the exit drain a round waits one slice for its reports.** The stop signal is set for the whole
+  exit drain, so each `KafkaSink` or `GooglePubSubSink` round takes every report that arrives in its
+  first 50 ms and reads the rest `UNKNOWN`; against a slower broker the exit batches are counted as
+  may-have-landed, and `close()`'s own bounded flush still gives Kafka's a chance to land, as
+  `GooglePubSubSink.close()`'s wait of up to `overflow_timeout` on them, not cut short by the stop,
+  gives Pub/Sub's (*corrected 2026-11-22*, Andrew's "Wait at close (Recommended)"). The stop
+  is set before `shutdown()` joins the drain thread, so a round already waiting ends within one
+  slice; a join that expires while a round waits, which needs a round started before the stop and a
+  join budget under one slice, leaves the sink open with the worker's `shutdown timed out … the sink
+  is left open because the worker thread is still using it` line, as for any sink still in use.
+  Since SPEC-098 the signal is the sink's own and stays set after the `shutdown()` until a
+  `configure()` installs the sink again, so a round delivered in that window waits one slice as
+  well (*added 2026-11-22*, on the rebase onto SPEC-098). (SPEC-094)
 
 ---
 

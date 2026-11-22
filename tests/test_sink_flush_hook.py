@@ -330,107 +330,27 @@ def test_the_logging_sink_flushes_its_handler_chain() -> None:
     assert stream.getvalue() != "", "the handler chain was never flushed"
 
 
-def test_pubsub_raises_when_a_publish_is_still_in_flight() -> None:
-    """AC-4 for the sink the FR names. This survived the whole suite as a mutant.
+def test_pubsub_has_nothing_in_flight_to_flush() -> None:
+    """SPEC-094 FR-002: each round waited on its own futures, so the hook returns without raising.
 
-    An unresolved future is a client buffer that did not go out; returning normally over it is the
-    exact "sink the worker believes" the FR exists to remove.
+    1.x resolved a pending list here and raised for a publish still in flight; that list is gone,
+    since no verdict is outstanding between emits, and the hook only refuses once the sink is closed.
     """
+    from log_foundry.sinks.base import SinkDeliveryError
     from log_foundry.sinks.pubsub import GooglePubSubSink
 
-    class NeverSettles:
-        def done(self) -> bool:
-            return False
-
-        def result(self, timeout: float | None = None) -> None:
-            raise TimeoutError("still in flight")
-
     sink = GooglePubSubSink("projects/p/topics/t", client=object(), overflow_timeout=0.05)
-    sink._futures.append(NeverSettles())
-
+    sink.flush()
+    sink.close()
     try:
         sink.flush()
-    except Exception as exc:
-        assert "in flight" in str(exc), f"the failure must name what happened: {exc}"
+    except SinkDeliveryError as exc:
+        assert "cannot flush: the sink is closed" in str(exc), exc
     else:  # pragma: no cover - the assertion below reports it
-        raise AssertionError("a publish still in flight must not read as a successful flush")
-
-    assert sink._futures, "and the future is put back, not dropped — the sink is still open"
+        raise AssertionError("a closed sink's flush must refuse")
 
 
 # --- behaviour that was load-bearing and unasserted, each found by a surviving mutant -------
-
-
-def test_pubsub_keeps_an_unwaitable_future_instead_of_abandoning_the_list() -> None:
-    """`_Unboundable` must be caught, or the whole swapped-out list is referenced by nothing.
-
-    A future whose `result()` takes no `timeout` cannot be waited on within one — reachable
-    through an injected `client=`. `flush()` has already swapped `pending` out of `self._futures`,
-    so letting it escape abandons every future in the list: never resolved, never counted, never
-    reported. Measured with the catch removed: 0 futures still held, against 2 with it.
-    """
-    from log_foundry.sinks.pubsub import GooglePubSubSink
-
-    class Unwaitable:
-        """`result()` takes no timeout, which is what `_Unboundable` exists to describe."""
-
-        def done(self) -> bool:
-            return False
-
-        def result(self) -> None:
-            return None
-
-    sink = GooglePubSubSink("projects/p/topics/t", client=object(), overflow_timeout=0.05)
-    sink._futures.extend([Unwaitable(), Unwaitable()])
-
-    try:
-        sink.flush()
-    except Exception as exc:
-        assert type(exc).__name__ == "SinkDeliveryError", (
-            f"an unwaitable future must be reported, not propagated raw: {type(exc).__name__}"
-        )
-    else:  # pragma: no cover - reported below
-        raise AssertionError("futures still in flight must not read as a successful flush")
-
-    assert len(sink._futures) == 2, (
-        "both futures must be put back — the list was swapped out, so nothing else holds them"
-    )
-
-
-def test_pubsub_bounds_the_whole_list_on_one_deadline() -> None:
-    """The whole list is bounded by one `overflow_timeout`, not `n` of them.
-
-    What this pins is the **bound**, not the line that implements it, and the distinction is
-    worth writing down: moving `deadline` inside the loop does *not* break it, because the first
-    future to exhaust the deadline extends the remainder into `unresolved` and breaks. Measured
-    both ways at 0.21 s for ten futures. So the property survives that edit, and the test says so
-    rather than claiming a mutant it does not kill.
-    """
-    import time
-
-    from log_foundry.sinks.pubsub import GooglePubSubSink
-
-    class NeverSettles:
-        def done(self) -> bool:
-            return False
-
-        def result(self, timeout: float | None = None) -> None:
-            raise TimeoutError("still in flight")
-
-    sink = GooglePubSubSink("projects/p/topics/t", client=object(), overflow_timeout=0.2)
-    sink._futures.extend(NeverSettles() for _ in range(10))
-
-    began = time.monotonic()
-    try:
-        sink.flush()
-    except Exception:
-        pass
-    elapsed = time.monotonic() - began
-
-    assert elapsed < 1.0, (
-        f"ten futures took {elapsed:.2f}s against a 0.2s bound — the deadline is per future, "
-        "which is not a bound at all"
-    )
 
 
 def test_the_logging_sink_flushes_handlers_on_an_ancestor_logger() -> None:

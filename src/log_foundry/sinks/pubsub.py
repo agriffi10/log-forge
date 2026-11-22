@@ -2,44 +2,58 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from log_foundry import _diag
-from log_foundry.sinks._deferral import Deferral
-from log_foundry.sinks._encode import encode_events
+from log_foundry.sinks import _engine
+from log_foundry.sinks._classify import driver_classes
+from log_foundry.sinks._encode import encode_round
+from log_foundry.sinks._engine import When, emit_via_deliver, run_context
 from log_foundry.sinks._extras import import_extra
 from log_foundry.sinks._refusal import final_refusal
-from log_foundry.sinks._retry import floor_count, usable_timeout, wait
-from log_foundry.sinks.base import SinkDeliveryError, SinkLosses
+from log_foundry.sinks._retry import floor_count, pause_on, usable_timeout, wait
+from log_foundry.sinks._rounds import Lost, mark_sent, raised_line
+from log_foundry.sinks.verdict import Outcome, SinkCounters, Verdict
+
+if TYPE_CHECKING:
+    from log_foundry.sinks.base import SinkLosses
 
 __all__ = ["GooglePubSubSink"]
 
 
-class _Unboundable(Exception):
-    """A future whose ``result()`` takes no ``timeout``, so no bounded wait on it is possible.
+def _announce_each(prefix: str, kinds: list[str]) -> None:
+    """Writes one ``lost 1 event(s)`` line per entry, ``<prefix>, <kind>``.
 
-    Raised rather than folded into :meth:`GooglePubSubSink._resolve`'s ``False`` because the two
-    need different answers: ``False`` means "not settled yet, wait the rest of the slice and try
-    again", while this means "trying again can only fail the same way". Conflating them spun the
-    slice loop at full speed until the deadline — measured at 3.5 million ``result()`` calls and
-    a pegged core for one second, which is thirty at the shipped default.
+    Args:
+      prefix: The line's sink and step.
+      kinds: Each event's type name.
+
+    Returns:
+      None.
+
+    Raises:
+      None.
     """
+    for kind in kinds:
+        _diag.lost("event", 1, f"{prefix}, {kind}")
+
 
 DEFAULT_OVERFLOW_TIMEOUT = 30.0
-"""Seconds one ``emit`` waits on an over-bound publish before putting it back (FR-004 AC-2).
+"""Seconds one round waits on its publish futures, under one deadline (SPEC-094 FR-002).
 
-Thirty matches ``DEFAULT_MAX_RETRY_AFTER``: it is long enough that an ordinary publish settles
-inside it, and short enough that the single drain thread is never held past what
-``shutdown()``'s own budget allows. It bounds the **whole** overflow pass of one ``emit``, not
-each future in it — per-future it would be thirty seconds times however many futures are over
-the limit, which is not a bound at all.
+Thirty matches ``DEFAULT_MAX_RETRY_AFTER``: long enough that an ordinary publish settles inside
+it. It bounds the **whole** wait of one round, not each future in it, which would be thirty
+seconds times the batch. It equals ``DEFAULT_SHUTDOWN_TIMEOUT``, and the stop signal is what keeps
+a shutdown from waiting it out: once the round's first slice has passed, a set stop ends the wait.
 """
 
 _POLL_INTERVAL = 0.05
-"""Longest single wait on one future, so a shutdown is noticed within it (SPEC-027).
+"""Longest single wait on one future, and the round's first slice (SPEC-027, SPEC-094).
 
 The deadline bounds the *total*, but a client honouring a 30-second timeout on one future
 blocks for all thirty regardless — measured, a shutdown 0.05 s into an emit went unnoticed for
@@ -47,12 +61,14 @@ blocks for all thirty regardless — measured, a shutdown 0.05 s into an emit we
 "interruptible" half of SPEC-027's rule; the deadline is the "bounded" half.
 """
 
-DEFAULT_MAX_PENDING = 1000
-"""Outstanding publish futures one sink will hold before it waits (FR-004 AC-2).
+_TAKES_NO_TIMEOUT = "a future that takes no timeout"
+"""The reading of a future whose ``result`` refuses ``timeout=``, which ``close()`` never waits on."""
 
-Roughly one drain interval's worth at the default batch size: large enough that ordinary
-publishing never serializes on it, and small enough to bound memory at a constant rather than at
-the number of events the process has ever logged.
+DEFAULT_MAX_PENDING = 1000
+"""``max_pending``'s default, kept as 1.x surface; since SPEC-094 it bounds nothing.
+
+Each round gives every future its verdict before it returns, so none awaits one between emits
+for a bound to hold; the ones it left ``UNKNOWN`` are kept only for ``close()`` to wait on.
 """
 
 
@@ -60,55 +76,52 @@ class GooglePubSubSink:
     """A :class:`~log_foundry.sinks.base.Sink` that publishes events to a Pub/Sub topic.
 
     This is a durable-buffer sink on ``google-cloud-pubsub``, the optional ``gcp-pubsub`` extra,
-    imported lazily. ``publish()`` returns a future that resolves asynchronously, so the sink
-    accumulates the batch's futures and resolves them on :meth:`close`.
+    imported lazily. ``publish()`` returns a future that resolves asynchronously.
+
+    **It waits for the report (SPEC-094 FR-002; Andrew's decision B, 2026-11-15, and "Truthy,
+    counted", 2026-11-16).** It is a delivery-engine sink: each round publishes every remaining
+    event, then waits on that round's futures under one deadline, ``overflow_timeout``, in
+    slices of :data:`_POLL_INTERVAL`, until the stop signal once the first slice has passed. A
+    result is ``ACCEPTED``. ``InvalidArgument``, a request the server refuses whole and the
+    publish retry does not retry, and ``FlowControlLimitError``, set on a future the client never
+    sent, are ``REJECTED``, so a batch of nothing else fails and ``flush()`` reads false. Any other
+    exception, ``PermissionDenied``, ``NotFound`` and ``DeadlineExceeded`` among them, since the
+    publish retry can end in one after an attempt the server kept, and no result by the deadline
+    or the stop, is ``UNKNOWN``, counted in ``failed`` with one may-have-landed line and never
+    sent again. Nothing is counted after a batch's verdict, and ``flush()`` has nothing to
+    resolve. **``close()`` waits for the unconfirmed** (Andrew's "Wait at close (Recommended)",
+    2026-11-22): the futures a round left ``UNKNOWN`` are kept, and ``close()`` waits on them up to
+    ``overflow_timeout``, not cut short by the stop signal, so a publish the client is still
+    sending when the process exits normally lands rather than dying with its daemon thread. That
+    wait counts nothing and writes no line.
 
     **Retry (SPEC-041 FR-004).** The client's own retry is bounded and runs on the client's
-    threads, never the worker's drain thread: the generated ``publish`` carries
-    ``Retry(initial=0.1, maximum=60.0, multiplier=4, deadline=600.0)`` with a 60 s per-call
-    timeout, so a publish gives up after ten minutes at the outside. What this sink contributes
-    is the only wait the drain thread ever takes — :meth:`_await_overflow`'s
-    ``overflow_timeout``, bounded and interruptible per SPEC-027. Measured with the destination
-    stopped and ``overflow_timeout=5.0``: every over-bound emit returned in 5.00 s exactly.
+    threads: the generated ``publish`` carries ``Retry(initial=0.1, maximum=60.0, multiplier=4,
+    deadline=600.0)``. This sink's wait for a round's futures is bounded by ``overflow_timeout``
+    and cut short by a shutdown, per SPEC-027; a publish that raises is read as a refused hand-off,
+    resent by the engine only in a round where nothing was published. An orphan log outside a
+    span holds the caller's thread for the same wait.
 
     The driver requirement satisfied (SPEC-028 FR-002): this sink takes **no** transport lock —
-    the publisher client owns its own batching and threading, and ``publish()`` is a local
-    hand-off. What it does hold is the pending-futures list, which is genuinely shared between
-    ``emit`` (appending) and ``close`` (resolving), so that list has its own small lock and
-    ``close`` swaps it out rather than iterating and clearing. Without the swap, a future
-    appended after the loop passed its index was dropped unresolved: an unconfirmed publish
-    never counted in ``failed`` and never reported by :meth:`losses`, which is precisely the
-    silent loss SPEC-026 exists to end.
-
-    That same loss was reachable from *outside* ``close`` until SPEC-032 FR-001: nothing stopped
-    a later ``emit`` appending to the fresh list, and nothing would ever call ``result()`` on
-    it. The sink now refuses a batch once closed, and the append re-checks under the futures
-    lock, so a publish cannot land on a list the swap has already taken.
-
-    The list was also append-only for the life of the process until SPEC-038 FR-004: memory grew
-    with the total number of events logged, and because ``result()`` ran only at ``close``,
-    ``failed`` stayed at zero and ``health()`` reported clean through an entire Pub/Sub outage.
-    Each ``emit`` now reaps whatever has settled and holds at most ``max_pending`` outstanding
-    **between emits, while the client is resolving**. Two documented exceptions: the reap runs
-    once at the end of a call, so one ``emit`` of 6,000 events peaks at 5,999 futures before it
-    trims; and against a client resolving nothing at all the list grows by a batch per emit,
-    because :meth:`_await_overflow` puts back what its bounded wait did not outlast rather than
-    discarding it. What the bound rules out is growth with the total number of events a *healthy*
-    process has logged, which is what FR-004 is about.
+    the publisher client owns its own batching and threading.
 
     **This sink keeps its own closed state** rather than the closed guard the other transport
-    sinks share (SPEC-076 FR-005). It is not an engine sink, and its close is deliberately absorbed
-    mid-batch: a publish whose hand-off finds the sink closed is counted under ``_futures_lock``
-    as an orphaned future, and :meth:`close` drains what is pending. That count is its rule for a
-    close that overlaps a call still inside, a documented difference from the guard's wait.
+    sinks share (SPEC-076 FR-005), the sink-delivery decision's declared exception row 3. A
+    publish whose hand-off finds the sink closed, read under ``_futures_lock``, is ``UNKNOWN``
+    with one line and is not waited on; ``close()`` sets the flag, and takes the futures kept
+    for it, in the same lock.
 
     Attributes:
-      max_pending: Outstanding futures held between emits before ``emit`` waits on the oldest.
-      overflow_timeout: Seconds one over-bound publish is waited on before being put back.
-      failed: Publishes the client did not confirm.
-      rejected: Publishes the client refused before any future existed. Counted only when
-        :meth:`emit` returns, so only when the rest of the batch was published: a batch refused
-        whole raises and is counted where the raise is caught (SPEC-059 FR-003).
+      max_pending: Accepted and validated as 1.x surface; it bounds nothing since SPEC-094.
+      overflow_timeout: Seconds one round waits on its futures, under one deadline.
+      log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
+      log_foundry_stop_signal: The sink's own stop signal, set by every stop and cleared by a
+        ``configure()`` that installs the sink again (SPEC-098), or ``None``.
+      failed: Publishes refused definitively or left unconfirmed, once per run, the engine's
+        ``failed_events``; assignable.
+      rejected: Publishes the client refused before any future existed, beside one that was
+        published, and events that could not be encoded, the engine's ``dropped_events``, counted
+        only when the run settles; assignable.
     """
 
     def __init__(
@@ -124,21 +137,21 @@ class GooglePubSubSink:
         Args:
           topic: The topic to publish to.
           client: A publisher client to borrow, or ``None`` to build one.
-          max_pending: Outstanding futures held before :meth:`emit` waits on the oldest, or
-            ``None`` for :data:`DEFAULT_MAX_PENDING`. Floored at one, since a bound of zero would
-            make every publish synchronous and defeat the client's own batching. A supplied
+          max_pending: Accepted as 1.x surface, or ``None`` for :data:`DEFAULT_MAX_PENDING`. It
+            has no effect since SPEC-094 FR-002, because each round gives every future its verdict
+            before it returns, so none awaits one between emits; it is still validated and floored
+            at one. A supplied
             value that is not an ``int`` is refused with ``TypeError`` (SPEC-066 FR-002), before
             any client is built: ``nan`` raised at every reap and ``2.5`` from the third
             outstanding future on. ``inf``, which used to mean no bound, is refused with them —
             pass a large ``int`` such as ``sys.maxsize`` for that. A ``bool`` or ``int`` subclass
             is read as the ``int`` it holds.
-          overflow_timeout: Seconds to wait on one over-bound publish before putting it back,
-            and since SPEC-048 the bound on ``close()`` too. The wait runs on the worker's single
-            drain thread, so it is bounded by SPEC-027's rule that no sink wait may be unbounded
-            or uninterruptible. **Floored** to :data:`DEFAULT_OVERFLOW_TIMEOUT` when it cannot
+          overflow_timeout: Seconds one round waits on its publish futures, under one deadline
+            (SPEC-094 FR-002). The wait runs on the worker's single drain thread, so it is bounded
+            by SPEC-027's rule that no sink wait may be unbounded or uninterruptible. **Floored** to :data:`DEFAULT_OVERFLOW_TIMEOUT` when it cannot
             bound anything (SPEC-049 FR-002) — ``nan`` made every deadline comparison ``False``,
-            so the loop that bounds ``flush()``, ``close()`` and ``_await_overflow`` had no bound
-            at all, and ``inf`` removed it outright. Floored rather than refused because it is an
+            so the loop that bounded the waits had no bound at all, and ``inf`` removed it
+            outright. Floored rather than refused because it is an
             *existing* argument some of whose degenerate values deliver against a healthy client,
             exactly ``KafkaSink(flush_timeout=)``'s shape, and SPEC-047 floored every one of those
             through :func:`~log_foundry.sinks._retry.usable_timeout`; refusing ``inf`` here while
@@ -162,82 +175,111 @@ class GooglePubSubSink:
         self.client = client
         self.overflow_timeout = usable_timeout(overflow_timeout, DEFAULT_OVERFLOW_TIMEOUT)
         self.log_foundry_stop_signal: threading.Event | None = None
-        self.failed = 0
-        self.rejected = 0
-        self._counter_lock = threading.Lock()
+        self.log_foundry_counters = SinkCounters()
         self._futures_lock = threading.Lock()
-        self._futures: list[Any] = []
         self._closed = False
+        self._unconfirmed: list[Any] = []
+        self._kept_by = os.getpid()
 
-    def losses(self) -> SinkLosses:
-        """Reports refused publishes and futures that resolved to an error (FR-002).
+    @property
+    def _counter_lock(self) -> threading.Lock:
+        """The counters' lock.
 
         Args:
           None.
 
         Returns:
-          The counters. ``failed`` moves as futures settle, which :meth:`emit` reaps on every
-          call (FR-004), so an outage is visible while it is happening rather than only at
-          shutdown. It still lags the publish that caused it by however long the client takes to
-          give up, which is a property of the client's asynchronous publish and not of this
-          accessor. An event :meth:`emit` could not encode is counted in ``rejected`` beside the
-          refusals (SPEC-069 FR-001), as it was when the encode sat inside the publish guard.
+          The lock.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters._counter_lock
+
+    @property
+    def failed(self) -> int:
+        """Publishes refused or unconfirmed, the engine's ``failed_events``.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.failed_events
+
+    @failed.setter
+    def failed(self, value: int) -> None:
+        """Sets the count.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
 
         Raises:
           None.
         """
         with self._counter_lock:
-            return SinkLosses(dropped=self.rejected, failed=self.failed, resent=0)
+            self.log_foundry_counters.failed_events = value
+
+    @property
+    def rejected(self) -> int:
+        """Publishes that never left the process, the engine's ``dropped_events``.
+
+        Args:
+          None.
+
+        Returns:
+          The count.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.dropped_events
+
+    @rejected.setter
+    def rejected(self, value: int) -> None:
+        """Sets the count.
+
+        Args:
+          value: The new count.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
+        with self._counter_lock:
+            self.log_foundry_counters.dropped_events = value
+
+    def losses(self) -> SinkLosses:
+        """Reports the engine's totals (SPEC-094 FR-002).
+
+        Args:
+          None.
+
+        Returns:
+          The counters: ``rejected`` as ``dropped``, a refusal counted and announced only when
+          ``emit`` returns — on the engine, only when the run settles — and ``failed``, each
+          publish refused definitively or left unconfirmed, counted once per run when its round
+          settles, never later.
+
+        Raises:
+          None.
+        """
+        return self.log_foundry_counters.losses()
 
     def emit(self, batch: list[dict[str, object]]) -> None:
-        """Publishes one message per event, then reaps the futures that have settled (FR-008).
+        """Delivers the batch through the engine inline, the 1.x entry point (SPEC-094 FR-002).
 
-        ``publish()`` is a local hand-off returning a future, so a refusal is the only failure
-        this call can observe. It is isolated per event, because letting the first refusal
-        propagate would hand the worker a batch whose earlier events are already in flight, and
-        the retry would duplicate them. The stderr line names which counter moved, since
-        "refused" and "unconfirmed" mean different things.
-
-        A closed sink refuses the batch before touching the client (SPEC-032 FR-001), because
-        nothing will resolve a future appended after :meth:`close` swapped the list out.
-        Refusing moves no counter here: it is a failure reported to the worker, which records it
-        in ``health().failed_batches``, not loss this sink absorbed. The flag is read twice on
-        purpose — once for the batch, and again under ``_futures_lock`` for each append, which
-        is the lock ``close`` swaps under. Without the second read a close landing mid-loop
-        would leave exactly the orphaned future this guard exists to prevent, and the read costs
-        nothing because the append already takes that lock. Only the read happens under it: the
-        counter bump and the stderr line are taken *after* the lock is released, because
-        ``close`` waits on the same lock and a blocked stderr would otherwise hold it — an I/O
-        call inside a transport lock is what SPEC-028's two-lock decision exists to avoid.
-
-        A close that lands mid-batch does **not** raise, even when it catches every event. Each
-        one had ``publish()`` called on it and may well land, so raising would have the worker
-        re-send them and duplicate whatever did — the SPEC-018 rule that only a *provable*
-        non-delivery may be retried. They are counted as unconfirmed instead, which is exactly
-        what they are. That is why the total-failure raise below tests the refusals rather than
-        the successes: "nothing was published" and "nothing was confirmed" are different claims,
-        and only the first is safe to retry.
-
-        The reap runs *before* the total-failure test, so a batch the client refused outright
-        still returns the pending list to its bound on the way out.
-
-        A refusal is counted and announced only when ``emit`` returns, through the deferral
-        helper whose ``with`` encloses the publish loop, :meth:`_reap` and the total-failure
-        raise (SPEC-059 FR-003). When every event was refused the call raises and counts nothing
-        — whoever catches the raise owns the batch, so a batch refused on one attempt and
-        accepted on the next records no loss that never happened — and a refusal followed by a
-        raise from :meth:`_reap` is discarded too. A partial refusal returns, and its count and
-        one line per refused event, each naming that event's own exception type bound as the
-        refusal was decided, land then. The lines are written after the reap, so one can trail
-        its refusal by up to one overflow wait, which ``overflow_timeout`` bounds; writing it
-        earlier would count before the call is known to return. The orphaned-future count above,
-        and the reap's, stay immediate: they are ``failed``, an upper bound this does not defer.
-
-        Every event is encoded before the first publish (SPEC-069 FR-001), through the encode
-        helper into ``rejected``: one that cannot be encoded is counted and announced with **one
-        line per call**, where the encode inside the publish guard wrote one "refused" line per
-        event. A batch of nothing encodable publishes nothing, skips the reap and returns
-        (FR-002), and the total-failure raise compares the refusals with the encodable events.
+        A failed run's events are counted in ``failed`` before it raises, as every engine
+        sink's adapter does.
 
         Args:
           batch: The events to publish.
@@ -246,49 +288,202 @@ class GooglePubSubSink:
           None.
 
         Raises:
-          SinkDeliveryError: When the sink was already closed on entry, or when every event was
-            refused (SPEC-026 FR-001). Either leaves no refusal counted.
+          SinkDeliveryError: When the run failed, the sink is closed on entry among them.
         """
-        if not batch:
-            return
+        emit_via_deliver(self, batch)
+
+    def deliver(self, batch: list[dict[str, object]]) -> Verdict:
+        """Runs one round and reports each event's fate by index (SPEC-094 FR-002).
+
+        Args:
+          batch: The events.
+
+        Returns:
+          The round's verdict.
+
+        Raises:
+          None. A ``publish`` that raises is a refusal and a ``result`` that raises an
+            ``Exception`` is that future's outcome; a ``BaseException`` from the client
+            propagates.
+        """
+        return _engine.one_round(self._round, batch)
+
+    def _round(self, batch: list[dict[str, object]]) -> Verdict:
+        """Publishes every remaining event, then waits for the round's futures.
+
+        A sink closed on entry refuses with 1.x's error. Events are encoded once per run. A
+        publish that raises beside one that was published is ``DROPPED``, counted in ``rejected``
+        and named, ``GooglePubSubSink refused the publish, <Type>``, counted and announced only
+        when ``emit`` returns — on the engine, only when the run settles; in a round where
+        nothing was published, every refused event is ``RETRYABLE`` and the engine resends it. A
+        publish whose hand-off then finds the sink closed is ``UNKNOWN``, ``GooglePubSubSink
+        publish unconfirmed, the sink closed mid-batch``, and is not waited on. Then
+        :meth:`_await_round` reads each future: a definitive refusal ``REJECTED``, one line each,
+        ``GooglePubSubSink publish refused, <Type>``; anything else unsettled ``UNKNOWN``, one
+        line for the round, ``GooglePubSubSink publish unconfirmed (<first Type>); may have
+        landed, not retried``.
+
+        Args:
+          batch: The events this round is offered.
+
+        Returns:
+          A verdict with one outcome per event of ``batch``.
+
+        Raises:
+          None. A ``publish`` that raises is a refusal and a ``result`` that raises an
+            ``Exception`` is that future's outcome; a ``BaseException`` from the client
+            propagates.
+        """
+        context = run_context()
         if self._closed:
-            raise final_refusal(
-                self,
-                f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed"
-            )
-        with Deferral(self) as pending:
-            refused: list[str] = []
-            encoded = encode_events(
-                batch, self._encode, pending, sink=_diag.type_name(self), counter="rejected"
-            )
-            if not encoded:
-                return
-            for _, data in encoded:
-                try:
-                    future = self.client.publish(self.topic, data=data)
-                except Exception as err:
-                    refused.append(_diag.type_name(err))
-                    continue
-                with self._futures_lock:
-                    orphaned = self._closed
-                    if not orphaned:
-                        self._futures.append(future)
-                if orphaned:
-                    with self._counter_lock:
-                        self.failed += 1
-                    _diag.lost(
-                        "event",
-                        1,
-                        "GooglePubSubSink publish unconfirmed, the sink closed mid-batch",
-                    )
-            if refused:
-                pending.count("rejected", len(refused))
-                pending.announce(lambda: self._announce_refused(refused))
-            self._reap()
-            if len(refused) == len(encoded):
-                raise SinkDeliveryError(
-                    f"GooglePubSubSink published none of {len(encoded)} event(s)"
+            context.refuse(
+                final_refusal(
+                    self,
+                    f"GooglePubSubSink published none of {len(batch)} event(s): the sink is closed",
                 )
+            )
+            return Verdict.uniform(Outcome.REJECTED, len(batch))
+        fates = [Outcome.DROPPED] * len(batch)
+        name = _diag.type_name(self)
+        futures: list[tuple[int, Any]] = []
+        refused: list[tuple[int, str]] = []
+        orphaned = 0
+        for position, data in encode_round(self, batch, self._encode, sink=name):
+            mark_sent(self, [batch[position]])
+            try:
+                future = self.client.publish(self.topic, data=data)
+            except Exception as err:
+                refused.append((position, _diag.type_name(err)))
+                continue
+            with self._futures_lock:
+                closed = self._closed
+            if closed:
+                fates[position] = Outcome.UNKNOWN
+                orphaned += 1
+                continue
+            futures.append((position, future))
+        if orphaned:
+            context.announce(
+                lambda: _diag.lost(
+                    "event",
+                    orphaned,
+                    "GooglePubSubSink publish unconfirmed, the sink closed mid-batch",
+                ),
+                when=When.ALWAYS,
+            )
+        lost = Lost(self)
+        if refused and not futures and not orphaned:
+            for position, kind in refused:
+                fates[position] = Outcome.RETRYABLE
+                lost.add(
+                    [batch[position]],
+                    when=When.LAST,
+                    key=kind,
+                    line=raised_line("event", "GooglePubSubSink publish", kind),
+                )
+            lost.register()
+            return Verdict(outcomes=tuple(fates))
+        kinds = [kind for _, kind in refused]
+        if kinds:
+            context.announce(
+                lambda: _announce_each("GooglePubSubSink refused the publish", kinds),
+                when=When.SETTLED,
+            )
+        definitive: list[str] = []
+        unknown: list[str] = []
+        published = dict(futures)
+        waitable: list[Any] = []
+        for position, state, kind in self._await_round(futures):
+            if state == "ok":
+                fates[position] = Outcome.ACCEPTED
+            elif state == "definitive":
+                fates[position] = Outcome.REJECTED
+                definitive.append(kind)
+            else:
+                fates[position] = Outcome.UNKNOWN
+                unknown.append(kind)
+                if kind != _TAKES_NO_TIMEOUT:
+                    waitable.append(published[position])
+        if waitable:
+            self._keep_for_close(waitable)
+        if definitive:
+            context.announce(
+                lambda: _announce_each("GooglePubSubSink publish refused", definitive),
+                when=When.ALWAYS,
+            )
+        if unknown:
+            count = len(unknown)
+            first = unknown[0]
+            context.announce(
+                lambda: _diag.lost(
+                    "event",
+                    count,
+                    f"GooglePubSubSink publish unconfirmed ({first}); may have landed, not "
+                    "retried",
+                ),
+                when=When.ALWAYS,
+            )
+        return Verdict(outcomes=tuple(fates))
+
+    def _await_round(self, futures: list[tuple[int, Any]]) -> list[tuple[int, str, str]]:
+        """Waits for one round's futures under one deadline, cut short by the stop signal.
+
+        Every future is asked at least once, through ``result(timeout=slice)``. The first slice
+        is a deadline, the wait's start plus :data:`_POLL_INTERVAL`: once it has passed and the
+        stop signal is set, each later ask waits nothing, and a future still unresolved reads as
+        unknown. A ``result`` that raises ``TimeoutError`` before its slice is over is followed by
+        a pause for the rest of the slice through ``_retry.wait``, cut short by the stop signal
+        unless it was already set when the pause began (``_retry.pause_on``). ``result()`` raises
+        the builtin ``TimeoutError`` both for a pending future and for one whose outcome is a
+        ``TimeoutError``; :func:`_resolved` tells them apart by ``done()``, so the second is
+        ``UNKNOWN`` at once rather than after the deadline. A ``result`` that takes no ``timeout``
+        (``TypeError``) is ``UNKNOWN`` at once. The signal's attribute is read once per wait, and
+        ``is_set()`` on every ask. ``pubsub`` is in the only-the-engine-waits gate's exclusions for
+        this wait, which is not a retry backoff.
+
+        Args:
+          futures: Each published event's position and future.
+
+        Returns:
+          Per future: its position, ``ok``, ``definitive`` or ``unknown``, and a type name.
+
+        Raises:
+          None. A ``publish`` that raises is a refusal and a ``result`` that raises an
+            ``Exception`` is that future's outcome; a ``BaseException`` from the client
+            propagates.
+        """
+        began = time.monotonic()
+        deadline = began + self.overflow_timeout
+        first_slice_end = began + _POLL_INTERVAL
+        stop = self.log_foundry_stop_signal
+        settled: list[tuple[int, str, str]] = []
+        for position, future in futures:
+            outcome: tuple[str, str] | None = None
+            while outcome is None:
+                now = time.monotonic()
+                left = deadline - now
+                stopping = now >= first_slice_end and stop is not None and stop.is_set()
+                slice_ = 0.0 if stopping or left <= 0 else min(left, _POLL_INTERVAL)
+                try:
+                    future.result(timeout=slice_)
+                except TimeoutError as err:
+                    if _resolved(future):
+                        outcome = ("unknown", _diag.type_name(err))
+                        break
+                    if stopping or left <= 0:
+                        outcome = ("unknown", "no result within the bound")
+                        break
+                    wait(slice_ - (time.monotonic() - now), pause_on(stop))
+                    continue
+                except TypeError:
+                    outcome = ("unknown", _TAKES_NO_TIMEOUT)
+                except Exception as err:
+                    kind = _diag.type_name(err)
+                    outcome = ("definitive", kind) if _is_definitive(err) else ("unknown", kind)
+                else:
+                    outcome = ("ok", "")
+            settled.append((position, *outcome))
+        return settled
 
     def _encode(self, event: dict[str, object]) -> bytes:
         """Encodes one event as the UTF-8 JSON data of its message.
@@ -307,335 +502,14 @@ class GooglePubSubSink:
         """
         return json.dumps(event).encode("utf-8")
 
-    def _announce_refused(self, kinds: list[str]) -> None:
-        """Writes one line per publish the client refused, naming its exception type (FR-008).
-
-        Called by the calling ``emit``'s deferral after the count is committed, outside the
-        counter lock, and only when that ``emit`` returned normally (SPEC-059 FR-003). The text
-        says "refused", where an unconfirmed future's says "unconfirmed", because the two lines
-        name different counters.
-
-        Args:
-          kinds: Each refused event's exception type name, in the order they were refused.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        for kind in kinds:
-            _diag.lost("event", 1, f"GooglePubSubSink refused the publish, {kind}")
-
-    def _reap(self) -> None:
-        """Resolves the futures that have settled, and waits on the oldest if over the bound.
-
-        This is what makes an outage visible while it is happening (FR-004 AC-1) and what stops
-        the pending list growing with the total number of events the process has ever logged
-        (AC-4). Before it, ``result()`` was called only from :meth:`close`, so ``failed`` stayed
-        at zero and ``health()`` read clean through an entire Pub/Sub outage.
-
-        Futures are selected under the futures lock and resolved *outside* it, as :meth:`close`
-        does: a settled future's ``result()`` is immediate, but an overflow future's is a wait,
-        and holding the lock across it would block every concurrent publish behind it — the I/O
-        inside a transport lock that SPEC-028's two-lock arrangement exists to avoid.
-
-        The partition is **one pass**, and that is load-bearing rather than tidy. Two
-        comprehensions query ``done()`` twice per future, and a future that settles between the
-        two queries — which is what a client's commit thread does — lands in neither list: not
-        resolved, and dropped by the reassignment below. Measured, five failed publishes vanished
-        with ``losses()`` reading clean, and under a real thread race 41% of failures went
-        uncounted. That is the silent loss this method exists to end, so the scan may not ask the
-        same future twice.
-
-        Overflow is taken from the front, so the oldest publish is the one waited on. Waiting
-        rather than discarding is deliberate (AC-2): the event has already been handed to the
-        client and may yet be delivered, so dropping it here would invent a loss that the
-        destination has not committed.
-
-        Args:
-          None.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        with self._futures_lock:
-            settled: list[Any] = []
-            outstanding: list[Any] = []
-            for future in self._futures:
-                (settled if _has_settled(future) else outstanding).append(future)
-            excess = max(len(outstanding) - self.max_pending, 0)
-            overflow, self._futures = outstanding[:excess], outstanding[excess:]
-        for future in settled:
-            self._resolve(future)
-        self._await_overflow(overflow)
-
-    def _await_overflow(self, overflow: list[Any]) -> None:
-        """Waits on the oldest futures once the pending list is over its bound (FR-004 AC-2).
-
-        The wait is **bounded and interruptible**, per SPEC-027. This runs inside ``emit`` on the
-        worker's single drain thread, so an unbounded ``result()`` here is a pause on all log
-        delivery that ``shutdown()`` cannot cut short. Before FR-004 the only blocking
-        ``result()`` was in ``close``, where such a wait belongs.
-
-        **One deadline covers the whole list, and the stop signal is re-read each time round.**
-        A per-*future* timeout is not a bound: with the shipped 30 s and ten futures over the
-        limit, one ``emit`` blocked for five minutes, and a shutdown landing mid-loop was not
-        noticed until every future had been waited on — measured at 5.04 s for a signal set after
-        0.3 s. Both were regressions against a version of this sink that never blocked at all.
-
-        A future the wait does not outlast is **put back**, not counted: it may still land, and
-        ``close`` resolves whatever remains. That has a consequence worth stating rather than
-        hiding, because it is a real limit: against a client that resolves *nothing*, the pending
-        list grows by a batch per emit (measured 10 → 60 over six emits) and the ``max_pending``
-        bound stops holding. Nothing better is available — the three properties "never invent
-        loss", "never block delivery indefinitely" and "bound memory" cannot all hold when the
-        destination has stopped answering, and the first two are the ones this library is for.
-        The growth is a symptom of the outage, every event in it is still accounted for, and
-        ``losses()`` reports what resolves.
-
-        Args:
-          overflow: The oldest outstanding futures, already removed from the pending list.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        if not overflow:
-            return
-        expired, unboundable = self._resolve_within(
-            overflow, time.monotonic() + self.overflow_timeout, heed_stop=True
-        )
-        unresolved = expired + unboundable
-        if not unresolved:
-            return
-        with self._futures_lock:
-            if not self._closed:
-                self._futures[:0] = unresolved
-                return
-        self._drain_pending(unresolved)
-
-    def _resolve_within(
-        self, pending: list[Any], deadline: float, *, heed_stop: bool
-    ) -> tuple[list[Any], list[Any]]:
-        """Waits on each future until the deadline, splitting what did not settle in two.
-
-        One deadline covers the whole list rather than a timeout per future: at the shipped
-        ``max_pending`` a per-future wait is not a bound at all (SPEC-038's rule that a bound
-        applied per item is ``n x timeout``). ``_futures_lock`` is never held across a
-        ``result()``, because ``emit`` takes it per event and an application thread on the orphan
-        path would block behind it.
-
-        Args:
-          pending: The futures to resolve, already removed from the pending list.
-          deadline: A ``time.monotonic()`` reading the pass must not run past.
-          heed_stop: Whether a set stop signal also ends the pass. **True only on the flush
-            path.** ``Worker.shutdown`` sets that event *before* closing the sink inline, so a
-            close that heeded it would abandon everything on every ordinary shutdown -- SPEC-038's
-            rule that a shutdown shortens a *wait* and must never skip *work*, and the exit drain
-            is the one path a serverless process has.
-
-        Returns:
-          The futures whose wait expired, and separately the ones that cannot be waited on within
-          a timeout at all. They are split because they mean opposite things: an expired future is
-          unconfirmed, while an *unboundable* one is a healthy publish this pass simply cannot
-          poll, and counting the second as loss invents it (SPEC-036 measured three of four
-          healthy publishes reported ``failed`` that way).
-
-        Raises:
-          None.
-        """
-        expired: list[Any] = []
-        unboundable: list[Any] = []
-        for index, future in enumerate(pending):
-            settled = False
-            unpollable = False
-            while not self._past(deadline, heed_stop=heed_stop):
-                began = time.monotonic()
-                slice_ = min(deadline - began, _POLL_INTERVAL)
-                try:
-                    settled = self._resolve(future, slice_)
-                except _Unboundable:
-                    unpollable = True
-                    break
-                if settled:
-                    break
-                wait(slice_ - (time.monotonic() - began), self.log_foundry_stop_signal)
-            else:
-                self._classify_remainder(pending[index:], expired, unboundable)
-                break
-            if unpollable:
-                unboundable.append(future)
-        return expired, unboundable
-
-    def _classify_remainder(
-        self, remaining: list[Any], expired: list[Any], unboundable: list[Any]
-    ) -> None:
-        """Sorts the futures a deadline never reached into expired and unboundable.
-
-        The pass gives up on the whole remainder when its one deadline expires, and the two
-        outcomes must still be told apart: an expired future is unconfirmed and is counted, while
-        an **unboundable** one is a healthy publish that simply cannot be polled within a timeout,
-        and counting it invents loss. A blanket ``expired.extend(...)`` here charged three healthy
-        publishes as lost behind one stalled future, which is SPEC-036's measured defect
-        reintroduced by the fix that cites it.
-
-        The probe is a zero-second wait, so it costs nothing against a deadline that has already
-        gone: a future whose ``result()`` takes no ``timeout`` raises ``_Unboundable`` on the way
-        in, and everything else either settles immediately or reports itself still in flight.
-
-        Args:
-          remaining: The futures the pass did not reach, the current one first.
-          expired: The unconfirmed list, appended to in place.
-          unboundable: The cannot-be-polled list, appended to in place.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        for future in remaining:
-            try:
-                if not self._resolve(future, 0):
-                    expired.append(future)
-            except _Unboundable:
-                unboundable.append(future)
-
-    def _past(self, deadline: float, *, heed_stop: bool) -> bool:
-        """Reports whether a resolution pass must stop.
-
-        Args:
-          deadline: A ``time.monotonic()`` reading.
-          heed_stop: Whether a set stop signal also ends the pass.
-
-        Returns:
-          True on the deadline, or on the stop signal when this caller heeds it.
-
-        Raises:
-          None.
-        """
-        if time.monotonic() >= deadline:
-            return True
-        if not heed_stop:
-            return False
-        stop = self.log_foundry_stop_signal
-        return stop is not None and stop.is_set()
-
-    def _drain_pending(self, pending: list[Any]) -> None:
-        """Resolves a swapped-out list within the close bound, counting what it abandons.
-
-        The tail every close-race site shares: :meth:`close`, and the two branches where a close
-        lands while another pass is mid-flight. Each used to resolve its leftovers with
-        ``timeout=None``, which is the unbounded wait ``Worker.shutdown`` performs inline against
-        a client publish deadline of 600 s. ``_await_overflow``'s copy is the one that mattered
-        most: it runs on whichever thread called ``emit``, which on the orphan path is an
-        application thread.
-
-        Unboundable futures still get ``timeout=None``, because that is the only wait they accept
-        and :meth:`_resolve` counts whatever they resolve to.
-
-        Args:
-          pending: The futures this caller owns and nothing else will resolve.
-
-        Returns:
-          None.
-
-        Raises:
-          None.
-        """
-        expired, unboundable = self._resolve_within(
-            pending, time.monotonic() + self.overflow_timeout, heed_stop=False
-        )
-        for future in unboundable:
-            self._resolve(future)
-        if not expired:
-            return
-        with self._counter_lock:
-            self.failed += len(expired)
-        _diag.lost(
-            "event",
-            len(expired),
-            f"GooglePubSubSink, {len(expired)} publish(es) still in flight when the "
-            f"{self.overflow_timeout}s close bound expired",
-        )
-
-    def _resolve(self, future: Any, timeout: float | None = None) -> bool:
-        """Waits for one publish to settle, counting and announcing a failure.
-
-        Args:
-          future: The publish future to resolve.
-          timeout: Seconds to wait, or ``None`` to wait indefinitely. Since SPEC-048 FR-004 that
-            is what an *unboundable* future gets, not what ``close`` does: ``close`` bounds itself
-            on ``overflow_timeout`` through :meth:`_drain_pending`, because it runs inline inside
-            ``Worker.shutdown`` against a client publish deadline of 600 s.
-
-        Returns:
-          True when the future settled, False when a *bounded* wait expired with it still in
-          flight. An expired wait is not a failure and moves no counter: the publish is
-          unfinished, not unconfirmed.
-
-          A ``TypeError`` from a *bounded* call is read the same way, because a future whose
-          ``result()`` takes no ``timeout`` cannot be waited on within one: counting it would
-          invent loss on a publish that was going to succeed, which an injected ``client=`` makes
-          reachable (measured: three of four healthy publishes reported ``failed`` with a
-          ``TypeError`` line). It is put back and resolved unbounded at ``close`` instead. A
-          genuine ``TypeError`` from the publish itself takes the same route and is counted
-          there, so nothing is lost either way.
-
-          A ``TimeoutError`` is only read that way when this call set a timeout. With none set —
-          which is every call from ``close`` — it is the client reporting that the publish itself
-          timed out, and is counted like any other failure. Conflating the two made a genuinely
-          unconfirmed publish silently uncounted, which an existing ``losses()`` test caught. A
-          server-side timeout arriving *during* a bounded wait is read as "still in flight" and
-          the future is put back, so it is counted at ``close`` rather than here — later, never
-          lost.
-
-        Raises:
-          _Unboundable: When a bounded call cannot be made at all, which only
-            :meth:`_await_overflow` catches. An unresolved future must never crash the worker
-            (FR-011), and this is called from ``close`` as well as from the emitting thread, so
-            nothing else escapes.
-        """
-        try:
-            future.result() if timeout is None else future.result(timeout=timeout)
-        except Exception as err:
-            if timeout is not None and _diag.is_a(err, TypeError):
-                raise _Unboundable from None
-            if timeout is not None and _diag.is_a(err, TimeoutError):
-                return False
-            with self._counter_lock:
-                self.failed += 1
-            _diag.lost("event", 1, f"GooglePubSubSink publish unconfirmed, {_diag.type_name(err)}")
-        return True
-
     def flush(self) -> None:
-        """Resolves the outstanding publish futures without closing the sink (SPEC-036 FR-002).
+        """Refuses when closed, and otherwise returns: nothing is in flight (SPEC-094 FR-002).
 
-        ``emit`` appends an unresolved future and returns; before this hook existed nothing but
-        ``close()`` ever called ``result()`` on them, so ``log_foundry.flush()`` could not reach a
-        single one — the call whose whole purpose is delivery before a freeze.
-
-        **It is :meth:`_await_overflow` applied to the whole pending list, and the three rules it
-        obeys are that method's, each earned by a measured defect.** One ``deadline`` covers the
-        list rather than a timeout per future: at the shipped ``max_pending`` a per-future wait is
-        not a bound at all, and a stalled destination would hold ``log_foundry.flush()`` for
-        hours. ``_Unboundable`` is **caught**, because a future whose ``result()`` takes no
-        ``timeout`` cannot be waited on within one — and letting it escape here would abandon the
-        entire list, which has already been swapped out and is referenced by nothing else. And
-        ``_futures_lock`` is **not** held across a ``result()``, because ``emit`` takes it per
-        event and an application thread on the orphan path would block behind it.
-
-        A future that did not settle is put back rather than dropped: the sink stays open, so it
-        is unfinished, not unconfirmed, and the next flush or the close waits on it again. It
-        **raises** when any remained, which is what makes ``log_foundry.flush()`` report
-        ``reason="sink-flush"``. A future that settled *failed* is already counted by
-        :meth:`_resolve` and reported through ``losses()``, per SPEC-026.
+        Each round gave every future its verdict before it returned, so no publish awaits one
+        between emits for this hook to resolve; the futures left ``UNKNOWN`` are waited on by
+        ``close()`` alone, which counts nothing. 1.x resolved a pending list here and raised for a
+        remainder, which made ``log_foundry.flush()`` falsy over an indefinite report; Andrew's
+        "Truthy, counted" answer of 2026-11-16 rules that out.
 
         Args:
           None.
@@ -644,64 +518,75 @@ class GooglePubSubSink:
           None.
 
         Raises:
-          SinkDeliveryError: The sink is closed, or a publish was still in flight afterwards.
+          SinkDeliveryError: The sink is closed.
         """
         if self._closed:
             raise final_refusal(self, "GooglePubSubSink cannot flush: the sink is closed")
-        with self._futures_lock:
-            pending, self._futures = self._futures, []
-        if not pending:
-            return
 
-        expired, unboundable = self._resolve_within(
-            pending, time.monotonic() + self.overflow_timeout, heed_stop=True
-        )
-        unresolved = expired + unboundable
+    def _keep_for_close(self, futures: list[Any]) -> None:
+        """Keeps a round's unconfirmed futures for ``close()`` to wait on (SPEC-094 FR-002).
 
-        if not unresolved:
-            return
+        Under ``_futures_lock``, and only while the sink is open: a round settling after the close
+        took the list keeps nothing, since no later ``close()`` waits. Each keep first drops the
+        futures already kept that :func:`_waitable` says are resolved or cannot be asked, so the
+        list holds only publishes still in flight and does not grow with every round a slow
+        client left unconfirmed. A list kept under another pid, a parent's inherited through
+        ``os.fork()``, is dropped first (invariant 12): its futures are resolved by the parent's
+        client threads, which do not exist in this process.
+
+        Args:
+          futures: The round's ``UNKNOWN`` futures whose ``result`` takes a ``timeout``.
+
+        Returns:
+          None.
+
+        Raises:
+          None.
+        """
         with self._futures_lock:
-            closed = self._closed
-            if not closed:
-                self._futures[:0] = unresolved
-        if closed:
-            self._drain_pending(unresolved)
-        raise SinkDeliveryError(
-            f"GooglePubSubSink flushed with {len(unresolved)} publish(es) still in flight"
-        )
+            if not self._closed:
+                self._unconfirmed = [f for f in self._kept_here() if _waitable(f)] + futures
+
+    def _kept_here(self) -> list[Any]:
+        """The kept futures, or none when the list was kept under another pid.
+
+        Called under ``_futures_lock``. A list inherited through ``os.fork()`` holds the
+        parent's futures, which only the parent's client threads resolve, so a child reads it
+        as empty and records itself as the keeper from then on (invariant 12).
+
+        Args:
+          None.
+
+        Returns:
+          The futures this process kept.
+
+        Raises:
+          None.
+        """
+        pid = os.getpid()
+        if self._kept_by != pid:
+            self._unconfirmed = []
+            self._kept_by = pid
+        return self._unconfirmed
 
     def close(self) -> None:
-        """Resolves the pending publish futures within a bound, counting the rest (FR-008).
+        """Marks the sink closed and waits for the publishes its rounds left unconfirmed.
 
-        **Bounded since SPEC-048 FR-004.** It used to wait ``timeout=None`` per future, and
-        ``Worker.shutdown`` closes the live sink inline, so one unreachable destination held
-        process exit for the client's 600 s publish deadline per future. The bound is
-        ``overflow_timeout`` on the monotonic clock and deliberately **not** the stop signal;
-        :meth:`_resolve_within` records why.
-
-        **The bound does not cover a future that cannot be waited on within a timeout.** One whose
-        ``result()`` takes no ``timeout`` argument is resolved unbounded, because that is the only
-        wait it accepts and SPEC-036 measured that counting it instead invents loss on publishes
-        that were going to succeed. So a client handing out unboundable futures that also do not
-        settle still holds the close for its own deadline, once per future: measured at 27.0 s for
-        nine futures against a 3 s stand-in, where the bounded path took 2.0 s for sixty.
-        ``google-cloud-pubsub``'s own future accepts a timeout, so this is reachable only through
-        an injected ``client=`` that does not — but ``client=`` is a frozen public parameter, which
-        is why it is written down here rather than assumed away. Recorded in ``architecture.md``
-        §12; it is strictly better than before, where **every** future took this path.
-
-        Idempotent. The pending list is swapped out under a lock rather than iterated and then
-        cleared (SPEC-028 FR-002): ``emit`` appends to it from any thread, so the old
-        iterate-then-``clear()`` discarded any future appended after the loop passed its index —
-        an unconfirmed publish whose ``result()`` was never called, never counted in ``failed``
-        and never reported by ``losses()``. That is the silent loss SPEC-026 exists to end,
-        reached through the one piece of shared state this sink has.
-
-        The closed flag is set in the same critical section as the swap (SPEC-032 FR-001), which
-        is what makes :meth:`emit`'s second check exact: an append winning the lock before this
-        point is resolved by the loop below, and one arriving after sees the flag. The futures
-        are resolved outside the lock, so a slow ``result()`` never blocks an emit that is about
-        to be refused anyway.
+        SPEC-094 FR-002, Andrew's "Wait at close (Recommended)", 2026-11-22. A round under a set
+        stop signal reads a future still unresolved after its first slice as ``UNKNOWN``, but the
+        client's own thread, a daemon in google-cloud-pubsub, is still sending it; a process
+        that exits on that verdict ends the send. So the flag is set and the kept futures taken
+        under ``_futures_lock``, the lock a round's hand-off reads the flag under, and each is then
+        waited on outside the lock, under one deadline of ``overflow_timeout`` for them all,
+        **not** cut short by the stop signal, which is already set at every exit. The wait
+        counts nothing and writes no line: each future's verdict was given by its round and
+        counted once there (SPEC-088's one-term ledger), and a future the wait sees resolve, or
+        not, changes none of it. A future whose ``done()`` raises, or whose ``result`` refuses
+        ``timeout=``, is not waited on, as its round reads it. A second ``close()`` finds the list
+        empty and waits on nothing; a publish whose hand-off lands after the close is read as
+        unconfirmed by its round and never kept. A forked child's ``close()``, a caller's own
+        included, waits on nothing its parent kept (invariant 12): no thread in the child will
+        ever resolve those futures, so waiting on them would only cost ``overflow_timeout``.
 
         Args:
           None.
@@ -710,39 +595,85 @@ class GooglePubSubSink:
           None.
 
         Raises:
-          None. This is an isolation boundary: an unresolved future must never crash the worker
-            (FR-011).
+          None. An ``Exception`` from a kept future is its outcome, already given; a
+            ``BaseException`` propagates.
         """
         with self._futures_lock:
             self._closed = True
-            pending, self._futures = self._futures, []
-        self._drain_pending(pending)
+            kept, self._unconfirmed = self._kept_here(), []
+        deadline = time.monotonic() + self.overflow_timeout
+        for future in kept:
+            if not _waitable(future):
+                continue
+            with contextlib.suppress(Exception):
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
 
 
-def _has_settled(future: Any) -> bool:
-    """Reports whether a publish future has already resolved, without ever waiting on it.
-
-    Total, and the two "cannot tell" cases are answered differently on purpose. A future with no
-    ``done()`` at all is reported **outstanding**: it cannot be polled, but it is still held
-    under ``max_pending``, so it is bounded without every publish being made synchronous — which
-    is what reporting it settled would do, since the reap would then call ``result()`` on it
-    immediately. A ``done()`` that *raises* is reported settled instead, because a future whose
-    own state query fails is broken, and resolving it now counts it rather than leaving it to
-    occupy the bound forever.
+def _resolved(future: Any) -> bool:
+    """Whether a future has resolved, so a ``TimeoutError`` from it is its own outcome.
 
     Args:
-      future: The publish future to inspect.
+      future: The publish future.
 
     Returns:
-      True when the future has resolved, or when its state query failed.
+      True when its ``done()`` answers true; False when it has none or the call fails.
+
+    Raises:
+      None.
+    """
+    done = getattr(future, "done", None)
+    try:
+        return callable(done) and bool(done())
+    except Exception:
+        return False
+
+
+def _waitable(future: Any) -> bool:
+    """Whether ``close()`` should wait on a kept future: unresolved, and its ``done()`` answers.
+
+    A future with no callable ``done`` is waitable, since its round asked it through ``result``
+    alone. One whose ``done()`` raises is not, so a future that cannot say whether it is
+    resolved is neither kept past the next round nor waited on at the close.
+
+    Args:
+      future: The publish future.
+
+    Returns:
+      False when its ``done()`` answers true or raises; True otherwise.
 
     Raises:
       None.
     """
     done = getattr(future, "done", None)
     if not callable(done):
-        return False
-    try:
-        return bool(done())
-    except Exception:
         return True
+    try:
+        return not bool(done())
+    except Exception:
+        return False
+
+
+def _is_definitive(err: Exception) -> bool:
+    """Reports whether a future's exception says no attempt of the publish could have been kept.
+
+    ``google.api_core.exceptions.InvalidArgument``: the server refuses a publish request whole and
+    the publish retry does not retry it, so no attempt it follows was kept; it lands on every
+    message of the client's batch, not only the one at fault. ``FlowControlLimitError``: set on a
+    future the client never sent. Both are resolved through ``driver_classes``, importing nothing.
+    That a refused request is applied to none of its messages is an inference from the API's
+    meaning, not a measurement.
+
+    Args:
+      err: The exception ``result()`` raised.
+
+    Returns:
+      True for ``InvalidArgument`` and the publisher's ``FlowControlLimitError``.
+
+    Raises:
+      None.
+    """
+    definitive = (
+        *driver_classes("google.api_core.exceptions", "InvalidArgument"),
+        *driver_classes("google.cloud.pubsub_v1.publisher.exceptions", "FlowControlLimitError"),
+    )
+    return _diag.is_a(err, definitive)

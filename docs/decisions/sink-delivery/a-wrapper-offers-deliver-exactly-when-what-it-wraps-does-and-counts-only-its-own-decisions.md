@@ -18,6 +18,9 @@ takes the inner sink's `deliver` again on every round. An inner sink that stoppe
 whose counters were replaced, raises `TypeError` naming its type, which fails the run. A direct
 `deliver` on a wrapper that offers nothing raises `TypeError` naming the wrapper. Both names are
 read through `_diag._STORED_NAME`.
+Since SPEC-094 `KafkaSink` and `GooglePubSubSink` are engine sinks too, so a `FilteringSink` or
+`TransformSink` over either now offers `deliver` on the inner sink's counters, where it used to call
+the inner `emit`.
 
 **Why the inner sink's counters, not the wrapper's own.** The engine commits a run's totals into
 the run sink's `log_foundry_counters`. A SPEC-074 sink's `losses()` *is* those totals, and an
@@ -105,6 +108,11 @@ idempotent; do NOT give `MultiSink` a `deliver`; do NOT copy a transform's resul
 the predicate again about a forwarded event, on a later round of one run. (SPEC-075 FR-001 to FR-004)
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-094, fence unchanged: `KafkaSink` and `GooglePubSubSink` offer `deliver`, so
+  a wrapper over either offers it too.
 
 ### 2026-11-09
 

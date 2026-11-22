@@ -846,6 +846,14 @@ LIMIT_GAINED: dict[str, frozenset[str]] = {
 
 ``BASE_PUBLIC`` stays as SPEC-069 found the surface; a name a later spec adds joins the union here.
 """
+ACK_GAINED: dict[str, frozenset[str]] = {
+    "SQSSink": frozenset({"dropped_unadjudicated"}),
+    "SNSSink": frozenset({"dropped_unadjudicated"}),
+    "KafkaSink": frozenset({"deliver", "log_foundry_counters", "log_foundry_stop_signal"}),
+    "GooglePubSubSink": frozenset({"deliver", "log_foundry_counters"}),
+}
+"""SPEC-093 FR-003's sub-count of ``failed`` an unread or unnaming reply moves, and the names
+SPEC-094's engine adds to ``KafkaSink`` and ``GooglePubSubSink``."""
 
 
 def _public(obj: object) -> set[str]:
@@ -874,6 +882,7 @@ def test_the_public_surface_grows_only_by_five_losses(
             | ({"losses"} if name in GAINED_LOSSES else set())
             | ENGINE_GAINED.get(name, frozenset())
             | LIMIT_GAINED.get(name, frozenset())
+            | ACK_GAINED.get(name, frozenset())
         ) - ENGINE_LOST.get(name, frozenset())
         assert names == expected, (name, sorted(names ^ expected))
 

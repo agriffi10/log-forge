@@ -92,7 +92,6 @@ _PRIMITIVE_HOMES = {
     "ConsoleWriter": "roster",
     "ClosedGuard": "walk",
     "FilteringSink": "walk",
-    "KafkaSink": "walk",
     "MultiSink": "walk",
     "NATSSink": "walk",
     "NullSink": "walk",
@@ -113,7 +112,8 @@ _PRIMITIVE_HOMES = {
 
 ``roster``: its instance is on a roster path. ``walk``: it is sink-shaped, a ``Worker``, or held
 by an attribute of one (``SinkCounters``, SPEC-076's guard), so the walk from the runtime's roots
-reaches it. ``dropped``: a child handler drops its instances.
+reaches it. ``dropped``: a child handler drops its instances. ``KafkaSink`` left the table at
+SPEC-094, when its counter lock moved into its ``SinkCounters``.
 """
 
 

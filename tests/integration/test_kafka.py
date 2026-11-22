@@ -59,3 +59,42 @@ def test_the_message_key_is_the_configured_field(services_are_up: dict[str, Endp
 
     keys = [key for key, _ in consume(brokers, topic, 1)]
     assert keys == [b"c" * 32]
+
+
+def test_emit_returns_once_the_rounds_messages_are_reported(
+    services_are_up: dict[str, Endpoint],
+) -> None:
+    """SPEC-094 FR-001: the round waits for its own reports, so nothing is queued after ``emit``.
+
+    ``len(producer)`` counts messages queued or awaiting their delivery report; 1.x returned with
+    them all still there.
+    """
+    brokers = services_are_up["kafka"].url_host
+    topic = f"lf-{uuid.uuid4().hex[:8]}"
+    sink = KafkaSink(topic, bootstrap_servers=brokers)
+    sink.emit([{"n": n} for n in range(5)])
+    assert len(sink.producer) == 0
+    assert sink.losses().failed == 0
+    sink.close()
+    assert sorted(payload["n"] for _, payload in consume(brokers, topic, 5)) == [0, 1, 2, 3, 4]
+
+
+def test_a_long_linger_does_not_leave_a_rounds_messages_unknown(
+    services_are_up: dict[str, Endpoint],
+) -> None:
+    """SPEC-094 FR-001: ``flush(slice)`` holds the flushing mark, so ``linger.ms`` cannot outlast it.
+
+    With ``linger.ms`` above ``flush_timeout``, a round that waited out the linger would read every
+    message ``UNKNOWN``; the round's ``flush(slice)`` sends at once, so each is ``ACCEPTED``. The
+    outcome is asserted, not the round's duration.
+    """
+    brokers = services_are_up["kafka"].url_host
+    topic = f"lf-{uuid.uuid4().hex[:8]}"
+    sink = KafkaSink(
+        topic, bootstrap_servers=brokers, flush_timeout=1.0, producer_config={"linger.ms": 3000}
+    )
+    sink.emit([{"n": 1}])
+    sink.emit([{"n": 2}, {"n": 3}])
+    assert sink.losses().failed == 0
+    sink.close()
+    assert sorted(payload["n"] for _, payload in consume(brokers, topic, 3)) == [1, 2, 3]

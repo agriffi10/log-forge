@@ -272,11 +272,13 @@ itself swept from open spans just before it queued the marker, and why concurren
 from other threads may or may not be included.
 
 **`flush()` also empties the sink's own client buffer**, when the sink has one. A sink that
-buffers in a driver rather than writing through — `KafkaSink` hands to librdkafka, `PubSubSink`
-appends an unresolved future, `SentrySink` hands to the SDK's background transport — used to be
-unreachable this way, so `flush()` could return truthy with events sitting in a client. If that
-client cannot be emptied the result is falsy with `reason="sink-flush"`, which is distinct from
-`"abandoned"`: the events are past this library and inside a driver. A **custom sink** that
+buffers in a driver rather than writing through — `SentrySink` hands to the SDK's background
+transport — used to be unreachable this way, so `flush()` could return truthy with events sitting
+in a client. If that client cannot be emptied the result is falsy with `reason="sink-flush"`, which
+is distinct from `"abandoned"`: the events are past this library and inside a driver. `KafkaSink`
+and `GooglePubSubSink` hand each message to a client that sends it later, but each batch waits for
+the client's report on every message it handed over before it returns, so their `flush()` hook
+has nothing left to wait for and never makes the result falsy (*Queue & stream*, below). A **custom sink** that
 buffers should implement `flush()` — it is optional, probed by name, and a sink without one is
 unaffected.
 
@@ -335,8 +337,8 @@ Adding a destination beside a sink, `configure(sink=MultiSink(file, other))` aft
 longer holds it.
 
 The 5 s covers the **whole** call — both drains and the previous sink's `close()`. `Sink.close()`
-takes no timeout of its own — though `KafkaSink` bounds its own flush at `flush_timeout=10.0`
-and counts whatever is still queued — so that close runs on its own daemon thread and is joined
+takes no timeout of its own — though `KafkaSink` bounds its own flush at `flush_timeout=10.0` —
+so that close runs on its own daemon thread and is joined
 for whatever is left of the budget. A hung `close()` therefore costs you the budget, once, and the close carries on in the
 background afterwards.
 
@@ -350,8 +352,9 @@ is not coming back, still holding its resources.
 runs for you) drains and closes the live sink first, then gives any still-running swapped-out close
 a short grace — 2 s, per `shutdown()` call, carved from that call's own timeout — to finish. A
 close that was merely slow completes. One that is genuinely stuck is abandoned there, and **its
-own buffered data is lost**: for a sink whose `close()` *is* its delivery, like
-`KafkaSink.close()` flushing the producer, that is everything it had not yet sent.
+own buffered data is lost**: for a sink whose `close()` still pushes a client buffer, like
+`KafkaSink.close()` flushing the producer, that is whatever the producer still held, messages a
+batch already counted as may-have-landed when its wait for their reports ran out.
 `health().closing_sinks` is the only warning you get, which is why it is worth watching.
 
 The closer runs as a daemon thread deliberately. A non-daemon one is worse: CPython joins
@@ -678,10 +681,12 @@ A few conventions hold across every sink below:
   excepted, count each such resend their delivery engine makes in `health().sink.resent`, as an
   upper bound, and say so once per batch on stderr (`log-foundry: resent <n> event(s) a lost
   reply may have landed; they may be duplicated; <Sink>`). Some copies go uncounted; the
-  `health()` section below says which. Three
+  `health()` section below says which. Four
   cases are excepted, each because a retry would be wrong rather than merely futile: an oversized
-  event (it can never fit), a response the sink could not adjudicate (it cannot prove nothing
-  landed), and an SQS or SNS sender fault (a byte-identical re-send can only fail again). Within a
+  event (it can never fit), a response or delivery report the sink could not adjudicate, or a
+  write it cannot confirm (it cannot prove nothing landed), an SQS or SNS sender fault (a
+  byte-identical re-send can only fail again), and an event the Sentry SDK discarded (a re-send
+  would be sampled or filtered again). Within a
   sink, only a failure its driver documents as transient — a dropped connection, a timeout, a
   throttle — is retried; anything else, a `TypeError` from your own client or a value the server
   refuses, is counted and announced at its first attempt, and the batch still raises if nothing
@@ -731,7 +736,7 @@ level is unknown or missing fails open (is forwarded).
 
 **Wrapping a sink that reports per event.** When the sink inside `FilteringSink` or `TransformSink`
 offers `deliver`, as the HTTP family, `SyslogSink`, `FileSink`, `RotatingFileSink` and the SDK
-and driver sinks other than `KafkaSink` and `GooglePubSubSink` do, the wrapper offers it too. The
+and driver sinks do, the wrapper offers it too. The
 library then retries the wrapped sink exactly as it would retry that sink configured alone: the
 same number of attempts, its own `max_retries` and `max_retry_after`, and only the events that can
 still land. The wrapped sink's losses are reported where they would be alone, and the wrapper adds
@@ -820,12 +825,12 @@ completed, not that every chunk of it landed.
 | Sink | Import from | Configure |
 |---|---|---|
 | `HTTPSink` | `log_foundry.sinks.http` | `HTTPSink(url, *, method="POST", headers=None, auth=None, body_format="ndjson", timeout=5.0, gzip=False, max_retries=3, max_retry_after=30.0, max_batch_count=None, max_batch_bytes=None, opener=None)` — generic POST. `auth` is a bearer-token `str` or `(user, pass)` for basic; `body_format` is `"ndjson"` or `"json_array"`; the two `max_batch_*` default to `None`, meaning "use this class's limits" from the table below (1,000 / 5,000,000 here); `opener` injects a `urlopen`-shaped callable for tests |
-| `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`). A `2xx` it cannot adjudicate, unreadable bodies included, is counted on `.dropped_unadjudicated` and not retried; those events may have landed, and a non-zero value can mean a proxy answered rather than the cluster |
+| `ElasticsearchSink` | `log_foundry.sinks.elasticsearch` | `ElasticsearchSink(url, *, index, auth=None, **http_kwargs)` — POST to `_bulk`, parsing per-item errors (`.item_errors`). A `2xx` it cannot adjudicate, unreadable bodies included, is counted on `.dropped_unadjudicated` and not retried; those events may have landed, and a non-zero value can mean a proxy answered rather than the cluster. That includes an object carrying neither `errors` nor `items`, such as `{}` or an error document; an object with `items` and no truthy `errors` is read as success |
 | `OpenSearchSink` | `log_foundry.sinks.elasticsearch` | same signature as `ElasticsearchSink` (identical bulk protocol) |
 | `LokiSink` | `log_foundry.sinks.loki` | `LokiSink(url, *, labels=("service", "env", "level"), **http_kwargs)` — Grafana Loki push API |
 | `OTLPSink` | `log_foundry.sinks.otlp` | `OTLPSink(endpoint="http://localhost:4318/v1/logs", **http_kwargs)` — OTLP/HTTP JSON logs, for a Collector or any OTLP backend; `endpoint` is used exactly as given, `method` must be `"POST"`, `body_format` is pinned. Retries `429`/`502`/`503`/`504` only, bounds the response it reads at 4 MiB, and counts a `2xx` partial success on `.rejected_records` (never retried) or, when it cannot read the verdict, on `.dropped_unadjudicated`. What it sends: *OTLPSink* below |
-| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp")` for a raw TCP/UDP socket. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per element; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
-| `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected |
+| `LogstashSink` | `log_foundry.sinks.logstash` | `LogstashSink(url=…, body_format="json_array", **http_kwargs)` for HTTP, **or** `LogstashSink(host=…, port=…, transport="tcp", ack_wait=None)` for a raw TCP/UDP socket, with the same TCP checks and `ack_wait` as `SyslogSink`. HTTP mode posts a JSON array as `application/json`, which a **stock** `http` input parses into one event per element; pass `body_format="ndjson"` for an input configured with `additional_codecs => {"application/x-ndjson" => "json_lines"}`, which that setting *replaces* the default map to provide |
+| `SyslogSink` | `log_foundry.sinks.syslog` | `SyslogSink(host, port=514, *, transport="udp", facility="user", app_name="log-foundry", max_datagram_bytes=65507, ack_wait=None)` — RFC 5424 over UDP/TCP. A UDP frame over the limit is dropped and counted rather than sent, retried and abandoned; TCP is a stream and is unaffected. Over TCP each batch checks the connection before it writes, replacing one the collector closed, and ends by waiting up to 0.25 s for the collector to acknowledge what it wrote, usually one round trip plus the collector's delayed acknowledgement; frames written to a connection the collector turned out to have closed are counted in `.failed` with one line, `written to a connection its peer closed; may have landed, not retried`, and never re-sent. `ack_wait=False` keeps the checks and drops the wait, which can miss a close whose reset arrives late; a value that is not a `bool` is a `TypeError`, and `ack_wait` with UDP, which has nothing to acknowledge, a `ValueError` |
 
 ```python
 from log_foundry.sinks.elasticsearch import ElasticsearchSink
@@ -899,6 +904,14 @@ uninitialized process, an `init()` with no DSN, and a `close()`d client all fail
 reports itself inactive, the other two report themselves active with nothing to send through, and
 all three drop events silently.
 
+An event the SDK discards when it is captured — sampled out by your error sample rate, dropped by
+`before_send` or an event processor, or refused for any other reason the SDK reports by returning
+no event id — is counted in `.discarded` and in `losses().dropped`, with one
+`SentrySink, discarded by the Sentry SDK at capture` line per batch, and is never re-sent. That
+includes deliberate sampling: the SDK reports a sampled-out event and an undeliverable one the same
+way, so the sink cannot tell them apart. A batch with a discard returns rather than raising. What the
+SDK drops after it accepted an event, a full transport queue or a rate limit, it never reports.
+
 An argument the chosen backend can never use is a `ValueError` rather than a silent ignore:
 `opener=` where no HTTP fallback is built, `client=` under `backend="http"`. Until this release
 `opener=` was accepted and then ignored whenever the SDK happened to import — including when it was
@@ -918,10 +931,18 @@ parallel array with no ids — so they check that it describes as many records a
 acting on it. A response that doesn't is not used to adjudicate any record in the chunk: the chunk is
 abandoned rather than re-sent (some of it almost certainly landed), counted on
 `.dropped_unadjudicated`, and named on stderr. A non-zero value there is real loss, and normally
-means the client isn't AWS-shaped. `SQSSink` and `SNSSink` correlate by explicit `Id` instead, read
+means the client isn't AWS-shaped. A response with neither a failed count nor a record array
+adjudicates none of its chunk the same way; one with a `0` count and no array is delivered.
+`SQSSink` and `SNSSink` correlate by explicit `Id` instead, read
 by the same all-or-none rule: a `Failed` list that names an unknown or repeated `Id`, or holds an
 item that is not a mapping, adjudicates none of the chunk, which is counted on `.failed` once and
-named on stderr, never re-sent.
+named on stderr, never re-sent. So does a reply with neither `Failed` nor `Successful`, such as
+`{}`. A reply that lists `Successful` delivers the entries it names; an entry named in neither list
+may have landed, so it is counted on `.failed` and named on stderr, never re-sent. A reply with only
+`Failed` reads every entry it does not name as delivered. Each entry these sinks could not
+adjudicate is also counted on `.dropped_unadjudicated`, which on `SQSSink` and `SNSSink` is part of
+`.failed`, so the two are not added together, and on `KinesisSink` and `FirehoseSink` is outside
+`.failed` and adds to it in `losses()`.
 
 Each makes **one call per chunk per round**: a chunk that failed retryably is re-sent in the next
 round, after the round's later chunks, and only the entries that failed are re-sent — so one entry
@@ -1018,12 +1039,41 @@ Redis, RabbitMQ and Event Hubs sinks retry through the library's delivery engine
 pipeline, message or pack per round, so their backoff is bounded *and* cut short by a shutdown, and
 none holds its lock across a wait.
 
-`KafkaSink` and `GooglePubSubSink` add no retry loop and need none — each hands off locally and
-returns without waiting, and their clients retry on their own threads within their own bounds.
-(`KafkaSink` holds nothing at all; `GooglePubSubSink` does take one wait on the drain thread, its
-`overflow_timeout`, when a batch exceeds `max_pending` — bounded and interruptible per SPEC-027.) For Kafka that is `message.timeout.ms`, five
-minutes by default (measured: the delivery callback fires at 300.18 s), reachable through
-`producer_config=`; for Pub/Sub, a 600 s deadline.
+**`RabbitMQSink` can ask the broker to confirm each publish**, with `confirm=True`, for a connection
+it opened or one you passed in. Each channel it opens is then put in confirm mode and each publish
+is sent `mandatory`, so a message the broker acked is delivered, one no queue took or the broker
+refused is counted in `.failed` and not re-sent, and one whose connection was lost before the confirm
+arrived is counted as may have landed and not re-sent. Before each batch it checks a connection it
+opened, so one that died while idle is reopened before anything is written; a connection you passed
+in is not checked, since that would run your own consumer callbacks on the worker's thread, so a
+publish on one that died while idle reads as a lost confirm. Confirms cost a broker round trip per
+message: a 1,000-event batch took about 0.25 s at a 0.2 ms round trip and about 5.4 s at 5 ms, longer
+than `flush()`'s 5 s default. A confirm wait ends only with the confirm or when the connection
+closes. The default, `confirm=False`, publishes as before, and a publish that returned is all it
+knows.
+
+`KafkaSink` and `GooglePubSubSink` hand each message to a client that sends it later, and **each
+batch waits for the client's report on every message it handed over** before it returns, within
+`flush_timeout` (10 s by default) or `overflow_timeout` (30 s by default), and only one 50 ms slice
+once a shutdown has begun, or after one until a `configure()` installs the sink again. A message the broker acknowledged is delivered. One refused where no
+attempt the client made could have delivered it — Kafka's `INVALID_REQUIRED_ACKS` and
+`INVALID_RECORD`, Pub/Sub's `InvalidArgument`, and the `FlowControlLimitError` a full Pub/Sub client
+queue sets on a message it never sent — is counted in `.failed`, and a batch of nothing else fails,
+so `flush()` reads false. Every other
+report, size and authorization refusals among them, and no report in time, is counted in `.failed`
+with one `may have landed, not retried` line and never re-sent, and `flush()` stays truthy: a truthy
+`flush()` means every event was acknowledged or counted. A report that arrives after its batch
+returned changes nothing. The wait costs about one broker round trip per batch; with one Kafka
+partition stuck, only that partition's messages wait the timeout, and each later batch pays one
+50 ms slice; against a broker that never answers, every batch waits the whole timeout, on your own
+thread for a log call outside any span. A Kafka producer with `delivery.report.only.error` reports
+nothing for a success, so with another partition stuck its unreported successes are counted as may
+have landed. Within those bounds the clients still retry on their own threads: for Kafka within
+`message.timeout.ms`, five minutes by default (measured: the delivery callback fires at 300.18 s),
+reachable through `producer_config=`; for Pub/Sub, a 600 s deadline. A shutdown's batches end
+after one slice, so `GooglePubSubSink.close()` then waits up to `overflow_timeout`, whatever the
+shutdown, for the publishes they counted as may have landed: a normal exit lets the client
+finish sending them rather than ending its sending thread, and the wait counts nothing.
 
 > ~~and for NATS a JetStream publish bounded by its 5 s ack timeout with no retry at all~~ —
 > **superseded by SPEC-047 FR-001.** That was true per *event* and false per *batch*: the awaits
@@ -1059,12 +1109,12 @@ outright while its client reports itself disconnected, so a sustained outage mov
 
 | Sink | Import from | Extra | Configure |
 |---|---|---|---|
-| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id", producer_config=None)` — `producer_config` is merged **beneath** the sink's own keys, so it reaches `message.timeout.ms` and friends without displacing `bootstrap.servers`; passing it with `producer=` is a `ValueError` |
+| `KafkaSink` | `log_foundry.sinks.kafka` | `kafka` | `KafkaSink(topic, *, flush_timeout=10.0, bootstrap_servers="…", key_field="trace_id", producer_config=None)` — `producer_config` is merged **beneath** the sink's own keys, so it reaches `message.timeout.ms` and friends without displacing `bootstrap.servers`; passing it with `producer=` is a `ValueError`. Each batch waits up to `flush_timeout` for its messages' delivery reports, as above |
 | `RedisStreamsSink` | `log_foundry.sinks.redis` | `redis` | `RedisStreamsSink(stream, *, url=None, maxlen=None)` — `XADD`. `maxlen` caps the stream (`approximate=True`); trimming happens **at Redis**, after delivery, so it is invisible to `health()` — which is why the default is unbounded |
 | `RedisListSink` | `log_foundry.sinks.redis` | `redis` | `RedisListSink(key, *, url=None, maxlen=None)` — `RPUSH` + `LTRIM` to the newest `maxlen`; same destination-side trimming caveat |
-| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None, blocked_connection_timeout=None, socket_timeout=None, stack_timeout=None)` — persistent messages; `pika` leaves `blocked_connection_timeout` unset, so a broker under a memory or disk alarm blocks every publish indefinitely — the sink applies `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` (30 s) unless the URL's query names one, and an explicit keyword overrides the URL. **Read from `pika` 1.4.4 and not executed against a broker** — verify it against yours |
+| `RabbitMQSink` | `log_foundry.sinks.rabbitmq` | `amqp` | `RabbitMQSink(*, exchange, routing_key, url=None, blocked_connection_timeout=None, socket_timeout=None, stack_timeout=None, confirm=False)` — persistent messages; `confirm=True` asks the broker to confirm each publish, at a round trip per message, as above, and a value that is not a `bool` is a `TypeError`; `pika` leaves `blocked_connection_timeout` unset, so a broker under a memory or disk alarm blocks every publish indefinitely — the sink applies `DEFAULT_BLOCKED_CONNECTION_TIMEOUT` (30 s) unless the URL's query names one, and an explicit keyword overrides the URL. **Read from `pika` 1.4.4 and not executed against a broker** — verify it against yours |
 | `NATSSink` | `log_foundry.sinks.nats` | `nats` | `NATSSink(subject, *, jetstream=False, servers=None, publish_timeout=10.0, connect_timeout=None, max_reconnect_attempts=None, reconnect_time_wait=None, drain_timeout=None)` — a non-positive `max_reconnect_attempts` is a `ValueError` at construction, since `nats-py` retires a server from its pool only under `max_reconnect_attempts > 0` and a non-positive value therefore never returns; `publish_timeout` bounds one whole `emit` and applies to an injected `client=` too; the four `None` timeouts are forwarded to `nats.connect` only when set, and passing one with `client=` is a `ValueError` |
-| `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic)` |
+| `GooglePubSubSink` | `log_foundry.sinks.pubsub` | `gcp-pubsub` | `GooglePubSubSink(topic, *, client=None, max_pending=None, overflow_timeout=30.0)` — each batch waits up to `overflow_timeout` for its publish futures, and `close()` up to `overflow_timeout` for those still in flight, as above; `max_pending` is still accepted and checked, and has no effect |
 | `AzureEventHubsSink` | `log_foundry.sinks.eventhubs` | `azure-eventhubs` | `AzureEventHubsSink(*, connection_str="…", eventhub=None)` |
 
 ```python
@@ -1441,7 +1491,7 @@ itself several causes, which is why the diagnostic line matters. Most sinks drop
 never fit, and an event they cannot encode at all (which only a third-party wrapper sink or a
 direct `emit` can hand them, since assembly makes every event valid JSON); `KafkaSink` and
 `GooglePubSubSink` also count an event their client refused while the rest of its batch was handed
-off. A batch refused whole raises instead and is counted where the
+off, and `SentrySink` an event the Sentry SDK discarded when it was captured. A batch refused whole raises instead and is counted where the
 raise is caught: in `failed_batches` once the worker's retries are spent, in `orphan_lost`
 outside a span, or in the fan-out's `sink.failed` under a `MultiSink` whose other children
 delivered, since a fan-out absorbs a partial failure rather than re-raising it. A

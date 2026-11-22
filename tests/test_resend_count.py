@@ -422,8 +422,15 @@ def test_sinklosses_without_resent_equals_resent_zero_and_match_args_stay_empty(
 
 # --- AC9: every SinkLosses the package builds passes resent= ---------------------------------
 
-FLOOR = 15
-"""The ``SinkLosses`` calls under ``src/`` when SPEC-095 was built: the fifteen it names."""
+FLOOR = 13
+"""The ``SinkLosses`` calls under ``src/``: SPEC-095's fifteen, less two SPEC-094 removed.
+
+``KafkaSink.losses()`` and ``GooglePubSubSink.losses()`` built one each until SPEC-094 moved both
+sinks onto the delivery engine, where each returns its counters' ``losses()``, which reports
+``resent`` from ``resent_events``. Pinned at the count, as SPEC-095 pinned it: a call that drops
+out of the walk's reach is what the floor exists to catch, and a removal on purpose lowers it here
+with its reason.
+"""
 
 
 def sinklosses_findings(sources: Iterable[tuple[str, str]], floor: int = FLOOR) -> list[str]:
@@ -494,10 +501,10 @@ def test_the_guard_is_silent_on_a_call_with_resent() -> None:
 
 
 def test_the_guard_reports_a_walk_below_its_floor() -> None:
-    """AC9: fourteen conforming calls fail the floor of fifteen."""
-    source = "SinkLosses(dropped=0, failed=0, resent=0)\n" * 14
+    """AC9: one conforming call fewer than the floor fails it, naming both numbers."""
+    source = "SinkLosses(dropped=0, failed=0, resent=0)\n" * (FLOOR - 1)
     assert sinklosses_findings([("m.py", source)]) == [
-        "found 14 SinkLosses call(s), fewer than the floor of 15"
+        f"found {FLOOR - 1} SinkLosses call(s), fewer than the floor of {FLOOR}"
     ]
 
 

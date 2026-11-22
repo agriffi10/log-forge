@@ -76,13 +76,19 @@ def test_close_flushes() -> None:
     assert producer.flushes == 1
 
 
-def test_delivery_errors_are_counted(capsys) -> None:
+def test_delivery_errors_are_counted_once_on_one_line(capsys) -> None:
+    """SPEC-094 FR-001: an error no definitive code names is ``UNKNOWN``, counted in the round.
+
+    1.x counted ``failed`` at each report with one line per message; the round now counts each
+    message once and names the count on one may-have-landed line, never the driver's text.
+    """
     producer = FakeProducer(deliver_error="broker down")
     sink = KafkaSink("logs", producer=producer)
     sink.emit([{"a": 1}, {"a": 2}])
     assert sink.failed == 2
     err = capsys.readouterr().err
-    assert err.count("lost 1 message(s)") == 2, "one line per failed delivery"
+    assert err.count("lost 2 message(s); KafkaSink, no definitive delivery report") == 1
+    assert "may have landed, not retried" in err
     assert "broker down" not in err, "the driver's text is never written"
 
 
@@ -114,15 +120,20 @@ class FakeKafkaError:
 
 
 def test_a_delivery_error_reports_the_code_not_the_message(capsys) -> None:
-    sink = KafkaSink("logs", producer=FakeProducer(deliver_error=FakeKafkaError()))
+    """A definitive refusal's line names the type and librdkafka's code, never the message.
 
-    sink.emit([{"a": 1}])
+    Code 87, ``INVALID_RECORD``, is in ``DEFINITIVE_CODES`` (SPEC-094 FR-001), so the message is
+    ``REJECTED``, the run fails, and the line is 1.x's ``KafkaSink delivery, <Type> code=N``.
+    """
+    sink = KafkaSink("logs", producer=FakeProducer(deliver_error=FakeKafkaError(87)))
+
+    with pytest.raises(SinkDeliveryError):
+        sink.emit([{"a": 1}])
 
     err = capsys.readouterr().err
     assert "user@example.com" not in err, "the driver's text can quote the record (arch §6)"
     assert "Broker transport failure" not in err
-    assert "FakeKafkaError" in err, "the type"
-    assert "code=-195" in err, "and librdkafka's own code, which is what makes it diagnosable"
+    assert "KafkaSink delivery, FakeKafkaError code=87" in err, "the type and librdkafka's code"
     assert sink.failed == 1
 
 
@@ -200,19 +211,19 @@ def test_close_passes_a_bounded_timeout_to_flush() -> None:
     assert producer.flush_timeouts == [7.5], "the wait must be capped, not open-ended"
 
 
-def test_a_non_zero_remainder_is_counted_and_announced_once(capsys) -> None:
-    """AC-2. `flush()` returns what is still queued — exactly the count lost at exit.
+def test_a_non_zero_remainder_at_close_is_counted_nowhere(capsys) -> None:
+    """SPEC-094 FR-001: every message was settled by its own round, so the close counts nothing.
 
-    The old call discarded that return value, so the loss was silent.
+    1.x counted what the close flush left queued, after its batch's verdict; that count went.
+    The bounded flush still runs, so a message a round left ``UNKNOWN`` may yet land.
     """
     producer = FakeProducer()
     producer.still_queued = 42
     sink = KafkaSink("t", producer=producer)
     sink.close()
-    assert sink.losses().failed == 42
-    err = capsys.readouterr().err
-    assert "lost 42 message(s)" in err, "one line carrying the count, not 42 lines"
-    assert err.count("KafkaSink") == 1
+    assert producer.flush_timeouts == [DEFAULT_FLUSH_TIMEOUT]
+    assert sink.losses().failed == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_a_clean_flush_counts_nothing() -> None:
@@ -451,11 +462,13 @@ def test_a_produce_released_during_the_close_wait_is_flushed(capsys, monkeypatch
     assert capsys.readouterr().err == ""
 
 
-def test_a_produce_released_after_close_is_counted_and_announced(capsys) -> None:
-    """FR-003 AC-3, second variant: the Overview's order — the release overtook the produce.
+def test_a_produce_released_after_close_is_settled_by_its_own_round(capsys) -> None:
+    """FR-003 AC-3's order, the release overtaking the produce, read by SPEC-094's round.
 
-    The close waits its bound, then flushes; the produce lands in the producer after that, so the
-    message is counted in ``failed`` with one line naming the count, never silently queued.
+    The close waits its bound and flushes; the produce then lands in the producer, and the
+    round that produced it waits for it: the stand-in's ``flush`` drains it and reads empty, so
+    it is ``ACCEPTED``. 1.x's "produced while the sink was closing" count, made after the batch's
+    verdict, is gone.
     """
     producer = ParkingProducer()
     sink = KafkaSink("logs", producer=producer)
@@ -464,12 +477,9 @@ def test_a_produce_released_after_close_is_counted_and_announced(capsys) -> None
     producer.release.set()
     emitter.join(10.0)
     assert 0.45 <= elapsed < 0.75, elapsed
-    assert producer.queued == [b'{"m": 1}'], "the message was not left behind the release's flush"
-    assert sink.losses().failed == 1
-    lines = capsys.readouterr().err.splitlines()
-    assert lines == [
-        "log-foundry: lost 1 message(s); KafkaSink, produced while the sink was closing"
-    ], lines
+    assert producer.delivered == [b'{"m": 1}'] and producer.queued == []
+    assert sink.losses().failed == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush(monkeypatch) -> None:
@@ -507,11 +517,11 @@ def test_a_flush_during_a_close_is_refused_and_a_close_waits_for_a_flush(monkeyp
     assert parked.flushes[:2] == ["enter flusher", "leave flusher"], parked.flushes
 
 
-def test_an_overtaken_emit_counts_every_message_it_handed_over(capsys) -> None:
-    """FR-003 AC-3: the count is what that call handed to the producer, not one, not the batch.
+def test_an_overtaken_round_settles_what_it_produced_and_counts_its_refusal(capsys) -> None:
+    """FR-003 AC-3 under SPEC-094: the round counts its refusal and settles what it produced.
 
-    Three events, one of which ``produce`` refuses: the two it accepted are counted ``failed``
-    and named in one line, and the refused one is counted as a refusal, once, elsewhere.
+    Three events, one of which ``produce`` refuses: the two it produced are waited for, drained
+    and ``ACCEPTED``; the refused one is ``DROPPED`` into ``rejected`` once, with 1.x's line.
     """
     producer = ParkingProducer(refuse_at=2)
     sink = KafkaSink("logs", producer=producer)
@@ -523,8 +533,9 @@ def test_an_overtaken_emit_counts_every_message_it_handed_over(capsys) -> None:
     sink.close()
     producer.release.set()
     emitter.join(10.0)
-    assert len(producer.queued) == 2
-    assert sink.losses().failed == 2
+    assert len(producer.delivered) == 2
+    assert sink.losses() == SinkLosses(dropped=1, failed=0)
     lines = capsys.readouterr().err.splitlines()
-    overtaken = "log-foundry: lost 2 message(s); KafkaSink, produced while the sink was closing"
-    assert lines.count(overtaken) == 1, lines
+    assert lines == ["log-foundry: lost 1 message(s); KafkaSink produce, BufferError"], lines
+
+

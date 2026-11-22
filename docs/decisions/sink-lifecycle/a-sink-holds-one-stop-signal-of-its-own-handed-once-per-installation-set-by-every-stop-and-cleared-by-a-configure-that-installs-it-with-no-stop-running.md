@@ -78,8 +78,12 @@ mark made before the setter returns; a clear while a stop is running.
 
 **What is left** (`architecture.md` §12): a reinstall's clear can cut the interruption of a close
 still running from an expired stop, reasoned and not measured; a child forked while a different
-parent thread is inside a sink's first setter can run that setter in its repair; a late delivery,
-with no `configure()`, to a `GooglePubSubSink` a `shutdown()` left open is unmeasured.
+parent thread is inside a sink's first setter can run that setter in its repair. ~~A late delivery,
+with no `configure()`, to a `GooglePubSubSink` a `shutdown()` left open is unmeasured.~~ *Measured
+at `cfa42af1`, SPEC-093/094 rebased onto this, 2026-11-22:* such a delivery to a `KafkaSink` or
+`GooglePubSubSink` waits one 50 ms slice for its reports and counts what is still unconfirmed in
+`failed`; configured again, the sink waits its full timeout, as
+`tests/test_stable_stop_signal.py`'s two reinstall tests hold (the release notes' *Known gaps*).
 
 ## History
 

@@ -214,6 +214,10 @@ class SQSSink:
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
       dropped_oversized: Events dropped for exceeding the message limit, counted only by a run
         that settled.
+      dropped_unadjudicated: Entries whose reply named them in neither ``Successful`` nor
+        ``Failed``, or whose reply could not be read, counted ``UNKNOWN`` and never resent
+        (SPEC-093 FR-003). A sub-count of ``failed``, which already holds every ``UNKNOWN``
+        entry, so it adds nothing to ``losses()``.
     """
 
     MAX_BATCH = 10
@@ -299,6 +303,7 @@ class SQSSink:
         self.max_message_bytes = max_message_bytes
         self.log_foundry_counters = SinkCounters()
         self.dropped_oversized = 0
+        self.dropped_unadjudicated = 0
 
     @property
     def _counter_lock(self) -> threading.Lock:

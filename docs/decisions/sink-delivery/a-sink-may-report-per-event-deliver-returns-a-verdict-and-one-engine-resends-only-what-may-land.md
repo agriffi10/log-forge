@@ -14,9 +14,16 @@ description: "a sink may add `deliver(batch) -> Verdict`, one closed `Outcome` p
 
 **Rejected.** A single retry layer, the sink's alone: a spec-review probe showed an `HTTPSink` answered nine `503`s then a `200`, delivered on the tenth request today, would be lost at the fourth, and `HTTPSink(max_retries=0)` under the default worker would fall from four tries to one. A single exponent across all fifteen worker-path rounds: `0.1 × 2**14` is about 27 minutes before the last. Reading `deliver` with ordinary attribute access: a proxy whose `__getattr__` delegates would offer its inner sink's `deliver` and be bypassed, filter and scrubber included, and third-party code would run in the probe. A whole-batch resend by the worker around an engine run: the budget already holds the worker's share, and the resend is the duplicate the contract exists to remove. Counters on the worker: they would not survive a swap back, a new worker or a fork.
 
-**Do NOT** add an `Outcome` member, a per-event reason or `retry_after`, or an async `deliver` before 2.0; declare `deliver` on the `Sink` Protocol; call a sink's own `emit` from its `deliver`, or mutate the list `deliver` is handed; nest engine rounds (the worker never calls the adapter for a sink that offers `deliver`); or resend an `UNKNOWN` or unreadable outcome for a sink that has not declared itself idempotent. `MultiSink`, `KafkaSink` and `GooglePubSubSink` never get `deliver`. (SPEC-072 FR-001 to FR-006)
+**Do NOT** add an `Outcome` member, a per-event reason or `retry_after`, or an async `deliver` before 2.0; declare `deliver` on the `Sink` Protocol; call a sink's own `emit` from its `deliver`, or mutate the list `deliver` is handed; nest engine rounds (the worker never calls the adapter for a sink that offers `deliver`); or resend an `UNKNOWN` or unreadable outcome for a sink that has not declared itself idempotent. `MultiSink` never gets `deliver`. ~~`MultiSink`, `KafkaSink` and `GooglePubSubSink` never get `deliver`.~~ Since SPEC-094 `KafkaSink` and `GooglePubSubSink` are engine sinks: each round waits for the client's reports on the messages it handed over, so their verdict can say `UNKNOWN` (*A client-buffered sink's round waits for its delivery reports*). (SPEC-072 FR-001 to FR-006)
 
 ## History
+
+### 2026-11-20
+
+- **Refined** by SPEC-094 FR-001 and FR-002, fence unchanged: the engine sinks now include
+  `KafkaSink` and `GooglePubSubSink`, whose rounds hand every message to the client and then wait
+  for its reports, so the *Do NOT* that they never get `deliver` is struck. `MultiSink` still never
+  gets one.
 
 ### 2026-11-08
 

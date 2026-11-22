@@ -78,10 +78,6 @@ def _each(sinks: Iterable[str], *faults: str) -> tuple[str, ...]:
 
 
 _LANDED_THEN_LOST = "An event a send may have landed is counted as lost when no later send lands it"
-_FINDING_12 = (
-    "`KafkaSink` and `GooglePubSubSink` give their verdict when the client queues a message, "
-    "not when the broker answers"
-)
 _FINDING_15 = "An injected autocommit connection breaks the database sinks' all-or-nothing write"
 
 PINS: tuple[Pin, ...] = (
@@ -95,64 +91,10 @@ PINS: tuple[Pin, ...] = (
         item=_LANDED_THEN_LOST,
     ),
     Pin(
-        name="reply-without-verdict",
-        rows=_each(
-            ("SQSSink[standard]", "SQSSink[fifo]", "SNSSink", "KinesisSink", "FirehoseSink"),
-            "no-verdict-shape",
-        ),
-        verdict=("silent-loss",),
-        item="An AWS batch reply that names no failure is read as full delivery",
-    ),
-    Pin(
-        name="bulk-without-errors",
-        rows=_each(("ElasticsearchSink", "OpenSearchSink"), "no-verdict-shape"),
-        verdict=("silent-loss",),
-        item=(
-            "`ElasticsearchSink` reads a `2xx` object without a truthy `errors` as success, "
-            "unverified."
-        ),
-    ),
-    Pin(
-        name="peer-closed-tcp",
-        rows=_each(("SyslogSink[tcp]", "LogstashSink[tcp]"), "peer-closed"),
-        verdict=("silent-loss",),
-        item=(
-            "A TCP `SyslogSink` or `LogstashSink` counts a frame as accepted when `sendall` "
-            "returns, so frames written after the peer closed vanish uncounted"
-        ),
-    ),
-    Pin(
-        name="publish-without-confirms",
-        rows=_each(("RabbitMQSink[owned]", "RabbitMQSink[borrowed]"), "peer-closed"),
-        verdict=("silent-loss",),
-        item=(
-            "`RabbitMQSink` publishes without confirms, so an unroutable message or one written "
-            "to a dead socket reads as accepted"
-        ),
-    ),
-    Pin(
         name="jetstream-ack-lost",
         rows=_each(("NATSSink[jetstream]", "NATSSink[jetstream-injected]"), "reply-lost"),
         verdict=("lost-but-held",),
         item="A timed-out JetStream publish is not retried, and cannot safely be",
-    ),
-    Pin(
-        name="verdict-before-refusal",
-        rows=_each(("KafkaSink", "GooglePubSubSink"), "never-acknowledged"),
-        verdict=("partition", "silent-loss"),
-        item=_FINDING_12,
-    ),
-    Pin(
-        name="verdict-before-indefinite-report",
-        rows=_each(("KafkaSink", "GooglePubSubSink"), "report-indefinite"),
-        verdict=("partition", "lost-but-held"),
-        item=_FINDING_12,
-    ),
-    Pin(
-        name="sdk-discard-counted-sent",
-        rows=("SentrySink[sdk]-never-acknowledged",),
-        verdict=("silent-loss",),
-        item="`SentrySink`'s SDK backend counts an event the SDK discarded as sent",
     ),
     Pin(
         name="autocommit-postgres",
@@ -167,11 +109,13 @@ PINS: tuple[Pin, ...] = (
         item=_FINDING_15,
     ),
 )
-"""The eleven pins after SPEC-095 FR-004: 22 rows over nine open items.
+"""The four pins after SPEC-095 FR-004, SPEC-093 FR-005 and SPEC-094 FR-003: 6 rows over three
+open items.
 
 SPEC-092 FR-004 set twelve pins over 74 rows. SPEC-095 removed `reply-resent`, whose 50 rows read
 green once a counted resend may leave a second copy, and moved `MongoDBSink`'s two
-`reply-counted-lost` rows to green, its duplicate `_id` now read as delivery.
+`reply-counted-lost` rows to green, its duplicate `_id` now read as delivery. SPEC-093 FR-005
+removed five pins and SPEC-094 FR-003 two, every row in them green.
 """
 
 DEPARTURES: tuple[Departure, ...] = (
@@ -313,8 +257,30 @@ DEPARTURES: tuple[Departure, ...] = (
             "It cannot report a failure, and that is the SDK's shape rather than a choice here.",
         ),
     ),
+    Departure(
+        name="publish-unconfirmed",
+        rows=_each(("RabbitMQSink[owned]", "RabbitMQSink[borrowed]"), "peer-closed"),
+        verdict=("silent-loss",),
+        record=(
+            "src/log_foundry/sinks/rabbitmq.py",
+            "With `confirm=False`, the default, a publish that returned is all this sink can know",
+        ),
+    ),
+    Departure(
+        name="confirm-borrowed-unprobed",
+        rows=("RabbitMQSink[confirmed-borrowed]-peer-closed",),
+        verdict=("ambiguous-when-knowable",),
+        record=(
+            "src/log_foundry/sinks/rabbitmq.py",
+            (
+                "A borrowed connection is not probed before a round, so a publish on one that "
+                "died while idle reads as a lost confirm"
+            ),
+        ),
+    ),
 )
-"""The twelve departures: SPEC-092 FR-004's seven over 12 rows, and SPEC-095 FR-004's five over 19.
+"""The fourteen departures: SPEC-092 FR-004's seven over 12 rows, SPEC-095 FR-004's five over 19,
+and SPEC-093 FR-005's two over 3.
 
 SPEC-095's five each hold a sink whose every failed call is counted as one that may have landed,
 so a resend after a refusal it could have known is counted too: the upper bound its record states.
