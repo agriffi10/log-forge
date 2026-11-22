@@ -632,10 +632,22 @@ def _terms(e) -> str:
     ))
 
 
-def test_a_forked_child_starts_with_what_it_holds(capsys) -> None:
-    """FR-005 AC-6: ``p15_fork_child_counters.py``, with the child's balance asserted (m6)."""
+def test_a_forked_child_starts_with_what_it_holds(capsys, monkeypatch) -> None:
+    """FR-005 AC-6: ``p15_fork_child_counters.py``, with the child's balance asserted (m6).
+
+    The worker's ``flush_interval`` default is raised to an hour before the library builds it, so
+    SPEC-091's sweep of an open span cannot run between the span's events and the fork: the
+    drain's first sweep is due a whole interval after it starts. At the default 1 s, a sweep that
+    falls due after the span's log and before the fork ships that event first, and a stall there
+    makes one likely: ``run_in_child``'s collection of the parent's garbage before it forks, which
+    in a full suite can take that long, or a starved runner. The child then held
+    ``accepted=1 open_spans=1``: CI read that on ``5170b023``'s py3.13 run, and stretching the
+    collection past 1 s reproduces it.
+    """
+    from conformance_backend import _set_flush_interval
     from test_fork_lifecycle import run_in_child
 
+    _set_flush_interval(monkeypatch, 3600.0)
     sink = PlanSink(lambda batch: [
         Outcome.REJECTED if e["message"] == "refuse me" else Outcome.ACCEPTED for e in batch
     ])
