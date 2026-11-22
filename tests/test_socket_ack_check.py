@@ -555,7 +555,9 @@ def test_frames_on_a_connection_a_later_write_finds_closed_are_unknown_and_never
 
     The first connection takes frames 0 and 1, then raises ``BrokenPipeError`` on frame 2. Frames
     0 and 1 are counted once in ``failed`` on one line and never written again; frame 2 keeps its
-    ``RETRYABLE`` outcome and is written again on the next connection, after frames 3 and 4. The
+    ``RETRYABLE`` outcome and is written again on the next connection, after frames 3 and 4, and
+    since SPEC-095 that resend is counted in ``resent`` with its own line, because a ``sendall``
+    that raised ``BrokenPipeError`` may have landed (an upper bound, not a loss). The
     stand-in raises ``TypeError`` from ``getsockopt``, so every check reads ``open`` and the
     criterion's other half, an object whose check raises keeping 1.x's ``ACCEPTED``, holds too.
     """
@@ -578,9 +580,12 @@ def test_frames_on_a_connection_a_later_write_finds_closed_are_unknown_and_never
         for conn, data in writes
     ]
     assert frames == [(0, "F0-"), (0, "F1-"), (1, "F3-"), (1, "F4-"), (1, "F2-")]
-    assert sink.losses().failed == 2
-    lines = [x for x in capsys.readouterr().err.splitlines() if "lost" in x]
+    assert (sink.losses().failed, sink.losses().resent) == (2, 1)
+    err = capsys.readouterr().err.splitlines()
+    lines = [x for x in err if ": lost " in x]
     assert len(lines) == 1 and f"lost 2 message(s); {LINE}" in lines[0], lines
+    resent = [x for x in err if ": resent " in x]
+    assert len(resent) == 1 and "resent 1 event(s)" in resent[0], resent
 
 
 def test_udp_rounds_make_no_check(monkeypatch: pytest.MonkeyPatch) -> None:

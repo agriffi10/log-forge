@@ -462,16 +462,21 @@ class Run:
       got: Frames of each round any peer received.
       counted: What each round added to ``failed``.
       lines: The ``lost`` lines written over the scenario.
+      resent: The ``resent`` lines, SPEC-095's count of a resend after a write that may have
+        landed, which is not a loss and is kept apart from ``lines``.
     """
 
-    def __init__(self, n: int, got: list[int], counted: list[int], lines: list[str]) -> None:
+    def __init__(
+        self, n: int, got: list[int], counted: list[int], lines: list[str], resent: list[str]
+    ) -> None:
         """Keeps the figures.
 
         Args:
           n: Frames per round.
           got: Received per round.
           counted: Counted per round.
-          lines: The lines.
+          lines: The loss lines.
+          resent: The resend lines.
 
         Returns:
           None.
@@ -480,6 +485,7 @@ class Run:
           None.
         """
         self.n = n
+        self.resent = resent
         self.got = got
         self.counted = counted
         self.lines = lines
@@ -547,8 +553,9 @@ def _run(
     finally:
         sink.close()
         srv.close()
-    lines = [x for x in capsys.readouterr().err.splitlines() if "lost" in x]
-    return Run(n, got, counted, lines)
+    err = capsys.readouterr().err.splitlines()
+    lines = [x for x in err if ": lost " in x]
+    return Run(n, got, counted, lines, [x for x in err if ": resent " in x])
 
 
 _ACK_WAIT = [
@@ -586,7 +593,7 @@ def test_a_peer_that_received_everything_draws_no_count_and_no_line(
     run = _run(monkeypatch, capsys, ack_wait, n=n, setup=setup, on_accept=on_accept, rounds=rounds)
     assert run.got == [n] * rounds, run.got
     assert run.counted == [0] * rounds, run.counted
-    assert run.lines == []
+    assert run.lines == [] and run.resent == [], (run.lines, run.resent)
 
 
 @pytest.mark.parametrize("ack_wait", _ACK_WAIT)

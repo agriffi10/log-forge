@@ -543,6 +543,14 @@ EXEMPT: dict[str, str] = {
     "StdoutSink": "a handed line is never handed again (SPEC-084)",
     "StderrSink": "a handed line is never handed again (SPEC-084)",
     "NATSSink": "its resend is the Nats-Msg-Id item of §12, out of SPEC-095's scope",
+    "KafkaSink": (
+        "a report it waited for and did not get is UNKNOWN, never resent; a produce() that "
+        "raised never queued the message (SPEC-094)"
+    ),
+    "GooglePubSubSink": (
+        "a future it waited on and could not read is UNKNOWN, never resent; a publish() that "
+        "raised returned no future (SPEC-094)"
+    ),
 }
 """The engine sinks that never mark, each with its reason."""
 

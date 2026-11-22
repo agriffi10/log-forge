@@ -367,18 +367,24 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
 
     ``spec097_pubsub_after_shutdown.py`` scaled down: P is handed, held by a caller's wrapper that
     forwards the signal and leaves P open, ``shutdown()`` sets P's signal, then P is configured
-    again, five orphan logs publish, ``flush()`` runs and a final ``shutdown()`` closes P. Futures
-    confirm after 0.6 s against an ``overflow_timeout`` of 0.4 s, the band where a set signal ended
-    the flush and overflow passes at once and the close bound counted every publish lost: before
-    the reinstall clear, ``failed=7``. Only the counts are asserted; ``flush()``'s verdict is the
-    sinks lane's to change (SPEC-093/094), and the probe's full reading is in the delivery doc.
+    again, five orphan logs publish, ``flush()`` runs and a final ``shutdown()`` closes P.
+
+    Since SPEC-094 each orphan log's round waits for its own future, up to ``overflow_timeout``,
+    and a set signal ends that wait after its first 50 ms slice, reading the publish ``UNKNOWN``
+    and counting it in ``failed``. So futures confirm after 0.3 s, inside the 1.0 s
+    ``overflow_timeout`` and past the first slice: with the reinstall's clear each round waits
+    and confirms, ``failed=0``, and without it each of the five is counted, ``failed=5``
+    (measured with the clear removed). The two logs before the first ``shutdown()`` confirm in
+    their own rounds, before ``confirmed`` is emptied, so five are confirmed after it. Before
+    SPEC-094 the band was a 0.6 s confirm against a 0.4 s ``overflow_timeout``, which SPEC-094
+    reads as unconfirmed whatever the signal says. Only the counts are asserted.
     """
 
     def work() -> str:
         from log_foundry.sinks.pubsub import GooglePubSubSink
 
         confirmed: list[int] = []
-        confirm_after = 0.6
+        confirm_after = 0.3
 
         class Future:
             def __init__(self) -> None:
@@ -418,7 +424,7 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
             def close(self) -> None:
                 pass
 
-        p = GooglePubSubSink("projects/p/topics/t", client=Publisher(), overflow_timeout=0.4)
+        p = GooglePubSubSink("projects/p/topics/t", client=Publisher(), overflow_timeout=1.0)
         log_foundry.configure(service="pubsub", sink=p)
         log_foundry.info("before")
         log_foundry.configure(sink=Forwarding(p))  # type: ignore[arg-type]
@@ -433,7 +439,7 @@ def test_a_pubsub_sink_configured_again_after_a_shutdown_confirms_what_it_publis
         return f"confirmed={len(confirmed)} failed={p.failed}"
 
     child = run_in_child(work, timeout=30)
-    assert child.output == "confirmed=7 failed=0", child.output
+    assert child.output == "confirmed=5 failed=0", child.output
 
 
 @pytest.mark.parametrize(
