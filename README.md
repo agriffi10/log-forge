@@ -1055,7 +1055,7 @@ knows.
 `KafkaSink` and `GooglePubSubSink` hand each message to a client that sends it later, and **each
 batch waits for the client's report on every message it handed over** before it returns, within
 `flush_timeout` (10 s by default) or `overflow_timeout` (30 s by default), and only one 50 ms slice
-once a shutdown has begun. A message the broker acknowledged is delivered. One refused where no
+once a shutdown has begun, or after one until a `configure()` installs the sink again. A message the broker acknowledged is delivered. One refused where no
 attempt the client made could have delivered it — Kafka's `INVALID_REQUIRED_ACKS` and
 `INVALID_RECORD`, Pub/Sub's `InvalidArgument`, and the `FlowControlLimitError` a full Pub/Sub client
 queue sets on a message it never sent — is counted in `.failed`, and a batch of nothing else fails,

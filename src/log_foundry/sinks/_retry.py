@@ -341,7 +341,7 @@ def pause_on(stop: threading.Event | None) -> threading.Event | None:
     Such a pause is waited out in full instead; one not yet set still cuts it short.
 
     Args:
-      stop: The worker's shutdown event, or ``None``.
+      stop: The sink's own stop signal (SPEC-098), or ``None``.
 
     Returns:
       ``stop`` when it is not set, else ``None``.

@@ -647,17 +647,22 @@ baseline.
   that every constructor parameter be a variant's pick or neutral, so `ack_wait` is listed in
   `NEUTRAL` for `SyslogSink` and `LogstashSink`, with that reason beside it: it changes what the
   sink can know, and the corpus cannot see the difference.
-- **Totals.** 268 rows: 62 pinned under seven pins, 15 departure rows under nine departures, and 191
-  that must pass. SPEC-092's FR-004 asserts its totals as literals, and those literals change to
-  these numbers.
+- **Totals.** SPEC-095 landed first (#414), and this spec lands with SPEC-094 on top of it. On the
+  merged tree: 268 rows, 6 pinned under four pins, 34 departure rows under fourteen departures,
+  and 228 that must pass. SPEC-092's FR-004 asserts its totals as literals, and those literals
+  change to these numbers. Before SPEC-095 landed, this spec's own settlement read 268 rows, 62
+  pinned under seven pins, 15 departure rows under nine departures and 191 that must pass,
+  measured at `a17a28a4` on base `c67931cd`, a local commit of the build that the squash merge
+  leaves off the remote.
 
 #### Acceptance Criteria:
 
-- [ ] The corpus generates 268 rows over 55 variants, and its literals read 268 rows, 62 pinned, 15
-      departure rows and 191 that must pass (invariants 2 and 7).
-- [ ] Against SPEC-092's delivered corpus at the branch, only the rows the criteria of FR-001 to
-      FR-004 name change verdict, and every other row reads as it read before this spec's `src/`
-      change (invariants 2 and 7).
+- [ ] The corpus generates 268 rows over 55 variants, and on the merged tree its literals read 268
+      rows, 6 pinned, 34 departure rows and 228 that must pass (invariants 2 and 7).
+- [ ] Against the corpus and `src` of the `origin/main` the build lands on (`295ba803`, with
+      SPEC-095 and SPEC-098), only the rows the criteria of FR-001 to FR-004 name and SPEC-094
+      FR-003's four change verdict, the twelve confirmed `RabbitMQSink` rows are new, and every
+      other row reads as it read before (invariants 2 and 7).
 - [ ] `adds_faults` has standing fixtures in `tests/test_conformance_gate.py`, one per failure it
       names, each asserting its line names the variant and the fault, and one well-formed table that
       yields no line. Applied to `VARIANTS`, it yields none (invariants 2 and 7).
@@ -1223,3 +1228,12 @@ check waits on a healthy peer.
     again on a new connection and arrive. That is the rule working, and the corpus judges the run
     right. The criterion now asks what the corpus asks: every frame the peer lost counted once, no
     frame it received counted, and one line. `tests/test_socket_close_corpus.py` asserts that.
+- Corrected on 2026-11-22, when the build was rebased onto SPEC-095 and SPEC-098.
+  - **FR-005's totals are the merged tree's.** SPEC-095 landed first and removed its
+    `reply-resent` pin's 50 rows, moved two more to green and added five departures over 19 rows,
+    so the literals read 268 rows, 6
+    pinned under four pins, 34 departure rows under fourteen departures and 228 that must pass.
+    The settlement this spec measured before then, 268, 62, 15 and 191, is kept as measured at
+    `a17a28a4` on base `c67931cd`, a local commit that is not on the remote after the squash
+    merge. Criterion 2 is read against `295ba803`: fourteen shared rows move, this spec's ten
+    and SPEC-094's four, and the twelve confirmed rows are new.

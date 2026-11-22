@@ -18,8 +18,9 @@ Built with SPEC-093 on one branch and landed in the same PR, after SPEC-093's co
   sending them (Andrew's "Wait at close (Recommended)", 2026-11-22, after the second diff
   review measured a flag-only close losing every publish still in flight at exit).
 - **The corpus** (FR-003): the Kafka double reports code 87, the Pub/Sub double raises a stub
-  `google.api_core.exceptions` hierarchy, and two pins removed. 268 rows: 58 pinned under 5 pins,
-  15 departure rows, 195 that must pass.
+  `google.api_core.exceptions` hierarchy, and two pins removed. On the merged tree, after SPEC-095
+  and SPEC-093: 268 rows, 6 pinned under 4 pins, 34 departure rows, 228 that must pass; before
+  SPEC-095 landed, 58 pinned under 5 pins, 15 departure rows and 195.
 - **New tests:** `tests/test_kafka_report_wait.py`, `tests/test_pubsub_round_wait.py`; `kafka` joins
   `WAIT_EXCLUSIONS`, and the engine-sink roster reads 18.
 - **The record** (FR-004): `architecture.md` §12 (the finding-12 verdict half and the

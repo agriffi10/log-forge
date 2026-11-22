@@ -249,7 +249,8 @@ class KafkaSink:
     Attributes:
       flush_timeout: Seconds a round waits for its reports, and :meth:`close` for the producer.
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
-      log_foundry_stop_signal: The worker's shutdown event, or ``None``.
+      log_foundry_stop_signal: The sink's own stop signal, set by every stop and cleared by a
+        ``configure()`` that installs the sink again (SPEC-098), or ``None``.
       failed: Messages a definitive report refused or no definitive report settled, once per
         run, the engine's ``failed_events``; assignable.
       rejected: Messages ``produce()`` itself refused — a full local queue, a serialization

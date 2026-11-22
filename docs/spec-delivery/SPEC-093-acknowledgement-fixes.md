@@ -19,8 +19,14 @@ Built with SPEC-094 on one branch and landed in one PR.
   `mandatory`, the owned-connection liveness probe, and the publish outcomes.
 - **The corpus** (FR-005): `Variant.adds` and `adds_faults`, the two confirmed RabbitMQ variants, the
   RabbitMQ double's confirm mode, five pins removed and the `publish-unconfirmed` and
-  `confirm-borrowed-unprobed` departures. 268 rows: 62 pinned under 7 pins, 15 departure rows under
-  9 departures, 191 that must pass, measured at `a17a28a4`.
+  `confirm-borrowed-unprobed` departures. SPEC-095 landed first, so on the merged tree, with
+  SPEC-094's: 268 rows, 6 pinned under 4 pins, 34 departure rows under 14 departures, 228 that
+  must pass. This spec's own settlement before then read 268 rows, 62 pinned under 7 pins, 15
+  departure rows under 9 departures and 191 that must pass, measured at `a17a28a4` on base
+  `c67931cd`, a local commit of the build that is not on the remote after the squash merge.
+  Against `295ba803`'s corpus and `src`, fourteen shared rows move, this spec's ten and
+  SPEC-094's four, and the twelve confirmed rows are new
+  (`docs/audits/2026-11-14-probes/sinks/spec093_094_build_results.txt`).
 - **New tests:** `tests/test_socket_close_corpus.py`, `test_socket_ack_check.py`,
   `test_sentry_discard.py`, `test_reply_names_no_event.py`, `test_rabbitmq_confirm.py`.
 - **The record** (FR-006): `architecture.md` §12 (four items struck and moved under *Resolved*, the

@@ -82,7 +82,9 @@ process exiting on the verdict would end: measured with a stand-in at 0.2 s late
 only set the flag landed none of seven, and the waiting close lands all seven. The stop is what
 keeps the drain itself from waiting out `GooglePubSubSink`'s 30 s default, which equals
 `DEFAULT_SHUTDOWN_TIMEOUT`; the close's wait is the one bounded wait an exit then pays, at most
-`overflow_timeout`, against a server that never answers.
+`overflow_timeout`, against a server that never answers. Since SPEC-098 the signal is the sink's
+own and stays set after a `shutdown()` until a `configure()` installs the sink again, so a round
+delivered in that window waits one slice too, and a sink installed again waits its full timeout.
 
 **What it costs.** A broker round trip on every batch; against a broker that never answers, each
 batch holds the drain thread for the sink's timeout, and an orphan log holds the caller's thread for
@@ -102,6 +104,10 @@ do NOT make the `flush()` hook wait or raise for a remainder.
   in flight at a normal exit, `close()` waits up to `overflow_timeout` on the futures its rounds
   left `UNKNOWN`, counting nothing. `tests/test_pubsub_round_wait.py` holds the exit delivery and
   the close's bound.
+- **Kept** through the rebase onto SPEC-098, which made the stop signal the sink's own and left it
+  set after a `shutdown()` until a `configure()` installs the sink again; the rounds read it as
+  before. `tests/test_stable_stop_signal.py`'s Pub/Sub test now confirms inside the round's wait,
+  since a confirm outside it is `UNKNOWN` whatever the signal says.
 
 ### 2026-11-20
 

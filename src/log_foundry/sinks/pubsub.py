@@ -115,7 +115,8 @@ class GooglePubSubSink:
       max_pending: Accepted and validated as 1.x surface; it bounds nothing since SPEC-094.
       overflow_timeout: Seconds one round waits on its futures, under one deadline.
       log_foundry_counters: The engine's event totals, which :meth:`losses` reports.
-      log_foundry_stop_signal: The worker's shutdown event, or ``None``.
+      log_foundry_stop_signal: The sink's own stop signal, set by every stop and cleared by a
+        ``configure()`` that installs the sink again (SPEC-098), or ``None``.
       failed: Publishes refused definitively or left unconfirmed, once per run, the engine's
         ``failed_events``; assignable.
       rejected: Publishes the client refused before any future existed, beside one that was

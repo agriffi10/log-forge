@@ -133,7 +133,13 @@ they were built from, their `[0.3]` outcome held by that stops-tail test.
   identical on both trees, `confirmed=7 failed=0` at 1.0, 2.5, 3.0 and 3.9 s, `flush()`
   `(True, None)` at 1.0 s and `(False, 'sink-flush')` at the other three. Its
   `signal_set_after_reuse=True` on both: straight after `configure(P)` the branch's P still holds
-  the wrapper's forwarded event, and P's first log hands it its own, cleared.
+  the wrapper's forwarded event, and P's first log hands it its own, cleared. *Corrected
+  2026-11-22, when SPEC-093/094 rebased onto this:* each Pub/Sub round now waits for its own
+  futures, so a confirm past `overflow_timeout` is `UNKNOWN` whatever the signal says. The test
+  therefore confirms at 0.3 s inside a 1.0 s `overflow_timeout` and pins `confirmed=5 failed=0`,
+  reading `failed=5` with the reinstall's clear removed. The probe on the merged tree reads
+  `confirmed=5 failed=0` at 1.0 s and `confirmed=7 failed=7` at 2.5, 3.0 and 3.9 s, with `flush()`
+  `(True, None)` throughout (`spec093_094_build_results.txt`).
 - **The model cells:** 640 on each tree, no verdict differs.
 - **The re-entry sweep** on the branch: `sections=140` or `141`, the count varying by run because
   the sections a workload reaches depend on thread timing, and `failed=0

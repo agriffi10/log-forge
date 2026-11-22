@@ -4673,7 +4673,9 @@ and a third copy is a fork with no merge.
   slice; a join that expires while a round waits, which needs a round started before the stop and a
   join budget under one slice, leaves the sink open with the worker's `shutdown timed out … the sink
   is left open because the worker thread is still using it` line, as for any sink still in use.
-  (SPEC-094)
+  Since SPEC-098 the signal is the sink's own and stays set after the `shutdown()` until a
+  `configure()` installs the sink again, so a round delivered in that window waits one slice as
+  well (*added 2026-11-22*, on the rebase onto SPEC-098). (SPEC-094)
 
 ---
 

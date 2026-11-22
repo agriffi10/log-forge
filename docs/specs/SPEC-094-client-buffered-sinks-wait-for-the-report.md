@@ -458,15 +458,16 @@ These are changes to SPEC-092's files as its build delivers them, after SPEC-093
   this change, because the sink reads no class.
 - **Pins.** `verdict-before-refusal` and `verdict-before-indefinite-report` are removed, because their
   four rows read green.
-- **Totals**, after SPEC-093's: 268 rows, 58 pinned under five pins, 15 departure rows and 195 that
-  must pass.
+- **Totals**, after SPEC-095's, which landed first, and SPEC-093's: 268 rows, 6 pinned under four
+  pins, 34 departure rows under fourteen departures and 228 that must pass. Before SPEC-095
+  landed they read 268 rows, 58 pinned under five pins, 15 departure rows and 195 that must pass.
 
 #### Acceptance Criteria:
 
-- [ ] The corpus's literals read 268 rows, 58 pinned, 15 departure rows and 195 that must pass
+- [ ] The corpus's literals read 268 rows, 6 pinned, 34 departure rows and 228 that must pass
       (invariants 2 and 7).
-- [ ] Against SPEC-093's verdicts, only the four rows of FR-001 and FR-002 change (invariants 2
-      and 7).
+- [ ] Against the corpus and `src` of the `origin/main` the build lands on (`295ba803`), only the
+      four rows of FR-001 and FR-002 change beyond SPEC-093's ten (invariants 2 and 7).
 - [ ] With `KafkaSink._round`'s wait removed, so that no report is waited for, in an export of the
       branch head, `KafkaSink-never-acknowledged` and `KafkaSink-clean` read
       `ambiguous-when-knowable` (invariant 2).
@@ -943,3 +944,8 @@ at or above `flush_timeout`, or a set stop, read every delivered message as `UNK
   - **The kept list is dropped in a forked child**, by the execution review's ruling: it records
     the pid that kept it, so a caller's direct `close()` in a child no longer waits
     `overflow_timeout` on futures only the parent's client threads resolve (invariant 12).
+- Corrected on 2026-11-22, when the build was rebased onto SPEC-095 and SPEC-098.
+  - **FR-003's totals are the merged tree's**: 268 rows, 6 pinned under four pins, 34 departure
+    rows under fourteen departures and 228 that must pass, since SPEC-095 landed first. Its
+    second criterion is read against `295ba803`: of the fourteen shared rows that move, these
+    four are this spec's and the other ten SPEC-093's.
